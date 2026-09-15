@@ -64,7 +64,7 @@ impl ProvisionStore {
     /// before regenerating from `RocksDB`. Idempotent on the
     /// `(height, shard)` slot — first writer wins, repeated inserts of
     /// the same content are no-ops.
-    pub fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardId) {
+    pub(crate) fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardId) {
         let hash = provisions.hash();
         let block_height = provisions.block_height();
         self.inner
@@ -98,7 +98,7 @@ impl ProvisionStore {
     /// Evict provisions whose retention window has elapsed. Returns the
     /// number of entries actually removed from the primary map. Also
     /// scrubs the outbound secondary index for the evicted hashes.
-    pub fn evict(&self, hashes: impl IntoIterator<Item = ProvisionHash>) -> usize {
+    pub(crate) fn evict(&self, hashes: impl IntoIterator<Item = ProvisionHash>) -> usize {
         let hashes: HashSet<ProvisionHash> = hashes.into_iter().collect();
         if hashes.is_empty() {
             return 0;

@@ -114,7 +114,7 @@ impl FinalizationStore {
     /// Remove the entry with this identity, if any. No-op when absent
     /// (sync paths may remove a finalization the local node never
     /// aggregated).
-    pub fn remove(&self, hash: &FinalizationHash) {
+    pub(crate) fn remove(&self, hash: &FinalizationHash) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let Some(slot) = inner.by_hash.remove(hash) else {
             return;
@@ -132,7 +132,7 @@ impl FinalizationStore {
     }
 
     /// Remove every finalization of `tick_id`, if any.
-    pub fn remove_tick(&self, tick_id: &TickId) {
+    pub(crate) fn remove_tick(&self, tick_id: &TickId) {
         let hashes: Vec<FinalizationHash> = self
             .inner
             .read()
@@ -162,7 +162,7 @@ impl FinalizationStore {
     /// All finalizations in tick order. Used by the proposer to include
     /// finalizations in the next block.
     #[must_use]
-    pub fn all(&self) -> Vec<Arc<Verifiable<Finalization>>> {
+    pub(crate) fn all(&self) -> Vec<Arc<Verifiable<Finalization>>> {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -187,7 +187,7 @@ impl FinalizationStore {
     /// Returns `None` once the finalization has been removed — callers then fall
     /// back to persisted storage.
     #[must_use]
-    pub fn get_for_tx(&self, tx_hash: TxHash) -> Option<Arc<Verifiable<Finalization>>> {
+    pub(crate) fn get_for_tx(&self, tx_hash: TxHash) -> Option<Arc<Verifiable<Finalization>>> {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let slot = inner.by_tx.get(&tx_hash)?;
         inner.finalizations.get(slot).map(Arc::clone)
@@ -195,7 +195,7 @@ impl FinalizationStore {
 
     /// Whether `tx_hash` is part of any currently-tracked finalization.
     #[must_use]
-    pub fn is_finalized(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn is_finalized(&self, tx_hash: TxHash) -> bool {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -208,7 +208,7 @@ impl FinalizationStore {
     /// The node passes this to shard consensus for conflict filtering — a transaction
     /// already finalized should not be re-proposed.
     #[must_use]
-    pub fn all_tx_hashes(&self) -> HashSet<TxHash> {
+    pub(crate) fn all_tx_hashes(&self) -> HashSet<TxHash> {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -222,7 +222,7 @@ impl FinalizationStore {
     /// paths to distinguish "tick is finalized" from "tick has no
     /// tracker".
     #[must_use]
-    pub fn contains(&self, tick_id: &TickId) -> bool {
+    pub(crate) fn contains(&self, tick_id: &TickId) -> bool {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -234,7 +234,7 @@ impl FinalizationStore {
 
     /// Number of finalizations currently tracked.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)

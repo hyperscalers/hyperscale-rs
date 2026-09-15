@@ -30,12 +30,12 @@ const PAYMENT: u32 = 5;
 #[derive(Clone, Debug)]
 pub struct ContentionReport {
     /// Payments submitted (all asserted `Accept`).
-    pub submitted: usize,
+    pub(crate) submitted: usize,
     /// First submission to last observed terminal, on the cluster clock.
     pub elapsed: Duration,
     /// Median submit-to-terminal latency, at the run-until poll
     /// granularity.
-    pub latency_p50: Duration,
+    pub(crate) latency_p50: Duration,
     /// 95th-percentile submit-to-terminal latency.
     pub latency_p95: Duration,
 }
@@ -53,7 +53,7 @@ impl Lcg {
     }
 
     #[allow(clippy::cast_precision_loss)] // uniform draw; 53 bits is the point
-    pub fn unit(&mut self) -> f64 {
+    pub(crate) fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
 }

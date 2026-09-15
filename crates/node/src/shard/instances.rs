@@ -43,7 +43,7 @@ pub struct InstancesState {
 }
 
 impl InstancesState {
-    pub fn new(config: &NodeConfig) -> Self {
+    pub(crate) fn new(config: &NodeConfig) -> Self {
         let mut fetch_config = config.instance_record_fetch.clone();
         fetch_config.max_ids_per_request = fetch_config
             .max_ids_per_request
@@ -55,7 +55,7 @@ impl InstancesState {
 
     /// Whether the record fetch has work the tick loop should drive.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         self.fetch.has_pending()
     }
 }

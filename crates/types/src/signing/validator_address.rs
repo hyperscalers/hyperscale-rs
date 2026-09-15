@@ -16,9 +16,9 @@ use crate::signing::NetworkId;
 #[hbor(signing_domain = "hyperscale-validator-address-v1", signing_context = NetworkId)]
 pub struct ValidatorAddressMessage {
     /// Monotonic announcement sequence — receivers keep the highest.
-    pub sequence: u64,
+    pub(crate) sequence: u64,
     /// Digest over the length-framed peer id and addresses.
-    pub content_digest: Hash,
+    pub(crate) content_digest: Hash,
 }
 
 impl ValidatorAddressMessage {

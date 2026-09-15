@@ -16,13 +16,13 @@ use crate::{BlockHeight, Hash, Provisions, ShardId};
 #[hbor(signing_domain = "hyperscale-provisions-sender-v1", signing_context = NetworkId)]
 pub struct ProvisionsSenderMessage {
     /// Shard the bundle was produced on.
-    pub source_shard: ShardId,
+    pub(crate) source_shard: ShardId,
     /// Shard the bundle serves.
-    pub target_shard: ShardId,
+    pub(crate) target_shard: ShardId,
     /// Source block height the bundle belongs to.
-    pub block_height: BlockHeight,
+    pub(crate) block_height: BlockHeight,
     /// Digest over the bundle's transaction hashes, in bundle order.
-    pub tx_digest: Hash,
+    pub(crate) tx_digest: Hash,
 }
 
 impl ProvisionsSenderMessage {

@@ -461,7 +461,7 @@ impl BeaconCoordinator {
     /// committee. The runner gates committee-only event forwarding
     /// (PC votes, SPC messages) on this.
     #[must_use]
-    pub fn is_on_committee(&self) -> bool {
+    pub(crate) fn is_on_committee(&self) -> bool {
         self.state.committee.contains(&self.me)
     }
 
@@ -546,7 +546,7 @@ impl BeaconCoordinator {
     /// [`Self::adopt_block`], so the beacon catches up to wall-clock and then
     /// paces to it rather than cascading ahead.
     #[must_use]
-    pub const fn committee_start_due(&self, epoch_boundary: LocalTimestamp) -> bool {
+    pub(crate) const fn committee_start_due(&self, epoch_boundary: LocalTimestamp) -> bool {
         self.now.as_millis() >= epoch_boundary.as_millis()
     }
 
@@ -580,7 +580,7 @@ impl BeaconCoordinator {
     /// arrived" + "local on active pool" checks before actually
     /// prevoting the skip hash.
     #[must_use]
-    pub fn skip_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
+    pub(crate) fn skip_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
         self.now.as_millis() >= expected_block_time.plus(self.skip_timeout()).as_millis()
     }
 
@@ -1204,7 +1204,7 @@ impl BeaconCoordinator {
     ///   re-recorded for the next epoch — each permanently revokes its
     ///   target. Shard witnesses ride the boundary contributions, not the
     ///   proposal.
-    pub fn try_propose(&mut self) -> Vec<Action> {
+    pub(crate) fn try_propose(&mut self) -> Vec<Action> {
         if !self.spc.is_bootstrapped() {
             trace!("try_propose: no SPC instance — deferring");
             return Vec::new();

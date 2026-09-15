@@ -46,7 +46,11 @@ use crate::vm_statics::{config_key, package_key};
 /// profile of anything it lets through, so no artifact that could
 /// publish is turned away here.
 #[must_use]
-pub fn committed_package(owner: Address, local: [u8; 16], value: &[u8]) -> Option<PackageHash> {
+pub(crate) fn committed_package(
+    owner: Address,
+    local: [u8; 16],
+    value: &[u8],
+) -> Option<PackageHash> {
     if !value.starts_with(WASM_PREAMBLE) {
         return None;
     }
@@ -85,7 +89,7 @@ const WASM_PREAMBLE: &[u8] = b"\0asm";
 /// costs nothing and is the statement that the two halves of the key
 /// agree; only then is a hash worth taking.
 #[must_use]
-pub fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
+pub(crate) fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
     let marker = Marker::from_bytes(value)?;
     if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(marker.expiry_ms) {
         return None;
@@ -102,7 +106,7 @@ pub fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u
 /// reader holding the leaf that it is value the shard still owes an
 /// answer for.
 #[must_use]
-pub fn record_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
+pub(crate) fn record_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
     let Ok(cell) = hbor_from_slice::<CrossingCell>(value) else {
         return false;
     };
@@ -189,7 +193,7 @@ pub struct NodeRecords {
 impl NodeRecords {
     /// Load both caches once, fixing the world this view answers from.
     #[must_use]
-    pub fn pinned(
+    pub(crate) fn pinned(
         packages: &PackageCache,
         instances: &InstanceCache,
         cells: Option<Arc<dyn LocalCells>>,
@@ -318,7 +322,7 @@ pub fn resource_issued_by<'a>(
 /// Shared rather than repeated: an address folds the rules it grants,
 /// so two sites deriving it differently would answer for two different
 /// resources under one name.
-pub fn issued_record(
+pub(crate) fn issued_record(
     hasher: &dyn Hasher,
     issuer: Address,
     meta: &InstanceMeta,
@@ -354,7 +358,7 @@ pub fn record_address(record: &[u8]) -> Option<Address> {
 /// record for a prefix this node serves is read back from the cell that
 /// sealed it, and one for a prefix it does not serve is fetched from the
 /// shard that does.
-pub const MAX_RESIDENT_INSTANCES: usize = 1 << 16;
+pub(crate) const MAX_RESIDENT_INSTANCES: usize = 1 << 16;
 
 /// The records a node is holding, and the order it lets them go in.
 ///
@@ -362,7 +366,7 @@ pub const MAX_RESIDENT_INSTANCES: usize = 1 << 16;
 /// and shared structurally, so leaving it intact costs a handful of
 /// nodes rather than a copy of the map.
 #[derive(Clone, Debug)]
-pub struct Resident {
+pub(crate) struct Resident {
     /// The blueprint serving every principal, and the instances genesis
     /// seated. Never let go: a genesis pool on a shard this node does
     /// not serve is answered by neither its state nor, usefully, a
@@ -384,7 +388,7 @@ pub struct Resident {
 impl Resident {
     /// The record serving a call target, if this node is holding one.
     #[must_use]
-    pub fn record(&self, target: CallTarget) -> Option<Arc<InstanceMeta>> {
+    pub(crate) fn record(&self, target: CallTarget) -> Option<Arc<InstanceMeta>> {
         if let Some(seeded) = self.seeded.record(target) {
             return Some(seeded);
         }
@@ -399,7 +403,7 @@ impl Resident {
     ///
     /// Seeded first, so a genesis record answers ahead of a grown one
     /// claiming its address — the same order [`Self::record`] reads in.
-    pub fn components(&self) -> impl Iterator<Item = (Address, &InstanceMeta)> {
+    pub(crate) fn components(&self) -> impl Iterator<Item = (Address, &InstanceMeta)> {
         self.seeded.components().chain(
             self.grown
                 .iter()
@@ -449,13 +453,13 @@ impl InstanceCache {
     /// A registry seeded with the instances a cold start already knows,
     /// at the default bound.
     #[must_use]
-    pub fn new(seed: InstanceRegistry) -> Self {
+    pub(crate) fn new(seed: InstanceRegistry) -> Self {
         Self::bounded(seed, MAX_RESIDENT_INSTANCES)
     }
 
     /// [`Self::new`] holding at most `capacity` grown records.
     #[must_use]
-    pub fn bounded(seed: InstanceRegistry, capacity: usize) -> Self {
+    pub(crate) fn bounded(seed: InstanceRegistry, capacity: usize) -> Self {
         Self(Arc::new(ArcSwap::from_pointee(Resident {
             seeded: Arc::new(seed),
             grown: OrdMap::new(),
@@ -466,7 +470,7 @@ impl InstanceCache {
 
     /// The instances this node currently answers for.
     #[must_use]
-    pub fn load(&self) -> Arc<Resident> {
+    pub(crate) fn load(&self) -> Arc<Resident> {
         self.0.load_full()
     }
 
@@ -485,7 +489,7 @@ impl InstanceCache {
     /// A second node's copy: the same records, in a cache that shares
     /// nothing either side goes on to hold or let go.
     #[must_use]
-    pub fn forked(&self) -> Self {
+    pub(crate) fn forked(&self) -> Self {
         Self(Arc::new(ArcSwap::from_pointee(Resident::clone(
             &self.load(),
         ))))
@@ -518,7 +522,7 @@ impl InstanceCache {
     /// Seat a record verified elsewhere — read out of a committed cell
     /// or delivered by the fetch, both of which check it derives the
     /// address it is claimed for.
-    pub fn seat_record(&self, meta: &InstanceMeta) {
+    pub(crate) fn seat_record(&self, meta: &InstanceMeta) {
         self.seat(&ProtocolHasher, meta);
     }
 
@@ -573,7 +577,7 @@ impl PackageCache {
     /// their artifact lengths unknown until [`Self::publish`] states
     /// them.
     #[must_use]
-    pub fn new(seed: MetadataCache) -> Self {
+    pub(crate) fn new(seed: MetadataCache) -> Self {
         Self {
             published: Arc::new(ArcSwap::from_pointee(Published {
                 metadata: Arc::new(seed),
@@ -585,7 +589,7 @@ impl PackageCache {
     /// A cache holding what this one holds now, growing apart from it
     /// afterwards.
     #[must_use]
-    pub fn forked(&self) -> Self {
+    pub(crate) fn forked(&self) -> Self {
         Self {
             published: Arc::new(ArcSwap::from_pointee((**self.published.load()).clone())),
         }
@@ -599,7 +603,7 @@ impl PackageCache {
 
     /// The length of `package`'s artifact, where this node has seen it.
     #[must_use]
-    pub fn artifact_bytes(&self, package: PackageHash) -> Option<u64> {
+    pub(crate) fn artifact_bytes(&self, package: PackageHash) -> Option<u64> {
         self.published.load().artifact_bytes.get(&package).copied()
     }
 

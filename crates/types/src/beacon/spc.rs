@@ -81,7 +81,7 @@ pub struct SpcEmptyViewMsg {
     /// Sender's validator id.
     pub signer: ValidatorId,
     /// Sender's signature over the empty-view signing bytes.
-    pub sig: ConsensusSignature,
+    pub(crate) sig: ConsensusSignature,
 }
 
 /// One signer's contribution to an [`SpcCert::Indirect`].
@@ -99,9 +99,9 @@ pub struct SpcEmptyViewMsg {
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct SkipReport {
     /// View of the signer's `max_high` at the time of the skip.
-    pub reported_view: SpcView,
+    pub(crate) reported_view: SpcView,
     /// Content hash of the signer's reported high value.
-    pub reported_value_hash: Hash,
+    pub(crate) reported_value_hash: Hash,
 }
 
 /// Certificate authorising entry into an SPC view.
@@ -202,7 +202,7 @@ pub struct SpcNewCommitMsg {
     /// lands `Verifiable::Unverified`; locally-built messages from
     /// [`Verified::<SpcNewCommitMsg>::from_verified_proof`] preserve the
     /// embedded marker.
-    pub proof: Verifiable<PcQc3>,
+    pub(crate) proof: Verifiable<PcQc3>,
 }
 
 impl SpcNewCommitMsg {

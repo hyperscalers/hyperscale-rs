@@ -594,7 +594,7 @@ impl Finalization {
     /// a reshape cut can name different sets. This shard settles on the
     /// set it committed under, which is the one its own committee signed.
     #[must_use]
-    pub fn uncovered_transactions(&self) -> BTreeMap<TxHash, ShardId> {
+    pub(crate) fn uncovered_transactions(&self) -> BTreeMap<TxHash, ShardId> {
         let Some(local_ec) = self
             .execution_certificates
             .iter()

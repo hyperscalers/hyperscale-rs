@@ -89,7 +89,7 @@ pub enum FetchFailureKind {
 /// immediately; other variants reflect transport conditions where a brief
 /// deferral is appropriate.
 #[must_use]
-pub const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind {
+pub(crate) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind {
     match err {
         RequestError::Exhausted { .. } => FetchFailureKind::Exhausted,
         RequestError::NoPeers => FetchFailureKind::NoPeers,
@@ -428,7 +428,7 @@ impl ShardScopedInput {
     /// Priority for ordering events at the same simulation timestamp.
     #[must_use]
     #[allow(clippy::match_same_arms)] // explicit per-variant arms document intent
-    pub fn priority(&self) -> EventPriority {
+    pub(crate) fn priority(&self) -> EventPriority {
         match self {
             Self::Protocol(event) => match event.as_ref() {
                 ProtocolEvent::ViewChangeTimer | ProtocolEvent::CleanupTimer => {
@@ -510,7 +510,7 @@ pub enum ProcessScopedInput {
 impl ProcessScopedInput {
     /// Priority for ordering events at the same simulation timestamp.
     #[must_use]
-    pub const fn priority(&self) -> EventPriority {
+    pub(crate) const fn priority(&self) -> EventPriority {
         match self {
             Self::SubmitTransaction { .. } => EventPriority::Client,
         }
@@ -564,7 +564,7 @@ pub enum PoolScopedInput {
 impl PoolScopedInput {
     /// Priority for ordering events at the same simulation timestamp.
     #[must_use]
-    pub fn priority(&self) -> EventPriority {
+    pub(crate) fn priority(&self) -> EventPriority {
         match self {
             // Inbound beacon gossip is a network input; the verify/adopt
             // continuations it spawns are internal consequences.

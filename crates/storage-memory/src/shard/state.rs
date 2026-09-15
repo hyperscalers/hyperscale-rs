@@ -47,42 +47,42 @@ pub type EntryHistory = OrdMap<(EntryKey, u64), Option<Arc<[u8]>>>;
 /// slices for the same reason — a copied path carries pointers, not bytes.
 #[derive(Clone)]
 pub struct SharedState {
-    pub tree_store: SimTreeStore,
-    pub current_block_height: BlockHeight,
-    pub current_root_hash: StateRoot,
+    pub(crate) tree_store: SimTreeStore,
+    pub(crate) current_block_height: BlockHeight,
+    pub(crate) current_root_hash: StateRoot,
     /// Current value per substate key. Absent key = no value. This is
     /// the authoritative source of truth for reads at the current tip.
-    pub current_state: Cells,
+    pub(crate) current_state: Cells,
     /// Per-write prior-value entries keyed by `(key, write_version)`.
     /// `None` means the key was absent immediately before the write at
     /// that version. Consumed by historical reads and the retention GC.
-    pub state_history: CellHistory,
+    pub(crate) state_history: CellHistory,
     /// Current value per ordered-collection entry — the order-native
     /// mirror of the entry leaves in `current_state`. Derived state: at
     /// every height it equals the tree's entry leaves.
-    pub current_entries: Entries,
+    pub(crate) current_entries: Entries,
     /// Per-write prior-value entries for the entry index, mirroring
     /// `state_history` row for row.
-    pub entries_history: EntryHistory,
+    pub(crate) entries_history: EntryHistory,
     /// Each version's weighted timestamp, from the floor on; what
     /// [`retire_dated`] reads.
-    pub version_time: BTreeMap<u64, u64>,
+    pub(crate) version_time: BTreeMap<u64, u64>,
     /// The oldest version historical reads are answered at.
-    pub retention_floor: u64,
+    pub(crate) retention_floor: u64,
     /// Committed substate byte total per version, written in
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
     /// every replica.
-    pub substate_bytes: BTreeMap<u64, u64>,
+    pub(crate) substate_bytes: BTreeMap<u64, u64>,
     /// Committed package artifacts by content address — the mirror of
     /// the `RocksDB` backend's package index. Derived state: a committed
     /// cell that self-identifies as a package lands its bytes here in
     /// the same application that lands the cell.
-    pub package_artifacts: BTreeMap<Hash, Vec<u8>>,
+    pub(crate) package_artifacts: BTreeMap<Hash, Vec<u8>>,
     /// The sweep index — the mirror of the `RocksDB` backend's, fed
     /// from the same judgement so both backends enumerate the same
     /// candidates.
-    pub sweep_index: SweepRows,
+    pub(crate) sweep_index: SweepRows,
 }
 
 impl SharedState {
@@ -214,29 +214,29 @@ pub fn apply_state_writes(
 /// All consensus-related metadata bundled into a single `RwLock`.
 pub struct ConsensusState {
     /// Committed blocks indexed by height.
-    pub blocks: BTreeMap<BlockHeight, CertifiedBlock>,
+    pub(crate) blocks: BTreeMap<BlockHeight, CertifiedBlock>,
     /// Certified headers held without their blocks: the anchor a
     /// snap-sync imported, kept so this store serves the next joiner's
     /// witness history as one that committed the block would.
-    pub boundary_headers: BTreeMap<BlockHeight, CertifiedBlockHeader>,
+    pub(crate) boundary_headers: BTreeMap<BlockHeight, CertifiedBlockHeader>,
     /// Committed height.
-    pub committed_height: BlockHeight,
+    pub(crate) committed_height: BlockHeight,
     /// Committed block hash.
-    pub committed_hash: Option<BlockHash>,
+    pub(crate) committed_hash: Option<BlockHash>,
     /// Latest QC.
-    pub committed_qc: Option<QuorumCertificate>,
+    pub(crate) committed_qc: Option<QuorumCertificate>,
     /// Transactions indexed by hash.
-    pub transactions: HashMap<TxHash, Transaction>,
+    pub(crate) transactions: HashMap<TxHash, Transaction>,
     /// Finalizations indexed by `TickId`.
-    pub certificates: HashMap<FinalizationHash, Finalization>,
+    pub(crate) certificates: HashMap<FinalizationHash, Finalization>,
     /// Consensus receipts keyed by transaction hash.
-    pub consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
+    pub(crate) consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.
-    pub execution_metadata: HashMap<TxHash, ExecutionMetadata>,
+    pub(crate) execution_metadata: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
-    pub receipt_heights: HashMap<TxHash, BlockHeight>,
+    pub(crate) receipt_heights: HashMap<TxHash, BlockHeight>,
     /// Execution certificates keyed by [`TickId`].
-    pub execution_certs: HashMap<TickId, ExecutionCertificate>,
+    pub(crate) execution_certs: HashMap<TickId, ExecutionCertificate>,
     /// Index: attested transaction → every certificate of this shard's
     /// carrying an outcome for it. Mirrors the production
     /// `tx_cert_index` CF so simulation integration tests serve the
@@ -247,27 +247,27 @@ pub struct ConsensusState {
     /// a retirement, a reclaim, an abandonment — and a counterpart that
     /// asks by naming the transaction cannot say which of them it
     /// wants.
-    pub tx_cert_index: HashMap<TxHash, BTreeSet<TickId>>,
+    pub(crate) tx_cert_index: HashMap<TxHash, BTreeSet<TickId>>,
     /// Index: `block_height` → `TickId`s at that height.
-    pub finalizations_by_height: HashMap<BlockHeight, Vec<TickId>>,
+    pub(crate) finalizations_by_height: HashMap<BlockHeight, Vec<TickId>>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
     /// `RocksDB` `beacon_witnesses` CF so simulation integration tests
     /// can serve fetches and replay the accumulator on restart. Shard
     /// is implicit — storage is scoped per-shard.
-    pub beacon_witnesses: BTreeMap<u64, ShardWitnessPayload>,
+    pub(crate) beacon_witnesses: BTreeMap<u64, ShardWitnessPayload>,
     /// Provision bodies keyed by their committing height and hash.
     /// Mirrors the production `provisions` CF: a stored block keeps only
     /// the hashes, so this is what a replay reads the bodies back from.
-    pub provisions: BTreeMap<(BlockHeight, ProvisionHash), Arc<Provisions>>,
+    pub(crate) provisions: BTreeMap<(BlockHeight, ProvisionHash), Arc<Provisions>>,
     /// The chain's origin — `ChainOrigin::ROOT` except for a split
     /// child's adopted store, where recovery must reconstruct the
     /// continued height line and clock.
-    pub chain_origin: ChainOrigin,
+    pub(crate) chain_origin: ChainOrigin,
     /// Durable safe-vote register records keyed by validator, each
     /// tagged with the chain origin that wrote it. Mirrors the
     /// production `safe_vote_registers` CF; reads ignore records whose
     /// tag differs from the current `chain_origin`.
-    pub safe_vote_registers: HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>,
+    pub(crate) safe_vote_registers: HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>,
     /// Blocks written beside a validator's safe-vote registers, keyed by
     /// height then hash and tagged with the chain origin that wrote them.
     /// Mirrors the production `voted_blocks` CF: the uncommitted chain
@@ -276,7 +276,7 @@ pub struct ConsensusState {
     /// on every commit — the hash in the key keeps a fork sibling from
     /// displacing its rival before then — and, like the registers,
     /// ignored by reads once the tag no longer matches.
-    pub voted_blocks: BTreeMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
+    pub(crate) voted_blocks: BTreeMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.

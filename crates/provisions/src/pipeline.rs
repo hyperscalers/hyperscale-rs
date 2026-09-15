@@ -58,11 +58,11 @@ pub const MAX_PENDING_PROVISION_ENTRIES: usize = 64 * MAX_TXS_PER_BLOCK;
 pub struct DeadlineSweep {
     /// `(source_shard, source_block_height)` keys whose verified entries
     /// evicted. Header buffers keyed by `(shard, height)` are pruned here.
-    pub evicted_keys: Vec<Key>,
+    pub(crate) evicted_keys: Vec<Key>,
     /// Content hashes of pending entries dropped before verification.
     /// The coordinator emits an `AbandonFetch::LocalProvisions` for each
     /// so any pinned local-DA fetch releases its slot.
-    pub evicted_pending: Vec<ProvisionHash>,
+    pub(crate) evicted_pending: Vec<ProvisionHash>,
 }
 
 /// Verified provisions held in `verified`, paired with their source

@@ -257,8 +257,8 @@ pub enum TraceKind {
 pub struct HostRole {
     pub host: u32,
     pub shards: Vec<ShardPath>,
-    pub seated: Vec<ShardPath>,
-    pub observing: Vec<ObserverSeat>,
+    pub(crate) seated: Vec<ShardPath>,
+    pub(crate) observing: Vec<ObserverSeat>,
     pub pooled: u32,
 }
 
@@ -271,12 +271,12 @@ pub struct HostRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(missing_docs)] // flat readouts; their names are the documentation
-pub struct ObserverSeat {
+pub(crate) struct ObserverSeat {
     pub shard: ShardPath,
-    pub child: ShardPath,
+    pub(crate) child: ShardPath,
     /// Whether the beacon has folded the seat's `ReshapeReady` witness — the
     /// observer has the child's state, not merely the assignment.
-    pub ready: bool,
+    pub(crate) ready: bool,
 }
 
 /// A transaction hash, shortened to the prefix a reader can match by eye.

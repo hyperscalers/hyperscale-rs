@@ -24,13 +24,13 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct SpcNewCommitNotification {
     /// Epoch the inner SPC instance belongs to.
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
     /// Validator relaying this commit — the implicit signer of
     /// `sender_signature`.
     pub sender: ValidatorId,
     /// Signature over the [`SpcRelayMessage`] for
     /// `(epoch, msg.view, msg.hash())`.
-    pub sender_signature: ConsensusSignature,
+    pub(crate) sender_signature: ConsensusSignature,
     /// The committed new-commit message.
     pub msg: Arc<Verifiable<SpcNewCommitMsg>>,
 }

@@ -41,7 +41,7 @@ pub const REBROADCAST_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutboundCertMemoryStats {
     /// Number of (tick, target-shard) entries currently being retained for re-broadcast.
-    pub tracked_certificates: usize,
+    pub(crate) tracked_certificates: usize,
 }
 
 /// A single tracked outbound EC for one (tick, `target_shard`) destination.
@@ -62,11 +62,11 @@ struct OutboundCertEntry {
 #[derive(Debug)]
 pub struct RebroadcastDirective {
     /// Shard the EC should be re-broadcast to.
-    pub target_shard: ShardId,
+    pub(crate) target_shard: ShardId,
     /// The verified execution certificate to re-broadcast.
-    pub certificate: Arc<Verified<ExecutionCertificate>>,
+    pub(crate) certificate: Arc<Verified<ExecutionCertificate>>,
     /// Per-shard recipients (peer pool) for the broadcast.
-    pub recipients: Vec<ValidatorId>,
+    pub(crate) recipients: Vec<ValidatorId>,
 }
 
 /// Sub-state machine that retains and periodically re-broadcasts ECs
@@ -85,14 +85,14 @@ impl Default for OutboundExecutionCertificateTracker {
 }
 
 impl OutboundExecutionCertificateTracker {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
             now: WeightedTimestamp::ZERO,
         }
     }
 
-    pub fn memory_stats(&self) -> OutboundCertMemoryStats {
+    pub(crate) fn memory_stats(&self) -> OutboundCertMemoryStats {
         OutboundCertMemoryStats {
             tracked_certificates: self.entries.len(),
         }
@@ -101,7 +101,7 @@ impl OutboundExecutionCertificateTracker {
     /// Register an EC the tick leader just broadcast to a remote shard.
     /// Idempotent on duplicate (tick, target) — preserves the original
     /// `first_sent_at` so the safety horizon counts from the first send.
-    pub fn on_broadcast(
+    pub(crate) fn on_broadcast(
         &mut self,
         certificate: Arc<Verified<ExecutionCertificate>>,
         target_shard: ShardId,
@@ -140,7 +140,7 @@ impl OutboundExecutionCertificateTracker {
     /// observed the same tick structure we did and almost certainly
     /// received our EC contribution (or are about to). This is the
     /// best positive signal available without an explicit ACK message.
-    pub fn on_tick_finalized(&mut self, tick_id: &TickId) {
+    pub(crate) fn on_tick_finalized(&mut self, tick_id: &TickId) {
         // A tick can have multiple target_shard entries — drop them all.
         let stale: Vec<_> = self
             .entries
@@ -164,7 +164,10 @@ impl OutboundExecutionCertificateTracker {
     /// for entries past `REBROADCAST_INTERVAL`, evicts entries past the
     /// safety horizon (logged at `warn!` — same severity as the symmetric
     /// outbound-provision eviction).
-    pub fn on_block_committed(&mut self, now: WeightedTimestamp) -> Vec<RebroadcastDirective> {
+    pub(crate) fn on_block_committed(
+        &mut self,
+        now: WeightedTimestamp,
+    ) -> Vec<RebroadcastDirective> {
         self.now = now;
 
         let mut directives = Vec::new();

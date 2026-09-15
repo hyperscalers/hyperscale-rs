@@ -8,68 +8,68 @@ use crate::accounts::SelectionMode;
 #[derive(Clone, Debug)]
 pub struct SpammerConfig {
     /// Number of shards in the network.
-    pub num_shards: u64,
+    pub(crate) num_shards: u64,
 
     /// Number of validators per shard.
     /// Used to distribute load across multiple nodes in each shard.
-    pub validators_per_shard: usize,
+    pub(crate) validators_per_shard: usize,
 
     /// Number of validators packed into each host process. Matches
     /// `launch-cluster.sh --vnodes-per-host`. Under same-shard packing the
     /// per-shard host count is `validators_per_shard / vnodes_per_host`,
     /// so each endpoint serves exactly one shard. Under cross-shard packing
     /// every endpoint serves every shard and this value is unused.
-    pub vnodes_per_host: usize,
+    pub(crate) vnodes_per_host: usize,
 
     /// True iff hosts run one vnode from each shard (the
     /// `launch-cluster.sh --cross-shard-pack` layout). Routing then ignores
     /// the per-shard endpoint partition because every host is reachable for
     /// every shard.
-    pub cross_shard_pack: bool,
+    pub(crate) cross_shard_pack: bool,
 
     /// RPC endpoints. Indexed in host order. Under same-shard packing
     /// endpoints are flat-grouped by shard:
     /// `[shard0_host0, shard0_host1, …, shard1_host0, …]`. Under
     /// cross-shard packing every endpoint serves every shard.
-    pub rpc_endpoints: Vec<String>,
+    pub(crate) rpc_endpoints: Vec<String>,
 
     /// Number of accounts to generate per shard.
-    pub accounts_per_shard: usize,
+    pub(crate) accounts_per_shard: usize,
 
     /// Target transactions per second.
-    pub target_tps: u64,
+    pub(crate) target_tps: u64,
 
     /// Ratio of cross-shard transactions (0.0 to 1.0).
-    pub cross_shard_ratio: f64,
+    pub(crate) cross_shard_ratio: f64,
 
     /// Account selection mode.
-    pub selection_mode: SelectionMode,
+    pub(crate) selection_mode: SelectionMode,
 
     /// Initial account balance for genesis.
     pub initial_balance: u128,
 
     /// Batch size for transaction generation.
-    pub batch_size: usize,
+    pub(crate) batch_size: usize,
 
     /// Interval between progress reports.
-    pub progress_interval: Duration,
+    pub(crate) progress_interval: Duration,
 
     /// Whether to track transaction latency by polling for completion.
-    pub latency_tracking: bool,
+    pub(crate) latency_tracking: bool,
 
     /// Sample rate for latency measurement (0.0 to 1.0).
     /// Only this fraction of transactions will be tracked.
-    pub latency_sample_rate: f64,
+    pub(crate) latency_sample_rate: f64,
 
     /// Poll interval for checking transaction status.
-    pub latency_poll_interval: Duration,
+    pub(crate) latency_poll_interval: Duration,
 
     /// Timeout for waiting for in-flight transactions to complete after spammer stops.
-    pub latency_finalization_timeout: Duration,
+    pub(crate) latency_finalization_timeout: Duration,
 
     /// Number of worker threads for parallel submission.
     /// Each worker gets its own partition of accounts.
-    pub num_workers: usize,
+    pub(crate) num_workers: usize,
 }
 
 impl Default for SpammerConfig {
@@ -148,7 +148,7 @@ impl SpammerConfig {
     /// Return the `[base, end)` range of `rpc_endpoints` indices that serve
     /// `shard`. Convenience wrapper around [`EndpointRouting`].
     #[must_use]
-    pub fn endpoint_range_for_shard(&self, shard: usize) -> std::ops::Range<usize> {
+    pub(crate) fn endpoint_range_for_shard(&self, shard: usize) -> std::ops::Range<usize> {
         self.routing().range_for_shard(shard)
     }
 
@@ -237,7 +237,7 @@ impl SpammerConfig {
         clippy::cast_sign_loss
     )]
     // Heuristic for human-friendly TPS pacing; precision/sign aren't material.
-    pub fn batch_interval(&self) -> Duration {
+    pub(crate) fn batch_interval(&self) -> Duration {
         if self.target_tps == 0 || self.batch_size == 0 {
             return Duration::from_millis(100);
         }
@@ -252,7 +252,7 @@ impl SpammerConfig {
     ///
     /// Returns a [`ConfigError`] if RPC endpoints are missing, shard count is
     /// zero, or per-shard account count is zero.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if self.rpc_endpoints.is_empty() {
             return Err(ConfigError::NoEndpoints);
         }
@@ -303,7 +303,7 @@ pub struct EndpointRouting {
 impl EndpointRouting {
     /// Derive the policy from a [`SpammerConfig`].
     #[must_use]
-    pub fn from_config(cfg: &SpammerConfig) -> Self {
+    pub(crate) fn from_config(cfg: &SpammerConfig) -> Self {
         let hosts_per_shard = if cfg.cross_shard_pack {
             0
         } else {

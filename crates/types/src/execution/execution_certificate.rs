@@ -454,7 +454,7 @@ impl ExecutionCertificate {
 
     /// signature aggregated signature from 2f+1 validators.
     #[must_use]
-    pub const fn aggregated_signature(&self) -> AggregateSignature {
+    pub(crate) const fn aggregated_signature(&self) -> AggregateSignature {
         self.aggregated_signature
     }
 
@@ -545,7 +545,7 @@ impl ExecutionCertificate {
     /// Same message as [`ExecutionVote::signing_message`]; reconstructed
     /// from the EC's own fields so verifiers don't need a vote sample.
     #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+    pub(crate) fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
             &ExecutionVoteMessage {
                 vote_anchor_ts: self.vote_anchor_ts,

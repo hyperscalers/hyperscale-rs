@@ -109,12 +109,12 @@ pub struct SyncConfig {
     /// Maximum heights packed into a single `Fetch` output. `1` for
     /// per-id payloads (block-sync); larger for range fetches
     /// (remote-header-sync).
-    pub max_per_request: u64,
+    pub(crate) max_per_request: u64,
     /// Per-scope sliding window: how far ahead of `committed` heights are
     /// queued for fetching.
-    pub window_size: u64,
+    pub(crate) window_size: u64,
     /// Cap on concurrent in-flight fetches per scope.
-    pub max_concurrent_per_scope: usize,
+    pub(crate) max_concurrent_per_scope: usize,
 }
 
 impl Default for SyncConfig {
@@ -131,15 +131,15 @@ impl Default for SyncConfig {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ScopeStatus {
     /// Highest known target.
-    pub target_height: u64,
+    pub(crate) target_height: u64,
     /// Highest admitted height.
-    pub current_height: u64,
+    pub(crate) current_height: u64,
     /// Number of heights behind target.
-    pub blocks_behind: u64,
+    pub(crate) blocks_behind: u64,
     /// In-flight fetch ranges.
-    pub pending_fetches: usize,
+    pub(crate) pending_fetches: usize,
     /// Heights queued or deferred awaiting fetch.
-    pub queued_heights: usize,
+    pub(crate) queued_heights: usize,
 }
 
 /// The per-height watermark a binding syncs over.
@@ -379,7 +379,7 @@ pub struct Sync<B: SyncBinding> {
 impl<B: SyncBinding> Sync<B> {
     /// Create a new instance with default binding state.
     #[must_use]
-    pub fn new(config: SyncConfig) -> Self {
+    pub(crate) fn new(config: SyncConfig) -> Self {
         Self {
             config,
             scopes: BTreeMap::new(),
@@ -389,24 +389,24 @@ impl<B: SyncBinding> Sync<B> {
 
     /// Read-only access to the binding's private state.
     #[must_use]
-    pub const fn binding_state(&self) -> &B::State {
+    pub(crate) const fn binding_state(&self) -> &B::State {
         &self.binding_state
     }
 
     /// Mutable access to the binding's private state.
-    pub const fn binding_state_mut(&mut self) -> &mut B::State {
+    pub(crate) const fn binding_state_mut(&mut self) -> &mut B::State {
         &mut self.binding_state
     }
 
     /// True if any scope has heights parked behind a backoff deadline.
     #[must_use]
-    pub fn has_deferred(&self) -> bool {
+    pub(crate) fn has_deferred(&self) -> bool {
         self.scopes.values().any(|s| !s.deferred.is_empty())
     }
 
     /// True if any scope is actively syncing (committed < target).
     #[must_use]
-    pub fn is_syncing(&self) -> bool {
+    pub(crate) fn is_syncing(&self) -> bool {
         self.scopes.values().any(|s| s.committed < s.target)
     }
 
@@ -414,7 +414,7 @@ impl<B: SyncBinding> Sync<B> {
     /// `target - committed`. Use for an aggregate gauge across a
     /// multi-scope binding.
     #[must_use]
-    pub fn total_blocks_behind(&self) -> u64 {
+    pub(crate) fn total_blocks_behind(&self) -> u64 {
         self.scopes
             .values()
             .map(|s| s.target.as_u64().saturating_sub(s.committed.as_u64()))
@@ -423,19 +423,19 @@ impl<B: SyncBinding> Sync<B> {
 
     /// Total in-flight fetch ranges across all scopes.
     #[must_use]
-    pub fn in_flight_ranges(&self) -> usize {
+    pub(crate) fn in_flight_ranges(&self) -> usize {
         self.scopes.values().map(|s| s.in_flight_ranges).sum()
     }
 
     /// Per-scope target. `None` if the scope has no entry yet.
     #[must_use]
-    pub fn target(&self, scope: &B::Scope) -> Option<B::Key> {
+    pub(crate) fn target(&self, scope: &B::Scope) -> Option<B::Key> {
         self.scopes.get(scope).map(|s| s.target)
     }
 
     /// Per-scope status snapshot.
     #[must_use]
-    pub fn status(&self, scope: &B::Scope) -> ScopeStatus {
+    pub(crate) fn status(&self, scope: &B::Scope) -> ScopeStatus {
         self.scopes
             .get(scope)
             .map(|s| ScopeStatus {
@@ -451,7 +451,7 @@ impl<B: SyncBinding> Sync<B> {
     }
 
     /// Process an input, returning outputs.
-    pub fn handle(&mut self, input: SyncInput<B>) -> Vec<SyncOutput<B>> {
+    pub(crate) fn handle(&mut self, input: SyncInput<B>) -> Vec<SyncOutput<B>> {
         match input {
             SyncInput::StartSync { scope, target } => self.handle_start_sync(&scope, target),
             SyncInput::FetchSucceeded {

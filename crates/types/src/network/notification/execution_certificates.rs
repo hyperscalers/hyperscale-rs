@@ -27,7 +27,7 @@ pub struct ExecutionCertificatesNotification {
     /// The validator who sent this batch.
     pub sender: ValidatorId,
     /// Signature over the domain-separated signing message, by the sender.
-    pub sender_signature: ConsensusSignature,
+    pub(crate) sender_signature: ConsensusSignature,
 }
 
 impl ExecutionCertificatesNotification {

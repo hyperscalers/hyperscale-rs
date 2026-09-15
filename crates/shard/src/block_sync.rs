@@ -127,7 +127,7 @@ pub struct BlockSyncManager {
 
 impl BlockSyncManager {
     /// Create a new `BlockSyncManager`.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             syncing: false,
             sync_target_height: None,
@@ -145,12 +145,12 @@ impl BlockSyncManager {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Check if this validator is currently syncing.
-    pub const fn is_syncing(&self) -> bool {
+    pub(crate) const fn is_syncing(&self) -> bool {
         self.syncing
     }
 
     /// Set the syncing flag.
-    pub const fn set_syncing(&mut self, syncing: bool) {
+    pub(crate) const fn set_syncing(&mut self, syncing: bool) {
         self.syncing = syncing;
         if !syncing {
             self.sync_target_height = None;
@@ -158,12 +158,12 @@ impl BlockSyncManager {
     }
 
     /// Set the sync target height (called when sync starts).
-    pub const fn set_sync_target(&mut self, height: BlockHeight) {
+    pub(crate) const fn set_sync_target(&mut self, height: BlockHeight) {
         self.sync_target_height = Some(height);
     }
 
     /// Get the sync target height, if syncing.
-    pub const fn sync_target_height(&self) -> Option<BlockHeight> {
+    pub(crate) const fn sync_target_height(&self) -> Option<BlockHeight> {
         self.sync_target_height
     }
 
@@ -172,7 +172,7 @@ impl BlockSyncManager {
     /// applied frontier and remembers the hash so re-deliveries dedup per
     /// `(height, hash)` — a certified sibling at the same height stays
     /// eligible to apply.
-    pub fn mark_applied(&mut self, height: BlockHeight, block_hash: BlockHash) {
+    pub(crate) fn mark_applied(&mut self, height: BlockHeight, block_hash: BlockHash) {
         self.sync_applied_height = self.sync_applied_height.max(height);
         let hashes = self.applied_uncommitted.entry(height).or_default();
         if !hashes.contains(&block_hash) {
@@ -190,7 +190,7 @@ impl BlockSyncManager {
     /// Highest synced height admitted to the chain state. Its round-contiguous
     /// commit may still be pending, so this can sit a block above
     /// `committed_height`; sync completion tracks it rather than the commit.
-    pub const fn sync_applied_height(&self) -> BlockHeight {
+    pub(crate) const fn sync_applied_height(&self) -> BlockHeight {
         self.sync_applied_height
     }
 
@@ -199,7 +199,7 @@ impl BlockSyncManager {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Check if a synced block is already pending verification.
-    pub fn has_pending_verification(&self, block_hash: &BlockHash) -> bool {
+    pub(crate) fn has_pending_verification(&self, block_hash: &BlockHash) -> bool {
         self.pending_synced_block_verifications
             .contains_key(block_hash)
     }
@@ -207,7 +207,7 @@ impl BlockSyncManager {
     /// Check if `(height, block_hash)` is already buffered. Used by `ingest`
     /// to dedup arrivals; keying on hash means a Byzantine wrong-hash block
     /// at a future height doesn't shadow honest arrivals at the same height.
-    pub fn has_buffered(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
+    pub(crate) fn has_buffered(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
         self.buffered_synced_blocks
             .get(&height)
             .is_some_and(|entries| entries.contains_key(block_hash))
@@ -217,7 +217,7 @@ impl BlockSyncManager {
     /// Used by the chain-progress query that just wants to know whether the
     /// next height has *some* block in the pipeline (it doesn't matter which
     /// candidate eventually wins QC verification).
-    pub fn has_any_buffered_at_height(&self, height: BlockHeight) -> bool {
+    pub(crate) fn has_any_buffered_at_height(&self, height: BlockHeight) -> bool {
         self.buffered_synced_blocks
             .get(&height)
             .is_some_and(|entries| !entries.is_empty())
@@ -245,7 +245,11 @@ impl BlockSyncManager {
     /// own QC has been checked. A forger who supplies both a block and its
     /// parent still cannot make the pair verify — the QC must hold under
     /// whatever committee the anchor selects.
-    pub fn held_header(&self, height: BlockHeight, block_hash: BlockHash) -> Option<&BlockHeader> {
+    pub(crate) fn held_header(
+        &self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Option<&BlockHeader> {
         self.pending_synced_block_verifications
             .get(&block_hash)
             .map(|pending| pending.block().header())
@@ -258,7 +262,7 @@ impl BlockSyncManager {
     }
 
     /// Check if any pending verification has a block at the given height.
-    pub fn has_pending_at_height(&self, height: BlockHeight) -> bool {
+    pub(crate) fn has_pending_at_height(&self, height: BlockHeight) -> bool {
         self.pending_synced_block_verifications
             .values()
             .any(|p| p.block().height() == height)
@@ -268,7 +272,7 @@ impl BlockSyncManager {
     /// (and silently drops the arrival) when the per-height entry cap is
     /// already saturated — the cap defends against memory exhaustion via
     /// many distinct fake blocks at the same height.
-    pub fn buffer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) -> bool {
+    pub(crate) fn buffer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) -> bool {
         if !self.has_capacity_at(height) {
             warn!(
                 height = height.inner(),
@@ -314,7 +318,7 @@ impl BlockSyncManager {
     ///
     /// Returns empty when the pending set is already saturated or no
     /// sequentially-eligible buffered block is available.
-    pub fn next_submitable(
+    pub(crate) fn next_submitable(
         &mut self,
         committed_height: BlockHeight,
         max_parallel: usize,
@@ -361,7 +365,7 @@ impl BlockSyncManager {
     /// drop it as stale/duplicate, mark it for QC-verification dispatch, or
     /// stash it in the future-height buffer. Returns the outcome the
     /// coordinator should act on.
-    pub fn ingest(
+    pub(crate) fn ingest(
         &mut self,
         certified: CertifiedBlock,
         committed_height: BlockHeight,
@@ -452,7 +456,7 @@ impl BlockSyncManager {
     /// never get out of sync; callers should check
     /// [`Self::has_pending_verification`] first to avoid clobbering an
     /// already-in-flight entry.
-    pub fn register_for_verification(
+    pub(crate) fn register_for_verification(
         &mut self,
         certified: CertifiedBlock,
         public_keys: Vec<ConsensusPublicKey>,
@@ -500,7 +504,7 @@ impl BlockSyncManager {
     ///
     /// Returns `Some(result)` if this was a synced block verification,
     /// `None` if the `block_hash` wasn't found.
-    pub fn on_qc_verified(
+    pub(crate) fn on_qc_verified(
         &mut self,
         block_hash: BlockHash,
         verified_qc: Option<Verified<QuorumCertificate>>,
@@ -562,7 +566,7 @@ impl BlockSyncManager {
     }
 
     /// Number of pending synced block verifications (for logging).
-    pub fn pending_verification_count(&self) -> usize {
+    pub(crate) fn pending_verification_count(&self) -> usize {
         self.pending_synced_block_verifications.len()
     }
 
@@ -572,7 +576,7 @@ impl BlockSyncManager {
     ///
     /// Distinct from [`Self::has_pending_verification`], which asks whether
     /// one specific block is tracked regardless of verification status.
-    pub fn has_unverified_in_flight(&self) -> bool {
+    pub(crate) fn has_unverified_in_flight(&self) -> bool {
         self.pending_synced_block_verifications
             .values()
             .any(|p| matches!(p, PendingSyncedBlockVerification::InFlight(_)))
@@ -595,7 +599,7 @@ impl BlockSyncManager {
     /// winner while the height reads as already synced. Returns `None`
     /// once the chain catches up to the verified frontier; also logs the
     /// verified / unverified pending heights for diagnostics.
-    pub fn take_next_verified(
+    pub(crate) fn take_next_verified(
         &mut self,
         committed_height: BlockHeight,
     ) -> Option<(Block, Verified<QuorumCertificate>)> {
@@ -630,7 +634,11 @@ impl BlockSyncManager {
     }
 
     /// Log the current state of pending verifications (for debugging).
-    pub fn log_verification_state(&self, committed_height: BlockHeight, next_height: BlockHeight) {
+    pub(crate) fn log_verification_state(
+        &self,
+        committed_height: BlockHeight,
+        next_height: BlockHeight,
+    ) {
         let verified_heights: Vec<_> = self
             .pending_synced_block_verifications
             .values()
@@ -668,7 +676,7 @@ impl BlockSyncManager {
     /// diverge during async persistence, but sync state tracks consensus
     /// progress — once a block is committed to consensus, its sync
     /// bookkeeping is no longer needed regardless of persistence state.
-    pub fn cleanup(&mut self, committed_height: BlockHeight) {
+    pub(crate) fn cleanup(&mut self, committed_height: BlockHeight) {
         self.buffered_synced_blocks
             .retain(|height, _| *height > committed_height);
 
@@ -737,7 +745,7 @@ impl BlockSyncManager {
     ///   commit flow is stalled (block hashes may have diverged after a
     ///   prior sync); sync to recover.
     #[allow(clippy::too_many_arguments)] // `ShardCoordinator` owns each input; bundling them just adds a struct without consolidating ownership
-    pub fn health_check(
+    pub(crate) fn health_check(
         &mut self,
         me: ValidatorId,
         committed_height: BlockHeight,

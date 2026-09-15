@@ -41,9 +41,9 @@ pub struct ExecutionVoteMessage {
 #[hbor(signing_domain = "hyperscale-execution-certificates-sender-v1", signing_context = NetworkId)]
 pub struct ExecutionCertificatesSenderMessage {
     /// Shard the certificates belong to.
-    pub shard_group: ShardId,
+    pub(crate) shard_group: ShardId,
     /// Digest over the batch's certificates, in batch order.
-    pub certificates_digest: Hash,
+    pub(crate) certificates_digest: Hash,
 }
 
 impl ExecutionCertificatesSenderMessage {

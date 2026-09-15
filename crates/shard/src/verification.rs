@@ -84,7 +84,7 @@ enum RootStage {
 #[derive(Debug, Clone)]
 pub struct PendingQcVerification {
     /// The block header we're considering voting on.
-    pub header: BlockHeader,
+    pub(crate) header: BlockHeader,
 }
 
 /// State root verification that is ready to dispatch (JMT is at the correct root).
@@ -170,18 +170,18 @@ pub enum InFlightCheck {
 /// time against the current chain view.
 #[derive(Debug, Clone)]
 pub struct PendingStateRootVerification {
-    pub block_hash: BlockHash,
-    pub parent_block_hash: BlockHash,
-    pub parent_block_height: BlockHeight,
-    pub expected_root: StateRoot,
-    pub expected_local_receipt_root: LocalReceiptRoot,
-    pub block_height: BlockHeight,
-    pub claimed_split_child_roots: Option<SplitChildRoots>,
-    pub split_child_roots_required: bool,
-    pub terminal_roots_required: bool,
-    pub claimed_terminal_roots: Option<TerminalRoots>,
-    pub parent_weighted_timestamp: WeightedTimestamp,
-    pub settled_txs_window_floor: Option<WeightedTimestamp>,
+    pub(crate) block_hash: BlockHash,
+    pub(crate) parent_block_hash: BlockHash,
+    pub(crate) parent_block_height: BlockHeight,
+    pub(crate) expected_root: StateRoot,
+    pub(crate) expected_local_receipt_root: LocalReceiptRoot,
+    pub(crate) block_height: BlockHeight,
+    pub(crate) claimed_split_child_roots: Option<SplitChildRoots>,
+    pub(crate) split_child_roots_required: bool,
+    pub(crate) terminal_roots_required: bool,
+    pub(crate) claimed_terminal_roots: Option<TerminalRoots>,
+    pub(crate) parent_weighted_timestamp: WeightedTimestamp,
+    pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
@@ -223,10 +223,10 @@ pub enum AssemblyError {
 #[derive(Debug)]
 pub struct PendingAssembly {
     /// Block whose commitments are being verified.
-    pub block: Arc<Block>,
+    pub(crate) block: Arc<Block>,
     /// Verified QC for [`Self::block`], populated when QC signature
     /// verification completes.
-    pub qc: Option<Verified<QuorumCertificate>>,
+    pub(crate) qc: Option<Verified<QuorumCertificate>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -360,7 +360,7 @@ pub struct VerificationPipeline {
 
 impl VerificationPipeline {
     /// Create a new verification pipeline.
-    pub fn new(persisted_height: BlockHeight, chain_origin: ChainOrigin) -> Self {
+    pub(crate) fn new(persisted_height: BlockHeight, chain_origin: ChainOrigin) -> Self {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
@@ -421,7 +421,7 @@ impl VerificationPipeline {
     /// readable, so it releases the children deferred on it, the
     /// proposal parked on its tree, and the walk parked on its substate
     /// delta. Any completion may be the last the assembly waits on.
-    pub fn checked(&mut self, block_hash: BlockHash, kind: VerificationKind) {
+    pub(crate) fn checked(&mut self, block_hash: BlockHash, kind: VerificationKind) {
         self.roots.insert((block_hash, kind), RootStage::Verified);
         debug!(?kind, ?block_hash, "Block check passed");
         if kind == VerificationKind::StateRoot {
@@ -437,7 +437,7 @@ impl VerificationPipeline {
     /// a refused beacon-witness root drops the children whose walk
     /// deferred on it, a refused state root drops the verifications
     /// deferred on its tree, since neither can ever unblock.
-    pub fn refused(&mut self, block_hash: BlockHash, kind: VerificationKind) {
+    pub(crate) fn refused(&mut self, block_hash: BlockHash, kind: VerificationKind) {
         self.roots.remove(&(block_hash, kind));
         match kind {
             VerificationKind::BeaconWitnessRoot => {
@@ -459,7 +459,7 @@ impl VerificationPipeline {
     /// One check on `block_hash` could not be answered here yet. The
     /// in-flight mark clears, so the next re-drive of the vote
     /// dispatches it again rather than reading it as still running.
-    pub fn deferred(&mut self, block_hash: BlockHash, kind: VerificationKind) {
+    pub(crate) fn deferred(&mut self, block_hash: BlockHash, kind: VerificationKind) {
         self.roots.remove(&(block_hash, kind));
     }
 
@@ -468,7 +468,7 @@ impl VerificationPipeline {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Track a block header pending QC signature verification.
-    pub fn track_pending_qc(&mut self, block_hash: BlockHash, header: BlockHeader) {
+    pub(crate) fn track_pending_qc(&mut self, block_hash: BlockHash, header: BlockHeader) {
         self.pending_qc_verifications
             .insert(block_hash, PendingQcVerification { header });
     }
@@ -477,12 +477,15 @@ impl VerificationPipeline {
     /// when no QC for that block has been verified yet. Callers MUST compare
     /// the candidate QC to the cached value byte-for-byte before treating it
     /// as a cache hit — see the field doc on [`Self::verified_qcs`].
-    pub fn cached_qc(&self, qc_block_hash: &BlockHash) -> Option<&Verified<QuorumCertificate>> {
+    pub(crate) fn cached_qc(
+        &self,
+        qc_block_hash: &BlockHash,
+    ) -> Option<&Verified<QuorumCertificate>> {
         self.verified_qcs.get(qc_block_hash)
     }
 
     /// Record a QC signature verification result. Returns the pending header if found.
-    pub fn on_qc_verified(
+    pub(crate) fn on_qc_verified(
         &mut self,
         block_hash: BlockHash,
         valid: bool,
@@ -492,7 +495,7 @@ impl VerificationPipeline {
     }
 
     /// Cache a verified QC to skip future re-verification.
-    pub fn cache_verified_qc(&mut self, qc: Verified<QuorumCertificate>) {
+    pub(crate) fn cache_verified_qc(&mut self, qc: Verified<QuorumCertificate>) {
         let qc_block_hash = qc.block_hash();
         let qc_height = qc.height();
         self.verified_qcs.insert(qc_block_hash, qc);
@@ -504,12 +507,12 @@ impl VerificationPipeline {
     }
 
     /// Check if a block has a pending QC verification in-flight.
-    pub fn has_pending_qc(&self, block_hash: &BlockHash) -> bool {
+    pub(crate) fn has_pending_qc(&self, block_hash: &BlockHash) -> bool {
         self.pending_qc_verifications.contains_key(block_hash)
     }
 
     /// Number of pending QC verifications (for logging).
-    pub fn pending_qc_count(&self) -> usize {
+    pub(crate) fn pending_qc_count(&self) -> usize {
         self.pending_qc_verifications.len()
     }
 
@@ -520,7 +523,7 @@ impl VerificationPipeline {
     /// Start tracking `block` as awaiting a [`Verified<CertifiedBlock>`]:
     /// its QC, and every check it demands. A block already tracked keeps
     /// the QC it has.
-    pub fn track_pending_assembly(&mut self, block: Arc<Block>) {
+    pub(crate) fn track_pending_assembly(&mut self, block: Arc<Block>) {
         self.pending_assemblies
             .entry(block.hash())
             .or_insert(PendingAssembly { block, qc: None });
@@ -534,7 +537,7 @@ impl VerificationPipeline {
     /// with the QC via [`Verified::<CertifiedBlock>::assemble`]. Returns
     /// `None` when no assembly is tracked for `block_hash`, or when a
     /// check is still outstanding.
-    pub fn record_qc_assembly(
+    pub(crate) fn record_qc_assembly(
         &mut self,
         block_hash: BlockHash,
         qc: Verified<QuorumCertificate>,
@@ -615,7 +618,7 @@ impl VerificationPipeline {
     /// Entries are evicted from the cache by [`Self::cleanup`] once the
     /// block leaves `pending_blocks`, so callers don't need to take by
     /// value.
-    pub fn cached_verified_certified_block(
+    pub(crate) fn cached_verified_certified_block(
         &self,
         block_hash: BlockHash,
     ) -> Option<&Arc<Verified<CertifiedBlock>>> {
@@ -627,7 +630,7 @@ impl VerificationPipeline {
     /// [`Verified::<CertifiedBlock>::from_qc_attestation`] (sync, or
     /// aggregator-without-local-verification) rather than by full
     /// per-root assembly through [`Self::try_complete_assembly`].
-    pub fn insert_verified_certified_block(
+    pub(crate) fn insert_verified_certified_block(
         &mut self,
         block_hash: BlockHash,
         certified: Arc<Verified<CertifiedBlock>>,
@@ -637,7 +640,7 @@ impl VerificationPipeline {
 
     /// Number of in-flight composite assemblies.
     #[must_use]
-    pub fn pending_assembly_count(&self) -> usize {
+    pub(crate) fn pending_assembly_count(&self) -> usize {
         self.pending_assemblies.len()
     }
 
@@ -646,7 +649,7 @@ impl VerificationPipeline {
     /// Used by `should_advance_round` to suppress view changes while
     /// verification is running — the leader proposed, we received the block,
     /// the timeout should detect leader failure, not slow verification.
-    pub fn has_verification_in_flight(&self) -> bool {
+    pub(crate) fn has_verification_in_flight(&self) -> bool {
         !self.deferred_state_root_verifications.is_empty()
             || !self.deferred_beacon_witness_verifications.is_empty()
             || self.deferred_proposal.is_some()
@@ -667,7 +670,7 @@ impl VerificationPipeline {
     /// Used by the commit path to decide between `CommitBlock` (fast path —
     /// `PreparedCommit` from `VerifyStateRoot` already in the cache) and
     /// `CommitBlockByQcOnly` (slow path — compute inline at commit time).
-    pub fn is_state_root_verified(&self, block_hash: &BlockHash) -> bool {
+    pub(crate) fn is_state_root_verified(&self, block_hash: &BlockHash) -> bool {
         self.is_root_verified(*block_hash, VerificationKind::StateRoot)
     }
 
@@ -685,7 +688,7 @@ impl VerificationPipeline {
     }
 
     /// The checks `block` demands that have not passed.
-    pub fn outstanding(&self, block: &Block) -> BTreeSet<VerificationKind> {
+    pub(crate) fn outstanding(&self, block: &Block) -> BTreeSet<VerificationKind> {
         let block_hash = block.hash();
         self.demands_of(block)
             .outstanding(|kind| self.is_root_verified(block_hash, kind))
@@ -693,13 +696,13 @@ impl VerificationPipeline {
 
     /// Whether every check `block` demands has passed, and its drain
     /// total was re-derived and matched.
-    pub fn is_block_verified(&self, block: &Block) -> bool {
+    pub(crate) fn is_block_verified(&self, block: &Block) -> bool {
         self.outstanding(block).is_empty() && self.verified_in_flight.contains(&block.hash())
     }
 
     /// Log why a block's verification is incomplete. Called on view change
     /// to explain why the current block couldn't be voted on in time.
-    pub fn log_incomplete_verification(&self, block: &Block) {
+    pub(crate) fn log_incomplete_verification(&self, block: &Block) {
         let block_hash = block.hash();
         let stage = |kind: VerificationKind| -> &'static str {
             if self.is_root_verified(block_hash, kind) {
@@ -773,7 +776,7 @@ impl VerificationPipeline {
     /// Always returns true for blocks that haven't been verified yet —
     /// even cert-less blocks verify (trivially) so their `PreparedCommit`
     /// populates the overlay for child block verifications.
-    pub fn needs_state_root_verification(&self, block: &Block) -> bool {
+    pub(crate) fn needs_state_root_verification(&self, block: &Block) -> bool {
         let block_hash = block.hash();
 
         !self.is_root_tracked(block_hash, VerificationKind::StateRoot)
@@ -808,7 +811,7 @@ impl VerificationPipeline {
     /// deferred before its parent committed would dispatch with the wrong
     /// base state.
     #[allow(clippy::too_many_arguments)] // block identity + per-window verdict bits
-    pub fn initiate_state_root_verification(
+    pub(crate) fn initiate_state_root_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
@@ -861,7 +864,7 @@ impl VerificationPipeline {
     /// before it commits. Without this a view change would report the
     /// checks as `NOT_STARTED`, since the proposer path bypasses
     /// `try_vote_on_block`.
-    pub fn mark_proposal_fully_verified(&mut self, block: &Block) {
+    pub(crate) fn mark_proposal_fully_verified(&mut self, block: &Block) {
         let block_hash = block.hash();
         for kind in block.demands().iter() {
             self.roots.insert((block_hash, kind), RootStage::Verified);
@@ -882,7 +885,7 @@ impl VerificationPipeline {
     /// The handler also enforces per-tx `validity_range`, anchored on the
     /// parent QC's `weighted_timestamp` carried on the block header. Same
     /// expression voters and the proposer apply.
-    pub fn initiate_transaction_root_verification(
+    pub(crate) fn initiate_transaction_root_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
@@ -905,7 +908,7 @@ impl VerificationPipeline {
     }
 
     /// Initiate receipt root verification for a block.
-    pub fn initiate_certificate_root_verification(
+    pub(crate) fn initiate_certificate_root_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
@@ -925,7 +928,7 @@ impl VerificationPipeline {
     }
 
     /// Initiate provisions root verification for a block.
-    pub fn initiate_provision_root_verification(
+    pub(crate) fn initiate_provision_root_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
@@ -946,7 +949,7 @@ impl VerificationPipeline {
     }
 
     /// Initiate provision tx-root verification for a block.
-    pub fn initiate_provision_tx_root_verification(
+    pub(crate) fn initiate_provision_tx_root_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
@@ -976,7 +979,7 @@ impl VerificationPipeline {
     /// timestamp — the transaction clock its members execute under if it
     /// commits them — which is what the payer binding's maturity
     /// comparison is judged at.
-    pub fn initiate_reservations_verification(
+    pub(crate) fn initiate_reservations_verification(
         &mut self,
         block_hash: BlockHash,
         demands: Vec<FeeDemand>,
@@ -1007,7 +1010,7 @@ impl VerificationPipeline {
     /// the coordinator folds into the pipeline: exact verifies, wrong or
     /// lapsed refuses, and unknown leaves the root in flight — the vote
     /// deferred, the block pending.
-    pub fn initiate_resolutions_verification(
+    pub(crate) fn initiate_resolutions_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
@@ -1448,14 +1451,14 @@ enum BeaconWitnessDefer {
 #[derive(Clone, Copy)]
 pub struct SubstateCountSource<'a> {
     /// Network reshape thresholds, from the schedule's chain config.
-    pub thresholds: ReshapeThresholds,
+    pub(crate) thresholds: ReshapeThresholds,
     /// Highest height with a known committed substate byte total, and that
     /// count.
-    pub frontier: (BlockHeight, u64),
+    pub(crate) frontier: (BlockHeight, u64),
     /// The committed tip the pending chain hangs off.
-    pub committed_height: BlockHeight,
+    pub(crate) committed_height: BlockHeight,
     /// Net substate delta per uncommitted block.
-    pub deltas: &'a HashMap<BlockHash, i64>,
+    pub(crate) deltas: &'a HashMap<BlockHash, i64>,
 }
 
 /// Why a substate-byte resolution blocked
@@ -1486,7 +1489,7 @@ pub enum SubstateCountBlocked {
 impl SubstateCountBlocked {
     /// The block whose progress unblocks the resolution, whichever way it
     /// blocked — the hash callers park on.
-    pub const fn blocking_hash(self) -> BlockHash {
+    pub(crate) const fn blocking_hash(self) -> BlockHash {
         match self {
             Self::Outstanding(hash) | Self::SyncAdmitted(hash) => hash,
         }
@@ -1513,7 +1516,7 @@ impl SubstateCountSource<'_> {
     /// `Err` classifies the blocked resolution — the parent's delta still
     /// outstanding (or, for a frontier lagging the tip, the tip's
     /// persistence reconcile), or a parent whose delta can never land.
-    pub fn count_behind(
+    pub(crate) fn count_behind(
         &self,
         committed_hash: BlockHash,
         parent_hash: BlockHash,
@@ -1756,7 +1759,7 @@ impl VerificationPipeline {
     /// frontier where it carries none. That the halves rise strictly
     /// above the parent's frontier is admission's rule, judged before
     /// this.
-    pub fn verify_settled_order(
+    pub(crate) fn verify_settled_order(
         block_hash: BlockHash,
         block: &Block,
         parent_settled_frontier: BlockHeight,
@@ -1793,7 +1796,7 @@ impl VerificationPipeline {
     /// Both terms are read off the block itself, so every validator
     /// reaches the same figure with no history behind it — including one
     /// that snap-synced past the transactions being released.
-    pub fn verify_in_flight(
+    pub(crate) fn verify_in_flight(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
@@ -1891,7 +1894,7 @@ impl VerificationPipeline {
     /// Check whether a deferred proposal was unblocked and should be retried.
     /// Returns `true` once, then resets. Caller re-enters `try_propose` with
     /// fresh transaction selection.
-    pub fn take_ready_proposal(&mut self) -> bool {
+    pub(crate) fn take_ready_proposal(&mut self) -> bool {
         let ready = std::mem::take(&mut self.proposal_unblocked);
         if ready {
             // The re-entry re-runs the substate walk from the committed tip
@@ -1905,7 +1908,7 @@ impl VerificationPipeline {
     /// Latch a proposal-retry attempt for after the current dispatch.
     /// Idempotent within a single dispatch; the post-dispatch drain calls
     /// `try_propose` once regardless of how many times this is set.
-    pub const fn queue_ready_proposal(&mut self) {
+    pub(crate) const fn queue_ready_proposal(&mut self) {
         self.proposal_unblocked = true;
     }
 
@@ -1913,7 +1916,7 @@ impl VerificationPipeline {
     /// verified with its JMT snapshot in the `PendingChain` overlay.
     /// Verification is the same act on a live block and a sync-admitted
     /// one, so a verified parent always has a tree to build on.
-    pub fn parent_tree_available(
+    pub(crate) fn parent_tree_available(
         &self,
         parent_block_height: BlockHeight,
         parent_block_hash: BlockHash,
@@ -1945,7 +1948,7 @@ impl VerificationPipeline {
     /// available. Only the parent identity is stored — when unblocked, the
     /// caller re-enters `try_propose` with fresh state rather than replaying
     /// a stale `BuildProposal` action.
-    pub fn defer_proposal(
+    pub(crate) fn defer_proposal(
         &mut self,
         parent_block_hash: BlockHash,
         parent_block_height: BlockHeight,
@@ -1971,7 +1974,7 @@ impl VerificationPipeline {
     /// Replaces any prior park: a released walk re-runs from the committed
     /// tip and blocks on whichever ancestor is still outstanding, which may
     /// be an earlier one than last time.
-    pub fn defer_proposal_on_substate(&mut self, ancestor: BlockHash) {
+    pub(crate) fn defer_proposal_on_substate(&mut self, ancestor: BlockHash) {
         debug!(
             ancestor = ?ancestor,
             "Parking proposal — substate byte delta outstanding"
@@ -1994,7 +1997,7 @@ impl VerificationPipeline {
     /// tip names that tip, not a block whose delta this could be matched
     /// against. Sync commits carry no delta, so this is the only edge that
     /// resolves a proposal parked behind one.
-    pub fn release_substate_park_on_reconcile(&mut self) {
+    pub(crate) fn release_substate_park_on_reconcile(&mut self) {
         if self.deferred_substate_ancestor.take().is_some() {
             debug!("Unparking proposal — substate frontier reconciled");
             self.proposal_unblocked = true;
@@ -2010,7 +2013,7 @@ impl VerificationPipeline {
     /// as a safety net if the consensus-commit path didn't fire for
     /// some reason. Steady-state unblocking happens via
     /// [`Self::on_block_committed`].
-    pub fn on_block_persisted(&mut self, block_height: BlockHeight) {
+    pub(crate) fn on_block_persisted(&mut self, block_height: BlockHeight) {
         if block_height <= self.last_persisted_height {
             return;
         }
@@ -2065,7 +2068,7 @@ impl VerificationPipeline {
     /// Unblocking on commit (rather than persistence) lets deferred
     /// verifications proceed as soon as the parent's tree is readable from
     /// the overlay, without waiting for `BlockPersisted`.
-    pub fn on_block_committed(&mut self, block_hash: BlockHash) {
+    pub(crate) fn on_block_committed(&mut self, block_hash: BlockHash) {
         if self.is_state_root_verified(&block_hash) {
             return;
         }
@@ -2102,7 +2105,11 @@ impl VerificationPipeline {
     /// the proposing block), so it uses height-based retention with a
     /// 2-block buffer to support view-change scenarios where multiple
     /// proposals share the same parent QC.
-    pub fn cleanup(&mut self, pending_blocks: &PendingBlocks, committed_height: BlockHeight) {
+    pub(crate) fn cleanup(
+        &mut self,
+        pending_blocks: &PendingBlocks,
+        committed_height: BlockHeight,
+    ) {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(*hash));
 

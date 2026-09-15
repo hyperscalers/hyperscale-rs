@@ -25,7 +25,7 @@ use tracing::warn;
 use crate::build::build_provisions;
 
 /// One outbound provision batch destined for a single target shard.
-pub type ProvisionBatch = (Arc<Provisions>, Vec<ValidatorId>);
+pub(crate) type ProvisionBatch = (Arc<Provisions>, Vec<ValidatorId>);
 
 /// Build per-target-shard provision batches for the cross-shard broadcast.
 ///
@@ -35,7 +35,7 @@ pub type ProvisionBatch = (Arc<Provisions>, Vec<ValidatorId>);
 /// matching transactions are silently skipped — callers still emit an
 /// `OutboundProvisionBroadcast` event so the state machine can mark the
 /// action complete.
-pub fn fetch_and_broadcast_provision<S, H>(
+pub(crate) fn fetch_and_broadcast_provision<S, H>(
     view: &SubstateView<S>,
     source_shard: ShardId,
     block_height: BlockHeight,

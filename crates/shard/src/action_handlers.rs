@@ -135,7 +135,7 @@ pub fn verify_and_build_qc(
 /// Wraps [`Verified::<BlockVote>::verify_batch`] with the committee
 /// bookkeeping (`(idx, vote, pubkey)` tuples → `(idx, verified)`); the typed
 /// batch verifier owns the verification work and the individual-verify fallback.
-pub fn verify_vote_batch(
+pub(crate) fn verify_vote_batch(
     verifier: &dyn Verifier,
     block_hash: BlockHash,
     signing_message: &[u8],
@@ -181,7 +181,7 @@ pub struct ProposalResult {
     /// JMT prepared-commit closure from the proposer's pre-commit,
     /// threaded to the commit pipeline so the proposer doesn't recompute
     /// on commit.
-    pub prepared_commit: PreparedCommit,
+    pub(crate) prepared_commit: PreparedCommit,
     /// JMT snapshot from the speculative state-root computation.
     /// Inserted into `PendingChain` so child verifications can chain on
     /// top.

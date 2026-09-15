@@ -82,13 +82,13 @@ impl WitnessSources {
     /// Validator-emitted ready signals the proposer included. The leaf
     /// derivation projects one readiness leaf per signal.
     #[must_use]
-    pub const fn ready_signals(&self) -> &Vec<ReadySignal> {
+    pub(crate) const fn ready_signals(&self) -> &Vec<ReadySignal> {
         &self.ready_signals
     }
 
     /// The proposer's reshape assertion, if any.
     #[must_use]
-    pub const fn reshape_trigger(&self) -> Option<ReshapeTrigger> {
+    pub(crate) const fn reshape_trigger(&self) -> Option<ReshapeTrigger> {
         self.reshape_trigger
     }
 

@@ -58,9 +58,9 @@ struct ExpectedProvision {
 /// snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutEffect {
-    pub source_shard: ShardId,
-    pub block_height: BlockHeight,
-    pub proposer: ValidatorId,
+    pub(crate) source_shard: ShardId,
+    pub(crate) block_height: BlockHeight,
+    pub(crate) proposer: ValidatorId,
 }
 
 impl TimeoutEffect {

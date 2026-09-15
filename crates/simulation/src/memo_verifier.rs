@@ -28,7 +28,7 @@ pub struct MemoVerifier<V> {
 impl<V> MemoVerifier<V> {
     /// Wrap `inner`.
     #[must_use]
-    pub fn new(inner: V) -> Self {
+    pub(crate) fn new(inner: V) -> Self {
         Self {
             inner,
             verdicts: Mutex::new(HashMap::new()),
@@ -37,7 +37,7 @@ impl<V> MemoVerifier<V> {
 
     /// How many distinct calls have been answered so far.
     #[must_use]
-    pub fn remembered(&self) -> usize {
+    pub(crate) fn remembered(&self) -> usize {
         self.verdicts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

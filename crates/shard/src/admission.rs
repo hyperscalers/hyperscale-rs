@@ -47,21 +47,21 @@ use crate::commit_dedup::CommitDedupIndex;
 /// enforcers rather than every node. The just-committed block is
 /// covered by the [`CommitDedupIndex`] instead.
 #[derive(Debug, Default)]
-pub struct QcChainSets {
+pub(crate) struct QcChainSets {
     /// Transactions an ancestor carries.
-    pub txs: HashSet<TxHash>,
+    pub(crate) txs: HashSet<TxHash>,
     /// Provision batches an ancestor carries.
-    pub provisions: HashSet<ProvisionHash>,
+    pub(crate) provisions: HashSet<ProvisionHash>,
     /// Transactions an ancestor's finalizations decided.
-    pub resolved: HashSet<TxHash>,
+    pub(crate) resolved: HashSet<TxHash>,
     /// Finalizations an ancestor carries.
-    pub finalizations: HashSet<FinalizationHash>,
+    pub(crate) finalizations: HashSet<FinalizationHash>,
 }
 
 impl QcChainSets {
     /// What the chain above `parent_block_hash` carries, walked once.
     #[must_use]
-    pub fn behind(chain: &ChainView<'_>, parent_block_hash: BlockHash) -> Self {
+    pub(crate) fn behind(chain: &ChainView<'_>, parent_block_hash: BlockHash) -> Self {
         let mut sets = Self::default();
         let mut current_hash = parent_block_hash;
         // Headers, not pending entries: a block admitted through sync is
@@ -106,38 +106,38 @@ impl QcChainSets {
 
 /// What a block is admitted against.
 #[derive(Clone, Copy)]
-pub struct Admission<'a> {
+pub(crate) struct Admission<'a> {
     /// The committee the block is classified under.
-    pub snapshot: &'a TopologySnapshot,
+    pub(crate) snapshot: &'a TopologySnapshot,
     /// The schedule, for the departures a record may name.
-    pub schedule: &'a TopologySchedule,
+    pub(crate) schedule: &'a TopologySchedule,
     /// The shard the block is on.
-    pub local_shard: ShardId,
+    pub(crate) local_shard: ShardId,
     /// The block's own anchor: its parent QC's weighted timestamp.
-    pub anchor: WeightedTimestamp,
+    pub(crate) anchor: WeightedTimestamp,
     /// Where this chain began; content anchored before it belongs to a
     /// predecessor.
-    pub chain_origin: WeightedTimestamp,
+    pub(crate) chain_origin: WeightedTimestamp,
     /// What the QC chain above the parent carries.
-    pub chain: &'a QcChainSets,
+    pub(crate) chain: &'a QcChainSets,
     /// What committed blocks within the retention window carry.
-    pub dedup: &'a CommitDedupIndex,
+    pub(crate) dedup: &'a CommitDedupIndex,
     /// The settlement frontier the parent left, which a determined half
     /// must settle above. `None` where the parent is pruned, which
     /// leaves the order unjudged here: such a block is verified but not
     /// voted on.
-    pub parent_settled_frontier: Option<BlockHeight>,
+    pub(crate) parent_settled_frontier: Option<BlockHeight>,
     /// Ticks whose determined half this chain still owes, by height —
     /// the fold's answer, which a proposer and every voter reach
     /// independently over the same committed blocks. A half may not
     /// settle past one of these; a validator that never composed the
     /// tick holds it in no set and enforces nothing, so the rule refuses
     /// only what a composing quorum would refuse anyway.
-    pub owed_determined: &'a BTreeSet<BlockHeight>,
+    pub(crate) owed_determined: &'a BTreeSet<BlockHeight>,
 }
 
 /// One section of a block, and the rule that admits an item to it.
-pub trait Section {
+pub(crate) trait Section {
     /// What the section holds.
     type Item: ?Sized;
     /// What the rule carries across the section.
@@ -155,18 +155,18 @@ pub trait Section {
 }
 
 /// The block's provisions.
-pub struct ProvisionsSection;
+pub(crate) struct ProvisionsSection;
 
 /// What the provisions admitted so far amount to.
 #[derive(Debug, Default)]
-pub struct ProvisionsFold {
+pub(crate) struct ProvisionsFold {
     /// Transactions the admitted batches provision, against the block's
     /// cap on them.
-    pub tx_count: usize,
+    pub(crate) tx_count: usize,
     /// Which transactions each admitted batch provisions, by payer
     /// shard — what the transactions section reads to engage a
     /// cross-shard transaction.
-    pub provisioned: HashSet<(ShardId, TxHash)>,
+    pub(crate) provisioned: HashSet<(ShardId, TxHash)>,
 }
 
 impl Section for ProvisionsSection {
@@ -223,27 +223,27 @@ impl Section for ProvisionsSection {
 
 /// The block's transactions, admitted beside the provisions that
 /// engage them.
-pub struct TransactionsSection<'p>(PhantomData<&'p ProvisionsFold>);
+pub(crate) struct TransactionsSection<'p>(PhantomData<&'p ProvisionsFold>);
 
 /// What the transactions admitted so far amount to.
 #[derive(Debug)]
-pub struct TransactionsFold<'a> {
+pub(crate) struct TransactionsFold<'a> {
     /// The sweepable cells the admitted transactions create on this
     /// shard, against the per-block creation cap.
-    pub sweepable: usize,
+    pub(crate) sweepable: usize,
     /// What the admitted transactions declare against this shard between
     /// them — each one's share under the block's placement — against the
     /// per-block caps.
-    pub budget: DeclaredWork,
+    pub(crate) budget: DeclaredWork,
     /// The provisions admitted beside them, which engage a cross-shard
     /// transaction's payer.
-    pub provisions: &'a ProvisionsFold,
+    pub(crate) provisions: &'a ProvisionsFold,
 }
 
 impl<'a> TransactionsFold<'a> {
     /// A fold beside the admitted `provisions`.
     #[must_use]
-    pub const fn beside(provisions: &'a ProvisionsFold) -> Self {
+    pub(crate) const fn beside(provisions: &'a ProvisionsFold) -> Self {
         Self {
             sweepable: 0,
             budget: DeclaredWork::ZERO,
@@ -356,28 +356,28 @@ impl<'p> Section for TransactionsSection<'p> {
 }
 
 /// The block's finalizations.
-pub struct FinalizationsSection;
+pub(crate) struct FinalizationsSection;
 
 /// What the finalizations admitted so far amount to.
 #[derive(Debug)]
-pub struct FinalizationsFold {
+pub(crate) struct FinalizationsFold {
     /// Every name an admitted finalization carries, deciding or not.
-    pub resolved_here: HashSet<TxHash>,
+    pub(crate) resolved_here: HashSet<TxHash>,
     /// Every admitted certificate's identity.
-    pub carried_here: HashSet<FinalizationHash>,
+    pub(crate) carried_here: HashSet<FinalizationHash>,
     /// Where the determined halves admitted so far end, starting at the
     /// parent's frontier. `None` where the parent is pruned and the
     /// order is not judged.
-    pub frontier: Option<BlockHeight>,
+    pub(crate) frontier: Option<BlockHeight>,
     /// Transactions the admitted finalizations carry, against the
     /// block's cap.
-    pub tx_count: usize,
+    pub(crate) tx_count: usize,
 }
 
 impl FinalizationsFold {
     /// A fold starting at the parent's settlement frontier.
     #[must_use]
-    pub fn from(ctx: &Admission<'_>) -> Self {
+    pub(crate) fn from(ctx: &Admission<'_>) -> Self {
         Self {
             resolved_here: HashSet::new(),
             carried_here: HashSet::new(),
@@ -526,27 +526,27 @@ fn already_resolved(ctx: &Admission<'_>, tx_hash: TxHash) -> Result<(), String> 
 
 /// The block's abandonment records, admitted after the finalizations
 /// whose names they may not repeat.
-pub struct RecordsSection<'f>(PhantomData<&'f FinalizationsFold>);
+pub(crate) struct RecordsSection<'f>(PhantomData<&'f FinalizationsFold>);
 
 /// What the records admitted so far amount to, beside the finalizations
 /// admitted before them.
 #[derive(Debug)]
-pub struct RecordsFold<'a> {
+pub(crate) struct RecordsFold<'a> {
     /// The finalizations the block carries, whose names no record may
     /// repeat.
-    pub finalizations: &'a FinalizationsFold,
+    pub(crate) finalizations: &'a FinalizationsFold,
     /// The last admitted record's shard, which the next must follow.
-    pub previous: Option<ShardId>,
+    pub(crate) previous: Option<ShardId>,
     /// Names the admitted records carry, against the drain's own bound.
-    pub named: usize,
+    pub(crate) named: usize,
     /// Bytes the admitted records weigh, against the section's budget.
-    pub weight: usize,
+    pub(crate) weight: usize,
 }
 
 impl<'a> RecordsFold<'a> {
     /// A fold after the block's `finalizations`.
     #[must_use]
-    pub const fn after(finalizations: &'a FinalizationsFold) -> Self {
+    pub(crate) const fn after(finalizations: &'a FinalizationsFold) -> Self {
         Self {
             finalizations,
             previous: None,
@@ -570,7 +570,7 @@ impl RecordsSection<'_> {
     /// # Errors
     ///
     /// Why the name is refused.
-    pub fn name_stands(
+    pub(crate) fn name_stands(
         ctx: &Admission<'_>,
         fold: &RecordsFold<'_>,
         tx_hash: TxHash,
@@ -709,15 +709,15 @@ impl<'f> Section for RecordsSection<'f> {
 }
 
 /// The block's state claims.
-pub struct StateClaimsSection;
+pub(crate) struct StateClaimsSection;
 
 /// What the claims admitted so far amount to.
 #[derive(Debug, Default)]
-pub struct StateClaimsFold {
+pub(crate) struct StateClaimsFold {
     /// The last admitted claim, which the next must follow.
-    pub previous: Option<StateClaim>,
+    pub(crate) previous: Option<StateClaim>,
     /// How many have been admitted, against the block's cap.
-    pub count: usize,
+    pub(crate) count: usize,
 }
 
 impl Section for StateClaimsSection {
@@ -771,7 +771,7 @@ impl Section for StateClaimsSection {
 /// # Errors
 ///
 /// The first refusal.
-pub fn admit_all<'i, S: Section>(
+pub(crate) fn admit_all<'i, S: Section>(
     ctx: &Admission<'_>,
     fold: &mut S::Fold,
     items: impl IntoIterator<Item = &'i S::Item>,
@@ -787,7 +787,7 @@ where
 /// Keep the items `S::admit` admits, in order, folding each admitted
 /// one — the proposer's filter over its candidates. Returns what was
 /// kept and how many were refused.
-pub fn admit_each<S: Section, T>(
+pub(crate) fn admit_each<S: Section, T>(
     ctx: &Admission<'_>,
     fold: &mut S::Fold,
     items: Vec<T>,
@@ -808,7 +808,7 @@ pub fn admit_each<S: Section, T>(
 }
 
 /// The shared shape of a section's items behind an `Arc<Verifiable<_>>`.
-pub fn unwrapped<T>(item: &Arc<Verifiable<T>>) -> &T {
+pub(crate) fn unwrapped<T>(item: &Arc<Verifiable<T>>) -> &T {
     item
 }
 
@@ -830,15 +830,15 @@ pub(crate) mod fixtures {
     /// behind the parent and nothing committed unless a test puts it
     /// there.
     pub struct Against {
-        pub snapshot: TopologySnapshot,
-        pub schedule: TopologySchedule,
-        pub local_shard: ShardId,
-        pub anchor: WeightedTimestamp,
-        pub chain_origin: WeightedTimestamp,
-        pub chain: QcChainSets,
-        pub dedup: CommitDedupIndex,
-        pub parent_settled_frontier: Option<BlockHeight>,
-        pub owed_determined: BTreeSet<BlockHeight>,
+        pub(crate) snapshot: TopologySnapshot,
+        pub(crate) schedule: TopologySchedule,
+        pub(crate) local_shard: ShardId,
+        pub(crate) anchor: WeightedTimestamp,
+        pub(crate) chain_origin: WeightedTimestamp,
+        pub(crate) chain: QcChainSets,
+        pub(crate) dedup: CommitDedupIndex,
+        pub(crate) parent_settled_frontier: Option<BlockHeight>,
+        pub(crate) owed_determined: BTreeSet<BlockHeight>,
     }
 
     impl Against {
@@ -850,7 +850,7 @@ pub(crate) mod fixtures {
         }
 
         /// Admission under `schedule`, classified under `snapshot`.
-        pub fn schedule(snapshot: TopologySnapshot, schedule: TopologySchedule) -> Self {
+        pub(crate) fn schedule(snapshot: TopologySnapshot, schedule: TopologySchedule) -> Self {
             Self {
                 snapshot,
                 schedule,
@@ -864,7 +864,7 @@ pub(crate) mod fixtures {
             }
         }
 
-        pub fn ctx(&self) -> Admission<'_> {
+        pub(crate) fn ctx(&self) -> Admission<'_> {
             Admission {
                 snapshot: &self.snapshot,
                 schedule: &self.schedule,

@@ -50,20 +50,20 @@ pub struct DeferredTransaction {
     pub tx: Arc<Transaction>,
     /// What its derivation could not resolve, in the forms a fetch asks
     /// for.
-    pub wanted: Unresolved,
+    pub(crate) wanted: Unresolved,
     /// Every name above as an address, which is what the wait is indexed
     /// by: a component by its own, a package by the one its content
     /// address derives.
-    pub awaited: Vec<Address>,
+    pub(crate) awaited: Vec<Address>,
     /// Where it came from.
-    pub origin: DeferredOrigin,
+    pub(crate) origin: DeferredOrigin,
 }
 
 impl DeferredTransaction {
     /// Hold `tx` for `wanted`, indexing the wait by the addresses that
     /// name it.
     #[must_use]
-    pub fn new(tx: Arc<Transaction>, wanted: Unresolved, origin: DeferredOrigin) -> Self {
+    pub(crate) fn new(tx: Arc<Transaction>, wanted: Unresolved, origin: DeferredOrigin) -> Self {
         let awaited = wanted.awaited(|package| Executor::package_artifact_key(package).owner);
         Self {
             tx,
@@ -83,15 +83,15 @@ impl DeferredTransaction {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Orphaned {
     /// Component addresses no held envelope awaits.
-    pub instances: Vec<Address>,
+    pub(crate) instances: Vec<Address>,
     /// Content addresses no held envelope awaits.
-    pub packages: Vec<Hash>,
+    pub(crate) packages: Vec<Hash>,
 }
 
 impl Orphaned {
     /// Whether nothing was orphaned.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.instances.is_empty() && self.packages.is_empty()
     }
 }
@@ -135,7 +135,7 @@ pub struct DeferredForRecords {
 impl DeferredForRecords {
     /// An empty wait at the default bound.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             held: HashMap::new(),
             waiting: HashMap::new(),
@@ -147,7 +147,7 @@ impl DeferredForRecords {
     /// Hold `deferred` until its records land, evicting the oldest
     /// entries the bound leaves no room for and returning their hashes
     /// so the caller can release their pipeline bookkeeping.
-    pub fn defer(&mut self, deferred: DeferredTransaction) -> (Vec<TxHash>, Orphaned) {
+    pub(crate) fn defer(&mut self, deferred: DeferredTransaction) -> (Vec<TxHash>, Orphaned) {
         let hash = deferred.tx.hash();
         for awaited in deferred.awaited.clone() {
             let queue = self.waiting.entry(awaited).or_default();
@@ -241,7 +241,10 @@ impl DeferredForRecords {
     /// its other asks stand, because admission has not said yet whether
     /// it wants them — only that it is no longer waiting here, which is
     /// what leaving the index says.
-    pub fn release(&mut self, arrived: &[Address]) -> Vec<(Arc<Transaction>, DeferredOrigin)> {
+    pub(crate) fn release(
+        &mut self,
+        arrived: &[Address],
+    ) -> Vec<(Arc<Transaction>, DeferredOrigin)> {
         let mut released = Vec::new();
         for name in arrived {
             let Some(hashes) = self.waiting.remove(name) else {
@@ -269,7 +272,7 @@ impl DeferredForRecords {
     /// `hash` the queue is holding again is one that answered for
     /// itself by coming back: it keeps its asks, and retiring them
     /// would cancel a fetch it is waiting on right now.
-    pub fn settle(&mut self, gone: &[TxHash]) -> Orphaned {
+    pub(crate) fn settle(&mut self, gone: &[TxHash]) -> Orphaned {
         let mut dropped = Vec::new();
         for hash in gone {
             if !self.held.get(hash).is_some_and(|held| held.reoffered) {
@@ -292,7 +295,7 @@ impl DeferredForRecords {
     /// The window is signed content, so this reads it without deriving
     /// anything. Nothing will include a transaction past it, and the
     /// record it waits on may never arrive at all.
-    pub fn sweep_expired(&mut self, now_ms: u64) -> (Vec<TxHash>, Orphaned) {
+    pub(crate) fn sweep_expired(&mut self, now_ms: u64) -> (Vec<TxHash>, Orphaned) {
         let expired: Vec<TxHash> = self
             .held
             .iter()
@@ -315,7 +318,7 @@ impl DeferredForRecords {
 
     /// Whether the queue holds nothing, waiting or re-offered.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.held.is_empty()
     }
 }

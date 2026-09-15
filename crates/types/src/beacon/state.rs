@@ -622,7 +622,7 @@ pub struct FrozenWindow {
     /// boundary predicates read it to tell which reshape a scheduled cut
     /// belongs to, and it marks the shards whose settled-transaction window is
     /// fenced open.
-    pub split_pending: BTreeSet<ShardId>,
+    pub(crate) split_pending: BTreeSet<ShardId>,
     /// Each terminating leaf's scheduled final window — the affirmative
     /// counterpart of `split_pending`, letting a boundary predicate answer
     /// "this window *is* the shard's last" from this entry alone.
@@ -631,11 +631,11 @@ pub struct FrozenWindow {
     /// opens (INV-RESHAPE-9). The freeze runs before the reshape folds, so
     /// a self-naming schedule would land after this snapshot and diverge a
     /// window's two writes.
-    pub scheduled_terminals: BTreeMap<ShardId, Epoch>,
+    pub(crate) scheduled_terminals: BTreeMap<ShardId, Epoch>,
     /// Each terminating leaf's settled-transaction window floor: pending split
     /// targets and paired merge children from the live records, plus
     /// shards already coasting to their terminal.
-    pub settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
+    pub(crate) settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
     /// Each pending split's observer cohort, keyed by parent, mapping
     /// observer to its seat. A window's `ReshapeReady` leaf
     /// classification reads it, and the applying fold flips the cohort to
@@ -646,13 +646,13 @@ pub struct FrozenWindow {
     /// The seat's `ready` bit rides the same freeze: it moves only at a
     /// fold, and an emitter reads it to tell whether its `ReshapeReady`
     /// has landed.
-    pub reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
+    pub(crate) reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
     /// Each pending merge's keepers, keyed by the child each keeper runs,
     /// mapping keeper to its seat on the merging parent. Drives a child's
     /// `ReshapeReady` classification and the merge-terminal settled-transaction
     /// carry; the applying fold consumes the keepers mid-fold, under the
     /// same argument as the observer cohort.
-    pub reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
+    pub(crate) reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
     /// Each shard's fullest cap dimension as its mean stood at
     /// promotion, before this epoch's fold advances it.
     ///
@@ -1612,7 +1612,7 @@ impl BeaconState {
     /// [`FrozenWindow::split_pending`], and what the lookahead snapshot
     /// projects for the window it describes.
     #[must_use]
-    pub fn live_split_pending(&self) -> BTreeSet<ShardId> {
+    pub(crate) fn live_split_pending(&self) -> BTreeSet<ShardId> {
         self.pending_reshapes
             .iter()
             .filter(|(_, r)| matches!(r, PendingReshape::Split { .. }))
@@ -1723,7 +1723,9 @@ impl BeaconState {
     /// next promotion freezes into [`FrozenWindow::reshape_observers`], and
     /// what the lookahead snapshot projects for the window it describes.
     #[must_use]
-    pub fn live_reshape_observers(&self) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
+    pub(crate) fn live_reshape_observers(
+        &self,
+    ) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
         self.pending_reshapes
             .iter()
             .filter_map(|(target, reshape)| match reshape {
@@ -1753,7 +1755,9 @@ impl BeaconState {
     /// [`FrozenWindow::reshape_keepers`]. One merge contributes both
     /// children's keeper sets.
     #[must_use]
-    pub fn live_reshape_keepers(&self) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
+    pub(crate) fn live_reshape_keepers(
+        &self,
+    ) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
         let mut keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> = BTreeMap::new();
         for (parent, reshape) in &self.pending_reshapes {
             if let PendingReshape::Merge { keepers: seats, .. } = reshape {

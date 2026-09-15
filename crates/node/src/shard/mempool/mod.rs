@@ -33,14 +33,14 @@ use crate::config::NodeConfig;
 /// Composed into [`ShardIo`](crate::shard::ShardIo).
 pub struct MempoolState {
     /// Per-block transaction fetch (intra-shard, pinned to proposer).
-    pub transaction: TransactionFetch,
+    pub(crate) transaction: TransactionFetch,
 
     /// Hashes currently in the validation pipeline — either sitting in
     /// `validation_batch` or being verified off-thread. Acts as a
     /// dedup guard so duplicate gossip / re-submits don't enqueue
     /// twice. Entries are removed by `TransactionValidated` /
     /// `TransactionValidationsFailed` handlers.
-    pub pending_validation: HashSet<TxHash>,
+    pub(crate) pending_validation: HashSet<TxHash>,
 
     /// Subset of `pending_validation` for which this shard is the
     /// designated source for a locally-submitted tx — i.e. it received
@@ -54,17 +54,17 @@ pub struct MempoolState {
     /// it. Passive co-hosts admit via `AdmitTransaction` without
     /// inserting; gossip-only hosts via `GossipTransaction` don't
     /// admit at all.
-    pub locally_submitted: HashSet<TxHash>,
+    pub(crate) locally_submitted: HashSet<TxHash>,
 
     /// Pending transactions awaiting batched signature / format /
     /// declared-shard verification on the `tx_validation` pool.
-    pub validation_batch: BatchAccumulator<Arc<Transaction>>,
+    pub(crate) validation_batch: BatchAccumulator<Arc<Transaction>>,
 
     /// Envelopes this node cannot derive yet, waiting on the component
     /// records a fetch is out for. Entries stay in
     /// `pending_validation` while they wait, so a re-gossip does not
     /// enqueue a second copy.
-    pub deferred_records: DeferredForRecords,
+    pub(crate) deferred_records: DeferredForRecords,
 
     /// Per-destination-shard outbound `TransactionGossip` accumulators.
     /// This shard acts as the "source" — locally-submitted or validated
@@ -72,19 +72,19 @@ pub struct MempoolState {
     /// fills until its count cap or time window expires, then flushes
     /// as a single batched gossip message published to the destination
     /// shard's topic.
-    pub outbound_gossip_batches: BTreeMap<ShardId, BatchAccumulator<Arc<Transaction>>>,
+    pub(crate) outbound_gossip_batches: BTreeMap<ShardId, BatchAccumulator<Arc<Transaction>>>,
 
     /// Size cap for new tx-gossip accumulators.
-    pub tx_gossip_max: usize,
+    pub(crate) tx_gossip_max: usize,
 
     /// Time window for new tx-gossip accumulators.
-    pub tx_gossip_window: Duration,
+    pub(crate) tx_gossip_window: Duration,
 }
 
 impl MempoolState {
     /// Build mempool state for a freshly hosted shard.
     #[must_use]
-    pub fn new(config: &NodeConfig) -> Self {
+    pub(crate) fn new(config: &NodeConfig) -> Self {
         let b = &config.batch;
         Self {
             transaction: TransactionFetch::new("transaction", config.transaction_fetch.clone()),
@@ -102,7 +102,7 @@ impl MempoolState {
     /// queued) — keeps this shard's `FetchTick` alive so deferred ids
     /// eventually retry.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         self.transaction.has_pending()
     }
 }

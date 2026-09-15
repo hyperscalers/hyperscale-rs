@@ -237,7 +237,7 @@ pub fn make_test_block(height: BlockHeight) -> Block {
 /// chain a retention horizon wide per block leaves every prior version
 /// behind, one a fraction of a horizon apart keeps a known number.
 #[must_use]
-pub fn make_test_block_at(height: BlockHeight, timestamp_ms: u64) -> Block {
+pub(crate) fn make_test_block_at(height: BlockHeight, timestamp_ms: u64) -> Block {
     let mut block = make_test_block_with_anchor_wt(height, 0);
     if let Block::Live { header, .. } = &mut block {
         *header = BlockHeader::new(BlockHeaderParts {
@@ -714,7 +714,7 @@ pub fn commit_writes(storage: &impl TestStore, writes: &SettledWrites) -> StateR
 
 /// The union of already-settled fixtures — values, so nothing to fold.
 #[must_use]
-pub fn union_of(parts: &[SettledWrites]) -> SettledWrites {
+pub(crate) fn union_of(parts: &[SettledWrites]) -> SettledWrites {
     SettledWrites::from_absolutes(
         parts
             .iter()
@@ -727,7 +727,7 @@ pub fn union_of(parts: &[SettledWrites]) -> SettledWrites {
 /// Writes holding a single removal of the cell [`make_state_writes`]
 /// writes.
 #[must_use]
-pub fn make_state_delete(owner_seed: u8, local_seed: u8) -> SettledWrites {
+pub(crate) fn make_state_delete(owner_seed: u8, local_seed: u8) -> SettledWrites {
     SettledWrites::from_absolutes(BTreeMap::from([(state_key(owner_seed, local_seed), None)]))
 }
 

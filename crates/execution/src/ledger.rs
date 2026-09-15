@@ -197,10 +197,10 @@ struct Departure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unanswerable {
     /// The transaction dropped.
-    pub tx_hash: TxHash,
+    pub(crate) tx_hash: TxHash,
     /// Whether a committed record had named it unsettled by a departed
     /// counterpart.
-    pub covered_by_record: bool,
+    pub(crate) covered_by_record: bool,
 }
 
 /// What this shard's part in a transaction is, which decides what the
@@ -430,11 +430,11 @@ impl Part {
 /// the reclaim of what its deliveries never claimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kept {
-    pub body: Arc<Verified<Transaction>>,
+    pub(crate) body: Arc<Verified<Transaction>>,
     /// The classification the committing block froze, which every cell
     /// the entry asks about and every scope a settlement runs under is
     /// read off.
-    pub classified: Classified,
+    pub(crate) classified: Classified,
 }
 
 impl Kept {
@@ -487,11 +487,11 @@ impl Kept {
 #[derive(Debug, Clone)]
 pub struct Settleable {
     /// The transaction.
-    pub tx_hash: TxHash,
+    pub(crate) tx_hash: TxHash,
     /// Its body, which the settlement's edges derive from.
-    pub body: Arc<Verified<Transaction>>,
+    pub(crate) body: Arc<Verified<Transaction>>,
     /// The classification its committing block froze.
-    pub classified: Classified,
+    pub(crate) classified: Classified,
     /// Whether a committed finalization of this shard's settled the
     /// price, so the settlement charges nothing.
     ///
@@ -499,7 +499,7 @@ pub struct Settleable {
     /// where it resolves, and a leg is charged when its own finalization
     /// commits, which is before a retirement can be composed for it — so
     /// only a reclaim ever reads a `false` here.
-    pub charged: bool,
+    pub(crate) charged: bool,
 }
 
 /// One cell a counterpart is asked about for one transaction: which
@@ -513,21 +513,21 @@ pub struct Settleable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Question {
     /// The transaction the question is asked for.
-    pub tx_hash: TxHash,
+    pub(crate) tx_hash: TxHash,
     /// The counterpart the question is put to.
     pub shard: ShardId,
     /// The cell it asks about.
-    pub key: SubstateKey,
+    pub(crate) key: SubstateKey,
     /// Which question it is.
-    pub probed: Probed,
+    pub(crate) probed: Probed,
     /// The entry's deadline, which every window an answer is held to
     /// is read off.
-    pub deadline: Deadline,
+    pub(crate) deadline: Deadline,
     /// Where a consumer's claiming success was spoken, if one has been
     /// heard: the anchor that opens a presence question ahead of the
     /// deadline, and that the cell it asks about becomes readable one
     /// [`CLAIM_VISIBILITY_LAG`](hyperscale_types::CLAIM_VISIBILITY_LAG) past.
-    pub cued: Option<WeightedTimestamp>,
+    pub(crate) cued: Option<WeightedTimestamp>,
 }
 
 impl Question {
@@ -537,7 +537,7 @@ impl Question {
     /// core may still legitimately commit, so absence says nothing —
     /// and the cue opens the presence, which needs no window at all.
     #[must_use]
-    pub fn open_at(self, now: WeightedTimestamp) -> bool {
+    pub(crate) fn open_at(self, now: WeightedTimestamp) -> bool {
         self.deadline.passed(now) || self.cued.is_some()
     }
 }
@@ -603,7 +603,7 @@ pub struct Ledger {
 impl Ledger {
     /// An empty account for `local`.
     #[must_use]
-    pub const fn new(local: ShardId) -> Self {
+    pub(crate) const fn new(local: ShardId) -> Self {
         Self {
             local,
             owed: BTreeMap::new(),
@@ -613,7 +613,7 @@ impl Ledger {
 
     /// The shard whose account this is.
     #[must_use]
-    pub const fn local(&self) -> ShardId {
+    pub(crate) const fn local(&self) -> ShardId {
         self.local
     }
 
@@ -661,7 +661,7 @@ impl Ledger {
     /// charged, and a later fold moving the table never moves a figure
     /// already owed. `committed.committee_anchor` states which that was,
     /// so a verifier holding no entry resolves the same window.
-    pub fn register_committed<'a>(
+    pub(crate) fn register_committed<'a>(
         &mut self,
         committed: CommittedAt,
         prices: &PriceTable,
@@ -689,7 +689,12 @@ impl Ledger {
     /// What the chain read of `key` on `shard` for `tx_hash`, once it
     /// has read it.
     #[cfg(test)]
-    pub fn reading(&self, tx_hash: TxHash, shard: ShardId, key: SubstateKey) -> Option<Inclusion> {
+    pub(crate) fn reading(
+        &self,
+        tx_hash: TxHash,
+        shard: ShardId,
+        key: SubstateKey,
+    ) -> Option<Inclusion> {
         let reading = self.owed.get(&tx_hash)?.readings.get(&(shard, key))?;
         Some(reading.inclusion)
     }
@@ -697,7 +702,7 @@ impl Ledger {
     /// Give a registered entry the part a fixture wants it to play,
     /// where the block that committed it froze another.
     #[cfg(test)]
-    pub fn seed(&mut self, tx_hash: TxHash, part: Part) {
+    pub(crate) fn seed(&mut self, tx_hash: TxHash, part: Part) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.part = part;
         }
@@ -706,7 +711,7 @@ impl Ledger {
     /// The core set of a leg entry — whose refusal is the transaction's.
     /// `None` for anything but a leg entry this ledger holds.
     #[must_use]
-    pub fn leg_core(&self, tx_hash: TxHash) -> Option<&BTreeSet<ShardId>> {
+    pub(crate) fn leg_core(&self, tx_hash: TxHash) -> Option<&BTreeSet<ShardId>> {
         self.owed
             .get(&tx_hash)
             .and_then(|owed| owed.part.kept())
@@ -716,7 +721,7 @@ impl Ledger {
     /// Whether `shard` is one of the transaction's core — whose refusal
     /// is the transaction's, and whose word is worth mirroring at all.
     #[must_use]
-    pub fn core_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
+    pub(crate) fn core_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         self.leg_core(tx_hash)
             .is_some_and(|core| core.contains(&shard))
     }
@@ -731,7 +736,7 @@ impl Ledger {
     /// frozen shard alone would drop the successor's answer to the
     /// question this ledger asked it.
     #[must_use]
-    pub fn consumer_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
+    pub(crate) fn consumer_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         let kept = self.owed.get(&tx_hash).and_then(|owed| owed.part.kept());
         kept.is_some_and(|kept| {
             kept.every_claim(self.local)
@@ -746,7 +751,7 @@ impl Ledger {
     /// A core shard's tick closes on every other core shard's
     /// certificate, so one saying it succeeded is not the transaction
     /// accepted: that is every core shard saying so.
-    pub fn record_acceptance(&mut self, tx_hash: TxHash, shard: ShardId) -> bool {
+    pub(crate) fn record_acceptance(&mut self, tx_hash: TxHash, shard: ShardId) -> bool {
         let Some(core_len) = self
             .leg_core(tx_hash)
             .filter(|core| core.contains(&shard))
@@ -763,7 +768,7 @@ impl Ledger {
     /// the question `probed` asks. First reading wins: `false` says the
     /// cell was already read, or the transaction is not held here, and
     /// a later claim adds nothing.
-    pub fn record_reading(
+    pub(crate) fn record_reading(
         &mut self,
         tx_hash: TxHash,
         shard: ShardId,
@@ -791,7 +796,7 @@ impl Ledger {
     /// and every member reads it off the same certificate. Where more
     /// than one consumer speaks, the earliest stands — the entry is
     /// asked about as soon as any cell it waits on could be there.
-    pub fn cue_probe(&mut self, tx_hash: TxHash, at: WeightedTimestamp) {
+    pub(crate) fn cue_probe(&mut self, tx_hash: TxHash, at: WeightedTimestamp) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.cued = Some(owed.cued.map_or(at, |cued| cued.min(at)));
         }
@@ -817,7 +822,7 @@ impl Ledger {
     /// the core it is part of, itself included, but what it has
     /// committed is not something it fetches a proof of.
     #[must_use]
-    pub fn questions(&self, trie: &ShardTrie) -> Vec<Question> {
+    pub(crate) fn questions(&self, trie: &ShardTrie) -> Vec<Question> {
         let local = self.local;
         let mut questions = Vec::new();
         for (&tx_hash, owed) in &self.owed {
@@ -876,7 +881,7 @@ impl Ledger {
 
     /// Whether this ledger still holds `tx_hash`.
     #[must_use]
-    pub fn contains(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn contains(&self, tx_hash: TxHash) -> bool {
         self.owed.contains_key(&tx_hash)
     }
 
@@ -892,7 +897,7 @@ impl Ledger {
     /// composed from. That entry gives the verdict and the reservation
     /// back; the leaves are answered for where they are.
     #[must_use]
-    pub fn settles_records(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn settles_records(&self, tx_hash: TxHash) -> bool {
         self.owed
             .get(&tx_hash)
             .is_some_and(|owed| owed.part.kept().is_some())
@@ -928,7 +933,7 @@ impl Ledger {
     /// certificate, and one that never ran, or whose tick was discarded
     /// before its finalization committed, owes it on the reclaim's.
     #[must_use]
-    pub fn reclaimable(&self) -> Vec<Settleable> {
+    pub(crate) fn reclaimable(&self) -> Vec<Settleable> {
         self.untaken_legs()
             .filter(|(_, owed, _)| owed.covered())
             .map(|(tx_hash, _, held)| Settleable {
@@ -943,7 +948,7 @@ impl Ledger {
     /// Record that a tick of this shard's has admitted the reclaim of
     /// `tx_hash`, so the finalization naming the hash next is the
     /// reclaim's and releases the entry.
-    pub fn admit_reclaim(&mut self, tx_hash: TxHash) {
+    pub(crate) fn admit_reclaim(&mut self, tx_hash: TxHash) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.part.take(Licence::Unclaimed);
         }
@@ -961,7 +966,7 @@ impl Ledger {
     /// [`Self::consumer_holds`] makes, and for the same reason — so the
     /// cell is what is held to, not the shard it was read on.
     #[must_use]
-    pub fn retirable(&self) -> Vec<Settleable> {
+    pub(crate) fn retirable(&self) -> Vec<Settleable> {
         self.untaken_legs()
             .filter(|(_, owed, _)| !owed.covered())
             .filter_map(|(tx_hash, owed, held)| {
@@ -986,7 +991,7 @@ impl Ledger {
     /// Record that a tick of this shard's has admitted the retirement
     /// of `tx_hash`'s records, so the finalization naming the hash next
     /// is the retirement's and releases the entry.
-    pub fn admit_retire(&mut self, tx_hash: TxHash) {
+    pub(crate) fn admit_retire(&mut self, tx_hash: TxHash) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.part.take(Licence::Claimed);
         }
@@ -995,7 +1000,7 @@ impl Ledger {
     /// Record that a tick of this shard's has taken `tx_hash` as a member,
     /// and so will speak for it in a certificate a counterpart can settle
     /// against.
-    pub fn certify(&mut self, tx_hash: TxHash) {
+    pub(crate) fn certify(&mut self, tx_hash: TxHash) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.certified = true;
         }
@@ -1006,7 +1011,7 @@ impl Ledger {
     /// to reach. False for a transaction this ledger does not hold, which
     /// is the same answer it gives for one no tick ever took.
     #[must_use]
-    pub fn is_certified(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn is_certified(&self, tx_hash: TxHash) -> bool {
         self.owed.get(&tx_hash).is_some_and(|owed| owed.certified)
     }
 
@@ -1036,7 +1041,7 @@ impl Ledger {
     /// reconstructed entry is the entry: the record restates every figure
     /// the transaction fixes and the reach it touches, so what this
     /// derives from it is what a replica that held the block derives.
-    pub fn record_abandonment_records(&mut self, records: &[AbandonmentRecord]) -> usize {
+    pub(crate) fn record_abandonment_records(&mut self, records: &[AbandonmentRecord]) -> usize {
         let mut reconstructed = 0usize;
         for record in records {
             for entry in record.unsettled() {
@@ -1076,7 +1081,11 @@ impl Ledger {
     /// successor still delivers what it was owed — only the lapse says a
     /// delivery never will.
     #[must_use]
-    pub fn outstanding_with(&self, shard: ShardId, cut: WeightedTimestamp) -> Vec<UnsettledTx> {
+    pub(crate) fn outstanding_with(
+        &self,
+        shard: ShardId,
+        cut: WeightedTimestamp,
+    ) -> Vec<UnsettledTx> {
         self.owed
             .iter()
             .filter(|(_, owed)| {
@@ -1092,7 +1101,7 @@ impl Ledger {
     /// Whether this shard only delivers for `tx_hash`, so no outcome of
     /// its own bears the verdict and the lapse is what bounds it.
     #[must_use]
-    pub fn is_delivery(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn is_delivery(&self, tx_hash: TxHash) -> bool {
         self.owed
             .get(&tx_hash)
             .is_some_and(|owed| owed.part.is_delivery())
@@ -1102,7 +1111,7 @@ impl Ledger {
     /// never settle — the question the split-boundary fence otherwise
     /// puts to a settled set that expires.
     #[must_use]
-    pub fn is_covered(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn is_covered(&self, tx_hash: TxHash) -> bool {
         self.owed.get(&tx_hash).is_some_and(Owed::covered)
     }
 
@@ -1116,7 +1125,7 @@ impl Ledger {
     /// caller retiring an id one of the two owners has finished with has
     /// to put this question to the other first.
     #[must_use]
-    pub fn awaits_certificate(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn awaits_certificate(&self, tx_hash: TxHash) -> bool {
         self.owed.get(&tx_hash).is_some_and(|owed| !owed.covered())
     }
 
@@ -1127,7 +1136,7 @@ impl Ledger {
     /// than of when this shard got around to reading it. The expiry fills
     /// in when the caller learns it — the beacon stamps the handoff
     /// complete some epochs after the cut — and never moves once set.
-    pub fn record_terminal(
+    pub(crate) fn record_terminal(
         &mut self,
         shard: ShardId,
         cut: WeightedTimestamp,
@@ -1145,7 +1154,7 @@ impl Ledger {
     /// Give a departure this ledger holds open its expiry, once. A
     /// departure not held is not invented here: the cut is the schedule's
     /// to state, and [`Self::record_terminal`] is where it is read.
-    pub fn stamp_terminal(&mut self, shard: ShardId, readable_until: WeightedTimestamp) {
+    pub(crate) fn stamp_terminal(&mut self, shard: ShardId, readable_until: WeightedTimestamp) {
         if let Some(departure) = self.departed.get_mut(&shard)
             && departure.readable_until.is_none()
         {
@@ -1163,7 +1172,7 @@ impl Ledger {
     /// after has to be asked about by name, or it and every entry a
     /// record covers against it hold each other open for good.
     #[must_use]
-    pub fn unstamped_departures(&self) -> Vec<ShardId> {
+    pub(crate) fn unstamped_departures(&self) -> Vec<ShardId> {
         self.departed
             .iter()
             .filter(|(_, departure)| departure.readable_until.is_none())
@@ -1210,7 +1219,7 @@ impl Ledger {
     /// transaction this ledger does not hold, and for one that never left
     /// this shard.
     #[must_use]
-    pub fn counterparts(&self, tx_hash: TxHash, trie: &ShardTrie) -> BTreeSet<ShardId> {
+    pub(crate) fn counterparts(&self, tx_hash: TxHash, trie: &ShardTrie) -> BTreeSet<ShardId> {
         let Some(owed) = self.owed.get(&tx_hash) else {
             return BTreeSet::new();
         };
@@ -1234,7 +1243,7 @@ impl Ledger {
     /// that does not has no counterpart to hold a certificate of ours,
     /// whatever this shard has said about it.
     #[must_use]
-    pub fn reaches_beyond(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn reaches_beyond(&self, tx_hash: TxHash) -> bool {
         self.owed
             .get(&tx_hash)
             .is_some_and(|owed| self.remote_routes(owed).next().is_some())
@@ -1246,7 +1255,7 @@ impl Ledger {
     /// Read before the same finalizations release the entries they
     /// name, since what a name means is a property of the entry.
     #[must_use]
-    pub fn resolutions_of(
+    pub(crate) fn resolutions_of(
         &self,
         finalizations: &[Arc<Verifiable<Finalization>>],
     ) -> Vec<(TxHash, TxResolution)> {
@@ -1286,7 +1295,7 @@ impl Ledger {
     /// the retirement. A leg that failed is the transaction's end on
     /// this shard — it issued nothing, so there is nothing to reclaim —
     /// and its own finalization releases it.
-    pub fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
+    pub(crate) fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         let local = self.local;
         for finalization in finalizations {
             let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
@@ -1343,7 +1352,7 @@ impl Ledger {
     /// certificate settled alone, so there is nothing to abandon. What a
     /// record licenses on one is a reclaim.
     #[must_use]
-    pub fn past_deadline(&self, now: WeightedTimestamp) -> Vec<UnsettledTx> {
+    pub(crate) fn past_deadline(&self, now: WeightedTimestamp) -> Vec<UnsettledTx> {
         self.owed
             .iter()
             .filter(|(_, owed)| !owed.part.is_leg())
@@ -1402,7 +1411,7 @@ impl Ledger {
     /// from one that never had the evidence to compose it. A leg entry
     /// dropped at its horizon is not among them: its reservation came
     /// back with its own finalization, so nothing leaks with it.
-    pub fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
+    pub(crate) fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
         let mut entries = std::mem::take(&mut self.owed);
         entries.retain(|tx_hash, owed| {
@@ -1476,7 +1485,7 @@ impl Ledger {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.owed.len()
     }
 }

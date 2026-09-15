@@ -31,7 +31,7 @@ pub struct CanonicalTxs {
 }
 
 impl CanonicalTxs {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cache: QuickCache::new(CANONICAL_TX_CACHE_SIZE),
         }
@@ -39,7 +39,7 @@ impl CanonicalTxs {
 
     /// Map `tx` onto the process-wide canonical instance for its hash.
     /// The first arrival's instance wins; later arrivals get it back.
-    pub fn canonicalize(&self, tx: &Arc<Transaction>) -> Arc<Transaction> {
+    pub(crate) fn canonicalize(&self, tx: &Arc<Transaction>) -> Arc<Transaction> {
         let hash = tx.hash();
         self.cache
             .get_or_insert_with(&hash, || Ok::<_, Infallible>(Arc::clone(tx)))

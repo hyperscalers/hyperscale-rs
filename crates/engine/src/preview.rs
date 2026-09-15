@@ -478,7 +478,7 @@ pub struct PreviewReport {
     /// envelope does.
     pub ceilings: Vec<u64>,
     /// What the run emitted.
-    pub events: Vec<Event>,
+    pub(crate) events: Vec<Event>,
     /// The committed height each answering shard read at, by shard.
     ///
     /// A preview is a statement about state at a moment, and the moment

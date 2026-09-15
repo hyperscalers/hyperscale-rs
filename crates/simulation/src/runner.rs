@@ -335,23 +335,23 @@ pub struct SimulationStats {
     /// Total events processed.
     pub events_processed: u64,
     /// Events processed by type.
-    pub events_by_priority: [u64; 4],
+    pub(crate) events_by_priority: [u64; 4],
     /// Total actions generated.
     pub actions_generated: u64,
     /// Messages sent (successfully scheduled for delivery).
     pub messages_sent: u64,
     /// Messages dropped due to network partition.
-    pub messages_dropped_partition: u64,
+    pub(crate) messages_dropped_partition: u64,
     /// Messages dropped due to packet loss.
     pub messages_dropped_loss: u64,
     /// Messages dropped by an installed fault rule.
     pub messages_dropped_fault: u64,
     /// Messages deduplicated (same message already received by host).
-    pub messages_deduplicated: u64,
+    pub(crate) messages_deduplicated: u64,
     /// Timers set.
     pub timers_set: u64,
     /// Timers cancelled.
-    pub timers_cancelled: u64,
+    pub(crate) timers_cancelled: u64,
 }
 
 impl SimulationRunner {

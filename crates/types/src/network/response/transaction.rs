@@ -15,7 +15,7 @@ pub struct GetTransactionsResponse {
     /// The requested transactions that were found.
     /// Uses Arc to avoid copying transaction data.
     #[hbor(max = MAX_TXS_PER_BLOCK)]
-    pub transactions: Vec<Arc<Transaction>>,
+    pub(crate) transactions: Vec<Arc<Transaction>>,
 }
 
 impl GetTransactionsResponse {

@@ -75,7 +75,7 @@ impl<T> PositionalBundle<T> {
 
     /// Number of `(index, item)` pairs.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.items.len()
     }
 
@@ -86,7 +86,7 @@ impl<T> PositionalBundle<T> {
     }
 
     /// Iterate `(committee_index, &item)` pairs in set-bit order.
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> + '_ {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &T)> + '_ {
         self.signers.set_indices().zip(self.items.iter())
     }
 

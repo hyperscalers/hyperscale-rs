@@ -83,7 +83,7 @@ impl<'a> CfHandles<'a> {
     /// # Panics
     ///
     /// Panics if any expected column family is missing.
-    pub fn resolve(db: &'a DB) -> Self {
+    pub(crate) fn resolve(db: &'a DB) -> Self {
         let resolve = |name: &str| -> &'a ColumnFamily {
             db.cf_handle(name)
                 .unwrap_or_else(|| panic!("beacon column family '{name}' must exist"))

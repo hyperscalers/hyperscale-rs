@@ -164,7 +164,7 @@ impl BlockVote {
     /// `parent_block_hash` isn't stored on the vote; the verifier supplies it
     /// (from the block header, or the QC's own field for an aggregate).
     #[must_use]
-    pub fn signing_message(
+    pub(crate) fn signing_message(
         &self,
         network: &NetworkDefinition,
         parent_block_hash: &BlockHash,
@@ -187,13 +187,13 @@ impl BlockVote {
 #[derive(Debug, Clone, Copy)]
 pub struct BlockVoteContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
-    pub network: &'a NetworkDefinition,
+    pub(crate) network: &'a NetworkDefinition,
     /// Public key of the voter who cast this vote.
-    pub voter_public_key: &'a ConsensusPublicKey,
+    pub(crate) voter_public_key: &'a ConsensusPublicKey,
     /// Parent of the voted block (from its header), bound into the signing message.
-    pub parent_block_hash: BlockHash,
+    pub(crate) parent_block_hash: BlockHash,
     /// Scheme verifier the signature check runs through.
-    pub verifier: &'a dyn Verifier,
+    pub(crate) verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`BlockVote`] verification.

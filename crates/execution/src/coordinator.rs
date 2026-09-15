@@ -185,19 +185,19 @@ impl PendingTick {
 #[derive(Debug)]
 pub struct CompletionData {
     /// Block this tick belongs to; pairs with `tick_id` to identify the vote target.
-    pub block_hash: BlockHash,
+    pub(crate) block_hash: BlockHash,
     /// Height of the tick-starting block.
-    pub block_height: BlockHeight,
+    pub(crate) block_height: BlockHeight,
     /// BFT-authenticated weighted timestamp at which this tick's outcome is
     /// fixed. Included in the vote payload and the EC canonical hash, so all
     /// validators aggregate under the same identifier.
-    pub vote_anchor_ts: WeightedTimestamp,
+    pub(crate) vote_anchor_ts: WeightedTimestamp,
     /// Tick identifier; unique within `block_hash`.
-    pub tick_id: TickId,
+    pub(crate) tick_id: TickId,
     /// Merkle root over per-tx outcome leaves (cross-shard agreement).
-    pub global_receipt_root: GlobalReceiptRoot,
+    pub(crate) global_receipt_root: GlobalReceiptRoot,
     /// Per-tx outcomes in tick order.
-    pub tx_outcomes: Vec<TxOutcome>,
+    pub(crate) tx_outcomes: Vec<TxOutcome>,
 }
 
 /// Execution memory statistics for monitoring collection sizes.
@@ -3877,7 +3877,7 @@ impl ExecutionCoordinator {
     /// cleanup works even when the tick was never aggregated locally — e.g.
     /// for blocks received via sync. The committed `Finalization` is the
     /// authoritative tx-set source.
-    pub fn remove_finalization(&mut self, fw: &Finalization) {
+    pub(crate) fn remove_finalization(&mut self, fw: &Finalization) {
         let tick_id = fw.tick_id();
         self.finalized.remove(&fw.receipt_hash());
 

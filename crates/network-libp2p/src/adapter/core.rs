@@ -376,7 +376,7 @@ impl Libp2pAdapter {
     /// Update the validator key map for bind verification.
     ///
     /// Called by `Libp2pNetwork::update_validator_keys` on topology changes.
-    pub fn update_validator_keys(&self, keys: Arc<ValidatorKeyMap>) {
+    pub(crate) fn update_validator_keys(&self, keys: Arc<ValidatorKeyMap>) {
         self.validator_keys.store(keys);
     }
 
@@ -406,7 +406,7 @@ impl Libp2pAdapter {
     /// # Errors
     ///
     /// Returns [`NetworkError::NetworkShutdown`] if the swarm task has stopped.
-    pub fn publish(
+    pub(crate) fn publish(
         &self,
         topic: &Topic,
         data: Vec<u8>,
@@ -470,7 +470,7 @@ impl Libp2pAdapter {
 
     /// Add `shard` to the hosted set — the event loop's inbound
     /// shard-local filter admits its topics from the next message.
-    pub fn add_local_shard(&self, shard: ShardId) {
+    pub(crate) fn add_local_shard(&self, shard: ShardId) {
         let mut set = (**self.local_shards.load()).clone();
         set.insert(shard);
         self.local_shards.store(Arc::new(set));
@@ -478,7 +478,7 @@ impl Libp2pAdapter {
 
     /// Remove `shard` from the hosted set — the inbound filter rejects
     /// its shard-local topics from the next message.
-    pub fn remove_local_shard(&self, shard: ShardId) {
+    pub(crate) fn remove_local_shard(&self, shard: ShardId) {
         let mut set = (**self.local_shards.load()).clone();
         set.remove(&shard);
         self.local_shards.store(Arc::new(set));
@@ -489,7 +489,7 @@ impl Libp2pAdapter {
     /// # Errors
     ///
     /// Returns [`NetworkError::NetworkShutdown`] if the swarm task has stopped.
-    pub fn unsubscribe_topic(&self, topic: String) -> Result<(), NetworkError> {
+    pub(crate) fn unsubscribe_topic(&self, topic: String) -> Result<(), NetworkError> {
         self.priority_channels
             .send(SwarmCommand::Unsubscribe { topic })
             .map_err(|_| NetworkError::NetworkShutdown)
@@ -549,7 +549,7 @@ impl Libp2pAdapter {
     /// serve `shard`'s request protocol, and
     /// [`NetworkError::StreamOpenFailed`] for any other rejected open (peer
     /// unknown, handshake I/O failure, etc.).
-    pub async fn open_request_stream(
+    pub(crate) async fn open_request_stream(
         &self,
         peer: Libp2pPeerId,
         shard: ShardId,
@@ -575,7 +575,10 @@ impl Libp2pAdapter {
     ///
     /// Returns [`NetworkError::StreamOpenFailed`] if the underlying libp2p
     /// stream control rejects the open.
-    pub async fn open_notify_stream(&self, peer: Libp2pPeerId) -> Result<Stream, NetworkError> {
+    pub(crate) async fn open_notify_stream(
+        &self,
+        peer: Libp2pPeerId,
+    ) -> Result<Stream, NetworkError> {
         self.stream_control
             .clone()
             .open_stream(peer, NOTIFY_PROTOCOL)
@@ -599,7 +602,10 @@ impl Libp2pAdapter {
     /// validator keys and store it in the book if it is the newest for its
     /// validator.
     #[must_use]
-    pub fn ingest_validator_address(&self, gossip: &ValidatorAddressGossip) -> IngestOutcome {
+    pub(crate) fn ingest_validator_address(
+        &self,
+        gossip: &ValidatorAddressGossip,
+    ) -> IngestOutcome {
         self.address_book.ingest(
             self.verifier.as_ref(),
             &self.network,
@@ -615,7 +621,7 @@ impl Libp2pAdapter {
     /// usually connects them at once; the event loop's maintenance sweep
     /// covers the ones whose announcements arrive later and any dial that
     /// fails.
-    pub fn update_wanted_validators(&self, wanted: HashSet<ValidatorId>) {
+    pub(crate) fn update_wanted_validators(&self, wanted: HashSet<ValidatorId>) {
         let candidates = self
             .address_book
             .dial_candidates(&wanted, &self.validator_peers);
@@ -651,7 +657,7 @@ impl Libp2pAdapter {
     ///
     /// This allows external components (like `InboundRouter`) to accept incoming streams.
     #[must_use]
-    pub fn stream_control(&self) -> StreamControl {
+    pub(crate) fn stream_control(&self) -> StreamControl {
         self.stream_control.clone()
     }
 }

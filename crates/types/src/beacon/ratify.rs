@@ -282,7 +282,7 @@ impl RatifyCert {
 
     /// Round the precommit quorum formed in.
     #[must_use]
-    pub const fn round(&self) -> RatifyRound {
+    pub(crate) const fn round(&self) -> RatifyRound {
         self.round
     }
 
@@ -295,14 +295,14 @@ impl RatifyCert {
     /// Bitfield indexing the active pool's positional ordering at the
     /// anchor's epoch.
     #[must_use]
-    pub const fn signers(&self) -> &SignerBitfield {
+    pub(crate) const fn signers(&self) -> &SignerBitfield {
         &self.signers
     }
 
     /// Aggregated signature over the canonical precommit signing
     /// bytes, verifying under the union of [`Self::signers`]' pubkeys.
     #[must_use]
-    pub const fn aggregate_sig(&self) -> AggregateSignature {
+    pub(crate) const fn aggregate_sig(&self) -> AggregateSignature {
         self.aggregate_sig
     }
 
@@ -574,7 +574,7 @@ impl CandidateBeaconBlock {
 
     /// SPC proposal certificate.
     #[must_use]
-    pub const fn spc(&self) -> &SpcCert {
+    pub(crate) const fn spc(&self) -> &SpcCert {
         &self.spc
     }
 
@@ -598,7 +598,7 @@ impl CandidateBeaconBlock {
 
     /// Consume and return parts.
     #[must_use]
-    pub fn into_parts(self) -> (BeaconBlock, Box<SpcCert>) {
+    pub(crate) fn into_parts(self) -> (BeaconBlock, Box<SpcCert>) {
         (self.block, self.spc)
     }
 }

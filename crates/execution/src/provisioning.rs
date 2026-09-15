@@ -135,7 +135,7 @@ pub fn divided_requirements(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceAnchor {
     /// The source block's parent-QC weighted timestamp.
-    pub clock: WeightedTimestamp,
+    pub(crate) clock: WeightedTimestamp,
 }
 
 /// What one source shard's committed bundles carried for a transaction.
@@ -237,7 +237,7 @@ pub struct ProvisioningTracker {
 }
 
 impl ProvisioningTracker {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             absorbed: HashMap::new(),
             required: HashMap::new(),
@@ -249,7 +249,7 @@ impl ProvisioningTracker {
     /// Update the shard consensus-attested local-commit clock absorptions
     /// are stamped with. Called once per `on_block_committed`. Monotone —
     /// out-of-order or stale calls are ignored.
-    pub fn advance_clock(&mut self, now: WeightedTimestamp) {
+    pub(crate) fn advance_clock(&mut self, now: WeightedTimestamp) {
         if now > self.now {
             self.now = now;
         }
@@ -261,14 +261,14 @@ impl ProvisioningTracker {
     /// callers set this once per candidate. Arrival order does not
     /// matter: a bundle absorbed before its requirement is filed still
     /// answers it.
-    pub fn record_required(&mut self, tx_hash: TxHash, requirements: BTreeSet<Requirement>) {
+    pub(crate) fn record_required(&mut self, tx_hash: TxHash, requirements: BTreeSet<Requirement>) {
         self.required.insert(tx_hash, requirements);
     }
 
     /// Record the remote payer shard of a cross-shard transaction, so
     /// dispatch can read the transaction's environment off the payer's
     /// bundle.
-    pub fn record_payer_shard(&mut self, tx_hash: TxHash, payer_shard: ShardId) {
+    pub(crate) fn record_payer_shard(&mut self, tx_hash: TxHash, payer_shard: ShardId) {
         self.payer_shards.insert(tx_hash, payer_shard);
     }
 
@@ -277,7 +277,7 @@ impl ProvisioningTracker {
     /// proof held: absorption admits a bundle only against a
     /// commit-proven source header, committed into the local chain.
     #[must_use]
-    pub fn has_received_from(&self, tx_hash: TxHash, shard: ShardId) -> bool {
+    pub(crate) fn has_received_from(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         self.absorbed
             .get(&tx_hash)
             .is_some_and(|by_shard| by_shard.contains_key(&shard))
@@ -288,7 +288,7 @@ impl ProvisioningTracker {
     /// `None` when the payer is local (the tick block is the anchor) or
     /// the bundle has not been absorbed.
     #[must_use]
-    pub fn payer_anchor(&self, tx_hash: TxHash) -> Option<SourceAnchor> {
+    pub(crate) fn payer_anchor(&self, tx_hash: TxHash) -> Option<SourceAnchor> {
         let payer = self.payer_shards.get(&tx_hash)?;
         Some(self.absorbed.get(&tx_hash)?.get(payer)?.anchor)
     }
@@ -297,7 +297,7 @@ impl ProvisioningTracker {
     /// for txs with no recorded requirements (single-shard txs or txs we
     /// aren't tracking). A recorded empty set is immediately satisfied —
     /// the member that waits on nothing and dispatches without waiting.
-    pub fn is_fully_provisioned(&self, tx_hash: TxHash) -> bool {
+    pub(crate) fn is_fully_provisioned(&self, tx_hash: TxHash) -> bool {
         self.required.get(&tx_hash).is_some_and(|required| {
             required.iter().all(|requirement| match requirement {
                 Requirement::CommittedState(shard) => self.has_received_from(tx_hash, *shard),
@@ -318,7 +318,7 @@ impl ProvisioningTracker {
     /// which local ticks are affected and to drive the dispatch check.
     /// Preserves iteration order of `provisions.transactions` (callers sort
     /// batches upstream for determinism).
-    pub fn absorb_provisions(&mut self, provisions: &Verified<Provisions>) -> Vec<TxHash> {
+    pub(crate) fn absorb_provisions(&mut self, provisions: &Verified<Provisions>) -> Vec<TxHash> {
         let mut touched = Vec::with_capacity(provisions.transactions().len());
         let source_shard = provisions.source_shard();
         let anchor = SourceAnchor {
@@ -348,7 +348,11 @@ impl ProvisioningTracker {
     /// here, and past `RETENTION_HORIZON` the transaction is provably
     /// terminal everywhere, so no candidate can still consume it.
     /// Returns the number of transactions whose absorptions were swept.
-    pub fn sweep(&mut self, now: WeightedTimestamp, waiting: impl Fn(TxHash) -> bool) -> usize {
+    pub(crate) fn sweep(
+        &mut self,
+        now: WeightedTimestamp,
+        waiting: impl Fn(TxHash) -> bool,
+    ) -> usize {
         self.required.retain(|tx_hash, _| waiting(*tx_hash));
         self.payer_shards.retain(|tx_hash, _| waiting(*tx_hash));
         let before = self.absorbed.len();
@@ -366,7 +370,7 @@ impl ProvisioningTracker {
     /// What was absorbed for `tx_hash`, one entry list per source shard
     /// in shard order — what a cross-shard execution request carries.
     #[must_use]
-    pub fn provisions_for(&self, tx_hash: TxHash) -> Vec<Arc<Vec<SubstateEntry>>> {
+    pub(crate) fn provisions_for(&self, tx_hash: TxHash) -> Vec<Arc<Vec<SubstateEntry>>> {
         self.absorbed
             .get(&tx_hash)
             .map_or_else(Vec::new, |by_shard| {
@@ -381,7 +385,7 @@ impl ProvisioningTracker {
     /// them present for `tx_hash` — a crossing's record, read from the
     /// one bundle whose root says anything about it.
     #[must_use]
-    pub fn present_cell(
+    pub(crate) fn present_cell(
         &self,
         tx_hash: TxHash,
         source: ShardId,
@@ -391,12 +395,12 @@ impl ProvisioningTracker {
     }
 
     /// Transactions with at least one bundle absorbed.
-    pub fn absorbed_len(&self) -> usize {
+    pub(crate) fn absorbed_len(&self) -> usize {
         self.absorbed.len()
     }
 
     /// Transactions with a requirement filed.
-    pub fn required_len(&self) -> usize {
+    pub(crate) fn required_len(&self) -> usize {
         self.required.len()
     }
 }

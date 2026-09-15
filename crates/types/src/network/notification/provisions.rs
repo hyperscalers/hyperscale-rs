@@ -22,9 +22,9 @@ pub struct ProvisionsNotification {
     /// `Verifiable::Verified`.
     pub provisions: Arc<Verifiable<Provisions>>,
     /// The validator who sent this notification.
-    pub sender: ValidatorId,
+    pub(crate) sender: ValidatorId,
     /// Signature over the domain-separated signing message, by the sender.
-    pub sender_signature: ConsensusSignature,
+    pub(crate) sender_signature: ConsensusSignature,
 }
 
 impl ProvisionsNotification {

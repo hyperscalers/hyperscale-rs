@@ -39,7 +39,7 @@ use crate::pc::{PcEffect, PcEvent, PcInstance};
 /// parties. Views 1 and 2 use the input ranking (offset 0); from view
 /// 3 the ranking left-shifts by `view - 2 mod n` each step.
 #[must_use]
-pub const fn rank_shift_for_view(view: SpcView, n: usize) -> usize {
+pub(crate) const fn rank_shift_for_view(view: SpcView, n: usize) -> usize {
     let v = view.inner();
     if v <= 2 { 0 } else { (v as usize - 2) % n }
 }
@@ -447,20 +447,20 @@ impl SpcInstance {
 
     /// Epoch this SPC instance drives consensus for.
     #[must_use]
-    pub const fn epoch(&self) -> Epoch {
+    pub(crate) const fn epoch(&self) -> Epoch {
         self.epoch
     }
 
     /// Highest view this instance has entered.
     #[must_use]
-    pub const fn current_view(&self) -> SpcView {
+    pub(crate) const fn current_view(&self) -> SpcView {
         self.current_view
     }
 
     /// Beacon committee driving this instance, positional order matching
     /// every embedded signer bitfield.
     #[must_use]
-    pub fn committee(&self) -> &[(ValidatorId, ConsensusPublicKey)] {
+    pub(crate) fn committee(&self) -> &[(ValidatorId, ConsensusPublicKey)] {
         &self.committee
     }
 
@@ -469,7 +469,7 @@ impl SpcInstance {
     /// input is fed the PC FSM has started its round-trips and a
     /// second feed would be a no-op anyway.
     #[must_use]
-    pub fn view_one_input_fed(&self) -> bool {
+    pub(crate) fn view_one_input_fed(&self) -> bool {
         self.views
             .get(&SpcView::new(1))
             .is_some_and(|v| v.vpc_input_fed)

@@ -65,7 +65,7 @@ pub fn declared_price<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> u128 {
 ///
 /// Panics if the transaction does not derive, or if a full block of it
 /// would be refused.
-pub fn assert_a_full_block_fits<C: Cluster + ?Sized>(c: &C, tx: &Transaction) {
+pub(crate) fn assert_a_full_block_fits<C: Cluster + ?Sized>(c: &C, tx: &Transaction) {
     tx.try_derived(c.derivation().as_ref())
         .expect("a scenario fixture derives");
     let live = live_shards(c);
@@ -111,7 +111,7 @@ pub fn served_shards<C: Cluster + ?Sized>(c: &C) -> Vec<ShardId> {
 /// — but the shard serving it changes, and a shard that has handed its
 /// prefix on still answers for it, at the state it froze at.
 #[must_use]
-pub fn held<C: Cluster + ?Sized>(c: &C, owner: Address, resource: ResourceAddr) -> u128 {
+pub(crate) fn held<C: Cluster + ?Sized>(c: &C, owner: Address, resource: ResourceAddr) -> u128 {
     held_at(c, vault_key(owner, resource))
 }
 
@@ -123,7 +123,7 @@ pub fn held<C: Cluster + ?Sized>(c: &C, owner: Address, resource: ResourceAddr) 
 /// only from the package's own slot, which the scenario declaring the
 /// package is what knows.
 #[must_use]
-pub fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
+pub(crate) fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
     let shard = owning_shard(c, cell.owner);
     c.substate(shard, cell.owner, cell.local.0)
         .map_or(0, |bytes| {
@@ -139,7 +139,7 @@ pub fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
 /// them answered first. Before the beacon has folded anything the root
 /// is the one shard there is.
 #[must_use]
-pub fn owning_shard<C: Cluster + ?Sized>(c: &C, owner: Address) -> ShardId {
+pub(crate) fn owning_shard<C: Cluster + ?Sized>(c: &C, owner: Address) -> ShardId {
     let live = live_shards(c);
     if live.is_empty() {
         return ShardId::ROOT;
@@ -217,16 +217,16 @@ pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHe
 pub struct RanAs {
     /// The other shards whose certificates this shard's settlement
     /// waited on. Empty for a leg, a delivery, or a single-shard core.
-    pub awaited: Vec<ShardId>,
+    pub(crate) awaited: Vec<ShardId>,
     /// Whether this outcome bore the verdict on the transaction. False
     /// for a leg that succeeded and for a delivering member.
-    pub decides: bool,
+    pub(crate) decides: bool,
     /// Whether the transaction reached beyond this shard. False for a
     /// member this shard composed for itself — a reclaim or a
     /// retirement.
-    pub reaches_beyond: bool,
+    pub(crate) reaches_beyond: bool,
     /// The shards this execution's crossings were issued to.
-    pub crossing_targets: Vec<ShardId>,
+    pub(crate) crossing_targets: Vec<ShardId>,
 }
 
 impl RanAs {
@@ -234,7 +234,7 @@ impl RanAs {
     /// committed evidence — a reclaim or a retirement — rather than one
     /// the transaction's own admission put there.
     #[must_use]
-    pub const fn is_local_only(&self) -> bool {
+    pub(crate) const fn is_local_only(&self) -> bool {
         !self.reaches_beyond
     }
 }
@@ -287,7 +287,12 @@ pub fn chain_membership(store: &impl ShardChainReader, tx: TxHash) -> Vec<RanAs>
 /// Panics if the shard attested nothing for `tx`, if anything it
 /// attested for the wider transaction decided it, or if it composed any
 /// number of local members but one.
-pub fn assert_reclaimed_leg<C: Cluster + ?Sized>(c: &C, shard: ShardId, tx: TxHash, context: &str) {
+pub(crate) fn assert_reclaimed_leg<C: Cluster + ?Sized>(
+    c: &C,
+    shard: ShardId,
+    tx: TxHash,
+    context: &str,
+) {
     let ran = c.ran(shard, tx);
     assert!(
         !ran.is_empty(),
@@ -336,21 +341,21 @@ pub const fn status_rank(status: &TransactionStatus) -> u8 {
 
 /// The latest committed beacon epoch, if the cluster has folded one.
 #[must_use]
-pub fn beacon_epoch<C: Cluster>(c: &C) -> Option<Epoch> {
+pub(crate) fn beacon_epoch<C: Cluster>(c: &C) -> Option<Epoch> {
     c.beacon_state().map(|state| state.current_epoch)
 }
 
 /// The cluster's clock as the weighted timestamp a block anchored now
 /// carries.
 #[must_use]
-pub fn clock<C: Cluster + ?Sized>(c: &C) -> WeightedTimestamp {
+pub(crate) fn clock<C: Cluster + ?Sized>(c: &C) -> WeightedTimestamp {
     WeightedTimestamp::ZERO.plus(c.now())
 }
 
 /// Whether the beacon has admitted a split for `parent` — a pending `Split`
 /// record carrying the drawn observer cohort.
 #[must_use]
-pub fn split_admitted<C: Cluster>(c: &C, parent: ShardId) -> bool {
+pub(crate) fn split_admitted<C: Cluster>(c: &C, parent: ShardId) -> bool {
     c.beacon_state().is_some_and(|state| {
         matches!(
             state.pending_reshapes.get(&parent),
@@ -375,7 +380,7 @@ pub fn scheduled_terminal_epoch<C: Cluster>(c: &C, parent: ShardId) -> Option<Ep
 /// Milliseconds of weighted time per epoch, off the beacon's own chain
 /// config — what turns an epoch number into the boundary it starts at.
 #[must_use]
-pub fn epoch_duration_ms<C: Cluster>(c: &C) -> Option<u64> {
+pub(crate) fn epoch_duration_ms<C: Cluster>(c: &C) -> Option<u64> {
     c.beacon_state()
         .map(|state| state.chain_config.epoch_duration_ms)
 }
@@ -383,7 +388,7 @@ pub fn epoch_duration_ms<C: Cluster>(c: &C) -> Option<u64> {
 /// The beacon-composed anchor root for `shard` — the `boundaries` `state_root`
 /// a flip must reproduce.
 #[must_use]
-pub fn anchor_root<C: Cluster>(c: &C, shard: ShardId) -> Option<StateRoot> {
+pub(crate) fn anchor_root<C: Cluster>(c: &C, shard: ShardId) -> Option<StateRoot> {
     c.beacon_state()
         .and_then(|state| state.boundaries.get(&shard).map(|b| b.state_root))
 }
@@ -396,7 +401,7 @@ pub fn anchor_root<C: Cluster>(c: &C, shard: ShardId) -> Option<StateRoot> {
 /// flips from its own follow of the parent and serves from the cut — so
 /// "served" no longer implies "anchored".
 #[must_use]
-pub fn anchored_genesis_height<C: Cluster>(c: &C, shard: ShardId) -> Option<BlockHeight> {
+pub(crate) fn anchored_genesis_height<C: Cluster>(c: &C, shard: ShardId) -> Option<BlockHeight> {
     c.beacon_state().and_then(|state| {
         state
             .boundaries
@@ -409,7 +414,7 @@ pub fn anchored_genesis_height<C: Cluster>(c: &C, shard: ShardId) -> Option<Bloc
 /// The number of keepers drawn for a merge into `parent`, once paired (both
 /// children hold a live half). `None` before pairing.
 #[must_use]
-pub fn merge_keeper_count<C: Cluster>(c: &C, parent: ShardId) -> Option<usize> {
+pub(crate) fn merge_keeper_count<C: Cluster>(c: &C, parent: ShardId) -> Option<usize> {
     c.beacon_state()
         .and_then(|state| match state.pending_reshapes.get(&parent) {
             Some(PendingReshape::Merge {
@@ -436,7 +441,7 @@ pub fn committee_size<C: Cluster>(c: &C, shard: ShardId) -> Option<usize> {
 /// The set of shards the beacon currently seats a committee for — the live leaf
 /// partition.
 #[must_use]
-pub fn live_shards<C: Cluster + ?Sized>(c: &C) -> BTreeSet<ShardId> {
+pub(crate) fn live_shards<C: Cluster + ?Sized>(c: &C) -> BTreeSet<ShardId> {
     c.beacon_state()
         .map(|state| state.shard_committees.keys().copied().collect())
         .unwrap_or_default()
@@ -445,7 +450,7 @@ pub fn live_shards<C: Cluster + ?Sized>(c: &C) -> BTreeSet<ShardId> {
 /// The total stake folded into `pool`, or `None` if the beacon holds no record
 /// of it — counting deposits whether or not they have unbonded.
 #[must_use]
-pub fn pool_total_stake<C: Cluster>(c: &C, pool: StakePoolId) -> Option<Stake> {
+pub(crate) fn pool_total_stake<C: Cluster>(c: &C, pool: StakePoolId) -> Option<Stake> {
     c.beacon_state()
         .and_then(|state| state.pools.get(&pool).map(|p| p.total_stake))
 }
@@ -454,7 +459,7 @@ pub fn pool_total_stake<C: Cluster>(c: &C, pool: StakePoolId) -> Option<Stake> {
 /// its unbonding window. A withdrawal drops this immediately while
 /// [`pool_total_stake`] holds until the unbond matures.
 #[must_use]
-pub fn pool_effective_stake<C: Cluster>(c: &C, pool: StakePoolId) -> Option<Stake> {
+pub(crate) fn pool_effective_stake<C: Cluster>(c: &C, pool: StakePoolId) -> Option<Stake> {
     c.beacon_state()
         .and_then(|state| state.pools.get(&pool).map(StakePool::effective_stake))
 }
@@ -462,14 +467,14 @@ pub fn pool_effective_stake<C: Cluster>(c: &C, pool: StakePoolId) -> Option<Stak
 /// The folded status of validator `id`, or `None` if the beacon holds no record
 /// of it.
 #[must_use]
-pub fn validator_status<C: Cluster>(c: &C, id: ValidatorId) -> Option<ValidatorStatus> {
+pub(crate) fn validator_status<C: Cluster>(c: &C, id: ValidatorId) -> Option<ValidatorStatus> {
     c.beacon_state()
         .and_then(|state| state.validators.get(&id).map(|r| r.status))
 }
 
 /// The registered consensus public key of validator `id`, or `None` if unregistered.
 #[must_use]
-pub fn validator_pubkey<C: Cluster>(c: &C, id: ValidatorId) -> Option<ConsensusPublicKey> {
+pub(crate) fn validator_pubkey<C: Cluster>(c: &C, id: ValidatorId) -> Option<ConsensusPublicKey> {
     c.beacon_state()
         .and_then(|state| state.validators.get(&id).map(|r| r.pubkey))
 }

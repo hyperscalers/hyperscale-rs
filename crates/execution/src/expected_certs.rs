@@ -96,7 +96,7 @@ pub struct ExpectedCertTracker {
 }
 
 impl ExpectedCertTracker {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             expected: HashMap::new(),
             fulfilled: HashMap::new(),
@@ -109,7 +109,12 @@ impl ExpectedCertTracker {
     /// discovery timestamp. Skipped entirely when that shard's outcome has
     /// already been ingested — a later tick composing the same member must
     /// not re-open an expectation the certificate already closed.
-    pub fn register(&mut self, source_shard: ShardId, tx_hash: TxHash, now_ts: WeightedTimestamp) {
+    pub(crate) fn register(
+        &mut self,
+        source_shard: ShardId,
+        tx_hash: TxHash,
+        now_ts: WeightedTimestamp,
+    ) {
         if self.is_fulfilled(source_shard, tx_hash) {
             return;
         }
@@ -128,7 +133,7 @@ impl ExpectedCertTracker {
     /// [`prune_fulfilled`](Self::prune_fulfilled).
     ///
     /// Returns `true` if at least one active expectation was cleared.
-    pub fn mark_fulfilled(
+    pub(crate) fn mark_fulfilled(
         &mut self,
         source_shard: ShardId,
         tx_hashes: impl IntoIterator<Item = TxHash>,
@@ -153,7 +158,7 @@ impl ExpectedCertTracker {
     /// Drop the records for `tx_hashes` that just reached terminal state (a
     /// finalized local tick landed in a committed block). No shard's outcome
     /// for a terminal transaction is wanted anymore.
-    pub fn on_txs_terminated(&mut self, tx_hashes: impl IntoIterator<Item = TxHash>) {
+    pub(crate) fn on_txs_terminated(&mut self, tx_hashes: impl IntoIterator<Item = TxHash>) {
         for tx_hash in tx_hashes {
             self.fulfilled.remove(&tx_hash);
         }
@@ -162,7 +167,7 @@ impl ExpectedCertTracker {
     /// Backstop sweep: drop fulfilled tombstones whose deadline has
     /// elapsed. Catches the late-re-registration race — see the
     /// module-level fulfilled-tombstone lifetime section.
-    pub fn prune_fulfilled(&mut self, now_ts: WeightedTimestamp) {
+    pub(crate) fn prune_fulfilled(&mut self, now_ts: WeightedTimestamp) {
         self.fulfilled.retain(|_, entry| entry.deadline > now_ts);
     }
 
@@ -177,7 +182,7 @@ impl ExpectedCertTracker {
     /// passed over rather than chased. The cadence is only stamped on
     /// entries actually returned, so one held back that way still gets its
     /// full initial window if the wait resumes.
-    pub fn check_timeouts(
+    pub(crate) fn check_timeouts(
         &mut self,
         txs_needed: &HashSet<TxHash>,
         now_ts: WeightedTimestamp,
@@ -207,7 +212,7 @@ impl ExpectedCertTracker {
     /// fetches recover; a commit-independent caller flushes through here so
     /// the fallback still fires. Records `last_requested_at` so the `io_loop`
     /// owns retries from this point.
-    pub fn flush_all(
+    pub(crate) fn flush_all(
         &mut self,
         txs_needed: &HashSet<TxHash>,
         now_ts: WeightedTimestamp,
@@ -233,7 +238,10 @@ impl ExpectedCertTracker {
     /// and the certificate never came, so the id is answered by nothing
     /// and a caller that keeps the keys is the only thing that can retire
     /// it.
-    pub fn retain_if_tx_needed(&mut self, txs_needed: &HashSet<TxHash>) -> Vec<ExpectedCertKey> {
+    pub(crate) fn retain_if_tx_needed(
+        &mut self,
+        txs_needed: &HashSet<TxHash>,
+    ) -> Vec<ExpectedCertKey> {
         let mut dropped = Vec::new();
         self.expected.retain(|&key, _| {
             let needed = txs_needed.contains(&key.1);
@@ -250,7 +258,7 @@ impl ExpectedCertTracker {
     /// terminates at a reshape boundary — no local tick can consume a
     /// fetched EC anymore. Fulfilled tombstones stay; they only suppress
     /// re-registration.
-    pub fn drain_expected(&mut self) -> Vec<ExpectedCertKey> {
+    pub(crate) fn drain_expected(&mut self) -> Vec<ExpectedCertKey> {
         self.expected.drain().map(|(key, _)| key).collect()
     }
 
@@ -259,17 +267,17 @@ impl ExpectedCertTracker {
     /// exists). Read when a terminated partner's settled set arrives, to
     /// decide which of the certificates it owes us to fetch.
     #[must_use]
-    pub fn is_fulfilled(&self, source_shard: ShardId, tx_hash: TxHash) -> bool {
+    pub(crate) fn is_fulfilled(&self, source_shard: ShardId, tx_hash: TxHash) -> bool {
         self.fulfilled
             .get(&tx_hash)
             .is_some_and(|entry| entry.shards.contains(&source_shard))
     }
 
-    pub fn expected_len(&self) -> usize {
+    pub(crate) fn expected_len(&self) -> usize {
         self.expected.len()
     }
 
-    pub fn fulfilled_len(&self) -> usize {
+    pub(crate) fn fulfilled_len(&self) -> usize {
         self.fulfilled.len()
     }
 }

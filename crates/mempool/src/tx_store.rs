@@ -58,7 +58,7 @@ impl TxStore {
     /// Insert a transaction body. Idempotent: re-inserting the same hash is
     /// a no-op (the existing `Arc` is preserved so callers holding clones
     /// keep pointing at the same allocation).
-    pub fn insert(&self, tx: Arc<Verified<Transaction>>) {
+    pub(crate) fn insert(&self, tx: Arc<Verified<Transaction>>) {
         let hash = tx.hash();
         self.inner.pin().get_or_insert_with(hash, || tx);
     }
@@ -88,7 +88,7 @@ impl TxStore {
 
     /// Drop bodies for the given hashes. Returns the number actually
     /// removed.
-    pub fn evict(&self, hashes: impl IntoIterator<Item = TxHash>) -> usize {
+    pub(crate) fn evict(&self, hashes: impl IntoIterator<Item = TxHash>) -> usize {
         let g = self.inner.pin();
         hashes.into_iter().filter(|h| g.remove(h).is_some()).count()
     }

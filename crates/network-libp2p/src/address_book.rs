@@ -32,11 +32,11 @@ use libp2p::{Multiaddr, PeerId as Libp2pPeerId};
 #[derive(Debug, Clone)]
 pub struct AddressRecord {
     /// libp2p peer id the validator binds as.
-    pub peer_id: Libp2pPeerId,
+    pub(crate) peer_id: Libp2pPeerId,
     /// Dialable multiaddrs, parsed and non-empty.
-    pub addresses: Vec<Multiaddr>,
+    pub(crate) addresses: Vec<Multiaddr>,
     /// Announce sequence of this record; higher supersedes.
-    pub sequence: u64,
+    pub(crate) sequence: u64,
 }
 
 /// Outcome of ingesting one announcement.
@@ -65,7 +65,7 @@ impl AddressBook {
     /// for its validator. Caps are enforced before the signature check so
     /// oversized spam never reaches signature verification.
     #[must_use]
-    pub fn ingest(
+    pub(crate) fn ingest(
         &self,
         verifier: &dyn Verifier,
         network: &NetworkDefinition,
@@ -128,7 +128,7 @@ impl AddressBook {
 
     /// The newest verified record for `validator`, if any.
     #[must_use]
-    pub fn get(&self, validator: ValidatorId) -> Option<AddressRecord> {
+    pub(crate) fn get(&self, validator: ValidatorId) -> Option<AddressRecord> {
         self.records.get(&validator).map(|r| r.clone())
     }
 
@@ -139,7 +139,7 @@ impl AddressBook {
     /// that is wanted, unbound, and absent from the book resolves nothing —
     /// the caller retries once its announcement arrives.
     #[must_use]
-    pub fn dial_candidates(
+    pub(crate) fn dial_candidates(
         &self,
         wanted: &HashSet<ValidatorId>,
         bound: &DashMap<ValidatorId, Libp2pPeerId>,

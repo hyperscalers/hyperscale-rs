@@ -22,7 +22,7 @@ use crate::{ConsensusPublicKey, Epoch, NetworkDefinition, VrfProof};
 #[hbor(signing_domain = "hyperscale-beacon-reveal-v1", signing_context = NetworkId)]
 pub struct BeaconRevealMessage {
     /// The epoch whose randomness the reveal contributes to.
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
 }
 
 /// Sign `(network, epoch)` and return the VRF proof. The output is

@@ -92,7 +92,7 @@ impl RocksDbShardStorage {
     ///
     /// What [`adopt_plan`] refused, or a store that cannot yield the
     /// subtree it named.
-    pub fn adopt_genesis(
+    pub(crate) fn adopt_genesis(
         &self,
         origin: ChainOrigin,
         genesis: &Block,

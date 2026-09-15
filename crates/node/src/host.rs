@@ -58,7 +58,7 @@ use crate::vnode::{Vnode, VnodeInit};
 /// The shared process-scoped resources, the per-shard drivers keyed by
 /// hosted shard id, and the host's shard-less beacon-follower pool (present
 /// only when the host carries followers).
-pub type NodeHostParts<S, N, D> = (
+pub(crate) type NodeHostParts<S, N, D> = (
     Arc<ProcessIo<S, N, D>>,
     BTreeMap<ShardId, ShardLoop<S, N, D>>,
     Option<PoolLoop<S, N, D>>,

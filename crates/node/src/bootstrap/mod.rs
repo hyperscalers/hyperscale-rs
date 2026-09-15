@@ -252,7 +252,7 @@ impl ShardBootstrap {
     /// way: the reformed parent's witness domain starts fresh, so the
     /// import seeds no window and [`Self::take_finalize`]'s seed is empty.
     #[must_use]
-    pub fn state_only(shard: ShardId, anchor: ShardAnchor) -> Self {
+    pub(crate) fn state_only(shard: ShardId, anchor: ShardAnchor) -> Self {
         Self {
             shard,
             anchor,
@@ -485,7 +485,7 @@ impl ShardBootstrap {
     /// finalize is the duty's, at the reformed parent's genesis height,
     /// not the half's.
     #[must_use]
-    pub const fn is_staged(&self) -> bool {
+    pub(crate) const fn is_staged(&self) -> bool {
         matches!(self.phase, Phase::FinalizeReady)
     }
 

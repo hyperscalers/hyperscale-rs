@@ -78,7 +78,7 @@ impl RocksDbShardStorage {
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only transactions that were found (missing hashes are skipped).
     #[must_use]
-    pub fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Transaction> {
+    pub(crate) fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Transaction> {
         if hashes.is_empty() {
             return vec![];
         }
@@ -424,7 +424,7 @@ impl RocksDbShardStorage {
     ///
     /// This ensures sync responses always contain complete, self-contained blocks.
     /// If a peer can't provide a complete block, the requester should try another peer.
-    pub fn get_block_for_sync(
+    pub(crate) fn get_block_for_sync(
         &self,
         height: BlockHeight,
     ) -> Option<(Block, QuorumCertificate, Vec<ProvisionHash>)> {
@@ -603,7 +603,7 @@ impl RocksDbShardStorage {
     /// `read_committed_height`, `read_committed_hash`, `read_latest_qc`
     /// methods when only one value is needed.
     #[must_use]
-    pub fn get_chain_metadata(
+    pub(crate) fn get_chain_metadata(
         &self,
     ) -> (
         BlockHeight,
@@ -658,7 +658,7 @@ impl RocksDbShardStorage {
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing ids are skipped).
     #[must_use]
-    pub fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
+    pub(crate) fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
         if ids.is_empty() {
             return vec![];
         }
@@ -700,7 +700,7 @@ mod test_helpers {
         ///
         /// # Panics
         /// Panics if the synced `WriteBatch` fails.
-        pub fn set_chain_metadata(
+        pub(crate) fn set_chain_metadata(
             &self,
             height: BlockHeight,
             hash: Option<Hash>,

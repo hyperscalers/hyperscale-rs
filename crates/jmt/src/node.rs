@@ -52,7 +52,7 @@ pub(crate) fn bits_at(key: &Key, depth_bits: u16, count: u8) -> u8 {
 /// Maximum tree depth in bits: the key's own bit width. For any
 /// supported arity (1, 2, or 4 bits per level) the depth is bounded by
 /// `KEY_BITS / ARITY_BITS`.
-pub const MAX_DEPTH_BITS: u16 = KEY_BITS;
+pub(crate) const MAX_DEPTH_BITS: u16 = KEY_BITS;
 
 // ============================================================
 // NibblePath: compact bit-path representation
@@ -193,7 +193,7 @@ impl NibblePath {
 
     /// Canonical byte encoding: `bits_be (2B) || path_bytes`.
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(2 + self.bytes.len());
         buf.extend_from_slice(&self.bits.to_be_bytes());
         buf.extend_from_slice(&self.bytes);
@@ -207,7 +207,7 @@ impl NibblePath {
     ///
     /// Returns [`PathDecodeError`] if the buffer is truncated or its byte
     /// length disagrees with the encoded bit count.
-    pub fn decode(bytes: &[u8]) -> Result<Self, PathDecodeError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, PathDecodeError> {
         if bytes.len() < 2 {
             return Err(PathDecodeError::Truncated);
         }
@@ -382,7 +382,7 @@ impl InternalNode {
 
     /// Hash an internal node's children without constructing one.
     #[must_use]
-    pub fn compute_hash<H: Hasher>(children: &[Option<Child>]) -> Hash {
+    pub(crate) fn compute_hash<H: Hasher>(children: &[Option<Child>]) -> Hash {
         let flat: Vec<Hash> = children
             .iter()
             .map(|c| c.as_ref().map_or(EMPTY_HASH, |c| c.hash))
@@ -432,7 +432,7 @@ pub struct LeafValue {
     /// Hash of the stored value.
     pub hash: ValueHash,
     /// Byte length of the stored value.
-    pub len: u64,
+    pub(crate) len: u64,
 }
 
 impl LeafValue {
@@ -479,7 +479,7 @@ impl LeafNode {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StaleNodeIndex {
     /// Version at which `node_key` ceased to be live.
-    pub stale_since_version: u64,
+    pub(crate) stale_since_version: u64,
     /// Key of the node that became stale.
     pub node_key: NodeKey,
 }
@@ -492,7 +492,7 @@ pub struct TreeUpdateBatch {
     /// Nodes that the update made unreachable.
     pub stale_nodes: Vec<StaleNodeIndex>,
     /// New `(version, root_key)` mapping, if the tree changed.
-    pub root_key: Option<(u64, NodeKey)>,
+    pub(crate) root_key: Option<(u64, NodeKey)>,
     /// Net leaf-count change: inserts of new keys minus deletes of
     /// existing keys. Value updates and deletes of absent keys
     /// contribute zero.

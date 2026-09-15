@@ -141,7 +141,7 @@ impl MemoryStore {
 
     /// Highest committed version, if any.
     #[must_use]
-    pub fn latest_version(&self) -> Option<u64> {
+    pub(crate) fn latest_version(&self) -> Option<u64> {
         self.root_keys.keys().max().copied()
     }
 

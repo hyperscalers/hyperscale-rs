@@ -116,7 +116,7 @@ pub struct EarlyArrivalBuffer {
 }
 
 impl EarlyArrivalBuffer {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             votes: HashMap::new(),
             tx_index: HashMap::new(),
@@ -142,7 +142,7 @@ impl EarlyArrivalBuffer {
     /// under a voter's name must not be able to keep that voter's
     /// genuine vote out. An overwritten vote costs its sender one retry
     /// interval, which is what a drop costs here anyway.
-    pub fn buffer_vote(&mut self, tick_id: TickId, vote: Verifiable<ExecutionVote>) -> bool {
+    pub(crate) fn buffer_vote(&mut self, tick_id: TickId, vote: Verifiable<ExecutionVote>) -> bool {
         let voter = vote.validator();
         if let Some(held) = self
             .votes
@@ -168,7 +168,10 @@ impl EarlyArrivalBuffer {
     /// Remove and return all buffered votes for `tick_id`. Called when the
     /// coordinator creates a leader or fallback-leader `VoteTracker` and
     /// needs to replay the backlog.
-    pub fn drain_votes_for_tick(&mut self, tick_id: &TickId) -> Vec<Verifiable<ExecutionVote>> {
+    pub(crate) fn drain_votes_for_tick(
+        &mut self,
+        tick_id: &TickId,
+    ) -> Vec<Verifiable<ExecutionVote>> {
         let drained = self.votes.remove(tick_id).unwrap_or_default();
         self.buffered -= drained.len();
         drained
@@ -177,7 +180,7 @@ impl EarlyArrivalBuffer {
     /// Predicate-driven retention for vote entries. The caller owns the
     /// policy (is the tick still tracked? does it already have an EC?); the
     /// buffer just exposes the retention cutoff and the retain loop.
-    pub fn retain_votes<F>(&mut self, mut predicate: F)
+    pub(crate) fn retain_votes<F>(&mut self, mut predicate: F)
     where
         F: FnMut(&TickId, &[Verifiable<ExecutionVote>]) -> bool,
     {
@@ -197,7 +200,11 @@ impl EarlyArrivalBuffer {
     /// assignment. Idempotent: `tx_hashes` already tracked for this EC's
     /// `tick_id` are skipped, so replaying a previously-buffered EC won't
     /// create duplicate entries in the reverse index.
-    pub fn buffer_ec(&mut self, ec: &Arc<Verified<ExecutionCertificate>>, tx_hashes: &[TxHash]) {
+    pub(crate) fn buffer_ec(
+        &mut self,
+        ec: &Arc<Verified<ExecutionCertificate>>,
+        tx_hashes: &[TxHash],
+    ) {
         if tx_hashes.is_empty() {
             return;
         }
@@ -222,7 +229,11 @@ impl EarlyArrivalBuffer {
     /// empty the EC has been fully delivered and the entry is dropped.
     /// The reverse index is NOT touched here — the EC's `tx_hashes` are
     /// drained explicitly by [`drain_ecs_for_txs`] when those txs commit.
-    pub fn clear_routed(&mut self, ec: &Arc<Verified<ExecutionCertificate>>, tx_hashes: &[TxHash]) {
+    pub(crate) fn clear_routed(
+        &mut self,
+        ec: &Arc<Verified<ExecutionCertificate>>,
+        tx_hashes: &[TxHash],
+    ) {
         let Some(entry) = self.pending_routing.get_mut(ec.tick_id()) else {
             return;
         };
@@ -242,7 +253,7 @@ impl EarlyArrivalBuffer {
     /// `pending_routing` entry is left alone (the caller will typically
     /// feed the EC into `handle_attestation`, which then calls
     /// `clear_routed` to drop the entry).
-    pub fn drain_ecs_for_txs(
+    pub(crate) fn drain_ecs_for_txs(
         &mut self,
         tx_hashes: &[TxHash],
     ) -> Vec<Arc<Verified<ExecutionCertificate>>> {
@@ -267,7 +278,7 @@ impl EarlyArrivalBuffer {
     /// side. Past it, every tx the EC mentions has expired its
     /// `validity_range` and either terminated or aborted, so no local
     /// tick can still consume it. Returns the number of ECs evicted.
-    pub fn gc_stale_ecs(&mut self, now_ts: WeightedTimestamp) -> usize {
+    pub(crate) fn gc_stale_ecs(&mut self, now_ts: WeightedTimestamp) -> usize {
         let stale: Vec<TickId> = self
             .pending_routing
             .iter()
@@ -296,21 +307,21 @@ impl EarlyArrivalBuffer {
 
     // ─── Query ──────────────────────────────────────────────────────────
 
-    pub fn vote_len(&self) -> usize {
+    pub(crate) fn vote_len(&self) -> usize {
         self.votes.len()
     }
 
-    pub fn tx_index_len(&self) -> usize {
+    pub(crate) fn tx_index_len(&self) -> usize {
         self.tx_index.len()
     }
 
-    pub fn pending_routing_len(&self) -> usize {
+    pub(crate) fn pending_routing_len(&self) -> usize {
         self.pending_routing.len()
     }
 
     /// How many buffered ECs mention `tx_hash` — the count surfaced by the
     /// coordinator's `certificate_tracking_debug` output.
-    pub fn attestation_count_for_tx(&self, tx_hash: TxHash) -> usize {
+    pub(crate) fn attestation_count_for_tx(&self, tx_hash: TxHash) -> usize {
         self.tx_index.get(&tx_hash).map_or(0, Vec::len)
     }
 }

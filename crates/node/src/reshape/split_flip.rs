@@ -42,7 +42,7 @@ use hyperscale_types::{
 /// Fails when the quorum certificate does not certify the terminal header,
 /// or when the terminal carries no `split_child_roots` pair composing to
 /// its own committed state root.
-pub fn split_genesis_from_terminal(
+pub(crate) fn split_genesis_from_terminal(
     child: ShardId,
     terminal_header: &BlockHeader,
     terminal_qc: &QuorumCertificate,

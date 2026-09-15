@@ -171,7 +171,7 @@ impl RequestStreamPool {
     /// Returns the underlying [`NetworkError`] if the per-(peer,shard)
     /// actor cannot be spawned, the stream open fails, or the request
     /// times out.
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         peer: PeerId,
         shard: ShardId,

@@ -16,18 +16,23 @@ use hyperscale_node::shard::{EventPriority, HostEvent};
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct EventKey {
     /// When this event should be processed.
-    pub time: Duration,
+    pub(crate) time: Duration,
     /// Priority for ordering at same time.
-    pub priority: EventPriority,
+    pub(crate) priority: EventPriority,
     /// Which node receives this event.
-    pub node_index: NodeIndex,
+    pub(crate) node_index: NodeIndex,
     /// Sequence number for deterministic FIFO ordering.
-    pub sequence: u64,
+    pub(crate) sequence: u64,
 }
 
 impl EventKey {
     /// Create a new event key from a [`HostEvent`].
-    pub fn new(time: Duration, event: &HostEvent, node_index: NodeIndex, sequence: u64) -> Self {
+    pub(crate) fn new(
+        time: Duration,
+        event: &HostEvent,
+        node_index: NodeIndex,
+        sequence: u64,
+    ) -> Self {
         Self {
             time,
             priority: event.priority(),

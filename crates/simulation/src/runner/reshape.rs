@@ -55,7 +55,7 @@ impl SimulationRunner {
     /// Step every host's reshape orchestrator one slice, driving its duties to a
     /// fixpoint against the synchronous in-memory io. Idempotent — safe to call
     /// every slice.
-    pub fn reshape_step(&mut self) {
+    pub(crate) fn reshape_step(&mut self) {
         for host in 0..self.num_hosts() {
             self.reshape_step_host(host);
         }

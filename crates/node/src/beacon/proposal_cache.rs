@@ -38,7 +38,7 @@ pub struct BeaconProposalCache {
 }
 
 impl BeaconProposalCache {
-    pub fn new(network: NetworkDefinition) -> Self {
+    pub(crate) fn new(network: NetworkDefinition) -> Self {
         Self {
             network,
             feed: Mutex::new(()),
@@ -49,7 +49,12 @@ impl BeaconProposalCache {
     /// Admit a verified proposal, advancing the cache to `epoch` when
     /// newer. First write per `(epoch, validator)` wins, mirroring the
     /// coordinator pools' discipline.
-    pub fn admit(&self, from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>) {
+    pub(crate) fn admit(
+        &self,
+        from: ValidatorId,
+        epoch: Epoch,
+        proposal: Arc<Verified<BeaconProposal>>,
+    ) {
         let _feed = self.feed.lock().expect("beacon proposal cache feed lock");
         if epoch > self.pool.epoch() {
             self.pool.reset(epoch);
@@ -60,7 +65,7 @@ impl BeaconProposalCache {
     /// Admit a wire proposal: reuse a surviving `Verified` marker
     /// (local dispatch), otherwise VRF-verify under `sender_pk` and
     /// drop on failure.
-    pub fn admit_wire(
+    pub(crate) fn admit_wire(
         &self,
         verifier: &dyn Verifier,
         from: ValidatorId,
@@ -86,7 +91,7 @@ impl BeaconProposalCache {
     }
 
     /// Serve an inbound fetch from the cache.
-    pub fn serve(&self, req: &GetBeaconProposalRequest) -> GetBeaconProposalResponse {
+    pub(crate) fn serve(&self, req: &GetBeaconProposalRequest) -> GetBeaconProposalResponse {
         serve_beacon_proposal_request(&self.pool, req)
     }
 }

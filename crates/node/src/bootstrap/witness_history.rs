@@ -46,7 +46,7 @@ enum SyncState {
 }
 
 /// Witness-history assembly state for one shard bootstrap.
-pub struct WitnessHistorySync {
+pub(crate) struct WitnessHistorySync {
     anchor: ShardAnchor,
     limit: u32,
     state: SyncState,
@@ -59,7 +59,7 @@ impl WitnessHistorySync {
     /// Start an assembly against `anchor`, fetching up to `limit` leaf
     /// hashes per request.
     #[must_use]
-    pub fn new(anchor: ShardAnchor, limit: u32) -> Self {
+    pub(crate) fn new(anchor: ShardAnchor, limit: u32) -> Self {
         Self {
             anchor,
             limit: limit.max(1),
@@ -77,7 +77,7 @@ impl WitnessHistorySync {
     /// first page's header) plus the hashes assembled so far. The
     /// opening request starts at zero — the server clamps it up to the
     /// base the joiner doesn't yet know.
-    pub fn next_request(&mut self) -> Option<GetWitnessHistoryRequest> {
+    pub(crate) fn next_request(&mut self) -> Option<GetWitnessHistoryRequest> {
         if self.state != SyncState::Idle {
             return None;
         }
@@ -96,14 +96,14 @@ impl WitnessHistorySync {
 
     /// Re-arm after a transport-level failure (timeout, unreachable
     /// peer). Not a peer verdict — that's the transport's.
-    pub fn on_failure(&mut self) {
+    pub(crate) fn on_failure(&mut self) {
         if self.state == SyncState::InFlight {
             self.state = SyncState::Idle;
         }
     }
 
     /// Verify and absorb one response.
-    pub fn on_response(&mut self, response: &GetWitnessHistoryResponse) -> BootstrapOutcome {
+    pub(crate) fn on_response(&mut self, response: &GetWitnessHistoryResponse) -> BootstrapOutcome {
         if self.state != SyncState::InFlight {
             return BootstrapOutcome::Rejected("unsolicited response");
         }
@@ -172,7 +172,7 @@ impl WitnessHistorySync {
 
     /// Whether the history is fully assembled and verified.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.state == SyncState::Complete
     }
 
@@ -187,7 +187,9 @@ impl WitnessHistorySync {
     /// Panics unless [`Self::is_complete`] — a partial history would
     /// seed an accumulator whose roots can never match.
     #[must_use]
-    pub fn take_parts(&mut self) -> (BlockHeader, QuorumCertificate, Vec<ShardWitnessPayload>) {
+    pub(crate) fn take_parts(
+        &mut self,
+    ) -> (BlockHeader, QuorumCertificate, Vec<ShardWitnessPayload>) {
         assert!(
             self.is_complete(),
             "witness history taken before assembly completed",

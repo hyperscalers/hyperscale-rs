@@ -42,14 +42,14 @@ pub struct ExpectedTxs {
 }
 
 impl ExpectedTxs {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Record `(tx_hash, source_shard, first_seen_ts)` as expected. No-op if
     /// `tx_hash` is already tracked (first sighting wins regardless of
     /// source).
-    pub fn record(
+    pub(crate) fn record(
         &mut self,
         tx_hash: TxHash,
         source_shard: ShardId,
@@ -65,7 +65,7 @@ impl ExpectedTxs {
     /// the tx is in pool. Returns `true` if an entry was removed — the
     /// caller uses that to emit `Action::AbandonFetch` so any in-flight
     /// fetch is cancelled.
-    pub fn forget(&mut self, tx_hash: &TxHash) -> bool {
+    pub(crate) fn forget(&mut self, tx_hash: &TxHash) -> bool {
         self.entries.remove(tx_hash).is_some()
     }
 
@@ -87,7 +87,7 @@ impl ExpectedTxs {
     /// Drain entries whose first sighting is older than `horizon` at `now`.
     /// Returned in `(tx_hash, source_shard)` form so callers can warn/metric
     /// per-entry; the entries themselves are removed from the index.
-    pub fn drop_past_horizon(
+    pub(crate) fn drop_past_horizon(
         &mut self,
         now: WeightedTimestamp,
         horizon: Duration,
@@ -109,7 +109,7 @@ impl ExpectedTxs {
     ///
     /// Returns groups in `ShardId` order; ids within each group sorted
     /// by `TxHash` — `HashMap` iteration is otherwise random.
-    pub fn due_for_fetch(
+    pub(crate) fn due_for_fetch(
         &self,
         now: WeightedTimestamp,
         grace: Duration,
@@ -135,7 +135,7 @@ impl ExpectedTxs {
     /// missing txs; a commit-independent caller flushes through here so the
     /// fallback still fires. The fetch protocol dedupes in-flight ids, so
     /// re-emitting is safe.
-    pub fn flush_all(&self) -> Vec<(ShardId, Vec<TxHash>)> {
+    pub(crate) fn flush_all(&self) -> Vec<(ShardId, Vec<TxHash>)> {
         let mut by_source: BTreeMap<ShardId, Vec<TxHash>> = BTreeMap::new();
         for (tx_hash, entry) in &self.entries {
             by_source

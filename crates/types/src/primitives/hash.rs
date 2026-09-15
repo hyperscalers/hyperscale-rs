@@ -80,7 +80,7 @@ impl Hash {
 
     /// Convert hash to hex string.
     #[must_use]
-    pub fn to_hex(&self) -> String {
+    pub(crate) fn to_hex(self) -> String {
         hex_encode(self.0.0)
     }
 
@@ -129,7 +129,7 @@ impl Hash {
 
     /// Check if this is the zero hash.
     #[must_use]
-    pub fn is_zero(&self) -> bool {
+    pub(crate) fn is_zero(&self) -> bool {
         self.0.0.iter().all(|&b| b == 0)
     }
 

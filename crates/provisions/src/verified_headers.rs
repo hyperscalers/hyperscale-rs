@@ -41,14 +41,14 @@ pub struct VerifiedHeaderBuffer {
 impl VerifiedHeaderBuffer {
     /// Create an empty buffer.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             headers: HashMap::new(),
         }
     }
 
     /// Insert a verified header. Overwrites any previous entry for the same key.
-    pub fn insert(&self, key: Key, header: Arc<Verified<CertifiedBlockHeader>>) {
+    pub(crate) fn insert(&self, key: Key, header: Arc<Verified<CertifiedBlockHeader>>) {
         self.headers.pin().insert(key, header);
     }
 
@@ -63,7 +63,7 @@ impl VerifiedHeaderBuffer {
     /// above the attested frontier the retained committee's certified
     /// history is rejected network-wide, so a pre-admitted header must not
     /// keep anchoring provision verification.
-    pub fn remove_above(&self, shard: ShardId, frontier: BlockHeight) -> Vec<Key> {
+    pub(crate) fn remove_above(&self, shard: ShardId, frontier: BlockHeight) -> Vec<Key> {
         let map = self.headers.pin();
         let keys: Vec<Key> = map
             .keys()
@@ -77,13 +77,13 @@ impl VerifiedHeaderBuffer {
     }
 
     /// Remove and return a verified header.
-    pub fn remove(&self, key: Key) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    pub(crate) fn remove(&self, key: Key) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
         self.headers.pin().remove(&key).cloned()
     }
 
     /// Current number of stored headers.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.headers.len()
     }
 

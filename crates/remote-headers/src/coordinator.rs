@@ -58,13 +58,13 @@ const COMMIT_PROOF_INITIAL_COUNT: u64 = 4;
 #[allow(missing_docs)] // flat counters; field names are the documentation
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RemoteHeaderMemoryStats {
-    pub pending_headers: usize,
-    pub verified_headers: usize,
-    pub proven_headers: usize,
-    pub expected_headers: usize,
+    pub(crate) pending_headers: usize,
+    pub(crate) verified_headers: usize,
+    pub(crate) proven_headers: usize,
+    pub(crate) expected_headers: usize,
     /// Held off-branch fork siblings — nonzero means a remote committee is
     /// producing conflicting certified headers at some height.
-    pub fork_siblings: usize,
+    pub(crate) fork_siblings: usize,
 }
 
 impl RemoteHeaderMemoryStats {

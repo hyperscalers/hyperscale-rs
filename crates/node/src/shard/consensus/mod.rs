@@ -48,17 +48,17 @@ pub type CertifiedHeaderVerificationItem = (
 pub struct ConsensusState {
     /// Block-sync state machine: catch the shard chain up to a target
     /// height by fetching and committing missing blocks.
-    pub block_sync: BlockSync,
+    pub(crate) block_sync: BlockSync,
 
     /// Pending remote-certified header gossip awaiting batched
     /// sender-signature verification on the crypto pool.
-    pub certified_header_batch: BatchAccumulator<CertifiedHeaderVerificationItem>,
+    pub(crate) certified_header_batch: BatchAccumulator<CertifiedHeaderVerificationItem>,
 }
 
 impl ConsensusState {
     /// Build consensus state for a freshly hosted shard.
     #[must_use]
-    pub fn new(config: &NodeConfig) -> Self {
+    pub(crate) fn new(config: &NodeConfig) -> Self {
         let b = &config.batch;
         Self {
             block_sync: BlockSync::new(config.block_sync.clone()),
@@ -74,13 +74,13 @@ impl ConsensusState {
     /// heights eventually retry and an active sync keeps emitting fetches
     /// even if its consumer is slow to admit.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         self.block_sync.has_deferred() || self.block_sync.is_syncing()
     }
 
     /// Drive the block-sync FSM's periodic tick. Returns the outputs the
     /// I/O loop should dispatch (block fetches, deliveries, sync-complete).
-    pub fn block_tick(&mut self, now: LocalTimestamp) -> Vec<BlockSyncOutput> {
+    pub(crate) fn block_tick(&mut self, now: LocalTimestamp) -> Vec<BlockSyncOutput> {
         self.block_sync.handle(BlockSyncInput::Tick { now })
     }
 }

@@ -121,7 +121,7 @@ where
     /// Add a follower at runtime — a validator that drained off its last
     /// shard — arming its beacon startup timers into the timer scratch for
     /// the caller to drain.
-    pub fn add_vnode(&mut self, vnode: Vnode) {
+    pub(crate) fn add_vnode(&mut self, vnode: Vnode) {
         self.vnodes.push(vnode);
         self.arm_beacon_startup(self.vnodes.len() - 1);
     }
@@ -165,13 +165,13 @@ where
 
     /// Number of pooled vnodes.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.vnodes.len()
     }
 
     /// Whether the pool holds no vnodes.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.vnodes.is_empty()
     }
 

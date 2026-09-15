@@ -25,7 +25,7 @@ use crate::{BlockHash, BlockHeight, LeafIndex, MessageClass, NetworkMessage, Req
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetShardWitnessesRequest {
     /// Shard whose witnesses are being fetched.
-    pub shard_id: ShardId,
+    pub(crate) shard_id: ShardId,
     /// Height of the anchor block in `shard_id`'s chain.
     pub block_height: BlockHeight,
     /// Hash of the anchor block. The responder cross-checks this

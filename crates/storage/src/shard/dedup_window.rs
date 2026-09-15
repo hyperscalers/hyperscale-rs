@@ -276,7 +276,7 @@ impl DedupWindow {
     /// the horizon. Since the anchor trails the tip by up to a full epoch
     /// and the horizon is under one, the tail alone often covers it.
     #[must_use]
-    pub fn covering_nothing() -> Self {
+    pub(crate) fn covering_nothing() -> Self {
         Self::default()
     }
 }

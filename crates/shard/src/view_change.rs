@@ -78,7 +78,7 @@ impl ViewChangeController {
     /// round the first block after the recovered (or genesis) QC is proposed
     /// in. Rounds increase per block, so this is the genesis QC's round (0)
     /// plus one on a fresh start.
-    pub const fn new(initial_view: Round) -> Self {
+    pub(crate) const fn new(initial_view: Round) -> Self {
         Self {
             view: initial_view,
             view_at_height_start: initial_view,
@@ -90,13 +90,13 @@ impl ViewChangeController {
     }
 
     /// Record a direct signal of leader progress (proposal, QC, commit).
-    pub const fn record_leader_activity(&mut self, now: LocalTimestamp) {
+    pub(crate) const fn record_leader_activity(&mut self, now: LocalTimestamp) {
         self.last_leader_activity = Some(now);
     }
 
     /// Record leader progress from a received header, rate-limited to once
     /// per `(height, round)` to thwart Byzantine header-spam.
-    pub fn record_header_activity(
+    pub(crate) fn record_header_activity(
         &mut self,
         height: BlockHeight,
         round: Round,
@@ -115,7 +115,7 @@ impl ViewChangeController {
     /// rounds_at_height, VIEW_CHANGE_TIMEOUT_MAX)`. All validators compute
     /// the same timeout because round numbers are QC- and header-attested,
     /// so the formula is deterministic network-wide.
-    pub fn current_timeout(&self) -> Duration {
+    pub(crate) fn current_timeout(&self) -> Duration {
         let rounds_at_height = self
             .view
             .inner()
@@ -126,7 +126,7 @@ impl ViewChangeController {
     }
 
     /// Time remaining until the view change timer should fire.
-    pub fn remaining_timeout(&self, now: LocalTimestamp) -> Duration {
+    pub(crate) fn remaining_timeout(&self, now: LocalTimestamp) -> Duration {
         let timeout = self.current_timeout();
         let deadline = self
             .last_leader_activity
@@ -141,7 +141,7 @@ impl ViewChangeController {
 
     /// Returns `true` if the leader has been silent longer than the current
     /// timeout and a view change should fire.
-    pub fn timeout_elapsed(&self, now: LocalTimestamp) -> bool {
+    pub(crate) fn timeout_elapsed(&self, now: LocalTimestamp) -> bool {
         let Some(last_activity) = self.last_leader_activity else {
             return false;
         };
@@ -150,7 +150,7 @@ impl ViewChangeController {
 
     /// Called when committed height advances: rebase linear-backoff tracking
     /// so the next height starts with a fresh round counter.
-    pub const fn reset_for_height_advance(&mut self) {
+    pub(crate) const fn reset_for_height_advance(&mut self) {
         self.view_at_height_start = self.view;
     }
 
@@ -159,7 +159,7 @@ impl ViewChangeController {
     /// `r`; the proposer of the successor block moves to `r + 1`. This is what
     /// makes rounds strictly increase per block. Returns `true` if the view
     /// advanced.
-    pub fn advance_on_qc(&mut self, qc_round: Round) -> bool {
+    pub(crate) fn advance_on_qc(&mut self, qc_round: Round) -> bool {
         self.sync_to_qc_round(qc_round.next())
     }
 
@@ -167,7 +167,7 @@ impl ViewChangeController {
     /// round abandoned. Counts as a view change (the pacemaker synchronised the
     /// cluster), and clears the header-reset tracker so the new round accepts a
     /// fresh header-activity reset. Returns `true` if the view advanced.
-    pub fn advance_to(&mut self, target: Round) -> bool {
+    pub(crate) fn advance_to(&mut self, target: Round) -> bool {
         if target > self.view {
             self.view = target;
             self.view_changes += 1;
@@ -182,7 +182,7 @@ impl ViewChangeController {
     /// quorum certificate. A QC at round R proves 2f+1 validators reached R,
     /// so the target reflects real network progress and is adopted as-is.
     /// Returns `true` if the view was advanced.
-    pub fn sync_to_qc_round(&mut self, qc_round: Round) -> bool {
+    pub(crate) fn sync_to_qc_round(&mut self, qc_round: Round) -> bool {
         if qc_round > self.view {
             self.view = qc_round;
             self.view_syncs += 1;
@@ -203,7 +203,11 @@ impl ViewChangeController {
     /// what a quorum has certified. A node further behind than the cap catches
     /// up through verified QC sync as it applies blocks. Returns `true` if the
     /// view was advanced.
-    pub fn sync_to_observed_round(&mut self, observed_round: Round, verified_round: Round) -> bool {
+    pub(crate) fn sync_to_observed_round(
+        &mut self,
+        observed_round: Round,
+        verified_round: Round,
+    ) -> bool {
         let ceiling = Round::new(verified_round.inner().saturating_add(VIEW_SYNC_GAP));
         self.sync_to_qc_round(observed_round.min(ceiling))
     }

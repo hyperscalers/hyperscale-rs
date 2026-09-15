@@ -39,7 +39,7 @@ impl RoutePrefix {
 
     /// The bits themselves, most significant first.
     #[must_use]
-    pub const fn bits(self) -> u64 {
+    pub(crate) const fn bits(self) -> u64 {
         self.0
     }
 }
@@ -193,7 +193,7 @@ impl ShardTrie {
 
     /// Number of live shards.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.leaves.len()
     }
 

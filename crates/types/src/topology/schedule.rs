@@ -505,7 +505,7 @@ impl TopologySchedule {
     /// to reject the orphan, since the only legitimate new crossing is the
     /// fresh committee's. False when no recovery is pending for the shard.
     #[must_use]
-    pub fn recovery_resolves_retained(
+    pub(crate) fn recovery_resolves_retained(
         &self,
         shard: ShardId,
         anchor_wt: WeightedTimestamp,
@@ -867,7 +867,7 @@ impl TopologySchedule {
     /// [`anchor_epoch_for`](Self::anchor_epoch_for) treats a boundary
     /// instant as belonging to the window it closes.
     #[must_use]
-    pub fn terminates_at_end_of(&self, shard: ShardId, epoch: Epoch) -> Option<bool> {
+    pub(crate) fn terminates_at_end_of(&self, shard: ShardId, epoch: Epoch) -> Option<bool> {
         if self.epoch_duration_ms == 0 {
             return Some(false);
         }
@@ -899,7 +899,7 @@ impl TopologySchedule {
     /// [`merge_pending`]: TopologySnapshot::merge_pending
     /// [`terminates_at_next_boundary`]: Self::terminates_at_next_boundary
     #[must_use]
-    pub fn termination_scheduled(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+    pub(crate) fn termination_scheduled(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
         let pending = self
             .forward_windows(wt)
             .into_iter()

@@ -49,7 +49,7 @@ pub struct PackagesState {
 }
 
 impl PackagesState {
-    pub fn new(config: &NodeConfig) -> Self {
+    pub(crate) fn new(config: &NodeConfig) -> Self {
         // The wire caps the batch far below the generic default: an
         // artifact runs to a transaction's whole byte budget.
         let mut fetch_config = config.package_artifact_fetch.clone();
@@ -63,7 +63,7 @@ impl PackagesState {
 
     /// Whether the artifact fetch has work the tick loop should drive.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         self.fetch.has_pending()
     }
 }

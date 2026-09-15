@@ -77,7 +77,7 @@ pub enum HistoryOutcome {
 
 /// The walk down from a boundary anchor.
 #[derive(Debug)]
-pub struct HistoryBackfill {
+pub(crate) struct HistoryBackfill {
     /// The highest height not yet on the hash line.
     next: BlockHeight,
     /// The hash the block at [`Self::next`] must have.
@@ -101,7 +101,7 @@ impl HistoryBackfill {
     /// boundary import seats that block's header and no manifest, so the
     /// first row a fold asks for is already one the store cannot answer.
     #[must_use]
-    pub const fn new(anchor: &ShardAnchor, floor: WeightedTimestamp) -> Self {
+    pub(crate) const fn new(anchor: &ShardAnchor, floor: WeightedTimestamp) -> Self {
         Self {
             next: anchor.height,
             expected: anchor.block_hash,
@@ -114,12 +114,12 @@ impl HistoryBackfill {
 
     /// Whether the walk has reached the floor or the bottom of the chain.
     #[must_use]
-    pub const fn is_complete(&self) -> bool {
+    pub(crate) const fn is_complete(&self) -> bool {
         self.done
     }
 
     /// Every height the walk wants in flight and has no request out for.
-    pub fn next_requests(&mut self) -> Vec<GetBlockRequest> {
+    pub(crate) fn next_requests(&mut self) -> Vec<GetBlockRequest> {
         if self.done {
             return Vec::new();
         }
@@ -139,7 +139,7 @@ impl HistoryBackfill {
 
     /// Re-arm `height` after a transport failure or an empty answer, so
     /// the next pass asks another peer.
-    pub fn on_failure(&mut self, height: BlockHeight) {
+    pub(crate) fn on_failure(&mut self, height: BlockHeight) {
         self.asked.remove(&height);
     }
 
@@ -148,7 +148,7 @@ impl HistoryBackfill {
     /// Rehydrated against nothing: the walk advertises no inventory, so
     /// a peer that elides a body has answered something this store could
     /// never reassemble and the height re-arms against another.
-    pub fn on_response(
+    pub(crate) fn on_response(
         &mut self,
         height: BlockHeight,
         response: &GetBlockResponse,

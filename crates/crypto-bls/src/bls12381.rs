@@ -20,7 +20,7 @@ use blst::min_pk::{
 /// The proof-of-possession ciphersuite every signature here is made and
 /// verified under. Signing and verifying must name the identical string
 /// or verification fails, so it lives in one place.
-pub const CIPHERSUITE: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+pub(crate) const CIPHERSUITE: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 /// A BLS12-381 G1 public key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -28,7 +28,7 @@ pub struct PublicKey(pub [u8; Self::LENGTH]);
 
 impl PublicKey {
     /// Byte length of a compressed G1 point.
-    pub const LENGTH: usize = 48;
+    pub(crate) const LENGTH: usize = 48;
 
     /// Sum `keys` into the single key their signatures aggregate under.
     ///
@@ -39,7 +39,7 @@ impl PublicKey {
     /// check would otherwise be defending against, and it is a per-key
     /// cost on a hot path.
     #[must_use]
-    pub fn aggregate(keys: &[Self], validate: bool) -> Option<Self> {
+    pub(crate) fn aggregate(keys: &[Self], validate: bool) -> Option<Self> {
         if keys.is_empty() {
             return None;
         }
@@ -57,11 +57,11 @@ impl PublicKey {
 
 /// A BLS12-381 G2 signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Signature(pub [u8; Self::LENGTH]);
+pub(crate) struct Signature(pub [u8; Self::LENGTH]);
 
 impl Signature {
     /// Byte length of a compressed G2 point.
-    pub const LENGTH: usize = 96;
+    pub(crate) const LENGTH: usize = 96;
 
     /// Sum `signatures` into the aggregate that verifies against the
     /// summed public key.
@@ -70,7 +70,7 @@ impl Signature {
     /// refuses the whole aggregate rather than producing a value that
     /// cannot verify.
     #[must_use]
-    pub fn aggregate(signatures: &[Self], validate: bool) -> Option<Self> {
+    pub(crate) fn aggregate(signatures: &[Self], validate: bool) -> Option<Self> {
         if signatures.is_empty() {
             return None;
         }
@@ -86,7 +86,7 @@ pub struct PrivateKey(SecretKey);
 
 impl PrivateKey {
     /// Byte length of a serialized scalar.
-    pub const LENGTH: usize = 32;
+    pub(crate) const LENGTH: usize = 32;
 
     /// Derive a key from 32 bytes of input keying material.
     ///
@@ -98,7 +98,7 @@ impl PrivateKey {
     ///
     /// Cannot panic: `key_gen` succeeds for any input of this length.
     #[must_use]
-    pub fn from_ikm(ikm: &[u8; Self::LENGTH]) -> Self {
+    pub(crate) fn from_ikm(ikm: &[u8; Self::LENGTH]) -> Self {
         Self(SecretKey::key_gen(ikm, &[]).expect("key_gen accepts any 32-byte ikm"))
     }
 
@@ -120,7 +120,7 @@ impl PrivateKey {
 
     /// Sign `message`.
     #[must_use]
-    pub fn sign(&self, message: &[u8]) -> Signature {
+    pub(crate) fn sign(&self, message: &[u8]) -> Signature {
         Signature(self.0.sign(message, CIPHERSUITE, &[]).to_bytes())
     }
 
@@ -136,7 +136,7 @@ impl PrivateKey {
 /// Both points are group-checked, and malformed bytes are a refusal
 /// rather than a panic, so peer-supplied values reach this directly.
 #[must_use]
-pub fn verify(message: &[u8], public_key: &PublicKey, signature: &Signature) -> bool {
+pub(crate) fn verify(message: &[u8], public_key: &PublicKey, signature: &Signature) -> bool {
     let (Ok(sig), Ok(pk)) = (
         BlstSignature::from_bytes(&signature.0),
         BlstPublicKey::from_bytes(&public_key.0),
@@ -149,7 +149,7 @@ pub fn verify(message: &[u8], public_key: &PublicKey, signature: &Signature) -> 
 /// Whether `signature` is the aggregate of each key's signature over its
 /// own message — the distinct-message aggregate check.
 #[must_use]
-pub fn aggregate_verify(pairs: &[(PublicKey, Vec<u8>)], signature: &Signature) -> bool {
+pub(crate) fn aggregate_verify(pairs: &[(PublicKey, Vec<u8>)], signature: &Signature) -> bool {
     let Ok(sig) = BlstSignature::from_bytes(&signature.0) else {
         return false;
     };

@@ -47,7 +47,7 @@ pub struct BlockSyncState {
     /// for these heights must omit the inventory bloom so the responder
     /// cannot elide bodies the requester couldn't resolve last time.
     /// Drained when the height is admitted or the protocol completes.
-    pub force_full_refetch: HashSet<BlockHeight>,
+    pub(crate) force_full_refetch: HashSet<BlockHeight>,
 }
 
 impl SyncBinding for BlockSyncBinding {
@@ -110,19 +110,19 @@ pub struct BlockSyncStatus {
 /// generic's per-scope status into block-sync's external shape.
 impl Sync<BlockSyncBinding> {
     /// Mark `height` so its next fetch omits the inventory bloom.
-    pub fn mark_force_full_refetch(&mut self, height: BlockHeight) {
+    pub(crate) fn mark_force_full_refetch(&mut self, height: BlockHeight) {
         self.binding_state_mut().force_full_refetch.insert(height);
     }
 
     /// Whether `height` is flagged for a full refetch.
     #[must_use]
-    pub fn force_full(&self, height: BlockHeight) -> bool {
+    pub(crate) fn force_full(&self, height: BlockHeight) -> bool {
         self.binding_state().force_full_refetch.contains(&height)
     }
 
     /// Block-sync status for the (only) scope.
     #[must_use]
-    pub fn block_sync_status(&self) -> BlockSyncStatus {
+    pub(crate) fn block_sync_status(&self) -> BlockSyncStatus {
         let scope: ScopeStatus = self.status(&());
         let is_syncing = self.is_syncing();
         BlockSyncStatus {
@@ -145,7 +145,7 @@ impl Sync<BlockSyncBinding> {
 
     /// Number of blocks behind the current target.
     #[must_use]
-    pub fn blocks_behind(&self) -> u64 {
+    pub(crate) fn blocks_behind(&self) -> u64 {
         self.status(&()).blocks_behind
     }
 }

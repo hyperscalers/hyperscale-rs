@@ -35,19 +35,19 @@ use super::NodeStateMachine;
 /// The committee stays alive so tests can mint signed messages targeting
 /// the same validator set the node sees.
 pub struct TestNode {
-    pub node: NodeStateMachine,
+    pub(crate) node: NodeStateMachine,
     #[allow(dead_code)] // exposed for tests that mint signed messages
-    pub committee: TestCommittee,
+    pub(crate) committee: TestCommittee,
 }
 
 impl TestNode {
     /// Default-config node: 4-validator committee, 1 shard, local index 0.
     /// Sufficient for tests that don't need a specific committee shape.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::builder().build()
     }
 
-    pub fn builder() -> TestNodeBuilder {
+    pub(crate) fn builder() -> TestNodeBuilder {
         TestNodeBuilder::default()
     }
 }
@@ -58,12 +58,12 @@ pub struct TestNodeBuilder {
 }
 
 impl TestNodeBuilder {
-    pub fn local_idx(mut self, idx: usize) -> Self {
+    pub(crate) fn local_idx(mut self, idx: usize) -> Self {
         self.local_idx = idx;
         self
     }
 
-    pub fn build(self) -> TestNode {
+    pub(crate) fn build(self) -> TestNode {
         let committee = TestCommittee::new(4, 7);
         let me = committee.validator_id(self.local_idx);
         // The beacon harness consolidates every validator onto the root shard.

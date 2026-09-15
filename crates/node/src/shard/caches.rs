@@ -31,18 +31,18 @@ pub struct SharedCaches {
     /// to storage. Owned jointly with [`hyperscale_mempool::MempoolCoordinator`]
     /// — both hold `Arc<TxStore>` pointing at the same map, so the network
     /// worker can read bodies without contending on a mempool lock.
-    pub tx_store: Arc<TxStore>,
+    pub(crate) tx_store: Arc<TxStore>,
     /// Finalizations, keyed by `TickId`. Populated by `io_loop`'s
     /// `Continuation(FinalizationsAdmitted)` interception; queried by the
     /// inbound finalization handler.
-    pub finalization: Arc<QuickCache<FinalizationHash, Arc<Verifiable<Finalization>>>>,
+    pub(crate) finalization: Arc<QuickCache<FinalizationHash, Arc<Verifiable<Finalization>>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
     /// local-provision, cross-shard provision) can read it without going
     /// through the state machine.
     ///
     /// [`ProvisionCoordinator`]: hyperscale_provisions::ProvisionCoordinator
-    pub provision_store: Arc<ProvisionStore>,
+    pub(crate) provision_store: Arc<ProvisionStore>,
     /// Verified source-shard headers, owned by the
     /// [`ProvisionCoordinator`]. The `local_provision.request` handler
     /// reads this to bundle each returned provision with its matching
@@ -50,7 +50,7 @@ pub struct SharedCaches {
     /// for a header that's still in flight.
     ///
     /// [`ProvisionCoordinator`]: hyperscale_provisions::ProvisionCoordinator
-    pub verified_headers: Arc<VerifiedHeaderBuffer>,
+    pub(crate) verified_headers: Arc<VerifiedHeaderBuffer>,
     /// Aggregated local-shard execution certificates awaiting block commit,
     /// owned by the [`ExecutionCoordinator`]. Cloned here so the inbound EC
     /// fetch handler can serve cross-shard fallback requests without taking
@@ -58,15 +58,15 @@ pub struct SharedCaches {
     /// storage.
     ///
     /// [`ExecutionCoordinator`]: hyperscale_execution::ExecutionCoordinator
-    pub exec_cert_store: Arc<ExecCertStore>,
+    pub(crate) exec_cert_store: Arc<ExecCertStore>,
     /// Per-shard finalization store, shared with every same-shard
     /// `ExecutionCoordinator`.
-    pub finalization_store: Arc<FinalizationStore>,
+    pub(crate) finalization_store: Arc<FinalizationStore>,
     /// The counterpart cells this node has proven, owned by the
     /// `ShardCoordinator` and filled by the `ExecutionCoordinator`'s
     /// fetches. Cloned here so the relayed-state-proof handler can pass
     /// a peer the bytes without going through the state machine.
-    pub proven_cells: Arc<ProvenCells>,
+    pub(crate) proven_cells: Arc<ProvenCells>,
 }
 
 impl SharedCaches {
@@ -76,7 +76,7 @@ impl SharedCaches {
     /// in so the same `Arc`s flow into network handler closures and sync
     /// helpers.
     #[allow(clippy::too_many_arguments)] // one per store the handlers read
-    pub fn new(
+    pub(crate) fn new(
         provision_store: Arc<ProvisionStore>,
         verified_headers: Arc<VerifiedHeaderBuffer>,
         tx_store: Arc<TxStore>,

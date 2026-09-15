@@ -28,7 +28,7 @@ pub struct Secp256k1PublicKey(pub [u8; Self::LENGTH]);
 
 impl Secp256k1PublicKey {
     /// Byte length of a compressed public key.
-    pub const LENGTH: usize = 33;
+    pub(crate) const LENGTH: usize = 33;
 }
 
 /// A secp256k1 signature: compact `r || s`, low-`s`.
@@ -37,7 +37,7 @@ pub struct Secp256k1Signature(pub [u8; Self::LENGTH]);
 
 impl Secp256k1Signature {
     /// Byte length of a compact signature.
-    pub const LENGTH: usize = 64;
+    pub(crate) const LENGTH: usize = 64;
 }
 
 /// A secp256k1 signing key.
@@ -73,7 +73,7 @@ impl Secp256k1PrivateKey {
     /// If the curve's own signing fails, which it does only for a key
     /// this type cannot hold.
     #[must_use]
-    pub fn sign_prehash(&self, prehash: &[u8; 32]) -> Secp256k1Signature {
+    pub(crate) fn sign_prehash(&self, prehash: &[u8; 32]) -> Secp256k1Signature {
         let signature: EcdsaSignature = self
             .signing_key()
             .sign_prehash(prehash)

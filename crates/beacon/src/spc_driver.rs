@@ -35,11 +35,11 @@ use crate::verification::VerificationSlots;
 /// Per-`(epoch, view, signer, round)` because a Byzantine signer may
 /// dispatch divergent votes at the same round within a view; each gets
 /// its own slot so the post-verify equivocation check sees both.
-pub type PcVoteSlotKey = (Epoch, SpcView, ValidatorId, PcVoteRound);
+pub(crate) type PcVoteSlotKey = (Epoch, SpcView, ValidatorId, PcVoteRound);
 
 /// Which SPC message kind a verification slot refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SpcMsgKind {
+pub(crate) enum SpcMsgKind {
     /// `NewView` cert verification.
     NewView,
     /// `NewCommit` embedded QC3 verification.
@@ -49,11 +49,11 @@ pub enum SpcMsgKind {
 }
 
 /// Slot key for a pending SPC message verification.
-pub type SpcMsgSlotKey = (Epoch, SpcView, ValidatorId, SpcMsgKind);
+pub(crate) type SpcMsgSlotKey = (Epoch, SpcView, ValidatorId, SpcMsgKind);
 
 /// Per-vnode SPC driver: the optional current-epoch [`SpcInstance`] plus
 /// the PC-vote and SPC-message verification slot pools.
-pub struct SpcDriver {
+pub(crate) struct SpcDriver {
     /// Scheme verifier handed to each bootstrapped [`SpcInstance`].
     verifier: Arc<dyn Verifier>,
     /// `None` between bootstrap and the first epoch-boundary trigger, and
@@ -67,7 +67,7 @@ pub struct SpcDriver {
 impl SpcDriver {
     /// A driver with no instance bootstrapped.
     #[must_use]
-    pub fn new(verifier: Arc<dyn Verifier>, me: ValidatorId) -> Self {
+    pub(crate) fn new(verifier: Arc<dyn Verifier>, me: ValidatorId) -> Self {
         Self {
             verifier,
             spc: None,
@@ -79,25 +79,25 @@ impl SpcDriver {
 
     /// Whether an SPC instance is currently bootstrapped.
     #[must_use]
-    pub const fn is_bootstrapped(&self) -> bool {
+    pub(crate) const fn is_bootstrapped(&self) -> bool {
         self.spc.is_some()
     }
 
     /// The current instance's epoch, or `None` when not bootstrapped.
     #[must_use]
-    pub fn epoch(&self) -> Option<Epoch> {
+    pub(crate) fn epoch(&self) -> Option<Epoch> {
         self.spc.as_ref().map(SpcInstance::epoch)
     }
 
     /// The current instance's view, or `None` when not bootstrapped.
     #[must_use]
-    pub fn current_view(&self) -> Option<SpcView> {
+    pub(crate) fn current_view(&self) -> Option<SpcView> {
         self.spc.as_ref().map(SpcInstance::current_view)
     }
 
     /// Whether the current instance has been fed its view-1 input.
     #[must_use]
-    pub fn view_one_input_fed(&self) -> bool {
+    pub(crate) fn view_one_input_fed(&self) -> bool {
         self.spc
             .as_ref()
             .is_some_and(SpcInstance::view_one_input_fed)
@@ -106,13 +106,13 @@ impl SpcDriver {
     /// Count of dispatched-but-unresolved PC-vote + SPC-message
     /// verifications.
     #[must_use]
-    pub fn in_flight_count(&self) -> usize {
+    pub(crate) fn in_flight_count(&self) -> usize {
         self.pc_votes.len() + self.spc_msgs.len()
     }
 
     /// Tear down the instance after a commit. The slot pools are left
     /// intact — stale results clear their own slots on arrival.
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.spc = None;
     }
 
@@ -125,7 +125,7 @@ impl SpcDriver {
     /// lets the skip path carry the epoch — the ready on-shard set has
     /// collapsed below the BFT floor, an operator-visible degradation the
     /// chain recovers from once enough validators ready up.
-    pub fn bootstrap(
+    pub(crate) fn bootstrap(
         &mut self,
         next_epoch: Epoch,
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
@@ -154,7 +154,7 @@ impl SpcDriver {
     /// Whether the current instance is ready to receive its view-1
     /// `Input`: instance exists, drives `epoch`, and hasn't been fed.
     #[must_use]
-    pub fn should_feed_view_one_input(&self, epoch: Epoch) -> bool {
+    pub(crate) fn should_feed_view_one_input(&self, epoch: Epoch) -> bool {
         self.spc
             .as_ref()
             .is_some_and(|spc| spc.epoch() == epoch && !spc.view_one_input_fed())
@@ -164,7 +164,7 @@ impl SpcDriver {
     /// [`Self::should_feed_view_one_input`]. Not skip-quorum gated — the
     /// input is the local node's entry into the round, independent of
     /// the skip path.
-    pub fn feed_view_one_input(&mut self, input: PcVector) -> Vec<SpcEffect> {
+    pub(crate) fn feed_view_one_input(&mut self, input: PcVector) -> Vec<SpcEffect> {
         let Some(spc) = self.spc.as_mut() else {
             return Vec::new();
         };
@@ -174,7 +174,7 @@ impl SpcDriver {
     /// A peer's round-1 PC vote arrived. Gate on instance/skip-quorum,
     /// mark the slot in-flight, and dispatch the signature check. Admission
     /// happens in [`Self::on_pc_vote1_verified`] when the result lands.
-    pub fn on_pc_vote1_received(
+    pub(crate) fn on_pc_vote1_received(
         &mut self,
         view: SpcView,
         vote: PcVote1,
@@ -200,7 +200,7 @@ impl SpcDriver {
     }
 
     /// A peer's round-2 PC vote arrived.
-    pub fn on_pc_vote2_received(
+    pub(crate) fn on_pc_vote2_received(
         &mut self,
         view: SpcView,
         vote: Box<PcVote2>,
@@ -226,7 +226,7 @@ impl SpcDriver {
     }
 
     /// A peer's round-3 PC vote arrived.
-    pub fn on_pc_vote3_received(
+    pub(crate) fn on_pc_vote3_received(
         &mut self,
         view: SpcView,
         vote: Box<PcVote3>,
@@ -253,7 +253,7 @@ impl SpcDriver {
 
     /// A peer's SPC `new-view` arrived. Gate, mark the slot in-flight, and
     /// dispatch the cert signature check.
-    pub fn on_spc_new_view_received(
+    pub(crate) fn on_spc_new_view_received(
         &mut self,
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
@@ -280,7 +280,7 @@ impl SpcDriver {
 
     /// A peer's SPC `new-commit` arrived. Gate, mark the slot in-flight,
     /// and dispatch the embedded QC3's signature check.
-    pub fn on_spc_new_commit_received(
+    pub(crate) fn on_spc_new_commit_received(
         &mut self,
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
@@ -308,7 +308,7 @@ impl SpcDriver {
     /// A peer's SPC `empty-view` attestation arrived. Gate, mark the slot
     /// in-flight (keyed by the embedded signer), and dispatch the
     /// check.
-    pub fn on_unverified_spc_empty_view_received(
+    pub(crate) fn on_unverified_spc_empty_view_received(
         &mut self,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
         skip_quorum: bool,
@@ -337,7 +337,7 @@ impl SpcDriver {
     /// signing-key holder produced the signature over a verified high
     /// triple, so the message is verified by construction — feed it
     /// directly into the FSM without the verify round-trip.
-    pub fn on_verified_spc_empty_view_received(
+    pub(crate) fn on_verified_spc_empty_view_received(
         &mut self,
         msg: Box<Verified<SpcEmptyViewMsg>>,
         skip_quorum: bool,
@@ -354,7 +354,7 @@ impl SpcDriver {
 
     /// Result of an [`Action::VerifySpcNewView`] dispatch. The view rode
     /// back from the unverified payload so the slot clears on both arms.
-    pub fn on_spc_new_view_verified(
+    pub(crate) fn on_spc_new_view_verified(
         &mut self,
         epoch: Epoch,
         from: ValidatorId,
@@ -394,7 +394,7 @@ impl SpcDriver {
     }
 
     /// Result of an [`Action::VerifySpcNewCommit`] dispatch.
-    pub fn on_spc_new_commit_verified(
+    pub(crate) fn on_spc_new_commit_verified(
         &mut self,
         epoch: Epoch,
         from: ValidatorId,
@@ -435,7 +435,7 @@ impl SpcDriver {
     }
 
     /// Result of an [`Action::VerifySpcEmptyView`] dispatch.
-    pub fn on_spc_empty_view_verified(
+    pub(crate) fn on_spc_empty_view_verified(
         &mut self,
         epoch: Epoch,
         from: ValidatorId,
@@ -471,7 +471,7 @@ impl SpcDriver {
 
     /// Result of an [`Action::VerifyPcVote1`] dispatch. Clears the slot,
     /// routes the verified vote into the FSM, drops on verify failure.
-    pub fn on_pc_vote1_verified(
+    pub(crate) fn on_pc_vote1_verified(
         &mut self,
         epoch: Epoch,
         view: SpcView,
@@ -508,7 +508,7 @@ impl SpcDriver {
     }
 
     /// Result of an [`Action::VerifyPcVote2`] dispatch.
-    pub fn on_pc_vote2_verified(
+    pub(crate) fn on_pc_vote2_verified(
         &mut self,
         epoch: Epoch,
         view: SpcView,
@@ -545,7 +545,7 @@ impl SpcDriver {
     }
 
     /// Result of an [`Action::VerifyPcVote3`] dispatch.
-    pub fn on_pc_vote3_verified(
+    pub(crate) fn on_pc_vote3_verified(
         &mut self,
         epoch: Epoch,
         view: SpcView,
@@ -584,7 +584,7 @@ impl SpcDriver {
     /// A round-1 PC vote the coordinator received already verified — fed
     /// in via the local sign-and-emit path. Skips the verify dispatch and
     /// routes straight into the FSM.
-    pub fn on_verified_pc_vote1_received(
+    pub(crate) fn on_verified_pc_vote1_received(
         &mut self,
         view: SpcView,
         vote: Verified<PcVote1>,
@@ -606,7 +606,7 @@ impl SpcDriver {
     }
 
     /// A round-2 PC vote the coordinator received already verified.
-    pub fn on_verified_pc_vote2_received(
+    pub(crate) fn on_verified_pc_vote2_received(
         &mut self,
         view: SpcView,
         vote: Box<Verified<PcVote2>>,
@@ -628,7 +628,7 @@ impl SpcDriver {
     }
 
     /// A round-3 PC vote the coordinator received already verified.
-    pub fn on_verified_pc_vote3_received(
+    pub(crate) fn on_verified_pc_vote3_received(
         &mut self,
         view: SpcView,
         vote: Box<Verified<PcVote3>>,
@@ -652,7 +652,7 @@ impl SpcDriver {
     /// `TimerId::BeaconSpcView` fired. Route a synthesized `TimerExpired`
     /// into the FSM against its current view — the stale-view guard no-ops
     /// if the view has already advanced.
-    pub fn on_beacon_spc_view_timer(&mut self, skip_quorum: bool) -> Vec<SpcEffect> {
+    pub(crate) fn on_beacon_spc_view_timer(&mut self, skip_quorum: bool) -> Vec<SpcEffect> {
         let Some(spc) = self.spc.as_ref() else {
             trace!("BeaconSpcViewTimer fired but no SPC instance bootstrapped");
             return Vec::new();

@@ -54,7 +54,7 @@ impl<'a> ReshapeView<'a> {
     /// the terminal crossing as it passes, rather than learning which
     /// crossing was terminal an epoch later from the beacon's anchor.
     #[must_use]
-    pub fn terminal_cut(&self, shard: ShardId) -> Option<WeightedTimestamp> {
+    pub(crate) fn terminal_cut(&self, shard: ShardId) -> Option<WeightedTimestamp> {
         let windows = self.schedule.windows();
         if windows.epoch_duration_ms() == 0 {
             return None;
@@ -66,7 +66,7 @@ impl<'a> ReshapeView<'a> {
     /// The chain's network definition — the domain every signature and QC
     /// verification binds to.
     #[must_use]
-    pub fn network(&self) -> &NetworkDefinition {
+    pub(crate) fn network(&self) -> &NetworkDefinition {
         self.topology_snapshot().network()
     }
 
@@ -80,13 +80,13 @@ impl<'a> ReshapeView<'a> {
     /// folds first. A derivation cross-check is only meaningful while this
     /// is `false`.
     #[must_use]
-    pub fn advanced_past_genesis(&self, shard: ShardId) -> bool {
+    pub(crate) fn advanced_past_genesis(&self, shard: ShardId) -> bool {
         self.topology_snapshot().advanced_past_genesis(shard)
     }
 
     /// The shard's beacon-attested boundary anchor, or `None` until it seeds.
     #[must_use]
-    pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
+    pub(crate) fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
         self.topology_snapshot().boundary(shard)
     }
 
@@ -102,7 +102,7 @@ impl<'a> ReshapeView<'a> {
     /// Committees are frozen per window, so a copy taken during the final
     /// window is exactly the set that signed that window's QCs.
     #[must_use]
-    pub fn resolved_committee(&self, shard: ShardId) -> Option<ResolvedCommittee> {
+    pub(crate) fn resolved_committee(&self, shard: ShardId) -> Option<ResolvedCommittee> {
         let members = self
             .topology_snapshot()
             .consensus_committee_for_shard(shard);
@@ -159,7 +159,7 @@ impl<'a> ReshapeView<'a> {
     /// `parent`'s pending split. `false` for a seat that does not exist —
     /// a cohort that has lapsed has nothing left to assert either.
     #[must_use]
-    pub fn observer_ready(&self, parent: ShardId, validator: ValidatorId) -> bool {
+    pub(crate) fn observer_ready(&self, parent: ShardId, validator: ValidatorId) -> bool {
         self.topology_snapshot()
             .reshape_observer_seat(parent, validator)
             .is_some_and(|seat| seat.ready)
@@ -167,7 +167,7 @@ impl<'a> ReshapeView<'a> {
 
     /// Whether the beacon has credited `validator`'s keeper seat on `child`.
     #[must_use]
-    pub fn keeper_ready(&self, child: ShardId, validator: ValidatorId) -> bool {
+    pub(crate) fn keeper_ready(&self, child: ShardId, validator: ValidatorId) -> bool {
         self.topology_snapshot()
             .reshape_keeper_seat(child, validator)
             .is_some_and(|seat| seat.ready)
@@ -185,7 +185,7 @@ impl<'a> ReshapeView<'a> {
     /// projection drops zeroed genesis placeholders, so a projected anchor
     /// means the shard's boundary crossing committed.
     #[must_use]
-    pub fn seeded(&self, shard: ShardId) -> bool {
+    pub(crate) fn seeded(&self, shard: ShardId) -> bool {
         self.topology_snapshot().boundary(shard).is_some()
     }
 
@@ -206,7 +206,7 @@ impl<'a> ReshapeView<'a> {
     /// pends, so the keeper must wait for a *live* committee — present only once
     /// the merge actually reforms the parent.
     #[must_use]
-    pub fn merge_composed(&self, parent: ShardId) -> bool {
+    pub(crate) fn merge_composed(&self, parent: ShardId) -> bool {
         self.seeded(parent) && !self.committee(parent).is_empty()
     }
 

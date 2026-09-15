@@ -39,7 +39,7 @@ use crate::shard_source::ShardSourceTracker;
 /// boundary QC carries `≥ f+1` honest verifiers, so the fold trusts what
 /// commits.
 #[must_use]
-pub fn proposal_boundary_qcs_admissible(
+pub(crate) fn proposal_boundary_qcs_admissible(
     verifier: &dyn Verifier,
     proposal: &Verified<BeaconProposal>,
     state: &BeaconState,
@@ -90,7 +90,7 @@ pub fn proposal_boundary_qcs_admissible(
 /// merge child keeps sourcing its folded terminal: the parent composes only
 /// when both children's terminals are recorded in one fold.
 #[must_use]
-pub fn source_boundary_qcs(
+pub(crate) fn source_boundary_qcs(
     state: &BeaconState,
     shard_source: &ShardSourceTracker,
 ) -> BTreeMap<ShardId, Option<QuorumCertificate>> {
@@ -156,7 +156,7 @@ pub fn source_boundary_qcs(
 /// a fully-synced peer's, so the local node waits for the peer's gossiped
 /// block rather than assemble an incomplete one.
 #[must_use]
-pub fn build_shard_contributions(
+pub(crate) fn build_shard_contributions(
     state: &BeaconState,
     shard_source: &ShardSourceTracker,
     committed: &[(ValidatorId, Verified<BeaconProposal>)],

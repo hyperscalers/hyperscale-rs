@@ -92,7 +92,7 @@ pub type Jmt = Tree<Blake3Hasher, 1>;
 /// A JMT root hash as a [`StateRoot`], mapping the empty-tree sentinel
 /// (all zeroes) to `StateRoot::ZERO`.
 #[must_use]
-pub fn state_root_from_jmt(root_hash: [u8; 32]) -> StateRoot {
+pub(crate) fn state_root_from_jmt(root_hash: [u8; 32]) -> StateRoot {
     if root_hash == [0u8; 32] {
         StateRoot::ZERO
     } else {
@@ -160,7 +160,7 @@ pub fn jmt_parent_height(block_height: BlockHeight, root: StateRoot) -> Option<B
 
 /// The root node at `version`, in `pending_snapshots` or `store`.
 #[must_use]
-pub fn materialized_root<S: TreeReader>(
+pub(crate) fn materialized_root<S: TreeReader>(
     store: &S,
     pending_snapshots: &[Arc<JmtSnapshot>],
     version: u64,

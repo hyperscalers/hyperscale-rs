@@ -22,7 +22,7 @@ pub struct SimTreeStore {
 }
 
 impl SimTreeStore {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             nodes: HashMap::new(),
             root_path: NibblePath::empty(),
@@ -31,15 +31,15 @@ impl SimTreeStore {
 
     /// Set the prefix this tree is rooted at (its shard's prefix). Set once
     /// before any writes, while the store is empty.
-    pub fn set_root_path(&mut self, root_path: NibblePath) {
+    pub(crate) fn set_root_path(&mut self, root_path: NibblePath) {
         self.root_path = root_path;
     }
 
-    pub fn insert(&mut self, key: NodeKey, node: Arc<Node>) {
+    pub(crate) fn insert(&mut self, key: NodeKey, node: Arc<Node>) {
         self.nodes.insert(key, node);
     }
 
-    pub fn remove(&mut self, key: &NodeKey) {
+    pub(crate) fn remove(&mut self, key: &NodeKey) {
         self.nodes.remove(key);
     }
 }

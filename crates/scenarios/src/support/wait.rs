@@ -30,7 +30,12 @@ pub fn await_beacon_epoch<C: Cluster>(c: &mut C, target: u64, budget: Budget) ->
 }
 
 /// Wait until `shard`'s committed height reaches `target`.
-pub fn await_height<C: Cluster>(c: &mut C, shard: ShardId, target: u64, budget: Budget) -> bool {
+pub(crate) fn await_height<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    target: u64,
+    budget: Budget,
+) -> bool {
     c.run_until(budget, |c| {
         c.committed_height(shard)
             .is_some_and(|h| h.inner() >= target)
@@ -44,7 +49,12 @@ pub fn await_height<C: Cluster>(c: &mut C, shard: ShardId, target: u64, budget: 
 /// back" is read over blocks: a shard commits many times a second
 /// whatever the epoch length, and an epoch of that is thousands of
 /// blocks for a question a handful decides.
-pub fn await_blocks<C: Cluster>(c: &mut C, shard: ShardId, blocks: u64, budget: Budget) -> bool {
+pub(crate) fn await_blocks<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    blocks: u64,
+    budget: Budget,
+) -> bool {
     let target = c
         .committed_height(shard)
         .map_or(0, BlockHeight::inner)
@@ -57,7 +67,7 @@ pub fn await_blocks<C: Cluster>(c: &mut C, shard: ShardId, blocks: u64, budget: 
 ///
 /// The hold behind a claim about a beacon record: a record moves only at a
 /// fold, so "the record did not move" is read across folds.
-pub fn await_folds<C: Cluster>(c: &mut C, folds: u64, budget: Budget) -> bool {
+pub(crate) fn await_folds<C: Cluster>(c: &mut C, folds: u64, budget: Budget) -> bool {
     let target = beacon_epoch(c)
         .map_or(0, Epoch::inner)
         .saturating_add(folds);
@@ -76,7 +86,7 @@ pub fn await_folds<C: Cluster>(c: &mut C, folds: u64, budget: Budget) -> bool {
 ///
 /// Panics if no beacon epoch is committed, since the epoch length is what
 /// the sample is scaled to.
-pub fn measure_blocks_per_epoch<C: Cluster>(c: &mut C, shard: ShardId) -> u64 {
+pub(crate) fn measure_blocks_per_epoch<C: Cluster>(c: &mut C, shard: ShardId) -> u64 {
     let epoch_ms = epoch_duration_ms(c).expect("a committed beacon epoch");
     let height = |c: &C| c.committed_height(shard).map_or(0, BlockHeight::inner);
     let before = height(c);
@@ -88,7 +98,7 @@ pub fn measure_blocks_per_epoch<C: Cluster>(c: &mut C, shard: ShardId) -> u64 {
 }
 
 /// Wait until any host serves `shard`.
-pub fn await_serves<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bool {
+pub(crate) fn await_serves<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bool {
     c.run_until(budget, |c| c.serves_shard(shard))
 }
 
@@ -99,7 +109,7 @@ pub fn await_split_admitted<C: Cluster>(c: &mut C, parent: ShardId, budget: Budg
 
 /// Wait until the beacon pairs a merge into `parent` with at least `min`
 /// keepers drawn.
-pub fn await_merge_keeper_count<C: Cluster>(
+pub(crate) fn await_merge_keeper_count<C: Cluster>(
     c: &mut C,
     parent: ShardId,
     min: usize,
@@ -112,7 +122,7 @@ pub fn await_merge_keeper_count<C: Cluster>(
 
 /// Wait until the beacon composes `shard`'s reshape anchor, replacing the
 /// placeholder its cut installed.
-pub fn await_anchor_seeded<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bool {
+pub(crate) fn await_anchor_seeded<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bool {
     c.run_until(budget, |c| anchored_genesis_height(c, shard).is_some())
 }
 
@@ -127,7 +137,7 @@ pub fn await_anchor_seeded<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget
 ///
 /// The reading is taken inside the wait, at the first step the shard
 /// serves, so it cannot drift as the beacon catches up afterwards.
-pub fn await_serves_ahead_of_anchor<C: Cluster>(
+pub(crate) fn await_serves_ahead_of_anchor<C: Cluster>(
     c: &mut C,
     shard: ShardId,
     budget: Budget,
@@ -145,7 +155,11 @@ pub fn await_serves_ahead_of_anchor<C: Cluster>(
 
 /// Wait until `shard`'s committed root matches the beacon-composed anchor — the
 /// subtree-root-continuity check a flip must satisfy.
-pub fn await_root_matches_anchor<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bool {
+pub(crate) fn await_root_matches_anchor<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    budget: Budget,
+) -> bool {
     c.run_until(budget, |c| {
         matches!(
             (c.committed_state_root(shard), anchor_root(c, shard)),
@@ -178,7 +192,7 @@ pub fn await_tx_terminal<C: Cluster>(
 /// # Panics
 ///
 /// Panics if the height advances over the window.
-pub fn assert_height_frozen<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) {
+pub(crate) fn assert_height_frozen<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) {
     let before = c.committed_height(shard);
     c.run_until(budget, |_| false);
     let after = c.committed_height(shard);

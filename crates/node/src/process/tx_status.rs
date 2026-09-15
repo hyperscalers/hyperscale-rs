@@ -69,7 +69,7 @@ impl TxStatusCache {
 
     /// Number of cached entries.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.cache.len()
     }
 

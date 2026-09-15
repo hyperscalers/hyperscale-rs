@@ -40,14 +40,14 @@ impl TxPhaseTimes {
         }
     }
 
-    pub const fn added_at(&self) -> LocalTimestamp {
+    pub(crate) const fn added_at(&self) -> LocalTimestamp {
         self.added_at
     }
 
     /// Renders the phase breakdown for the slow-tx log, formatting the
     /// completed-at duration relative to `completed_at` (the terminal stamp
     /// the `io_loop` computed when it observed the `Completed` status).
-    pub fn display_at(&self, completed_at: LocalTimestamp) -> impl fmt::Display + '_ {
+    pub(crate) fn display_at(&self, completed_at: LocalTimestamp) -> impl fmt::Display + '_ {
         TxPhaseTimesDisplay {
             phases: self,
             completed_at,
@@ -67,7 +67,7 @@ impl TxPhaseTimesCache {
     /// the populated entry on terminal statuses (so the caller can render
     /// the slow-tx log) and removes it from the cache. Returns `None` for
     /// non-terminal statuses or unknown transitions.
-    pub fn observe_status(
+    pub(crate) fn observe_status(
         &mut self,
         tx_hash: TxHash,
         status: &TransactionStatus,
@@ -99,7 +99,7 @@ impl TxPhaseTimesCache {
 
     /// Stamp `ec_created_at` for each tx hash. Pure stamp — no terminal
     /// status flows through here.
-    pub fn record_ec_created(&mut self, tx_hashes: &[TxHash], now: LocalTimestamp) {
+    pub(crate) fn record_ec_created(&mut self, tx_hashes: &[TxHash], now: LocalTimestamp) {
         for hash in tx_hashes {
             let entry = self
                 .entries

@@ -16,9 +16,9 @@ use crate::{ConsensusPublicKey, ConsensusSignature, NetworkDefinition, Validator
 )]
 pub struct ValidatorPossessionProofMessage {
     /// The registering validator.
-    pub validator_id: ValidatorId,
+    pub(crate) validator_id: ValidatorId,
     /// The consensus public key being registered.
-    pub pubkey: ConsensusPublicKey,
+    pub(crate) pubkey: ConsensusPublicKey,
 }
 
 /// Sign the possession proof for `validator_id` with `signer`'s own key.

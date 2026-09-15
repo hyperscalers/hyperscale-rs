@@ -345,7 +345,11 @@ impl RocksDbShardStorage {
     }
 
     /// Typed single put (immediate write, no batch).
-    pub(crate) fn cf_put_sync<CF>(&self, key: &CF::Key, value: &CF::Value)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `RocksDB` rejects the write.
+    pub fn cf_put_sync<CF>(&self, key: &CF::Key, value: &CF::Value)
     where
         for<'a> CF: TypedCf<Handles<'a> = CfHandles<'a>>,
     {

@@ -410,7 +410,7 @@ pub struct DeliveryRecord {
     /// not the message's.
     pub shard: Option<ShardId>,
     /// Encoded size on the wire.
-    pub wire_bytes: usize,
+    pub(crate) wire_bytes: usize,
 }
 
 /// Per-class totals over a drain interval, indexed by `MessageClass as usize`.
@@ -721,7 +721,7 @@ impl SimulatedNetwork {
 
     /// Check if two nodes are partitioned (message from `from` to `to` would be dropped).
     #[must_use]
-    pub fn is_partitioned(&self, from: NodeIndex, to: NodeIndex) -> bool {
+    pub(crate) fn is_partitioned(&self, from: NodeIndex, to: NodeIndex) -> bool {
         self.faults.is_blocked(HostId(from), HostId(to))
     }
 
@@ -783,7 +783,7 @@ impl SimulatedNetwork {
 
     /// Check if a packet should be dropped based on the configured loss rate.
     /// Returns true if the packet should be dropped.
-    pub fn should_drop_packet(&self, rng: &mut ChaCha8Rng) -> bool {
+    pub(crate) fn should_drop_packet(&self, rng: &mut ChaCha8Rng) -> bool {
         self.config.packet_loss_rate > 0.0 && rng.random::<f64>() < self.config.packet_loss_rate
     }
 
@@ -803,7 +803,7 @@ impl SimulatedNetwork {
     /// Determine if a message should be delivered from `from` to `to`.
     /// Returns `None` if the message should be dropped (partition or packet loss).
     /// Returns `Some(latency)` if the message should be delivered.
-    pub fn should_deliver(
+    pub(crate) fn should_deliver(
         &self,
         from: NodeIndex,
         to: NodeIndex,
@@ -834,7 +834,12 @@ impl SimulatedNetwork {
     /// `cross_shard_latency`. Co-location is read from the live registries
     /// (see [`Self::hosts_share_shard`]), so a host that joins a shard at
     /// runtime becomes near to that shard's peers.
-    pub fn sample_latency(&self, from: NodeIndex, to: NodeIndex, rng: &mut ChaCha8Rng) -> Duration {
+    pub(crate) fn sample_latency(
+        &self,
+        from: NodeIndex,
+        to: NodeIndex,
+        rng: &mut ChaCha8Rng,
+    ) -> Duration {
         let base = if self.hosts_share_shard(from, to) {
             self.config.intra_shard_latency
         } else {
@@ -864,7 +869,7 @@ impl SimulatedNetwork {
     /// Get all hosts (`IoLoop` indices) whose registry hosts `shard` — the
     /// reshape-aware peer pool the request and gossip paths route on.
     #[must_use]
-    pub fn peers_in_shard(&self, shard: ShardId) -> Vec<NodeIndex> {
+    pub(crate) fn peers_in_shard(&self, shard: ShardId) -> Vec<NodeIndex> {
         self.registries
             .iter()
             .enumerate()
@@ -880,7 +885,7 @@ impl SimulatedNetwork {
     /// Panics if the host count exceeds `NodeIndex` — test harnesses are far
     /// smaller.
     #[must_use]
-    pub fn all_nodes(&self) -> Vec<NodeIndex> {
+    pub(crate) fn all_nodes(&self) -> Vec<NodeIndex> {
         let total = NodeIndex::try_from(self.total_nodes()).expect("host count fits NodeIndex");
         (0..total).collect()
     }
@@ -1571,7 +1576,7 @@ impl SimulatedNetwork {
 
     /// Earliest pending gossip delivery time (for event loop scheduling).
     #[must_use]
-    pub fn next_gossip_delivery_time(&self) -> Option<Duration> {
+    pub(crate) fn next_gossip_delivery_time(&self) -> Option<Duration> {
         self.pending_gossip.peek().map(|Reverse(s)| s.delivery_time)
     }
 
@@ -1610,7 +1615,7 @@ impl SimulatedNetwork {
 
     /// Earliest pending notification delivery time.
     #[must_use]
-    pub fn next_notification_delivery_time(&self) -> Option<Duration> {
+    pub(crate) fn next_notification_delivery_time(&self) -> Option<Duration> {
         self.pending_notifications
             .peek()
             .map(|Reverse(s)| s.delivery_time)
@@ -1631,7 +1636,7 @@ impl SimulatedNetwork {
 
     /// Earliest pending response delivery time.
     #[must_use]
-    pub fn next_response_delivery_time(&self) -> Option<Duration> {
+    pub(crate) fn next_response_delivery_time(&self) -> Option<Duration> {
         self.pending_responses
             .peek()
             .map(|Reverse(s)| s.delivery_time)

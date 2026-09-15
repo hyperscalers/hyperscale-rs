@@ -41,13 +41,13 @@ pub struct TimeoutKeeper {
 impl TimeoutKeeper {
     /// Empty keeper.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Record a verified timeout, deduplicated by voter. Returns `true` if it
     /// was newly recorded (a fresh voter for its round).
-    pub fn record(&mut self, timeout: Verified<Timeout>, power: VoteCount) -> bool {
+    pub(crate) fn record(&mut self, timeout: Verified<Timeout>, power: VoteCount) -> bool {
         let round = timeout.round();
         let voter = timeout.voter();
         let entry = self.rounds.entry(round).or_default();
@@ -61,7 +61,7 @@ impl TimeoutKeeper {
 
     /// Combined voting power of the timeouts seen for `round`.
     #[must_use]
-    pub fn power(&self, round: Round) -> VoteCount {
+    pub(crate) fn power(&self, round: Round) -> VoteCount {
         self.rounds
             .get(&round)
             .map_or(VoteCount::ZERO, |r| r.total_power)
@@ -70,7 +70,7 @@ impl TimeoutKeeper {
     /// Whether `voter`'s timeout for `round` is already tallied. Lets callers
     /// skip re-verifying a retransmitted share the keeper would dedup anyway.
     #[must_use]
-    pub fn contains(&self, round: Round, voter: ValidatorId) -> bool {
+    pub(crate) fn contains(&self, round: Round, voter: ValidatorId) -> bool {
         self.rounds
             .get(&round)
             .is_some_and(|r| r.by_voter.contains_key(&voter))
@@ -84,7 +84,7 @@ impl TimeoutKeeper {
     /// caller skip it and still reach the genuine quorum-max an honest timeout
     /// carries. Empty if no timeouts seen.
     #[must_use]
-    pub fn high_qcs_by_round_desc(&self, round: Round) -> Vec<QuorumCertificate> {
+    pub(crate) fn high_qcs_by_round_desc(&self, round: Round) -> Vec<QuorumCertificate> {
         let Some(entry) = self.rounds.get(&round) else {
             return Vec::new();
         };
@@ -98,7 +98,7 @@ impl TimeoutKeeper {
     }
 
     /// Drop every round strictly below `round` (GC once the chain advances).
-    pub fn prune_below(&mut self, round: Round) {
+    pub(crate) fn prune_below(&mut self, round: Round) {
         self.rounds.retain(|r, _| *r >= round);
     }
 }

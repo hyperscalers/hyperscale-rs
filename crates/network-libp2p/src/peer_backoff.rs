@@ -41,8 +41,8 @@ pub const UNSUPPORTED_MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// pool, `(PeerId, ShardId)` for the per-shard request pool) and
 /// clear the entry on successful reconnect to reset the series.
 pub struct BackoffState {
-    pub next_attempt: Instant,
-    pub current_backoff: Duration,
+    pub(crate) next_attempt: Instant,
+    pub(crate) current_backoff: Duration,
 }
 
 /// Apply (or escalate) backoff for `key`. The first call sets

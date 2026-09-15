@@ -75,20 +75,20 @@ pub struct PoolRegistry {
 impl PoolRegistry {
     /// An empty registry: no instance speaks to the beacon.
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             pools: BTreeMap::new(),
         }
     }
 
     /// Recognise `address` as the pool the beacon folds under `id`.
-    pub fn register(&mut self, address: impl Into<Address>, id: StakePoolId) {
+    pub(crate) fn register(&mut self, address: impl Into<Address>, id: StakePoolId) {
         self.pools.insert(address.into(), id);
     }
 
     /// The pool `address` is recognised as, if any.
     #[must_use]
-    pub fn pool_of(&self, address: impl Into<Address>) -> Option<StakePoolId> {
+    pub(crate) fn pool_of(&self, address: impl Into<Address>) -> Option<StakePoolId> {
         self.pools.get(&address.into()).copied()
     }
 

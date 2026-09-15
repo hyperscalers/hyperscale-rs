@@ -155,7 +155,7 @@ pub enum Adoption {
 impl Adoption {
     /// The root the adoption installs, or answers with.
     #[must_use]
-    pub fn root(self) -> StateRoot {
+    pub(crate) fn root(self) -> StateRoot {
         match self {
             Self::Recorded(root) | Self::InPlace(root) => root,
             Self::Repoint(subtree) => subtree.map_or(StateRoot::ZERO, |subtree| subtree.root),

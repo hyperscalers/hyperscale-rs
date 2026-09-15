@@ -17,9 +17,9 @@ pub struct NetworkDefinition {
     /// Domain byte mixed into every signed message. Distinct per network,
     /// which is what makes a cross-network replay produce a different
     /// digest and so fail verification.
-    pub id: u8,
+    pub(crate) id: u8,
     /// The name a config file names this network by.
-    pub logical_name: String,
+    pub(crate) logical_name: String,
 }
 
 impl NetworkDefinition {
@@ -34,7 +34,7 @@ impl NetworkDefinition {
 
     /// The public test network.
     #[must_use]
-    pub fn testnet() -> Self {
+    pub(crate) fn testnet() -> Self {
         Self {
             id: 2,
             logical_name: "testnet".to_string(),

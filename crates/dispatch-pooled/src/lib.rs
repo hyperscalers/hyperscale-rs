@@ -84,18 +84,18 @@ pub struct ThreadPoolConfig {
     pub pin_cores: bool,
 
     /// Starting core index for the consensus pool (if pinning enabled).
-    pub consensus_core_start: Option<usize>,
+    pub(crate) consensus_core_start: Option<usize>,
 
     /// Starting core index for the throughput pool (if pinning enabled).
-    pub throughput_core_start: Option<usize>,
+    pub(crate) throughput_core_start: Option<usize>,
 
     /// Stack size for consensus pool threads (bytes).
-    pub consensus_stack_size: usize,
+    pub(crate) consensus_stack_size: usize,
 
     /// Stack size for throughput pool threads (bytes). The VM engine
     /// execution lives here, so this is sized larger than the consensus
     /// pool's stack.
-    pub throughput_stack_size: usize,
+    pub(crate) throughput_stack_size: usize,
 }
 
 impl ThreadPoolConfig {
@@ -133,7 +133,7 @@ impl ThreadPoolConfig {
     /// count is below its minimum (consensus ≥ 2, throughput ≥ 1) or when
     /// core pinning is enabled but the configured pools exceed
     /// `available_parallelism()`.
-    pub fn validate(&self) -> Result<(), ThreadPoolError> {
+    pub(crate) fn validate(&self) -> Result<(), ThreadPoolError> {
         if self.consensus_threads < 2 {
             return Err(ThreadPoolError::InvalidConfig(
                 "consensus_threads must be at least 2 (verify + build concurrently)".to_string(),
@@ -168,7 +168,7 @@ pub struct ThreadPoolConfigBuilder {
 impl ThreadPoolConfigBuilder {
     /// Create a new builder starting from minimal defaults.
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             config: ThreadPoolConfig::minimal(),
         }

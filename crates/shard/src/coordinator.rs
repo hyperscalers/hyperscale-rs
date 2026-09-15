@@ -1297,7 +1297,7 @@ impl ShardCoordinator {
     /// is what makes it the right gate for *acquiring* the predecessors,
     /// where [`Self::precut_rule_live`] would be circular.
     #[must_use]
-    pub fn precut_window_open(&self) -> bool {
+    pub(crate) fn precut_window_open(&self) -> bool {
         self.chain_origin.anchor_wt > WeightedTimestamp::ZERO
             && self.high_qc().weighted_timestamp()
                 < self.chain_origin.anchor_wt.plus(MAX_VALIDITY_RANGE)
@@ -1324,7 +1324,10 @@ impl ShardCoordinator {
     /// Runs only while the window is open and only when nothing is held,
     /// so it neither displaces what the flip delivered nor undoes a
     /// retirement. Returns whether anything was adopted.
-    pub fn adopt_precut_predecessors(&mut self, topology_schedule: &TopologySchedule) -> bool {
+    pub(crate) fn adopt_precut_predecessors(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+    ) -> bool {
         if self.precut.has_predecessors() || !self.precut_window_open() {
             return false;
         }
@@ -6833,7 +6836,7 @@ impl ShardCoordinator {
     /// record restored with a lock above every QC the validator can
     /// produce refuses every proposal forever.
     #[must_use]
-    pub fn safe_vote_registers(&self) -> SafeVoteRegisters {
+    pub(crate) fn safe_vote_registers(&self) -> SafeVoteRegisters {
         SafeVoteRegisters {
             locked_round: self.locked_round,
             last_voted_round: self.last_voted_round,
@@ -6850,7 +6853,7 @@ impl ShardCoordinator {
     /// certificate either way; what it cannot rebuild from a committed
     /// chain alone is the state these blocks left.
     #[must_use]
-    pub fn vote_position(&self, voted: Option<BlockHash>) -> VotePosition {
+    pub(crate) fn vote_position(&self, voted: Option<BlockHash>) -> VotePosition {
         let tip = voted.or_else(|| self.latest_qc.as_deref().map(QuorumCertificate::block_hash));
         VotePosition {
             registers: self.safe_vote_registers(),

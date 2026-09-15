@@ -250,11 +250,11 @@ pub fn cast_threshold_vote<C: Cluster>(c: &mut C, split_bytes: u64) {
 /// conservation ledger the run was opened over.
 pub struct StraddlerRun {
     /// The probe hashes, in submission order.
-    pub probes: Vec<TxHash>,
+    pub(crate) probes: Vec<TxHash>,
     /// The shard that terminated.
-    pub splitter: ShardId,
+    pub(crate) splitter: ShardId,
     /// Its terminal block height.
-    pub terminal_b: BlockHeight,
+    pub(crate) terminal_b: BlockHeight,
     world: World,
     charges: Charges,
 }
@@ -264,7 +264,7 @@ impl StraddlerRun {
     /// they started with, less the prices: a straddler the fence abandoned
     /// moved nothing and still paid, and one it settled moved its payment
     /// exactly once.
-    pub fn assert_conserved<C: Cluster>(&self, c: &mut C) {
+    pub(crate) fn assert_conserved<C: Cluster>(&self, c: &mut C) {
         self.world.assert_settles_within(
             c,
             &self.charges,

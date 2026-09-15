@@ -82,7 +82,7 @@ impl PcValueElement {
     /// `skip_target` encoding to pin empty-view skip statements to a
     /// specific `(empty_view, reported_view)` pair.
     #[must_use]
-    pub const fn from_view_number(n: u64) -> Self {
+    pub(crate) const fn from_view_number(n: u64) -> Self {
         let mut bytes = [0u8; PC_VALUE_ELEMENT_BYTES];
         let le = n.to_le_bytes();
         let mut i = 0;
@@ -95,7 +95,7 @@ impl PcValueElement {
 
     /// Get the underlying bytes.
     #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; PC_VALUE_ELEMENT_BYTES] {
+    pub(crate) const fn as_bytes(&self) -> &[u8; PC_VALUE_ELEMENT_BYTES] {
         &self.0
     }
 }
@@ -152,7 +152,7 @@ impl PcVector {
     ///
     /// Paper notation: `self ⪯ other`.
     #[must_use]
-    pub fn is_prefix_of(&self, other: &Self) -> bool {
+    pub(crate) fn is_prefix_of(&self, other: &Self) -> bool {
         self.len() <= other.len() && self.as_slice() == &other.as_slice()[..self.len()]
     }
 
@@ -257,13 +257,13 @@ impl PcCompactVote {
     /// Length of the maximum common prefix between the signer's
     /// `v_in_i` and the canonical `x`.
     #[must_use]
-    pub const fn shared_len(&self) -> u32 {
+    pub(crate) const fn shared_len(&self) -> u32 {
         self.shared_len
     }
 
     /// First divergent element of `v_in_i` past `shared_len`, if any.
     #[must_use]
-    pub const fn divergent(&self) -> Option<&PcValueElement> {
+    pub(crate) const fn divergent(&self) -> Option<&PcValueElement> {
         self.divergent.as_ref()
     }
 }
@@ -305,7 +305,7 @@ impl PcQc1 {
 
     /// Certified prefix.
     #[must_use]
-    pub const fn x(&self) -> &PcVector {
+    pub(crate) const fn x(&self) -> &PcVector {
         &self.x
     }
 
@@ -317,7 +317,7 @@ impl PcQc1 {
 
     /// Different-messages signature aggregate over the signers' `sig_i(v'_i)`.
     #[must_use]
-    pub const fn x_agg_sig(&self) -> AggregateSignature {
+    pub(crate) const fn x_agg_sig(&self) -> AggregateSignature {
         self.x_agg_sig
     }
 }
@@ -354,7 +354,7 @@ impl PcVote2 {
     /// marker for the round-2 verifier's short-circuit. The prefix-sig
     /// cap is enforced at encode and decode, not here.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         validator: ValidatorId,
         x: PcVector,
         prefix_sigs: Vec<ConsensusSignature>,
@@ -391,7 +391,7 @@ impl PcVote2 {
     /// Round-1 QC anchoring this validator's `x` (raw view, regardless
     /// of verification state).
     #[must_use]
-    pub fn qc1(&self) -> &PcQc1 {
+    pub(crate) fn qc1(&self) -> &PcQc1 {
         self.qc1.as_unverified()
     }
 
@@ -399,13 +399,13 @@ impl PcVote2 {
     /// round-2 verifier inspects this directly to short-circuit when
     /// already verified.
     #[must_use]
-    pub const fn qc1_verifiable(&self) -> &Verifiable<PcQc1> {
+    pub(crate) const fn qc1_verifiable(&self) -> &Verifiable<PcQc1> {
         &self.qc1
     }
 
     /// Signature binding the validator to their `|x|`.
     #[must_use]
-    pub const fn length_attestation(&self) -> ConsensusSignature {
+    pub(crate) const fn length_attestation(&self) -> ConsensusSignature {
         self.length_attestation
     }
 }
@@ -416,20 +416,20 @@ impl PcVote2 {
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct PcDivergingProof {
     /// First diverging signer.
-    pub j: ValidatorId,
+    pub(crate) j: ValidatorId,
     /// First diverging signer's value at position `|x_p|`.
-    pub j_divergent: PcValueElement,
+    pub(crate) j_divergent: PcValueElement,
     /// Round-1 QC anchoring the first diverging signer's full `x`.
-    pub qc1_j: PcQc1,
+    pub(crate) qc1_j: PcQc1,
     /// Second diverging signer.
-    pub k: ValidatorId,
+    pub(crate) k: ValidatorId,
     /// Second diverging signer's value at position `|x_p|`.
-    pub k_divergent: PcValueElement,
+    pub(crate) k_divergent: PcValueElement,
     /// Round-1 QC anchoring the second diverging signer's full `x`.
-    pub qc1_k: PcQc1,
+    pub(crate) qc1_k: PcQc1,
     /// Different-messages aggregate of j's sig over `x_p ++ [j_divergent]`
     /// and k's sig over `x_p ++ [k_divergent]`.
-    pub combined_sig: AggregateSignature,
+    pub(crate) combined_sig: AggregateSignature,
 }
 
 /// Witness that `PcQc2.x_p` is the actual mcp of the round-2 quorum's
@@ -511,14 +511,14 @@ impl PcQc2 {
 
     /// Bitfield of round-2 quorum signers.
     #[must_use]
-    pub const fn signers(&self) -> &SignerBitfield {
+    pub(crate) const fn signers(&self) -> &SignerBitfield {
         &self.signers
     }
 
     /// Combined signature; see the type-level comment for what it
     /// covers per `pi` variant.
     #[must_use]
-    pub const fn combined_sig(&self) -> AggregateSignature {
+    pub(crate) const fn combined_sig(&self) -> AggregateSignature {
         self.combined_sig
     }
 
@@ -549,7 +549,7 @@ impl PcVote3 {
     /// Build a `PcVote3` from its parts. Accepts either a raw `PcQc2`
     /// or a `Verified<PcQc2>` for `qc2`.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         validator: ValidatorId,
         x_p: PcVector,
         sig_xp: ConsensusSignature,
@@ -584,7 +584,7 @@ impl PcVote3 {
     /// Round-2 QC anchoring `x_p` (raw view, regardless of
     /// verification state).
     #[must_use]
-    pub fn qc2(&self) -> &PcQc2 {
+    pub(crate) fn qc2(&self) -> &PcQc2 {
         self.qc2.as_unverified()
     }
 
@@ -592,7 +592,7 @@ impl PcVote3 {
     /// round-3 verifier inspects this directly to short-circuit when
     /// already verified.
     #[must_use]
-    pub const fn qc2_verifiable(&self) -> &Verifiable<PcQc2> {
+    pub(crate) const fn qc2_verifiable(&self) -> &Verifiable<PcQc2> {
         &self.qc2
     }
 }
@@ -623,7 +623,7 @@ impl PcSignerLengths {
     /// Panics if `lens.is_empty()`. The caller (round-3 quorum
     /// assembly) always supplies at least `f + 1` lengths.
     #[must_use]
-    pub fn from_per_signer(lens: Vec<u32>) -> Self {
+    pub(crate) fn from_per_signer(lens: Vec<u32>) -> Self {
         assert!(
             !lens.is_empty(),
             "PcSignerLengths: at least one length required",
@@ -640,7 +640,7 @@ impl PcSignerLengths {
     /// for the per-signer encoding; always `Some(uniform)` for the
     /// uniform encoding regardless of `i`.
     #[must_use]
-    pub fn get(&self, i: usize) -> Option<u32> {
+    pub(crate) fn get(&self, i: usize) -> Option<u32> {
         match self {
             Self::Uniform(l) => Some(*l),
             Self::PerSigner(lens) => lens.get(i).copied(),
@@ -650,7 +650,7 @@ impl PcSignerLengths {
     /// Length of the per-signer vector under the `PerSigner` encoding,
     /// or `None` when the uniform encoding has no explicit count.
     #[must_use]
-    pub const fn explicit_count(&self) -> Option<usize> {
+    pub(crate) const fn explicit_count(&self) -> Option<usize> {
         match self {
             Self::Uniform(_) => None,
             Self::PerSigner(lens) => Some(lens.len()),
@@ -725,7 +725,7 @@ impl PcQc3 {
 
     /// Embedded `PcQc2` for `x_pp` including its verification marker.
     #[must_use]
-    pub const fn qc2_xpp_verifiable(&self) -> &Verifiable<PcQc2> {
+    pub(crate) const fn qc2_xpp_verifiable(&self) -> &Verifiable<PcQc2> {
         &self.qc2_xpp
     }
 
@@ -749,7 +749,7 @@ impl PcQc3 {
     /// Resolves dedup encoding — returns the `x_pp` slot when high
     /// coincides with low.
     #[must_use]
-    pub const fn qc2_xpe_verifiable(&self) -> &Verifiable<PcQc2> {
+    pub(crate) const fn qc2_xpe_verifiable(&self) -> &Verifiable<PcQc2> {
         match &self.qc2_xpe {
             Some(v) => v,
             None => &self.qc2_xpp,

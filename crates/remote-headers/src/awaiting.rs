@@ -40,13 +40,13 @@ impl<V> Default for AwaitingTopologyBuffer<V> {
 impl<V> AwaitingTopologyBuffer<V> {
     /// An empty buffer.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Buffer `value` under `shard`, evicting the oldest entries while the
     /// shard's queue exceeds the per-shard cap.
-    pub fn push(&mut self, shard: ShardId, value: V) {
+    pub(crate) fn push(&mut self, shard: ShardId, value: V) {
         let queue = self.by_shard.entry(shard).or_default();
         queue.push_back(value);
         while queue.len() > MAX_AWAITING_TOPOLOGY_PER_SHARD {
@@ -57,7 +57,7 @@ impl<V> AwaitingTopologyBuffer<V> {
     /// Remove and return every buffered value across all shards, in ascending
     /// shard order then per-shard FIFO. The shard key is dropped; replay
     /// re-derives it from each value.
-    pub fn drain(&mut self) -> Vec<V> {
+    pub(crate) fn drain(&mut self) -> Vec<V> {
         std::mem::take(&mut self.by_shard)
             .into_values()
             .flatten()

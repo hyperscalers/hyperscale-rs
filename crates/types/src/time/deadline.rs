@@ -206,7 +206,7 @@ impl Probed {
     /// The window an *absence* of this cell is read in, `None` where an
     /// absence never answers.
     #[must_use]
-    pub const fn absence_window(self) -> Option<Window> {
+    pub(crate) const fn absence_window(self) -> Option<Window> {
         match self {
             Self::Core => Some(Window::Core),
             Self::Delivery => Some(Window::Lapse),
@@ -221,7 +221,11 @@ impl Probed {
     /// still write the cell, and past it the sweep may have taken one
     /// that was there, so an absence outside says nothing either way.
     #[must_use]
-    pub fn absence_answers_at(self, probed_wt: WeightedTimestamp, deadline: Deadline) -> bool {
+    pub(crate) fn absence_answers_at(
+        self,
+        probed_wt: WeightedTimestamp,
+        deadline: Deadline,
+    ) -> bool {
         self.absence_window()
             .is_some_and(|window| window.of(deadline).contains(&probed_wt))
     }
@@ -236,7 +240,7 @@ impl Probed {
     /// by the lapse or never. A consumer's claiming success opens the
     /// question earlier, and that cue is the prober's to read.
     #[must_use]
-    pub fn presence_asked_from(self, deadline: Deadline) -> Option<WeightedTimestamp> {
+    pub(crate) fn presence_asked_from(self, deadline: Deadline) -> Option<WeightedTimestamp> {
         match self {
             Self::Core => None,
             Self::Claim => Some(deadline.at()),
@@ -302,7 +306,7 @@ impl Probed {
     /// core member certified — and absent is a sibling still pending. A
     /// delivery's claim answers either way.
     #[must_use]
-    pub const fn read(self, inclusion: Inclusion) -> Option<Inclusion> {
+    pub(crate) const fn read(self, inclusion: Inclusion) -> Option<Inclusion> {
         match (inclusion, self) {
             (Inclusion::Present(_), Self::Claim | Self::Delivery)
             | (Inclusion::Absent, Self::Core | Self::Delivery) => Some(inclusion),

@@ -62,7 +62,7 @@ impl Demands {
     /// coordinator's derivation — so the dispatcher adds them with
     /// [`Self::with`].
     #[must_use]
-    pub fn of(block: &Block) -> Self {
+    pub(crate) fn of(block: &Block) -> Self {
         let h = block.header();
         let mut demanded = BTreeSet::from([
             VerificationKind::StateRoot,

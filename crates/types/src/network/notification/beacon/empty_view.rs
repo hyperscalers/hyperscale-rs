@@ -31,7 +31,7 @@ pub struct SpcEmptyViewMsgNotification {
     /// Epoch the inner SPC instance belongs to. Bound into the signer's
     /// signing message, so a swap across epochs makes the relay-edge
     /// signature check fail.
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
     /// The empty-view message.
     pub msg: Arc<Verifiable<SpcEmptyViewMsg>>,
 }

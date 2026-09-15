@@ -35,7 +35,7 @@ pub struct TombstoneStore {
 }
 
 impl TombstoneStore {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tombstones: HashMap::new(),
         }
@@ -43,12 +43,16 @@ impl TombstoneStore {
 
     /// Record `tx_hash` as tombstoned. `end_timestamp_exclusive` comes from
     /// the tx's `validity_range` and bounds the entry's lifetime.
-    pub fn tombstone(&mut self, tx_hash: TxHash, end_timestamp_exclusive: WeightedTimestamp) {
+    pub(crate) fn tombstone(
+        &mut self,
+        tx_hash: TxHash,
+        end_timestamp_exclusive: WeightedTimestamp,
+    ) {
         self.tombstones.insert(tx_hash, end_timestamp_exclusive);
     }
 
     /// Whether `tx_hash` has been tombstoned.
-    pub fn is_tombstoned(&self, tx_hash: &TxHash) -> bool {
+    pub(crate) fn is_tombstoned(&self, tx_hash: &TxHash) -> bool {
         self.tombstones.contains_key(tx_hash)
     }
 
@@ -57,7 +61,7 @@ impl TombstoneStore {
     /// [`crate::TxStore`]. Past expiry, the validator-side validity check
     /// rejects any re-submission, so the tombstone is no longer load-bearing
     /// for correctness.
-    pub fn prune_tombstones(&mut self, now: WeightedTimestamp) -> Vec<TxHash> {
+    pub(crate) fn prune_tombstones(&mut self, now: WeightedTimestamp) -> Vec<TxHash> {
         let mut removed = Vec::new();
         self.tombstones.retain(|hash, end| {
             if *end > now {
@@ -70,7 +74,7 @@ impl TombstoneStore {
         removed
     }
 
-    pub fn len_tombstones(&self) -> usize {
+    pub(crate) fn len_tombstones(&self) -> usize {
         self.tombstones.len()
     }
 }

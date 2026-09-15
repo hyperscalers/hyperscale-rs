@@ -59,17 +59,17 @@ pub enum ProposalKind {
 /// the chain. Empty for a block that exists only to advance the chain.
 #[derive(Debug, Default)]
 pub struct ProposalPayload {
-    pub transactions: Vec<Arc<Verified<Transaction>>>,
-    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    pub provisions: Vec<Arc<Verifiable<Provisions>>>,
-    pub abandonment_records: Vec<AbandonmentRecord>,
-    pub state_claims: Vec<StateClaim>,
+    pub(crate) transactions: Vec<Arc<Verified<Transaction>>>,
+    pub(crate) finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub(crate) abandonment_records: Vec<AbandonmentRecord>,
+    pub(crate) state_claims: Vec<StateClaim>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PendingProposal {
-    pub height: BlockHeight,
-    pub round: Round,
+    pub(crate) height: BlockHeight,
+    pub(crate) round: Round,
 }
 
 pub struct ProposalTracker {
@@ -95,7 +95,7 @@ pub enum TakeResult {
 }
 
 impl ProposalTracker {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             pending: None,
             deferred: None,
@@ -104,13 +104,13 @@ impl ProposalTracker {
 
     /// Record a new in-flight build. A successful dispatch also invalidates
     /// any deferred slot for a prior attempt.
-    pub const fn start(&mut self, height: BlockHeight, round: Round) {
+    pub(crate) const fn start(&mut self, height: BlockHeight, round: Round) {
         self.pending = Some(PendingProposal { height, round });
         self.deferred = None;
     }
 
     /// Read the in-flight build, if any.
-    pub const fn pending(&self) -> Option<&PendingProposal> {
+    pub(crate) const fn pending(&self) -> Option<&PendingProposal> {
         self.pending.as_ref()
     }
 
@@ -118,7 +118,7 @@ impl ProposalTracker {
     /// so a stale build completing later is discarded by the next
     /// `take_matching` and the deferred slot doesn't gate the new round's
     /// `(height, round)` target.
-    pub const fn clear(&mut self) {
+    pub(crate) const fn clear(&mut self) {
         self.pending = None;
         self.deferred = None;
     }
@@ -126,24 +126,24 @@ impl ProposalTracker {
     /// Record that a build for `(height, round)` could not dispatch because
     /// the parent JMT tree wasn't available. Consulted by `can_propose` to
     /// suppress re-entry until `clear_deferred` fires.
-    pub const fn mark_deferred(&mut self, height: BlockHeight, round: Round) {
+    pub(crate) const fn mark_deferred(&mut self, height: BlockHeight, round: Round) {
         self.deferred = Some(PendingProposal { height, round });
     }
 
     /// Read the deferred slot, if any.
-    pub const fn deferred(&self) -> Option<&PendingProposal> {
+    pub(crate) const fn deferred(&self) -> Option<&PendingProposal> {
         self.deferred.as_ref()
     }
 
     /// Drop the deferred slot. Called when the verification pipeline signals
     /// that the awaited parent tree has landed, so the next `try_propose`
     /// actually re-dispatches.
-    pub const fn clear_deferred(&mut self) {
+    pub(crate) const fn clear_deferred(&mut self) {
         self.deferred = None;
     }
 
     /// Consume the in-flight build iff its `(height, round)` matches.
-    pub fn take_matching(&mut self, height: BlockHeight, round: Round) -> TakeResult {
+    pub(crate) fn take_matching(&mut self, height: BlockHeight, round: Round) -> TakeResult {
         match self.pending.take() {
             None => TakeResult::NotPending,
             Some(p) if p.height == height && p.round == round => TakeResult::Matched,
@@ -169,10 +169,10 @@ impl ProposalTracker {
 pub struct Prefilter<'a> {
     /// The predecessors' answers for transactions opening before the
     /// origin.
-    pub precut: &'a Precut,
+    pub(crate) precut: &'a Precut,
     /// Transactions this shard only delivers for, admissible past their
     /// validity end to the delivery window's close.
-    pub late_deliveries: &'a HashSet<TxHash>,
+    pub(crate) late_deliveries: &'a HashSet<TxHash>,
 }
 
 /// Filter ready transactions for proposal inclusion. Drops what the
@@ -374,17 +374,17 @@ pub fn select_provisions(
 /// tracker, deferring if the parent tree isn't ready).
 pub struct BuildActionPlan {
     /// The `BuildProposal` action ready for dispatch.
-    pub action: Action,
+    pub(crate) action: Action,
     /// Parent hash, forwarded to the tracker / verification pipeline.
-    pub parent_block_hash: BlockHash,
+    pub(crate) parent_block_hash: BlockHash,
     /// Parent block height, same rationale.
-    pub parent_block_height: BlockHeight,
+    pub(crate) parent_block_height: BlockHeight,
     /// Whether to record leader activity: `Fallback` / `Sync` count as
     /// proposer progress; `Normal` does not (it isn't progress until the
     /// QC forms).
-    pub record_leader_activity: bool,
+    pub(crate) record_leader_activity: bool,
     /// Logging label for the "proposal built" info event.
-    pub log_label: &'static str,
+    pub(crate) log_label: &'static str,
 }
 
 /// Assemble a `BuildProposal` action for the given `ProposalKind`.

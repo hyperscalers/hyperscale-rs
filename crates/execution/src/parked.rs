@@ -96,7 +96,7 @@ pub struct ParkedArtifacts {
 
 impl ParkedArtifacts {
     /// Hold `item` until `waiting` is answered.
-    pub fn park(&mut self, waiting: Waiting, item: Parked) {
+    pub(crate) fn park(&mut self, waiting: Waiting, item: Parked) {
         let queue = self.held.entry((waiting, item.shard())).or_default();
         if let Parked::Built(tick) = &item {
             let id = tick.receipt_hash();
@@ -113,7 +113,7 @@ impl ParkedArtifacts {
     /// Take everything `wake` answers for, in reason then shard then
     /// arrival order. What still waits after re-driving is parked
     /// again by the handler that finds it so.
-    pub fn release(&mut self, wake: Wake) -> Vec<Parked> {
+    pub(crate) fn release(&mut self, wake: Wake) -> Vec<Parked> {
         let (released, kept): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.held)
             .into_iter()
             .partition(|((waiting, _), _)| wake.releases(*waiting));
@@ -123,7 +123,7 @@ impl ParkedArtifacts {
 
     /// How many artifacts wait on `waiting`.
     #[must_use]
-    pub fn waiting_on(&self, waiting: impl Fn(Waiting) -> bool) -> usize {
+    pub(crate) fn waiting_on(&self, waiting: impl Fn(Waiting) -> bool) -> usize {
         self.held
             .iter()
             .filter(|((held, _), _)| waiting(*held))

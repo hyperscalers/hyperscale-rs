@@ -37,7 +37,7 @@ use hyperscale_vm_types::PrincipalAddr;
 ///
 /// Placeholder pricing — well above what a transfer draws at any node,
 /// so the ceiling is never what a load generator hits first.
-pub const DEFAULT_GAS_LIMIT: u64 = 1_000_000;
+pub(crate) const DEFAULT_GAS_LIMIT: u64 = 1_000_000;
 
 /// The per-node ceilings every built envelope signs for a manifest of
 /// `nodes` lowered nodes: [`DEFAULT_GAS_LIMIT`] split evenly, so the sum
@@ -72,7 +72,7 @@ pub enum Ceilings {
 impl Ceilings {
     /// The ceilings themselves, for a manifest of `nodes` lowered nodes.
     #[must_use]
-    pub fn over(self, nodes: usize) -> Vec<u64> {
+    pub(crate) fn over(self, nodes: usize) -> Vec<u64> {
         match self {
             Self::Measured(ceilings) => ceilings,
             Self::Guessed => default_gas_limits(nodes),

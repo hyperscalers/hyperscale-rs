@@ -18,11 +18,11 @@ use super::ShardParticipation;
 
 /// Inputs gathered for building a block proposal.
 pub(in crate::state) struct ProposalInputs {
-    pub ready_txs: Vec<Arc<Verified<Transaction>>>,
-    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    pub provisions: Vec<Arc<Verifiable<Provisions>>>,
-    pub abandonment_records: Vec<AbandonmentRecord>,
-    pub state_claims: Vec<StateClaim>,
+    pub(crate) ready_txs: Vec<Arc<Verified<Transaction>>>,
+    pub(crate) finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub(crate) abandonment_records: Vec<AbandonmentRecord>,
+    pub(crate) state_claims: Vec<StateClaim>,
 }
 
 impl ShardParticipation {

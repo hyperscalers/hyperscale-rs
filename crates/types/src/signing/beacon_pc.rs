@@ -70,9 +70,9 @@ pub struct PcVoteMessage {
 #[hbor(signing_domain = "hyperscale-spc-empty-view-v1", signing_context = NetworkId)]
 pub struct SpcEmptyViewMessage {
     /// The epoch whose SPC instance the statement belongs to.
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
     /// The `(empty_view, reported_max_view)` pair, as a vector.
-    pub vector: PcVector,
+    pub(crate) vector: PcVector,
 }
 
 /// Which SPC relay notification a sender attestation covers.

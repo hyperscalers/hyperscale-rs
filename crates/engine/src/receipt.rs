@@ -66,7 +66,7 @@ impl CachedOutput {
     /// placement in the owner prefix, so no declared node set or
     /// ownership map exists.
     #[must_use]
-    pub const fn succeeded(
+    pub(crate) const fn succeeded(
         raw_writes: StateWrites,
         receipt_hash: GlobalReceiptHash,
         metadata: ExecutionMetadata,
@@ -89,7 +89,7 @@ impl CachedOutput {
     /// The failure output — a per-transaction abort whose diagnostics
     /// ride the node-local metadata.
     #[must_use]
-    pub const fn failed(metadata: ExecutionMetadata) -> Self {
+    pub(crate) const fn failed(metadata: ExecutionMetadata) -> Self {
         Self {
             metadata,
             body: CachedOutputBody::Failed,

@@ -20,9 +20,9 @@ use crate::executor::protocol_hash;
 /// cannot disagree. The two shard types are one number — a heap index —
 /// which is what lets the mapping be a cast rather than a table.
 #[derive(Clone, Copy, Debug)]
-pub struct TrieShardResolver<'a> {
+pub(crate) struct TrieShardResolver<'a> {
     /// The active partition.
-    pub trie: &'a ShardTrie,
+    pub(crate) trie: &'a ShardTrie,
 }
 
 impl ShardResolver for TrieShardResolver<'_> {
@@ -90,7 +90,7 @@ pub fn filter_genesis_writes_for_shard(
 /// A substate key carries its owner prefix — the identity leaf's routing
 /// half — so shard assignment is a prefix walk and nothing else.
 #[must_use]
-pub fn filter_writes_for_shard(
+pub(crate) fn filter_writes_for_shard(
     writes: &StateWrites,
     owned: impl Fn(Address) -> bool,
 ) -> StateWrites {

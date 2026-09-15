@@ -84,9 +84,9 @@ pub trait SetRoot: Copy + PartialEq + fmt::Debug {
 #[error("computed root {computed:?} ≠ claimed {expected:?}")]
 pub struct RootMismatch<R> {
     /// The header's claimed root.
-    pub expected: R,
+    pub(crate) expected: R,
     /// The root the section recomputes to.
-    pub computed: R,
+    pub(crate) computed: R,
 }
 
 /// Construction asserts: `self` is [`LeafRoot::over`] the section.

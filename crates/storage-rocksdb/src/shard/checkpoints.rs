@@ -356,7 +356,7 @@ impl CheckpointRing {
         self.dir.join(entry_name(height))
     }
 
-    pub fn create(&self, height: BlockHeight) -> Result<(), StorageError> {
+    pub(crate) fn create(&self, height: BlockHeight) -> Result<(), StorageError> {
         let final_path = self.entry_path(height);
         if final_path.exists() {
             return Ok(());
@@ -381,7 +381,7 @@ impl CheckpointRing {
 
     /// All checkpoints in the ring, ascending by height.
     #[must_use]
-    pub fn entries(&self) -> Vec<(BlockHeight, PathBuf)> {
+    pub(crate) fn entries(&self) -> Vec<(BlockHeight, PathBuf)> {
         let Ok(read) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
@@ -444,7 +444,7 @@ impl CheckpointStore {
     ///
     /// Returns [`StorageError`] if the directory is not an openable
     /// `RocksDB` database with the expected column families.
-    pub fn open(path: &Path, root_path: NibblePath) -> Result<Self, StorageError> {
+    pub(crate) fn open(path: &Path, root_path: NibblePath) -> Result<Self, StorageError> {
         let opts = Options::default();
         let db = DB::open_cf_for_read_only(&opts, path, ALL_COLUMN_FAMILIES, false)
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint open: {e}")))?;

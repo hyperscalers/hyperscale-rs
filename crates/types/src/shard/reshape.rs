@@ -63,7 +63,7 @@ impl ReshapeThresholds {
     /// with its sibling. Zero (never fires) when reshaping is disabled
     /// — a byte total is never negative, so `bytes < 0` is unsatisfiable.
     #[must_use]
-    pub const fn merge_bytes(&self) -> u64 {
+    pub(crate) const fn merge_bytes(&self) -> u64 {
         if self.split_bytes == u64::MAX {
             0
         } else {
@@ -88,7 +88,7 @@ impl ReshapeThresholds {
     /// is exactly the shape that is busy enough to matter and small
     /// enough to qualify on bytes.
     #[must_use]
-    pub const fn merge_fullness(&self) -> u32 {
+    pub(crate) const fn merge_fullness(&self) -> u32 {
         if self.split_fullness > BASIS_POINTS {
             u32::MAX
         } else {
@@ -145,7 +145,7 @@ impl ReshapeTrigger {
     /// no parent to merge under, so the assertion is structurally
     /// invalid and verification rejects it as a predicate mismatch.
     #[must_use]
-    pub fn to_payload(self, shard: ShardId) -> Option<ShardWitnessPayload> {
+    pub(crate) fn to_payload(self, shard: ShardId) -> Option<ShardWitnessPayload> {
         match self {
             Self::Split { epoch } => Some(ShardWitnessPayload::ScheduleSplit { shard, epoch }),
             Self::Merge { epoch } => shard

@@ -10,22 +10,22 @@ use hyperscale_types::{BeaconChainConfig, ReshapeThresholds};
 #[derive(Clone, Debug)]
 pub struct SimulatorConfig {
     /// Number of shards in the network.
-    pub num_shards: u32,
+    pub(crate) num_shards: u32,
 
     /// Number of validators per shard.
-    pub validators_per_shard: u32,
+    pub(crate) validators_per_shard: u32,
 
     /// Number of accounts to create per shard.
-    pub accounts_per_shard: usize,
+    pub(crate) accounts_per_shard: usize,
 
     /// Initial protocol resource balance for each account.
-    pub initial_balance: u128,
+    pub(crate) initial_balance: u128,
 
     /// Workload configuration.
-    pub workload: WorkloadConfig,
+    pub(crate) workload: WorkloadConfig,
 
     /// Random seed for deterministic simulation.
-    pub seed: u64,
+    pub(crate) seed: u64,
 }
 
 impl SimulatorConfig {
@@ -93,7 +93,7 @@ impl SimulatorConfig {
     ///
     /// [`grow_to`]: hyperscale_simulation::SimulationRunner::grow_to
     #[must_use]
-    pub fn to_sim_config(&self) -> SimConfig {
+    pub(crate) fn to_sim_config(&self) -> SimConfig {
         let committee = self.validators_per_shard;
         if self.num_shards <= 1 {
             return SimConfig {
@@ -133,16 +133,16 @@ pub struct WorkloadConfig {
 
     /// Ratio of cross-shard transactions (vs same-shard).
     /// 1.0 = all cross-shard, 0.0 = all same-shard.
-    pub cross_shard_ratio: f64,
+    pub(crate) cross_shard_ratio: f64,
 
     /// Number of transactions to generate per batch.
-    pub batch_size: usize,
+    pub(crate) batch_size: usize,
 
     /// Time between transaction batches (simulated time).
-    pub batch_interval: Duration,
+    pub(crate) batch_interval: Duration,
 
     /// Account selection mode.
-    pub selection_mode: SelectionMode,
+    pub(crate) selection_mode: SelectionMode,
 }
 
 impl Default for WorkloadConfig {
@@ -190,7 +190,7 @@ impl WorkloadConfig {
 
     /// Set the account selection mode.
     #[must_use]
-    pub const fn with_selection_mode(mut self, mode: SelectionMode) -> Self {
+    pub(crate) const fn with_selection_mode(mut self, mode: SelectionMode) -> Self {
         self.selection_mode = mode;
         self
     }

@@ -27,9 +27,9 @@ use crate::fault_gate::FaultState;
 /// The event loop drains these and calls `report_message_validation_result`
 /// on the gossipsub behaviour, which controls message forwarding and peer scoring.
 pub(super) struct ValidationReport {
-    pub message_id: MessageId,
-    pub propagation_source: Libp2pPeerId,
-    pub acceptance: MessageAcceptance,
+    pub(crate) message_id: MessageId,
+    pub(crate) propagation_source: Libp2pPeerId,
+    pub(crate) acceptance: MessageAcceptance,
 }
 
 /// Guards a single message's verdict so gossipsub never leaks peer-scoring

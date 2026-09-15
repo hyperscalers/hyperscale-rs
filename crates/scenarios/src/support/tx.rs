@@ -42,7 +42,7 @@ use hyperscale_vm_types::Address;
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
 /// fee comes from the faucet, so any key notarizes it.
 #[must_use]
-pub fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
+pub(crate) fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
     ed25519_keypair_from_seed(&[seed; 32])
 }
 
@@ -52,7 +52,7 @@ pub fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
 ///
 /// Cannot panic: every 32-byte string is a valid ML-DSA seed.
 #[must_use]
-pub fn ml_dsa_signer_from_seed(seed: u8) -> MlDsa65PrivateKey {
+pub(crate) fn ml_dsa_signer_from_seed(seed: u8) -> MlDsa65PrivateKey {
     MlDsa65PrivateKey::from_bytes(&[seed; 32]).expect("any 32 bytes seed ML-DSA")
 }
 
@@ -98,7 +98,7 @@ const STRADDLER_SURVIVOR_BULK: usize = 300;
 /// Straddler pairs submitted across the splitter's grow — enough to span its
 /// terminal cut: the earliest settle on it before it crosses, the latest name a
 /// splitter that has already terminated.
-pub const STRADDLER_COUNT: usize = 8;
+pub(crate) const STRADDLER_COUNT: usize = 8;
 
 /// The surviving shard of the depth-2 merge-straddler topology —
 /// `leaf(2, 2)`.
@@ -112,18 +112,18 @@ pub const STRADDLER_COUNT: usize = 8;
 /// seeded with the fixtures beside them does not — those spread across
 /// every quarter — and brackets its floor through
 /// [`fixture_merge_floor`] instead.
-pub const MERGE_STRADDLER_SURVIVOR: ShardId = ShardId::leaf(2, 2);
+pub(crate) const MERGE_STRADDLER_SURVIVOR: ShardId = ShardId::leaf(2, 2);
 
 /// The merge-left child — `leaf(2, 0)`.
 ///
 /// Light enough to fall under `merge_bytes` and collapse into `leaf(1, 0)` with
 /// its sibling. Straddler recipients live here, so the survivor's tick names the
 /// shard that terminates at the merge.
-pub const MERGE_STRADDLER_LEFT: ShardId = ShardId::leaf(2, 0);
+pub(crate) const MERGE_STRADDLER_LEFT: ShardId = ShardId::leaf(2, 0);
 
 /// The merge-right child — `leaf(2, 1)`, the lightest quarter, which merges with
 /// [`MERGE_STRADDLER_LEFT`] into their parent `leaf(1, 0)`.
-pub const MERGE_STRADDLER_RIGHT: ShardId = ShardId::leaf(2, 1);
+pub(crate) const MERGE_STRADDLER_RIGHT: ShardId = ShardId::leaf(2, 1);
 
 /// Headroom between a merging pair's committed bytes and the floor that
 /// collapses it, and again between that floor and the surviving pair.
@@ -136,7 +136,7 @@ const MERGE_FLOOR_MARGIN: u64 = 18_000;
 /// The merge floor a fixture-seeded four-quarter topology brackets its
 /// pairs against: clear of the heavier merging quarter's flash.
 #[must_use]
-pub fn fixture_merge_floor() -> u64 {
+pub(crate) fn fixture_merge_floor() -> u64 {
     flash_bytes_on(MERGE_STRADDLER_LEFT, 4)
         .max(flash_bytes_on(MERGE_STRADDLER_RIGHT, 4))
         .saturating_add(MERGE_FLOOR_MARGIN)
@@ -152,7 +152,7 @@ pub fn fixture_merge_split_bytes() -> u64 {
 /// [`fixture_merge_floor`], so neither asserts a merge of its own while
 /// the lighter pair collapses.
 #[must_use]
-pub fn fixture_merge_survivor_ballast() -> Vec<(PrincipalAddr, u128)> {
+pub(crate) fn fixture_merge_survivor_ballast() -> Vec<(PrincipalAddr, u128)> {
     let target = fixture_merge_floor().saturating_add(MERGE_FLOOR_MARGIN);
     let mut accounts = ballast_to(MERGE_STRADDLER_SURVIVOR, 4, target);
     accounts.extend(ballast_to(ShardId::leaf(2, 3), 4, target));
@@ -170,7 +170,7 @@ const MERGE_SURVIVOR_BULK: usize = 500;
 /// Each payer in the survivor `leaf(2, 0)`, each recipient in the merging
 /// `leaf(2, 2)`. Submitted in two ticks — the first settles before the
 /// merge-left terminal, the second straddles it.
-pub const MERGE_STRADDLER_COUNT: usize = 4;
+pub(crate) const MERGE_STRADDLER_COUNT: usize = 4;
 
 /// Seed of the merge-straddler vote payer.
 ///
@@ -227,7 +227,7 @@ pub struct HaltStraddlerSetup {
     pub straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
     /// Transfers submitted after the recovery record clears, one per
     /// direction — the recovered shard's cross-shard rail must serve both.
-    pub post_recovery: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+    pub(crate) post_recovery: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
 }
 
 /// Ballast accounts per child of the root split, for the halt-recovery
@@ -290,7 +290,7 @@ pub struct MergeStraddlerSetup {
     pub accounts: Vec<(PrincipalAddr, u128)>,
     /// Straddler transfers: `(payer key, payer account in the survivor,
     /// recipient in the merging left child)`.
-    pub straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+    pub(crate) straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
 }
 
 /// The genesis funding and straddler transfers for the split-straddler scenario.
@@ -304,7 +304,7 @@ pub struct SplitStraddlerSetup {
     pub accounts: Vec<(PrincipalAddr, u128)>,
     /// Straddler transfers: `(payer key, payer account in survivor, recipient in
     /// splitter)`.
-    pub straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+    pub(crate) straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
 }
 
 /// Push `count` ballast accounts routing to `shard` under a
@@ -384,7 +384,7 @@ const CONTENTION_RECIPIENT_BASE: u8 = 200;
 /// threshold and the survivor under it, for a scenario that brings its
 /// own cast to the pair.
 #[must_use]
-pub fn split_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
+pub(crate) fn split_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
     split_ballast_accounts_over(stdlib_flash_bytes())
 }
 
@@ -398,7 +398,7 @@ pub fn split_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
 ///
 /// [`split_bytes_over`]: crate::straddler::split_bytes_over
 #[must_use]
-pub fn quarter_ballast_over(shard: ShardId, flash: u64) -> Vec<(PrincipalAddr, u128)> {
+pub(crate) fn quarter_ballast_over(shard: ShardId, flash: u64) -> Vec<(PrincipalAddr, u128)> {
     let mut accounts = Vec::new();
     let bulk = usize::try_from((flash + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
         .expect("ballast count fits usize");
@@ -414,7 +414,7 @@ pub fn quarter_ballast_over(shard: ShardId, flash: u64) -> Vec<(PrincipalAddr, u
 ///
 /// Panics if the ballast count does not fit `usize`.
 #[must_use]
-pub fn split_ballast_accounts_over(flash: u64) -> Vec<(PrincipalAddr, u128)> {
+pub(crate) fn split_ballast_accounts_over(flash: u64) -> Vec<(PrincipalAddr, u128)> {
     let mut accounts = Vec::new();
     let bulk = usize::try_from((flash + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
         .expect("ballast count fits usize");
@@ -431,7 +431,7 @@ pub fn split_ballast_accounts_over(flash: u64) -> Vec<(PrincipalAddr, u128)> {
 /// The genesis flash of a network born running the fixture packages
 /// beside the protocol's: every artifact, summed.
 #[must_use]
-pub fn fixture_flash_bytes() -> u64 {
+pub(crate) fn fixture_flash_bytes() -> u64 {
     GenesisPackages::with_fixtures()
         .artifacts()
         .iter()
@@ -449,7 +449,7 @@ pub fn fixture_flash_bytes() -> u64 {
 /// that assumes a single prefix holds the lot is calibrated against an
 /// accident.
 #[must_use]
-pub fn flash_bytes_on(shard: ShardId, num_shards: u64) -> u64 {
+pub(crate) fn flash_bytes_on(shard: ShardId, num_shards: u64) -> u64 {
     let trie = ShardTrie::uniform_from_count(num_shards);
     GenesisPackages::with_fixtures()
         .artifacts()
@@ -473,7 +473,11 @@ pub fn flash_bytes_on(shard: ShardId, num_shards: u64) -> u64 {
 ///
 /// Panics if the ballast count does not fit `usize`.
 #[must_use]
-pub fn ballast_to(shard: ShardId, num_shards: u64, target: u64) -> Vec<(PrincipalAddr, u128)> {
+pub(crate) fn ballast_to(
+    shard: ShardId,
+    num_shards: u64,
+    target: u64,
+) -> Vec<(PrincipalAddr, u128)> {
     let mut accounts = Vec::new();
     let owed = target.saturating_sub(flash_bytes_on(shard, num_shards));
     let bulk = usize::try_from(owed.div_ceil(BALLAST_CELL_BYTES)).expect("ballast fits usize");
@@ -483,9 +487,9 @@ pub fn ballast_to(shard: ShardId, num_shards: u64, target: u64) -> Vec<(Principa
 
 /// The genesis funding and transfers for a train into a shard across its
 /// reshape.
-pub struct TrainSetup {
+pub(crate) struct TrainSetup {
     /// Genesis accounts: the byte skew plus every leg's payer and recipient.
-    pub accounts: Vec<(PrincipalAddr, u128)>,
+    pub(crate) accounts: Vec<(PrincipalAddr, u128)>,
     /// One transfer per leg, a surviving shard's payer into the
     /// terminating shard's recipient, each from its own payer so the
     /// train never waits on a reservation.
@@ -495,7 +499,7 @@ pub struct TrainSetup {
 /// Build the split-train genesis funding and its `count` legs: survivor
 /// payers into splitter recipients over the split-straddler byte skew.
 #[must_use]
-pub fn split_train_setup(count: usize) -> TrainSetup {
+pub(crate) fn split_train_setup(count: usize) -> TrainSetup {
     let mut accounts = split_ballast_accounts();
     let mut taken = Vec::new();
     let legs = (0..count)
@@ -515,7 +519,7 @@ pub fn split_train_setup(count: usize) -> TrainSetup {
 /// Build the merge-train genesis funding and its `count` legs: survivor
 /// payers into merge-left recipients over the merge-straddler byte skew.
 #[must_use]
-pub fn merge_train_setup(count: usize) -> TrainSetup {
+pub(crate) fn merge_train_setup(count: usize) -> TrainSetup {
     let mut accounts = Vec::new();
     merge_survivor_ballast(&mut accounts);
     let mut taken = Vec::new();
@@ -658,7 +662,7 @@ pub fn merge_straddler_setup() -> MergeStraddlerSetup {
 /// window narrows the transaction, so mirroring the envelope's is what
 /// leaves the transaction exactly as wide as its composer asked.
 #[must_use]
-pub const fn scenario_header(validity: TimestampRange) -> IntentHeader {
+pub(crate) const fn scenario_header(validity: TimestampRange) -> IntentHeader {
     IntentHeader {
         network: SCENARIO_NETWORK,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
@@ -674,7 +678,7 @@ pub const fn scenario_header(validity: TimestampRange) -> IntentHeader {
 /// and does not know when a composer will. The composition's own window
 /// is what narrows it.
 #[must_use]
-pub const fn offer_header() -> IntentHeader {
+pub(crate) const fn offer_header() -> IntentHeader {
     IntentHeader {
         network: SCENARIO_NETWORK,
         validity_start_ms: 0,
@@ -713,7 +717,7 @@ const VALIDITY_FORWARD: Duration =
 
 /// The account owned by [`signer_from_seed`]'s key for `seed`.
 #[must_use]
-pub fn account_from_seed(seed: u8) -> PrincipalAddr {
+pub(crate) fn account_from_seed(seed: u8) -> PrincipalAddr {
     account_address(&signer_from_seed(seed).public_key().0)
 }
 
@@ -727,7 +731,7 @@ pub fn account_from_seed(seed: u8) -> PrincipalAddr {
 /// Cannot panic: the registry admits ML-DSA-65 keys at the width this
 /// signer produces them, which its own crate pins.
 #[must_use]
-pub fn ml_dsa_account_from_seed(seed: u8) -> PrincipalAddr {
+pub(crate) fn ml_dsa_account_from_seed(seed: u8) -> PrincipalAddr {
     let key = ml_dsa_signer_from_seed(seed);
     principal_for(SchemeId::ML_DSA_65, &key.public_key())
         .expect("ML-DSA-65 is registered at the width its keys have")
@@ -787,7 +791,7 @@ pub fn withdrawal_burst_genesis_accounts(count: u8) -> Vec<(PrincipalAddr, u128)
 /// Panics on a recipient list long enough to overflow a node index,
 /// which is orders past the manifest node cap admission enforces.
 #[must_use]
-pub fn build_fan_out_tx(
+pub(crate) fn build_fan_out_tx(
     payer: &Ed25519PrivateKey,
     from: PrincipalAddr,
     recipients: &[PrincipalAddr],
@@ -811,7 +815,9 @@ pub fn build_fan_out_tx(
 /// The sweep walks the same grind, so what it names is what genesis
 /// funded.
 #[must_use]
-pub fn participant_sweep_accounts(num_shards: u64) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
+pub(crate) fn participant_sweep_accounts(
+    num_shards: u64,
+) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
     let depth = num_shards.trailing_zeros();
     let mut taken = Vec::new();
     let mut accounts = accounts_routing_to(ShardId::leaf(depth, 0), num_shards, 1, &mut taken);
@@ -843,7 +849,7 @@ pub fn participant_sweep_genesis_accounts(num_shards: u64) -> Vec<(PrincipalAddr
 /// mirror, which is the shape that would livelock if conflicting ticks
 /// could starve each other.
 #[must_use]
-pub fn livelock_pair() -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
+pub(crate) fn livelock_pair() -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
     let mut taken = Vec::new();
     vec![
         account_routing_to(ShardId::leaf(1, 0), &mut taken),
@@ -878,7 +884,7 @@ pub fn build_probe_transfer_tx(validity: TimestampRange) -> Transaction {
 /// What [`build_probe_transfer_tx`] moves: enough to be a real credit,
 /// far under the sender's genesis funding so a scenario can submit
 /// several.
-pub const PROBE_PAYMENT: u128 = 100;
+pub(crate) const PROBE_PAYMENT: u128 = 100;
 
 /// Genesis funding for a scenario that submits a train of
 /// [`build_probe_transfer_tx`] probes rather than one.
@@ -897,7 +903,7 @@ pub fn probe_train_genesis_accounts(count: u32) -> Vec<(PrincipalAddr, u128)> {
 /// `count` accounts routing to `shard` under a `num_shards`-wide trie,
 /// each drawing a fresh seed.
 #[must_use]
-pub fn accounts_routing_to(
+pub(crate) fn accounts_routing_to(
     shard: ShardId,
     num_shards: u64,
     count: usize,
@@ -970,7 +976,7 @@ pub fn account_routing_to(
 ///
 /// Panics if no seed in the `u8` space routes to `shard`.
 #[must_use]
-pub fn account_routing_to_n(
+pub(crate) fn account_routing_to_n(
     shard: ShardId,
     num_shards: u64,
     taken: &mut Vec<u8>,
@@ -1000,7 +1006,7 @@ pub fn account_routing_to_n(
 ///
 /// Panics if no seed in the `u8` space routes to `shard`.
 #[must_use]
-pub fn ml_dsa_account_routing_to(
+pub(crate) fn ml_dsa_account_routing_to(
     shard: ShardId,
     taken: &mut Vec<u8>,
 ) -> (MlDsa65PrivateKey, PrincipalAddr) {
@@ -1030,7 +1036,7 @@ pub fn ml_dsa_account_routing_to(
 ///
 /// Panics if `num_shards` is not a power of two.
 #[must_use]
-pub fn account_shard(address: impl Into<Address>, num_shards: u64) -> ShardId {
+pub(crate) fn account_shard(address: impl Into<Address>, num_shards: u64) -> ShardId {
     ShardTrie::uniform_from_count(num_shards).shard_for_prefix(address)
 }
 
@@ -1064,7 +1070,7 @@ pub fn cross_shard_cast() -> (Ed25519PrivateKey, PrincipalAddr, PrincipalAddr) {
 /// scenario needs when the far side has to authorise something of its
 /// own rather than only be paid.
 #[must_use]
-pub fn cross_shard_keys() -> (
+pub(crate) fn cross_shard_keys() -> (
     Ed25519PrivateKey,
     PrincipalAddr,
     Ed25519PrivateKey,
@@ -1087,11 +1093,11 @@ pub fn cross_shard_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 
 /// What one payer's vault is funded with when two withdrawals off it are
 /// meant to be individually covered and jointly uncoverable.
-pub const OVERDRAW_FUNDING: u128 = 10_000;
+pub(crate) const OVERDRAW_FUNDING: u128 = 10_000;
 
 /// One withdrawal of an [`OVERDRAW_CAST`](overdraw_cast) pair: covered
 /// on its own, uncoverable beside its sibling.
-pub const OVERDRAW_AMOUNT: u128 = 6_000;
+pub(crate) const OVERDRAW_AMOUNT: u128 = 6_000;
 
 /// The cast of two withdrawals off one vault into separate remote
 /// vaults: the payer on `leaf(1, 0)`, two distinct recipients on
@@ -1101,7 +1107,7 @@ pub const OVERDRAW_AMOUNT: u128 = 6_000;
 /// what the pair measures is the payer's reservation, not the
 /// recipients' deposits.
 #[must_use]
-pub fn overdraw_cast() -> (
+pub(crate) fn overdraw_cast() -> (
     Ed25519PrivateKey,
     PrincipalAddr,
     PrincipalAddr,
@@ -1126,7 +1132,7 @@ pub fn overdraw_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// cell: the remote payer on `leaf(1, 0)`, a payer on `leaf(1, 1)`, and
 /// the recipient they both credit, also on `leaf(1, 1)`.
 #[must_use]
-pub fn shared_recipient_cast() -> (
+pub(crate) fn shared_recipient_cast() -> (
     Ed25519PrivateKey,
     PrincipalAddr,
     Ed25519PrivateKey,
@@ -1154,7 +1160,7 @@ pub fn shared_recipient_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// Distinct seeds from every other VM scenario's, so the shared statics
 /// registry admits them all without collision.
 #[must_use]
-pub fn nullifier_race_cast() -> (Ed25519PrivateKey, Ed25519PrivateKey, Ed25519PrivateKey) {
+pub(crate) fn nullifier_race_cast() -> (Ed25519PrivateKey, Ed25519PrivateKey, Ed25519PrivateKey) {
     (
         signer_from_seed(191),
         signer_from_seed(192),
@@ -1182,19 +1188,19 @@ pub fn nullifier_race_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// between the crossing accounts would declare the same vault cells as
 /// the in-flight cross-shard tick and queue behind it instead of proving
 /// the shard still settles locally.
-pub struct CrossShardFaultCast {
+pub(crate) struct CrossShardFaultCast {
     /// The payer and account in `leaf(1, 0)`.
-    pub left: (Ed25519PrivateKey, PrincipalAddr),
+    pub(crate) left: (Ed25519PrivateKey, PrincipalAddr),
     /// The payer and account in `leaf(1, 1)`.
-    pub right: (Ed25519PrivateKey, PrincipalAddr),
+    pub(crate) right: (Ed25519PrivateKey, PrincipalAddr),
     /// One intra-shard control per child: `(payer key, payer, recipient)`,
     /// both accounts in the same child.
-    pub controls: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+    pub(crate) controls: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
 }
 
 /// Build the cross-shard fault family's cast.
 #[must_use]
-pub fn cross_shard_fault_cast() -> CrossShardFaultCast {
+pub(crate) fn cross_shard_fault_cast() -> CrossShardFaultCast {
     let mut taken = Vec::new();
     let left = account_routing_to(ShardId::leaf(1, 0), &mut taken);
     let right = account_routing_to(ShardId::leaf(1, 1), &mut taken);
@@ -1249,7 +1255,7 @@ pub fn insolvent_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 ///
 /// Panics if no salt in the `u8` space lands on `shard`.
 #[must_use]
-pub fn lottery_on(shard: ShardId) -> InstanceMeta {
+pub(crate) fn lottery_on(shard: ShardId) -> InstanceMeta {
     let trie = ShardTrie::uniform_from_count(2);
     for salt in 0..=u8::MAX {
         let meta = InstanceMeta {
@@ -1276,7 +1282,7 @@ pub fn lottery_on(shard: ShardId) -> InstanceMeta {
 /// If the scenario world does not answer the seal, which would be a
 /// defect in the world rather than in the seal.
 #[must_use]
-pub fn build_instantiate_tx(
+pub(crate) fn build_instantiate_tx(
     payer: &Ed25519PrivateKey,
     lotteries: &[InstanceMeta],
     validity: TimestampRange,
@@ -1339,7 +1345,7 @@ pub fn build_instantiate_tx(
 /// If the scenario world does not answer a draw, which would be a defect
 /// in the world rather than in the draw.
 #[must_use]
-pub fn build_close_tx(
+pub(crate) fn build_close_tx(
     payer: &Ed25519PrivateKey,
     lotteries: &[InstanceMeta],
     validity: TimestampRange,
@@ -1357,7 +1363,7 @@ pub fn build_close_tx(
 /// If the scenario world does not answer a settlement, which would be a
 /// defect in the world rather than in the settlement.
 #[must_use]
-pub fn build_draw_tx(
+pub(crate) fn build_draw_tx(
     payer: &Ed25519PrivateKey,
     lotteries: &[InstanceMeta],
     validity: TimestampRange,
@@ -1456,7 +1462,7 @@ pub fn build_transfer_tx<S: AccountSigner>(
 ///
 /// As [`build_transfer_tx`].
 #[must_use]
-pub fn build_transfer_at_priority<S: AccountSigner>(
+pub(crate) fn build_transfer_at_priority<S: AccountSigner>(
     payer: &S,
     from: PrincipalAddr,
     to: PrincipalAddr,
@@ -1490,7 +1496,7 @@ pub fn build_transfer_at_priority<S: AccountSigner>(
 ///
 /// As [`build_transfer_tx`].
 #[must_use]
-pub fn build_transfer_at_ceilings<S: AccountSigner>(
+pub(crate) fn build_transfer_at_ceilings<S: AccountSigner>(
     payer: &S,
     from: PrincipalAddr,
     to: PrincipalAddr,
@@ -1529,7 +1535,7 @@ pub fn build_transfer_at_ceilings<S: AccountSigner>(
 /// If the scenario world does not answer a transfer, which would be a
 /// defect in the world rather than in the transfer.
 #[must_use]
-pub fn build_transfer_paid_by<S: AccountSigner>(
+pub(crate) fn build_transfer_paid_by<S: AccountSigner>(
     signer: &S,
     from: PrincipalAddr,
     to: PrincipalAddr,
@@ -1576,7 +1582,7 @@ pub fn build_transfer_paid_by<S: AccountSigner>(
 /// the signer's key does not open — the unbound case of
 /// [`build_transfer_paid_by`], where the binding must refuse.
 #[must_use]
-pub fn build_unbound_payer_tx(
+pub(crate) fn build_unbound_payer_tx(
     signer: &Ed25519PrivateKey,
     from: PrincipalAddr,
     to: PrincipalAddr,
@@ -1590,7 +1596,7 @@ pub fn build_unbound_payer_tx(
 /// the recipient on `leaf(1, 1)`, and a victim account also on
 /// `leaf(1, 0)` that the signer's key does not open.
 #[must_use]
-pub fn unbound_payer_cast() -> (
+pub(crate) fn unbound_payer_cast() -> (
     Ed25519PrivateKey,
     PrincipalAddr,
     PrincipalAddr,
@@ -1619,7 +1625,7 @@ pub fn unbound_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// the fee vault and the stored-authority cell — so its binding verdict
 /// stands alone rather than beside a manifest leg.
 #[must_use]
-pub fn unbound_remote_payer_cast() -> (
+pub(crate) fn unbound_remote_payer_cast() -> (
     Ed25519PrivateKey,
     PrincipalAddr,
     PrincipalAddr,
@@ -1652,7 +1658,7 @@ pub fn unbound_remote_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// afterwards is post-quantum. A rule names an address and an address
 /// commits to a scheme, so nothing between the two knows which happened.
 #[must_use]
-pub fn securify_cast() -> (
+pub(crate) fn securify_cast() -> (
     Ed25519PrivateKey,
     PrincipalAddr,
     MlDsa65PrivateKey,
@@ -1688,7 +1694,7 @@ pub fn securify_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// derives *is* the account, and it opens by signature alone — a virtual
 /// account's rule is the identity its own address derives.
 #[must_use]
-pub fn native_pq_cast() -> (MlDsa65PrivateKey, PrincipalAddr, PrincipalAddr) {
+pub(crate) fn native_pq_cast() -> (MlDsa65PrivateKey, PrincipalAddr, PrincipalAddr) {
     let (payer_key, payer) = ml_dsa_account_routing_to(ShardId::leaf(1, 0), &mut Vec::new());
     let (_, to) = account_routing_to(ShardId::leaf(1, 1), &mut Vec::new());
     (payer_key, payer, to)
@@ -1714,7 +1720,7 @@ pub fn native_pq_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// If the scenario world does not answer a securify, which would be a
 /// defect in the world rather than in the transition.
 #[must_use]
-pub fn build_securify_tx(
+pub(crate) fn build_securify_tx(
     owner_key: &Ed25519PrivateKey,
     owner: PrincipalAddr,
     holder: PrincipalAddr,
@@ -1782,7 +1788,7 @@ fn off_genesis_pool_shard(index: usize) -> (Ed25519PrivateKey, PrincipalAddr) {
 /// holdings and deposit it into `buyer`'s. An ordinary NF transfer —
 /// which is the point.
 #[must_use]
-pub fn build_badge_sale_tx(
+pub(crate) fn build_badge_sale_tx(
     seller: &Ed25519PrivateKey,
     buyer: PrincipalAddr,
     validity: TimestampRange,
@@ -1799,7 +1805,7 @@ pub fn build_badge_sale_tx(
 /// The publishers a deploy storm spams from: one per depth-1 shard, so
 /// the storm lands on both committees at once.
 #[must_use]
-pub fn storm_publishers() -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
+pub(crate) fn storm_publishers() -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
     let mut taken = Vec::new();
     vec![
         account_routing_to(ShardId::leaf(1, 0), &mut taken),
@@ -1823,7 +1829,7 @@ pub fn storm_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// What a storm publisher is funded with, and the ceiling each publish
 /// signs. Placeholder pricing, sized to cover the stdlib-shaped artifact
 /// the storm deploys.
-pub const STORM_FUNDING: u128 = 100_000_000;
+pub(crate) const STORM_FUNDING: u128 = 100_000_000;
 const PUBLISH_MAX_FEE: u128 = 1_000_000;
 
 /// The `nonce`-th distinct publishable artifact.
@@ -1838,7 +1844,7 @@ const PUBLISH_MAX_FEE: u128 = 1_000_000;
 /// Panics if the metadata does not attach, which would be a defect in
 /// the codec rather than a runtime condition.
 #[must_use]
-pub fn storm_artifact(nonce: u16) -> Vec<u8> {
+pub(crate) fn storm_artifact(nonce: u16) -> Vec<u8> {
     // The staking package rather than the account: a published package
     // serves instances, and a component becomes actual through the seal
     // its own package declares — which the account, serving principals,
@@ -1865,7 +1871,7 @@ pub fn storm_artifact(nonce: u16) -> Vec<u8> {
 /// Build a signed publish of `artifact`, paid for by `payer` from their
 /// own account — the publisher and the payer are the same signer.
 #[must_use]
-pub fn build_publish_tx(
+pub(crate) fn build_publish_tx(
     payer: &Ed25519PrivateKey,
     artifact: Vec<u8>,
     validity: TimestampRange,
@@ -1898,7 +1904,11 @@ pub fn build_publish_tx(
 /// is registered anywhere — the envelope carries the record, and every
 /// node composes the same registry from it.
 #[must_use]
-pub fn published_instance(artifact: &[u8], salt: u8, founder: PrincipalAddr) -> InstanceMeta {
+pub(crate) fn published_instance(
+    artifact: &[u8],
+    salt: u8,
+    founder: PrincipalAddr,
+) -> InstanceMeta {
     // The staking package's own configuration: what a delegation is
     // denominated in, and who may bring the component up. The founder is
     // folded into the address, so the caller that seals it is fixed
@@ -1929,7 +1939,7 @@ const VENUE_FEE: u128 = 30 * (1_000_000_000_000_000_000 / 10_000);
 /// If no salt in a byte lands the venue on `shard`, which would mean the
 /// derivation had stopped spreading addresses.
 #[must_use]
-pub fn venue_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> InstanceMeta {
+pub(crate) fn venue_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> InstanceMeta {
     // The uniform trie the target leaf belongs to, so a venue grinds onto
     // a shard of whatever depth the world has.
     let trie = ShardTrie::uniform_from_count(1u64 << shard.depth());
@@ -1962,7 +1972,7 @@ pub fn venue_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> InstanceM
 /// If the scenario world does not answer the call, which would be a
 /// defect in the world rather than in the call.
 #[must_use]
-pub fn build_add_liquidity_tx(
+pub(crate) fn build_add_liquidity_tx(
     payer: &Ed25519PrivateKey,
     from: PrincipalAddr,
     venue: &InstanceMeta,
@@ -2024,7 +2034,7 @@ pub fn build_swap_tx(
 ///
 /// If the scenario world does not answer either call.
 #[must_use]
-pub fn build_route_tx(
+pub(crate) fn build_route_tx(
     payer: &Ed25519PrivateKey,
     from: PrincipalAddr,
     venues: (&InstanceMeta, &InstanceMeta),
@@ -2127,7 +2137,7 @@ fn build_venues_tx(
 /// If the graph does not build, which would be a defect here rather than
 /// in the chain.
 #[must_use]
-pub fn build_instance_instantiate_tx(
+pub(crate) fn build_instance_instantiate_tx(
     payer: &Ed25519PrivateKey,
     artifact: &[u8],
     salt: u8,
@@ -2182,11 +2192,11 @@ pub fn build_instance_instantiate_tx(
 /// Distinct from the genesis pool every seated validator belongs to, so a
 /// delegation through the VM is the only source of this pool's stake and
 /// the assertion cannot be satisfied by anything else.
-pub const STAKE_POOL_ID: StakePoolId = StakePoolId::new(7777);
+pub(crate) const STAKE_POOL_ID: StakePoolId = StakePoolId::new(7777);
 
 /// The delegator's signing key and account.
 #[must_use]
-pub fn delegator() -> (Ed25519PrivateKey, PrincipalAddr) {
+pub(crate) fn delegator() -> (Ed25519PrivateKey, PrincipalAddr) {
     let key = signer_from_seed(180);
     let account = account_address(&key.public_key().0);
     (key, account)
@@ -2199,7 +2209,7 @@ pub fn delegator() -> (Ed25519PrivateKey, PrincipalAddr) {
 /// stake-scale funds rather than the token amounts the transfer
 /// scenarios use. Sized above every delegation any scenario makes plus
 /// their fees.
-pub const DELEGATOR_FUNDING: u128 = 40 * MIN_STAKE_FLOOR.quanta();
+pub(crate) const DELEGATOR_FUNDING: u128 = 40 * MIN_STAKE_FLOOR.quanta();
 
 /// Genesis accounts for the staking scenarios.
 ///
@@ -2215,7 +2225,7 @@ pub fn staking_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 }
 
 /// The identifier the beacon folds the second staking pool under.
-pub const SECOND_POOL_ID: StakePoolId = StakePoolId::new(7778);
+pub(crate) const SECOND_POOL_ID: StakePoolId = StakePoolId::new(7778);
 
 /// The identifier beacon genesis creates the founding pool under.
 ///
@@ -2223,13 +2233,13 @@ pub const SECOND_POOL_ID: StakePoolId = StakePoolId::new(7778);
 /// for it is what gives it an operator, which is how a deployment retires
 /// a founding validator. Nothing else about the pool changes — its stake
 /// and its membership are still genesis's.
-pub const GENESIS_POOL_ID: StakePoolId = StakePoolId::new(0);
+pub(crate) const GENESIS_POOL_ID: StakePoolId = StakePoolId::new(0);
 
 /// The cell a stake pool keeps its delegations in: the pool's declared
 /// vault of the resource it is configured to hold, under the pool's own
 /// address.
 #[must_use]
-pub fn pool_vault_cell(pool: ComponentAddr) -> SubstateKey {
+pub(crate) fn pool_vault_cell(pool: ComponentAddr) -> SubstateKey {
     child_key(
         &ProtocolHasher,
         pool.address(),
@@ -2241,7 +2251,7 @@ pub fn pool_vault_cell(pool: ComponentAddr) -> SubstateKey {
 /// Where genesis seats the pool with `id` — derived from the record, so
 /// a scenario names a pool the way genesis places it.
 #[must_use]
-pub fn pool_at(id: StakePoolId) -> ComponentAddr {
+pub(crate) fn pool_at(id: StakePoolId) -> ComponentAddr {
     let seat = StakePoolSeat {
         id,
         operator: pool_operator().1,
@@ -2257,7 +2267,7 @@ pub fn pool_at(id: StakePoolId) -> ComponentAddr {
 /// exercised where it can be isolated, and here the interesting question
 /// is what two *pools* may say about each other.
 #[must_use]
-pub fn staking_pools() -> Vec<StakePoolSeat> {
+pub(crate) fn staking_pools() -> Vec<StakePoolSeat> {
     let operator = pool_operator().1;
     vec![
         StakePoolSeat {
@@ -2282,7 +2292,7 @@ pub fn staking_pools() -> Vec<StakePoolSeat> {
 
 /// Retire `validator`, which `pool` must operate.
 #[must_use]
-pub fn build_deactivate_tx(
+pub(crate) fn build_deactivate_tx(
     operator: &Ed25519PrivateKey,
     pool: ComponentAddr,
     validator: ValidatorId,
@@ -2310,7 +2320,7 @@ pub fn build_deactivate_tx(
 /// admits exactly that identity, and the custody gate refuses a
 /// presenter who does not hold it.
 #[must_use]
-pub fn build_register_tx(
+pub(crate) fn build_register_tx(
     operator: &Ed25519PrivateKey,
     pool: ComponentAddr,
     validator: ValidatorId,
@@ -2344,7 +2354,7 @@ pub fn build_register_tx(
 /// other balance — a staking position is an ordinary fungible holding,
 /// so unwinding one is an ordinary withdrawal.
 #[must_use]
-pub fn build_unstake_tx(
+pub(crate) fn build_unstake_tx(
     delegator: &Ed25519PrivateKey,
     from: PrincipalAddr,
     pool: ComponentAddr,
@@ -2361,7 +2371,7 @@ pub fn build_unstake_tx(
 /// The principal the staking scenario's pool admits on its operator
 /// surface, and the key that satisfies it.
 #[must_use]
-pub fn pool_operator() -> (Ed25519PrivateKey, PrincipalAddr) {
+pub(crate) fn pool_operator() -> (Ed25519PrivateKey, PrincipalAddr) {
     let key = signer_from_seed(181);
     let account = account_address(&key.public_key().0);
     (key, account)
@@ -2374,7 +2384,7 @@ pub fn pool_operator() -> (Ed25519PrivateKey, PrincipalAddr) {
 /// account, which is what makes a staking position something a holder can
 /// hold rather than a record only the pool can read.
 #[must_use]
-pub fn build_stake_tx(
+pub(crate) fn build_stake_tx(
     delegator: &Ed25519PrivateKey,
     from: PrincipalAddr,
     pool: ComponentAddr,
@@ -2397,7 +2407,7 @@ pub fn build_stake_tx(
 /// lets the signer sign it before any composer exists and lets two
 /// composers bind the identical declaration afterwards.
 #[must_use]
-pub fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
+pub(crate) fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
     declaration(signer, |b| {
         let incoming = b.declare(*PROTOCOL_RESOURCE, [Constraint::MinAmount(amount)]);
         account::deposit(b, signer, incoming)
@@ -2411,7 +2421,7 @@ pub fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
 /// request signed for a transaction-shaped window yields a nullifier a
 /// scenario's clock can outrun and watch the sweep retire.
 #[must_use]
-pub fn payment_request_for(
+pub(crate) fn payment_request_for(
     signer: PrincipalAddr,
     amount: u128,
     window: TimestampRange,
@@ -2435,7 +2445,7 @@ pub fn payment_request_for(
 /// Panics if the composed envelope does not derive, which would be a
 /// defect in the builder rather than a runtime condition.
 #[must_use]
-pub fn build_composed_tx(
+pub(crate) fn build_composed_tx(
     composer: &Ed25519PrivateKey,
     from: PrincipalAddr,
     signer_key: &Ed25519PrivateKey,
@@ -2492,12 +2502,12 @@ pub fn build_composed_tx(
 /// payer shard's reservation check demands
 /// the ceiling be coverable, so it must sit below the funded balances, and a
 /// scenario probing for a stale reservation sizes its funding against it.
-pub const MAX_FEE: u128 = 1_000;
+pub(crate) const MAX_FEE: u128 = 1_000;
 
 /// The network every built envelope names: both harnesses run the
 /// simulator definition, and admission refuses an envelope naming any
 /// other network.
-pub const SCENARIO_NETWORK: NetworkId = NetworkId(242);
+pub(crate) const SCENARIO_NETWORK: NetworkId = NetworkId(242);
 
 /// The client every scenario transaction is built through: the world its
 /// pools are seated in, and the one network both harnesses run.
@@ -2592,18 +2602,18 @@ fn envelope<S: AccountSigner>(
 /// reset it. Defaulting to what genesis runs under is what lets a
 /// scenario name the one row it means to move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParamBallot {
+pub(crate) struct ParamBallot {
     /// Substate bytes past which a shard splits.
-    pub split_bytes: u64,
+    pub(crate) split_bytes: u64,
     /// Cap share, in basis points, past which a shard splits on traffic.
-    pub split_fullness: u32,
+    pub(crate) split_fullness: u32,
     /// Epochs a convicted pool's withdrawals stay frozen.
     pub impound_epochs: u64,
     /// The lowest each price row may reach, in basis points of the
     /// reference table.
-    pub floor_bp: u32,
+    pub(crate) floor_bp: u32,
     /// The highest each may reach, on the same terms.
-    pub ceiling_bp: u32,
+    pub(crate) ceiling_bp: u32,
 }
 
 impl ParamBallot {
@@ -2626,7 +2636,7 @@ impl ParamBallot {
     ///
     /// [`PriceBounds::as_band`]: hyperscale_vm_types::PriceBounds::as_band
     #[must_use]
-    pub fn of(params: &NetworkParams) -> Self {
+    pub(crate) fn of(params: &NetworkParams) -> Self {
         let (floor_bp, ceiling_bp) = params
             .price_bounds
             .as_band()
@@ -2647,7 +2657,7 @@ impl ParamBallot {
 /// The founding pool holds every genesis validator's stake, so one vote
 /// is a majority.
 #[must_use]
-pub fn build_param_vote_tx(
+pub(crate) fn build_param_vote_tx(
     operator: &Ed25519PrivateKey,
     ballot: ParamBallot,
     activate_at: Epoch,
@@ -2686,7 +2696,7 @@ pub fn build_param_vote_tx(
 /// seed guessed at rather than read moves every row the cluster does
 /// not run at its default.
 #[must_use]
-pub fn build_reshape_threshold_vote_tx(
+pub(crate) fn build_reshape_threshold_vote_tx(
     operator: &Ed25519PrivateKey,
     live: &NetworkParams,
     split_bytes: u64,

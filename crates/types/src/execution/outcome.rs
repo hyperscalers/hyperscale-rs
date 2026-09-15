@@ -65,7 +65,7 @@ impl Role {
     /// Whether an outcome with this role and `outcome` bears the verdict
     /// on the transaction for the certifying shard.
     #[must_use]
-    pub const fn decides(self, outcome: &ExecutionOutcome) -> bool {
+    pub(crate) const fn decides(self, outcome: &ExecutionOutcome) -> bool {
         match outcome {
             ExecutionOutcome::Succeeded { .. } => self.success_decides(),
             // A member that could not do its part ends the transaction
@@ -109,7 +109,7 @@ impl Role {
     /// value it stands for has been taken — which on a shard that is
     /// both a caller and a recipient is every swap.
     #[must_use]
-    pub const fn success_claims(self) -> bool {
+    pub(crate) const fn success_claims(self) -> bool {
         matches!(self, Self::Whole | Self::Core | Self::Delivery)
     }
 }
@@ -310,7 +310,7 @@ impl TxOutcome {
 
     /// What the attesting shard was to the transaction.
     #[must_use]
-    pub const fn role(&self) -> Role {
+    pub(crate) const fn role(&self) -> Role {
         self.role
     }
 
@@ -338,7 +338,7 @@ impl TxOutcome {
     /// Whether this outcome is the transaction's own execution, rather
     /// than a member settling what one left.
     #[must_use]
-    pub const fn executes(&self) -> bool {
+    pub(crate) const fn executes(&self) -> bool {
         self.role.executes()
     }
 
@@ -387,7 +387,7 @@ impl TxOutcome {
     /// Whether this member's committing block took a place in the drain
     /// for it, which its settlement gives back.
     #[must_use]
-    pub const fn reserved(&self) -> bool {
+    pub(crate) const fn reserved(&self) -> bool {
         self.reserved
     }
 

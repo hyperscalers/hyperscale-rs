@@ -18,8 +18,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncStatus {
     /// Per-hosted-shard sync state, keyed by shard id.
-    pub shards: HashMap<u64, BlockSyncStatus>,
+    pub(crate) shards: HashMap<u64, BlockSyncStatus>,
     /// Number of connected peers capable of sync. Process-level — the
     /// libp2p adapter is shared across hosted shards.
-    pub sync_peers: usize,
+    pub(crate) sync_peers: usize,
 }

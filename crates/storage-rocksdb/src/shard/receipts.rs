@@ -52,7 +52,7 @@ impl RocksDbShardStorage {
 
     /// Read the consensus portion. Present for any tx that committed
     /// (success or failure); absent for aborted txs and unknown hashes.
-    pub fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
+    pub(crate) fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
         self.cf_get::<ConsensusReceiptsCf>(&Hash::from(*tx_hash))
             .map(Arc::new)
     }

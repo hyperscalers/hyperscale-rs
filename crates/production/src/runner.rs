@@ -227,7 +227,7 @@ impl ProductionRunnerBuilder {
     /// Panics if `validators` is empty.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // storage + identity threading
-    pub fn new(
+    pub(crate) fn new(
         validators: Vec<LocalValidator>,
         genesis_validators: GenesisValidators,
         shard_config: ShardConsensusConfig,

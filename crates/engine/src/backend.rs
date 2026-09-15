@@ -213,7 +213,7 @@ mod native {
         ///
         /// Panics if a genesis artifact fails admission or compilation —
         /// a build defect, not a runtime condition.
-        pub fn new(packages: &GenesisPackages) -> Self {
+        pub(crate) fn new(packages: &GenesisPackages) -> Self {
             let engine = blessed_engine().expect("blessed engine configuration is pinned");
             let linker = kernel_linker(&engine);
             let slots = Arc::new(PackageSlots::new());
@@ -250,13 +250,13 @@ mod native {
         /// Idempotent by content address; the compiled code becomes
         /// resolvable when the worker lands it, and an invocation
         /// arriving sooner waits on exactly that.
-        pub fn absorb_artifact(&self, artifact: &[u8]) {
+        pub(crate) fn absorb_artifact(&self, artifact: &[u8]) {
             queue(&self.slots, &self.compile, artifact);
         }
 
         /// A cheap-clone feed of this backend for the commit path to
         /// hold: [`Self::absorb_artifact`] detached from the borrow.
-        pub fn absorber(&self) -> impl Fn(&[u8]) + Send + Sync + 'static {
+        pub(crate) fn absorber(&self) -> impl Fn(&[u8]) + Send + Sync + 'static {
             let slots = Arc::clone(&self.slots);
             let compile = self.compile.clone();
             move |artifact: &[u8]| queue(&slots, &compile, artifact)
@@ -264,7 +264,7 @@ mod native {
 
         /// Where `package` stands on this node.
         #[must_use]
-        pub fn code_standing(&self, package: PackageHash) -> Availability {
+        pub(crate) fn code_standing(&self, package: PackageHash) -> Availability {
             self.slots.availability(package)
         }
     }

@@ -24,7 +24,7 @@ pub struct BatchAccumulator<T> {
 
 impl<T> BatchAccumulator<T> {
     /// Create a new accumulator that flushes after `max_count` items or `window` time.
-    pub const fn new(max_count: usize, window: Duration) -> Self {
+    pub(crate) const fn new(max_count: usize, window: Duration) -> Self {
         Self {
             items: Vec::new(),
             count: 0,
@@ -35,7 +35,7 @@ impl<T> BatchAccumulator<T> {
     }
 
     /// Push an item with weight 1. Returns `true` if the batch is full.
-    pub fn push(&mut self, item: T, now: LocalTimestamp) -> bool {
+    pub(crate) fn push(&mut self, item: T, now: LocalTimestamp) -> bool {
         self.push_weighted(item, 1, now)
     }
 
@@ -43,7 +43,7 @@ impl<T> BatchAccumulator<T> {
     ///
     /// Use this when the count threshold applies to a measure other than the
     /// number of items (e.g. total individual votes across grouped vote items).
-    pub fn push_weighted(&mut self, item: T, weight: usize, now: LocalTimestamp) -> bool {
+    pub(crate) fn push_weighted(&mut self, item: T, weight: usize, now: LocalTimestamp) -> bool {
         if self.count == 0 {
             self.deadline = Some(now.plus(self.window));
         }
@@ -53,24 +53,24 @@ impl<T> BatchAccumulator<T> {
     }
 
     /// Take all items, resetting the accumulator and clearing the deadline.
-    pub fn take(&mut self) -> Vec<T> {
+    pub(crate) fn take(&mut self) -> Vec<T> {
         self.count = 0;
         self.deadline = None;
         std::mem::take(&mut self.items)
     }
 
     /// Whether the batch deadline has expired.
-    pub fn is_expired(&self, now: LocalTimestamp) -> bool {
+    pub(crate) fn is_expired(&self, now: LocalTimestamp) -> bool {
         self.deadline.is_some_and(|d| now >= d)
     }
 
     /// The deadline for this batch, if non-empty.
-    pub const fn deadline(&self) -> Option<LocalTimestamp> {
+    pub(crate) const fn deadline(&self) -> Option<LocalTimestamp> {
         self.deadline
     }
 
     /// Number of items currently buffered.
-    pub const fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.items.len()
     }
 }

@@ -20,11 +20,11 @@ pub struct BlockHeaderNotification {
     pub header: Arc<BlockHeader>,
 
     /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
-    pub manifest: BlockManifest,
+    pub(crate) manifest: BlockManifest,
 
     /// signature by the proposer over the domain-separated block header message.
     /// Verifies that the claimed proposer actually created this proposal.
-    pub proposer_signature: ConsensusSignature,
+    pub(crate) proposer_signature: ConsensusSignature,
 }
 
 impl BlockHeaderNotification {

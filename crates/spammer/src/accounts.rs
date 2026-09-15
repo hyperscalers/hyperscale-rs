@@ -21,10 +21,10 @@ use tracing::info;
 /// The nonce is wrapped in Arc so it can be shared across partitions.
 pub struct FundedAccount {
     /// The Ed25519 keypair for signing transactions.
-    pub keypair: Ed25519PrivateKey,
+    pub(crate) keypair: Ed25519PrivateKey,
 
     /// This account's 32-byte address — also its shard placement.
-    pub address: PrincipalAddr,
+    pub(crate) address: PrincipalAddr,
 
     /// The shard this account belongs to.
     pub shard: ShardId,
@@ -56,7 +56,7 @@ impl FundedAccount {
     /// The seed is deterministically expanded to create a keypair,
     /// and the account's shard is determined by hashing the address.
     #[must_use]
-    pub fn from_seed(seed: u64, num_shards: u64) -> Self {
+    pub(crate) fn from_seed(seed: u64, num_shards: u64) -> Self {
         // Create varied seed bytes from the u64 seed
         let mut seed_bytes = [0u8; 32];
         let seed_le = seed.to_le_bytes();
@@ -83,7 +83,7 @@ impl FundedAccount {
     ///
     /// Thread-safe for concurrent transaction generation.
     #[must_use]
-    pub fn next_nonce(&self) -> u64 {
+    pub(crate) fn next_nonce(&self) -> u64 {
         self.nonce.fetch_add(1, Ordering::SeqCst)
     }
 
@@ -171,7 +171,7 @@ pub struct AccountPartition {
 impl AccountPool {
     /// Create an empty account pool.
     #[must_use]
-    pub fn new(num_shards: u64) -> Self {
+    pub(crate) fn new(num_shards: u64) -> Self {
         use std::sync::atomic::AtomicUsize;
 
         let mut by_shard = HashMap::new();
@@ -305,7 +305,7 @@ impl AccountPool {
     }
 
     /// Get a pair of accounts on different shards (for cross-shard transactions).
-    pub fn cross_shard_pair(
+    pub(crate) fn cross_shard_pair(
         &self,
         rng: &mut (impl Rng + ?Sized),
         mode: SelectionMode,
@@ -336,7 +336,7 @@ impl AccountPool {
     ///
     /// Panics if `from_shard`'s round-robin counter is missing — unreachable
     /// for any shard registered via [`Self::new`] / [`Self::generate`].
-    pub fn cross_shard_pair_for(
+    pub(crate) fn cross_shard_pair_for(
         &self,
         from_shard: ShardId,
         to_shard: ShardId,
@@ -380,7 +380,7 @@ impl AccountPool {
     /// Get a pair of accounts on a specific shard.
     ///
     /// This properly uses the selection mode's atomic counters for NoContention/RoundRobin.
-    pub fn pair_for_shard(
+    pub(crate) fn pair_for_shard(
         &self,
         shard: ShardId,
         rng: &mut (impl Rng + ?Sized),
@@ -524,13 +524,13 @@ impl AccountPool {
 
     /// Get the number of shards.
     #[must_use]
-    pub const fn num_shards(&self) -> u64 {
+    pub(crate) const fn num_shards(&self) -> u64 {
         self.num_shards
     }
 
     /// Get accounts for a specific shard.
     #[must_use]
-    pub fn accounts_for_shard(&self, shard: ShardId) -> Option<&[FundedAccount]> {
+    pub(crate) fn accounts_for_shard(&self, shard: ShardId) -> Option<&[FundedAccount]> {
         self.by_shard.get(&shard).map(Vec::as_slice)
     }
 
@@ -547,7 +547,7 @@ impl AccountPool {
     /// A vector of `AccountPartition`, each containing a disjoint subset of accounts.
     /// If there are fewer accounts than partitions, some partitions may be empty.
     #[must_use]
-    pub fn partition(&self, num_partitions: usize) -> Vec<AccountPartition> {
+    pub(crate) fn partition(&self, num_partitions: usize) -> Vec<AccountPartition> {
         let num_partitions = num_partitions.max(1);
 
         let mut partitions: Vec<AccountPartition> = (0..num_partitions)
@@ -618,9 +618,9 @@ pub struct AccountUsageStats {
     /// Total number of account selections.
     pub total_selections: u64,
     /// Average selections per account.
-    pub avg_selections: f64,
+    pub(crate) avg_selections: f64,
     /// Maximum selections for any account.
-    pub max_selections: u64,
+    pub(crate) max_selections: u64,
     /// Minimum selections for any account (excluding unused).
     pub min_selections: u64,
     /// Total number of accounts.
@@ -662,7 +662,7 @@ pub enum AccountPoolError {
 }
 
 /// Default path for nonce state file.
-pub const DEFAULT_NONCE_FILE: &str = ".hyperscale-nonces.json";
+pub(crate) const DEFAULT_NONCE_FILE: &str = ".hyperscale-nonces.json";
 
 impl AccountPool {
     /// Load nonces from a JSON file.
@@ -674,7 +674,7 @@ impl AccountPool {
     ///
     /// Returns [`AccountPoolError::NonceLoadError`] if the file exists but
     /// can't be read or parsed as JSON.
-    pub fn load_nonces(&self, path: &std::path::Path) -> Result<usize, AccountPoolError> {
+    pub(crate) fn load_nonces(&self, path: &std::path::Path) -> Result<usize, AccountPoolError> {
         use std::sync::atomic::Ordering;
 
         let contents = match std::fs::read_to_string(path) {
@@ -708,7 +708,7 @@ impl AccountPool {
     ///
     /// Returns [`AccountPoolError::NonceSaveError`] if serialization or the
     /// underlying file write fails.
-    pub fn save_nonces(&self, path: &std::path::Path) -> Result<usize, AccountPoolError> {
+    pub(crate) fn save_nonces(&self, path: &std::path::Path) -> Result<usize, AccountPoolError> {
         use std::sync::atomic::Ordering;
 
         let mut nonces: HashMap<String, u64> = HashMap::new();
@@ -769,13 +769,13 @@ impl AccountPartition {
 
     /// Get the number of shards.
     #[must_use]
-    pub const fn num_shards(&self) -> u64 {
+    pub(crate) const fn num_shards(&self) -> u64 {
         self.num_shards
     }
 
     /// Get total number of accounts in this partition.
     #[must_use]
-    pub fn total_accounts(&self) -> usize {
+    pub(crate) fn total_accounts(&self) -> usize {
         self.by_shard.values().map(Vec::len).sum()
     }
 
@@ -799,7 +799,7 @@ impl AccountPartition {
     ///
     /// Panics if `shard` has no counter — unreachable for any shard registered
     /// via [`AccountPool::new`] / [`AccountPool::generate`].
-    pub fn pair_for_shard(
+    pub(crate) fn pair_for_shard(
         &mut self,
         shard: ShardId,
         rng: &mut impl Rng,
@@ -868,7 +868,7 @@ impl AccountPartition {
     ///
     /// Panics if either shard's counter is missing — unreachable for any
     /// shard registered via [`AccountPool::new`] / [`AccountPool::generate`].
-    pub fn cross_shard_pair_for(
+    pub(crate) fn cross_shard_pair_for(
         &mut self,
         from_shard: ShardId,
         to_shard: ShardId,

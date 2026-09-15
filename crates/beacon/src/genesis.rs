@@ -178,7 +178,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
 pub struct GenesisBoot {
     /// Genesis [`CertifiedBeaconBlock`], verified for each per-vnode
     /// `BeaconCoordinator` to resume from.
-    pub block: Arc<Verified<CertifiedBeaconBlock>>,
+    pub(crate) block: Arc<Verified<CertifiedBeaconBlock>>,
     /// Folded genesis [`BeaconState`].
     pub state: Arc<BeaconState>,
     /// Genesis config hash, bound into beacon signatures alongside the

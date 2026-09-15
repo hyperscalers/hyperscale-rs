@@ -49,36 +49,36 @@ use crate::fetch::FetchConfig;
 pub struct CrossShardState {
     /// Multi-shard remote-header sync: tracks other shards' certified header
     /// chains for the cross-shard data dependencies a shard provisions against.
-    pub remote_header_sync: RemoteHeaderSync,
+    pub(crate) remote_header_sync: RemoteHeaderSync,
 
     /// Cross-shard provision fetch (rotates through source committee).
-    pub provision: ProvisionFetch,
+    pub(crate) provision: ProvisionFetch,
     /// Cross-shard execution-cert fetch (rotates through source committee).
-    pub exec_cert: ExecCertFetch,
+    pub(crate) exec_cert: ExecCertFetch,
     /// Finalization fetch (rotates through committee).
-    pub finalization: FinalizationFetch,
+    pub(crate) finalization: FinalizationFetch,
     /// Local-provision fetch (pinned to proposer).
-    pub local_provision: LocalProvisionFetch,
+    pub(crate) local_provision: LocalProvisionFetch,
     /// Committed-transaction membership fetch against the chains this
     /// one succeeds (rotates through the predecessor's committee).
-    pub committed_tx: CommittedTxFetch,
+    pub(crate) committed_tx: CommittedTxFetch,
     /// State-proof fetch against other shards' commit-proven headers
     /// (rotates through the anchor's committee).
-    pub state_proof: StateProofFetch,
+    pub(crate) state_proof: StateProofFetch,
     /// State-proof relay for a claim this validator has not proven,
     /// asked of its own committee (rotates through it). Its own slot
     /// rather than the one above, so a relay is not suppressed by a
     /// counterpart-addressed fetch of the same cell that is failing.
-    pub relayed_state_proof: StateProofFetch,
+    pub(crate) relayed_state_proof: StateProofFetch,
     /// Settled-set fetch against departed shards' terminals (rotates
     /// through the terminal committee).
-    pub settled_txs: SettledTxsFetch,
+    pub(crate) settled_txs: SettledTxsFetch,
 }
 
 impl CrossShardState {
     /// Build cross-shard state for a freshly hosted shard.
     #[must_use]
-    pub fn new(config: &NodeConfig) -> Self {
+    pub(crate) fn new(config: &NodeConfig) -> Self {
         Self {
             remote_header_sync: RemoteHeaderSync::new(remote_header::default_config()),
             provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
@@ -138,7 +138,7 @@ impl CrossShardState {
     /// fetches) has pending work — keeps this shard's `FetchTick` alive so
     /// deferred work retries.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         self.remote_header_sync.has_deferred()
             || self.remote_header_sync.is_syncing()
             || self.provision.has_pending()
@@ -154,14 +154,17 @@ impl CrossShardState {
     /// Drive the remote-header-sync FSM's periodic tick. Returns range
     /// fetches and any newly-emitted `SyncComplete` for shards that just
     /// caught up.
-    pub fn remote_header_tick(&mut self, now: LocalTimestamp) -> Vec<RemoteHeaderSyncOutput> {
+    pub(crate) fn remote_header_tick(
+        &mut self,
+        now: LocalTimestamp,
+    ) -> Vec<RemoteHeaderSyncOutput> {
         self.remote_header_sync
             .handle(RemoteHeaderSyncInput::Tick { now })
     }
 
     /// Notify the remote-header-sync FSM that `RemoteHeaderCoordinator`
     /// admitted a header at `height` for `source_shard`.
-    pub fn on_remote_header_admitted(
+    pub(crate) fn on_remote_header_admitted(
         &mut self,
         source_shard: ShardId,
         height: BlockHeight,

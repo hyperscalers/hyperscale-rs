@@ -106,7 +106,10 @@ impl EpochWindows {
     /// opens. `None` when no boundary lies below `wt` — it falls in the genesis
     /// window, or the duration is zero.
     #[must_use]
-    pub const fn boundary_below(self, wt: WeightedTimestamp) -> Option<(Epoch, WeightedTimestamp)> {
+    pub(crate) const fn boundary_below(
+        self,
+        wt: WeightedTimestamp,
+    ) -> Option<(Epoch, WeightedTimestamp)> {
         let wt = wt.as_millis();
         if self.epoch_duration_ms == 0 || wt == 0 {
             return None;

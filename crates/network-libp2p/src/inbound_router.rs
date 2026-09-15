@@ -116,7 +116,7 @@ impl InboundRouterHandle {
     /// protocol on the stream control. Replaces (and aborts) any prior
     /// loop for the same shard; the prior is aborted first so the new
     /// loop's registration usually lands on its first attempt.
-    pub fn start_shard_loop(&self, shard: ShardId) {
+    pub(crate) fn start_shard_loop(&self, shard: ShardId) {
         if let Some((_, prior)) = self.request_handles.remove(&shard) {
             prior.abort();
         }
@@ -128,7 +128,7 @@ impl InboundRouterHandle {
     /// drops its `IncomingStreams`, which de-registers the shard's wire
     /// protocol — peers opening it afterwards get protocol-not-supported
     /// until a re-join starts the loop again.
-    pub fn stop_shard_loop(&self, shard: ShardId) {
+    pub(crate) fn stop_shard_loop(&self, shard: ShardId) {
         if let Some((_, handle)) = self.request_handles.remove(&shard) {
             handle.abort();
         }

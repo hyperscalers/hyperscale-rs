@@ -36,7 +36,7 @@ pub struct SnapshotTreeStore<'a> {
 }
 
 impl<'a> SnapshotTreeStore<'a> {
-    pub fn new(db: &'a DB, root_path: NibblePath) -> Self {
+    pub(crate) fn new(db: &'a DB, root_path: NibblePath) -> Self {
         let cf = CfHandles::resolve(db);
         Self {
             snapshot: db.snapshot(),
@@ -50,7 +50,7 @@ impl<'a> SnapshotTreeStore<'a> {
     /// atomic with respect to the nodes visible through this snapshot.
     ///
     /// Returns `(version, root_hash)`. For an empty tree, returns `(0, [0; 32])`.
-    pub fn read_jmt_metadata(&self) -> (u64, StateRoot) {
+    pub(crate) fn read_jmt_metadata(&self) -> (u64, StateRoot) {
         read_jmt_metadata(&self.snapshot)
     }
 }

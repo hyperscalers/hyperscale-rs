@@ -456,7 +456,7 @@ pub fn with_sweep(
 /// in the block that retracts it, and a removal named twice would be
 /// two `None`s at one key. Ascending, so the fold walks one order.
 #[must_use]
-pub fn removals_of(
+pub(crate) fn removals_of(
     swept: &[SubstateKey],
     finalizations: &[Arc<Verifiable<Finalization>>],
 ) -> Vec<SubstateKey> {

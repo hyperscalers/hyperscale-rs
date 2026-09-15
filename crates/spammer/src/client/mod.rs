@@ -146,7 +146,7 @@ impl RpcClient {
 
     /// Get the base URL of this client.
     #[must_use]
-    pub fn base_url(&self) -> &str {
+    pub(crate) fn base_url(&self) -> &str {
         &self.base_url
     }
 }

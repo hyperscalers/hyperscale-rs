@@ -26,14 +26,14 @@ use hyperscale_types::ShardId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProtocolVersion {
     /// Major version (breaking changes)
-    pub major: u32,
+    pub(crate) major: u32,
     /// Minor version (backwards compatible changes)
-    pub minor: u32,
+    pub(crate) minor: u32,
 }
 
 impl ProtocolVersion {
     /// Current protocol version.
-    pub const CURRENT: Self = Self { major: 1, minor: 0 };
+    pub(crate) const CURRENT: Self = Self { major: 1, minor: 0 };
 }
 
 impl Default for ProtocolVersion {
@@ -129,7 +129,7 @@ impl Topic {
     /// - Global: `hyperscale/{message_type}/{major}.{minor}.0`
     /// - Shard: `hyperscale/{message_type}/shard-{id}/{major}.{minor}.0`
     #[must_use]
-    pub fn to_topic_string(&self) -> String {
+    pub(crate) fn to_topic_string(&self) -> String {
         self.shard.map_or_else(
             || {
                 format!(

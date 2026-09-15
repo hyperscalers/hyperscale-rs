@@ -367,7 +367,7 @@ impl Epoch {
 
     /// Little-endian byte representation of the inner value.
     #[must_use]
-    pub const fn to_le_bytes(self) -> [u8; 8] {
+    pub(crate) const fn to_le_bytes(self) -> [u8; 8] {
         self.0.to_le_bytes()
     }
 }
@@ -411,7 +411,7 @@ impl Stake {
     /// in `min_stake` computations: an empty active-validator set imposes
     /// no eject ceiling, so the field reads as `Stake::MAX` and the
     /// `.min(...)` clamp picks the admit-threshold or floor instead.
-    pub const MAX: Self = Self(u128::MAX);
+    pub(crate) const MAX: Self = Self(u128::MAX);
 
     /// Construct from a raw quantum count. The canonical primary
     /// constructor — sites that already hold a quantum count pass it
@@ -818,7 +818,7 @@ impl Attempt {
 
     /// Little-endian byte representation of the inner value.
     #[must_use]
-    pub const fn to_le_bytes(self) -> [u8; 4] {
+    pub(crate) const fn to_le_bytes(self) -> [u8; 4] {
         self.0.to_le_bytes()
     }
 }

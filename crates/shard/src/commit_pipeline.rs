@@ -20,20 +20,20 @@ pub struct CommitPipeline {
 }
 
 impl CommitPipeline {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             out_of_order: BTreeMap::new(),
         }
     }
 
     /// Drop all pipeline entries at or below `committed_height`.
-    pub fn cleanup_committed(&mut self, committed_height: BlockHeight) {
+    pub(crate) fn cleanup_committed(&mut self, committed_height: BlockHeight) {
         self.out_of_order
             .retain(|height, _| *height > committed_height);
     }
 
     /// Park a commit received with height beyond the next expected height.
-    pub fn buffer_out_of_order(
+    pub(crate) fn buffer_out_of_order(
         &mut self,
         height: BlockHeight,
         certified: Arc<Verified<CertifiedBlock>>,
@@ -46,19 +46,19 @@ impl CommitPipeline {
     ///
     /// Used by the commit-chain drain loop to process the next buffered
     /// commit after committing the predecessor.
-    pub fn take_out_of_order(
+    pub(crate) fn take_out_of_order(
         &mut self,
         height: BlockHeight,
     ) -> Option<(Arc<Verified<CertifiedBlock>>, CommitSource)> {
         self.out_of_order.remove(&height)
     }
 
-    pub fn out_of_order_len(&self) -> usize {
+    pub(crate) fn out_of_order_len(&self) -> usize {
         self.out_of_order.len()
     }
 
     /// True if a commit is buffered for `height` in the out-of-order pipeline.
-    pub fn has_out_of_order_at(&self, height: BlockHeight) -> bool {
+    pub(crate) fn has_out_of_order_at(&self, height: BlockHeight) -> bool {
         self.out_of_order.contains_key(&height)
     }
 }

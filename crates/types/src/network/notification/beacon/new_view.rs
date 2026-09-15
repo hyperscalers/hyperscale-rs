@@ -33,13 +33,13 @@ use crate::{
 pub struct SpcNewViewNotification {
     /// Epoch the inner SPC instance belongs to. Bound into the
     /// signing message so a swap across epochs invalidates the sig.
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
     /// Validator relaying this proposal — the implicit signer of
     /// `sender_signature`.
     pub sender: ValidatorId,
     /// Signature over the [`SpcRelayMessage`] for
     /// `(epoch, proposal.view, proposal.hash())`.
-    pub sender_signature: ConsensusSignature,
+    pub(crate) sender_signature: ConsensusSignature,
     /// The proposal object.
     pub proposal: Arc<Verifiable<SpcProposalObject>>,
 }

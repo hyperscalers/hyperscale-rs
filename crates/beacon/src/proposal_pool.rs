@@ -109,7 +109,7 @@ impl BeaconProposalPool {
     }
 
     #[must_use]
-    pub fn contains(&self, from: ValidatorId) -> bool {
+    pub(crate) fn contains(&self, from: ValidatorId) -> bool {
         self.proposals.pin().contains_key(&from)
     }
 

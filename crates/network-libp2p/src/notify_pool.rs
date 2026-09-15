@@ -91,7 +91,11 @@ pub struct NotifyStreamPool {
 }
 
 impl NotifyStreamPool {
-    pub fn new(adapter: Arc<Libp2pAdapter>, tokio_handle: Handle, latency: Duration) -> Self {
+    pub(crate) fn new(
+        adapter: Arc<Libp2pAdapter>,
+        tokio_handle: Handle,
+        latency: Duration,
+    ) -> Self {
         Self {
             adapter,
             peers: Arc::new(DashMap::new()),
@@ -110,7 +114,7 @@ impl NotifyStreamPool {
     /// If a persistent stream actor exists and is healthy, the frame is queued
     /// (non-blocking fast path). If no actor exists or the existing one is dead,
     /// a new actor is spawned (subject to backoff).
-    pub fn send(&self, peer_id: PeerId, type_id: &'static str, compressed_data: Vec<u8>) {
+    pub(crate) fn send(&self, peer_id: PeerId, type_id: &'static str, compressed_data: Vec<u8>) {
         let frame = PendingFrame {
             type_id,
             compressed_data,

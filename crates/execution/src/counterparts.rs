@@ -97,13 +97,13 @@ impl Budget {
 pub struct HeldRecord {
     /// The record leaf, which carries the claim key, the issuing
     /// transaction and the expiry every window is read off.
-    pub cell: CrossingCell,
+    pub(crate) cell: CrossingCell,
     /// The newest counterpart header the claim has been asked at, so
     /// the question is not re-sent at the same one every block.
     asked_at: Option<BlockHeight>,
     /// What a committed claim read of the cell, once one has read it:
     /// present at any anchor, absent only past the lapse.
-    pub answer: Option<Inclusion>,
+    pub(crate) answer: Option<Inclusion>,
     /// Whether a committed abandonment record says the chain that was
     /// to consume this crossing can never settle the transaction that
     /// issued it.
@@ -114,13 +114,13 @@ pub struct HeldRecord {
     /// lands rather than only while the transaction is still owed an
     /// outcome here. A transaction nothing settled was never accepted,
     /// so nothing claimed any crossing it issued.
-    pub departed: bool,
+    pub(crate) departed: bool,
 }
 
 impl HeldRecord {
     /// The record as the leaves give it: undisposed, unasked.
     #[must_use]
-    pub const fn of(cell: CrossingCell) -> Self {
+    pub(crate) const fn of(cell: CrossingCell) -> Self {
         Self {
             cell,
             asked_at: None,
@@ -134,7 +134,7 @@ impl HeldRecord {
     /// outright, and so does the claim read absent inside the window an
     /// absence means something in.
     #[must_use]
-    pub const fn unclaimable(&self) -> bool {
+    pub(crate) const fn unclaimable(&self) -> bool {
         self.departed || matches!(self.answer, Some(Inclusion::Absent))
     }
 
@@ -142,7 +142,7 @@ impl HeldRecord {
     /// from — the producing intent's, recovered from the expiry the leaf
     /// states.
     #[must_use]
-    pub const fn deadline(&self) -> Deadline {
+    pub(crate) const fn deadline(&self) -> Deadline {
         Deadline::from_expiry(self.cell.expiry_ms)
     }
 }
@@ -168,10 +168,10 @@ struct Probe {
 /// What a commit folded, and what it could not answer for.
 pub struct Committed {
     /// The fetches it releases and the probes it opens.
-    pub actions: Vec<Action>,
+    pub(crate) actions: Vec<Action>,
     /// The transactions let go of because every counterpart has fallen
     /// silent — the tick machine's to discard.
-    pub unanswerable: Vec<Unanswerable>,
+    pub(crate) unanswerable: Vec<Unanswerable>,
 }
 
 /// What this validator holds to offer in a block it proposes.
@@ -266,7 +266,7 @@ impl Counterparts {
     /// decode is one no disposal could be composed from, so it is
     /// dropped rather than held.
     #[must_use]
-    pub fn holding(
+    pub(crate) fn holding(
         local_shard: ShardId,
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
@@ -297,7 +297,7 @@ impl Counterparts {
     /// `trie` is the block's committee's, which says who was party to
     /// each transaction, and `now` the committed clock every deadline is
     /// read against.
-    pub fn on_commit(
+    pub(crate) fn on_commit(
         &mut self,
         trie: &ShardTrie,
         topology_schedule: &TopologySchedule,
@@ -339,7 +339,7 @@ impl Counterparts {
     }
 
     /// Record a departed shard's settled set where the fence reads it.
-    pub fn on_settled(&self, shard: ShardId, settled: SettledTxSet) {
+    pub(crate) fn on_settled(&self, shard: ShardId, settled: SettledTxSet) {
         self.mirror.record_settled(shard, settled);
     }
 
@@ -351,7 +351,7 @@ impl Counterparts {
     /// so a set acquired, a window closed or a shard evicted simply
     /// drops out.
     #[must_use]
-    pub fn wanted_settled_sets(
+    pub(crate) fn wanted_settled_sets(
         &self,
         topology_schedule: &TopologySchedule,
         now: WeightedTimestamp,
@@ -384,7 +384,7 @@ impl Counterparts {
 
     /// What this validator holds to offer in a block it proposes.
     #[must_use]
-    pub fn offers(&self) -> Offers {
+    pub(crate) fn offers(&self) -> Offers {
         Offers {
             state_claims: self.state_claims(),
             abandonment_records: self.abandonment_records(),
@@ -434,7 +434,7 @@ impl Counterparts {
     ///
     /// The cell is named from signed content and the counterpart shard
     /// alone, so nothing but the header and the proof is fetched.
-    pub fn probe(&mut self, trie: &ShardTrie, now: WeightedTimestamp) -> Vec<Action> {
+    pub(crate) fn probe(&mut self, trie: &ShardTrie, now: WeightedTimestamp) -> Vec<Action> {
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         for question in self.ledger.questions(trie) {
             if !question.open_at(now) {
@@ -551,7 +551,7 @@ impl Counterparts {
     /// the same header again, and a reading that answered is kept
     /// beside the transactions it answered for, which is what keeps the
     /// question from being put to any header until a block carries it.
-    pub fn on_proof_fetched(
+    pub(crate) fn on_proof_fetched(
         &mut self,
         anchor: Anchor,
         keys: Vec<SubstateKey>,
@@ -827,7 +827,7 @@ impl Counterparts {
     /// back is the committed cell the refusal retracts, read absent past
     /// the deadline — and the mempool reads a verdict it already holds
     /// as nothing new.
-    pub fn relay_refusal(
+    pub(crate) fn relay_refusal(
         &self,
         shard: ShardId,
         tx_hash: TxHash,
@@ -849,7 +849,7 @@ impl Counterparts {
     /// finalization can still be refused afterwards, so what a record
     /// stands on is the claim cell proved present, and this only opens
     /// the question.
-    pub fn fold_claimed(
+    pub(crate) fn fold_claimed(
         &mut self,
         shard: ShardId,
         tx_hash: TxHash,
@@ -991,7 +991,7 @@ impl Counterparts {
     /// expiry is not knowable at the cut: the beacon stamps the handoff
     /// complete some epochs later, and the ledger's entry fills in on the
     /// first commit after the stamp lands.
-    pub fn stamp_departures(
+    pub(crate) fn stamp_departures(
         &mut self,
         topology_schedule: &TopologySchedule,
         now: WeightedTimestamp,
@@ -1025,7 +1025,10 @@ impl Counterparts {
     /// the leg's tick settled long ago, so the certificate routes
     /// nowhere, and what it says is the one thing in it this shard still
     /// has a use for.
-    pub fn on_certificate(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
+    pub(crate) fn on_certificate(
+        &mut self,
+        ec: &Arc<Verified<ExecutionCertificate>>,
+    ) -> Vec<Action> {
         let shard = ec.shard_id();
         let mut actions = Vec::new();
         for (tx_hash, spoken) in ec.verdicts() {
@@ -1048,7 +1051,7 @@ impl Counterparts {
     /// must be named: one outside the set is a verdict the departed
     /// shard never settled, and a certificate naming nothing gives the
     /// set nothing to vouch for.
-    pub fn settled_set_admits(
+    pub(crate) fn settled_set_admits(
         &self,
         shard: ShardId,
         cert: &Verifiable<ExecutionCertificate>,

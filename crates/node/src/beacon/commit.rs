@@ -37,7 +37,7 @@ struct CommitDedup {
 }
 
 impl BeaconCommitCoordinator {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(CommitDedup {
                 committed_through: None,
@@ -54,7 +54,7 @@ impl BeaconCommitCoordinator {
     /// `BeaconStorage` serializes the actual write under its own
     /// `commit_lock`, and holding this lock across the write would
     /// needlessly serialize every co-hosted vnode here too.
-    pub fn commit(
+    pub(crate) fn commit(
         &self,
         storage: &Arc<dyn BeaconStorage>,
         block: &Arc<Verified<CertifiedBeaconBlock>>,

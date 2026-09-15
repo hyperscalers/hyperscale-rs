@@ -106,7 +106,7 @@ impl TimestampRange {
     /// Range length, saturating at zero. Zero for malformed (empty or
     /// inverted) ranges; well-formed ranges return `end - start`.
     #[must_use]
-    pub const fn length(&self) -> Duration {
+    pub(crate) const fn length(&self) -> Duration {
         self.end_timestamp_exclusive
             .elapsed_since(self.start_timestamp_inclusive)
     }

@@ -108,7 +108,7 @@ pub enum VersionInteroperabilityMode {
 impl VersionInteroperabilityMode {
     /// Check if two versions are compatible according to this mode.
     #[must_use]
-    pub fn check(&self, local_version: &str, remote_version: &str) -> bool {
+    pub(crate) fn check(self, local_version: &str, remote_version: &str) -> bool {
         match self {
             Self::Off => true,
             Self::Strict => local_version == remote_version,

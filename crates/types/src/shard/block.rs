@@ -485,7 +485,7 @@ impl Block {
     /// a record's figures, or a finalization resolving a name it does
     /// not decide, or one it decides with success alone.
     #[must_use]
-    pub fn resolves_anything(&self) -> bool {
+    pub(crate) fn resolves_anything(&self) -> bool {
         !self.abandonment_records().is_empty()
             || !self.undecided_names().is_empty()
             || !self.successes_decided_alone().is_empty()

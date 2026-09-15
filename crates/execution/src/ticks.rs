@@ -60,13 +60,13 @@ pub struct PendingVoteRetry {
     /// Local weighted timestamp when this vote was last dispatched.
     /// Compared against `committed_ts` to detect leader aggregation
     /// timeouts independently of block production rate.
-    pub sent_at: WeightedTimestamp,
-    pub attempt: Attempt,
-    pub block_hash: BlockHash,
-    pub block_height: BlockHeight,
-    pub vote_anchor_ts: WeightedTimestamp,
-    pub global_receipt_root: GlobalReceiptRoot,
-    pub tx_outcomes: Arc<Vec<TxOutcome>>,
+    pub(crate) sent_at: WeightedTimestamp,
+    pub(crate) attempt: Attempt,
+    pub(crate) block_hash: BlockHash,
+    pub(crate) block_height: BlockHeight,
+    pub(crate) vote_anchor_ts: WeightedTimestamp,
+    pub(crate) global_receipt_root: GlobalReceiptRoot,
+    pub(crate) tx_outcomes: Arc<Vec<TxOutcome>>,
 }
 
 /// One retry the coordinator should lift to an
@@ -74,13 +74,13 @@ pub struct PendingVoteRetry {
 /// topology.
 #[derive(Debug, Clone)]
 pub struct RetryEffect {
-    pub tick_id: TickId,
-    pub attempt: Attempt,
-    pub block_hash: BlockHash,
-    pub block_height: BlockHeight,
-    pub vote_anchor_ts: WeightedTimestamp,
-    pub global_receipt_root: GlobalReceiptRoot,
-    pub tx_outcomes: Arc<Vec<TxOutcome>>,
+    pub(crate) tick_id: TickId,
+    pub(crate) attempt: Attempt,
+    pub(crate) block_hash: BlockHash,
+    pub(crate) block_height: BlockHeight,
+    pub(crate) vote_anchor_ts: WeightedTimestamp,
+    pub(crate) global_receipt_root: GlobalReceiptRoot,
+    pub(crate) tx_outcomes: Arc<Vec<TxOutcome>>,
 }
 
 /// Classification of an incoming cross-shard [`ExecutionCertificate`].
@@ -91,18 +91,18 @@ pub struct RetryEffect {
 /// they're buffered for replay when their blocks commit.
 #[derive(Debug, Default, Clone)]
 pub struct AttestationRouting {
-    pub affected_ticks: BTreeSet<TickId>,
-    pub routed_tx_hashes: Vec<TxHash>,
-    pub unrouted_tx_hashes: Vec<TxHash>,
+    pub(crate) affected_ticks: BTreeSet<TickId>,
+    pub(crate) routed_tx_hashes: Vec<TxHash>,
+    pub(crate) unrouted_tx_hashes: Vec<TxHash>,
 }
 
 /// Counts returned by [`TickRegistry::prune_resolved`] so the coordinator
 /// can fold in its own early-vote pruning before the final log line.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneCounts {
-    pub ticks: usize,
-    pub trackers: usize,
-    pub assignments: usize,
+    pub(crate) ticks: usize,
+    pub(crate) trackers: usize,
+    pub(crate) assignments: usize,
 }
 
 pub struct TickRegistry {
@@ -134,7 +134,7 @@ pub struct TickRegistry {
 }
 
 impl TickRegistry {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             states: BTreeMap::new(),
             trackers: BTreeMap::new(),
@@ -146,83 +146,83 @@ impl TickRegistry {
 
     // ─── Tick state ─────────────────────────────────────────────────────
 
-    pub fn insert_tick(&mut self, tick_id: TickId, state: TickState) {
+    pub(crate) fn insert_tick(&mut self, tick_id: TickId, state: TickState) {
         self.states.insert(tick_id, state);
     }
 
-    pub fn remove_tick(&mut self, tick_id: &TickId) -> Option<TickState> {
+    pub(crate) fn remove_tick(&mut self, tick_id: &TickId) -> Option<TickState> {
         self.states.remove(tick_id)
     }
 
-    pub fn contains_tick(&self, tick_id: &TickId) -> bool {
+    pub(crate) fn contains_tick(&self, tick_id: &TickId) -> bool {
         self.states.contains_key(tick_id)
     }
 
-    pub fn get_tick(&self, tick_id: &TickId) -> Option<&TickState> {
+    pub(crate) fn get_tick(&self, tick_id: &TickId) -> Option<&TickState> {
         self.states.get(tick_id)
     }
 
-    pub fn get_tick_mut(&mut self, tick_id: &TickId) -> Option<&mut TickState> {
+    pub(crate) fn get_tick_mut(&mut self, tick_id: &TickId) -> Option<&mut TickState> {
         self.states.get_mut(tick_id)
     }
 
-    pub fn ticks_iter(&self) -> impl Iterator<Item = (&TickId, &TickState)> {
+    pub(crate) fn ticks_iter(&self) -> impl Iterator<Item = (&TickId, &TickState)> {
         self.states.iter()
     }
 
-    pub fn ticks_iter_mut(&mut self) -> impl Iterator<Item = (&TickId, &mut TickState)> {
+    pub(crate) fn ticks_iter_mut(&mut self) -> impl Iterator<Item = (&TickId, &mut TickState)> {
         self.states.iter_mut()
     }
 
     // ─── Vote trackers ──────────────────────────────────────────────────
 
-    pub fn insert_tracker(&mut self, tick_id: TickId, tracker: VoteTracker) {
+    pub(crate) fn insert_tracker(&mut self, tick_id: TickId, tracker: VoteTracker) {
         self.trackers.insert(tick_id, tracker);
     }
 
-    pub fn remove_tracker(&mut self, tick_id: &TickId) -> Option<VoteTracker> {
+    pub(crate) fn remove_tracker(&mut self, tick_id: &TickId) -> Option<VoteTracker> {
         self.trackers.remove(tick_id)
     }
 
-    pub fn contains_tracker(&self, tick_id: &TickId) -> bool {
+    pub(crate) fn contains_tracker(&self, tick_id: &TickId) -> bool {
         self.trackers.contains_key(tick_id)
     }
 
-    pub fn get_tracker_mut(&mut self, tick_id: &TickId) -> Option<&mut VoteTracker> {
+    pub(crate) fn get_tracker_mut(&mut self, tick_id: &TickId) -> Option<&mut VoteTracker> {
         self.trackers.get_mut(tick_id)
     }
 
     // ─── EC dispatch gate ───────────────────────────────────────────────
 
-    pub fn mark_ec_dispatched(&mut self, tick_id: TickId) {
+    pub(crate) fn mark_ec_dispatched(&mut self, tick_id: TickId) {
         self.ec_dispatched.insert(tick_id);
     }
 
-    pub fn is_ec_dispatched(&self, tick_id: &TickId) -> bool {
+    pub(crate) fn is_ec_dispatched(&self, tick_id: &TickId) -> bool {
         self.ec_dispatched.contains(tick_id)
     }
 
     // ─── Assignments ────────────────────────────────────────────────────
 
-    pub fn assign_tx(&mut self, tx_hash: TxHash, tick_id: TickId) {
+    pub(crate) fn assign_tx(&mut self, tx_hash: TxHash, tick_id: TickId) {
         self.assignments.insert(tx_hash, tick_id);
     }
 
-    pub fn remove_assignment(&mut self, tx_hash: TxHash) {
+    pub(crate) fn remove_assignment(&mut self, tx_hash: TxHash) {
         self.assignments.remove(&tx_hash);
     }
 
-    pub fn tick_assignment(&self, tx_hash: TxHash) -> Option<TickId> {
+    pub(crate) fn tick_assignment(&self, tx_hash: TxHash) -> Option<TickId> {
         self.assignments.get(&tx_hash).copied()
     }
 
     // ─── Vote retries ───────────────────────────────────────────────────
 
-    pub fn record_vote_retry(&mut self, tick_id: TickId, pending: PendingVoteRetry) {
+    pub(crate) fn record_vote_retry(&mut self, tick_id: TickId, pending: PendingVoteRetry) {
         self.retries.insert(tick_id, pending);
     }
 
-    pub fn clear_vote_retry(&mut self, tick_id: &TickId) {
+    pub(crate) fn clear_vote_retry(&mut self, tick_id: &TickId) {
         self.retries.remove(tick_id);
     }
 
@@ -231,7 +231,10 @@ impl TickRegistry {
     /// [`RetryEffect`] per fired retry; entries stay in the retry table
     /// with `attempt` incremented and `sent_at = now_ts` so the next
     /// tick runs the rotated-leader check again.
-    pub fn check_vote_retry_timeouts(&mut self, now_ts: WeightedTimestamp) -> Vec<RetryEffect> {
+    pub(crate) fn check_vote_retry_timeouts(
+        &mut self,
+        now_ts: WeightedTimestamp,
+    ) -> Vec<RetryEffect> {
         let fired: Vec<TickId> = self
             .retries
             .iter()
@@ -266,7 +269,7 @@ impl TickRegistry {
     /// assignment. Read-only — mutation happens through the coordinator's
     /// follow-up calls to [`TickRegistry::get_tick_mut`] and to the
     /// early-arrival buffer.
-    pub fn classify_attestation(&self, ec: &ExecutionCertificate) -> AttestationRouting {
+    pub(crate) fn classify_attestation(&self, ec: &ExecutionCertificate) -> AttestationRouting {
         let mut routing = AttestationRouting::default();
         for outcome in ec.tx_outcomes() {
             match self.assignments.get(&outcome.tx_hash()) {
@@ -285,7 +288,7 @@ impl TickRegistry {
     /// Count of unique transactions still awaiting a counterpart's
     /// outcome. Used by observability to gauge the outstanding cross-shard
     /// backlog.
-    pub fn cross_shard_pending_count(&self) -> usize {
+    pub(crate) fn cross_shard_pending_count(&self) -> usize {
         let mut pending_txs: HashSet<TxHash> = HashSet::new();
         for tick in self.states.values() {
             for h in tick.awaiting_tx_hashes() {
@@ -302,7 +305,7 @@ impl TickRegistry {
     /// boundary: finalization is a finalization in a later block,
     /// and a terminated chain commits no later block, so every pending
     /// tick here is permanently undecidable.
-    pub fn drain_all(&mut self) -> PruneCounts {
+    pub(crate) fn drain_all(&mut self) -> PruneCounts {
         let counts = PruneCounts {
             ticks: self.states.len(),
             trackers: self.trackers.len(),
@@ -322,7 +325,7 @@ impl TickRegistry {
     /// The members are released rather than resolved: each is owed an
     /// outcome still, and with no tick holding it the deadline path is
     /// what reaches one.
-    pub fn discard_tick(&mut self, tick_id: &TickId) -> PruneCounts {
+    pub(crate) fn discard_tick(&mut self, tick_id: &TickId) -> PruneCounts {
         let ticks = usize::from(self.states.remove(tick_id).is_some());
         let trackers = usize::from(self.trackers.remove(tick_id).is_some());
         self.ec_dispatched.remove(tick_id);
@@ -348,7 +351,7 @@ impl TickRegistry {
     /// Emits a warning for vote trackers pruned with non-zero verified
     /// power (never reached quorum) so the operator sees split-receipt
     /// cases. No-op if every field is already consistent.
-    pub fn prune_resolved(&mut self) -> PruneCounts {
+    pub(crate) fn prune_resolved(&mut self) -> PruneCounts {
         let active_keys: HashSet<&TickId> = self.assignments.values().collect();
 
         let before_ticks = self.states.len();
@@ -397,23 +400,23 @@ impl TickRegistry {
 
     // ─── Stats ──────────────────────────────────────────────────────────
 
-    pub fn ticks_len(&self) -> usize {
+    pub(crate) fn ticks_len(&self) -> usize {
         self.states.len()
     }
 
-    pub fn trackers_len(&self) -> usize {
+    pub(crate) fn trackers_len(&self) -> usize {
         self.trackers.len()
     }
 
-    pub fn ec_dispatched_len(&self) -> usize {
+    pub(crate) fn ec_dispatched_len(&self) -> usize {
         self.ec_dispatched.len()
     }
 
-    pub fn retries_len(&self) -> usize {
+    pub(crate) fn retries_len(&self) -> usize {
         self.retries.len()
     }
 
-    pub fn assignments_len(&self) -> usize {
+    pub(crate) fn assignments_len(&self) -> usize {
         self.assignments.len()
     }
 }

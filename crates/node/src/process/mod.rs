@@ -325,7 +325,7 @@ where
     ///
     /// # Panics
     /// Panics if the seat registry mutex is poisoned.
-    pub fn allow_beacon_signing(
+    pub(crate) fn allow_beacon_signing(
         &self,
         validator: ValidatorId,
         my_shard: Option<ShardId>,
@@ -345,7 +345,7 @@ where
     ///
     /// # Panics
     /// Panics if the seat registry mutex is poisoned.
-    pub fn allow_ratify_signing(
+    pub(crate) fn allow_ratify_signing(
         &self,
         validator: ValidatorId,
         position: (Epoch, RatifyRound, RatifyPhase),
@@ -743,7 +743,7 @@ fn admit_topology_epoch(applied: &mut Epoch, incoming: Epoch) -> bool {
 /// Routing decision for a locally-submitted transaction. Returned by
 /// [`ProcessIo::compute_submit_fanout`]; consumed by `NodeHost` (sim)
 /// or the production routing thread.
-pub enum SubmitFanout {
+pub(crate) enum SubmitFanout {
     /// At least one hosted shard is in the tx's touched set. `source`
     /// admits, takes `locally_submitted` ownership, and gossips out;
     /// `passive` admit only.

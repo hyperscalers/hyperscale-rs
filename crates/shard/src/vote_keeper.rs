@@ -95,7 +95,7 @@ pub struct VoteKeeper {
 }
 
 impl VoteKeeper {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             vote_sets: HashMap::new(),
             received_votes_by_height: HashMap::new(),
@@ -104,7 +104,7 @@ impl VoteKeeper {
     }
 
     /// Drop all vote tracking at or below `committed_height`.
-    pub fn cleanup_committed(&mut self, committed_height: BlockHeight) {
+    pub(crate) fn cleanup_committed(&mut self, committed_height: BlockHeight) {
         self.vote_sets
             .retain(|_hash, vote_set| vote_set.height().is_none_or(|h| h > committed_height));
         self.received_votes_by_height
@@ -121,7 +121,7 @@ impl VoteKeeper {
     /// voter and capped both per block and in distinct blocks; returns `false`
     /// when a cap rejects it. The exact committee filters fabricated votes at
     /// QC-build time, so the cap is the only admission gate here.
-    pub fn buffer_unanchored_vote(&mut self, vote: BlockVote) -> bool {
+    pub(crate) fn buffer_unanchored_vote(&mut self, vote: BlockVote) -> bool {
         let block_hash = vote.block_hash();
         if !self.unanchored_votes.contains_key(&block_hash)
             && self.unanchored_votes.len() >= MAX_UNANCHORED_VOTE_BLOCKS
@@ -140,24 +140,24 @@ impl VoteKeeper {
 
     /// Remove and return the pre-header votes buffered for `block_hash` —
     /// called once its header arrives and the exact committee resolves.
-    pub fn take_unanchored_votes(&mut self, block_hash: BlockHash) -> Vec<BlockVote> {
+    pub(crate) fn take_unanchored_votes(&mut self, block_hash: BlockHash) -> Vec<BlockVote> {
         self.unanchored_votes
             .remove(&block_hash)
             .unwrap_or_default()
     }
 
-    pub fn vote_sets_len(&self) -> usize {
+    pub(crate) fn vote_sets_len(&self) -> usize {
         self.vote_sets.len()
     }
 
-    pub fn received_votes_len(&self) -> usize {
+    pub(crate) fn received_votes_len(&self) -> usize {
         self.received_votes_by_height.len()
     }
 
     /// Verified received vote for `(height, voter)`, if any.
     #[cfg(test)]
     #[must_use]
-    pub fn received_vote(
+    pub(crate) fn received_vote(
         &self,
         height: BlockHeight,
         voter: ValidatorId,
@@ -182,7 +182,7 @@ impl VoteKeeper {
     /// These are our own votes — one per block we vote on — so they are
     /// inherently bounded and bypass the [`MAX_VOTE_SETS`] flood cap that gates
     /// the untrusted wire path.
-    pub fn accept_verified_vote(
+    pub(crate) fn accept_verified_vote(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         me: ValidatorId,
@@ -227,7 +227,7 @@ impl VoteKeeper {
     /// validator id take the same batch-verify route as any other voter —
     /// the in-process verified path is only reachable through
     /// [`Self::accept_verified_vote`].
-    pub fn accept_unverified_vote(
+    pub(crate) fn accept_unverified_vote(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         me: ValidatorId,
@@ -348,7 +348,7 @@ impl VoteKeeper {
     /// verified + buffered voting power could reach quorum. Returns a
     /// `VerifyAndBuildQuorumCertificate` action, or empty if the quorum
     /// threshold can't be met yet or no buffered signatures are waiting.
-    pub fn maybe_trigger_verification(
+    pub(crate) fn maybe_trigger_verification(
         &mut self,
         local_shard: ShardId,
         block_hash: BlockHash,
@@ -398,7 +398,7 @@ impl VoteKeeper {
 
     /// Mark the vote set for `block_hash` as having produced a QC, so
     /// subsequent duplicates are ignored. No-op if the set is absent.
-    pub fn mark_qc_built(&mut self, block_hash: BlockHash) {
+    pub(crate) fn mark_qc_built(&mut self, block_hash: BlockHash) {
         if let Some(vote_set) = self.vote_sets.get_mut(&block_hash) {
             vote_set.on_qc_built();
         }
@@ -414,7 +414,7 @@ impl VoteKeeper {
     /// the vote's signing message and needed to reconstruct it — `None` when
     /// the caller can't resolve the block (e.g. it is no longer pending);
     /// the vote is still recorded for detection, but no evidence assembles.
-    pub fn track_verified_received_vote(
+    pub(crate) fn track_verified_received_vote(
         &mut self,
         block_hash: BlockHash,
         parent_block_hash: Option<BlockHash>,
@@ -459,7 +459,7 @@ impl VoteKeeper {
     /// pending-power state (some signatures verified) or an all-failed
     /// warning (none verified). No-op with a warning when the vote set has
     /// been cleaned up in the meantime.
-    pub fn finalize_pending_batch(
+    pub(crate) fn finalize_pending_batch(
         &mut self,
         block_hash: BlockHash,
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
@@ -497,7 +497,7 @@ impl VoteKeeper {
     /// at most one `(block_hash, round)` per `(height, validator)` at any
     /// single round. Later-round votes for different blocks are allowed
     /// (legitimate revote after lock release).
-    pub fn record_received_vote(
+    pub(crate) fn record_received_vote(
         &mut self,
         height: BlockHeight,
         voter: ValidatorId,
@@ -532,15 +532,15 @@ impl VoteKeeper {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredVote {
     /// Block the vote was cast for.
-    pub block_hash: BlockHash,
+    pub(crate) block_hash: BlockHash,
     /// Parent of the voted block, bound into the signing message. `None`
     /// when the recorder couldn't resolve it — the vote still counts for
     /// detection, but no evidence can be reconstructed from it.
-    pub parent_block_hash: Option<BlockHash>,
+    pub(crate) parent_block_hash: Option<BlockHash>,
     /// Round the vote was cast in.
-    pub round: Round,
+    pub(crate) round: Round,
     /// The vote's signature.
-    pub signature: ConsensusSignature,
+    pub(crate) signature: ConsensusSignature,
 }
 
 /// Result of `VoteKeeper::record_received_vote`.

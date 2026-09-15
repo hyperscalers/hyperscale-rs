@@ -88,7 +88,7 @@ impl SignerBitfield {
 
     /// Count the number of set bits.
     #[must_use]
-    pub fn count_ones(&self) -> usize {
+    pub(crate) fn count_ones(&self) -> usize {
         self.bits.iter().map(|b| b.count_ones() as usize).sum()
     }
 
@@ -100,7 +100,7 @@ impl SignerBitfield {
 
     /// Get the number of validators this bitfield can represent.
     #[must_use]
-    pub const fn num_validators(&self) -> usize {
+    pub(crate) const fn num_validators(&self) -> usize {
         self.num_validators
     }
 
@@ -111,7 +111,7 @@ impl SignerBitfield {
 
     /// Check if the bitfield is empty (no bits set).
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.bits.iter().all(|&b| b == 0)
     }
 }

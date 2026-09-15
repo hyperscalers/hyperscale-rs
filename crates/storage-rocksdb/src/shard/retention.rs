@@ -21,7 +21,7 @@ pub fn retention_floor(store: &impl ReadableStore) -> u64 {
 impl RocksDbShardStorage {
     /// The oldest version this store answers historical reads at.
     #[must_use]
-    pub fn retention_floor(&self) -> u64 {
+    pub(crate) fn retention_floor(&self) -> u64 {
         read_retention_floor(&*self.db)
     }
 

@@ -15,7 +15,7 @@ use hyperscale_types::{TimestampRange, WeightedTimestamp};
 /// Sets how far into the future `end_timestamp_exclusive` is from the
 /// submission instant. Comfortably under
 /// [`hyperscale_types::MAX_VALIDITY_RANGE`].
-pub const SPAMMER_VALIDITY_BUDGET: Duration = Duration::from_mins(1);
+pub(crate) const SPAMMER_VALIDITY_BUDGET: Duration = Duration::from_mins(1);
 
 /// Source of validity ranges for generated transactions.
 ///
@@ -29,7 +29,7 @@ pub type ValidityClock = Arc<dyn Fn() -> TimestampRange + Send + Sync>;
 /// forward budget. `start_timestamp_inclusive = now`,
 /// `end_timestamp_exclusive = now + SPAMMER_VALIDITY_BUDGET`.
 #[must_use]
-pub fn validity_range_for_now() -> TimestampRange {
+pub(crate) fn validity_range_for_now() -> TimestampRange {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -45,6 +45,6 @@ pub fn range_starting_at(start: WeightedTimestamp) -> TimestampRange {
 
 /// Default [`ValidityClock`] anchoring on the local wall clock.
 #[must_use]
-pub fn wall_clock() -> ValidityClock {
+pub(crate) fn wall_clock() -> ValidityClock {
     Arc::new(validity_range_for_now)
 }

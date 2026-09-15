@@ -487,7 +487,7 @@ impl TopologySnapshot {
     /// empty, which reads as idle — what a fixture that never folds an
     /// epoch resolves.
     #[must_use]
-    pub fn with_fullness(mut self, fullness: BTreeMap<ShardId, u32>) -> Self {
+    pub(crate) fn with_fullness(mut self, fullness: BTreeMap<ShardId, u32>) -> Self {
         self.fullness = fullness;
         self
     }
@@ -562,7 +562,7 @@ impl TopologySnapshot {
     /// committee-only constructions need not thread reshape lifecycle
     /// state.
     #[must_use]
-    pub fn with_settled_window_floors(
+    pub(crate) fn with_settled_window_floors(
         mut self,
         settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
     ) -> Self {
@@ -757,7 +757,7 @@ impl TopologySnapshot {
     /// once it has paired). `false` is definitive: no merge can land at
     /// this window's boundary.
     #[must_use]
-    pub fn merge_pending(&self, shard: ShardId) -> bool {
+    pub(crate) fn merge_pending(&self, shard: ShardId) -> bool {
         self.reshape_keepers.contains_key(&shard)
     }
 

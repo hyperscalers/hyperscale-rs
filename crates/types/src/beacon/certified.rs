@@ -66,7 +66,7 @@ impl CertifiedBeaconBlock {
     ///
     /// Returns `CertifiedBeaconBlockPairingError` if the cert shape
     /// doesn't match the block shape (see [module docs](self)).
-    pub fn new_checked(
+    pub(crate) fn new_checked(
         block: BeaconBlock,
         cert: BeaconCert,
     ) -> Result<Self, CertifiedBeaconBlockPairingError> {

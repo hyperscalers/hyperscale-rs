@@ -68,27 +68,27 @@ pub struct PreparedTx {
     /// of them this shard runs — envelope trees lower into one flat
     /// list, so nothing downstream sees intent structure — or settle
     /// the records a settlement names.
-    pub job: Job,
+    pub(crate) job: Job,
     /// The routed declaration, both views: the folded set scheduling
     /// reads, and the clause order the capability table is built in —
     /// which is what a lowered call's handle positions index.
-    pub declaration: Declaration,
+    pub(crate) declaration: Declaration,
     /// One record per bound subintent: the nullifier the batch entry
     /// enforces, and what the cell recording its spend says.
-    pub nullifiers: Vec<SubintentRecord>,
+    pub(crate) nullifiers: Vec<SubintentRecord>,
     /// The envelope's signed compute ceilings, in fuel: one per manifest
     /// node, in node order, each metering its own node and nothing else.
-    pub gas_limits: Vec<u64>,
+    pub(crate) gas_limits: Vec<u64>,
     /// What each call's method declares it may emit, in node order,
     /// which the kernel meters that node's events against and the
     /// declaration priced as retention.
-    pub event_bytes: Vec<u32>,
+    pub(crate) event_bytes: Vec<u32>,
     /// What the transaction declares it may consume, whole. A settlement
     /// is the batch's own and declares nothing.
-    pub work: DeclaredWork,
+    pub(crate) work: DeclaredWork,
     /// The owners this shard judges — with the job's plan, the one part
     /// of an entry that differs per participant.
-    pub judges: OwnerSet,
+    pub(crate) judges: OwnerSet,
 }
 
 /// The component address a record's own contents derive, or `None` for
@@ -143,15 +143,15 @@ fn env_at(ctx: &TickBatchContext<'_>, clock: WeightedTimestamp) -> EnvInputs {
 /// rather than by a lock, so nothing here is locked.
 #[derive(Debug, Default)]
 pub struct TickBaseline {
-    pub cells: BTreeMap<SubstateKey, Vec<u8>>,
+    pub(crate) cells: BTreeMap<SubstateKey, Vec<u8>>,
     /// The committed entries of every declared collection interval,
     /// keyed by entry identity — [`materialize_declared`] fills it, and
     /// the kernel's range capabilities read through it.
-    pub entries: BTreeMap<EntryKey, Vec<u8>>,
+    pub(crate) entries: BTreeMap<EntryKey, Vec<u8>>,
     /// What legs of unresolved ticks hold against these cells. Empty for
     /// a baseline with nothing in flight over it — a preview, or a shard
     /// with no cross-shard leg outstanding.
-    pub holds: ProvisionalHolds,
+    pub(crate) holds: ProvisionalHolds,
 }
 
 impl Substates for TickBaseline {
@@ -273,7 +273,7 @@ pub struct CodeUnavailable {
     /// The package whose code this node could not run.
     pub package: Hash,
     /// The class the backend reported.
-    pub reason: AbortReason,
+    pub(crate) reason: AbortReason,
 }
 
 /// Whether this node holds the code a tick's members name.
@@ -965,18 +965,18 @@ fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>) {
 /// What this shard, as a transaction's fee payer, charges it.
 #[derive(Clone, Copy)]
 pub struct PayerFee {
-    pub vault: SubstateKey,
+    pub(crate) vault: SubstateKey,
     /// The signed ceiling: the hold the price has to fit, and the most
     /// any burn reaches.
-    pub max_fee: u128,
+    pub(crate) max_fee: u128,
     /// The declared price — what every attempt owes, whatever refused
     /// it, derived from signed content and the committing block's table
     /// before anything runs.
-    pub price: u128,
+    pub(crate) price: u128,
     /// Whether a tick can abort this transaction after it executed —
     /// true for a cross-shard leg, which is the one shape whose effects
     /// are discarded after the engine completed them.
-    pub abortable: bool,
+    pub(crate) abortable: bool,
 }
 
 impl PayerFee {
@@ -991,7 +991,7 @@ impl PayerFee {
     /// reported above what was burned would claim emission weight for
     /// quanta nobody paid.
     #[must_use]
-    pub const fn burned(&self) -> u128 {
+    pub(crate) const fn burned(&self) -> u128 {
         if self.price < self.max_fee {
             self.price
         } else {

@@ -44,7 +44,7 @@ pub struct ProvisionalCells {
 
 impl ProvisionalCells {
     /// Record how one unresolved leg declared it would reach each cell.
-    pub fn claim(&mut self, declared: &[(DeclaredKey, Mode)]) {
+    pub(crate) fn claim(&mut self, declared: &[(DeclaredKey, Mode)]) {
         for (key, mode) in declared {
             let kind = mode.kind();
             match key {
@@ -64,7 +64,7 @@ impl ProvisionalCells {
     /// Whether nothing is claimed — the common case, and worth
     /// short-circuiting on since it spares every candidate the walk.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.cells.is_empty() && self.collections.is_empty()
     }
 
@@ -74,7 +74,7 @@ impl ProvisionalCells {
     /// Incompatible on any one cell is enough: the candidate is one
     /// transaction and it executes whole or not at all.
     #[must_use]
-    pub fn blocks(&self, declared: &[(DeclaredKey, Mode)]) -> bool {
+    pub(crate) fn blocks(&self, declared: &[(DeclaredKey, Mode)]) -> bool {
         declared.iter().any(|(key, mode)| {
             let candidate = mode.kind();
             let held = match key {

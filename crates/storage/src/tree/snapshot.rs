@@ -39,7 +39,7 @@ pub struct JmtSnapshot {
     /// mean two baselines, and a validator that picks the second from how
     /// far it happens to have persisted computes a state root no one else
     /// does.
-    pub settled: SettledWrites,
+    pub(crate) settled: SettledWrites,
 }
 
 impl JmtSnapshot {

@@ -22,7 +22,7 @@ use thiserror::Error;
 /// uncompressed size in its LZ4 header. The compressed wire frame is already
 /// capped at 10 MB; 64 MB allows for highly compressible wire payloads while
 /// blocking multi-GB allocations from malicious peers.
-pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
 
 /// Errors from compression/decompression.
 #[derive(Debug, Error)]

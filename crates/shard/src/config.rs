@@ -12,7 +12,7 @@ pub struct ShardConsensusConfig {
     /// Timeout before fetching missing transactions from peers.
     /// If a pending block is still incomplete after this duration, request
     /// the missing transactions directly from the proposer or a peer.
-    pub transaction_fetch_timeout: Duration,
+    pub(crate) transaction_fetch_timeout: Duration,
 
     /// Interval between cleanup timer fires.
     /// The cleanup timer performs periodic housekeeping tasks:
@@ -22,7 +22,7 @@ pub struct ShardConsensusConfig {
     /// Maximum number of synced blocks to submit for parallel QC verification
     /// at once. Bounds memory usage from buffered blocks and prevents
     /// overwhelming the crypto pool during sync catch-up.
-    pub max_parallel_sync_verifications: usize,
+    pub(crate) max_parallel_sync_verifications: usize,
 }
 
 impl Default for ShardConsensusConfig {

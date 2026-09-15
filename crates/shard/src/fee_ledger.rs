@@ -36,7 +36,7 @@ pub struct FeeReservationLedger {
 }
 
 impl FeeReservationLedger {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             holds: HashMap::new(),
         }
@@ -58,7 +58,7 @@ impl FeeReservationLedger {
     /// rest at the first commit. A hold for a payer this shard does not
     /// hold is invisible to [`held_for`](Self::held_for) meanwhile, which
     /// sums by the payer asked about.
-    pub fn seeded(holds: &[FeeHold]) -> Self {
+    pub(crate) fn seeded(holds: &[FeeHold]) -> Self {
         let mut ledger = Self::new();
         for hold in holds {
             ledger.holds.insert(
@@ -79,7 +79,7 @@ impl FeeReservationLedger {
     /// payers this shard answers for is
     /// [`retain_payers`](Self::retain_payers)'s question, asked once
     /// against the trie rather than here and at the seed separately.
-    pub fn register_committed(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
+    pub(crate) fn register_committed(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
         for tx in transactions {
             let vm = tx.body();
             let deadline = tx
@@ -96,7 +96,7 @@ impl FeeReservationLedger {
 
     /// Release the reservations a committed block's finalizations
     /// resolve — settlement and abort both arrive as finalizations.
-    pub fn release_finalized(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
+    pub(crate) fn release_finalized(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for tick in finalizations {
             for tx_hash in tick.tx_hashes() {
                 self.holds.remove(&tx_hash);
@@ -110,20 +110,20 @@ impl FeeReservationLedger {
     /// reshape, so a payer whose prefix leaves takes its holds with it,
     /// and a seed taken before any trie was in scope is narrowed here on
     /// the first commit.
-    pub fn retain_payers(&mut self, payer_local: impl Fn(Address) -> bool) {
+    pub(crate) fn retain_payers(&mut self, payer_local: impl Fn(Address) -> bool) {
         self.holds
             .retain(|_, hold| payer_local(hold.payer.address()));
     }
 
     /// Drop holds past their deadline. `now` is the latest committed
     /// block's weighted timestamp.
-    pub fn prune(&mut self, now: WeightedTimestamp) {
+    pub(crate) fn prune(&mut self, now: WeightedTimestamp) {
         self.holds.retain(|_, hold| hold.deadline > now);
     }
 
     /// The total engaged reservation against `payer`, saturating.
     #[must_use]
-    pub fn held_for(&self, payer: Address) -> u128 {
+    pub(crate) fn held_for(&self, payer: Address) -> u128 {
         self.holds
             .values()
             .filter(|hold| hold.payer == payer)

@@ -239,7 +239,7 @@ impl TransferWorkload {
     ///
     /// All transactions will involve the target shard (either as the only shard
     /// for same-shard transactions, or as one of the involved shards for cross-shard).
-    pub fn generate_batch_for_shard<R: Rng + ?Sized>(
+    pub(crate) fn generate_batch_for_shard<R: Rng + ?Sized>(
         &self,
         accounts: &AccountPool,
         target_shard: ShardId,

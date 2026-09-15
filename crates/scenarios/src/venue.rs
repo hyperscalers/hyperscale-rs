@@ -159,7 +159,7 @@ pub struct StockedVenue {
     /// The venue's metadata, which every call is typed against.
     pub meta: InstanceMeta,
     /// The stake unit the venue prices protocol resource against.
-    pub unit: ResourceAddr,
+    pub(crate) unit: ResourceAddr,
 }
 
 /// Stand a venue up on `shard`: seat its provider, seal it, and stock
@@ -682,12 +682,12 @@ pub fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue<C: Cluster>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VenueReport {
     /// How many swaps were submitted together.
-    pub submitted: usize,
+    pub(crate) submitted: usize,
     /// From the first submission to the last settlement.
-    pub elapsed: Duration,
+    pub(crate) elapsed: Duration,
     /// The median swap's time from the queue opening to its own
     /// settlement.
-    pub latency_p50: Duration,
+    pub(crate) latency_p50: Duration,
     /// Blocks the venue's own shard committed across the same span.
     ///
     /// The resolution the clock readings do not have. A harness samples

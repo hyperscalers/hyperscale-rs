@@ -43,7 +43,7 @@ impl MlDsa65PrivateKey {
     /// The seed is the whole secret: FIPS 204 derives the expanded
     /// signing key from it, and every parameter set seeds from the same
     /// 32 bytes.
-    pub const LENGTH: usize = 32;
+    pub(crate) const LENGTH: usize = 32;
 
     fn signing_key(&self) -> &SigningKey<MlDsa65> {
         (*self.0)
@@ -59,7 +59,7 @@ impl MlDsa65PrivateKey {
 
     /// Sign `msg`, yielding a signature in `sigEncode` form.
     #[must_use]
-    pub fn sign(&self, msg: impl AsRef<[u8]>) -> Vec<u8> {
+    pub(crate) fn sign(&self, msg: impl AsRef<[u8]>) -> Vec<u8> {
         let signature: Signature<MlDsa65> = self.signing_key().sign(msg.as_ref());
         signature.encode().to_vec()
     }

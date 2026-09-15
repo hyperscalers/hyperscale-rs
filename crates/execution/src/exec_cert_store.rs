@@ -115,13 +115,13 @@ impl ExecCertStore {
 
     /// Look up a verified execution certificate by `TickId`.
     #[must_use]
-    pub fn get(&self, tick_id: &TickId) -> Option<Arc<Verified<ExecutionCertificate>>> {
+    pub(crate) fn get(&self, tick_id: &TickId) -> Option<Arc<Verified<ExecutionCertificate>>> {
         self.inner.pin().get(tick_id).cloned()
     }
 
     /// Drop the entry for `tick_id`, if any, along with its transaction
     /// index entries.
-    pub fn evict(&self, tick_id: &TickId) {
+    pub(crate) fn evict(&self, tick_id: &TickId) {
         if let Some(cert) = self.inner.pin().remove(tick_id) {
             let by_tx = self.by_tx.pin();
             for tx_hash in cert.tx_outcomes().iter().map(TxOutcome::tx_hash) {

@@ -23,16 +23,16 @@ use crate::{BeaconBlockHash, Epoch, RatifyPhase, RatifyRound};
 #[hbor(signing_domain = "hyperscale-ratify-vote-v1", signing_context = NetworkId)]
 pub struct RatifyVoteMessage {
     /// The commit-anchor hash the ratification round runs under.
-    pub anchor_hash: BeaconBlockHash,
+    pub(crate) anchor_hash: BeaconBlockHash,
     /// The epoch being ratified.
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
     /// Ratification round.
-    pub round: RatifyRound,
+    pub(crate) round: RatifyRound,
     /// Prevote or precommit — the phase byte is load-bearing: without it
     /// a single signature could count toward both a polka and a commit.
-    pub phase: RatifyPhase,
+    pub(crate) phase: RatifyPhase,
     /// The beacon block being ratified.
-    pub block_hash: BeaconBlockHash,
+    pub(crate) block_hash: BeaconBlockHash,
 }
 
 #[cfg(test)]

@@ -78,7 +78,7 @@ pub struct VoteTracker {
 impl VoteTracker {
     /// Create a new execution vote tracker.
     #[must_use]
-    pub fn new(tick_id: TickId, block_hash: BlockHash, quorum: VoteCount) -> Self {
+    pub(crate) fn new(tick_id: TickId, block_hash: BlockHash, quorum: VoteCount) -> Self {
         Self {
             tick_id,
             block_hash,
@@ -100,7 +100,7 @@ impl VoteTracker {
 
     /// Get the block hash.
     #[must_use]
-    pub const fn block_hash(&self) -> BlockHash {
+    pub(crate) const fn block_hash(&self) -> BlockHash {
         self.block_hash
     }
 
@@ -114,7 +114,7 @@ impl VoteTracker {
     /// buffered for this (validator, `vote_anchor_ts`). The claimed validator is
     /// unauthenticated here, so the slot it takes is released again by
     /// [`Self::take_unverified_votes`].
-    pub fn buffer_unverified_vote(
+    pub(crate) fn buffer_unverified_vote(
         &mut self,
         vote: ExecutionVote,
         public_key: ConsensusPublicKey,
@@ -138,7 +138,7 @@ impl VoteTracker {
     /// 2. No verification is already in flight
     /// 3. Total power (verified + unverified) could reach quorum
     #[must_use]
-    pub fn should_trigger_verification(&self) -> bool {
+    pub(crate) fn should_trigger_verification(&self) -> bool {
         if self.unverified_votes.is_empty() || self.pending_verification {
             return false;
         }
@@ -157,7 +157,7 @@ impl VoteTracker {
     /// Take unverified votes for batch verification.
     ///
     /// Marks verification as pending. Call `on_verification_complete` when done.
-    pub fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, ConsensusPublicKey)> {
+    pub(crate) fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, ConsensusPublicKey)> {
         self.pending_verification = true;
         self.unverified_power = VoteCount::ZERO;
         // Reopen the buffered slots: these votes are now in the batch, and only
@@ -168,7 +168,7 @@ impl VoteTracker {
     }
 
     /// Handle verification completion.
-    pub const fn on_verification_complete(&mut self) {
+    pub(crate) const fn on_verification_complete(&mut self) {
         self.pending_verification = false;
     }
 
@@ -184,7 +184,7 @@ impl VoteTracker {
     /// Dedup scans [`Self::votes_by_key`] — a validator may have voted on
     /// any `global_receipt_root` at this anchor, so the check spans every
     /// bucket sharing the incoming `vote_anchor_ts`.
-    pub fn add_verified_vote(&mut self, vote: Verified<ExecutionVote>) {
+    pub(crate) fn add_verified_vote(&mut self, vote: Verified<ExecutionVote>) {
         let validator = vote.validator();
         let anchor_ts = vote.vote_anchor_ts();
         let already_counted = self
@@ -205,7 +205,7 @@ impl VoteTracker {
     /// Returns `Some((global_receipt_root, vote_anchor_ts, total_power))` if quorum reached.
     /// If multiple pairs have quorum, returns the one with the lowest `vote_anchor_ts`.
     #[must_use]
-    pub fn check_quorum(&self) -> Option<(GlobalReceiptRoot, WeightedTimestamp, VoteCount)> {
+    pub(crate) fn check_quorum(&self) -> Option<(GlobalReceiptRoot, WeightedTimestamp, VoteCount)> {
         let mut best: Option<(GlobalReceiptRoot, WeightedTimestamp, VoteCount)> = None;
         for (&(global_receipt_root, vote_anchor_ts), &power) in &self.power_by_key {
             if power >= self.quorum {
@@ -219,7 +219,7 @@ impl VoteTracker {
     }
 
     /// Take votes for a specific (`global_receipt_root`, `vote_anchor_ts`) pair.
-    pub fn take_votes(
+    pub(crate) fn take_votes(
         &mut self,
         global_receipt_root: GlobalReceiptRoot,
         vote_anchor_ts: WeightedTimestamp,
@@ -234,7 +234,7 @@ impl VoteTracker {
     /// already cap at the topology's voting-power total, so a saturated
     /// reading still gives a correct "well above quorum" answer.
     #[must_use]
-    pub fn total_verified_power(&self) -> VoteCount {
+    pub(crate) fn total_verified_power(&self) -> VoteCount {
         self.power_by_key
             .values()
             .fold(VoteCount::ZERO, |acc, &p| acc.saturating_add(p))
@@ -242,7 +242,7 @@ impl VoteTracker {
 
     /// Return the number of distinct receipt roots across all verified vote groups.
     #[must_use]
-    pub fn distinct_global_receipt_root_count(&self) -> usize {
+    pub(crate) fn distinct_global_receipt_root_count(&self) -> usize {
         self.power_by_key
             .keys()
             .map(|(root, _)| root)
@@ -253,7 +253,7 @@ impl VoteTracker {
     /// Return a summary of verified voting power per global receipt root (summed across vote heights).
     /// Used for diagnostics when quorum cannot be reached.
     #[must_use]
-    pub fn global_receipt_root_power_summary(&self) -> Vec<(GlobalReceiptRoot, VoteCount)> {
+    pub(crate) fn global_receipt_root_power_summary(&self) -> Vec<(GlobalReceiptRoot, VoteCount)> {
         let mut by_root: BTreeMap<GlobalReceiptRoot, VoteCount> = BTreeMap::new();
         for (&(root, _), &power) in &self.power_by_key {
             *by_root.entry(root).or_insert(VoteCount::ZERO) += power;
@@ -266,13 +266,13 @@ impl VoteTracker {
 impl VoteTracker {
     /// Check if verification is pending.
     #[must_use]
-    pub const fn is_verification_pending(&self) -> bool {
+    pub(crate) const fn is_verification_pending(&self) -> bool {
         self.pending_verification
     }
 
     /// Get votes for a specific global receipt root at any height (for tests).
     #[must_use]
-    pub fn votes_for_global_receipt_root(
+    pub(crate) fn votes_for_global_receipt_root(
         &self,
         global_receipt_root: GlobalReceiptRoot,
     ) -> Vec<&Verified<ExecutionVote>> {

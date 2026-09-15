@@ -93,7 +93,7 @@ pub struct VoteSet {
 
 impl VoteSet {
     /// Create a new vote set.
-    pub fn new(header: Option<&BlockHeader>, num_validators: usize) -> Self {
+    pub(crate) fn new(header: Option<&BlockHeader>, num_validators: usize) -> Self {
         let (block_hash, height, round, parent_block_hash, parent_weighted_timestamp) = header
             .map_or((None, None, None, None, None), |h| {
                 (
@@ -125,29 +125,29 @@ impl VoteSet {
     }
 
     /// Committee votes this set tallies against — see the field.
-    pub const fn committee_votes(&self) -> VoteCount {
+    pub(crate) const fn committee_votes(&self) -> VoteCount {
         self.committee_votes
     }
 
     /// Get the block height.
-    pub const fn height(&self) -> Option<BlockHeight> {
+    pub(crate) const fn height(&self) -> Option<BlockHeight> {
         self.height
     }
 
     /// Get the current verified voting power.
-    pub const fn verified_power(&self) -> VoteCount {
+    pub(crate) const fn verified_power(&self) -> VoteCount {
         self.verified_power
     }
 
     /// Get the current unverified voting power.
-    pub const fn unverified_power(&self) -> VoteCount {
+    pub(crate) const fn unverified_power(&self) -> VoteCount {
         self.unverified_power
     }
 
     /// Whether this validator's vote has already been verified and counted.
     /// Buffered-but-unverified votes are deliberately excluded, so a forged
     /// vote cannot suppress the genuine one behind it.
-    pub fn has_seen_validator(&self, committee_index: usize) -> bool {
+    pub(crate) fn has_seen_validator(&self, committee_index: usize) -> bool {
         committee_index < self.verified_voters.len() && self.verified_voters[committee_index]
     }
 
@@ -159,7 +159,7 @@ impl VoteSet {
     ///
     /// Returns `true` if the vote was buffered, `false` if it was rejected
     /// (out-of-range committee index or duplicate).
-    pub fn buffer_unverified_vote(
+    pub(crate) fn buffer_unverified_vote(
         &mut self,
         committee_index: usize,
         vote: BlockVote,
@@ -201,7 +201,7 @@ impl VoteSet {
     /// - We have unverified votes to verify
     /// - We're not already waiting for a verification result
     /// - We have the header info needed to build a QC
-    pub fn should_trigger_verification(&self, total_committee_power: VoteCount) -> bool {
+    pub(crate) fn should_trigger_verification(&self, total_committee_power: VoteCount) -> bool {
         !self.pending_verification
             && !self.qc_built
             && !self.unverified_votes.is_empty()
@@ -216,7 +216,7 @@ impl VoteSet {
     ///
     /// Returns the votes and marks the vote set as pending verification.
     /// Each tuple is (`committee_index`, vote, `public_key`).
-    pub fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, ConsensusPublicKey)> {
+    pub(crate) fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, ConsensusPublicKey)> {
         self.pending_verification = true;
         self.unverified_power = VoteCount::ZERO;
         // Reopen the buffered slots: these votes are now in the batch, and only
@@ -230,7 +230,7 @@ impl VoteSet {
     ///
     /// These are votes that were added via `add_verified_vote` (e.g., our own vote)
     /// and need to be included in the QC along with newly verified votes.
-    pub fn get_verified_votes(&self) -> Vec<(usize, Verified<BlockVote>)> {
+    pub(crate) fn get_verified_votes(&self) -> Vec<(usize, Verified<BlockVote>)> {
         self.verified_votes.clone()
     }
 
@@ -240,7 +240,7 @@ impl VoteSet {
     /// `parent_weighted_timestamp`) or `None` if not ready. The parent's
     /// weighted timestamp is the per-vote monotonicity floor used by the
     /// QC builder.
-    pub fn verification_data(
+    pub(crate) fn verification_data(
         &self,
     ) -> Option<(BlockHash, BlockHeight, Round, BlockHash, WeightedTimestamp)> {
         Some((
@@ -259,7 +259,7 @@ impl VoteSet {
     /// Called when verification completes successfully with a QC.
     ///
     /// Marks the vote set as built.
-    pub const fn on_qc_built(&mut self) {
+    pub(crate) const fn on_qc_built(&mut self) {
         self.qc_built = true;
         self.pending_verification = false;
     }
@@ -267,7 +267,7 @@ impl VoteSet {
     /// Called when verification completes but quorum wasn't reached.
     ///
     /// Adds the verified votes to the verified set and clears pending flag.
-    pub fn on_votes_verified(&mut self, verified_votes: Vec<(usize, Verified<BlockVote>)>) {
+    pub(crate) fn on_votes_verified(&mut self, verified_votes: Vec<(usize, Verified<BlockVote>)>) {
         self.pending_verification = false;
 
         let floor_ms = self
@@ -304,7 +304,11 @@ impl VoteSet {
     /// Also used by tests that want to seed verified state directly.
     /// Returns true on insertion, false if rejected (out-of-range committee
     /// index or duplicate).
-    pub fn add_verified_vote(&mut self, committee_index: usize, vote: Verified<BlockVote>) -> bool {
+    pub(crate) fn add_verified_vote(
+        &mut self,
+        committee_index: usize,
+        vote: Verified<BlockVote>,
+    ) -> bool {
         // Reject malformed index: see `buffer_unverified_vote` for rationale.
         if committee_index >= self.verified_voters.len() {
             return false;
@@ -358,7 +362,7 @@ mod test_helpers {
         /// # Errors
         ///
         /// Returns error if called before reaching quorum or with no votes.
-        pub fn build_qc(
+        pub(crate) fn build_qc(
             &mut self,
             verifier: &dyn Verifier,
             block_hash: BlockHash,

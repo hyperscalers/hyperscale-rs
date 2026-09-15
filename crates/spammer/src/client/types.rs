@@ -7,18 +7,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize)]
 pub struct SubmitTransactionRequest {
     /// Hex-encoded HBOR-serialized `Transaction`.
-    pub transaction_hex: String,
+    pub(crate) transaction_hex: String,
 }
 
 /// Response from transaction submission.
 #[derive(Debug, Deserialize)]
 pub struct SubmitTransactionResponse {
     /// True if the node accepted the transaction into its mempool.
-    pub accepted: bool,
+    pub(crate) accepted: bool,
     /// Hex-encoded transaction hash returned by the node.
     pub hash: String,
     /// Error message when `accepted == false`.
-    pub error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 /// Result of a transaction submission.
@@ -56,7 +56,7 @@ pub struct NodeStatusResponse {
     #[serde(default)]
     pub version: String,
     #[serde(default)]
-    pub vnodes: Vec<VnodeStatusEntry>,
+    pub(crate) vnodes: Vec<VnodeStatusEntry>,
 }
 
 /// Per-vnode status entry inside [`NodeStatusResponse::vnodes`].
@@ -66,7 +66,7 @@ pub struct VnodeStatusEntry {
     pub validator_id: u32,
     pub shard: u64,
     #[serde(default)]
-    pub block_height: u64,
+    pub(crate) block_height: u64,
     #[serde(default)]
     pub view: u64,
 }
@@ -94,7 +94,7 @@ pub struct TransactionStatusResponse {
     pub status: String,
     /// Block height where committed (if committed).
     #[serde(default)]
-    pub committed_height: Option<u64>,
+    pub(crate) committed_height: Option<u64>,
     /// Final decision (when completed): `accept`, `reject` or `aborted`.
     #[serde(default)]
     pub decision: Option<String>,
@@ -108,7 +108,7 @@ impl TransactionStatusResponse {
     ///
     /// Returns None for unknown statuses or parse errors.
     #[must_use]
-    pub fn to_status(&self) -> Option<TransactionStatus> {
+    pub(crate) fn to_status(&self) -> Option<TransactionStatus> {
         let decision = || -> Option<TransactionDecision> {
             match self.decision.as_deref()? {
                 "accept" => Some(TransactionDecision::Accept),

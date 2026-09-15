@@ -86,7 +86,7 @@ pub struct MultiProof {
     /// whole-keyspace tree; a prefix length for a subtree-rooted tree (e.g. a
     /// shard state tree rooted at its prefix). Verification reconstructs the
     /// root starting from this depth, so the proof is self-describing.
-    pub root_depth_bits: u16,
+    pub(crate) root_depth_bits: u16,
 
     /// Per-claim termination metadata, in sorted-key order.
     pub claims: Vec<ProofClaim>,
@@ -103,7 +103,7 @@ pub struct ProofClaim {
     /// `Some` iff the lookup hit a leaf whose key matches.
     pub value_hash: Option<ValueHash>,
     /// Depth (in bits) at which the lookup terminated.
-    pub depth_bits: u16,
+    pub(crate) depth_bits: u16,
     /// How the lookup ended (leaf, empty slot, or divergent leaf).
     pub termination: ClaimTermination,
 }

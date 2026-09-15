@@ -42,7 +42,7 @@ impl<K: Ord> VerificationSlots<K> {
     }
 
     #[must_use]
-    pub(crate) fn is_in_flight(&self, key: &K) -> bool {
+    pub fn is_in_flight(&self, key: &K) -> bool {
         self.in_flight.contains(key)
     }
 

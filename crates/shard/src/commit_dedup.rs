@@ -89,7 +89,7 @@ impl CommitDedupIndex {
     /// Only for a coordinator that has no chain to fold — a genuinely new
     /// chain. Anything resuming one seeds from [`Self::seeded`] instead,
     /// because an unseeded index refuses no duplicate at all.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tx_retention: HashMap::new(),
             resolved_tx_retention: HashMap::new(),
@@ -110,7 +110,7 @@ impl CommitDedupIndex {
     /// conservatively on the engagement mirror across the window — the
     /// same position a freshly synced validator already holds.
     #[must_use]
-    pub fn seeded(window: &DedupWindow, now: WeightedTimestamp) -> Self {
+    pub(crate) fn seeded(window: &DedupWindow, now: WeightedTimestamp) -> Self {
         let mut index = Self::new();
         index.tx_retention.extend(window.committed.iter().copied());
         index
@@ -147,7 +147,7 @@ impl CommitDedupIndex {
     /// commit. What this separates is "nothing was committed" from "what was
     /// committed is not all known", which the lookups cannot say apart.
     #[must_use]
-    pub fn is_complete(&self, now: WeightedTimestamp) -> bool {
+    pub(crate) fn is_complete(&self, now: WeightedTimestamp) -> bool {
         self.reached_origin
             || self
                 .covered_from
@@ -159,7 +159,7 @@ impl CommitDedupIndex {
     /// For a chain with no committed tip: nothing beneath it was ever
     /// committed, so there is nothing to have missed and no span to wait
     /// out.
-    pub const fn cover_to_origin(&mut self) {
+    pub(crate) const fn cover_to_origin(&mut self) {
         self.reached_origin = true;
     }
 
@@ -169,14 +169,14 @@ impl CommitDedupIndex {
     /// so a chain that starts short of the horizon reaches it by
     /// committing across it — the blocks it commits are the same evidence
     /// a walk would have read.
-    pub fn cover(&mut self, anchor: WeightedTimestamp) {
+    pub(crate) fn cover(&mut self, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
     }
 
     /// Record a block's transactions in the retention lookup. Each entry's
     /// stored value is the close of the tx's delivery window — the last
     /// anchor a block may carry the transaction at.
-    pub fn register_committed_txs(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
+    pub(crate) fn register_committed_txs(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
         for tx in transactions {
             let tx_hash = tx.hash();
             let deadline = Window::Delivery.of(Deadline::of_transaction(tx)).end;
@@ -198,7 +198,10 @@ impl CommitDedupIndex {
     /// transaction whose verdict belongs to another chain. Keyed on the
     /// deciding names alone, such a certificate is never seen as already
     /// carried, and the proposer offers it again on every block.
-    pub fn register_committed_certs(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
+    pub(crate) fn register_committed_certs(
+        &mut self,
+        finalizations: &[Arc<Verifiable<Finalization>>],
+    ) {
         for fw in finalizations {
             let deadline = fw.local_ec().deadline();
             self.finalization_retention
@@ -218,7 +221,7 @@ impl CommitDedupIndex {
     /// source from the block's manifest (which is independent of
     /// `Block::Live`/`Sealed`) rather than depending on `block.provisions()`
     /// (which is empty for `Sealed`).
-    pub fn register_committed_provisions(
+    pub(crate) fn register_committed_provisions(
         &self,
         provision_hashes: &[ProvisionHash],
         local_committed_ts: WeightedTimestamp,
@@ -230,14 +233,14 @@ impl CommitDedupIndex {
     /// The committed-provision window, for a coordinator that asks the
     /// same question of it. See [`Self::provision_retention`].
     #[must_use]
-    pub const fn committed_provisions(&self) -> &Arc<CommittedProvisions> {
+    pub(crate) const fn committed_provisions(&self) -> &Arc<CommittedProvisions> {
         &self.provision_retention
     }
 
     /// Record a committed block's bundle content in the engagement-mirror
     /// lookup: every `(source_shard, tx_hash)` pair a committed bundle
     /// names, under the provisions deadline tier.
-    pub fn register_committed_provision_txs(
+    pub(crate) fn register_committed_provision_txs(
         &mut self,
         batches: &[Arc<Verifiable<Provisions>>],
         local_committed_ts: WeightedTimestamp,
@@ -257,7 +260,7 @@ impl CommitDedupIndex {
     /// `weighted_timestamp` of the latest committed block. Past expiry,
     /// independent rules (tx validity check; finalization-deadline) reject any
     /// re-inclusion, so the entry is no longer correctness-bearing.
-    pub fn prune(&mut self, now: WeightedTimestamp) {
+    pub(crate) fn prune(&mut self, now: WeightedTimestamp) {
         self.tx_retention.retain(|_, end| *end > now);
         self.resolved_tx_retention
             .retain(|_, deadline| *deadline > now);
@@ -268,41 +271,41 @@ impl CommitDedupIndex {
             .retain(|_, deadline| *deadline > now);
     }
 
-    pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
+    pub(crate) fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.tx_retention.contains_key(tx_hash)
     }
 
     /// Whether a committed finalization already reached a verdict for
     /// `tx_hash`, within the retention window.
-    pub fn contains_resolved_tx(&self, tx_hash: &TxHash) -> bool {
+    pub(crate) fn contains_resolved_tx(&self, tx_hash: &TxHash) -> bool {
         self.resolved_tx_retention.contains_key(tx_hash)
     }
 
     /// Whether the chain already carries this exact finalization, within
     /// the retention window.
-    pub fn contains_finalization(&self, receipt_hash: &FinalizationHash) -> bool {
+    pub(crate) fn contains_finalization(&self, receipt_hash: &FinalizationHash) -> bool {
         self.finalization_retention.contains_key(receipt_hash)
     }
 
-    pub fn contains_provision(&self, provision_hash: &ProvisionHash) -> bool {
+    pub(crate) fn contains_provision(&self, provision_hash: &ProvisionHash) -> bool {
         self.provision_retention.contains(provision_hash)
     }
 
     /// Whether a committed bundle from `source` named `tx_hash` within
     /// the retention window — the engagement mirror's committed arm.
-    pub fn contains_provision_tx(&self, source: ShardId, tx_hash: TxHash) -> bool {
+    pub(crate) fn contains_provision_tx(&self, source: ShardId, tx_hash: TxHash) -> bool {
         self.provision_tx_retention.contains_key(&(source, tx_hash))
     }
 
-    pub fn tx_retention_len(&self) -> usize {
+    pub(crate) fn tx_retention_len(&self) -> usize {
         self.tx_retention.len()
     }
 
-    pub fn resolved_tx_retention_len(&self) -> usize {
+    pub(crate) fn resolved_tx_retention_len(&self) -> usize {
         self.resolved_tx_retention.len()
     }
 
-    pub fn provision_retention_len(&self) -> usize {
+    pub(crate) fn provision_retention_len(&self) -> usize {
         self.provision_retention.len()
     }
 }

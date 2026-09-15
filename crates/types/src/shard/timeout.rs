@@ -150,7 +150,7 @@ impl Timeout {
 
     /// Build the canonical signing message for this timeout.
     #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+    pub(crate) fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(self, network)
     }
 }

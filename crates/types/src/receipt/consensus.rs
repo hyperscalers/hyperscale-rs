@@ -205,7 +205,7 @@ impl ConsensusReceipt {
     /// Panics if HBOR encoding of `writes` fails — it is a closed wire
     /// type and encoding is infallible in practice.
     #[must_use]
-    pub fn local_receipt_hash(&self) -> Hash {
+    pub(crate) fn local_receipt_hash(&self) -> Hash {
         let (outcome_byte, event_root, writes) = match self {
             Self::Succeeded { writes, events, .. } => {
                 let event_hashes: Vec<Hash> = events.iter().map(EventExt::hash).collect();

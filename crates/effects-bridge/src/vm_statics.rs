@@ -407,7 +407,7 @@ pub fn vault_key(owner: impl Into<Address>, resource: impl Into<Address>) -> Sub
 /// The stored-authority cell under `owner` — what `securify` writes,
 /// `authorize` reads, and the payer shard's binding verdict consults.
 #[must_use]
-pub fn auth_key(owner: impl Into<Address>) -> SubstateKey {
+pub(crate) fn auth_key(owner: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, owner, AUTH, &[])
 }
 
@@ -712,7 +712,7 @@ pub fn envelope_identity(vm: &TransactionEnvelope) -> ManifestHash {
 /// A consumer of committed package artifacts — the engine's compile
 /// pipeline registers one so a package's code is being compiled from the
 /// moment its cell commits, not from its first call.
-pub type ArtifactSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
+pub(crate) type ArtifactSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// The bridge's [`Derivation`]: `decode → admit → route` over the
 /// process's genesis-static metadata.

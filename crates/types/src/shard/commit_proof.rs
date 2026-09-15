@@ -177,7 +177,7 @@ impl CommitProof {
     /// `None` when the proof carries no parent (see
     /// [`Self::certified_parent`]).
     #[must_use]
-    pub fn certified_committee_anchor(&self) -> Option<WeightedTimestamp> {
+    pub(crate) fn certified_committee_anchor(&self) -> Option<WeightedTimestamp> {
         Some(
             self.certified_parent
                 .as_ref()?
@@ -190,7 +190,7 @@ impl CommitProof {
     /// certified block's own anchor, one hop up from
     /// [`Self::certified_committee_anchor`].
     #[must_use]
-    pub fn child_committee_anchor(&self) -> WeightedTimestamp {
+    pub(crate) fn child_committee_anchor(&self) -> WeightedTimestamp {
         self.certified.header().parent_qc().weighted_timestamp()
     }
 

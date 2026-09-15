@@ -59,7 +59,7 @@ impl<'a> BatchRecords<'a> {
     /// The records for a batch executing against `committed`, with
     /// whatever its transactions were provisioned layered beside them.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         packages: Arc<MetadataCache>,
         seeded: Arc<InstanceRegistry>,
         provisions: &'a BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,

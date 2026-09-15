@@ -157,7 +157,7 @@ impl NodeStateMachine {
 
     /// Get this node's shard.
     #[must_use]
-    pub const fn shard_id(&self) -> ShardId {
+    pub(crate) const fn shard_id(&self) -> ShardId {
         self.participation().local_shard
     }
 
@@ -165,7 +165,7 @@ impl NodeStateMachine {
     /// Used by [`NodeHost::new`](crate::host::NodeHost::new) to split vnodes
     /// into per-shard groups and the beacon-follower pool.
     #[must_use]
-    pub fn seated_shard(&self) -> Option<ShardId> {
+    pub(crate) fn seated_shard(&self) -> Option<ShardId> {
         self.shard.as_ref().map(|s| s.local_shard)
     }
 
@@ -177,7 +177,7 @@ impl NodeStateMachine {
 
     /// Get the current topology snapshot.
     #[must_use]
-    pub fn topology_snapshot(&self) -> &TopologySnapshot {
+    pub(crate) fn topology_snapshot(&self) -> &TopologySnapshot {
         self.beacon_coordinator.current_topology_snapshot()
     }
 
@@ -187,7 +187,7 @@ impl NodeStateMachine {
     /// every vnode on a host; per-vnode identity travels alongside it
     /// on [`ActionContext`](hyperscale_core::ActionContext).
     #[must_use]
-    pub const fn topology_arc(&self) -> &Arc<TopologySnapshot> {
+    pub(crate) const fn topology_arc(&self) -> &Arc<TopologySnapshot> {
         self.beacon_coordinator.current_topology_snapshot()
     }
 
@@ -211,13 +211,13 @@ impl NodeStateMachine {
 
     /// Get a reference to the execution coordinator.
     #[must_use]
-    pub const fn execution_coordinator(&self) -> &ExecutionCoordinator {
+    pub(crate) const fn execution_coordinator(&self) -> &ExecutionCoordinator {
         &self.participation().execution_coordinator
     }
 
     /// Get a reference to the provision coordinator.
     #[must_use]
-    pub const fn provisions_coordinator(&self) -> &ProvisionCoordinator {
+    pub(crate) const fn provisions_coordinator(&self) -> &ProvisionCoordinator {
         &self.participation().provisions_coordinator
     }
 
@@ -251,7 +251,11 @@ impl NodeStateMachine {
     /// seats mid-network-life, where a frozen `ZERO` clock would turn the next
     /// epoch boundary's absolute offset into a relative delay and arm the first
     /// `BeaconCommitteeStart` an entire chain lifetime late.
-    pub fn initialize_genesis(&mut self, now: LocalTimestamp, genesis: &Block) -> Vec<Action> {
+    pub(crate) fn initialize_genesis(
+        &mut self,
+        now: LocalTimestamp,
+        genesis: &Block,
+    ) -> Vec<Action> {
         self.now = now;
         self.beacon_coordinator.set_now(now);
         let mut actions = Vec::new();
@@ -272,14 +276,14 @@ impl NodeStateMachine {
     /// coordinator's clock, so the caller (or the seat constructor) must
     /// have set `now` first.
     #[must_use]
-    pub fn beacon_startup_actions(&self) -> Vec<Action> {
+    pub(crate) fn beacon_startup_actions(&self) -> Vec<Action> {
         self.beacon_coordinator.on_startup()
     }
 
     /// Seed the reshape trigger's substate-byte frontier from the genesis
     /// store count — the I/O loop reads it once the genesis block commits.
     /// See [`hyperscale_shard::ShardCoordinator::seed_substate_bytes_frontier`].
-    pub const fn seed_substate_bytes_frontier(&mut self, height: BlockHeight, count: u64) {
+    pub(crate) const fn seed_substate_bytes_frontier(&mut self, height: BlockHeight, count: u64) {
         if let Some(s) = self.shard.as_mut() {
             s.shard_coordinator
                 .seed_substate_bytes_frontier(height, count);

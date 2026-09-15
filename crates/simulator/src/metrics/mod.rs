@@ -50,7 +50,7 @@ impl MetricsCollector {
     /// Panics if the `Histogram::new(3)` constructor fails (unreachable: `3` is
     /// a valid significant-digits argument).
     #[must_use]
-    pub fn new(start_time: Duration) -> Self {
+    pub(crate) fn new(start_time: Duration) -> Self {
         Self {
             submissions: 0,
             completions: 0,
@@ -67,18 +67,18 @@ impl MetricsCollector {
     }
 
     /// Record a transaction submission.
-    pub const fn record_submission(&mut self) {
+    pub(crate) const fn record_submission(&mut self) {
         self.submissions += 1;
     }
 
     /// Record multiple submissions.
     #[allow(dead_code)]
-    pub const fn record_submissions(&mut self, count: u64) {
+    pub(crate) const fn record_submissions(&mut self, count: u64) {
         self.submissions += count;
     }
 
     /// Record a transaction completion with its latency.
-    pub fn record_completion(&mut self, latency: Duration) {
+    pub(crate) fn record_completion(&mut self, latency: Duration) {
         self.completions += 1;
         // Store latency in microseconds for better resolution
         let latency_us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
@@ -86,22 +86,22 @@ impl MetricsCollector {
     }
 
     /// Record a transaction rejection.
-    pub const fn record_rejection(&mut self) {
+    pub(crate) const fn record_rejection(&mut self) {
         self.rejections += 1;
     }
 
     /// Set the submission end time for accurate TPS calculation.
-    pub const fn set_submission_end_time(&mut self, time: Duration) {
+    pub(crate) const fn set_submission_end_time(&mut self, time: Duration) {
         self.submission_end_time = Some(time);
     }
 
     /// Set the number of in-flight transactions at simulation end.
-    pub const fn set_in_flight_at_end(&mut self, count: u64) {
+    pub(crate) const fn set_in_flight_at_end(&mut self, count: u64) {
         self.in_flight_at_end = count;
     }
 
     /// Take a sample for time-series tracking.
-    pub fn sample(&mut self, current_time: Duration, in_flight: u64) {
+    pub(crate) fn sample(&mut self, current_time: Duration, in_flight: u64) {
         let elapsed_since_last = current_time.saturating_sub(self.last_sample_time);
         let completions_since_last = self
             .completions
@@ -135,13 +135,13 @@ impl MetricsCollector {
 
     /// Current raw stats: (submitted, completed, rejected).
     #[must_use]
-    pub const fn current_stats(&self) -> (u64, u64, u64) {
+    pub(crate) const fn current_stats(&self) -> (u64, u64, u64) {
         (self.submissions, self.completions, self.rejections)
     }
 
     /// Finalize and generate a report.
     #[must_use]
-    pub fn finalize(self, end_time: Duration) -> SimulationReport {
+    pub(crate) fn finalize(self, end_time: Duration) -> SimulationReport {
         let total_duration = end_time.saturating_sub(self.start_time);
         let submission_duration = self
             .submission_end_time
@@ -196,15 +196,15 @@ pub struct SimulationReport {
     /// Total transactions rejected.
     pub total_rejected: u64,
     /// Transactions still in-flight at simulation end.
-    pub in_flight_at_end: u64,
+    pub(crate) in_flight_at_end: u64,
     /// Average TPS over the submission period.
     pub average_tps: f64,
     /// Peak instantaneous TPS observed.
-    pub peak_tps: f64,
+    pub(crate) peak_tps: f64,
     /// Latency histogram (values in microseconds).
     latency_histogram: Histogram<u64>,
     /// Total simulation duration (including ramp-down).
-    pub total_duration: Duration,
+    pub(crate) total_duration: Duration,
     /// Submission phase duration (for TPS calculation).
     pub submission_duration: Duration,
     /// Time-series samples.
@@ -220,7 +220,7 @@ impl SimulationReport {
 
     /// Get the P90 latency.
     #[must_use]
-    pub fn p90_latency(&self) -> Duration {
+    pub(crate) fn p90_latency(&self) -> Duration {
         Duration::from_micros(self.latency_histogram.value_at_quantile(0.90))
     }
 
@@ -232,13 +232,13 @@ impl SimulationReport {
 
     /// Get the maximum latency.
     #[must_use]
-    pub fn max_latency(&self) -> Duration {
+    pub(crate) fn max_latency(&self) -> Duration {
         Duration::from_micros(self.latency_histogram.max())
     }
 
     /// Get the average latency.
     #[must_use]
-    pub fn avg_latency(&self) -> Duration {
+    pub(crate) fn avg_latency(&self) -> Duration {
         // Mean is bounded by `max()` (~hours of µs), so the cast is safe in practice.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let mean = self.latency_histogram.mean() as u64;
@@ -265,7 +265,7 @@ impl SimulationReport {
     }
 
     /// Print a summary of the report.
-    pub fn print_summary(&self) {
+    pub(crate) fn print_summary(&self) {
         println!("\n═══════════════════════════════════════════");
         println!("           SIMULATION REPORT                ");
         println!("═══════════════════════════════════════════");

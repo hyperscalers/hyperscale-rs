@@ -67,7 +67,7 @@ where
 /// Dispatch a typed gossip message into its handler without wire
 /// encode/decode. Used by network backends to deliver locally-published
 /// messages to in-process subscribers.
-pub trait LocalGossipDispatcher: Send + Sync {
+pub(crate) trait LocalGossipDispatcher: Send + Sync {
     /// Dispatch `msg` (downcast from `&dyn Any` to the registered `M`)
     /// to the typed handler. The handler consumes `M`, so the dispatcher
     /// clones internally. `shard` is the broadcast target shard for
@@ -78,14 +78,14 @@ pub trait LocalGossipDispatcher: Send + Sync {
 /// Counterpart to [`LocalGossipDispatcher`] for the host-level path
 /// (see [`HandlerRegistry::register_host_gossip_handler`]). No verdict: the
 /// per-hosted-shard Global fan owns it.
-pub trait LocalHostGossipDispatcher: Send + Sync {
+pub(crate) trait LocalHostGossipDispatcher: Send + Sync {
     /// Dispatch `msg` (downcast from `&dyn Any` to the registered `M`) to
     /// the host-level handler.
     fn dispatch(&self, msg: &dyn Any);
 }
 
 /// Counterpart to [`LocalGossipDispatcher`] for fire-and-forget notifications.
-pub trait LocalNotificationDispatcher: Send + Sync {
+pub(crate) trait LocalNotificationDispatcher: Send + Sync {
     /// Dispatch `msg` (downcast from `&dyn Any` to the registered `M`)
     /// to the typed handler.
     fn dispatch(&self, msg: &dyn Any);
@@ -98,7 +98,7 @@ pub trait LocalNotificationDispatcher: Send + Sync {
 /// the caller to downcast back. Skipping the codec keeps `Arc`-shared
 /// payloads (transactions, finalizations, execution certificates)
 /// reference-counted instead of deep-copied through bytes.
-pub trait LocalRequestDispatcher: Send + Sync {
+pub(crate) trait LocalRequestDispatcher: Send + Sync {
     /// Dispatch a boxed-Any request to the typed handler. The dispatcher
     /// downcasts `req` to the registered request type, calls the handler,
     /// and boxes the response. Panics if the downcast fails — a wrong

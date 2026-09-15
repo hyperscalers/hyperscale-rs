@@ -15,7 +15,7 @@ pub struct ShardRevealMessage {
     /// Shard whose chain the reveal extends.
     pub shard: ShardId,
     /// Height the reveal belongs to.
-    pub height: BlockHeight,
+    pub(crate) height: BlockHeight,
 }
 
 /// Sign `(network, shard, height)` and return the reveal proof.

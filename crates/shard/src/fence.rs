@@ -61,19 +61,19 @@ impl Withheld {
 pub struct VoteFence<'a> {
     /// The departed shards' settled sets, and what committed records
     /// cover.
-    pub mirror: &'a CounterpartMirror,
+    pub(crate) mirror: &'a CounterpartMirror,
     /// The commit-proven remote headers.
-    pub proven_anchors: &'a ProvenAnchors,
+    pub(crate) proven_anchors: &'a ProvenAnchors,
     /// The counterpart cells this validator has proven for itself.
-    pub proven_cells: &'a ProvenCells,
+    pub(crate) proven_cells: &'a ProvenCells,
     /// The predecessors' answers about transactions opening before the
     /// chain's origin.
-    pub precut: &'a Precut,
+    pub(crate) precut: &'a Precut,
     /// Where this chain began; content anchored before it belongs to a
     /// predecessor.
-    pub cut: WeightedTimestamp,
+    pub(crate) cut: WeightedTimestamp,
     /// The shard this validator votes on.
-    pub local_shard: ShardId,
+    pub(crate) local_shard: ShardId,
 }
 
 impl VoteFence<'_> {
@@ -86,7 +86,7 @@ impl VoteFence<'_> {
     /// # Errors
     ///
     /// The first claim this validator refuses or cannot yet check.
-    pub fn judge(&self, schedule: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
+    pub(crate) fn judge(&self, schedule: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
         self.finalizations(schedule, block, anchored_wt)?;
         self.records(block)?;
@@ -118,7 +118,7 @@ impl VoteFence<'_> {
     /// # Errors
     ///
     /// A claim the sets contradict, or one no held set can answer.
-    pub fn finalizations(
+    pub(crate) fn finalizations(
         &self,
         schedule: &TopologySchedule,
         block: &Block,
@@ -222,7 +222,7 @@ impl VoteFence<'_> {
     ///
     /// A claim whose anchor or whose reading this validator contradicts,
     /// or everything it has yet to prove.
-    pub fn state_claims(&self, block: &Block) -> Result<(), Withheld> {
+    pub(crate) fn state_claims(&self, block: &Block) -> Result<(), Withheld> {
         let mut wanted = Vec::new();
         // Keys to relay, gathered by anchor across every claim naming it.
         // A block may carry several claims at one anchor — admission only
@@ -341,7 +341,7 @@ impl VoteFence<'_> {
     /// block carrying it never gets a vote, so nothing is outstanding
     /// for it.
     #[must_use]
-    pub fn unread_cells(&self, block: &Block) -> BTreeMap<Anchor, Vec<SubstateKey>> {
+    pub(crate) fn unread_cells(&self, block: &Block) -> BTreeMap<Anchor, Vec<SubstateKey>> {
         let mut relay = BTreeMap::new();
         // An anchor this validator has not commit-proven is asked for by
         // the deferral of the block that names it, not by this.
@@ -384,7 +384,7 @@ impl VoteFence<'_> {
     ///
     /// A transaction a predecessor committed, or one no predecessor has
     /// answered for yet.
-    pub fn precut(&self, block: &Block) -> Result<(), Withheld> {
+    pub(crate) fn precut(&self, block: &Block) -> Result<(), Withheld> {
         let mut deferred = None;
         for tx in block
             .transactions()

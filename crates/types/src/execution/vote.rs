@@ -128,7 +128,7 @@ impl ExecutionVote {
     /// This avoids relying on each aggregator's local accumulator, which may
     /// have diverged due to different abort timing.
     #[must_use]
-    pub fn tx_outcomes(&self) -> &[TxOutcome] {
+    pub(crate) fn tx_outcomes(&self) -> &[TxOutcome] {
         &self.tx_outcomes
     }
 
@@ -140,7 +140,7 @@ impl ExecutionVote {
 
     /// signature over the vote signing message.
     #[must_use]
-    pub const fn signature(&self) -> ConsensusSignature {
+    pub(crate) const fn signature(&self) -> ConsensusSignature {
         self.signature
     }
 
@@ -180,7 +180,7 @@ impl ExecutionVote {
     /// The [`ExecutionVoteMessage`] domain separates it from every other signature. Same message
     /// used for `ExecutionCertificate` aggregated signature verification.
     #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+    pub(crate) fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
             &ExecutionVoteMessage {
                 vote_anchor_ts: self.vote_anchor_ts,
@@ -199,11 +199,11 @@ impl ExecutionVote {
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionVoteContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
-    pub network: &'a NetworkDefinition,
+    pub(crate) network: &'a NetworkDefinition,
     /// Public key of the validator who cast this vote.
-    pub voter_public_key: &'a ConsensusPublicKey,
+    pub(crate) voter_public_key: &'a ConsensusPublicKey,
     /// Scheme verifier the signature check runs through.
-    pub verifier: &'a dyn Verifier,
+    pub(crate) verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`ExecutionVote`] verification.

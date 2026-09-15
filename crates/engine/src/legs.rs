@@ -36,7 +36,7 @@ use crate::sharding::TrieShardResolver;
 
 /// One value edge whose producer and consumer do not run together, under
 /// the protocol's shard identifiers.
-pub type CrossingEdge = StarEdge<ShardId>;
+pub(crate) type CrossingEdge = StarEdge<ShardId>;
 
 /// Where a classification resolves an owner.
 ///
@@ -248,7 +248,7 @@ impl Classified {
     /// reaches; a shard it does not reach runs nothing and is never
     /// asked.
     #[must_use]
-    pub fn runs_at(&self, shard: ShardId, nodes: usize) -> Vec<bool> {
+    pub(crate) fn runs_at(&self, shard: ShardId, nodes: usize) -> Vec<bool> {
         if !self.decomposed() {
             return vec![true; nodes];
         }
@@ -690,7 +690,7 @@ impl Member {
     /// transaction's end on its shard, but a delivery that failed decides
     /// nothing — the value it claims stays in its cell for a later claim.
     #[must_use]
-    pub fn delivers(&self) -> bool {
+    pub(crate) fn delivers(&self) -> bool {
         self.classified.decomposed() && self.side == Side::Delivering
     }
 
@@ -807,7 +807,7 @@ impl Runs {
     /// shard, whose issuing member charged; a settlement on a leg that
     /// ran, or on a record whose transaction was priced elsewhere.
     #[must_use]
-    pub fn charged_already(&self) -> bool {
+    pub(crate) fn charged_already(&self) -> bool {
         match self {
             Self::Shape(member) => member.is_second(),
             Self::Settle {
@@ -838,7 +838,7 @@ impl ShardPlan {
     /// The plan every execution ran before there was anything else to
     /// run: nothing skipped, nothing crossing, every owner in scope.
     #[must_use]
-    pub fn whole() -> Self {
+    pub(crate) fn whole() -> Self {
         Self {
             legs: LegPlan::whole(0),
             judges: OwnerSet::whole(),

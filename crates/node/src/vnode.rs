@@ -281,5 +281,5 @@ pub struct Vnode {
     /// Signing identity for votes and proposals. Shared with
     /// `DispatchHandles` via `Arc` so delegated handlers running on
     /// thread pools can sign without re-entering the pinned thread.
-    pub signer: Arc<dyn Signer>,
+    pub(crate) signer: Arc<dyn Signer>,
 }

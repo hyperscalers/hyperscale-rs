@@ -46,7 +46,7 @@ use hyperscale_types::{
 /// # Errors
 ///
 /// Fails when a quorum certificate does not certify its terminal block.
-pub fn merge_genesis_from_terminals(
+pub(crate) fn merge_genesis_from_terminals(
     parent: ShardId,
     left: (&BlockHeader, &QuorumCertificate),
     right: (&BlockHeader, &QuorumCertificate),

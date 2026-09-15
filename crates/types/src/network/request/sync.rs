@@ -8,13 +8,13 @@ use crate::{BlockHeight, ConsensusSignature, MessageClass, NetworkMessage, Valid
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct SyncCompleteAnnouncement {
     /// Height synced to
-    pub synced_height: BlockHeight,
+    pub(crate) synced_height: BlockHeight,
 
     /// Validator announcing sync completion
-    pub validator: ValidatorId,
+    pub(crate) validator: ValidatorId,
 
     /// Signature proving this is authentic
-    pub signature: ConsensusSignature,
+    pub(crate) signature: ConsensusSignature,
 }
 
 impl SyncCompleteAnnouncement {

@@ -67,19 +67,19 @@ pub enum QcOnlyKind {
 /// admitted the block derived them.
 pub struct QcOnlyCommit {
     /// Block + certifying QC; see [`QcOnlyPending::certified`].
-    pub certified: Arc<Verified<CertifiedBlock>>,
+    pub(crate) certified: Arc<Verified<CertifiedBlock>>,
     /// Parent's state root, the base for the recomputation.
-    pub parent_state_root: StateRoot,
+    pub(crate) parent_state_root: StateRoot,
     /// Parent's height, the JMT parent version.
-    pub parent_block_height: BlockHeight,
+    pub(crate) parent_block_height: BlockHeight,
     /// Where the parent's sweep stopped.
-    pub parent_sweep_frontier: SweepFrontier,
+    pub(crate) parent_sweep_frontier: SweepFrontier,
     /// The committed cells the block writes, derived under its window.
-    pub creations: Vec<(SubstateKey, Vec<u8>)>,
+    pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
     /// How this node learned the certifying QC.
-    pub source: CommitSource,
+    pub(crate) source: CommitSource,
     /// Beacon-witness leaves to fold into the commit.
-    pub witness: BeaconWitnessCommit,
+    pub(crate) witness: BeaconWitnessCommit,
 }
 
 /// A QC-only commit waiting on the single in-flight slot. Every
@@ -91,31 +91,31 @@ pub struct QcOnlyCommit {
 pub struct QcOnlyPending {
     /// Block + certifying QC, with the full
     /// [`Verified<CertifiedBlock>`] predicate established upstream.
-    pub certified: Arc<Verified<CertifiedBlock>>,
+    pub(crate) certified: Arc<Verified<CertifiedBlock>>,
     /// Parent's state root (base for the JMT recomputation). Unused
     /// when `kind == AlreadyPrepared`.
-    pub parent_state_root: StateRoot,
+    pub(crate) parent_state_root: StateRoot,
     /// Parent's height (JMT parent version). Unused when
     /// `kind == AlreadyPrepared`.
-    pub parent_block_height: BlockHeight,
+    pub(crate) parent_block_height: BlockHeight,
     /// Where the parent's sweep stopped — the lower end of the interval
     /// this block's removals fill. Unused when
     /// `kind == AlreadyPrepared`.
-    pub parent_sweep_frontier: SweepFrontier,
+    pub(crate) parent_sweep_frontier: SweepFrontier,
     /// The committed cells the block writes, derived by the coordinator
     /// under the block's own window. Unused when
     /// `kind == AlreadyPrepared`.
-    pub creations: Vec<(SubstateKey, Vec<u8>)>,
+    pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
     /// How this node learned the certifying QC.
-    pub source: CommitSource,
+    pub(crate) source: CommitSource,
     /// Whether this entry needs the pool to run JMT prep or can
     /// reuse a cached `PreparedCommit`.
-    pub kind: QcOnlyKind,
+    pub(crate) kind: QcOnlyKind,
     /// Beacon-witness leaves to fold into the eventual block commit;
     /// the coordinator carries them across the JMT-prep slot so the
     /// `PendingCommit` queued for `flush` has the same data the
     /// original `Action::CommitBlockByQcOnly` supplied.
-    pub witness: BeaconWitnessCommit,
+    pub(crate) witness: BeaconWitnessCommit,
 }
 
 /// Outcome of [`BlockCommitCoordinator::decide_qc_only`]. The shard runs
@@ -145,19 +145,19 @@ pub enum QcOnlyDecision {
 #[derive(Debug, Clone)]
 pub struct QcOnlyDivergence {
     /// Height being committed.
-    pub block_height: BlockHeight,
+    pub(crate) block_height: BlockHeight,
     /// Hash of the committing block.
-    pub block_hash: BlockHash,
+    pub(crate) block_hash: BlockHash,
     /// Parent's state root the prep ran against.
-    pub parent_state_root: StateRoot,
+    pub(crate) parent_state_root: StateRoot,
     /// Parent's height the prep ran against.
-    pub parent_block_height: BlockHeight,
+    pub(crate) parent_block_height: BlockHeight,
     /// State root the block's header claimed.
-    pub expected_root: StateRoot,
+    pub(crate) expected_root: StateRoot,
     /// State root our local prep produced.
-    pub computed_root: StateRoot,
+    pub(crate) computed_root: StateRoot,
     /// How this node learned the certifying QC.
-    pub source: CommitSource,
+    pub(crate) source: CommitSource,
 }
 
 /// Run the JMT prep for a QC-only commit on the calling thread. Intended
@@ -334,19 +334,19 @@ where
 pub struct PendingCommit {
     /// Block + certifying QC, with the full
     /// [`Verified<CertifiedBlock>`] predicate established upstream.
-    pub certified: Arc<Verified<CertifiedBlock>>,
+    pub(crate) certified: Arc<Verified<CertifiedBlock>>,
     /// How this node learned the certifying QC. Tagged into metrics so
     /// dashboards can separate aggregator/header/sync commit paths.
-    pub source: CommitSource,
+    pub(crate) source: CommitSource,
     /// Whether `BlockCommitted` was already fired immediately during
     /// accumulation (true) or deferred due to backpressure (false). The
     /// flush closure uses this to decide whether to send `BlockCommitted`
     /// after persistence.
-    pub committed_notified: bool,
+    pub(crate) committed_notified: bool,
     /// Beacon-witness leaves to persist atomically with the block.
     /// Sourced from the `Action::CommitBlock` / `Action::CommitBlockByQcOnly`
     /// payload the shard coordinator emits at commit time.
-    pub witness: BeaconWitnessCommit,
+    pub(crate) witness: BeaconWitnessCommit,
 }
 
 /// Outcome of accumulating a single commit.
@@ -378,10 +378,10 @@ pub struct BoundaryMemo {
     /// here or the linkage is broken and the pin re-anchors.
     pub hash: BlockHash,
     /// Height pinned when the candidate proves to be the crossing.
-    pub height: BlockHeight,
+    pub(crate) height: BlockHeight,
     /// The candidate's `parent_qc` weighted timestamp — the low side of
     /// the crossing interval its child adjudicates.
-    pub parent_qc_wt: WeightedTimestamp,
+    pub(crate) parent_qc_wt: WeightedTimestamp,
 }
 
 /// Pins shard state at epoch-boundary blocks for snap-sync serving.
@@ -466,9 +466,9 @@ pub struct BlockCommitCoordinator {
 impl BlockCommitCoordinator {
     /// Maximum number of blocks consensus can advance ahead of persistence
     /// before falling back to deferred `BlockCommitted` notification.
-    pub const MAX_PERSISTENCE_LAG: u64 = 5;
+    pub(crate) const MAX_PERSISTENCE_LAG: u64 = 5;
 
-    pub fn new(shard: ShardId, initial_persisted_height: BlockHeight) -> Self {
+    pub(crate) fn new(shard: ShardId, initial_persisted_height: BlockHeight) -> Self {
         Self {
             shard,
             boundary: None,
@@ -487,7 +487,7 @@ impl BlockCommitCoordinator {
     /// `seed` is the committed tip's [`BoundaryMemo`] so the first
     /// post-restart commit can adjudicate its parent; `None` skips at
     /// most the one boundary that lands exactly at the restart gap.
-    pub fn set_boundary_trigger(
+    pub(crate) fn set_boundary_trigger(
         &mut self,
         epoch_duration_ms: u64,
         pin: Arc<dyn Fn(BlockHeight) + Send + Sync>,
@@ -508,7 +508,10 @@ impl BlockCommitCoordinator {
     /// The slot is released later by [`Self::release_qc_only_slot`] when
     /// the worker's `QcOnlyCommitPrepared` / `QcOnlyCommitDiverged`
     /// callback returns to the shard.
-    pub fn try_acquire_qc_only_slot(&mut self, pending: QcOnlyPending) -> Option<QcOnlyPending> {
+    pub(crate) fn try_acquire_qc_only_slot(
+        &mut self,
+        pending: QcOnlyPending,
+    ) -> Option<QcOnlyPending> {
         if self.qc_only_in_flight {
             self.qc_only_queue.push_back(pending);
             None
@@ -521,7 +524,7 @@ impl BlockCommitCoordinator {
     /// Release the in-flight QC-only slot once a callback returns. If a
     /// queued commit is waiting, returns it for immediate dispatch and
     /// keeps the slot marked in-flight; otherwise clears the flag.
-    pub fn release_qc_only_slot(&mut self) -> Option<QcOnlyPending> {
+    pub(crate) fn release_qc_only_slot(&mut self) -> Option<QcOnlyPending> {
         debug_assert!(
             self.qc_only_in_flight,
             "release_qc_only_slot called without a prep in flight",
@@ -538,7 +541,7 @@ impl BlockCommitCoordinator {
 
     /// Clone the prepared-commit cache handle for use in delegated action
     /// dispatch closures (which insert prepared commits asynchronously).
-    pub fn prepared_commits_handle(&self) -> Arc<Mutex<PreparedCommitMap>> {
+    pub(crate) fn prepared_commits_handle(&self) -> Arc<Mutex<PreparedCommitMap>> {
         Arc::clone(&self.prepared_commits)
     }
 
@@ -547,7 +550,7 @@ impl BlockCommitCoordinator {
         self.persisted_height
     }
 
-    pub fn mark_persisted(&mut self, height: BlockHeight) {
+    pub(crate) fn mark_persisted(&mut self, height: BlockHeight) {
         if height > self.persisted_height {
             self.persisted_height = height;
         }
@@ -556,7 +559,7 @@ impl BlockCommitCoordinator {
     /// Whether a prepared commit has already been cached for this block.
     /// Used by the QC-only commit path to avoid recomputing JMT when the
     /// consensus path beat sync to the prepare step.
-    pub fn has_prepared(&self, block_hash: &BlockHash) -> bool {
+    pub(crate) fn has_prepared(&self, block_hash: &BlockHash) -> bool {
         self.prepared_commits
             .lock()
             .unwrap()
@@ -582,7 +585,11 @@ impl BlockCommitCoordinator {
     /// run inline before deciding whether to dispatch the heavy prep.
     ///
     /// [`Action::CommitBlockByQcOnly`]: hyperscale_core::Action::CommitBlockByQcOnly
-    pub fn decide_qc_only(&self, block_hash: &BlockHash, height: BlockHeight) -> QcOnlyDecision {
+    pub(crate) fn decide_qc_only(
+        &self,
+        block_hash: &BlockHash,
+        height: BlockHeight,
+    ) -> QcOnlyDecision {
         // Hard skip only if already persisted (consensus path got all
         // the way through). We must still enqueue blocks whose prepared
         // commit was populated by the consensus path but that never
@@ -606,11 +613,11 @@ impl BlockCommitCoordinator {
         QcOnlyDecision::NeedsPrep
     }
 
-    pub const fn pending_len(&self) -> usize {
+    pub(crate) const fn pending_len(&self) -> usize {
         self.pending.len()
     }
 
-    pub fn prepared_len(&self) -> usize {
+    pub(crate) fn prepared_len(&self) -> usize {
         self.prepared_commits.lock().unwrap().len()
     }
 
@@ -622,7 +629,7 @@ impl BlockCommitCoordinator {
     /// the crash-recovery window.
     ///
     /// [`MAX_PERSISTENCE_LAG`]: Self::MAX_PERSISTENCE_LAG
-    pub fn accumulate(
+    pub(crate) fn accumulate(
         &mut self,
         mut commit: PendingCommit,
         now: LocalTimestamp,
@@ -709,7 +716,7 @@ impl BlockCommitCoordinator {
     /// the pinned thread via `event_tx`; see `ProcessIo::shard_event_senders`
     /// for the off-thread → pinned-thread routing convention.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
-    pub fn flush<D: Dispatch>(&mut self, event_tx: &Sender<HostEvent>, dispatch: &D) {
+    pub(crate) fn flush<D: Dispatch>(&mut self, event_tx: &Sender<HostEvent>, dispatch: &D) {
         if self.pending.is_empty() {
             return;
         }

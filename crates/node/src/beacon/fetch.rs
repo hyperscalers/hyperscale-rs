@@ -45,15 +45,15 @@ pub type BeaconProposalFetch = Fetch<(Epoch, ValidatorId)>;
 /// coordinator drives for this shard.
 pub struct BeaconFetchState {
     /// Cross-shard beacon-witness fetch (rotates through source committee).
-    pub shard_witness: ShardWitnessFetch,
+    pub(crate) shard_witness: ShardWitnessFetch,
     /// Missing-proposal fetch (rotates through beacon committee).
-    pub beacon_proposal: BeaconProposalFetch,
+    pub(crate) beacon_proposal: BeaconProposalFetch,
 }
 
 impl BeaconFetchState {
     /// Build beacon fetch state for a freshly hosted shard.
     #[must_use]
-    pub fn new(config: &NodeConfig) -> Self {
+    pub(crate) fn new(config: &NodeConfig) -> Self {
         Self {
             shard_witness: ShardWitnessFetch::new(
                 "shard_witness",
@@ -70,7 +70,7 @@ impl BeaconFetchState {
     /// queued). Keeps this shard's `FetchTick` timer alive so deferred ids
     /// eventually retry.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         self.shard_witness.has_pending() || self.beacon_proposal.has_pending()
     }
 }

@@ -216,7 +216,7 @@ impl SimulationRunner {
     /// slice, and a join whose attested anchor has gone stale (a transient fold
     /// freeze evicted its state) simply defers to a later slice, the same way
     /// production's async bootstrap retries against the advanced anchor.
-    pub fn reconcile_placement(&mut self) {
+    pub(crate) fn reconcile_placement(&mut self) {
         let _ = self.take_participation_changes();
         for host in 0..self.num_hosts() {
             // Committee membership only changes at an epoch boundary, so skip the

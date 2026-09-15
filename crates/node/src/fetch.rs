@@ -36,11 +36,11 @@ use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, pu
 #[derive(Debug, Clone)]
 pub struct FetchConfig {
     /// Maximum ids in flight across all entries simultaneously.
-    pub max_in_flight: usize,
+    pub(crate) max_in_flight: usize,
     /// Maximum ids in a single chunked request.
-    pub max_ids_per_request: usize,
+    pub(crate) max_ids_per_request: usize,
     /// Maximum chunks emitted from a single `Tick`.
-    pub parallel_chunks_per_tick: usize,
+    pub(crate) parallel_chunks_per_tick: usize,
 }
 
 impl Default for FetchConfig {
@@ -169,7 +169,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     ///
     /// `kind` labels metrics emitted by this instance.
     #[must_use]
-    pub const fn new(kind: &'static str, config: FetchConfig) -> Self {
+    pub(crate) const fn new(kind: &'static str, config: FetchConfig) -> Self {
         Self {
             config,
             kind,
@@ -178,7 +178,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     }
 
     /// Process an input and return outputs.
-    pub fn handle(&mut self, input: FetchInput<Id>) -> Vec<FetchOutput<Id>> {
+    pub(crate) fn handle(&mut self, input: FetchInput<Id>) -> Vec<FetchOutput<Id>> {
         match input {
             FetchInput::Request {
                 ids,
@@ -196,19 +196,19 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
 
     /// Whether any id is currently tracked.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
 
     /// Number of ids currently dispatched and not yet acknowledged.
     #[must_use]
-    pub fn in_flight_count(&self) -> usize {
+    pub(crate) fn in_flight_count(&self) -> usize {
         self.pending.values().filter(|e| e.in_flight).count()
     }
 
     /// Total ids currently tracked (in-flight or awaiting dispatch).
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub(crate) fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
@@ -216,7 +216,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// consumer re-derives its wanted set each tick diffs against this to
     /// abandon what the consumer no longer asks for — without it an id
     /// nobody answers stays in the pending set for the process's life.
-    pub fn pending_ids(&self) -> impl Iterator<Item = &Id> {
+    pub(crate) fn pending_ids(&self) -> impl Iterator<Item = &Id> {
         self.pending.keys()
     }
 
@@ -226,7 +226,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// without notifying the FSM — the symptom that motivated the
     /// provision-fetch robustness work in the first place.
     #[must_use]
-    pub fn oldest_in_flight_age_ms(&self) -> u64 {
+    pub(crate) fn oldest_in_flight_age_ms(&self) -> u64 {
         let oldest = self
             .pending
             .values()
@@ -622,7 +622,7 @@ pub enum Release {
 
 impl Release {
     /// The [`FetchInput`] releasing `ids` this way.
-    pub const fn input<Id>(self, ids: Vec<Id>) -> FetchInput<Id> {
+    pub(crate) const fn input<Id>(self, ids: Vec<Id>) -> FetchInput<Id> {
         match self {
             Self::Failed => FetchInput::Failed { ids },
             Self::Unroutable => FetchInput::Unroutable { ids },
@@ -659,7 +659,7 @@ pub enum Intent {
 
 impl Intent {
     /// The [`FetchInput`] this intent makes of `ids`.
-    pub const fn input<Id>(self, ids: Vec<Id>) -> FetchInput<Id> {
+    pub(crate) const fn input<Id>(self, ids: Vec<Id>) -> FetchInput<Id> {
         match self {
             Self::Ask {
                 shard,
@@ -703,13 +703,13 @@ enum Respawn {
 /// Result of partitioning a fetch response against the requested set.
 pub struct Partition<T, Id> {
     /// Items whose extracted id matched a requested id.
-    pub kept: Vec<T>,
+    pub(crate) kept: Vec<T>,
     /// Requested ids that didn't appear in the response.
-    pub missing: Vec<Id>,
+    pub(crate) missing: Vec<Id>,
     /// Count of returned items whose id was NOT requested. A non-zero
     /// value indicates a buggy or malicious peer trying to inject items
     /// we never asked for.
-    pub unsolicited: usize,
+    pub(crate) unsolicited: usize,
 }
 
 /// Split a fetch response into solicited / missing / unsolicited buckets.

@@ -165,7 +165,7 @@ impl QuorumCertificate {
     /// The [`BlockVoteMessage`] domain separates it from every other signature.
     /// This is the same message used for individual block vote verification.
     #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+    pub(crate) fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
             &BlockVoteMessage {
                 shard_group: self.shard_id,

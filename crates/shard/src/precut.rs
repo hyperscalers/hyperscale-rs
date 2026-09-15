@@ -56,7 +56,7 @@ pub struct Precut {
 impl Precut {
     /// The chains this one succeeds, with nothing answered yet.
     #[must_use]
-    pub fn succeeding(predecessors: Vec<PredecessorTerminal>) -> Self {
+    pub(crate) fn succeeding(predecessors: Vec<PredecessorTerminal>) -> Self {
         Self {
             predecessors,
             answers: HashMap::new(),
@@ -65,13 +65,13 @@ impl Precut {
 
     /// The chains this one succeeds.
     #[must_use]
-    pub fn predecessors(&self) -> &[PredecessorTerminal] {
+    pub(crate) fn predecessors(&self) -> &[PredecessorTerminal] {
         &self.predecessors
     }
 
     /// Whether any predecessor is on hand to answer at all.
     #[must_use]
-    pub const fn has_predecessors(&self) -> bool {
+    pub(crate) const fn has_predecessors(&self) -> bool {
         !self.predecessors.is_empty()
     }
 
@@ -81,7 +81,7 @@ impl Precut {
     /// `MAX_VALIDITY_RANGE`: nothing on offer can open before the cut from
     /// there on, so no answer will be consulted again and the map would
     /// otherwise be held for the coordinator's life.
-    pub fn retire(&mut self) {
+    pub(crate) fn retire(&mut self) {
         self.predecessors = Vec::new();
         self.answers = HashMap::new();
     }
@@ -89,7 +89,7 @@ impl Precut {
     /// Whether anything is still held — what a caller retiring the rule
     /// checks before doing the work of retiring it.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.predecessors.is_empty() && self.answers.is_empty()
     }
 
@@ -98,7 +98,7 @@ impl Precut {
     /// The caller has already verified an `absent` answer against that
     /// predecessor's attested root; a `committed` answer needs no proof,
     /// because it leaves the standing refusal in place.
-    pub fn record(&mut self, predecessor: ShardId, tx_hash: TxHash, absent: bool) {
+    pub(crate) fn record(&mut self, predecessor: ShardId, tx_hash: TxHash, absent: bool) {
         self.answers.insert((predecessor, tx_hash), absent);
     }
 
@@ -108,7 +108,7 @@ impl Precut {
     /// (born at network genesis, where no transaction predates it) or has
     /// not been handed them yet, and both cases keep the strict rule.
     #[must_use]
-    pub fn status(&self, tx_hash: &TxHash) -> PrecutStatus {
+    pub(crate) fn status(&self, tx_hash: &TxHash) -> PrecutStatus {
         if self.predecessors.is_empty() {
             return PrecutStatus::Unresolved;
         }
@@ -132,7 +132,7 @@ impl Precut {
     /// Whether `tx_hash` may be offered despite opening before this chain
     /// did — proven absent from every predecessor's committed set.
     #[must_use]
-    pub fn admissible(&self, tx_hash: &TxHash) -> bool {
+    pub(crate) fn admissible(&self, tx_hash: &TxHash) -> bool {
         self.status(tx_hash) == PrecutStatus::Absent
     }
 
@@ -144,7 +144,7 @@ impl Precut {
     /// absence proof that comes back is checked against that terminal's
     /// root.
     #[must_use]
-    pub fn outstanding(
+    pub(crate) fn outstanding(
         &self,
         tx_hashes: impl IntoIterator<Item = TxHash>,
     ) -> Vec<(PredecessorTerminal, TxHash)> {

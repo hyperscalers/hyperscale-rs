@@ -109,7 +109,7 @@ impl SimShardStorage {
     ///
     /// Panics if the state lock is poisoned.
     #[must_use]
-    pub fn retention_floor(&self) -> u64 {
+    pub(crate) fn retention_floor(&self) -> u64 {
         read_or_recover(&self.state).retention_floor
     }
 
@@ -275,7 +275,7 @@ impl SimShardStorage {
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned.
-    pub fn commit_substates_only(&self, writes: &SettledWrites) {
+    pub(crate) fn commit_substates_only(&self, writes: &SettledWrites) {
         let mut s = write_or_recover(&self.state);
         apply_writes(&mut s, writes, 0, /* write_history */ false);
     }
@@ -294,7 +294,7 @@ impl SimShardStorage {
     /// Panics if the internal `RwLock` is poisoned, or if the JMT has
     /// already been initialized.
     #[must_use]
-    pub fn finalize_genesis_jmt(&self, merged: &SettledWrites) -> StateRoot {
+    pub(crate) fn finalize_genesis_jmt(&self, merged: &SettledWrites) -> StateRoot {
         let mut s = write_or_recover(&self.state);
 
         // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.

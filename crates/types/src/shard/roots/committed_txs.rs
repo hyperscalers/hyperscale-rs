@@ -86,16 +86,16 @@ pub fn committed_txs_root_from_hashes<'a>(
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct CommittedTxAbsence {
     /// The set member immediately below the queried hash, if any.
-    pub left: Option<TxHash>,
+    pub(crate) left: Option<TxHash>,
     /// The set member immediately above the queried hash, if any.
-    pub right: Option<TxHash>,
+    pub(crate) right: Option<TxHash>,
     /// Leaf index of `left`, or of `right` when `left` is absent.
-    pub lo: u32,
+    pub(crate) lo: u32,
     /// Total leaves in the committed set.
-    pub leaf_count: u32,
+    pub(crate) leaf_count: u32,
     /// Range proof lifting the bracket to the root.
     #[hbor(max = MAX_ABSENCE_PROOF_NODES)]
-    pub proof: Vec<Hash>,
+    pub(crate) proof: Vec<Hash>,
 }
 
 impl CommittedTxAbsence {

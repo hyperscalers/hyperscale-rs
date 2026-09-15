@@ -76,9 +76,9 @@ type SharedValidatorKeys = Arc<ArcSwap<ValidatorKeyMap>>;
 /// takes effect there rather than in the handler task that verified it.
 pub struct VerifiedBind {
     /// Peer that proved control of every listed validator's consensus key.
-    pub peer_id: Libp2pPeerId,
+    pub(crate) peer_id: Libp2pPeerId,
     /// Validators the peer attested as in this exchange.
-    pub validators: Vec<ValidatorId>,
+    pub(crate) validators: Vec<ValidatorId>,
 }
 
 /// Stream protocol identifier for the validator-bind handshake.

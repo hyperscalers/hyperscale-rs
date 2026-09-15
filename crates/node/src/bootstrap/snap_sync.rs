@@ -80,7 +80,7 @@ enum SubRangeState {
 }
 
 /// Snap-sync assembly state for one shard bootstrap.
-pub struct SnapSync {
+pub(crate) struct SnapSync {
     anchor: ShardAnchor,
     root_path: NibblePath,
     split_bits: u8,
@@ -96,7 +96,7 @@ impl SnapSync {
     /// `root_path`, partitioned into `2^split_bits` parallel sub-ranges,
     /// fetching up to `chunk_limit` leaves per request.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         anchor: ShardAnchor,
         root_path: NibblePath,
         split_bits: u8,
@@ -117,7 +117,7 @@ impl SnapSync {
     ///
     /// Panics unless `span_path` sits at or under `root_path`.
     #[must_use]
-    pub fn spanning(
+    pub(crate) fn spanning(
         anchor: ShardAnchor,
         root_path: NibblePath,
         span_path: &NibblePath,
@@ -157,7 +157,7 @@ impl SnapSync {
     /// against the anchor and fetch geometry — staged chunks are
     /// meaningless against any other `state_root`.
     #[must_use]
-    pub fn with_cursors(
+    pub(crate) fn with_cursors(
         anchor: ShardAnchor,
         root_path: NibblePath,
         progress: &ImportProgress,
@@ -188,7 +188,7 @@ impl SnapSync {
     /// Emit a request for every idle sub-range, marking each in flight.
     /// Returned pairs are `(sub_range id, request)`; the driver answers
     /// through [`Self::on_response`] / [`Self::on_failure`] with the id.
-    pub fn next_requests(&mut self) -> Vec<(usize, GetStateRangeRequest)> {
+    pub(crate) fn next_requests(&mut self) -> Vec<(usize, GetStateRangeRequest)> {
         let height = self.anchor.height;
         let limit = self.chunk_limit;
         self.sub_ranges
@@ -214,7 +214,7 @@ impl SnapSync {
     /// # Panics
     ///
     /// Panics if `sub_range` is not an id this assembly emitted.
-    pub fn on_failure(&mut self, sub_range: usize) {
+    pub(crate) fn on_failure(&mut self, sub_range: usize) {
         let sub = &mut self.sub_ranges[sub_range];
         if sub.state == SubRangeState::InFlight {
             sub.state = SubRangeState::Idle;
@@ -227,7 +227,7 @@ impl SnapSync {
     /// # Panics
     ///
     /// Panics if `sub_range` is not an id this assembly emitted.
-    pub fn on_response(
+    pub(crate) fn on_response(
         &mut self,
         sub_range: usize,
         response: &GetStateRangeResponse,
@@ -282,7 +282,7 @@ impl SnapSync {
 
     /// Whether every sub-range is exhausted.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.sub_ranges
             .iter()
             .all(|sub| sub.state == SubRangeState::Done)
@@ -291,7 +291,7 @@ impl SnapSync {
     /// Leaf value bytes across every chunk handed to the driver for
     /// staging.
     #[must_use]
-    pub const fn staged_bytes(&self) -> u64 {
+    pub(crate) const fn staged_bytes(&self) -> u64 {
         self.staged_bytes
     }
 

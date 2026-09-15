@@ -36,7 +36,7 @@ pub struct ChainView<'a> {
 
 impl<'a> ChainView<'a> {
     #[allow(clippy::too_many_arguments)] // a borrow-bundle over the coordinator's chain fields
-    pub const fn new(
+    pub(crate) const fn new(
         local_shard: ShardId,
         chain_origin: ChainOrigin,
         committed_height: BlockHeight,
@@ -65,17 +65,17 @@ impl<'a> ChainView<'a> {
     /// the dedicated header / state-root accessors expose.
     /// The committed height the walks stop at.
     #[must_use]
-    pub const fn committed_height(&self) -> BlockHeight {
+    pub(crate) const fn committed_height(&self) -> BlockHeight {
         self.committed_height
     }
 
-    pub fn get_pending(&self, block_hash: BlockHash) -> Option<&PendingBlock> {
+    pub(crate) fn get_pending(&self, block_hash: BlockHash) -> Option<&PendingBlock> {
         self.pending.get(block_hash)
     }
 
     /// The complete block for `block_hash`: a constructed pending block,
     /// or a certified one admitted through sync.
-    pub fn get_block(&self, block_hash: BlockHash) -> Option<&Block> {
+    pub(crate) fn get_block(&self, block_hash: BlockHash) -> Option<&Block> {
         self.pending
             .get(block_hash)
             .and_then(PendingBlock::block)
@@ -93,7 +93,7 @@ impl<'a> ChainView<'a> {
     /// verified-certified cache — the home of a sync-admitted block whose
     /// round-contiguous commit is still pending, which a halt recovery's
     /// fresh committee extends as its proposal parent.
-    pub fn get_header(&self, block_hash: BlockHash) -> Option<&BlockHeader> {
+    pub(crate) fn get_header(&self, block_hash: BlockHash) -> Option<&BlockHeader> {
         self.pending
             .get(block_hash)
             .map(PendingBlock::header)
@@ -107,7 +107,7 @@ impl<'a> ChainView<'a> {
     /// State root of the parent block. Returns the committed-tip state root
     /// when `parent_block_hash` IS the committed tip (may have been pruned
     /// from `pending` by cleanup) or when lookup otherwise fails.
-    pub fn parent_state_root(&self, parent_block_hash: BlockHash) -> StateRoot {
+    pub(crate) fn parent_state_root(&self, parent_block_hash: BlockHash) -> StateRoot {
         if parent_block_hash == self.committed_hash {
             return self.committed_state_root;
         }
@@ -139,7 +139,10 @@ impl<'a> ChainView<'a> {
     /// joiner extending its boundary anchor resolves through the tip (the
     /// anchor header never enters `pending`); a `None` skips the vote,
     /// since the claimed in-flight count can't be checked.
-    pub fn parent_in_flight_checked(&self, parent_block_hash: BlockHash) -> Option<TxsInFlight> {
+    pub(crate) fn parent_in_flight_checked(
+        &self,
+        parent_block_hash: BlockHash,
+    ) -> Option<TxsInFlight> {
         if let Some(header) = self.get_header(parent_block_hash) {
             return Some(header.txs_in_flight());
         }
@@ -152,7 +155,7 @@ impl<'a> ChainView<'a> {
     /// [`Self::parent_in_flight_checked`]; a `None` skips the vote, since
     /// the claimed frontier can't be checked.
     #[must_use]
-    pub fn parent_settled_frontier_checked(
+    pub(crate) fn parent_settled_frontier_checked(
         &self,
         parent_block_hash: BlockHash,
     ) -> Option<BlockHeight> {
@@ -167,7 +170,7 @@ impl<'a> ChainView<'a> {
     /// the proposer-side read, where an unresolvable parent means the
     /// block being built settles from the bottom rather than skipping.
     #[must_use]
-    pub fn parent_settled_frontier(&self, parent_block_hash: BlockHash) -> BlockHeight {
+    pub(crate) fn parent_settled_frontier(&self, parent_block_hash: BlockHash) -> BlockHeight {
         self.parent_settled_frontier_checked(parent_block_hash)
             .unwrap_or(BlockHeight::GENESIS)
     }
@@ -181,7 +184,7 @@ impl<'a> ChainView<'a> {
     /// proposer's cannot exceed. An unresolvable parent stops the block
     /// on other grounds long before either matters.
     #[must_use]
-    pub fn parent_sweep_frontier(&self, parent_block_hash: BlockHash) -> SweepFrontier {
+    pub(crate) fn parent_sweep_frontier(&self, parent_block_hash: BlockHash) -> SweepFrontier {
         if let Some(header) = self.get_header(parent_block_hash) {
             return header.sweep_frontier();
         }
@@ -193,7 +196,7 @@ impl<'a> ChainView<'a> {
     /// block advances. `None` when the parent is unresolvable, under the
     /// same conditions as [`Self::parent_in_flight_checked`].
     #[must_use]
-    pub fn parent_load_checked(&self, parent_block_hash: BlockHash) -> Option<ShardLoad> {
+    pub(crate) fn parent_load_checked(&self, parent_block_hash: BlockHash) -> Option<ShardLoad> {
         if let Some(header) = self.get_header(parent_block_hash) {
             return Some(header.load());
         }
@@ -208,7 +211,7 @@ impl<'a> ChainView<'a> {
     /// There is no safe default — a guessed chain produces a header every
     /// other replica rejects — so a `None` skips the vote and defers the
     /// build until the first commit reseats the tip.
-    pub fn parent_reveal_chain(&self, parent_block_hash: BlockHash) -> Option<RevealChain> {
+    pub(crate) fn parent_reveal_chain(&self, parent_block_hash: BlockHash) -> Option<RevealChain> {
         if let Some(header) = self.get_header(parent_block_hash) {
             return Some(header.reveal_chain());
         }
@@ -217,7 +220,7 @@ impl<'a> ChainView<'a> {
 
     /// Drain total on the parent header. Returns zero if the parent is
     /// unresolvable (see [`Self::parent_in_flight_checked`]).
-    pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> TxsInFlight {
+    pub(crate) fn parent_in_flight(&self, parent_block_hash: BlockHash) -> TxsInFlight {
         self.parent_in_flight_checked(parent_block_hash)
             .unwrap_or(TxsInFlight::ZERO)
     }
@@ -225,7 +228,7 @@ impl<'a> ChainView<'a> {
     /// Parent to use when building the next proposal: the latest QC's block
     /// if any, otherwise the committed tip under a genesis QC tagged with
     /// the local shard and the chain's start-time anchor.
-    pub fn proposal_parent(&self) -> (BlockHash, Verified<QuorumCertificate>) {
+    pub(crate) fn proposal_parent(&self) -> (BlockHash, Verified<QuorumCertificate>) {
         self.latest_qc.map_or_else(
             || {
                 (

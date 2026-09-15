@@ -58,10 +58,10 @@ pub struct ExecutionMetadata {
     /// the cap sits inside a tuple element, out of a field attribute's
     /// reach.
     #[hbor(max = MAX_LOG_MESSAGES_PER_TX)]
-    pub log_messages: Vec<(LogLevel, String)>,
+    pub(crate) log_messages: Vec<(LogLevel, String)>,
     /// Engine error message when `outcome == Failure`.
     #[hbor(max = MAX_DIAGNOSTIC_STRING_LEN)]
-    pub error_message: Option<String>,
+    pub(crate) error_message: Option<String>,
 }
 
 /// The per-log-string cap, checked at the wire boundary. It sits inside

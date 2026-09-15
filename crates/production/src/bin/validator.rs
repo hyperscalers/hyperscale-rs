@@ -145,9 +145,9 @@ struct Cli {
 /// state — fails loudly at load rather than being silently dropped.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ValidatorConfig {
+pub(crate) struct ValidatorConfig {
     /// Host-level identity configuration
-    pub node: NodeConfig,
+    pub(crate) node: NodeConfig,
 
     /// Hosted validators. One entry per validator this process runs. A
     /// single-validator deployment has exactly one block; multi-validator
@@ -155,19 +155,19 @@ pub struct ValidatorConfig {
     /// storage and gossipsub subscriptions; different-shard entries
     /// additionally provision a per-shard `ShardIo`.
     #[serde(rename = "vnode", default)]
-    pub vnodes: Vec<VnodeEntry>,
+    pub(crate) vnodes: Vec<VnodeEntry>,
 
     /// Network configuration
     #[serde(default)]
-    pub network: NetworkConfig,
+    pub(crate) network: NetworkConfig,
 
     /// Thread pool configuration
     #[serde(default)]
-    pub threads: ThreadsConfig,
+    pub(crate) threads: ThreadsConfig,
 
     /// Storage configuration
     #[serde(default)]
-    pub storage: StorageConfig,
+    pub(crate) storage: StorageConfig,
 
     /// Metrics configuration
     #[serde(default)]
@@ -183,11 +183,11 @@ pub struct ValidatorConfig {
 
     /// Mempool configuration
     #[serde(default)]
-    pub mempool: MempoolConfig,
+    pub(crate) mempool: MempoolConfig,
 
     /// Provision coordinator configuration
     #[serde(default)]
-    pub provisions: ProvisionConfig,
+    pub(crate) provisions: ProvisionConfig,
 }
 
 /// Host-level identity configuration. Per-validator identity lives in
@@ -197,18 +197,18 @@ pub struct ValidatorConfig {
 /// `shard`/`num_shards`, now projected from beacon state.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeConfig {
+pub(crate) struct NodeConfig {
     /// Network this node is configured for. Bound into every
     /// signed consensus message to prevent cross-network replay.
     /// Parsed from a network name (`"mainnet"`, `"testnet"`,
     /// `"simulator"`, etc.) via [`NetworkDefinition::from_str`](std::str::FromStr::from_str).
     #[serde(default = "default_network", with = "network_serde")]
-    pub network: NetworkDefinition,
+    pub(crate) network: NetworkDefinition,
 
     /// Data directory for storage. Per-shard `RocksDB` instances are
     /// opened at `data_dir/shard-{N}/db`.
     #[serde(default = "default_data_dir")]
-    pub data_dir: PathBuf,
+    pub(crate) data_dir: PathBuf,
 }
 
 fn default_network() -> NetworkDefinition {
@@ -247,12 +247,12 @@ mod network_serde {
 /// state, derived by the runner at startup (an obsolete `shard = N` line in
 /// an existing config is ignored).
 #[derive(Debug, Clone, Deserialize)]
-pub struct VnodeEntry {
+pub(crate) struct VnodeEntry {
     /// Validator ID (index in the committee)
-    pub validator_id: u64,
+    pub(crate) validator_id: u64,
 
     /// Path to this validator's signing key file
-    pub key_path: PathBuf,
+    pub(crate) key_path: PathBuf,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -261,14 +261,14 @@ fn default_data_dir() -> PathBuf {
 
 /// Network configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct NetworkConfig {
+pub(crate) struct NetworkConfig {
     /// QUIC listen address (multiaddr format, e.g., "/ip4/0.0.0.0/udp/9000/quic-v1")
     #[serde(default = "default_listen_addr")]
-    pub listen_addr: String,
+    pub(crate) listen_addr: String,
 
     /// Bootstrap peer addresses
     #[serde(default)]
-    pub bootstrap_peers: Vec<String>,
+    pub(crate) bootstrap_peers: Vec<String>,
 
     /// Maximum message size in bytes
     #[serde(default = "default_max_message_size")]
@@ -276,22 +276,22 @@ pub struct NetworkConfig {
 
     /// Gossipsub heartbeat interval in milliseconds
     #[serde(default = "default_gossipsub_heartbeat_ms")]
-    pub gossipsub_heartbeat_ms: u64,
+    pub(crate) gossipsub_heartbeat_ms: u64,
 
     /// Enable `UPnP` port forwarding
     #[serde(default = "default_upnp_enabled")]
-    pub upnp_enabled: bool,
+    pub(crate) upnp_enabled: bool,
 
     /// Version interoperability mode
     pub version_interop_mode: Option<VersionInteroperabilityMode>,
 
     /// Idle connection timeout in milliseconds
     #[serde(default = "default_idle_connection_timeout_ms")]
-    pub idle_connection_timeout_ms: u64,
+    pub(crate) idle_connection_timeout_ms: u64,
 
     /// QUIC keep-alive interval in milliseconds
     #[serde(default = "default_keep_alive_interval_ms")]
-    pub keep_alive_interval_ms: u64,
+    pub(crate) keep_alive_interval_ms: u64,
 }
 
 fn default_listen_addr() -> String {
@@ -320,34 +320,34 @@ const fn default_keep_alive_interval_ms() -> u64 {
 
 /// Thread pool configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct ThreadsConfig {
+pub(crate) struct ThreadsConfig {
     /// Threads in the consensus pool (0 = auto). Liveness-critical work
     /// — block votes, QC verification, state root, proposal building.
     #[serde(default)]
-    pub consensus_threads: usize,
+    pub(crate) consensus_threads: usize,
 
     /// Threads in the throughput pool (0 = auto). General crypto
     /// verification, transaction signature validation, and engine
     /// execution share this pool; in-handler `par_iter` fans batches
     /// across the same workers.
     #[serde(default)]
-    pub throughput_threads: usize,
+    pub(crate) throughput_threads: usize,
 
     /// Number of tokio runtime worker threads (0 = auto).
     /// Controls the async I/O runtime used for networking, timers, and RPC.
     #[serde(default)]
-    pub io_threads: usize,
+    pub(crate) io_threads: usize,
 
     /// Enable CPU core pinning (Linux only)
     #[serde(default)]
-    pub pin_cores: bool,
+    pub(crate) pin_cores: bool,
 }
 
 /// Compression type for storage (maps to `RocksDB` compression).
 #[allow(missing_docs)] // codec names are self-explanatory
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CompressionType {
+pub(crate) enum CompressionType {
     None,
     Snappy,
     Zlib,
@@ -372,38 +372,38 @@ impl From<CompressionType> for RocksCompressionType {
 
 /// Storage configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub struct StorageConfig {
+pub(crate) struct StorageConfig {
     /// Maximum background jobs for `RocksDB`
     #[serde(default = "default_max_background_jobs")]
-    pub max_background_jobs: i32,
+    pub(crate) max_background_jobs: i32,
 
     /// Write buffer size in MB
     #[serde(default = "default_write_buffer_mb")]
-    pub write_buffer_mb: usize,
+    pub(crate) write_buffer_mb: usize,
 
     /// Maximum number of write buffers
     #[serde(default = "default_max_write_buffer_number")]
-    pub max_write_buffer_number: i32,
+    pub(crate) max_write_buffer_number: i32,
 
     /// Block cache size in MB (0 to disable)
     #[serde(default = "default_block_cache_mb")]
-    pub block_cache_mb: usize,
+    pub(crate) block_cache_mb: usize,
 
     /// Compression type (none, snappy, zlib, lz4, lz4hc, zstd)
     #[serde(default)]
-    pub compression: CompressionType,
+    pub(crate) compression: CompressionType,
 
     /// Bloom filter bits per key (0 to disable)
     #[serde(default = "default_bloom_filter_bits")]
-    pub bloom_filter_bits: f64,
+    pub(crate) bloom_filter_bits: f64,
 
     /// Bytes per sync in MB (0 to disable)
     #[serde(default = "default_bytes_per_sync_mb")]
-    pub bytes_per_sync_mb: usize,
+    pub(crate) bytes_per_sync_mb: usize,
 
     /// Number of log files to keep
     #[serde(default = "default_keep_log_file_num")]
-    pub keep_log_file_num: usize,
+    pub(crate) keep_log_file_num: usize,
 }
 
 impl Default for StorageConfig {
@@ -451,14 +451,14 @@ const fn default_keep_log_file_num() -> usize {
 
 /// Metrics configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub struct MetricsConfig {
+pub(crate) struct MetricsConfig {
     /// Enable metrics endpoint
     #[serde(default = "default_metrics_enabled")]
-    pub enabled: bool,
+    pub(crate) enabled: bool,
 
     /// Metrics HTTP listen address
     #[serde(default = "default_metrics_addr")]
-    pub listen_addr: String,
+    pub(crate) listen_addr: String,
 }
 
 impl Default for MetricsConfig {
@@ -480,22 +480,22 @@ fn default_metrics_addr() -> String {
 
 /// Telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct TelemetryConfigToml {
+pub(crate) struct TelemetryConfigToml {
     /// Enable OpenTelemetry tracing
     #[serde(default)]
-    pub enabled: bool,
+    pub(crate) enabled: bool,
 
     /// OTLP endpoint for traces
     #[serde(default)]
-    pub otlp_endpoint: Option<String>,
+    pub(crate) otlp_endpoint: Option<String>,
 
     /// Service name for tracing
     #[serde(default = "default_service_name")]
-    pub service_name: String,
+    pub(crate) service_name: String,
 
     /// Optional log file path. If provided, logs are written to this file.
     #[serde(default)]
-    pub log_file: Option<PathBuf>,
+    pub(crate) log_file: Option<PathBuf>,
 }
 
 fn default_service_name() -> String {
@@ -504,36 +504,36 @@ fn default_service_name() -> String {
 
 /// Genesis configuration defining the validator set and initial balances.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct GenesisConfig {
+pub(crate) struct GenesisConfig {
     /// Validators in the network
     #[serde(default)]
-    pub validators: Vec<ValidatorEntry>,
+    pub(crate) validators: Vec<ValidatorEntry>,
 
     /// Initial balances for funded accounts, keyed by their 32-byte
     /// address. This is what genesis actually seeds: an account's address
     /// *is* its shard placement, so the list needs no routing metadata.
     #[serde(default)]
-    pub accounts: Vec<AccountBalanceEntry>,
+    pub(crate) accounts: Vec<AccountBalanceEntry>,
 }
 
 /// A funded-account entry for genesis configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AccountBalanceEntry {
+pub(crate) struct AccountBalanceEntry {
     /// Hex-encoded 32-byte account address.
-    pub address: String,
+    pub(crate) address: String,
 
     /// Balance as a string, parsed as `u128`.
-    pub balance: String,
+    pub(crate) balance: String,
 }
 
 /// A validator entry in genesis configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ValidatorEntry {
+pub(crate) struct ValidatorEntry {
     /// Validator ID
-    pub id: u64,
+    pub(crate) id: u64,
 
     /// Hex-encoded public key
-    pub public_key: String,
+    pub(crate) public_key: String,
 }
 
 impl ValidatorConfig {
@@ -543,7 +543,7 @@ impl ValidatorConfig {
     ///
     /// Returns an error if the file cannot be read or if its contents fail to
     /// parse as TOML in the [`ValidatorConfig`] schema.
-    pub fn load(path: &PathBuf) -> Result<Self> {
+    pub(crate) fn load(path: &PathBuf) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 

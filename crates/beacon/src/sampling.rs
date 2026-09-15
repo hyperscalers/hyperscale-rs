@@ -27,7 +27,7 @@ const POOL_DRAW_DOMAIN: &[u8] = b"hyperscale-pool-draw-v1";
 /// state layer can derive purpose-bound seeds (committee draw,
 /// pool draw, future per-shard randomness) the same way.
 #[must_use]
-pub fn prng_from(seed: &[u8; 32]) -> ChaCha20Rng {
+pub(crate) fn prng_from(seed: &[u8; 32]) -> ChaCha20Rng {
     ChaCha20Rng::from_seed(*seed)
 }
 
@@ -38,7 +38,7 @@ pub fn prng_from(seed: &[u8; 32]) -> ChaCha20Rng {
 /// Caller is responsible for filtering `eligible` to the right set
 /// (e.g. `OnShard { ready: true }` under the current eligibility rule).
 #[must_use]
-pub fn sample_committee(
+pub(crate) fn sample_committee(
     eligible: &[ValidatorId],
     randomness: &[u8; 32],
     committee_size: usize,
@@ -82,7 +82,7 @@ pub fn sample_committee(
 /// removed once it is picked. If every remaining weight is zero the seat
 /// falls back to a uniform draw, so the committee always fills.
 #[must_use]
-pub fn sample_committee_weighted(
+pub(crate) fn sample_committee_weighted(
     weighted: &[(ValidatorId, u64)],
     randomness: &[u8; 32],
     committee_size: usize,
@@ -135,7 +135,7 @@ pub fn sample_committee_weighted(
 /// from the same `(epoch, shard)` must remove each pick from the pool
 /// before the next call.
 #[must_use]
-pub fn draw_from_pool(
+pub(crate) fn draw_from_pool(
     pool: &[ValidatorId],
     randomness: &[u8; 32],
     epoch: Epoch,

@@ -34,29 +34,29 @@ pub enum BroadcastTarget {
 #[derive(Debug)]
 pub struct OutboxEntry {
     /// Where to deliver.
-    pub target: BroadcastTarget,
+    pub(crate) target: BroadcastTarget,
     /// The message type identifier (e.g., "block.header").
-    pub message_type: &'static str,
+    pub(crate) message_type: &'static str,
     /// The sending type's [`NetworkMessage::class`]. Carried on the entry
     /// because the class is a property of the Rust type and never reaches
     /// the wire: the harness sees only `message_type` once the message is
     /// encoded, so anything downstream that needs the class needs it here.
-    pub class: MessageClass,
+    pub(crate) class: MessageClass,
     /// Wire-encoded message bytes (HBOR + LZ4).
-    pub data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// A buffered notification (fire-and-forget unicast) awaiting harness delivery.
 pub struct PendingNotification {
     /// Validators to deliver to.
-    pub recipients: Vec<ValidatorId>,
+    pub(crate) recipients: Vec<ValidatorId>,
     /// Message type ID for handler lookup.
-    pub type_id: &'static str,
+    pub(crate) type_id: &'static str,
     /// The sending type's [`NetworkMessage::class`]. See
     /// [`OutboxEntry::class`].
-    pub class: MessageClass,
+    pub(crate) class: MessageClass,
     /// Wire-encoded message bytes (HBOR + LZ4).
-    pub data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// A buffered request from `IoLoop`, awaiting harness fulfillment.
@@ -70,22 +70,23 @@ pub struct PendingRequest {
     /// resolves it to a peer list from its topology view.
     pub shard: ShardId,
     /// Optional preferred peer (e.g., block proposer for fetch).
-    pub preferred_peer: Option<ValidatorId>,
+    pub(crate) preferred_peer: Option<ValidatorId>,
     /// Message type ID for handler lookup (e.g., "block.request").
-    pub type_id: &'static str,
+    pub(crate) type_id: &'static str,
     /// Class of the request leg — the caller's override where it gave one,
     /// otherwise the request type's own. See [`OutboxEntry::class`].
-    pub class: MessageClass,
+    pub(crate) class: MessageClass,
     /// Class of the response leg, from the response type. The two legs of a
     /// round trip are separate messages and need not share a class.
-    pub response_class: MessageClass,
+    pub(crate) response_class: MessageClass,
     /// encoded request bytes.
-    pub request_bytes: Vec<u8>,
+    pub(crate) request_bytes: Vec<u8>,
     /// Callback that receives encoded response bytes (or error). Returns
     /// a [`ResponseVerdict`] for parity with the production `Network::request`
     /// signature; the simulation discards the verdict (deterministic harness
     /// owns peer behaviour directly).
-    pub on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
+    pub(crate) on_response:
+        Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
 }
 
 /// Network implementation for simulation.

@@ -112,7 +112,7 @@ impl<T> BloomFilter<T> {
 
     /// Number of bits in the backing array. Always a multiple of 64.
     #[must_use]
-    pub const fn bit_len(&self) -> usize {
+    pub(crate) const fn bit_len(&self) -> usize {
         self.bits.len() * 64
     }
 

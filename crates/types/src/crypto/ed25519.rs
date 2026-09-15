@@ -20,7 +20,7 @@ pub struct Ed25519PublicKey(pub [u8; Self::LENGTH]);
 
 impl Ed25519PublicKey {
     /// Byte length of a public key.
-    pub const LENGTH: usize = 32;
+    pub(crate) const LENGTH: usize = 32;
 }
 
 /// An Ed25519 signature: `R || s`.
@@ -29,7 +29,7 @@ pub struct Ed25519Signature(pub [u8; Self::LENGTH]);
 
 impl Ed25519Signature {
     /// Byte length of a signature.
-    pub const LENGTH: usize = 64;
+    pub(crate) const LENGTH: usize = 64;
 }
 
 /// An Ed25519 signing key.
@@ -43,7 +43,7 @@ pub struct Ed25519PrivateKey(Pin<Box<Option<SigningKey>>>);
 
 impl Ed25519PrivateKey {
     /// Byte length of a private key seed.
-    pub const LENGTH: usize = 32;
+    pub(crate) const LENGTH: usize = 32;
 
     fn signing_key(&self) -> &SigningKey {
         (*self.0)
@@ -59,7 +59,7 @@ impl Ed25519PrivateKey {
 
     /// Sign `msg`.
     #[must_use]
-    pub fn sign(&self, msg: impl AsRef<[u8]>) -> Ed25519Signature {
+    pub(crate) fn sign(&self, msg: impl AsRef<[u8]>) -> Ed25519Signature {
         Ed25519Signature(self.signing_key().sign(msg.as_ref()).to_bytes())
     }
 
