@@ -763,6 +763,15 @@ impl<B: SyncBinding> Sync<B> {
                     state.queue_height(h);
                 }
             }
+
+            // And the window, which every other handler queues before it
+            // emits. A scope below its target with nothing queued, in
+            // flight, deferred or awaiting admission has no way to refill
+            // itself: the tick is the only thing that runs again, and
+            // without this it would find the same empty scope forever.
+            // `queue_window` is idempotent against every one of those
+            // sets, so the ordinary case costs a walk of the window.
+            Self::queue_window(state, &self.config);
         }
         self.emit_fetches()
     }
@@ -1167,6 +1176,43 @@ mod tests {
             st.target,
             BlockHeight::new(40),
             "implicit advance should clamp at committed + window + max_per_request"
+        );
+    }
+
+    /// A tick refills a scope that lost everything it had queued.
+    ///
+    /// Every other handler queues the window before it emits; this one
+    /// only promoted what was already tracked. A scope below its target
+    /// with nothing queued, in flight, deferred or awaiting admission
+    /// would find the same empty scope on every tick and sync forever
+    /// with nothing outstanding.
+    #[test]
+    fn a_tick_refills_a_scope_that_holds_nothing() {
+        let mut s: Sync<ShardBinding> = Sync::new(cfg_range());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(8),
+        });
+        // Strip the scope of everything the start queued, leaving it
+        // below target with nothing to run.
+        {
+            let state = s.scopes.get_mut(&1).unwrap();
+            state.heights_to_fetch.clear();
+            state.heights_queued.clear();
+            state.in_flight.clear();
+            state.in_flight_ranges = 0;
+        }
+
+        let outputs = s.handle(SyncInput::Tick {
+            now: LocalTimestamp::from_millis(1),
+        });
+
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::Fetch { .. })),
+            "the tick has to refill the window, got {} outputs",
+            outputs.len()
         );
     }
 
