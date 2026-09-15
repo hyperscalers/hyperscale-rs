@@ -717,9 +717,7 @@ mod tests {
     use hyperscale_hbor::{
         DecodeError, Hash32, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
-    use hyperscale_vm_types::{
-        Address, AddressClass, LegRole, Mode, Moves, SubintentHash, ValueEdge,
-    };
+    use hyperscale_vm_types::{Address, AddressClass, IntentHash, LegRole, Mode, Moves, ValueEdge};
 
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
@@ -842,7 +840,7 @@ mod tests {
             edges,
             presents: Vec::new(),
             declares: Vec::new(),
-            intent: SubintentHash(Hash32([0x5A; 32])),
+            intent: IntentHash(Hash32([0x5A; 32])),
             local: 0,
             expiry_ms: 0,
         };

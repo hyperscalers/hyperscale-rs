@@ -4128,7 +4128,7 @@ mod tests {
         TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet,
         Window,
     };
-    use hyperscale_vm_effects::{CrossingCell, Hash32, SubintentHash};
+    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
     use super::*;
@@ -9267,7 +9267,7 @@ mod tests {
         let cell = CrossingCell {
             resource: ResourceAddr::new([0xE1; 31]),
             amount: 1_000,
-            intent: SubintentHash(Hash32([local; 32])),
+            intent: IntentHash(Hash32([local; 32])),
             local: 0,
             output: 0,
             expiry_ms,

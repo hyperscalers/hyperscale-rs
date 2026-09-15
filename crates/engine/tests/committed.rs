@@ -10,7 +10,7 @@
 use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{AddressClass, ShardId};
 use hyperscale_vm_effects::Hash32;
-use hyperscale_vm_types::{Address, LegRole, LegShape, SubintentHash, ValueEdge};
+use hyperscale_vm_types::{Address, IntentHash, LegRole, LegShape, ValueEdge};
 
 /// A component on the leaf at `path` of a four-leaf trie.
 const fn on(path: u8, seed: u8) -> Address {
@@ -33,7 +33,7 @@ fn leg(target: Address, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
             .collect(),
         presents: Vec::new(),
         declares: vec![target],
-        intent: SubintentHash(Hash32([7; 32])),
+        intent: IntentHash(Hash32([7; 32])),
         local: 0,
         expiry_ms: 1_000,
     }

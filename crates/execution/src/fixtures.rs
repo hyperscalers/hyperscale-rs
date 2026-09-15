@@ -5,7 +5,7 @@
 //! [`trie`].
 
 use hyperscale_types::{Address, AddressClass, ShardId, ShardTrie};
-use hyperscale_vm_effects::{Hash32, SubintentHash};
+use hyperscale_vm_effects::{Hash32, IntentHash};
 use hyperscale_vm_types::{LegRole, LegShape, ValueEdge};
 
 /// The four-leaf trie every shape here is placed on.
@@ -36,7 +36,7 @@ pub fn leg(path: u8, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
             .collect(),
         presents: Vec::new(),
         declares: vec![target],
-        intent: SubintentHash(Hash32([7; 32])),
+        intent: IntentHash(Hash32([7; 32])),
         local: 0,
         expiry_ms: 1_000,
     }

@@ -48,18 +48,13 @@ use crate::records::{
 /// frame: the payer, whose vault the reservation and the burn reach,
 /// and every signer, whose nullifier a bound subintent writes. Sorted
 /// and unique, so two derivations of one envelope agree byte for byte.
-fn route_owners(
-    vm: &TransactionEnvelope,
-    signer: PrincipalAddr,
-    admitted: &AdmittedTree,
-) -> Vec<Address> {
-    [vm.fee_payer.address(), signer.address()]
-        .into_iter()
+fn route_owners(vm: &TransactionEnvelope, admitted: &AdmittedTree) -> Vec<Address> {
+    std::iter::once(vm.fee_payer.address())
         .chain(
             admitted
-                .subintents
+                .intents
                 .iter()
-                .map(|record| record.signer.address()),
+                .map(|record| record.account.address()),
         )
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -296,22 +291,41 @@ pub fn declared_vector(
 /// The addresses only. The signatures themselves verify at the
 /// transaction gate, over the declaration hashes admission returns —
 /// what is checked here is that the material a gate would verify belongs
-/// to the signer the tree declared.
-fn check_subintent_signers(
+/// to the account the tree declared for each intent.
+///
+/// The composition's own intent leads and is attested by the envelope's
+/// signature; every intent after it carries one of `subintent_sigs`, in
+/// the same order. So the arity is one fewer signature than intents, and
+/// an envelope carrying a signature for an intent it does not hold —
+/// or holding an intent nothing signs — is refused before anything is
+/// admitted.
+fn check_intent_accounts(
     vm: &TransactionEnvelope,
     tree: &EnvelopeTree,
+    signer: PrincipalAddr,
 ) -> Result<(), DerivationError> {
-    if vm.subintent_sigs.len() != tree.subintents.len() {
+    let Some((composed, offered)) = tree.intents.split_first() else {
+        return Err(DerivationError::Refused(
+            "a call body carries no intent at all".into(),
+        ));
+    };
+    if composed.account != signer {
+        return Err(DerivationError::Refused(
+            "the composition's intent names an account its signer's key does not derive".into(),
+        ));
+    }
+    if vm.subintent_sigs.len() != offered.len() {
         return Err(DerivationError::Refused(format!(
-            "envelope binds {} subintents but carries {} signatures",
-            tree.subintents.len(),
+            "envelope carries {} offered intents but {} signatures for them",
+            offered.len(),
             vm.subintent_sigs.len()
         )));
     }
-    for (index, (sig, subintent)) in vm.subintent_sigs.iter().zip(&tree.subintents).enumerate() {
-        if principal_for(sig.scheme, &sig.public_key) != Some(subintent.signer) {
+    for (index, (sig, intent)) in vm.subintent_sigs.iter().zip(offered).enumerate() {
+        if principal_for(sig.scheme, &sig.public_key) != Some(intent.account) {
             return Err(DerivationError::Refused(format!(
-                "subintent {index} signer address does not match its public key"
+                "intent {} names an account its public key does not derive",
+                index + 1
             )));
         }
     }
@@ -518,12 +532,12 @@ pub fn decode_tree(bytes: &[u8]) -> Result<EnvelopeTree, DerivationError> {
 /// envelope's with every intent's, and an empty one is a composition no
 /// signer agreed to.
 ///
-/// The root is no special case. Its window folds in like any other, so a
-/// composer who states a tighter one on their own intent than on the
-/// envelope gets the tighter one, and a wider one buys nothing. That is
-/// what a narrowing rule gives for free, where an equality rule would
-/// have made a signed field mean one thing in the root and another
-/// everywhere else.
+/// The composition's own intent is no special case. Its window folds in
+/// like any other, so a composer who states a tighter one on their own
+/// intent than on the envelope gets the tighter one, and a wider one
+/// buys nothing. That is what a narrowing rule gives for free, where an
+/// equality rule would have made a signed field mean one thing there and
+/// another everywhere else.
 ///
 /// Checked against the envelope rather than against the session's
 /// network, and against no clock at all, because a derivation that read
@@ -535,17 +549,13 @@ fn effective_window(
     tree: &EnvelopeTree,
 ) -> Result<TimestampRange, DerivationError> {
     let mut window = vm.validity_window();
-    let headers = std::iter::once(&tree.root.header).chain(
-        tree.subintents
-            .iter()
-            .map(|subintent| &subintent.decl.header),
-    );
+    let headers = tree.intents.iter().map(|intent| &intent.decl.header);
     for (index, header) in headers.enumerate() {
         let named = || {
             if index == 0 {
-                "the root intent".to_string()
+                "the composition's own intent".to_string()
             } else {
-                format!("subintent {}", index - 1)
+                format!("intent {index}")
             }
         };
         if header.network != vm.network {
@@ -762,11 +772,7 @@ fn unresolved_targets(tree: &EnvelopeTree, chain: &dyn ChainRecords) -> Unresolv
         .map(|meta| (meta.address(&ProtocolHasher).address(), meta.package))
         .collect();
     let mut wanted = Unresolved::default();
-    let graphs = std::iter::once(&tree.root.graph).chain(
-        tree.subintents
-            .iter()
-            .map(|subintent| &subintent.decl.graph),
-    );
+    let graphs = tree.intents.iter().map(|intent| &intent.decl.graph);
     for node in graphs.flat_map(|graph| &graph.nodes) {
         let address = node.target.address();
         // The record first, and the package only through it: a target
@@ -953,7 +959,7 @@ impl Derivation for BridgeStatics {
         }
         let tree = decode_tree(vm.call_tree().unwrap_or_default())?;
         let effective_window = effective_window(vm, &tree)?;
-        check_subintent_signers(vm, &tree)?;
+        check_intent_accounts(vm, &tree, signer)?;
         // What the chain answers a target with: genesis, grown by every
         // seal that has committed since. Admission layers the tree's own
         // records behind these itself, holding each to standing for the
@@ -971,14 +977,8 @@ impl Derivation for BridgeStatics {
         if !unresolved.is_empty() {
             return Err(DerivationError::Unresolved(unresolved));
         }
-        let admitted_tree = admit_tree(
-            &tree,
-            signer,
-            envelope_identity(vm),
-            &chain,
-            &ProtocolHasher,
-        )
-        .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
+        let admitted_tree = admit_tree(&tree, envelope_identity(vm), &chain, &ProtocolHasher)
+            .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
         let admitted = &admitted_tree.admitted;
 
         let DeclaredAccess {
@@ -1028,10 +1028,11 @@ impl Derivation for BridgeStatics {
             everywhere,
             legs,
             nullifiers: admitted_tree
-                .records()
+                .intents
+                .iter()
                 .map(|record| record.nullifier)
                 .collect(),
-            owners: route_owners(vm, signer, &admitted_tree),
+            owners: route_owners(vm, &admitted_tree),
             signer,
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),
@@ -1042,10 +1043,14 @@ impl Derivation for BridgeStatics {
                 provision_keys: provision_keys.into_iter().collect(),
                 declared_modes,
             },
+            // The offered intents alone, in the order `subintent_sigs`
+            // pairs with: the composition's own is attested by the
+            // envelope's signature and carries none of them.
             subintent_hashes: admitted_tree
-                .subintents
+                .intents
                 .iter()
-                .map(|record| record.subintent.0.0)
+                .skip(1)
+                .map(|record| record.intent.0.0)
                 .collect(),
             fee_vault_local: vault_key(vm.fee_payer, *PROTOCOL_RESOURCE).local.0,
             auth_cell_local: auth_key(vm.fee_payer).local.0,
@@ -1103,8 +1108,8 @@ mod tests {
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
         Binding, Claim, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hash32, Hasher,
-        InstanceMeta, InstanceRegistry, IntentDecl, ManifestGraph, MetadataCache, PackageHash,
-        Socket, StoredRule, Subintent, SubintentHash, child_key, never, nullifier_expiry_ms,
+        InstanceMeta, InstanceRegistry, Intent, IntentDecl, IntentHash, ManifestGraph,
+        MetadataCache, PackageHash, Socket, StoredRule, child_key, never, nullifier_expiry_ms,
         nullifier_key, package_slot,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
@@ -1214,15 +1219,19 @@ mod tests {
         discriminator: 0,
     };
 
-    fn single_intent_tree(nodes: Vec<GraphNode>) -> EnvelopeTree {
+    /// A tree of one intent acting as `account` — whose key has to be the
+    /// one the envelope around it is signed with.
+    fn intent_tree(account: PrincipalAddr, nodes: Vec<GraphNode>) -> EnvelopeTree {
         EnvelopeTree {
-            root: IntentDecl {
-                header: HEADER,
-                graph: ManifestGraph { nodes },
-                sockets: Vec::new(),
-            },
-            root_bindings: Vec::new(),
-            subintents: Vec::new(),
+            intents: vec![Intent {
+                decl: IntentDecl {
+                    header: HEADER,
+                    graph: ManifestGraph { nodes },
+                    sockets: Vec::new(),
+                },
+                account,
+                bindings: Vec::new(),
+            }],
             instances: Vec::new(),
             resources: Vec::new(),
         }
@@ -1232,28 +1241,31 @@ mod tests {
     /// subintent's Y.
     fn composed_tree() -> EnvelopeTree {
         EnvelopeTree {
-            root: IntentDecl {
-                header: HEADER,
-                graph: ManifestGraph {
-                    nodes: vec![
-                        sign_in(composer_addr()),
-                        withdraw(composer_addr(), RES_X, 100),
-                        deposit_socket(composer_addr(), 0),
-                    ],
+            intents: std::iter::once(Intent {
+                decl: IntentDecl {
+                    header: HEADER,
+                    graph: ManifestGraph {
+                        nodes: vec![
+                            sign_in(composer_addr()),
+                            withdraw(composer_addr(), RES_X, 100),
+                            deposit_socket(composer_addr(), 0),
+                        ],
+                    },
+                    sockets: vec![Socket::Value {
+                        resource: RES_Y,
+                        constraints: vec![Constraint::MinAmount(10)],
+                    }],
                 },
-                sockets: vec![Socket::Value {
-                    resource: RES_Y,
-                    constraints: vec![Constraint::MinAmount(10)],
+                account: composer_addr(),
+                bindings: vec![Binding::Value {
+                    intent: 1,
+                    edge: EdgeRef {
+                        producer: 1,
+                        output: 0,
+                    },
                 }],
-            },
-            root_bindings: vec![Binding::Value {
-                intent: 1,
-                edge: EdgeRef {
-                    producer: 1,
-                    output: 0,
-                },
-            }],
-            subintents: vec![Subintent {
+            })
+            .chain(vec![Intent {
                 decl: IntentDecl {
                     header: HEADER,
                     graph: ManifestGraph {
@@ -1268,7 +1280,7 @@ mod tests {
                         constraints: vec![Constraint::MinAmount(100)],
                     }],
                 },
-                signer: bob_addr(),
+                account: bob_addr(),
                 bindings: vec![Binding::Value {
                     intent: 0,
                     edge: EdgeRef {
@@ -1276,19 +1288,24 @@ mod tests {
                         output: 0,
                     },
                 }],
-            }],
+            }])
+            .collect(),
             instances: Vec::new(),
             resources: Vec::new(),
         }
     }
 
     fn envelope(tree: &EnvelopeTree, subintent_keys: &[&Ed25519PrivateKey]) -> TransactionEnvelope {
+        // The composition's own intent leads and the envelope's
+        // signature attests it, so the offered intents are what these
+        // keys pair with.
         let subintent_sigs = tree
-            .subintents
+            .intents
             .iter()
+            .skip(1)
             .zip(subintent_keys)
-            .map(|(subintent, signer)| {
-                let hash = subintent.decl.hash(&ProtocolHasher);
+            .map(|(intent, signer)| {
+                let hash = intent.decl.hash(&ProtocolHasher);
                 sign_subintent(*signer, &hash.0.0)
             })
             .collect();
@@ -1316,11 +1333,14 @@ mod tests {
     /// nothing, so it files no nullifier.
     #[test]
     fn a_transfer_derives_one_crossing_per_value_edge() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let vm = envelope(&tree, &[]);
         let derived = statics().derive(&vm).expect("derives");
 
@@ -1396,11 +1416,14 @@ mod tests {
     /// the node count is refused, whether short or long.
     #[test]
     fn a_ceiling_count_off_the_manifest_is_refused() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let mut vm = envelope(&tree, &[]);
         assert_eq!(vm.gas_limits.len(), 3);
         statics().derive(&vm).expect("one ceiling per node derives");
@@ -1421,11 +1444,14 @@ mod tests {
     /// The bound is on the sum over the nodes, not on any one of them.
     #[test]
     fn ceilings_summing_past_the_bound_are_refused() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let mut vm = envelope(&tree, &[]);
         vm.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2, 1];
         let heavy = statics()
@@ -1478,20 +1504,23 @@ mod tests {
     fn escrow_cells_follow_the_signing_intent() {
         let first = composed_tree();
         let mut second = composed_tree();
-        second.root.header.validity_end_ms -= 1_000;
+        second.intents[0].decl.header.validity_end_ms -= 1_000;
         let derive = |tree: &EnvelopeTree| {
             statics()
                 .derive(&envelope(tree, &[&key(9)]))
                 .expect("derives")
         };
         let (one, other) = (derive(&first), derive(&second));
-        let bob = first.subintents[0].decl.hash(&ProtocolHasher);
+        let bob = first.intents[1].decl.hash(&ProtocolHasher);
 
         // The interleave puts Bob's withdraw at manifest node 3, second
         // in his own intent — and the leg says which of those it is.
         assert_eq!(one.legs[3].intent, bob);
         assert_eq!(one.legs[3].local, 1);
-        assert_eq!(one.legs[1].intent, first.root.hash(&ProtocolHasher));
+        assert_eq!(
+            one.legs[1].intent,
+            first.intents[0].decl.hash(&ProtocolHasher)
+        );
 
         let record_of = |derived: &Derived, node: usize| {
             CrossingSite::record_of(&ProtocolHasher, &derived.legs[node], 0).key()
@@ -1522,11 +1551,14 @@ mod tests {
     /// the artifacts its nodes instantiate as reads.
     #[test]
     fn work_carries_the_ceilings_the_envelope_and_the_artifacts() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let vm = envelope(&tree, &[]);
         let derived = statics().derive(&vm).expect("derives");
         let envelope_bytes = envelope_bytes(&vm).expect("encodes");
@@ -1572,13 +1604,16 @@ mod tests {
         // pair adds its own bound again, so what retention prices is
         // what the frames may spend between them rather than one
         // package's figure or the cap they are held under.
-        let twice = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 3, RES_X),
-        ]);
+        let twice = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 3, RES_X),
+            ],
+        );
         let wider_vm = envelope(&twice, &[]);
         let twice = statics().derive(&wider_vm).expect("derives");
         let wider_bytes = super::envelope_bytes(&wider_vm).expect("encodes");
@@ -1607,13 +1642,16 @@ mod tests {
         // A second recipient declares more, so it costs more in every
         // dimension the declaration reaches — nothing else about the two
         // envelopes differs.
-        let wider = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-            withdraw(composer_addr(), RES_Y, 10),
-            deposit_edge(bob_addr(), 3, RES_Y),
-        ]);
+        let wider = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+                withdraw(composer_addr(), RES_Y, 10),
+                deposit_edge(bob_addr(), 3, RES_Y),
+            ],
+        );
         let wider = statics().derive(&envelope(&wider, &[])).expect("derives");
         assert!(
             wider.work.footprint > derived.work.footprint
@@ -1641,16 +1679,22 @@ mod tests {
     /// else.
     #[test]
     fn a_vault_paying_itself_is_one_leaf_and_not_two_charges() {
-        let plain = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
-        let itself = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(composer_addr(), 1, RES_X),
-        ]);
+        let plain = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
+        let itself = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(composer_addr(), 1, RES_X),
+            ],
+        );
         let write_of = |tree| {
             statics()
                 .derive(&envelope(tree, &[]))
@@ -1681,11 +1725,14 @@ mod tests {
     /// about is the floor being there, and the floor is the difference.
     #[test]
     fn a_leaf_the_chain_writes_carries_the_floor_a_declared_leaf_does() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
         assert_eq!(
             derived.everywhere.write_bytes,
@@ -1696,11 +1743,14 @@ mod tests {
         // And the floor stays out of what is kept: dropping one vault
         // leaf takes the floor off the write dimension and only the
         // leaf's own bytes off retention.
-        let itself = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(composer_addr(), 1, RES_X),
-        ]);
+        let itself = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(composer_addr(), 1, RES_X),
+            ],
+        );
         let fewer = statics().derive(&envelope(&itself, &[])).expect("derives");
         assert_eq!(
             derived.work.write_bytes - fewer.work.write_bytes,
@@ -1719,21 +1769,27 @@ mod tests {
     /// than free verification.
     #[test]
     fn work_prices_the_signatures_the_envelope_carries() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let ed = statics().derive(&envelope(&tree, &[])).expect("derives");
 
         let secp = Secp256k1PrivateKey::from_bytes(&[7u8; 32]).expect("a scalar in range");
         let payer = principal_for(SchemeId::SECP256K1, &secp.public_key().0)
             .expect("a registered scheme opens an account");
-        let secp_tree = single_intent_tree(vec![
-            sign_in(payer),
-            withdraw(payer, RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let secp_tree = intent_tree(
+            payer,
+            vec![
+                sign_in(payer),
+                withdraw(payer, RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let mut wider = envelope(&secp_tree, &[]);
         wider.fee_payer = payer;
         let wider = statics().derive(&wider.sign(&secp)).expect("derives");
@@ -1756,11 +1812,14 @@ mod tests {
 
     #[test]
     fn a_transfer_derives_substate_keys_and_owner_prefixes() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
 
         // Reserve at the sender's vault and deltas at the recipient's:
@@ -1794,12 +1853,12 @@ mod tests {
         assert_eq!(derived.routing.read_keys, reads);
         // The root's nullifier is a creation, so its absence is
         // provisioned to every participant beside what the calls read.
-        let root_hash = tree.root.hash(&ProtocolHasher);
+        let root_hash = tree.intents[0].decl.hash(&ProtocolHasher);
         let root_nullifier = nullifier_key(
             &ProtocolHasher,
             composer_addr(),
             root_hash,
-            nullifier_expiry_ms(&tree.root.header),
+            nullifier_expiry_ms(&tree.intents[0].decl.header),
         );
         let mut provisioned = reads.clone();
         provisioned.push(DeclaredKey::substate(
@@ -1882,13 +1941,13 @@ mod tests {
             .derive(&envelope(&tree, &[&bob]))
             .expect("derives");
 
-        let hash = tree.subintents[0].decl.hash(&ProtocolHasher);
+        let hash = tree.intents[1].decl.hash(&ProtocolHasher);
         assert_eq!(derived.subintent_hashes, vec![hash.0.0]);
         let nullifier = nullifier_key(
             &ProtocolHasher,
             bob_addr(),
             hash,
-            nullifier_expiry_ms(&tree.subintents[0].decl.header),
+            nullifier_expiry_ms(&tree.intents[1].decl.header),
         );
         assert!(derived.routing.write_keys.contains(&DeclaredKey::substate(
             bob_addr().address(),
@@ -1905,11 +1964,14 @@ mod tests {
         // the envelope's key opens, and records it from the key rather
         // than from the payer field — so a stranger naming someone
         // else's account gets their own badge, never the account's.
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let mut stolen = envelope(&tree, &[]);
         stolen.fee_payer = bob_addr();
         let stolen = stolen.sign(&key(7));
@@ -1941,11 +2003,14 @@ mod tests {
             "one seed, two schemes, two accounts"
         );
 
-        let tree = single_intent_tree(vec![
-            sign_in(payer),
-            withdraw(payer, RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            payer,
+            vec![
+                sign_in(payer),
+                withdraw(payer, RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         let mut signed = envelope(&tree, &[]);
         signed.fee_payer = payer;
         let signed = signed.sign(&secp);
@@ -1962,21 +2027,27 @@ mod tests {
     /// nothing has to be read to know the answer.
     #[test]
     fn a_withdrawal_from_an_unsigned_account_is_refused() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(bob_addr(), RES_X, 100),
-            deposit_edge(composer_addr(), 1, RES_X),
-        ]);
+        let tree = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(bob_addr(), RES_X, 100),
+                deposit_edge(composer_addr(), 1, RES_X),
+            ],
+        );
         assert!(statics().derive(&envelope(&tree, &[])).is_err());
 
         // Reversed, it is the ordinary transfer: the composer withdraws
         // from their own account and Bob is credited without being asked.
         // One signature, because only the spending side is gated.
-        let transfer = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
+        let transfer = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
         assert!(statics().derive(&envelope(&transfer, &[])).is_ok());
     }
 
@@ -2003,7 +2074,7 @@ mod tests {
         // target is the target's own question, answered at execution.
         let refused = statics()
             .derive(&envelope(
-                &single_intent_tree(vec![node(BTreeSet::new())]),
+                &intent_tree(composer_addr(), vec![node(BTreeSet::new())]),
                 &[],
             ))
             .expect_err("refuses");
@@ -2016,7 +2087,10 @@ mod tests {
         // in, and the write takes what the sign-in minted.
         let refused = statics()
             .derive(&envelope(
-                &single_intent_tree(vec![node([EvidenceRef::IntentSignature].into())]),
+                &intent_tree(
+                    composer_addr(),
+                    vec![node([EvidenceRef::IntentSignature].into())],
+                ),
                 &[],
             ))
             .expect_err("refuses");
@@ -2028,10 +2102,13 @@ mod tests {
         assert!(
             statics()
                 .derive(&envelope(
-                    &single_intent_tree(vec![
-                        sign_in(composer_addr()),
-                        node([EvidenceRef::Node(0)].into()),
-                    ]),
+                    &intent_tree(
+                        composer_addr(),
+                        vec![
+                            sign_in(composer_addr()),
+                            node([EvidenceRef::Node(0)].into()),
+                        ]
+                    ),
                     &[]
                 ))
                 .is_ok()
@@ -2060,7 +2137,7 @@ mod tests {
         // of that are signed content, so the answer is admission's to
         // give rather than execution's.
         let mut stolen = composed_tree();
-        stolen.root.graph.nodes[1] = withdraw(bob_addr(), RES_X, 100);
+        stolen.intents[0].decl.graph.nodes[1] = withdraw(bob_addr(), RES_X, 100);
         assert!(statics().derive(&envelope(&stolen, &[&bob])).is_err());
     }
 
@@ -2086,18 +2163,21 @@ mod tests {
         // that makes the subintent once-only lives on the network they
         // did name.
         let mut foreign = composed_tree();
-        foreign.subintents[0].decl.header.network = NetworkId(1);
+        foreign.intents[1].decl.header.network = NetworkId(1);
         assert!(statics().derive(&envelope(&foreign, &[&key(9)])).is_err());
 
         // The composer's own intent answers the same rule: an envelope
         // whose root disagrees with the network it names is refused
         // before any signature is read.
-        let mut root_foreign = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
-        root_foreign.root.header.network = NetworkId(1);
+        let mut root_foreign = intent_tree(
+            composer_addr(),
+            vec![
+                sign_in(composer_addr()),
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 1, RES_X),
+            ],
+        );
+        root_foreign.intents[0].decl.header.network = NetworkId(1);
         assert!(statics().derive(&envelope(&root_foreign, &[])).is_err());
     }
 
@@ -2107,8 +2187,8 @@ mod tests {
         // transaction its own tighter edges: a composer cannot bind a
         // signer past what that signer offered.
         let mut tight = composed_tree();
-        tight.subintents[0].decl.header.validity_start_ms = 10;
-        tight.subintents[0].decl.header.validity_end_ms = 900;
+        tight.intents[1].decl.header.validity_start_ms = 10;
+        tight.intents[1].decl.header.validity_end_ms = 900;
         let derived = statics()
             .derive(&envelope(&tight, &[&key(9)]))
             .expect("an offer inside the window composes");
@@ -2128,7 +2208,7 @@ mod tests {
         // the envelope leaves the transaction exactly as wide as its
         // composer signed for.
         let mut wide = composed_tree();
-        wide.subintents[0].decl.header.validity_end_ms = 5_000_000;
+        wide.intents[1].decl.header.validity_end_ms = 5_000_000;
         let derived = statics()
             .derive(&envelope(&wide, &[&key(9)]))
             .expect("a wider offer composes");
@@ -2143,15 +2223,15 @@ mod tests {
         // The offer closed before the transaction opens. There is no
         // instant both signers agreed to, so there is no transaction.
         let mut lapsed = composed_tree();
-        lapsed.subintents[0].decl.header.validity_start_ms = 2_000_000;
-        lapsed.subintents[0].decl.header.validity_end_ms = 2_000_001;
+        lapsed.intents[1].decl.header.validity_start_ms = 2_000_000;
+        lapsed.intents[1].decl.header.validity_end_ms = 2_000_001;
         assert!(statics().derive(&envelope(&lapsed, &[&key(9)])).is_err());
     }
 
     #[test]
     fn an_intent_standing_longer_than_the_cap_is_refused() {
         let mut forever = composed_tree();
-        forever.subintents[0].decl.header.validity_end_ms = u64::MAX;
+        forever.intents[1].decl.header.validity_end_ms = u64::MAX;
         assert!(statics().derive(&envelope(&forever, &[&key(9)])).is_err());
     }
 
@@ -2163,7 +2243,7 @@ mod tests {
         // declarations that conflict on nothing.
         let once = composed_tree();
         let mut twice = composed_tree();
-        twice.subintents[0].decl.header.discriminator = 1;
+        twice.intents[1].decl.header.discriminator = 1;
 
         let first = statics()
             .derive(&envelope(&once, &[&key(9)]))
@@ -2193,7 +2273,7 @@ mod tests {
     #[test]
     fn an_inadmissible_tree_is_refused() {
         // The produced bucket is never consumed: linearity refuses it.
-        let tree = single_intent_tree(vec![withdraw(composer_addr(), RES_X, 100)]);
+        let tree = intent_tree(composer_addr(), vec![withdraw(composer_addr(), RES_X, 100)]);
         assert!(statics().derive(&envelope(&tree, &[])).is_err());
     }
 
@@ -2204,10 +2284,10 @@ mod tests {
         let tree = composed_tree();
         let decoded = decode_tree(&encode_tree(&tree)).unwrap();
         assert_eq!(
-            decoded.subintents[0].decl.hash(&ProtocolHasher),
-            tree.subintents[0].decl.hash(&ProtocolHasher)
+            decoded.intents[1].decl.hash(&ProtocolHasher),
+            tree.intents[1].decl.hash(&ProtocolHasher)
         );
-        let _typed: SubintentHash = tree.subintents[0].decl.hash(&ProtocolHasher);
+        let _typed: IntentHash = tree.intents[1].decl.hash(&ProtocolHasher);
     }
 
     /// The provision-weight cap: cells count one, ranges count their

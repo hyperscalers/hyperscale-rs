@@ -1010,9 +1010,7 @@ mod tests {
     #[test]
     fn a_claim_is_judged_off_its_leaf_and_a_record_is_swept_by_nothing() {
         use hyperscale_vm_effects::{CrossingSite, IntentHeader, crossing_expiry_ms};
-        use hyperscale_vm_types::{
-            AddressClass, CROSSING_GRACE_MS, NetworkId, SubintentHash, TxHash,
-        };
+        use hyperscale_vm_types::{AddressClass, CROSSING_GRACE_MS, IntentHash, NetworkId, TxHash};
 
         let header = IntentHeader {
             network: NetworkId(0),
@@ -1025,7 +1023,7 @@ mod tests {
 
         let producer = Address::new([0x5A; 31], AddressClass::Component);
         let taker = Address::new([0x5C; 31], AddressClass::Component);
-        let intent = SubintentHash(Hash32([0xB0; 32]));
+        let intent = IntentHash(Hash32([0xB0; 32]));
         let record_site = CrossingSite::record(&ProtocolHasher, producer, intent, 1, 0, expiry_ms);
         let claim_site = CrossingSite::claim(&ProtocolHasher, taker, intent, 1, 0, expiry_ms);
         let record = record_site.crossing(

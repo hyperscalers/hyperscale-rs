@@ -6,8 +6,8 @@ use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_hbor::Hash32;
 use hyperscale_vm_types::{
-    Address, AddressClass, DeclaredWork, LegRole, LegShape, LocalKey, Mode, Moves, PrincipalAddr,
-    SWEEP_BUCKET_BYTES, SchemeId, SubintentHash, SubstateKey, SweepBucket, ValueEdge,
+    Address, AddressClass, DeclaredWork, IntentHash, LegRole, LegShape, LocalKey, Mode, Moves,
+    PrincipalAddr, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey, SweepBucket, ValueEdge,
 };
 
 use crate::crypto::Ed25519PrivateKey;
@@ -1204,7 +1204,7 @@ pub fn leg_shape(target: Address, role: LegRole, edges: &[(u32, u32)]) -> LegSha
             .collect(),
         presents: Vec::new(),
         declares: vec![target],
-        intent: SubintentHash(Hash32([7; 32])),
+        intent: IntentHash(Hash32([7; 32])),
         local: 0,
         expiry_ms: 1_000,
     }

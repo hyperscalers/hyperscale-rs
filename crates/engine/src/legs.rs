@@ -877,7 +877,7 @@ pub enum PlanDefect {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{Address, AddressClass, LocalKey, SubstateKey};
-    use hyperscale_vm_effects::{CrossingSite, Hash32, SubintentHash};
+    use hyperscale_vm_effects::{CrossingSite, Hash32, IntentHash};
     use hyperscale_vm_types::{ResourceAddr, ValueEdge};
 
     use super::*;
@@ -920,7 +920,7 @@ mod tests {
                 .collect(),
             presents: Vec::new(),
             declares: vec![target],
-            intent: SubintentHash(Hash32([7; 32])),
+            intent: IntentHash(Hash32([7; 32])),
             local,
             expiry_ms: 1_000,
         }
