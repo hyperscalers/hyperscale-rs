@@ -18,10 +18,11 @@
 //! the fetch key (no id-set to enumerate).
 
 use hyperscale_types::{
-    Anchor, BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass,
-    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash,
+    Anchor, MessageClass, PredecessorTerminal, ShardId, SubstateKey, TerminalEvidence, TxHash,
     ValidatorId,
 };
+
+use crate::FetchIds;
 
 /// Fetch family — one variant per payload type.
 ///
@@ -37,86 +38,26 @@ use hyperscale_types::{
 ///   (typically `Recovery`) for catch-up / best-effort traffic.
 #[derive(Debug, Clone)]
 pub enum FetchRequest {
-    /// Transaction bodies by `TxHash` — shard-path fetches against the
-    /// local shard's committee.
-    Transactions {
-        /// Transaction hashes to fetch.
-        ids: Vec<TxHash>,
-        /// Committee shard serving the request.
+    /// Ask `shard`'s committee for `ids`.
+    ///
+    /// The id vocabulary is [`FetchIds`], which is also what retires a
+    /// batch on [`Action::AbandonFetch`](crate::Action::AbandonFetch) —
+    /// one spelling per payload, asked and released alike, rather than a
+    /// request shape per binding that a dispatcher reassembles into the
+    /// ids its emitter already writes on the abandon path.
+    ///
+    /// Routing rules the ids do not carry themselves: transactions,
+    /// local provisions and finalizations are intra-shard, so `shard` is
+    /// local; remote provisions, execution certificates and shard
+    /// witnesses route to the source shard, which has to be carried
+    /// because the requester knows only that the payload is that
+    /// shard's business; a state proof routes to its anchor's shard,
+    /// whose committee holds the JMT version the anchor's height names.
+    Ask {
+        /// What to fetch.
+        ids: FetchIds,
+        /// Committee whose members will serve the request.
         shard: ShardId,
-        /// Canonical-source hint, when one exists.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// Intra-shard DA payload — `shard` is always local.
-    LocalProvisions {
-        /// Provision hashes to fetch.
-        ids: Vec<ProvisionHash>,
-        /// Always the local shard for this variant.
-        shard: ShardId,
-        /// Canonical-source hint, when one exists.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// Intra-shard DA payload — `shard` is always local.
-    Finalizations {
-        /// Identities of the finalizations that are missing.
-        ids: Vec<FinalizationHash>,
-        /// Always the local shard for this variant.
-        shard: ShardId,
-        /// Canonical-source hint, when one exists.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// Cross-shard provisions fetch keyed by `(source_shard, block_height)`.
-    /// Routing shard is `source_shard`; `preferred` is the source-block
-    /// proposer that originated the provisions.
-    RemoteProvisions {
-        /// Source shard whose provisions are missing.
-        source_shard: ShardId,
-        /// Source-shard block height the missing provisions are anchored to.
-        block_height: BlockHeight,
-        /// Canonical-source hint, when one exists.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// Cross-shard execution-cert fetch by transaction. Routing shard is
-    /// `source_shard`, which has to be carried: the requester knows only
-    /// that the transaction is the source shard's business too, not which
-    /// of its certificates ends up covering it. `preferred` is `None` —
-    /// the designated broadcaster role is computable but health-weighted
-    /// selection works equally well empirically.
-    ExecutionCerts {
-        /// Shard whose outcome for the transaction is missing.
-        source_shard: ShardId,
-        /// Transaction whose outcome is missing.
-        tx_hash: TxHash,
-        /// Always `None` for this variant; see variant-level doc.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// Cross-shard beacon-witness fetch keyed by the source shard's
-    /// `(block_height, committed_block_hash, leaf range)`. Routing
-    /// shard is `source_shard` (the shard whose committee anchors the
-    /// witness accumulator). The whole run is one request: its range
-    /// proof is scoped to the run, so a partial answer proves nothing.
-    ShardWitnesses {
-        /// Source shard whose witnesses we want.
-        source_shard: ShardId,
-        /// Height of the anchor block in the source-shard chain.
-        block_height: BlockHeight,
-        /// Hash of the anchor block; binds responses to the right
-        /// `beacon_witness_root`.
-        committed_block_hash: BlockHash,
-        /// First leaf of the run in the anchor block's accumulator.
-        lo: LeafIndex,
-        /// End of the run, exclusive.
-        hi: LeafIndex,
         /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.
@@ -139,27 +80,6 @@ pub enum FetchRequest {
         /// Transactions whose membership in that chain's committed set
         /// is outstanding.
         tx_hashes: Vec<TxHash>,
-        /// Always `None` for this variant; see variant-level doc.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// State proof of `keys` against a commit-proven remote header.
-    /// Routing shard is `anchor.shard`, whose committee holds the JMT
-    /// version the anchor's height names. `preferred` is `None`: every
-    /// member serves the same tree, so health-weighted rotation is what
-    /// moves off a peer that has pruned the height or serves a proof
-    /// against another root.
-    ///
-    /// The anchor rides whole rather than as a shard and height: its
-    /// root is what the proof is checked against before any answer
-    /// reaches the coordinator, and the answer is keyed by it so a
-    /// proof taken at one height never answers a probe at another.
-    StateProof {
-        /// The commit-proven state the proof reconstructs.
-        anchor: Anchor,
-        /// The keys whose presence or absence under it is wanted.
-        keys: Vec<SubstateKey>,
         /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.
@@ -208,25 +128,6 @@ pub enum FetchRequest {
         /// Every terminal whose settled set is still wanted.
         wanted: Vec<TerminalEvidence>,
         /// Always `None` for this variant; see variant-level doc.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// Missing-proposal fetch for a beacon committee member at an
-    /// in-flight epoch. The responding committee is the beacon
-    /// committee at `epoch`; the runner routes via the requesting
-    /// vnode's local shard (the network layer's peer selection
-    /// resolves through the topology snapshot).
-    BeaconProposal {
-        /// Local shard the requesting vnode belongs to; threaded so
-        /// the network layer has a valid committee handle for peer
-        /// selection. `preferred` pins the actual destination.
-        shard: ShardId,
-        /// Epoch the proposal targets.
-        epoch: Epoch,
-        /// Validator whose proposal we're fetching.
-        validator: ValidatorId,
-        /// Beacon-committee peer to try first.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,

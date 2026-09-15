@@ -23,18 +23,13 @@ use tracing::{debug, error, trace, warn};
 
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
 use crate::beacon;
-use crate::beacon::{BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind,
     QcOnlyPending, make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
-use crate::shard::cross_shard::{
-    CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding, SettledTxsBinding, StateProofBinding, StateProofRelayBinding,
-};
-use crate::shard::mempool::TransactionBinding;
+use crate::shard::cross_shard::{CommittedTxBinding, SettledTxsBinding, StateProofRelayBinding};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -576,74 +571,28 @@ where
     /// fan out under the per-tick cap. The tick timer is refreshed once at
     /// the end of `NodeHost::step`.
     #[allow(clippy::too_many_lines)] // single dispatch over FetchRequest variants
+    /// Dispatch a typed fetch request to the corresponding binding.
+    ///
+    /// The fetch instance lives in this shard's `ShardIo` — keyed by the
+    /// emitting vnode's shard, not the routing target, which rides on the
+    /// request. `Ask` never emits `Send`s on its own — it only adds the
+    /// ids to the pending set; chunks fan out under the per-tick cap. The
+    /// tick timer is refreshed once at the end of `NodeHost::step`.
+    ///
+    /// The three arms below `Ask` are a different message: the pending
+    /// set under a scope is now exactly these ids. Their consumers
+    /// re-derive the whole wanted set each pass, so what the fetch still
+    /// holds under that scope and the consumer no longer names is retired
+    /// here — for an id nobody re-asks about, against a committee that
+    /// may never answer, this is the only release there is.
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
-            FetchRequest::Transactions {
+            FetchRequest::Ask {
                 ids,
                 shard,
                 preferred,
                 class,
-            } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Request {
-                    ids,
-                    shard,
-                    preferred,
-                    class,
-                });
-            }
-            FetchRequest::LocalProvisions {
-                ids,
-                shard,
-                preferred,
-                class,
-            } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Request {
-                    ids,
-                    shard,
-                    preferred,
-                    class,
-                });
-            }
-            FetchRequest::Finalizations {
-                ids,
-                shard,
-                preferred,
-                class,
-            } => {
-                self.drive_fetch::<FinalizationBinding>(FetchInput::Request {
-                    ids,
-                    shard,
-                    preferred,
-                    class,
-                });
-            }
-            FetchRequest::RemoteProvisions {
-                source_shard,
-                block_height,
-                preferred,
-                class,
-            } => {
-                let local_shard = self.shard;
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Request {
-                    ids: vec![(source_shard, local_shard, block_height)],
-                    shard: source_shard,
-                    preferred,
-                    class,
-                });
-            }
-            FetchRequest::ExecutionCerts {
-                source_shard,
-                tx_hash,
-                preferred,
-                class,
-            } => {
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Request {
-                    ids: vec![(source_shard, tx_hash)],
-                    shard: source_shard,
-                    preferred,
-                    class,
-                });
-            }
+            } => self.request_fetch(ids, shard, preferred, class),
             FetchRequest::CommittedTxs {
                 predecessor,
                 tx_hashes,
@@ -697,19 +646,6 @@ where
                     });
                 }
             }
-            FetchRequest::StateProof {
-                anchor,
-                keys,
-                preferred,
-                class,
-            } => {
-                self.drive_fetch::<StateProofBinding>(FetchInput::Request {
-                    ids: keys.into_iter().map(|key| (anchor, key)).collect(),
-                    shard: anchor.shard,
-                    preferred,
-                    class,
-                });
-            }
             FetchRequest::RelayedStateProof {
                 anchor,
                 keys,
@@ -730,36 +666,6 @@ where
                 self.abandon_unwanted::<StateProofRelayBinding>(&wanted, |id| id.0 == anchor);
                 self.drive_fetch::<StateProofRelayBinding>(FetchInput::Request {
                     ids: wanted.into_iter().collect(),
-                    shard,
-                    preferred,
-                    class,
-                });
-            }
-            FetchRequest::ShardWitnesses {
-                source_shard,
-                block_height,
-                committed_block_hash,
-                lo,
-                hi,
-                preferred,
-                class,
-            } => {
-                self.drive_fetch::<ShardWitnessBinding>(FetchInput::Request {
-                    ids: vec![(source_shard, block_height, committed_block_hash, lo, hi)],
-                    shard: source_shard,
-                    preferred,
-                    class,
-                });
-            }
-            FetchRequest::BeaconProposal {
-                shard,
-                epoch,
-                validator,
-                preferred,
-                class,
-            } => {
-                self.drive_fetch::<BeaconProposalBinding>(FetchInput::Request {
-                    ids: vec![(epoch, validator)],
                     shard,
                     preferred,
                     class,

@@ -436,8 +436,8 @@ impl PendingBlocks {
                     timeout_ms = timeout.as_millis(),
                     "Fetch timeout reached, requesting missing transactions"
                 );
-                actions.push(Action::Fetch(FetchRequest::Transactions {
-                    ids: missing_txs,
+                actions.push(Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Transactions(missing_txs),
                     shard: local_shard,
                     preferred: Some(proposer),
                     class: None,
@@ -453,8 +453,8 @@ impl PendingBlocks {
                     age_ms = age.as_millis(),
                     "Fetch timeout reached, requesting missing provisions"
                 );
-                actions.push(Action::Fetch(FetchRequest::LocalProvisions {
-                    ids: missing_provisions,
+                actions.push(Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::LocalProvisions(missing_provisions),
                     shard: local_shard,
                     preferred: Some(proposer),
                     class: None,
@@ -470,8 +470,8 @@ impl PendingBlocks {
                     age_ms = age.as_millis(),
                     "Fetch timeout reached, requesting missing finalizations"
                 );
-                actions.push(Action::Fetch(FetchRequest::Finalizations {
-                    ids: missing_finalizations,
+                actions.push(Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Finalizations(missing_finalizations),
                     shard: local_shard,
                     preferred: Some(proposer),
                     class: None,

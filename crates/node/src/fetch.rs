@@ -590,7 +590,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
 /// Why a batch of ids leaves the in-flight set: the three id-carrying
 /// [`FetchInput`]s, so one dispatcher can route a [`FetchIds`] batch to
 /// its binding whichever way it is being released.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Release {
     /// The attempt failed or went unanswered; retry at once, since the
     /// transport already spent a round trip on it.
@@ -613,6 +613,56 @@ impl Release {
             Self::Admitted => FetchInput::Admitted { ids },
             Self::Abandoned => FetchInput::Abandoned { ids },
         }
+    }
+}
+
+/// What to do with a batch of ids, erased over the id type.
+///
+/// The erasure is what keeps the one place a [`FetchIds`] arm is matched
+/// back to its binding a flat match rather than one per intent: asking
+/// and releasing differ in the [`FetchInput`] they build and in nothing
+/// else.
+///
+/// [`FetchIds`]: hyperscale_core::FetchIds
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intent {
+    /// Add the ids to the pending set, to be asked of `shard`'s
+    /// committee. No `Send` goes out here — chunks fan out under the
+    /// per-tick cap.
+    Ask {
+        /// Shard whose committee answers.
+        shard: ShardId,
+        /// Canonical-source hint, when one exists.
+        preferred: Option<ValidatorId>,
+        /// Class override forwarded to `Network::request`.
+        class: Option<MessageClass>,
+    },
+    /// Take the ids back out of it, the way [`Release`] says.
+    Let(Release),
+}
+
+impl Intent {
+    /// The [`FetchInput`] this intent makes of `ids`.
+    pub const fn input<Id>(self, ids: Vec<Id>) -> FetchInput<Id> {
+        match self {
+            Self::Ask {
+                shard,
+                preferred,
+                class,
+            } => FetchInput::Request {
+                ids,
+                shard,
+                preferred,
+                class,
+            },
+            Self::Let(how) => how.input(ids),
+        }
+    }
+}
+
+impl From<Release> for Intent {
+    fn from(how: Release) -> Self {
+        Self::Let(how)
     }
 }
 

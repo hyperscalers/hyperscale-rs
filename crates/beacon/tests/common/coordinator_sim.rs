@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_core::{Action, FetchRequest};
+use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
     AggregateSignature, BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
@@ -1381,13 +1381,12 @@ impl CoordinatorSim {
                 );
                 self.absorb(emitter_idx, post);
             }
-            Action::Fetch(FetchRequest::BeaconProposal {
-                shard: _,
-                epoch,
-                validator,
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::BeaconProposals(ref wanted),
                 preferred,
-                class: _,
-            }) => {
+                ..
+            }) if wanted.len() == 1 => {
+                let (epoch, validator) = wanted[0];
                 // Walk every other coordinator (with `preferred` first if
                 // set) and look up the proposal directly in its
                 // `proposal_pool`. Queue the first hit back to the emitter;

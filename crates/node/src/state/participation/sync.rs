@@ -200,7 +200,7 @@ impl ShardParticipation {
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_core::{Action, FetchRequest, ProtocolEvent, StateMachine};
+    use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine};
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
@@ -215,7 +215,7 @@ mod tests {
     /// provisions in one pass. The provisions flush is the most
     /// directly observable: when a verified remote header has seeded
     /// `expected_provisions`, the flush surfaces an
-    /// `Action::Fetch(FetchRequest::RemoteProvisions { .. })`. This
+    /// `Action::Fetch(FetchRequest::Ask { ids: FetchIds::RemoteProvisions(..), .. })`. This
     /// test catches a regression where the provisions flush is
     /// dropped from the sync-complete arm.
     #[test]
@@ -276,7 +276,11 @@ mod tests {
 
         assert_emits!(
             actions,
-            Action::Fetch(FetchRequest::RemoteProvisions { source_shard, .. })
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::RemoteProvisions(..),
+                shard: source_shard,
+                ..
+            })
                 if *source_shard == ShardId::leaf(1, 1)
         );
     }

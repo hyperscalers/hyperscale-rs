@@ -7,10 +7,11 @@ use hyperscale_core::{FetchIds, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
+use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 
 use super::{ShardLoop, TimerOp};
 use crate::beacon::{self, BeaconProposalBinding, ShardWitnessBinding};
-use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Release};
+use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Intent, Release};
 use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
     ProvisionBinding, SettledTxsBinding, StateProofBinding, StateProofRelayBinding,
@@ -96,38 +97,69 @@ where
         self.process_fetch_outputs::<B>(outputs);
     }
 
-    /// Release a batch of ids from the binding that fetches them. The
-    /// one place a [`FetchIds`] arm is matched back to its binding: a
+    /// Release a batch of ids from the binding that fetches them: a
     /// response boundary's failure or fulfilment and a coordinator's
     /// `Action::AbandonFetch` all arrive here.
     pub(in crate::shard) fn release_fetch(&mut self, ids: FetchIds, how: Release) {
+        self.drive_fetch_ids(ids, how.into());
+    }
+
+    /// Ask `shard`'s committee for a batch of ids.
+    pub(in crate::shard) fn request_fetch(
+        &mut self,
+        ids: FetchIds,
+        shard: ShardId,
+        preferred: Option<ValidatorId>,
+        class: Option<MessageClass>,
+    ) {
+        self.drive_fetch_ids(
+            ids,
+            Intent::Ask {
+                shard,
+                preferred,
+                class,
+            },
+        );
+    }
+
+    /// The one place a [`FetchIds`] arm is matched back to its binding.
+    /// Asking and releasing differ only in the [`FetchInput`] the
+    /// [`Intent`] builds, so they share this walk rather than each
+    /// keeping their own copy of it.
+    fn drive_fetch_ids(&mut self, ids: FetchIds, intent: Intent) {
         match ids {
-            FetchIds::Transactions(ids) => self.drive_fetch::<TransactionBinding>(how.input(ids)),
+            FetchIds::Transactions(ids) => {
+                self.drive_fetch::<TransactionBinding>(intent.input(ids));
+            }
             FetchIds::LocalProvisions(ids) => {
-                self.drive_fetch::<LocalProvisionBinding>(how.input(ids));
+                self.drive_fetch::<LocalProvisionBinding>(intent.input(ids));
             }
             FetchIds::Finalizations(ids) => {
-                self.drive_fetch::<FinalizationBinding>(how.input(ids));
+                self.drive_fetch::<FinalizationBinding>(intent.input(ids));
             }
-            FetchIds::RemoteProvisions(ids) => self.drive_fetch::<ProvisionBinding>(how.input(ids)),
-            FetchIds::ExecutionCerts(ids) => self.drive_fetch::<ExecCertBinding>(how.input(ids)),
-            FetchIds::CommittedTxs(ids) => self.drive_fetch::<CommittedTxBinding>(how.input(ids)),
-            FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(how.input(ids)),
+            FetchIds::RemoteProvisions(ids) => {
+                self.drive_fetch::<ProvisionBinding>(intent.input(ids));
+            }
+            FetchIds::ExecutionCerts(ids) => self.drive_fetch::<ExecCertBinding>(intent.input(ids)),
+            FetchIds::CommittedTxs(ids) => {
+                self.drive_fetch::<CommittedTxBinding>(intent.input(ids));
+            }
+            FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(intent.input(ids)),
             FetchIds::RelayedStateProofs(ids) => {
-                self.drive_fetch::<StateProofRelayBinding>(how.input(ids));
+                self.drive_fetch::<StateProofRelayBinding>(intent.input(ids));
             }
-            FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(how.input(ids)),
+            FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(intent.input(ids)),
             FetchIds::BeaconProposals(ids) => {
-                self.drive_fetch::<BeaconProposalBinding>(how.input(ids));
+                self.drive_fetch::<BeaconProposalBinding>(intent.input(ids));
             }
             FetchIds::ShardWitnesses(ids) => {
-                self.drive_fetch::<ShardWitnessBinding>(how.input(ids));
+                self.drive_fetch::<ShardWitnessBinding>(intent.input(ids));
             }
             FetchIds::PackageArtifacts(ids) => {
-                self.drive_fetch::<PackageArtifactBinding>(how.input(ids));
+                self.drive_fetch::<PackageArtifactBinding>(intent.input(ids));
             }
             FetchIds::InstanceRecords(ids) => {
-                self.drive_fetch::<InstanceRecordBinding>(how.input(ids));
+                self.drive_fetch::<InstanceRecordBinding>(intent.input(ids));
             }
         }
     }

@@ -1940,12 +1940,15 @@ impl BeaconCoordinator {
         // abandoned. The tracker's record is for cancellation, not dedup.
         self.shard_source
             .register_pending_fetch(shard, block_height, anchor, prior, chunk_end);
-        vec![Action::Fetch(FetchRequest::ShardWitnesses {
-            source_shard: shard,
-            block_height,
-            committed_block_hash: anchor,
-            lo: LeafIndex::new(prior),
-            hi: LeafIndex::new(chunk_end),
+        vec![Action::Fetch(FetchRequest::Ask {
+            ids: FetchIds::ShardWitnesses(vec![(
+                shard,
+                block_height,
+                anchor,
+                LeafIndex::new(prior),
+                LeafIndex::new(chunk_end),
+            )]),
+            shard,
             preferred: None,
             class: None,
         })]
@@ -2296,7 +2299,7 @@ impl BeaconCoordinator {
         }
     }
 
-    /// Emit one [`FetchRequest::BeaconProposal`] per missing committed
+    /// Emit one [`FetchRequest::Ask`] of beacon proposals per missing committed
     /// proposal. The routing `shard` is the dispatching vnode's
     /// `local_shard` (peer selection rides the local committee);
     /// `preferred` rotates through the beacon committee so multiple
@@ -2309,10 +2312,9 @@ impl BeaconCoordinator {
             .enumerate()
             .map(|(i, &validator)| {
                 let preferred = peers.get(i % peers.len().max(1)).copied();
-                Action::Fetch(FetchRequest::BeaconProposal {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::BeaconProposals(vec![(epoch, validator)]),
                     shard: local_shard,
-                    epoch,
-                    validator,
                     preferred,
                     class: None,
                 })
@@ -4776,8 +4778,13 @@ mod tests {
         let fetches_divergent = actions.iter().any(|a| {
             matches!(
                 a,
-                Action::Fetch(FetchRequest::BeaconProposal { validator, .. })
-                    if *validator == committee[divergent_pos]
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::BeaconProposals(wanted),
+                    ..
+                })
+                    if wanted
+                        .iter()
+                        .any(|(_, validator)| *validator == committee[divergent_pos])
             )
         });
         assert!(
@@ -5371,7 +5378,10 @@ mod tests {
         let (lo, hi) = actions
             .iter()
             .find_map(|a| match a {
-                Action::Fetch(FetchRequest::ShardWitnesses { lo, hi, .. }) => Some((*lo, *hi)),
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ShardWitnesses(runs),
+                    ..
+                }) => runs.first().map(|(_, _, _, lo, hi)| (*lo, *hi)),
                 _ => None,
             })
             .expect("expected a ShardWitnesses fetch");

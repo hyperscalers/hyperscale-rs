@@ -2616,9 +2616,9 @@ impl ExecutionCoordinator {
             .flush_all(&awaited, now_ts)
             .into_iter()
             .map(|(source_shard, tx_hash)| {
-                Action::Fetch(FetchRequest::ExecutionCerts {
-                    source_shard,
-                    tx_hash,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(vec![(source_shard, tx_hash)]),
+                    shard: source_shard,
                     preferred: None,
                     class: None,
                 })
@@ -2644,9 +2644,9 @@ impl ExecutionCoordinator {
                 retry = is_retry,
                 "Execution cert timeout — requesting fallback"
             );
-            actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
-                source_shard,
-                tx_hash,
+            actions.push(Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::ExecutionCerts(vec![(source_shard, tx_hash)]),
+                shard: source_shard,
                 preferred: None,
                 class: None,
             }));
@@ -6311,9 +6311,13 @@ mod tests {
             "expectation must survive age pruning while a local tick still needs shard 1"
         );
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::Fetch(FetchRequest::ExecutionCerts { .. }))),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(..),
+                    ..
+                })
+            )),
             "fallback fetch must keep firing while the expectation is retained"
         );
 
@@ -7979,9 +7983,15 @@ mod tests {
         actions
             .iter()
             .filter_map(|action| match action {
-                Action::Fetch(FetchRequest::StateProof { anchor, keys, .. }) => {
-                    Some((*anchor, keys.clone()))
-                }
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::StateProofs(keys),
+                    ..
+                }) => keys.first().map(|(anchor, _)| {
+                    (
+                        *anchor,
+                        keys.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
+                    )
+                }),
                 _ => None,
             })
             .collect()
@@ -8668,9 +8678,13 @@ mod tests {
             "a cell present is a member still pending, not an answer"
         );
         assert!(
-            !folded
-                .iter()
-                .any(|action| matches!(action, Action::Fetch(FetchRequest::ExecutionCerts { .. }))),
+            !folded.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(..),
+                    ..
+                })
+            )),
             "and no certificate is fetched on it"
         );
         assert!(state.offers().abandonment_records.is_empty());
@@ -9458,8 +9472,11 @@ mod tests {
         assert!(
             folded.iter().any(|action| matches!(
                 action,
-                Action::Fetch(FetchRequest::ExecutionCerts { source_shard, tx_hash: fetched, .. })
-                    if *source_shard == PEER && *fetched == tx_hash
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(fetched),
+                    ..
+                })
+                    if fetched.as_slice() == [(PEER, tx_hash)]
             )),
             "a present claim fetches the consumer's certificate"
         );
@@ -11117,9 +11134,15 @@ mod tests {
 
         let actions = state.on_block_committed(&topo, &certified);
 
-        let fallback_fired = actions
-            .iter()
-            .any(|a| matches!(a, Action::Fetch(FetchRequest::ExecutionCerts { .. })));
+        let fallback_fired = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(..),
+                    ..
+                })
+            )
+        });
         assert!(
             !fallback_fired,
             "an expectation stamped at the commit clock is not already overdue at that commit"

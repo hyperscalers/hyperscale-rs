@@ -24,7 +24,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::committed_tombstones::CommittedProvisionTombstones;
-use crate::expected::{ExpectedProvisionTracker, TimeoutEffect};
+use crate::expected::ExpectedProvisionTracker;
 use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
@@ -363,7 +363,7 @@ impl ProvisionCoordinator {
             self.expected
                 .check_timeouts(local_ts)
                 .into_iter()
-                .map(TimeoutEffect::into_fetch_action),
+                .map(|effect| effect.into_fetch_action(self.local_shard)),
         );
         actions
     }
@@ -456,13 +456,14 @@ impl ProvisionCoordinator {
             .then(|| Action::AbandonFetch(FetchIds::LocalProvisions(sweep.evicted_pending)))
     }
 
-    /// Immediately emit `Action::Fetch(FetchRequest::RemoteProvisions)` for all outstanding expected
+    /// Immediately emit an `Action::Fetch` of remote provisions for all outstanding expected
     /// provisions, bypassing the normal liveness timeout.
     ///
     /// Called when urgency overrides the default patience — sync completion
     /// (validator needs to catch up before `MAX_FINALIZATION_DELAY` runs out) and the
     /// execution advance gate stalling on missing data.
     pub fn flush_expected_provisions(&mut self) -> Vec<Action> {
+        let local_shard = self.local_shard;
         self.expected
             .flush_all()
             .into_iter()
@@ -472,7 +473,7 @@ impl ProvisionCoordinator {
                     block_height = effect.block_height.inner(),
                     "Eager fetch — immediately requesting missing provisions"
                 );
-                effect.into_fetch_action()
+                effect.into_fetch_action(local_shard)
             })
             .collect()
     }
@@ -2123,13 +2124,20 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::Fetch(FetchRequest::RemoteProvisions {
-                source_shard,
-                block_height,
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::RemoteProvisions(wanted),
+                shard,
                 preferred,
                 ..
-            }) if *source_shard == ShardId::leaf(2, 1)
-                && *block_height == BlockHeight::new(10)
+            }) if *shard == ShardId::leaf(2, 1)
+                // Both ends: the source the provisions come from, and
+                // this coordinator's own shard they are owed to.
+                && wanted.as_slice()
+                    == [(
+                        ShardId::leaf(2, 1),
+                        ShardId::leaf(2, 0),
+                        BlockHeight::new(10),
+                    )]
                 && *preferred == Some(ValidatorId::new(0))
         ));
     }

@@ -565,8 +565,8 @@ impl MempoolCoordinator {
             .flush_all()
             .into_iter()
             .map(|(source_shard, ids)| {
-                Action::Fetch(FetchRequest::Transactions {
-                    ids,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Transactions(ids),
                     shard: source_shard,
                     preferred: None,
                     class: Some(MessageClass::Recovery),
@@ -799,8 +799,8 @@ impl MempoolCoordinator {
                 height = height.inner(),
                 "Mempool fetching expected cross-shard txs past grace window"
             );
-            actions.push(Action::Fetch(FetchRequest::Transactions {
-                ids,
+            actions.push(Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::Transactions(ids),
                 shard: source_shard,
                 preferred: None,
                 class: Some(MessageClass::Recovery),
@@ -1604,9 +1604,13 @@ mod tests {
             &certified_block_with_provisions(BlockHeight::new(4), ShardId::ROOT, &[]),
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::Fetch(FetchRequest::Transactions { .. }))),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Transactions(..),
+                    ..
+                })
+            )),
             "Fetch should not fire within grace window"
         );
         assert_eq!(mempool.pending_expected_count(), 1);
@@ -1633,9 +1637,11 @@ mod tests {
         let fetch = actions
             .iter()
             .find_map(|a| match a {
-                Action::Fetch(FetchRequest::Transactions { ids, preferred, .. }) => {
-                    Some((ids, preferred))
-                }
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Transactions(ids),
+                    preferred,
+                    ..
+                }) => Some((ids, preferred)),
                 _ => None,
             })
             .expect("fetch action emitted past grace");
@@ -1673,9 +1679,11 @@ mod tests {
         let fetches: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                Action::Fetch(FetchRequest::Transactions { ids, preferred, .. }) => {
-                    Some((ids, preferred))
-                }
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Transactions(ids),
+                    preferred,
+                    ..
+                }) => Some((ids, preferred)),
                 _ => None,
             })
             .collect();
@@ -1886,9 +1894,13 @@ mod tests {
             &certified_block_with_provisions(BlockHeight::new(5), ShardId::ROOT, &[]),
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::Fetch(FetchRequest::Transactions { .. }))),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Transactions(..),
+                    ..
+                })
+            )),
             "no fetch after admission cleared expectation"
         );
     }

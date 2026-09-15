@@ -516,9 +516,9 @@ impl Counterparts {
         wanted
             .into_iter()
             .map(|(anchor, keys)| {
-                Action::Fetch(FetchRequest::StateProof {
-                    anchor,
-                    keys,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::StateProofs(keys.into_iter().map(|key| (anchor, key)).collect()),
+                    shard: anchor.shard,
                     preferred: None,
                     class: None,
                 })
@@ -730,9 +730,9 @@ impl Counterparts {
             // Its broadcast may have missed this shard, so it is fetched
             // rather than waited for.
             if inclusion.is_present() {
-                actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
-                    source_shard: shard,
-                    tx_hash,
+                actions.push(Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(vec![(shard, tx_hash)]),
+                    shard,
                     preferred: None,
                     class: None,
                 }));

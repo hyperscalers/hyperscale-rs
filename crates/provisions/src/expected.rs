@@ -12,7 +12,7 @@
 //!    timeout via [`Self::flush_all`].
 //!
 //! Both produce [`TimeoutEffect`]s; the coordinator attaches peers from
-//! topology and lifts each effect into an `Action::Fetch(FetchRequest::RemoteProvisions)`.
+//! topology and lifts each effect into an `Action::Fetch` of remote provisions.
 //!
 //! The tracker also owns `local_committed_ts` because every other consumer
 //! of that value reads it through here (deadline sweeps, receipt-time
@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchRequest};
+use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_types::{BlockHeight, ShardId, ValidatorId, WeightedTimestamp};
 use tracing::warn;
 
@@ -53,7 +53,7 @@ struct ExpectedProvision {
     proposer: ValidatorId,
 }
 
-/// Lifted into an `Action::Fetch(FetchRequest::RemoteProvisions)` via
+/// Lifted into an `Action::Fetch` of remote provisions via
 /// [`Self::into_fetch_action`] once peers are attached from the topology
 /// snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,13 +64,20 @@ pub struct TimeoutEffect {
 }
 
 impl TimeoutEffect {
-    /// Build the `RemoteProvisions` fetch action: the proposer is preferred,
+    /// Build the remote-provisions fetch action: the proposer is preferred,
     /// the rest of the source shard's committee is rotation fallback (picked
     /// by the network layer from the source shard's current committee).
-    pub(crate) const fn into_fetch_action(self) -> Action {
-        Action::Fetch(FetchRequest::RemoteProvisions {
-            source_shard: self.source_shard,
-            block_height: self.block_height,
+    ///
+    /// The id names both ends — the shard the provisions come from and the
+    /// one they are owed to — so `for_shard` is this coordinator's own.
+    pub(crate) fn into_fetch_action(self, for_shard: ShardId) -> Action {
+        Action::Fetch(FetchRequest::Ask {
+            ids: FetchIds::RemoteProvisions(vec![(
+                self.source_shard,
+                for_shard,
+                self.block_height,
+            )]),
+            shard: self.source_shard,
             preferred: Some(self.proposer),
             class: None,
         })
