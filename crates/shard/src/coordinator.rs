@@ -1159,17 +1159,35 @@ impl ShardCoordinator {
     /// / already-voted short-circuit), so re-driving every pending block
     /// is safe.
     pub fn redrive_pending_votes(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        let pending: Vec<BlockHash> = self
-            .pending_blocks
-            .values()
-            .filter(|p| p.block().is_some())
-            .map(|p| p.header().hash())
-            .collect();
+        let pending = self.assembled_in_chain_order();
         let mut actions = Vec::new();
         for block_hash in pending {
             actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, block_hash));
         }
         actions
+    }
+
+    /// The assembled pending blocks, lowest height first and totally
+    /// ordered under it.
+    ///
+    /// The pending set is keyed by hash, so iterating it hands out a
+    /// different order on every process. What the order decides is
+    /// whose asks go out first under a shared in-flight budget, and the
+    /// block nearest the committed frontier is the one whose vote
+    /// unblocks the chain — so a run-to-run order can starve exactly the
+    /// block the commit is waiting on, over and over.
+    fn assembled_in_chain_order(&self) -> Vec<BlockHash> {
+        let mut pending: Vec<(BlockHeight, Round, BlockHash)> = self
+            .pending_blocks
+            .values()
+            .filter(|p| p.block().is_some())
+            .map(|p| {
+                let header = p.header();
+                (header.height(), header.round(), header.hash())
+            })
+            .collect();
+        pending.sort_unstable();
+        pending.into_iter().map(|(_, _, hash)| hash).collect()
     }
 
     /// Whether `wt` lands past this shard's terminal window — the coast
@@ -3079,12 +3097,19 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         parent_hash: BlockHash,
     ) -> Vec<Action> {
-        let children: Vec<(BlockHeader, bool)> = self
+        // Totally ordered, for the reason `redrive_pending_votes` states:
+        // the pending set is keyed by hash, so its iteration order is a
+        // different one on every process, and what the order decides is
+        // whose asks go out first under a shared budget. An honest
+        // proposer produces one child; a larger set is an equivocation.
+        let mut children: Vec<(BlockHeader, bool)> = self
             .pending_blocks
             .values()
             .filter(|p| p.header().parent_block_hash() == parent_hash)
             .map(|p| (p.header().clone(), p.block().is_some()))
             .collect();
+        children
+            .sort_unstable_by_key(|(header, _)| (header.height(), header.round(), header.hash()));
         let mut actions = Vec::new();
         for (header, assembled) in children {
             let child = header.hash();
@@ -6889,6 +6914,49 @@ mod tests {
             .construct_block()
             .expect("complete block constructs cleanly");
         state.pending_blocks.insert(pending);
+    }
+
+    /// A re-drive visits the pending blocks lowest height first.
+    ///
+    /// The pending set is keyed by hash, so its iteration order differs
+    /// on every process. What the order decides is whose asks go out
+    /// first under a shared in-flight budget, and a run-to-run order can
+    /// starve exactly the block the commit is waiting on, pass after
+    /// pass.
+    #[test]
+    fn a_redrive_visits_the_pending_blocks_lowest_height_first() {
+        let (mut state, _sched) = make_test_state();
+        let blocks: Vec<Block> = [7u64, 2, 5, 3]
+            .into_iter()
+            .map(|height| {
+                make_live_block(
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    1_000 * height,
+                    ValidatorId::new(0),
+                    vec![],
+                    vec![],
+                )
+            })
+            .collect();
+        for block in &blocks {
+            install_complete_block(&mut state, block);
+        }
+
+        let heights: Vec<u64> = state
+            .assembled_in_chain_order()
+            .into_iter()
+            .map(|hash| {
+                state
+                    .pending_blocks
+                    .get(hash)
+                    .expect("the order names blocks the set holds")
+                    .header()
+                    .height()
+                    .inner()
+            })
+            .collect();
+        assert_eq!(heights, vec![2, 3, 5, 7]);
     }
 
     fn make_test_state() -> (ShardCoordinator, TopologySchedule) {
