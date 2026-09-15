@@ -3747,10 +3747,15 @@ impl ShardCoordinator {
     // Vote Collection (Deferred Verification)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle a locally-produced, pre-verified block vote. Skips the
-    /// batch-verify path — the vote is admitted directly to the verified
-    /// tally. Wire-arrived votes route through
-    /// [`Self::on_unverified_block_vote`].
+    /// Handle a pre-verified block vote. Skips the batch-verify path —
+    /// the vote is admitted directly to the verified tally. Wire-arrived
+    /// votes route through [`Self::on_unverified_block_vote`].
+    ///
+    /// Two producers reach here: this validator's own signed vote, fed
+    /// back for local tally tracking, and a co-hosted validator's vote,
+    /// whose notification keeps its marker because `notify` hands local
+    /// recipients the in-memory message rather than wire bytes. Only the
+    /// first implies we hold the block being voted on.
     #[instrument(skip(self, topology_schedule, vote), fields(
         height = vote.height().inner(),
         voter = ?vote.voter(),
@@ -3768,8 +3773,15 @@ impl ShardCoordinator {
             "Received pre-verified block vote"
         );
 
-        // Our own verified votes are only produced after we hold the block, so
-        // its committee resolves exactly; `None` is a beacon-behind stall.
+        // A co-hosted voter's vote can outrun the block it names, exactly
+        // as a wire vote can: hold it raw until the anchor resolves, and
+        // admit it in `link_buffered_votes_to_header`. Buffering drops the
+        // marker, so such a vote is batch-verified on admission.
+        if self.committee_anchor(vote.block_hash()).is_none() {
+            self.votes.buffer_unanchored_vote(vote.into_inner());
+            return vec![];
+        }
+        // Anchor resolvable but committee `None` ⇒ beacon-behind stall.
         let Some(committee) = self.committee_of_block(topology_schedule, vote.block_hash()) else {
             return vec![];
         };
@@ -7616,6 +7628,38 @@ mod tests {
             (Epoch::new(0), Epoch::new(0)),
             "the child dates itself in epoch 1 but is governed by epoch 0, so it extends the \
              parent's reveal chain instead of reseeding",
+        );
+    }
+
+    /// A co-hosted validator's vote reaches `on_verified_block_vote` with
+    /// its marker intact, and it can name a block this coordinator does
+    /// not hold yet — `notify` hands local recipients the in-memory
+    /// message, so the wire decode that would have stripped the marker
+    /// never runs.
+    #[test]
+    fn a_verified_vote_for_an_unanchored_block_is_held_not_dropped() {
+        let (mut state, topology_schedule) = make_test_state();
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"a block never seen here"));
+        let vote = BlockVote::from_parts(
+            block_hash,
+            ShardId::ROOT,
+            BlockHeight::new(7),
+            Round::new(1),
+            ValidatorId::new(1),
+            ConsensusSignature::ZERO,
+            ProposerTimestamp::from_millis(100_000),
+        );
+
+        let actions = state.on_verified_block_vote(
+            &topology_schedule,
+            Verified::<BlockVote>::new_unchecked_for_test(vote),
+        );
+
+        assert!(actions.is_empty(), "an unanchored vote produces no action");
+        assert_eq!(
+            state.votes.take_unanchored_votes(block_hash).len(),
+            1,
+            "a vote for a block we do not hold must be buffered, not dropped",
         );
     }
 
