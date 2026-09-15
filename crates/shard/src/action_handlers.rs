@@ -2015,11 +2015,11 @@ mod tests {
     }
 
     #[test]
-    fn build_qc_from_verified_computes_mean_timestamp() {
+    fn build_qc_from_verified_takes_the_median_timestamp() {
         let keys = keypairs(3);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
-        // Each vote weighs one, so the aggregate is the plain mean of the
-        // vote timestamps: (1000 + 2000 + 3000) / 3 = 2000.
+        // Each vote weighs one and the aggregate is their lower median, so
+        // three votes at 1000 / 2000 / 3000 yield 2000.
         let verified = vec![
             (
                 0usize,
@@ -2076,9 +2076,9 @@ mod tests {
         let keys = keypairs(3);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         // Two voters under the floor (500, 800) and one above (3000); floor=2000.
-        // Without clamp the mean would be (500 + 800 + 3000) / 3 = 1433 — below
-        // parent. With clamp each below-floor vote rises to 2000, giving a mean
-        // of (2000 + 2000 + 3000) / 3 = 2333, monotonically >= parent.
+        // Without the clamp the median would be 800 — below parent. With it
+        // each below-floor vote rises to 2000, so the median of
+        // (2000, 2000, 3000) is 2000, monotonically >= parent.
         let verified = vec![
             (
                 0usize,
@@ -2128,8 +2128,54 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(qc.weighted_timestamp().as_millis(), 2333);
+        assert_eq!(qc.weighted_timestamp().as_millis(), 2000);
         assert!(qc.weighted_timestamp().as_millis() >= parent_floor.as_millis());
+    }
+
+    /// A rushed vote timestamp cannot move the aggregate off an honest
+    /// voter's own reading.
+    ///
+    /// The timestamp rides outside `BlockVoteMessage`, so a committee member
+    /// picks it freely and the vote still verifies. The lower median of a
+    /// quorum's clamped readings is indexed at `(k - 1) / 2`, which for every
+    /// `k >= 2f + 1` sits inside the honest band whatever the forged values
+    /// are — here, one voter three minutes ahead leaves the aggregate on the
+    /// two honest middle readings rather than dragging it 44 seconds forward.
+    #[test]
+    fn build_qc_from_verified_ignores_a_rushed_vote_timestamp() {
+        let keys = keypairs(4);
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
+        let verified: Vec<_> = [1000u64, 2000, 3000, 180_000]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, ms)| {
+                (
+                    idx,
+                    Verified::<BlockVote>::new_unchecked_for_test(make_vote(
+                        &keys,
+                        idx,
+                        block_hash,
+                        BlockHeight::new(1),
+                        Round::INITIAL,
+                        ms,
+                    )),
+                )
+            })
+            .collect();
+
+        let qc = Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
+            block_hash,
+            shard(),
+            BlockHeight::new(1),
+            Round::INITIAL,
+            BlockHash::ZERO,
+            WeightedTimestamp::ZERO,
+            &verified,
+        )
+        .unwrap();
+
+        assert_eq!(qc.weighted_timestamp().as_millis(), 2500);
     }
 
     // ─── verify_and_build_qc (composition) ──────────────────────────────

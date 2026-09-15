@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{ByzantineBehaviour, ShardCoordinatorSim};
 use hyperscale_types::{BlockHeight, Round, VIEW_CHANGE_TIMEOUT, ValidatorId, WeightedTimestamp};
 
@@ -345,5 +347,68 @@ fn forged_genesis_parent_qc_is_not_voted_on() {
                 );
             }
         }
+    }
+}
+
+/// A voter that rushes its vote timestamp cannot stall the chain.
+///
+/// A `BlockVote`'s `timestamp` rides outside `BlockVoteMessage` — the signed
+/// message covers shard, height, round and the two hashes and nothing else —
+/// so a committee member can put any value there and its vote still verifies
+/// and still tallies. The aggregator folds the votes' clamped timestamps into
+/// the QC's `weighted_timestamp` as their mean, clamped only from BELOW at the
+/// parent's anchor, so one rushed vote drags the aggregate forward by
+/// `rush / signers` with nothing to stop it.
+///
+/// What the aggregator then does with the poisoned QC is the whole finding:
+/// `on_qc_formed` refuses one past `qc_weighted_timestamp_too_far_ahead` and
+/// returns no actions, while the vote set that produced it has already been
+/// marked `qc_built`. The block is then permanently uncertifiable at that node
+/// — no later honest vote retriggers verification — and the next round's block
+/// is poisoned the same way. One Byzantine voter, every slot, indefinitely.
+///
+/// Swept across seeds: which votes land in the first batch is delivery-order
+/// dependent, and a slot whose batch happened to exclude the rushed vote
+/// certifies normally.
+#[test]
+fn a_rushed_vote_timestamp_cannot_stall_the_chain() {
+    const TARGET: usize = 12;
+    /// Three minutes past the sim clock. The aggregate is a mean over the
+    /// quorum, so the rush must exceed `signers * (MAX_TIMESTAMP_DELAY +
+    /// MAX_TIMESTAMP_RUSH)` to carry the QC past the bound — and the margin
+    /// is independent of where the clock sits, since honest votes move with it.
+    const RUSH: Duration = Duration::from_secs(180);
+
+    for seed in [0x8C_01, 0x8C_02, 0x8C_03, 0x8C_04, 0x8C_05, 0x8C_06] {
+        let mut sim = ShardCoordinatorSim::new(4, seed);
+        sim.with_byzantine(
+            ValidatorId::new(1),
+            ByzantineBehaviour::RushVoteTimestamp { ahead: RUSH },
+        );
+        sim.kick_off();
+        let all: Vec<usize> = (0..sim.n()).collect();
+        sim.run_until_committed_paced(&all, TARGET, 400);
+
+        assert!(
+            sim.byzantine_fires[1] >= 1,
+            "seed {seed:#x}: the rushing voter never cast a vote",
+        );
+        assert_no_fork(&sim, TARGET);
+    }
+}
+
+/// The baseline for `a_rushed_vote_timestamp_cannot_stall_the_chain`: the same
+/// seeds, the same target, no Byzantine flag. A stall the attack is credited
+/// with has to be the attack's.
+#[test]
+fn the_rushed_vote_baseline_commits() {
+    const TARGET: usize = 12;
+
+    for seed in [0x8C_01, 0x8C_02, 0x8C_03, 0x8C_04, 0x8C_05, 0x8C_06] {
+        let mut sim = ShardCoordinatorSim::new(4, seed);
+        sim.kick_off();
+        let all: Vec<usize> = (0..sim.n()).collect();
+        sim.run_until_committed_paced(&all, TARGET, 400);
+        assert_no_fork(&sim, TARGET);
     }
 }

@@ -909,7 +909,7 @@ impl ShardCoordinator {
     /// [`Self::committee_for_child_of`], so election and build cannot disagree.
     ///
     /// Keying on the tip block rather than on our own aggregate over it is
-    /// what makes the proposer agreed. A QC's weighted timestamp is the mean
+    /// what makes the proposer agreed. A QC's weighted timestamp is the median
     /// of whichever votes the aggregator held when quorum landed, so replicas
     /// hold different values for one block — by the spread of the voters'
     /// clocks. Within that spread of an epoch cut, the aggregate resolves two
@@ -4715,27 +4715,6 @@ impl ShardCoordinator {
             "QC formed"
         );
 
-        // The QC's weighted timestamp is the mean of per-vote `timestamp`
-        // fields, which ride outside the vote's signed message — ~f Byzantine
-        // voters (or a relay rewriting timestamps in flight) can drag the
-        // mean far forward. A locally-aggregated QC is as untrusted an
-        // ingress as any other; adopting one past the bound poisons
-        // `latest_qc` so `tip_committee()` resolves to an epoch beyond the
-        // schedule and proposals + timeout tallying stall. Drop it instead:
-        // the untouched view-change timer recovers the round, and peers
-        // would reject a header carrying this QC for the same reason.
-        if qc_weighted_timestamp_too_far_ahead(qc, self.now) {
-            warn!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                height = height.inner(),
-                weighted_ms = qc.weighted_timestamp().as_millis(),
-                now_ms = self.now.as_millis(),
-                "Locally formed QC weighted timestamp too far ahead — discarding"
-            );
-            return vec![];
-        }
-
         // Record leader activity - QC forming indicates progress
         self.record_leader_activity();
 
@@ -7464,7 +7443,7 @@ mod tests {
 
     #[test]
     fn the_proposer_does_not_move_with_the_aggregate_across_a_cut() {
-        // A QC's weighted timestamp is the mean of whichever votes the
+        // A QC's weighted timestamp is the median of whichever votes the
         // aggregator held when quorum landed, so replicas hold different
         // values for one block — by the spread of the voters' clocks, a few
         // milliseconds on a healthy shard. Either side of an epoch cut that
@@ -9611,13 +9590,19 @@ mod tests {
     }
 
     #[test]
-    fn qc_formed_rejects_weighted_timestamp_past_the_envelope() {
-        // Per-vote timestamps ride outside the vote's signed message, so the
-        // aggregated mean can be dragged far forward by Byzantine voters or
-        // a rewriting relay. A locally formed QC past the bound must not be
-        // adopted: it would poison `latest_qc` and stall proposals and
-        // timeout tallying on an unresolvable tip committee. One at the
-        // bound's edge must still adopt and drive the next proposal.
+    fn qc_formed_adopts_its_own_aggregate_at_any_weighted_timestamp() {
+        // The aggregator holds no bound on the QC it just built, and the
+        // absence is the point. A vote's timestamp rides outside
+        // `BlockVoteMessage`, so the value is whatever a voter put there;
+        // what makes the aggregate trustworthy is that it is the MEDIAN of a
+        // quorum's clamped readings, which for `k >= 2f + 1` is always an
+        // honest voter's own clock. Bounding one's own median against one's
+        // own clock only ever refuses because the local clock is the outlier,
+        // and the refusal is not free: the vote set is already marked
+        // `qc_built` and the certified block already attached, so the height
+        // is stranded and its half-published certificate is served to peers
+        // that must refuse it. The bound lives at the three ingress sites
+        // that judge a QC somebody else built.
         let (mut state, topology_schedule) = make_test_state();
         let now = LocalTimestamp::from_millis(100_000);
         state.set_time(now);
@@ -9628,45 +9613,23 @@ mod tests {
             u64::try_from((MAX_TIMESTAMP_DELAY + MAX_TIMESTAMP_RUSH).as_millis()).unwrap();
 
         let block_3_hash = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
-        let qc_with_ts = |weighted_ms: u64| {
-            let __qc = make_test_qc(block_3_hash, BlockHeight::new(3));
-            // SAFETY: synthetic test fixture, no real signature.
-            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
-                __qc.block_hash(),
-                __qc.shard_id(),
-                __qc.height(),
-                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
-                __qc.round(),
-                __qc.signers().clone(),
-                __qc.aggregated_signature(),
-                WeightedTimestamp::from_millis(weighted_ms),
-            ))
-        };
+        let base = make_test_qc(block_3_hash, BlockHeight::new(3));
+        // SAFETY: synthetic test fixture, no real signature.
+        let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+            base.block_hash(),
+            base.shard_id(),
+            base.height(),
+            BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+            base.round(),
+            base.signers().clone(),
+            base.aggregated_signature(),
+            WeightedTimestamp::from_millis(now.as_millis() + envelope_ms + 1),
+        ));
 
-        // One millisecond past the envelope: discarded outright.
-        let forged = qc_with_ts(now.as_millis() + envelope_ms + 1);
         let actions = state.on_qc_formed(
             &topology_schedule,
             block_3_hash,
-            &forged,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
-        assert!(
-            actions.is_empty(),
-            "forged QC must emit nothing: {actions:?}"
-        );
-        assert!(state.latest_qc().is_none(), "forged QC must not be adopted");
-
-        // Exactly at the envelope: kept, and the next proposal fires.
-        let honest = qc_with_ts(now.as_millis() + envelope_ms);
-        let actions = state.on_qc_formed(
-            &topology_schedule,
-            block_3_hash,
-            &honest,
+            &qc,
             &[],
             vec![],
             vec![],
@@ -9677,7 +9640,7 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::BuildProposal { .. })),
-            "honest QC must drive the next proposal: {actions:?}"
+            "a locally formed QC must drive the next proposal: {actions:?}"
         );
     }
 

@@ -527,6 +527,7 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         c,
         TRADER_SHARD,
         refused_hash,
+        budget,
         "a route refused at its second venue",
     );
 

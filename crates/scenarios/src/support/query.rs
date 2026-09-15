@@ -18,7 +18,7 @@ use hyperscale_types::{
     TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
 };
 
-use super::Cluster;
+use super::{Budget, Cluster};
 
 /// The deepest leaf [`served_shards`] looks for. A scenario that grows or
 /// splits reaches depth two; nothing here goes deeper.
@@ -282,17 +282,27 @@ pub fn chain_membership(store: &impl ShardChainReader, tx: TxHash) -> Vec<RanAs>
 /// refusal scenarios assert would be reached identically; this is what
 /// tells the two apart.
 ///
+/// Waits for that member on `budget` before reading, because the two
+/// seams a refusal moves are not one seam: the balance a reclaim returns
+/// is readable from applied state a block before the finalization
+/// carrying its outcome commits. A caller that waits on the balance and
+/// then reads the chain is reading the earlier of the two.
+///
 /// # Panics
 ///
 /// Panics if the shard attested nothing for `tx`, if anything it
 /// attested for the wider transaction decided it, or if it composed any
 /// number of local members but one.
 pub(crate) fn assert_reclaimed_leg<C: Cluster + ?Sized>(
-    c: &C,
+    c: &mut C,
     shard: ShardId,
     tx: TxHash,
+    budget: Budget,
     context: &str,
 ) {
+    c.run_until(budget, |c| {
+        c.ran(shard, tx).iter().any(RanAs::is_local_only)
+    });
     let ran = c.ran(shard, tx);
     assert!(
         !ran.is_empty(),

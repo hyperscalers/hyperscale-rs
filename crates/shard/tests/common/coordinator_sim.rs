@@ -204,6 +204,18 @@ pub enum ByzantineBehaviour {
         /// genesis QC would be legitimate anyway (the first block of a chain).
         min_height: BlockHeight,
     },
+    /// Sign every block vote with a `timestamp` of `now + ahead` instead of
+    /// the replica's own clock reading. `BlockVoteMessage` covers shard,
+    /// height, round and the two hashes — never the timestamp — so the
+    /// rushed vote verifies like any other and is tallied like any other.
+    /// The aggregator sums the clamped vote timestamps and divides, so one
+    /// rushed vote drags the QC's `weighted_timestamp` forward by
+    /// `ahead / signers`. Sustained: every vote the flagged replica casts
+    /// carries it.
+    RushVoteTimestamp {
+        /// How far past the sim clock the forged vote timestamp sits.
+        ahead: Duration,
+    },
 }
 
 /// Wire-shape events translated from emitted [`Action`]s by
@@ -1303,6 +1315,18 @@ impl ShardCoordinatorSim {
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
                 self.storages[emitter_idx].persist_vote_position(me, &position);
+                // A rushing replica signs one vote and sends that one vote,
+                // so the forged timestamp rides the loopback copy too.
+                let timestamp =
+                    match self.byzantine[emitter_idx] {
+                        Some(ByzantineBehaviour::RushVoteTimestamp { ahead }) => {
+                            self.byzantine_fires[emitter_idx] += 1;
+                            ProposerTimestamp::from_millis(self.now.as_millis().saturating_add(
+                                u64::try_from(ahead.as_millis()).unwrap_or(u64::MAX),
+                            ))
+                        }
+                        _ => timestamp,
+                    };
                 let verified = Verified::<BlockVote>::sign_local(
                     &self.network,
                     block_hash,

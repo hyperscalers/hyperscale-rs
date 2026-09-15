@@ -60,13 +60,13 @@ pub fn qc_has_local_quorum_power(
 /// pass `VerifyQcSignature`. A far-future value poisons the BFT clock that
 /// anchors transaction-validity windows — honest transactions fall outside the
 /// window (blocks go empty) and the aggregation floor propagates the skew
-/// irreversibly. An honestly-aggregated weighted timestamp is a mean of voters'
-/// clocks from an earlier round, so it leads ours by at most the honest skew
-/// envelope; anything beyond is rejected. Checked wherever an untrusted QC
-/// enters chain state: header validation, synced-block admission,
-/// timeout-quorum `high_qc` adoption, and local QC aggregation (per-vote
-/// timestamps are equally unsigned, so the aggregated mean is no more
-/// trustworthy than a received QC's field).
+/// irreversibly. An honestly-aggregated weighted timestamp is one honest
+/// voter's clock reading from an earlier round, so it leads ours by at most the
+/// honest skew envelope; anything beyond is rejected. Checked wherever an
+/// untrusted QC enters chain state: header validation, synced-block admission,
+/// and timeout-quorum `high_qc` adoption. A QC this node aggregates itself is
+/// not one of them — the median over a quorum is an honest voter's own
+/// reading, so no bound on it bounds an adversary.
 #[must_use]
 pub fn qc_weighted_timestamp_too_far_ahead(qc: &QuorumCertificate, now: LocalTimestamp) -> bool {
     let weighted_ms = qc.weighted_timestamp().as_millis();

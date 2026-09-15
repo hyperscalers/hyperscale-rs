@@ -348,7 +348,7 @@ impl Verified<QuorumCertificate> {
         let floor_ms = parent_weighted_timestamp.as_millis();
         let max_idx = sorted.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
         let mut signers = SignerBitfield::new(max_idx + 1);
-        let mut timestamp_sum: u128 = 0;
+        let mut clamped: Vec<u64> = Vec::with_capacity(sorted.len());
         for (idx, vote) in &sorted {
             signers.set(*idx);
             // Per-vote monotonicity clamp: a vote timestamp below
@@ -356,16 +356,30 @@ impl Verified<QuorumCertificate> {
             // Byzantine voter) is raised to the floor before
             // aggregation, so the resulting QC's `weighted_timestamp`
             // is guaranteed >= parent's.
-            let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
-            timestamp_sum += u128::from(clamped_ms);
+            clamped.push(vote.timestamp().as_millis().max(floor_ms));
         }
 
-        // Every vote weighs one, so the aggregate timestamp is the mean of
-        // the clamped vote timestamps.
-        let weighted_timestamp_ms = if sorted.is_empty() {
-            0
-        } else {
-            u64::try_from(timestamp_sum / sorted.len() as u128).unwrap_or(u64::MAX)
+        // The aggregate is the median of the clamped vote timestamps, not
+        // their mean. A vote's `timestamp` rides outside `BlockVoteMessage`,
+        // so a committee member sets it freely, and a mean carries that
+        // value into the aggregate divided only by the signer count — one
+        // voter moves the chain clock arbitrarily far, and every consumer
+        // downstream is then bounding a number an adversary chose.
+        //
+        // The signer set is a quorum, so at most `f` of its `k >= 2f+1`
+        // votes are Byzantine and the honest band of the sorted readings is
+        // `[f, k - 1 - f]`. Both central indices — `(k - 1) / 2` and
+        // `k / 2` — lie inside that band for every such `k`, so wherever
+        // the forged values sort, the aggregate is built from honest
+        // voters' own clamped readings.
+        let weighted_timestamp_ms = {
+            clamped.sort_unstable();
+            let k = clamped.len();
+            if k == 0 {
+                0
+            } else {
+                u64::midpoint(clamped[(k - 1) / 2], clamped[k / 2])
+            }
         };
 
         // SAFETY: every vote in `verified_votes` carries a type-level

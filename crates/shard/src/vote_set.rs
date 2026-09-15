@@ -49,10 +49,6 @@ pub struct VoteSet {
     /// Number of verified votes counted.
     verified_power: VoteCount,
 
-    /// Sum of verified votes' (clamped) timestamps; divided by the vote count
-    /// to yield the mean weighted timestamp.
-    verified_timestamp_weight_sum: u128,
-
     // ═══════════════════════════════════════════════════════════════════════
     // Unverified votes (buffered until quorum possible)
     // ═══════════════════════════════════════════════════════════════════════
@@ -113,7 +109,6 @@ impl VoteSet {
             parent_weighted_timestamp,
             verified_votes: Vec::new(),
             verified_power: VoteCount::ZERO,
-            verified_timestamp_weight_sum: 0,
             unverified_votes: Vec::new(),
             unverified_power: VoteCount::ZERO,
             committee_votes: VoteCount::of(num_validators),
@@ -270,9 +265,6 @@ impl VoteSet {
     pub(crate) fn on_votes_verified(&mut self, verified_votes: Vec<(usize, Verified<BlockVote>)>) {
         self.pending_verification = false;
 
-        let floor_ms = self
-            .parent_weighted_timestamp
-            .map_or(0, WeightedTimestamp::as_millis);
         for (committee_index, vote) in verified_votes {
             // Mark the voter counted only now that its signature verified, and
             // skip any already tallied (its own vote, or an overlapping batch)
@@ -283,13 +275,6 @@ impl VoteSet {
                 continue;
             }
             self.verified_voters[committee_index] = true;
-
-            // Per-vote monotonicity clamp against parent's weighted timestamp
-            // — keeps the aggregated `weighted_timestamp` monotonic regardless
-            // of slow-clocked or Byzantine voters. Every vote weighs one, so
-            // the aggregate is the mean of the clamped timestamps.
-            let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
-            self.verified_timestamp_weight_sum += u128::from(clamped_ms);
             self.verified_power += VoteCount::MIN;
             self.verified_votes.push((committee_index, vote));
         }
@@ -329,13 +314,6 @@ impl VoteSet {
         }
 
         self.verified_voters[committee_index] = true;
-
-        // Per-vote monotonicity clamp; see `on_votes_verified` for rationale.
-        let floor_ms = self
-            .parent_weighted_timestamp
-            .map_or(0, WeightedTimestamp::as_millis);
-        let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
-        self.verified_timestamp_weight_sum += u128::from(clamped_ms);
         self.verified_power += VoteCount::MIN;
         self.verified_votes.push((committee_index, vote));
 
@@ -345,14 +323,19 @@ impl VoteSet {
 
 #[cfg(test)]
 mod test_helpers {
-    use hyperscale_types::{
-        ConsensusSignature, QuorumCertificate, ShardId, SignerBitfield, Verifier,
-    };
+    use hyperscale_types::{QuorumCertificate, ShardId, Verifier};
 
     use super::*;
 
     impl VoteSet {
         /// Build a Quorum Certificate from collected votes (test only).
+        ///
+        /// Aggregation itself is
+        /// [`Verified::<QuorumCertificate>::from_verified_votes`] — the one
+        /// place the signer bitfield and the weighted timestamp are derived —
+        /// so a vote set's own tests cannot drift from what the crypto pool
+        /// builds. This wrapper adds only the two preconditions the pool's
+        /// caller enforces elsewhere: some votes, and not built already.
         ///
         /// Two-chain rule (HotStuff-2): when creating a QC for block N,
         /// the committable block is at height N-1 (the parent). The committable
@@ -376,62 +359,27 @@ mod test_helpers {
                 return Err("QC already built from this vote set".to_string());
             }
 
-            // Sort votes by committee index to ensure deterministic signature aggregation.
-            // This is critical: the aggregated signature must be built in the same order
-            // as the public keys will be aggregated during verification.
-            self.verified_votes.sort_by_key(|(idx, _)| *idx);
-
-            // Bitfield is sized to fit the largest committee index seen, not the full committee.
-            let max_idx = self
-                .verified_votes
-                .iter()
-                .map(|(idx, _)| *idx)
-                .max()
-                .unwrap_or(0);
-            let mut signers = SignerBitfield::new(max_idx + 1);
-            for (idx, _) in &self.verified_votes {
-                signers.set(*idx);
-            }
-
-            let signatures: Vec<ConsensusSignature> = self
-                .verified_votes
-                .iter()
-                .map(|(_, v)| v.signature())
-                .collect();
-
-            let aggregated_signature = verifier
-                .aggregate(&signatures)
-                .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?;
-
-            // Mean of the clamped vote timestamps — every vote weighs one.
-            let weighted_timestamp_ms = if self.verified_power == VoteCount::ZERO {
-                0
-            } else {
-                // A mean of u64 timestamps always fits in u64.
-                u64::try_from(
-                    self.verified_timestamp_weight_sum / u128::from(self.verified_power.inner()),
-                )
-                .unwrap_or(u64::MAX)
-            };
-
             let height = self.height.ok_or("no height in vote set")?;
             let round = self.round.unwrap_or(Round::INITIAL);
             let parent_block_hash = self
                 .parent_block_hash
                 .ok_or("no parent block hash in vote set")?;
 
-            self.qc_built = true;
-
-            Ok(QuorumCertificate::new(
+            let qc = Verified::<QuorumCertificate>::from_verified_votes(
+                verifier,
                 block_hash,
                 shard_id,
                 height,
-                parent_block_hash,
                 round,
-                signers,
-                aggregated_signature,
-                WeightedTimestamp::from_millis(weighted_timestamp_ms),
-            ))
+                parent_block_hash,
+                self.parent_weighted_timestamp.unwrap_or_default(),
+                &self.verified_votes,
+            )
+            .ok_or_else(|| "failed to aggregate signatures".to_string())?;
+
+            self.qc_built = true;
+
+            Ok(qc.into_inner())
         }
     }
 }

@@ -390,7 +390,7 @@ fn a_restarted_payer_still_reclaims_its_refused_leg() {
 /// nothing.
 #[test]
 fn a_restarted_host_reseats_every_member_it_carries() {
-    payer_reclaims_after_restart(5, true);
+    payer_reclaims_after_restart(1, true);
 }
 
 fn payer_reclaims_after_restart(seed: u64, co_hosted: bool) {

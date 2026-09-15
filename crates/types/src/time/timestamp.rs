@@ -4,7 +4,7 @@
 //! carry very different trust guarantees:
 //!
 //! - [`WeightedTimestamp`] — BFT-authenticated aggregate produced on every
-//!   QC: the mean of the quorum's vote timestamps, clamped so it never
+//!   QC: the median of the quorum's vote timestamps, each clamped so none
 //!   precedes the parent QC's value. Safe to anchor consensus deadlines on;
 //!   all validators derive the same value for a given committed block.
 //! - [`ProposerTimestamp`] — the proposer's local wall-clock embedded in a
@@ -29,12 +29,15 @@ use hyperscale_hbor::Hbor;
 
 /// BFT-authenticated block timestamp in milliseconds.
 ///
-/// Each QC carries the mean of the timestamps of the 2f+1 votes that formed
-/// it (every node is one vote), clamped so it never precedes the parent QC's
-/// value. Two aggregators collecting different quorum subsets for the same
-/// block can therefore produce different means, and the field rides outside
-/// the QC's signed message — so a QC's own `weighted_timestamp` is neither
-/// unique nor unforgeable on its own. The canonical, hash-pinned timestamp
+/// Each QC carries the median of the timestamps of the 2f+1 votes that formed
+/// it (every node is one vote), each clamped so none precedes the parent QC's
+/// value. A median rather than a mean because the vote timestamp rides outside
+/// `BlockVoteMessage`: a voter picks it freely, and in a quorum where a
+/// majority is honest the median is always one of the honest readings. Two
+/// aggregators collecting different quorum subsets for the same block can
+/// still land on different medians, and the field rides outside the QC's
+/// signed message — so a QC's own `weighted_timestamp` is neither unique nor
+/// unforgeable on its own. The canonical, hash-pinned timestamp
 /// for a block is the one its committing child embeds as `parent_qc`: anchor
 /// deterministic deadlines on `header.parent_qc().weighted_timestamp()`,
 /// never on a received block's own `qc().weighted_timestamp()`.

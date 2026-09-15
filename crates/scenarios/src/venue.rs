@@ -560,7 +560,13 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
         stocked,
         "a venue that refused a swap holds exactly what it held",
     );
-    assert_reclaimed_leg(c, SWAPPER_SHARD, refused_hash, "a swap the venue refuses");
+    assert_reclaimed_leg(
+        c,
+        SWAPPER_SHARD,
+        refused_hash,
+        budget,
+        "a swap the venue refuses",
+    );
 
     // That the venue can still price is the weaker claim, and the one
     // that says the swap after this is not running against a wedged
