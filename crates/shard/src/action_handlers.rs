@@ -15,7 +15,9 @@ use hyperscale_storage::{
     BeaconChainReader, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore,
     SubstateView, SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, sweep_for_block,
 };
-use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
+use hyperscale_types::network::gossip::{
+    CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
+};
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
 };
@@ -35,7 +37,7 @@ use hyperscale_types::{
     VrfProof, WeightedTimestamp, Window, WitnessSources, absorb_committed_cells,
     commit_witness_window, derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
-    signed_bytes, vrf_output_from_proof,
+    signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
 /// Result of QC verification and assembly.
@@ -652,6 +654,25 @@ where
                 start.elapsed().as_secs_f64(),
             );
             ctx.notify_protocol(ProtocolEvent::ShardForkProofVerified { proof, verified });
+        }
+
+        Action::VerifyShardVoteEquivocation { evidence, pubkey } => {
+            let start = Stopwatch::start();
+            let verified = verify_shard_vote_equivocation(
+                ctx.verifier,
+                &evidence,
+                ctx.topology_snapshot.network(),
+                &pubkey,
+            )
+            .is_ok();
+            record_signature_verification_latency(
+                "shard_vote_equivocation",
+                start.elapsed().as_secs_f64(),
+            );
+            ctx.notify_protocol(ProtocolEvent::ShardVoteEquivocationVerified {
+                evidence,
+                verified,
+            });
         }
 
         Action::VerifyTransactionRoot {
@@ -1527,6 +1548,15 @@ where
             // re-verifies it against its own topology.
             let gossip = ShardForkProofGossip {
                 proof: Arc::from(proof),
+            };
+            ctx.network.broadcast_global(&gossip);
+        }
+
+        Action::BroadcastShardVoteEquivocation { evidence } => {
+            // Self-authenticating: gossip the pair unsigned; every recipient
+            // re-verifies both signatures under the accused key.
+            let gossip = ShardVoteEquivocationGossip {
+                evidence: Arc::from(evidence),
             };
             ctx.network.broadcast_global(&gossip);
         }

@@ -1937,6 +1937,7 @@ impl Action {
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
             | Self::VerifyShardForkProof { .. }
+            | Self::VerifyShardVoteEquivocation { .. }
             | Self::VerifyTransactionRoot { .. }
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
@@ -1951,7 +1952,8 @@ impl Action {
             | Self::SignAndBroadcastTimeout { .. }
             | Self::SignAndBroadcastReadySignal { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
-            | Self::BroadcastShardForkProof { .. } => ActionOwner::Shard,
+            | Self::BroadcastShardForkProof { .. }
+            | Self::BroadcastShardVoteEquivocation { .. } => ActionOwner::Shard,
 
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }
