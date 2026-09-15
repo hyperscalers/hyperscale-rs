@@ -11,8 +11,8 @@
 
 use hyperscale_jmt::{Key, NibblePath, TreeReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlockHeader, ChainOrigin, ShardId,
-    ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
+    BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
+    ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
 };
 
 use crate::Substates;
@@ -354,6 +354,25 @@ pub trait BoundaryStore {
         height: BlockHeight,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String>;
+
+    /// Record a committed block that sits below this store's committed
+    /// frontier: its metadata row, its certificates and its transaction
+    /// bodies, and nothing else.
+    ///
+    /// What a member that arrived by snap-sync needs before it can fold
+    /// its own terminal window, which reaches epochs below the boundary
+    /// it imported against. Nothing here re-derives state: the tree, the
+    /// committed frontier, the latest QC and the retention floor all stay
+    /// where the import left them, and a height already held is
+    /// overwritten with the same bytes.
+    ///
+    /// The block arrives unverified, and the caller's tie is the hash
+    /// line: each block is the one the block above it names as its
+    /// parent, up to the beacon-attested anchor. That settles which block
+    /// stands at the height — which is the whole question here — and no
+    /// signature check could add to it, so this takes the pairing as it
+    /// comes rather than asking for a marker the walk does not produce.
+    fn import_historical_block(&self, certified: &CertifiedBlock);
 
     /// Apply the subset of a followed chain's block that falls under
     /// this store's prefix, at the block's height — substate values, the

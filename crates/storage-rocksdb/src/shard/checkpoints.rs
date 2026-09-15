@@ -23,7 +23,7 @@ use hyperscale_storage::{
     prefix_low_key,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, ShardId, StateRoot, SubstateKey, SubstateLeaf,
+    Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, StateRoot, SubstateKey, SubstateLeaf,
     shard_prefix_path,
 };
 use hyperscale_vm_types::{Address, CollectionId};
@@ -612,6 +612,14 @@ impl BoundaryStore for RocksDbShardStorage {
             );
         }
         Ok(root)
+    }
+
+    fn import_historical_block(&self, certified: &CertifiedBlock) {
+        let mut batch = WriteBatch::default();
+        self.append_historical_block_to_batch(&mut batch, certified);
+        self.db
+            .write(batch)
+            .expect("failed to persist a historical block");
     }
 
     fn follow_block_writes(

@@ -171,6 +171,52 @@ impl RocksDbShardStorage {
         self.append_provisions_to_batch(batch, block, retention_floor);
     }
 
+    /// Append a block that sits below the store's committed frontier:
+    /// its metadata row, its certificates and its transaction bodies.
+    ///
+    /// Everything the commit path does *around* the row is deliberately
+    /// absent. The vote justifications a commit clears sit above this
+    /// height and are not this block's to retire; the provision prune a
+    /// commit carries cuts at a floor this write does not move; and no
+    /// chain metadata advances, because the frontier is already past
+    /// here. What is written is exactly what the attested window folds
+    /// read back — the header's parent-QC anchor, the manifest, and the
+    /// certificates the settled side folds.
+    pub(crate) fn append_historical_block_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        certified: &CertifiedBlock,
+    ) {
+        let block = certified.block();
+        let cf = self.cf();
+        let metadata = BlockMetadata::from_block(block, certified.qc_verifiable().clone());
+        batch_put::<BlocksCf>(
+            batch,
+            BlocksCf::handle(&cf),
+            &block.height().inner(),
+            &metadata,
+        );
+        let transactions_cf = TransactionsCf::handle(&cf);
+        for tx in block.transactions().iter() {
+            batch_put_raw::<TransactionsCf>(
+                batch,
+                transactions_cf,
+                &Hash::from(tx.hash()),
+                tx.as_ref(),
+                Some(tx.cached_wire_bytes()),
+            );
+        }
+        let certificates_cf = CertificatesCf::handle(&cf);
+        for fw in block.certificates().iter() {
+            batch_put::<CertificatesCf>(
+                batch,
+                certificates_cf,
+                &fw.receipt_hash(),
+                &fw.attestation(),
+            );
+        }
+    }
+
     /// Fold a block's provision bodies into the same batch, and drop
     /// every body a replay could no longer read.
     ///

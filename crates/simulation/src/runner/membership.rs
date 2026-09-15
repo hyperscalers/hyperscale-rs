@@ -25,11 +25,12 @@ use std::sync::Arc;
 use hyperscale_core::ParticipationChange;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
+use hyperscale_node::bootstrap::history::{HistoryOutcome, history_floor};
 use hyperscale_node::bootstrap::{
     BootstrapRequest, ShardBootstrap, StateRangeOutcome, replicate_engine_bootstrap,
 };
 use hyperscale_node::{
-    SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
+    SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group, serve_block_request,
     serve_state_range_request, serve_witness_history_request,
 };
 use hyperscale_provisions::ProvisionConfig;
@@ -328,6 +329,32 @@ impl SimulationRunner {
         self.seat_joined_group(host, shard, &carried, storage)
     }
 
+    /// Bounce `host`'s replica of `shard` onto an empty store: tear the
+    /// shard loop down, discard what it kept, and seat every validator it
+    /// carried again through snap-sync against the beacon-attested
+    /// anchor.
+    ///
+    /// What production does to a replica whose disk did not survive, and
+    /// the only way to put a member with no history below its anchor onto
+    /// a committee that has been seated all along.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shard` isn't hosted on `host`.
+    pub fn resync_shard(&mut self, host: NodeIndex, shard: ShardId) -> JoinKind {
+        let carried: Vec<ValidatorId> = (0..self.hosts[host as usize].vnodes_len(shard))
+            .map(|index| {
+                self.hosts[host as usize]
+                    .vnode_state(shard, index)
+                    .validator_id()
+            })
+            .collect();
+        drop(self.leave_shard(host, shard));
+        self.retained_storages.remove(&(host, shard));
+        let fresh = SimShardStorage::new(shard_prefix_path(shard));
+        self.seat_joined_group(host, shard, &carried, fresh)
+    }
+
     /// Stop hosting `shard` on `host`, returning a shared handle onto
     /// its storage so a later [`Self::join_shard`] can exercise the
     /// retained-storage fast path.
@@ -420,7 +447,18 @@ impl SimulationRunner {
             return None;
         }
 
-        let mut bootstrap = ShardBootstrap::new(shard, anchor);
+        // How far below the anchor this store has to reach before the
+        // attested window folds can answer — off the same schedule
+        // projection the folds read their own floor from.
+        let floor = history_floor(
+            anchor.weighted_timestamp,
+            self.hosts[host as usize]
+                .process()
+                .topology_snapshot()
+                .load()
+                .settled_window_floor(shard),
+        );
+        let mut bootstrap = ShardBootstrap::new(shard, anchor, floor);
         let mut peer = 0usize;
         for _ in 0..MAX_BOOTSTRAP_ROUNDS {
             if bootstrap.is_complete() {
@@ -456,6 +494,18 @@ impl SimulationRunner {
                             &request,
                         );
                         bootstrap.on_witness_history(&response);
+                    }
+                    BootstrapRequest::History(height, request) => {
+                        let io = server.shard_io(shard);
+                        let response =
+                            serve_block_request(io.pending_chain(), io.provision_store(), &request);
+                        if let HistoryOutcome::Verified(blocks) =
+                            bootstrap.on_history_block(height, &response)
+                        {
+                            for certified in &blocks {
+                                storage.import_historical_block(certified);
+                            }
+                        }
                     }
                 }
             }

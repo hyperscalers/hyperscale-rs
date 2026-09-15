@@ -18,11 +18,13 @@ use std::time::Duration;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_node::SharedTopologySnapshot;
+use hyperscale_node::bootstrap::history::{HistoryOutcome, history_floor};
 use hyperscale_node::bootstrap::{
     BootstrapOutcome, BootstrapRequest, ShardBootstrap, StateRangeOutcome,
 };
 use hyperscale_storage::{RecoveredState, ShardStorage};
-use hyperscale_types::{Request, ShardId};
+use hyperscale_types::network::request::GetBlockRequest;
+use hyperscale_types::{BlockHeight, Request, ShardId};
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
@@ -67,9 +69,16 @@ where
         // root this assembly no longer targets — wipe it and start
         // fresh. The anchor-refresh restart lands back here, where the
         // stale record fails the binding and is wiped the same way.
+        // How far below the anchor this store has to reach before the
+        // attested window folds can answer — read off the same schedule
+        // projection the folds themselves read their floor from.
+        let floor = history_floor(
+            anchor.weighted_timestamp,
+            topology_snapshot.load().settled_window_floor(shard),
+        );
         let resumed = storage
             .read_import_progress()
-            .and_then(|progress| ShardBootstrap::resume(shard, anchor, progress));
+            .and_then(|progress| ShardBootstrap::resume(shard, anchor, progress, floor));
         let bootstrap = if let Some(bootstrap) = resumed {
             info!(
                 ?shard,
@@ -87,7 +96,7 @@ where
             storage
                 .wipe_import_staging()
                 .map_err(|error| format!("import staging wipe failed: {error}"))?;
-            ShardBootstrap::new(shard, anchor)
+            ShardBootstrap::new(shard, anchor, floor)
         };
         let bootstrap = Arc::new(Mutex::new(bootstrap));
         let mut fruitless = 0u32;
@@ -242,6 +251,9 @@ async fn run_round<S: ShardStorage, N: Network>(
                     )
                 })
             }
+            BootstrapRequest::History(height, request) => send_history(
+                network, shard, storage, &sequencer, &accepted, height, request,
+            ),
         };
         waiters.push(waiter);
     }
@@ -253,6 +265,50 @@ async fn run_round<S: ShardStorage, N: Network>(
         return Err(format!("staging write failed: {error}"));
     }
     Ok(accepted.load(Ordering::Relaxed))
+}
+
+/// Issue one history-walk block fetch, recording into `storage` from
+/// inside the callback the blocks the hash line reached.
+fn send_history<S: ShardStorage, N: Network>(
+    network: &Arc<N>,
+    shard: ShardId,
+    storage: &Arc<S>,
+    sequencer: &Arc<Mutex<ShardBootstrap>>,
+    accepted: &Arc<AtomicUsize>,
+    height: BlockHeight,
+    request: GetBlockRequest,
+) -> oneshot::Receiver<()> {
+    let sequencer = Arc::clone(sequencer);
+    let accepted = Arc::clone(accepted);
+    let storage = Arc::clone(storage);
+    send(network, shard, request, move |result| {
+        result.map_or_else(
+            |_| {
+                lock(&sequencer).on_history_failure(height);
+                ResponseVerdict::Accept
+            },
+            |response| {
+                let mut sequencer = lock(&sequencer);
+                match sequencer.on_history_block(height, &response) {
+                    HistoryOutcome::Verified(blocks) => {
+                        for certified in &blocks {
+                            storage.import_historical_block(certified);
+                        }
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                        ResponseVerdict::Accept
+                    }
+                    HistoryOutcome::Accepted => {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                        ResponseVerdict::Accept
+                    }
+                    HistoryOutcome::Rejected(reason) => {
+                        debug!(?shard, reason, "Bootstrap response rejected");
+                        ResponseVerdict::Reject
+                    }
+                }
+            },
+        )
+    })
 }
 
 /// Issue one request whose verdict `judge_response` decides; the
@@ -304,15 +360,20 @@ mod tests {
     use arc_swap::ArcSwap;
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
     use hyperscale_network::{GossipHandler, NotificationHandler, RequestHandler};
-    use hyperscale_node::{serve_state_range_request, serve_witness_history_request};
+    use hyperscale_node::{
+        serve_block_request, serve_state_range_request, serve_witness_history_request,
+    };
+    use hyperscale_provisions::ProvisionStore;
     use hyperscale_storage::test_helpers::{completed_import_progress, pin_snap_sync_replica};
     use hyperscale_storage::{BoundaryStore, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
+    use hyperscale_types::network::request::{
+        GetBlockRequest, GetStateRangeRequest, GetWitnessHistoryRequest,
+    };
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         ChainOrigin, GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, ShardAnchor,
-        SubstateLeaf, TopologySnapshot, ValidatorId, ValidatorSet,
+        SubstateLeaf, TopologySnapshot, ValidatorId, ValidatorSet, WeightedTimestamp,
     };
 
     use super::*;
@@ -335,8 +396,10 @@ mod tests {
     struct StubNetwork {
         honest: Arc<SimShardStorage>,
         pending_chain: PendingChain<SimShardStorage>,
+        provisions: ProvisionStore,
         flaky_failures: AtomicUsize,
         state_ranges_served: AtomicUsize,
+        blocks_served: AtomicUsize,
     }
 
     impl StubNetwork {
@@ -344,8 +407,10 @@ mod tests {
             Self {
                 honest: Arc::clone(&storage),
                 pending_chain: PendingChain::new(storage, ChainOrigin::ROOT),
+                provisions: ProvisionStore::new(),
                 flaky_failures: AtomicUsize::new(flaky_failures),
                 state_ranges_served: AtomicUsize::new(0),
+                blocks_served: AtomicUsize::new(0),
             }
         }
     }
@@ -381,6 +446,16 @@ mod tests {
                     let req: GetWitnessHistoryRequest = hbor_from_slice(&encoded).expect("decode");
                     hbor_to_vec(&serve_witness_history_request(&self.pending_chain, &req))
                         .expect("encode")
+                }
+                "block.request" => {
+                    self.blocks_served.fetch_add(1, Ordering::Relaxed);
+                    let req: GetBlockRequest = hbor_from_slice(&encoded).expect("decode");
+                    hbor_to_vec(&serve_block_request(
+                        &self.pending_chain,
+                        &self.provisions,
+                        &req,
+                    ))
+                    .expect("encode")
                 }
                 other => panic!("unexpected bootstrap request type {other}"),
             };
@@ -476,7 +551,7 @@ mod tests {
         // The "previous process": witness, then stage three sub-ranges
         // of the fan-out before dying.
         let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
-        let mut first = ShardBootstrap::new(shard, anchor);
+        let mut first = ShardBootstrap::new(shard, anchor, WeightedTimestamp::ZERO);
         let mut staged = 0usize;
         'outer: for _ in 0..1_000 {
             for request in first.next_requests() {
@@ -485,6 +560,8 @@ mod tests {
                         let response = serve_witness_history_request(&pending_chain, &request);
                         first.on_witness_history(&response);
                     }
+                    // Unreachable: this loop stops mid state fan-out.
+                    BootstrapRequest::History(..) => unreachable!(),
                     BootstrapRequest::StateRange(id, request) => {
                         if staged >= 3 {
                             break 'outer;

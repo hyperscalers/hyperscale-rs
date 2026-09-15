@@ -17,8 +17,8 @@ use hyperscale_storage::{
     key_under_prefix, prefix_low_key,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, EntryKey, ShardId, StateRoot, SubstateKey, SubstateLeaf,
-    shard_prefix_path,
+    Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, ShardId, StateRoot, SubstateKey,
+    SubstateLeaf, shard_prefix_path,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -248,6 +248,18 @@ impl BoundaryStore for SimShardStorage {
         // committed through it would, and that one pinned it.
         self.pin_boundary(height)?;
         Ok(root)
+    }
+
+    fn import_historical_block(&self, certified: &CertifiedBlock) {
+        let block = certified.block();
+        let mut c = write_or_recover(&self.consensus);
+        for tx in block.transactions().iter() {
+            c.transactions.insert(tx.hash(), (***tx).clone());
+        }
+        for fw in block.certificates().iter() {
+            c.certificates.insert(fw.receipt_hash(), fw.attestation());
+        }
+        c.blocks.insert(block.height(), certified.clone());
     }
 
     fn follow_block_writes(

@@ -475,6 +475,21 @@ impl SimCluster {
         );
     }
 
+    /// Bounce `host`'s replica of `shard` onto an empty store, so it
+    /// rejoins by snap-sync and holds no block below its anchor.
+    /// Returns the anchor height it imported against.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the seat resumed a retained store instead of syncing.
+    pub fn resync_host(&mut self, host: usize, shard: ShardId) -> BlockHeight {
+        let kind = self.runner.resync_shard(host_index(host), shard);
+        let JoinKind::SnapSync { anchor_height } = kind else {
+            panic!("a wiped store must snap-sync, not resume; got {kind:?}");
+        };
+        anchor_height
+    }
+
     /// The host a submission of `tx` enters at: a member of the payer
     /// shard's live committee, else of any touched shard's.
     ///
