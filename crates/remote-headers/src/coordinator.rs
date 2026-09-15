@@ -709,6 +709,7 @@ impl RemoteHeaderCoordinator {
         }
 
         self.refresh_expected(topology_schedule);
+        self.retire_departed(topology_schedule);
         self.observe_recoveries(topology_schedule.head());
 
         // Gossip-timed fork fences hold until the attested recovery for
@@ -1003,6 +1004,52 @@ impl RemoteHeaderCoordinator {
         let cutoff = tip.1.minus(REMOTE_HEADER_RETENTION);
         if cutoff > WeightedTimestamp::ZERO {
             self.prune_shard_below(shard, cutoff);
+        }
+    }
+
+    /// Drop everything held for a shard whose handoff evidence window has
+    /// closed.
+    ///
+    /// The retention pass beside this one counts back from the shard's
+    /// OWN tip, and a shard that dissolves at a reshape stops producing
+    /// one — so its last window's worth of headers, and the tips entry
+    /// that makes every sweep iterate it, would be held for the life of
+    /// the process, growing linearly in the number of shards ever
+    /// created. What ends a departed shard instead is the evidence
+    /// window, counted from the handoff the beacon stamped, which is the
+    /// same reading every other cache and prune in the tree closes on —
+    /// so nothing here stops holding a header while a fence still expects
+    /// an answer off it.
+    ///
+    /// Keyed on the stamp being present rather than on the shard being
+    /// absent from the routable set: a departure this can act on is one
+    /// the schedule states, not one it fails to mention.
+    fn retire_departed(&mut self, topology_schedule: &TopologySchedule) {
+        let now = self.local_committed_ts;
+        if now == WeightedTimestamp::ZERO {
+            return;
+        }
+        let departed: Vec<ShardId> = self
+            .tips
+            .keys()
+            .copied()
+            .filter(|shard| {
+                topology_schedule
+                    .handoff_evidence_expiry(*shard)
+                    .is_some_and(|expiry| now > expiry)
+            })
+            .collect();
+        for shard in departed {
+            tracing::debug!(
+                shard = shard.inner(),
+                "Retiring a departed shard's remote headers — its evidence window has closed"
+            );
+            self.pending.retain(|&(s, _), _| s != shard);
+            self.verified.retain(|&(s, _), _| s != shard);
+            self.proven.retain(|key| self.verified.contains_key(key));
+            self.promoted.retain(|key| self.proven.contains(key));
+            self.fork_siblings.retain(|&(s, _), _| s != shard);
+            self.tips.remove(&shard);
         }
     }
 
@@ -1955,6 +2002,94 @@ mod tests {
             *keys, expected_b,
             "must verify under the epoch-1 committee at the parent QC's WT, not the head",
         );
+    }
+
+    /// A shard that dissolved at a reshape stops producing a tip, and
+    /// the retention pass beside this one counts back from that tip — so
+    /// its last window's worth of headers, and the tips entry that makes
+    /// every sweep iterate it, would be held for the life of the
+    /// process. The handoff evidence window is what ends a departed
+    /// shard.
+    #[test]
+    fn a_departed_shards_headers_go_when_its_evidence_window_closes() {
+        use std::collections::HashMap;
+
+        use hyperscale_types::{BeaconWitnessLeafCount, ShardAnchor, StateRoot};
+
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let departed = ShardId::leaf(1, 1);
+        let live = ShardId::leaf(1, 0);
+
+        let stamped = |handoff_complete: Option<Epoch>| {
+            let mut boundaries = HashMap::new();
+            boundaries.insert(
+                departed,
+                ShardAnchor {
+                    state_root: StateRoot::ZERO,
+                    block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal")),
+                    height: BlockHeight::new(9),
+                    weighted_timestamp: WeightedTimestamp::from_millis(ED),
+                    witness_base: BeaconWitnessLeafCount::ZERO,
+                    terminal_roots: None,
+                    handoff_complete,
+                },
+            );
+            let snapshot = shard_snapshot(2, &[0, 1, 2, 3], 0).with_boundaries(boundaries);
+            TopologySchedule::new(ED, Epoch::new(0), Arc::new(snapshot))
+        };
+
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        for shard in [departed, live] {
+            let key = (shard, BlockHeight::new(5));
+            coord.verified.insert(
+                key,
+                Arc::new(Verified::<CertifiedBlockHeader>::from_persisted(
+                    Arc::unwrap_or_clone(remote_header(shard, BlockHeight::new(5), ED)),
+                )),
+            );
+            coord.proven.insert(key);
+            coord.promoted.insert(key);
+            coord.tips.insert(
+                shard,
+                (BlockHeight::new(5), WeightedTimestamp::from_millis(ED)),
+            );
+        }
+
+        // Unstamped: the window is open, the terminal crossing is still
+        // being synced, and nothing is retired.
+        coord.local_committed_ts = WeightedTimestamp::from_millis(1_000_000);
+        coord.retire_departed(&stamped(None));
+        assert!(coord.tips.contains_key(&departed), "an open window holds");
+
+        // Stamped, but the local chain has not reached the expiry yet.
+        let sched = stamped(Some(Epoch::new(1)));
+        let expiry = sched
+            .handoff_evidence_expiry(departed)
+            .expect("the stamp fixes an expiry");
+        coord.local_committed_ts = expiry;
+        coord.retire_departed(&sched);
+        assert!(coord.tips.contains_key(&departed), "at the expiry it holds");
+
+        coord.local_committed_ts = expiry.plus(Duration::from_millis(1));
+        coord.retire_departed(&sched);
+
+        assert!(
+            !coord.tips.contains_key(&departed),
+            "past it the tips entry goes"
+        );
+        assert!(
+            !coord
+                .verified
+                .contains_key(&(departed, BlockHeight::new(5)))
+        );
+        assert!(!coord.proven.contains(&(departed, BlockHeight::new(5))));
+        assert!(!coord.promoted.contains(&(departed, BlockHeight::new(5))));
+        assert!(
+            coord.verified.contains_key(&(live, BlockHeight::new(5))),
+            "a shard with no departure record keeps everything"
+        );
+        assert!(coord.tips.contains_key(&live));
     }
 
     #[test]
