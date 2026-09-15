@@ -5975,11 +5975,6 @@ impl ShardCoordinator {
         timeout: Verified<Timeout>,
     ) -> Vec<Action> {
         let round = timeout.round();
-        // Ignore timeouts we've advanced past or that sit too far beyond
-        // verified progress for the pacemaker to ever reach.
-        if round < self.view_change.view || round > self.max_pacemaker_round() {
-            return Vec::new();
-        }
         // The pacemaker's quorum is measured against the in-progress committee.
         let Some(committee) = self.tip_committee(topology_schedule) else {
             return Vec::new();
@@ -5989,10 +5984,26 @@ impl ShardCoordinator {
         // tally to the local committee: the quorum total is committee-scoped, so
         // a globally-registered validator from another shard must not count
         // toward the f+1 / 2f+1 thresholds.
+        //
+        // Screened ahead of the round bounds, as the wire path screens: a
+        // retained ex-member times out on the halted chain's rounds, which
+        // the fresh committee's pacemaker bounds reject, and the harvest
+        // below is the only route back to the certified frontier.
         let Some(power) = self.committee_timeout_power(committee, timeout.voter()) else {
+            // A co-hosted retained ex-member's timeout keeps its marker —
+            // `notify` hands local recipients the in-memory message — so
+            // the harvest has to run here too, not only on the wire path.
+            if let Some(actions) = self.harvest_retained_tip(topology_schedule, &timeout) {
+                return actions;
+            }
             warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
             return Vec::new();
         };
+        // Ignore timeouts we've advanced past or that sit too far beyond
+        // verified progress for the pacemaker to ever reach.
+        if round < self.view_change.view || round > self.max_pacemaker_round() {
+            return Vec::new();
+        }
         // A verified committee timeout at a higher round nudges the view
         // toward it, exactly as headers and votes do — and it is the one
         // signal an idle chain still emits. A view split thinner than f+1
@@ -9076,6 +9087,62 @@ mod tests {
         assert!(
             harvest(RecoveryCause::Fork).is_empty(),
             "a fork recovery must refuse the retained suffix",
+        );
+    }
+
+    /// The harvest must also run when the retained ex-member is co-hosted:
+    /// `notify` hands local recipients the in-memory message, so its
+    /// timeout keeps its marker and lands on the verified path. The round
+    /// is far past the fresh committee's pacemaker bound, as a halted
+    /// chain's rounds are — so the membership screen has to come first.
+    #[test]
+    fn a_verified_retained_timeout_still_harvests_the_halted_tip() {
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
+
+        let (mut state, schedule) = make_test_state();
+        let head = schedule.head().as_ref().clone().with_pending_recoveries(
+            std::iter::once((
+                ShardId::ROOT,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(2),
+                    retained: vec![ValidatorId::new(9)],
+                    attested_frontier: BlockHeight::GENESIS,
+                },
+            ))
+            .collect(),
+        );
+        let schedule = TopologySchedule::single(Arc::new(head));
+        let carried = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"retained-tip")),
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
+            Round::new(1),
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        let timeout = Timeout::new(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            Round::new(9_999),
+            carried,
+            ValidatorId::new(9),
+            &BlsSigner::generate(),
+        )
+        .expect("sign");
+
+        let actions = state.on_verified_timeout(
+            &schedule,
+            Verified::<Timeout>::new_unchecked_for_test(timeout),
+        );
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartBlockSync { .. })),
+            "a co-hosted retained ex-member's timeout must harvest, not drop",
         );
     }
 
