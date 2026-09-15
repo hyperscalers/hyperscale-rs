@@ -1549,17 +1549,14 @@ pub(crate) fn build_transfer_paid_by<S: AccountSigner>(
         .expect("the stdlib account answers a transfer");
     let gas_limits = default_gas_limits(graph.nodes.len());
     let envelope = signing::wrap(
-        &EnvelopeTree {
-            root: IntentDecl {
+        &EnvelopeTree::of_one(
+            principal_of(signer),
+            IntentDecl {
                 header: scenario_header(validity),
                 graph,
                 sockets: Vec::new(),
             },
-            root_bindings: Vec::new(),
-            subintents: Vec::new(),
-            instances: Vec::new(),
-            resources: Vec::new(),
-        },
+        ),
         Vec::new(),
         payer,
         client.network(),
@@ -2162,17 +2159,15 @@ pub(crate) fn build_instance_instantiate_tx(
     let [] = b.call(founder, "deposit-nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
 
-    let tree = EnvelopeTree {
-        root: IntentDecl {
+    let mut tree = EnvelopeTree::of_one(
+        principal_of(payer),
+        IntentDecl {
             header: scenario_header(validity),
             graph,
             sockets: Vec::new(),
         },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-        instances: vec![meta],
-        resources: Vec::new(),
-    };
+    );
+    tree.instances = vec![meta];
     Transaction::new(client().sign_tree(
         &tree,
         Vec::new(),

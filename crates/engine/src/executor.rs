@@ -732,11 +732,11 @@ impl Executor {
                 .ok_or_else(|| "publish body in a call sub-batch".to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        // The composer identity is what the signature's own key opens,
-        // never the payer field: the payer names who is debited, and
-        // whether the payer's rule admits this signer was the payer
-        // shard's verdict before the transaction committed.
-        let signer = principal_for(vm.signer_scheme, &vm.signer)
+        // The key has to be material its scheme admits before anything
+        // reads the tree it signed. Which account it attests is the
+        // tree's own statement and derivation's to check against this;
+        // what is refused here is a key that names no principal at all.
+        principal_for(vm.signer_scheme, &vm.signer)
             .ok_or_else(|| "the envelope's signer key derives no principal".to_string())?;
         // The records the caller answers with. Admission composes the
         // envelope's own over these itself, and holds each to standing
@@ -746,7 +746,6 @@ impl Executor {
         // is dropped below.
         let admitted = admit_tree_with_authority(
             &tree,
-            signer,
             envelope_identity(vm),
             chain,
             &ProtocolHasher,
@@ -810,7 +809,7 @@ impl Executor {
                     legs: LegPlan::whole(0),
                 },
                 declaration,
-                nullifiers: admitted.records().copied().collect(),
+                nullifiers: admitted.intents.clone(),
                 gas_limits: vm.gas_limits.clone(),
                 event_bytes,
                 work,

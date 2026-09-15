@@ -33,8 +33,9 @@ use hyperscale_types::{
     Verified, WeightedTimestamp, Window, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
-    PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
+    AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, Intent, IntentDecl,
+    IntentHeader, PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource,
+    package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
@@ -2197,17 +2198,14 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let [] = b.call(unsealed, "draw", (64u64,));
     let graph = b.build().expect("every output is consumed");
     let gap = Transaction::new(client().sign_tree(
-        &EnvelopeTree {
-            root: IntentDecl {
+        &EnvelopeTree::of_one(
+            account_address(&key.public_key().0),
+            IntentDecl {
                 header: HEADER,
                 graph,
                 sockets: Vec::new(),
             },
-            root_bindings: Vec::new(),
-            subintents: Vec::new(),
-            instances: Vec::new(),
-            resources: Vec::new(),
-        },
+        ),
         Vec::new(),
         &key,
         terms(TRANSFER_FEE),
@@ -2233,13 +2231,15 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let graph = b.build().expect("every output is consumed");
     let carried = Transaction::new(client().sign_tree(
         &EnvelopeTree {
-            root: IntentDecl {
-                header: HEADER,
-                graph,
-                sockets: Vec::new(),
-            },
-            root_bindings: Vec::new(),
-            subintents: Vec::new(),
+            intents: vec![Intent {
+                decl: IntentDecl {
+                    header: HEADER,
+                    graph,
+                    sockets: Vec::new(),
+                },
+                account: account_address(&key.public_key().0),
+                bindings: Vec::new(),
+            }],
             instances: vec![meta],
             resources: Vec::new(),
         },
@@ -2268,17 +2268,14 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let [] = b.call(payer, "deposit", ());
     let graph = b.build().expect("every output is consumed");
     let refused = Transaction::new(client().sign_tree(
-        &EnvelopeTree {
-            root: IntentDecl {
+        &EnvelopeTree::of_one(
+            account_address(&key.public_key().0),
+            IntentDecl {
                 header: HEADER,
                 graph,
                 sockets: Vec::new(),
             },
-            root_bindings: Vec::new(),
-            subintents: Vec::new(),
-            instances: Vec::new(),
-            resources: Vec::new(),
-        },
+        ),
         Vec::new(),
         &key,
         terms(TRANSFER_FEE),
@@ -3256,13 +3253,15 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let [] = b.call(payer, "deposit-nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
     let tree = EnvelopeTree {
-        root: IntentDecl {
-            header: HEADER,
-            graph,
-            sockets: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
+        intents: vec![Intent {
+            decl: IntentDecl {
+                header: HEADER,
+                graph,
+                sockets: Vec::new(),
+            },
+            account: account_address(&key.public_key().0),
+            bindings: Vec::new(),
+        }],
         instances: vec![meta.clone()],
         resources: Vec::new(),
     };

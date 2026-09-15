@@ -26,7 +26,7 @@ use hyperscale_types::{
     TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
-    Claim, EnvelopeTree, IntentDecl, IntentHeader, ManifestGraph, StoredRule,
+    Claim, EnvelopeTree, Intent, IntentDecl, IntentHeader, ManifestGraph, StoredRule,
 };
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
@@ -265,23 +265,25 @@ impl Client {
     ) -> TransactionEnvelope {
         self.sign_tree(
             &EnvelopeTree {
-                root: IntentDecl {
-                    header: IntentHeader {
-                        network: self.network,
-                        validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
-                        validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
-                        // Only a subintent's identity becomes a
-                        // nullifier, so a root has nothing to
-                        // distinguish itself from; what keeps two
-                        // identical submissions apart is the envelope,
-                        // through `Terms::message`.
-                        discriminator: 0,
+                intents: vec![Intent {
+                    decl: IntentDecl {
+                        header: IntentHeader {
+                            network: self.network,
+                            validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
+                            validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
+                            // One offer, so one nullifier: a second
+                            // submission of this declaration inside this
+                            // window replaces it rather than running
+                            // beside it. A caller who means two picks two
+                            // discriminators.
+                            discriminator: 0,
+                        },
+                        graph,
+                        sockets: Vec::new(),
                     },
-                    graph,
-                    sockets: Vec::new(),
-                },
-                root_bindings: Vec::new(),
-                subintents: Vec::new(),
+                    account: principal_of(payer),
+                    bindings: Vec::new(),
+                }],
                 instances: Vec::new(),
                 resources: Vec::new(),
             },
