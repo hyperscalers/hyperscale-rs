@@ -83,10 +83,11 @@ impl CommittedTxsCache {
 
 /// Serve an inbound committed-transaction query from the local chain.
 ///
-/// Returns `not_found` when the terminal block isn't held or the stored
-/// block's hash doesn't match the requested terminal — the requester
-/// rotates peers. The hash is checked before the walk, so an unheld
-/// terminal costs a lookup rather than a reconstruction.
+/// Returns `not_found` when the terminal block isn't held, the stored
+/// block's hash doesn't match the requested terminal, or that block
+/// carries no terminal roots — the requester rotates peers. All three are
+/// checked before the walk, so a request naming a block no answer could
+/// be accepted against costs a lookup rather than a reconstruction.
 #[must_use]
 pub fn serve_committed_txs_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
@@ -98,6 +99,14 @@ pub fn serve_committed_txs_request<S: ShardStorage>(
         return GetCommittedTxsResponse::not_found();
     };
     if block.hash() != req.terminal_block_hash {
+        record_fetch_response_sent("committed_txs", 0);
+        return GetCommittedTxsResponse::not_found();
+    }
+    // Absence is proven against the named block's own
+    // `committed_txs_root`, so a block carrying no terminal roots is one
+    // whose answer no requester can accept — and the walk behind it folds
+    // every transaction of every block within a retention horizon.
+    if block.header().terminal_roots().is_none() {
         record_fetch_response_sent("committed_txs", 0);
         return GetCommittedTxsResponse::not_found();
     }
@@ -155,9 +164,10 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, ProposerTimestamp,
-        QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield, Transaction,
-        Verifiable, WeightedTimestamp, WitnessSources, committed_txs_root_from_hashes,
+        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, CommittedTxsRoot, Hash,
+        ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SettledTxsRoot, ShardId,
+        SignerBitfield, TerminalRoots, Transaction, Verifiable, WeightedTimestamp, WitnessSources,
+        committed_txs_root_from_hashes,
     };
 
     use super::*;
@@ -178,6 +188,28 @@ mod tests {
         pred_wt: u64,
         seeds: &[u8],
     ) -> BlockHash {
+        commit_block_with(storage, height, parent, pred_wt, seeds, true)
+    }
+
+    /// The ordinary case: a block outside any terminating window.
+    fn commit_block_without_terminal_roots(
+        storage: &SimShardStorage,
+        height: u64,
+        parent: BlockHash,
+        pred_wt: u64,
+        seeds: &[u8],
+    ) -> BlockHash {
+        commit_block_with(storage, height, parent, pred_wt, seeds, false)
+    }
+
+    fn commit_block_with(
+        storage: &SimShardStorage,
+        height: u64,
+        parent: BlockHash,
+        pred_wt: u64,
+        seeds: &[u8],
+        terminating: bool,
+    ) -> BlockHash {
         let parent_qc = QuorumCertificate::new(
             parent,
             SHARD,
@@ -195,6 +227,12 @@ mod tests {
             parent_qc: parent_qc.into(),
             timestamp: ProposerTimestamp::from_millis(1_000 * height),
             provision_tx_roots: std::collections::BTreeMap::new(),
+            // Every block of a terminating window carries the roots; a
+            // block without them is not one this handler answers for.
+            terminal_roots: terminating.then_some(TerminalRoots {
+                settled_txs: SettledTxsRoot::ZERO,
+                committed_txs: CommittedTxsRoot::ZERO,
+            }),
             ..Default::default()
         });
         let txs: Vec<Arc<Verifiable<Transaction>>> = seeds
@@ -421,6 +459,34 @@ mod tests {
             serve_committed_txs_request(&pending_chain, &cache, &forged)
                 .verdicts
                 .is_none()
+        );
+    }
+
+    /// A block carrying no terminal roots is one no absence proof could
+    /// be checked against, and the walk behind that answer folds every
+    /// transaction of every block within a retention horizon. Answering
+    /// at any height a node holds hands any peer that fold per request.
+    #[test]
+    fn a_block_with_no_terminal_roots_serves_not_found() {
+        let storage = SimShardStorage::default();
+        let rooted = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[1]);
+        let plain = commit_block_without_terminal_roots(&storage, 2, rooted, 2_000, &[2]);
+        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+
+        let req = GetCommittedTxsRequest::new(BlockHeight::new(2), plain, vec![tx_hash(1)]);
+        assert!(
+            serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
+                .verdicts
+                .is_none(),
+            "the block is held and its hash matches; what it lacks is the root"
+        );
+
+        let req = GetCommittedTxsRequest::new(BlockHeight::new(1), rooted, vec![tx_hash(1)]);
+        assert!(
+            serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
+                .verdicts
+                .is_some(),
+            "and a block that carries them is answered as before"
         );
     }
 

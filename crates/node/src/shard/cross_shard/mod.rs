@@ -35,7 +35,7 @@ pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
 use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
-pub use settled_txs_serve::serve_settled_txs_request;
+pub use settled_txs_serve::{SettledTxsCache, serve_settled_txs_request};
 pub use state_proof_serve::{
     serve_cells_request, serve_relayed_state_proof_request, serve_state_proof_request,
 };

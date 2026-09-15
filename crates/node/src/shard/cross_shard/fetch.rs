@@ -875,14 +875,14 @@ mod settled_txs_tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, CommittedTxsRoot,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
         Hash, ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, SignerBitfield,
-        TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
+        TerminalRoots, TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
-    use crate::shard::cross_shard::serve_settled_txs_request;
+    use crate::shard::cross_shard::{SettledTxsCache, serve_settled_txs_request};
 
     const SHARD: ShardId = ShardId::ROOT;
 
@@ -948,6 +948,10 @@ mod settled_txs_tests {
                 timestamp: ProposerTimestamp::from_millis(1_000 * h),
                 certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
                 provision_tx_roots: BTreeMap::new(),
+                terminal_roots: Some(TerminalRoots {
+                    settled_txs: SettledTxsRoot::ZERO,
+                    committed_txs: CommittedTxsRoot::ZERO,
+                }),
                 ..Default::default()
             });
             let block = Block::Live {
@@ -992,6 +996,7 @@ mod settled_txs_tests {
         let scope = evidence(terminal, root);
         let response = serve_settled_txs_request(
             &pending_chain,
+            &SettledTxsCache::default(),
             None,
             &SettledTxsBinding::request(scope, &[]),
         );
@@ -1021,6 +1026,7 @@ mod settled_txs_tests {
         let scope = evidence(terminal, settled_txs_root_from_hashes([&settled_tx(99)]));
         let response = serve_settled_txs_request(
             &pending_chain,
+            &SettledTxsCache::default(),
             None,
             &SettledTxsBinding::request(scope, &[]),
         );

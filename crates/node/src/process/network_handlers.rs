@@ -807,7 +807,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        CommittedTxsCache, serve_cells_request, serve_committed_txs_request,
+        CommittedTxsCache, SettledTxsCache, serve_cells_request, serve_committed_txs_request,
         serve_execution_certs_request, serve_finalizations_request, serve_local_provisions_request,
         serve_provision_request, serve_relayed_state_proof_request, serve_remote_headers_request,
         serve_settled_txs_request, serve_state_proof_request,
@@ -1161,11 +1161,16 @@ pub fn register_shard_request_handlers<S, N, D>(
     // proposer attested.
     let pending_chain = Arc::clone(&io.pending_chain);
     let topology_snapshot = process.topology_snapshot().clone();
+    // The walk behind an answer is the terminating shard's whole
+    // scheduled window, and the chain's own memo only extends — so a
+    // request below its coverage re-walks the span in full. One
+    // reconstruction per terminal serves every peer still asking.
+    let settled_txs_cache = Arc::new(SettledTxsCache::default());
     process
         .network
         .register_request_handler::<GetSettledTxsRequest>(shard, move |req| {
             let window_floor = topology_snapshot.load().settled_window_floor(shard);
-            serve_settled_txs_request(&pending_chain, window_floor, &req)
+            serve_settled_txs_request(&pending_chain, &settled_txs_cache, window_floor, &req)
         });
 
     // ── committed_txs.request → terminated-shard membership answers ──
