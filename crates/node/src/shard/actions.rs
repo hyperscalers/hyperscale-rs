@@ -655,14 +655,14 @@ where
             } => {
                 let wanted: BTreeSet<(Anchor, SubstateKey)> =
                     keys.into_iter().map(|key| (anchor, key)).collect();
-                // The fence re-derives what it wants relayed at this
-                // anchor on every deferral, so a cell the fetch still
-                // holds under it and the fence no longer names is one
-                // nobody is waiting on — the block that claimed it was
-                // discarded, or this validator's own probe proved the
-                // cell first. Nothing else retires these ids: a
-                // committee that never holds the proof would pin them
-                // for good.
+                // A deferral names what every block deferred at this
+                // anchor is waiting on, not what one of them wants, so a
+                // cell the fetch still holds under it and the ask no
+                // longer names is one nobody is waiting on — the block
+                // that claimed it was discarded, or this validator's own
+                // probe proved the cell first. Nothing else retires
+                // these ids: a committee that never holds the proof
+                // would pin them for good.
                 self.abandon_unwanted::<StateProofRelayBinding>(&wanted, |id| id.0 == anchor);
                 self.drive_fetch::<StateProofRelayBinding>(FetchInput::Request {
                     ids: wanted.into_iter().collect(),

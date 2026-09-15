@@ -329,6 +329,31 @@ impl VoteFence<'_> {
         Ok(count)
     }
 
+    /// The cells `block` claims at anchors this validator holds and has
+    /// not itself proven, per anchor — what a deferral of it would ask
+    /// to have relayed.
+    ///
+    /// Asked of the blocks beside the one being judged, because the
+    /// relay fetch retires by anchor: an ask states the whole pending
+    /// set under it, so what a block asks for has to be what the anchor
+    /// is waiting on rather than what one block wants. A claim this
+    /// validator's own reading contradicts contributes nothing — the
+    /// block carrying it never gets a vote, so nothing is outstanding
+    /// for it.
+    #[must_use]
+    pub fn unread_cells(&self, block: &Block) -> BTreeMap<Anchor, Vec<SubstateKey>> {
+        let mut relay = BTreeMap::new();
+        // An anchor this validator has not commit-proven is asked for by
+        // the deferral of the block that names it, not by this.
+        let mut commit_proofs = Vec::new();
+        for claim in block.state_claims() {
+            if matches!(self.anchor_stands(claim, &mut commit_proofs), Ok(true)) {
+                let _ = self.cells_stand(claim, &mut relay);
+            }
+        }
+        relay
+    }
+
     /// Which of `block`'s transactions belong to the chain that ran
     /// before this one: those whose validity window opened before the
     /// cut. A certificate anchored before the cut is admission's to

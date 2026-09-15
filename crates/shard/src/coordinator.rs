@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
+use hyperscale_core::{Action, CommitSource, FeeDemand, FetchRequest, ProtocolEvent, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
     FinalizationHash, Hash, LocalTimestamp, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
@@ -1076,6 +1076,59 @@ impl ShardCoordinator {
             cut: self.chain_origin.anchor_wt,
             local_shard: self.local_shard,
         }
+    }
+
+    /// Widen a deferral's relay asks to the cells every deferred block
+    /// at those anchors is waiting on.
+    ///
+    /// The relay binding retires by anchor: an ask states the whole
+    /// pending set under it, so a second block deferring at an anchor a
+    /// first already asked about would cancel the first's in-flight ids
+    /// and leave it waiting on a proof nobody is fetching. What an
+    /// anchor is waiting on is the union across the blocks deferred at
+    /// it, which is what an ask has to name for that retirement to be
+    /// the truth. Anchors this deferral does not name are left alone,
+    /// since the retirement is scoped to the anchor asked about.
+    fn relay_asks_across_deferred(
+        &self,
+        judged: BlockHash,
+        mut wanted: Vec<Action>,
+    ) -> Vec<Action> {
+        let anchors: BTreeSet<Anchor> = wanted
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::RelayedStateProof { anchor, .. }) => Some(*anchor),
+                _ => None,
+            })
+            .collect();
+        if anchors.is_empty() {
+            return wanted;
+        }
+        let fence = self.vote_fence();
+        let mut beside: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
+        for pending in self.pending_blocks.iter() {
+            if !pending.awaiting_counterpart() || pending.header().hash() == judged {
+                continue;
+            }
+            let Some(block) = pending.block() else {
+                continue;
+            };
+            for (anchor, keys) in fence.unread_cells(block) {
+                if anchors.contains(&anchor) {
+                    beside.entry(anchor).or_default().extend(keys);
+                }
+            }
+        }
+        for action in &mut wanted {
+            if let Action::Fetch(FetchRequest::RelayedStateProof { anchor, keys, .. }) = action
+                && let Some(extra) = beside.get(anchor)
+            {
+                let mut union: BTreeSet<SubstateKey> = keys.drain(..).collect();
+                union.extend(extra.iter().copied());
+                *keys = union.into_iter().collect();
+            }
+        }
+        wanted
     }
 
     /// Whether anything the vote fence reads has been written since the
@@ -3453,6 +3506,7 @@ impl ShardCoordinator {
                         %why,
                         "The vote fence cannot yet judge the block — deferring"
                     );
+                    let wanted = self.relay_asks_across_deferred(block_hash, wanted);
                     if let Some(pending) = self.pending_blocks.get_mut(block_hash) {
                         pending.set_awaiting_counterpart(true);
                     }
@@ -11634,6 +11688,66 @@ mod tests {
         assert!(
             coord.vote_fence().state_claims(&agreeing).is_ok(),
             "and passes once this validator has proven the cell for itself"
+        );
+    }
+
+    /// Two blocks deferring at one anchor on different cells.
+    ///
+    /// The relay fetch retires by anchor, so an ask naming only the
+    /// second block's cells would cancel the first's in-flight ids and
+    /// leave it waiting on a proof nobody is fetching. What the anchor
+    /// is waiting on is both.
+    #[test]
+    fn a_relay_ask_names_every_cell_its_anchor_is_deferred_on() {
+        use hyperscale_types::Inclusion;
+
+        let mut coord = fence_coordinator();
+        let peer = ShardId::leaf(1, 1);
+        let anchor = Anchor {
+            shard: peer,
+            height: BlockHeight::new(5),
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+            ts: WeightedTimestamp::from_millis(5_000),
+        };
+        coord.record_proven_anchor(anchor);
+
+        let cell_of = |seed: u8| stub_abort_charge(seed).vault;
+        let claim_on = |seed: u8| StateClaim::new(anchor, [(cell_of(seed), Inclusion::Absent)]);
+
+        let first = block_with_state_claims(vec![claim_on(1)]);
+        let second = block_with_state_claims(vec![claim_on(2)]);
+        assert_ne!(
+            cell_of(1),
+            cell_of(2),
+            "the two blocks read different cells"
+        );
+
+        // The first block is already deferred at the anchor.
+        let mut pending = PendingBlock::from_complete_block(
+            &first,
+            Vec::new(),
+            Vec::new(),
+            LocalTimestamp::from_millis(0),
+        );
+        pending.construct_block().expect("no content is missing");
+        pending.set_awaiting_counterpart(true);
+        coord.pending_blocks.insert(pending);
+
+        let Err(Withheld::Deferred { wanted, .. }) = coord.vote_fence().state_claims(&second)
+        else {
+            panic!("the second block's own reading is unproven, so its vote is withheld");
+        };
+        let widened = coord.relay_asks_across_deferred(second.header().hash(), wanted);
+
+        let [Action::Fetch(FetchRequest::RelayedStateProof { keys, .. })] = widened.as_slice()
+        else {
+            panic!("one relay ask at the one anchor, got {widened:?}");
+        };
+        let asked: BTreeSet<SubstateKey> = keys.iter().copied().collect();
+        assert_eq!(
+            asked,
+            BTreeSet::from([cell_of(1), cell_of(2)]),
+            "the ask states what the anchor is waiting on, not what one block wants"
         );
     }
 
