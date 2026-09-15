@@ -12,7 +12,7 @@
 // Metrics values are display readouts; precision loss on usize/u64 → f64 is irrelevant.
 #![allow(clippy::cast_precision_loss)]
 
-use hyperscale_metrics::{ChannelDepths, MemoryMetrics, MetricsRecorder, set_global_recorder};
+use hyperscale_metrics::{ChannelDepths, MemoryFamily, MetricsRecorder, set_global_recorder};
 use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, gather, register_counter,
     register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
@@ -135,7 +135,6 @@ pub struct Metrics {
     pub memory_remote_headers: GaugeVec,
     pub memory_provisions: GaugeVec,
     pub memory_node: GaugeVec,
-    pub memory_storage: GaugeVec,
 
     // === Cross-Shard Message Delivery ===
     pub dispatch_failures: CounterVec,
@@ -638,49 +637,42 @@ impl Metrics {
             memory_shard: register_gauge_vec!(
                 "hyperscale_memory_shard_collections",
                 "shard consensus state machine collection sizes (entry count)",
-                &["collection"]
+                &["collection", "shard", "validator_id"]
             )
             .unwrap(),
 
             memory_exec: register_gauge_vec!(
                 "hyperscale_memory_exec_collections",
                 "Execution state machine collection sizes (entry count)",
-                &["collection"]
+                &["collection", "shard", "validator_id"]
             )
             .unwrap(),
 
             memory_mempool: register_gauge_vec!(
                 "hyperscale_memory_mempool_collections",
                 "Mempool collection sizes (entry count)",
-                &["collection"]
+                &["collection", "shard", "validator_id"]
             )
             .unwrap(),
 
             memory_remote_headers: register_gauge_vec!(
                 "hyperscale_memory_remote_headers_collections",
                 "Remote header coordinator collection sizes (entry count)",
-                &["collection"]
+                &["collection", "shard", "validator_id"]
             )
             .unwrap(),
 
             memory_provisions: register_gauge_vec!(
                 "hyperscale_memory_provisions_collections",
                 "Provision coordinator collection sizes (entry count)",
-                &["collection"]
+                &["collection", "shard", "validator_id"]
             )
             .unwrap(),
 
             memory_node: register_gauge_vec!(
                 "hyperscale_memory_node_collections",
                 "Node io_loop collection sizes (entry count)",
-                &["collection"]
-            )
-            .unwrap(),
-
-            memory_storage: register_gauge_vec!(
-                "hyperscale_memory_storage",
-                "Storage cache memory usage",
-                &["cache"]
+                &["collection", "shard"]
             )
             .unwrap(),
 
@@ -1304,281 +1296,31 @@ impl MetricsRecorder for PrometheusRecorder {
 
     // ── Memory ──────────────────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines)] // flat dispatch over every memory-metrics field
-    fn set_memory_metrics(&self, m: &MemoryMetrics) {
-        // Shard consensus
-        self.metrics
-            .memory_shard
-            .with_label_values(&["pending_blocks"])
-            .set(m.shard_pending_blocks as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["vote_sets"])
-            .set(m.shard_vote_sets as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["pending_commits"])
-            .set(m.shard_pending_commits as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["pending_commits_awaiting_data"])
-            .set(m.shard_pending_commits_awaiting_data as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["received_votes_by_height"])
-            .set(m.shard_received_votes_by_height as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["committed_tx_lookup"])
-            .set(m.shard_committed_tx_lookup as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["committed_resolution_lookup"])
-            .set(m.shard_committed_resolution_lookup as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["committed_provision_lookup"])
-            .set(m.shard_committed_provision_lookup as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["pending_qc_verifications"])
-            .set(m.shard_pending_qc_verifications as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["verified_qcs"])
-            .set(m.shard_verified_qcs as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["pending_state_root_verifications"])
-            .set(m.shard_pending_state_root_verifications as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["buffered_synced_blocks"])
-            .set(m.shard_buffered_synced_blocks as f64);
-        self.metrics
-            .memory_shard
-            .with_label_values(&["pending_synced_block_verifications"])
-            .set(m.shard_pending_synced_block_verifications as f64);
+    fn set_vnode_memory_gauge(
+        &self,
+        family: MemoryFamily,
+        field: &str,
+        shard: u64,
+        validator_id: u64,
+        value: usize,
+    ) {
+        let gauge = match family {
+            MemoryFamily::Shard => &self.metrics.memory_shard,
+            MemoryFamily::Execution => &self.metrics.memory_exec,
+            MemoryFamily::Mempool => &self.metrics.memory_mempool,
+            MemoryFamily::RemoteHeaders => &self.metrics.memory_remote_headers,
+            MemoryFamily::Provisions => &self.metrics.memory_provisions,
+        };
+        gauge
+            .with_label_values(&[field, &shard.to_string(), &validator_id.to_string()])
+            .set(value as f64);
+    }
 
-        // Execution
-        self.metrics
-            .memory_exec
-            .with_label_values(&["cache_entries"])
-            .set(m.exec_cache_entries as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["finalizations"])
-            .set(m.exec_finalizations as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["ticks"])
-            .set(m.exec_ticks as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["vote_trackers"])
-            .set(m.exec_vote_trackers as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["early_votes"])
-            .set(m.exec_early_votes as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["expected_exec_certs"])
-            .set(m.exec_expected_exec_certs as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["absorbed_provisions"])
-            .set(m.exec_absorbed_provisions as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["required_provision_shards"])
-            .set(m.exec_required_provision_shards as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["ticks_with_ec"])
-            .set(m.exec_ticks_with_ec as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["pending_vote_retries"])
-            .set(m.exec_pending_vote_retries as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["tick_assignments"])
-            .set(m.exec_tick_assignments as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["early_attestations"])
-            .set(m.exec_early_attestations as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["pending_routing"])
-            .set(m.exec_pending_routing as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["fulfilled_exec_certs"])
-            .set(m.exec_fulfilled_exec_certs as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["outbound_certs"])
-            .set(m.exec_outbound_certs as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["proven_remote_blocks"])
-            .set(m.exec_proven_remote_blocks as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["unproven_ecs"])
-            .set(m.exec_unproven_ecs as f64);
-
-        // Mempool
-        self.metrics
-            .memory_mempool
-            .with_label_values(&["pool"])
-            .set(m.mempool_pool as f64);
-        self.metrics
-            .memory_mempool
-            .with_label_values(&["pending"])
-            .set(m.mempool_pending as f64);
-        self.metrics
-            .memory_mempool
-            .with_label_values(&["tombstones"])
-            .set(m.mempool_tombstones as f64);
-
-        // Remote Headers
-        self.metrics
-            .memory_remote_headers
-            .with_label_values(&["pending_headers"])
-            .set(m.rh_pending_headers as f64);
-        self.metrics
-            .memory_remote_headers
-            .with_label_values(&["verified_headers"])
-            .set(m.rh_verified_headers as f64);
-        self.metrics
-            .memory_remote_headers
-            .with_label_values(&["proven_headers"])
-            .set(m.rh_proven_headers as f64);
-        self.metrics
-            .memory_remote_headers
-            .with_label_values(&["fork_siblings"])
-            .set(m.rh_fork_siblings as f64);
-        self.metrics
-            .memory_remote_headers
-            .with_label_values(&["expected_headers"])
-            .set(m.rh_expected_headers as f64);
-
-        // Provision
-        self.metrics
-            .memory_provisions
-            .with_label_values(&["verified_remote_headers"])
-            .set(m.prov_verified_remote_headers as f64);
-        self.metrics
-            .memory_provisions
-            .with_label_values(&["pending_provisions"])
-            .set(m.prov_pending_provisions as f64);
-        self.metrics
-            .memory_provisions
-            .with_label_values(&["verified_provisions"])
-            .set(m.prov_verified_provisions as f64);
-        self.metrics
-            .memory_provisions
-            .with_label_values(&["expected_provisions"])
-            .set(m.prov_expected_provisions as f64);
-        self.metrics
-            .memory_provisions
-            .with_label_values(&["provisions_by_hash"])
-            .set(m.prov_provisions_by_hash as f64);
-        self.metrics
-            .memory_provisions
-            .with_label_values(&["queued_provisions"])
-            .set(m.prov_queued_provisions as f64);
-
-        // Node (io_loop)
+    fn set_shard_memory_gauge(&self, field: &str, shard: u64, value: usize) {
         self.metrics
             .memory_node
-            .with_label_values(&["tx_store"])
-            .set(m.node_tx_store as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["tx_status_cache"])
-            .set(m.node_tx_status_cache as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["finalization_cache"])
-            .set(m.node_finalization_cache as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["provision_cache"])
-            .set(m.node_provision_cache as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["exec_cert_cache"])
-            .set(m.node_exec_cert_cache as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["prepared_commits"])
-            .set(m.node_prepared_commits as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["pending_validation"])
-            .set(m.node_pending_validation as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["locally_submitted"])
-            .set(m.node_locally_submitted as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["pending_block_commits"])
-            .set(m.node_pending_block_commits as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["validation_batch"])
-            .set(m.node_validation_batch as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["certified_header_batch"])
-            .set(m.node_certified_header_batch as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["sync_queued_heights"])
-            .set(m.node_block_sync_queued_heights as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["sync_in_flight_fetches"])
-            .set(m.node_block_sync_in_flight_fetches as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["tx_fetch_blocks"])
-            .set(m.node_tx_fetch_blocks as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["local_provision_fetch_pending"])
-            .set(m.node_local_provision_fetch_pending as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["finalization_fetch_pending"])
-            .set(m.node_finalization_fetch_pending as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["provision_fetch_pending"])
-            .set(m.node_provision_fetch_pending as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["exec_cert_fetch_pending"])
-            .set(m.node_exec_cert_fetch_pending as f64);
-        self.metrics
-            .memory_node
-            .with_label_values(&["remote_header_fetch_pending"])
-            .set(m.node_remote_header_fetch_pending as f64);
-
-        // Storage
-        self.metrics
-            .memory_storage
-            .with_label_values(&["rocksdb_block_cache_bytes"])
-            .set(m.rocksdb_block_cache_usage_bytes as f64);
-        self.metrics
-            .memory_storage
-            .with_label_values(&["rocksdb_memtable_bytes"])
-            .set(m.rocksdb_memtable_usage_bytes as f64);
+            .with_label_values(&[field, &shard.to_string()])
+            .set(value as f64);
     }
 }
 

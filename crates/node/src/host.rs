@@ -492,11 +492,6 @@ where
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this NodeHost"))
     }
 
-    /// Internal: immutable per-shard vnode by index.
-    pub(crate) fn vnode(&self, shard: ShardId, vnode_idx: usize) -> &Vnode {
-        &self.shard_loop(shard).vnodes[vnode_idx]
-    }
-
     /// Shared `ShardIo` for `shard`. The single per-shard accessor;
     /// fields like `storage`, `caches`, `fetches`, `syncs`, `block_commit`,
     /// `pending_chain` are read directly off the returned reference.

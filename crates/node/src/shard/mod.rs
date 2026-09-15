@@ -60,7 +60,6 @@ use hyperscale_types::{
     TransactionStatus, TxHash, Verified,
 };
 pub use io::ShardIo;
-pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::beacon::{BeaconBlockSync, BeaconProposalCache};

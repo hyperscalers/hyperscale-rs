@@ -83,6 +83,59 @@ pub struct ShardMemoryStats {
     pub pending_assemblies: usize,
 }
 
+impl ShardMemoryStats {
+    /// Every readout as a `(field, value)` pair for the metrics backend.
+    ///
+    /// The destructure is the drift guard: a field added above does not
+    /// compile here until it is given a gauge.
+    #[must_use]
+    pub fn gauges(&self) -> Vec<(&'static str, usize)> {
+        let Self {
+            pending_blocks,
+            vote_sets,
+            pending_commits,
+            pending_commits_awaiting_data,
+            received_votes_by_height,
+            committed_tx_lookup,
+            dedup_window_complete,
+            committed_resolution_lookup,
+            committed_provision_lookup,
+            pending_qc_verifications,
+            verified_qcs,
+            pending_state_root_verifications,
+            buffered_synced_blocks,
+            pending_synced_block_verifications,
+            pending_assemblies,
+        } = *self;
+        vec![
+            ("pending_blocks", pending_blocks),
+            ("vote_sets", vote_sets),
+            ("pending_commits", pending_commits),
+            (
+                "pending_commits_awaiting_data",
+                pending_commits_awaiting_data,
+            ),
+            ("received_votes_by_height", received_votes_by_height),
+            ("committed_tx_lookup", committed_tx_lookup),
+            ("dedup_window_complete", usize::from(dedup_window_complete)),
+            ("committed_resolution_lookup", committed_resolution_lookup),
+            ("committed_provision_lookup", committed_provision_lookup),
+            ("pending_qc_verifications", pending_qc_verifications),
+            ("verified_qcs", verified_qcs),
+            (
+                "pending_state_root_verifications",
+                pending_state_root_verifications,
+            ),
+            ("buffered_synced_blocks", buffered_synced_blocks),
+            (
+                "pending_synced_block_verifications",
+                pending_synced_block_verifications,
+            ),
+            ("pending_assemblies", pending_assemblies),
+        ]
+    }
+}
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

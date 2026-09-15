@@ -49,156 +49,20 @@ pub struct ChannelDepths {
     pub cert_request: usize,
 }
 
-/// Memory usage statistics for monitoring state machine growth.
-///
-/// All values are collection lengths (entry counts), not byte sizes,
-/// unless the field name explicitly says `_bytes`.
-#[derive(Debug, Default, Clone)]
-pub struct MemoryMetrics {
-    // ── Shard consensus ──
-    /// Blocks being assembled from headers + transactions.
-    pub shard_pending_blocks: usize,
-    /// Vote sets per block (unverified + verified votes).
-    pub shard_vote_sets: usize,
-    /// Out-of-order commits buffered.
-    pub shard_pending_commits: usize,
-    /// Commits waiting for block data (header/txs).
-    pub shard_pending_commits_awaiting_data: usize,
-    /// Votes received per (height, validator) pair.
-    pub shard_received_votes_by_height: usize,
-    /// Committed transaction hash lookup.
-    pub shard_committed_tx_lookup: usize,
-    /// Committed finalization lookup.
-    pub shard_committed_resolution_lookup: usize,
-    /// Committed provision batch lookup.
-    pub shard_committed_provision_lookup: usize,
-    /// Block headers pending QC verification.
-    pub shard_pending_qc_verifications: usize,
-    /// Cache of verified QC signatures.
-    pub shard_verified_qcs: usize,
-    /// Blocks waiting for JMT to reach parent state.
-    pub shard_pending_state_root_verifications: usize,
-    /// Out-of-order synced blocks.
-    pub shard_buffered_synced_blocks: usize,
-    /// Synced blocks pending QC verification.
-    pub shard_pending_synced_block_verifications: usize,
-
-    // ── Execution ──
-    /// In-memory write sets per transaction.
-    pub exec_cache_entries: usize,
-    /// Finalizations ready for block inclusion.
-    pub exec_finalizations: usize,
-    /// Active tick states (per-tick execution + finalization tracking).
-    pub exec_ticks: usize,
-    /// Execution votes collection per tick.
-    pub exec_vote_trackers: usize,
-    /// Votes that arrived before tracking started.
-    pub exec_early_votes: usize,
-    /// Expected execution certificates from remote shards.
-    pub exec_expected_exec_certs: usize,
-    /// Transactions with a provision bundle absorbed.
-    pub exec_absorbed_provisions: usize,
-    /// Candidates with a requirement set filed.
-    pub exec_required_provision_shards: usize,
-    /// Ticks that have produced an execution certificate.
-    pub exec_ticks_with_ec: usize,
-    /// Ticks with pending vote retries.
-    pub exec_pending_vote_retries: usize,
-    /// Transaction to tick assignment mapping.
-    pub exec_tick_assignments: usize,
-    /// Tick attestations that arrived before tracking.
-    pub exec_early_attestations: usize,
-    /// Buffered ECs awaiting full routing to local tick trackers.
-    pub exec_pending_routing: usize,
-    /// Fulfilled execution certificates from remote shards.
-    pub exec_fulfilled_exec_certs: usize,
-    /// Outbound ECs awaiting finalization (re-broadcast tracker).
-    pub exec_outbound_certs: usize,
-    /// Commit-proven remote source blocks within retention.
-    pub exec_proven_remote_blocks: usize,
-    /// Cross-shard ECs deferred on their source block's commit proof.
-    pub exec_unproven_ecs: usize,
-
-    // ── Mempool ──
-    /// All transactions in the pool.
-    pub mempool_pool: usize,
-    /// Pool entries still awaiting inclusion.
-    pub mempool_pending: usize,
-    /// Terminal state transactions (for dedup).
-    pub mempool_tombstones: usize,
-
-    // ── Remote Headers ──
-    /// Remote headers pending QC verification.
-    pub rh_pending_headers: usize,
-    /// Verified remote shard headers.
-    pub rh_verified_headers: usize,
-    /// Verified remote headers whose commit proof is also held.
-    pub rh_proven_headers: usize,
-    /// Held off-branch fork siblings — nonzero signals a forking committee.
-    pub rh_fork_siblings: usize,
-    /// Remote shards being tracked for liveness.
-    pub rh_expected_headers: usize,
-
-    // ── Provision ──
-    /// Verified remote shard headers (provisions local cache).
-    pub prov_verified_remote_headers: usize,
-    /// Provisions waiting for corresponding header.
-    pub prov_pending_provisions: usize,
-    /// Verified provisions.
-    pub prov_verified_provisions: usize,
-    /// Expected provisions that haven't arrived yet.
-    pub prov_expected_provisions: usize,
-    /// Content-addressed lookup count.
-    pub prov_provisions_by_hash: usize,
-    /// Provisions queued for processing.
-    pub prov_queued_provisions: usize,
-
-    // ── Node (io_loop) ──
-    /// Shared transaction body store (admitted-and-not-yet-pruned). Sized
-    /// by tombstone retention windows, not LRU pressure.
-    pub node_tx_store: usize,
-    /// LRU cache of transaction statuses (fixed capacity, ~100k).
-    pub node_tx_status_cache: usize,
-    /// LRU cache of finalizations (fixed capacity, ~10k).
-    pub node_finalization_cache: usize,
-    /// Time-bounded cache of provision bodies for cross-shard fetch service.
-    pub node_provision_cache: usize,
-    /// Fallback execution certificate cache keyed by `tick_id`.
-    pub node_exec_cert_cache: usize,
-    /// Blocks with prepared JMT state awaiting flush.
-    pub node_prepared_commits: usize,
-    /// Transactions awaiting validation.
-    pub node_pending_validation: usize,
-    /// Locally-submitted transactions awaiting finalization (latency tracking).
-    pub node_locally_submitted: usize,
-    /// Block commits queued for batched flushing.
-    pub node_pending_block_commits: usize,
-    /// Transactions queued in the validation batch.
-    pub node_validation_batch: usize,
-    /// Certified headers queued in the verification batch.
-    pub node_certified_header_batch: usize,
-    /// Block heights queued for sync fetch.
-    pub node_block_sync_queued_heights: usize,
-    /// In-flight sync fetches.
-    pub node_block_sync_in_flight_fetches: usize,
-    /// Blocks with pending transaction fetches.
-    pub node_tx_fetch_blocks: usize,
-    /// Blocks with pending local provision fetches.
-    pub node_local_provision_fetch_pending: usize,
-    /// Blocks with pending finalization fetches.
-    pub node_finalization_fetch_pending: usize,
-    /// (shard, height) keys with pending cross-shard provision fetches.
-    pub node_provision_fetch_pending: usize,
-    /// (shard, height) keys with pending cross-shard execution-cert fetches.
-    pub node_exec_cert_fetch_pending: usize,
-    /// In-flight cross-shard remote-header range fetches across all shards.
-    pub node_remote_header_fetch_pending: usize,
-
-    // ── Storage (byte-level where available) ──
-    /// `RocksDB` block cache usage in bytes.
-    pub rocksdb_block_cache_usage_bytes: u64,
-    /// `RocksDB` memtable usage in bytes.
-    pub rocksdb_memtable_usage_bytes: u64,
+/// Which coordinator a memory readout belongs to. One gauge family per
+/// variant; the readout's own name is the label within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryFamily {
+    /// Shard consensus coordinator.
+    Shard,
+    /// Execution coordinator.
+    Execution,
+    /// Mempool coordinator.
+    Mempool,
+    /// Remote-header coordinator.
+    RemoteHeaders,
+    /// Provision coordinator.
+    Provisions,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -532,8 +396,22 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     // ── Memory ────────────────────────────────────────────────────────
 
-    /// Set memory usage metrics for all sub-state machines and storage.
-    fn set_memory_metrics(&self, metrics: &MemoryMetrics) {}
+    /// Set one collection-size readout for a coordinator on one vnode.
+    /// `family` names the coordinator ("shard", "exec", …), `field` the
+    /// readout within it.
+    fn set_vnode_memory_gauge(
+        &self,
+        family: MemoryFamily,
+        field: &str,
+        shard: u64,
+        validator_id: u64,
+        value: usize,
+    ) {
+    }
+
+    /// Set one collection-size readout for shard-scoped runner state,
+    /// which no single vnode owns.
+    fn set_shard_memory_gauge(&self, field: &str, shard: u64, value: usize) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1068,8 +946,20 @@ pub fn set_lock_contention(shard: u64, validator_id: u64, ratio: f64) {
 
 // ── Memory ────────────────────────────────────────────────────────
 
-/// Set memory usage metrics for all sub-state machines and storage.
+/// Set one collection-size readout for a coordinator on one vnode.
 #[inline]
-pub fn set_memory_metrics(metrics: &MemoryMetrics) {
-    recorder().set_memory_metrics(metrics);
+pub fn set_vnode_memory_gauge(
+    family: MemoryFamily,
+    field: &str,
+    shard: u64,
+    validator_id: u64,
+    value: usize,
+) {
+    recorder().set_vnode_memory_gauge(family, field, shard, validator_id, value);
+}
+
+/// Set one collection-size readout for shard-scoped runner state.
+#[inline]
+pub fn set_shard_memory_gauge(field: &str, shard: u64, value: usize) {
+    recorder().set_shard_memory_gauge(field, shard, value);
 }

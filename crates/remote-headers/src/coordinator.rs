@@ -67,6 +67,30 @@ pub struct RemoteHeaderMemoryStats {
     pub fork_siblings: usize,
 }
 
+impl RemoteHeaderMemoryStats {
+    /// Every readout as a `(field, value)` pair for the metrics backend.
+    ///
+    /// The destructure is the drift guard: a field added above does not
+    /// compile here until it is given a gauge.
+    #[must_use]
+    pub fn gauges(&self) -> Vec<(&'static str, usize)> {
+        let Self {
+            pending_headers,
+            verified_headers,
+            proven_headers,
+            expected_headers,
+            fork_siblings,
+        } = *self;
+        vec![
+            ("pending_headers", pending_headers),
+            ("verified_headers", verified_headers),
+            ("proven_headers", proven_headers),
+            ("expected_headers", expected_headers),
+            ("fork_siblings", fork_siblings),
+        ]
+    }
+}
+
 /// Tracks an expected header from a remote shard that hasn't arrived yet.
 ///
 /// Created from topology knowledge: if we know a shard exists, we expect

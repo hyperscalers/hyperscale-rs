@@ -74,6 +74,32 @@ pub struct ProvisionMemoryStats {
     pub queued_provisions: usize,
 }
 
+impl ProvisionMemoryStats {
+    /// Every readout as a `(field, value)` pair for the metrics backend.
+    ///
+    /// The destructure is the drift guard: a field added above does not
+    /// compile here until it is given a gauge.
+    #[must_use]
+    pub fn gauges(&self) -> Vec<(&'static str, usize)> {
+        let Self {
+            verified_remote_headers,
+            pending_provisions,
+            verified_provisions,
+            expected_provisions,
+            provisions_by_hash,
+            queued_provisions,
+        } = *self;
+        vec![
+            ("verified_remote_headers", verified_remote_headers),
+            ("pending_provisions", pending_provisions),
+            ("verified_provisions", verified_provisions),
+            ("expected_provisions", expected_provisions),
+            ("provisions_by_hash", provisions_by_hash),
+            ("queued_provisions", queued_provisions),
+        ]
+    }
+}
+
 /// Centralized provision coordination.
 ///
 /// Responsibilities:

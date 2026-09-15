@@ -1,139 +1,20 @@
-//! Metrics aggregation for the I/O loop.
+//! Prometheus emission for the I/O loop.
 //!
-//! Splits the per-tick metrics work into two phases:
-//!
-//! 1. [`NodeHost::metrics_snapshot`] runs on the pinned thread and reads
-//!    `.len()` / `.stats()` from every subsystem. No locks (beyond cheap
-//!    cache `len()`s), no I/O, no prometheus calls.
-//! 2. [`record_metrics`] takes the snapshot and dispatches the actual
-//!    prometheus `set_*` calls plus the `RocksDB` property queries that
-//!    feed memory metrics. Designed to run off-thread via `spawn_blocking`
-//!    so the I/O loop never blocks on compaction-pressured `RocksDB` reads.
-//!
-//! # Layered snapshot
-//!
-//! The snapshot mirrors the three-layer architecture: per-shard
-//! infrastructure counts in [`ShardMetrics`] (sync / fetch state) and
-//! per-vnode consensus counts in [`VnodeMetrics`] (shard consensus / mempool state).
-//! The prometheus backend uses flat (unlabeled) gauges, so
-//! [`record_metrics`] picks a representative shard + vnode via
-//! [`MetricsSnapshot::primary`] and emits its values.
-
-use std::collections::BTreeMap;
+//! [`ShardLoop::record_prometheus`] runs on the shard's pinned thread on
+//! the metrics tick and emits every gauge this shard owns: sync and fetch
+//! state per shard, consensus and mempool counts per vnode, and the
+//! coordinator collection sizes each `memory_stats().gauges()` reports.
+//! All reads are `.len()` / `.stats()` — no locks beyond cheap cache
+//! lengths, no I/O.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
-    MemoryMetrics, set_fetch_in_flight, set_fetch_oldest_in_flight_age_ms, set_memory_metrics,
-    set_mempool_size, set_shard_round, set_sync_blocks_behind, set_sync_in_progress,
-    set_sync_round_in_flight, set_view_changes, set_view_syncs,
+    MemoryFamily, set_fetch_in_flight, set_fetch_oldest_in_flight_age_ms, set_mempool_size,
+    set_shard_memory_gauge, set_shard_round, set_sync_blocks_behind, set_sync_in_progress,
+    set_sync_round_in_flight, set_view_changes, set_view_syncs, set_vnode_memory_gauge,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::{ShardId, ValidatorId};
-
-use crate::host::NodeHost;
-
-/// Per-shard infrastructure counts.
-#[allow(missing_docs)] // fields are flat readouts; names are the documentation
-pub struct ShardMetrics {
-    /// Block-sync FSM lag.
-    pub blocks_behind: u64,
-    pub is_syncing: bool,
-    pub block_sync_round_in_flight: usize,
-    /// Sum across every remote-header sync scope.
-    pub remote_header_blocks_behind: u64,
-    pub remote_header_is_syncing: bool,
-    pub remote_header_round_in_flight: usize,
-    /// Per-payload fetch in-flight counts.
-    pub fetch_transaction: usize,
-    pub fetch_provision: usize,
-    pub fetch_local_provision: usize,
-    pub fetch_exec_cert: usize,
-    pub fetch_finalization: usize,
-}
-
-/// Per-vnode consensus counts.
-#[allow(missing_docs)] // fields are flat readouts; names are the documentation
-pub struct VnodeMetrics {
-    /// Shard this vnode participates in. Carried alongside the consensus
-    /// counts so [`record_metrics`] can label the per-vnode gauges with
-    /// both `shard` and `validator_id`.
-    pub shard: ShardId,
-    pub shard_round: u64,
-    pub view_changes: u64,
-    pub view_syncs: u64,
-    pub mempool_size: usize,
-}
-
-/// Composite metrics snapshot.
-///
-/// Per-shard infrastructure metrics live in `shards`; per-vnode consensus
-/// metrics live in `vnodes`. `memory` is a flat readout populated from a
-/// representative shard + vnode (see [`Self::primary`]).
-pub struct MetricsSnapshot {
-    /// Per-hosted-shard infrastructure metrics.
-    pub shards: BTreeMap<ShardId, ShardMetrics>,
-    /// Per-hosted-vnode consensus metrics.
-    pub vnodes: BTreeMap<ValidatorId, VnodeMetrics>,
-    /// Flat memory readouts, assembled from primary shard + primary vnode.
-    pub memory: MemoryMetrics,
-}
-
-impl MetricsSnapshot {
-    /// Pick a representative `(ShardMetrics, VnodeMetrics)` pair for
-    /// the memory readouts and any flat gauge that's still process-wide
-    /// — the lowest hosted shard id and validator id. Returns `None` if
-    /// there's nothing hosted (shouldn't happen for a running
-    /// `NodeHost`).
-    #[must_use]
-    pub fn primary(&self) -> Option<(&ShardMetrics, &VnodeMetrics)> {
-        let shard = self.shards.values().next()?;
-        let vnode = self.vnodes.values().next()?;
-        Some((shard, vnode))
-    }
-}
-
-/// Record a [`MetricsSnapshot`] to the metrics backend.
-///
-/// Iterates the per-shard and per-vnode maps and emits one labeled gauge
-/// per entry. Process-wide `RocksDB` readouts (block-cache, memtable
-/// bytes) come from `rocksdb_block_cache_bytes` / `rocksdb_memtable_bytes`,
-/// summed across hosted shards by the caller. Designed to run off the
-/// pinned thread via `spawn_blocking`.
-pub fn record_metrics(
-    snapshot: MetricsSnapshot,
-    rocksdb_block_cache_bytes: u64,
-    rocksdb_memtable_bytes: u64,
-) {
-    for (shard_id, shard) in &snapshot.shards {
-        let s = shard_id.inner();
-        set_sync_blocks_behind("block", s, shard.blocks_behind);
-        set_sync_in_progress("block", s, shard.is_syncing);
-        set_sync_round_in_flight("block", s, shard.block_sync_round_in_flight);
-        set_sync_blocks_behind("remote_header", s, shard.remote_header_blocks_behind);
-        set_sync_in_progress("remote_header", s, shard.remote_header_is_syncing);
-        set_sync_round_in_flight("remote_header", s, shard.remote_header_round_in_flight);
-        set_fetch_in_flight("transaction", s, shard.fetch_transaction);
-        set_fetch_in_flight("provision", s, shard.fetch_provision);
-        set_fetch_in_flight("local_provision", s, shard.fetch_local_provision);
-        set_fetch_in_flight("exec_cert", s, shard.fetch_exec_cert);
-        set_fetch_in_flight("finalization", s, shard.fetch_finalization);
-    }
-
-    for (validator_id, vnode) in &snapshot.vnodes {
-        let s = vnode.shard.inner();
-        let v = validator_id.inner();
-        set_shard_round(s, v, vnode.shard_round);
-        set_view_changes(s, v, vnode.view_changes);
-        set_view_syncs(s, v, vnode.view_syncs);
-        set_mempool_size(s, v, vnode.mempool_size);
-    }
-
-    let mut memory = snapshot.memory;
-    memory.rocksdb_block_cache_usage_bytes = rocksdb_block_cache_bytes;
-    memory.rocksdb_memtable_usage_bytes = rocksdb_memtable_bytes;
-    set_memory_metrics(&memory);
-}
 
 impl<S, N, D> super::ShardLoop<S, N, D>
 where
@@ -143,8 +24,6 @@ where
 {
     /// Emit this shard's per-shard and per-vnode prometheus gauges.
     /// Called from the shard's pinned thread on the metrics tick.
-    /// Process-wide gauges (memory, `RocksDB`) are emitted separately
-    /// by the runner after aggregating per-shard contributions.
     pub fn record_prometheus(&self) {
         let s = self.shard.inner();
         let fetches = self.io.fetch_metrics();
@@ -198,180 +77,86 @@ where
             set_view_syncs(s, v, shard_stats.view_syncs);
             set_mempool_size(s, v, mempool.len());
         }
+
+        self.record_memory_gauges();
     }
-}
 
-impl<S, N, D> NodeHost<S, N, D>
-where
-    S: ShardStorage,
-    N: Network,
-    D: Dispatch,
-{
-    /// Capture a lightweight metrics snapshot from state-machine internals.
-    ///
-    /// Only reads `.len()` / `.stats()` from subsystems — no locks, no I/O,
-    /// no prometheus calls. The caller dispatches [`record_metrics`] off-thread
-    /// to do the expensive work (`RocksDB` queries, prometheus recording).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `Mutex`-protected caches are poisoned.
-    #[must_use]
-    #[allow(clippy::too_many_lines)] // single aggregation snapshot; cheap reads stitched together
-    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        let mut shards = BTreeMap::new();
-        let mut vnodes = BTreeMap::new();
+    /// Emit every coordinator's collection sizes, plus the runner state no
+    /// single vnode owns.
+    fn record_memory_gauges(&self) {
+        let s = self.shard.inner();
+        let fetches = self.io.fetch_metrics();
+        let rh = &self.io.cross_shard.remote_header_sync;
 
-        for shard in self.hosted_shards() {
-            let fetches = self.shard_io(shard).fetch_metrics();
-            let block_sync = &self.shard_io(shard).consensus.block_sync;
-            let rh = &self.shard_io(shard).cross_shard.remote_header_sync;
-            shards.insert(
-                shard,
-                ShardMetrics {
-                    blocks_behind: block_sync.blocks_behind(),
-                    is_syncing: block_sync.is_syncing(),
-                    block_sync_round_in_flight: block_sync.in_flight_ranges(),
-                    remote_header_blocks_behind: rh.total_blocks_behind(),
-                    remote_header_is_syncing: rh.is_syncing(),
-                    remote_header_round_in_flight: rh.in_flight_ranges(),
-                    fetch_transaction: fetches.transaction_in_flight,
-                    fetch_provision: fetches.provision_in_flight,
-                    fetch_local_provision: fetches.local_provision_in_flight,
-                    fetch_exec_cert: fetches.exec_cert_in_flight,
-                    fetch_finalization: fetches.finalization_in_flight,
-                },
-            );
-
-            for vnode_idx in 0..self.vnodes_len(shard) {
-                let vnode = self.vnode(shard, vnode_idx);
-                let state = &vnode.state;
-                let shard_stats = state.shard_coordinator().stats();
-                let mempool = state.mempool_coordinator();
-                vnodes.insert(
-                    vnode.validator_id,
-                    VnodeMetrics {
-                        shard,
-                        shard_round: shard_stats.current_round,
-                        view_changes: shard_stats.view_changes,
-                        view_syncs: shard_stats.view_syncs,
-                        mempool_size: mempool.len(),
-                    },
-                );
+        for vnode in &self.vnodes {
+            let v = vnode.validator_id.inner();
+            let state = &vnode.state;
+            let mempool = state.mempool_coordinator();
+            let families = [
+                (
+                    MemoryFamily::Shard,
+                    state.shard_coordinator().memory_stats().gauges(),
+                ),
+                (
+                    MemoryFamily::Execution,
+                    state.execution_coordinator().memory_stats().gauges(),
+                ),
+                (MemoryFamily::Mempool, mempool.memory_stats().gauges()),
+                (
+                    MemoryFamily::RemoteHeaders,
+                    state.remote_headers_coordinator().memory_stats().gauges(),
+                ),
+                (
+                    MemoryFamily::Provisions,
+                    state.provisions_coordinator().memory_stats().gauges(),
+                ),
+            ];
+            for (family, gauges) in families {
+                for (field, value) in gauges {
+                    set_vnode_memory_gauge(family, field, s, v, value);
+                }
             }
         }
 
-        // Memory readouts come from a primary shard + vnode; iteration
-        // order matches the maps above so this aligns with
-        // `MetricsSnapshot::primary`.
-        let primary_shard = self
-            .hosted_shards()
-            .next()
-            .expect("NodeHost hosts at least one shard");
-        let primary_vnode = &self.vnode(primary_shard, 0).state;
-        let shard_mem = primary_vnode.shard_coordinator().memory_stats();
-        let exec_mem = primary_vnode.execution_coordinator().memory_stats();
-        let mempool_mem = primary_vnode.mempool_coordinator().memory_stats();
-        let prov_mem = primary_vnode.provisions_coordinator().memory_stats();
-        let rh_mem = primary_vnode.remote_headers_coordinator().memory_stats();
-        let fetches = self.shard_io(primary_shard).fetch_metrics();
-        let block_sync_status = self
-            .shard_io(primary_shard)
-            .consensus
-            .block_sync
-            .block_sync_status();
-
-        let memory = MemoryMetrics {
-            // Shard consensus
-            shard_pending_blocks: shard_mem.pending_blocks,
-            shard_vote_sets: shard_mem.vote_sets,
-            shard_pending_commits: shard_mem.pending_commits,
-            shard_pending_commits_awaiting_data: shard_mem.pending_commits_awaiting_data,
-            shard_received_votes_by_height: shard_mem.received_votes_by_height,
-            shard_committed_tx_lookup: shard_mem.committed_tx_lookup,
-            shard_committed_resolution_lookup: shard_mem.committed_resolution_lookup,
-            shard_committed_provision_lookup: shard_mem.committed_provision_lookup,
-            shard_pending_qc_verifications: shard_mem.pending_qc_verifications,
-            shard_verified_qcs: shard_mem.verified_qcs,
-            shard_pending_state_root_verifications: shard_mem.pending_state_root_verifications,
-            shard_buffered_synced_blocks: shard_mem.buffered_synced_blocks,
-            shard_pending_synced_block_verifications: shard_mem.pending_synced_block_verifications,
-            // Execution
-            exec_cache_entries: exec_mem.tick_execution_receipts,
-            exec_finalizations: exec_mem.finalizations,
-            exec_ticks: exec_mem.ticks,
-            exec_vote_trackers: exec_mem.vote_trackers,
-            exec_early_votes: exec_mem.early_votes,
-            exec_expected_exec_certs: exec_mem.expected_exec_certs,
-            exec_absorbed_provisions: exec_mem.absorbed_provisions,
-            exec_required_provision_shards: exec_mem.required_provision_shards,
-            exec_ticks_with_ec: exec_mem.ticks_with_ec,
-            exec_pending_vote_retries: exec_mem.pending_vote_retries,
-            exec_tick_assignments: exec_mem.tick_assignments,
-            exec_early_attestations: exec_mem.early_attestations,
-            exec_pending_routing: exec_mem.pending_routing,
-            exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
-            exec_outbound_certs: exec_mem.outbound_certs,
-            exec_proven_remote_blocks: exec_mem.proven_remote_blocks,
-            exec_unproven_ecs: exec_mem.unproven_ecs,
-            // Mempool
-            mempool_pool: mempool_mem.pool,
-            mempool_pending: mempool_mem.pending,
-            mempool_tombstones: mempool_mem.tombstones,
-            // Remote Headers
-            rh_pending_headers: rh_mem.pending_headers,
-            rh_verified_headers: rh_mem.verified_headers,
-            rh_proven_headers: rh_mem.proven_headers,
-            rh_fork_siblings: rh_mem.fork_siblings,
-            rh_expected_headers: rh_mem.expected_headers,
-            // Provision
-            prov_verified_remote_headers: prov_mem.verified_remote_headers,
-            prov_pending_provisions: prov_mem.pending_provisions,
-            prov_verified_provisions: prov_mem.verified_provisions,
-            prov_expected_provisions: prov_mem.expected_provisions,
-            prov_provisions_by_hash: prov_mem.provisions_by_hash,
-            prov_queued_provisions: prov_mem.queued_provisions,
-            // Node (io_loop, per-shard)
-            node_tx_store: self.shard_io(primary_shard).caches.tx_store.len(),
-            node_tx_status_cache: self.process.tx_status.len(),
-            node_finalization_cache: self.shard_io(primary_shard).caches.finalization.len(),
-            node_provision_cache: self.shard_io(primary_shard).caches.provision_store.len(),
-            node_exec_cert_cache: self.shard_io(primary_shard).caches.exec_cert_store.len(),
-            node_prepared_commits: self.shard_io(primary_shard).block_commit.prepared_len(),
-            node_pending_validation: self
-                .shard_io(primary_shard)
-                .mempool
-                .pending_validation
-                .len(),
-            node_locally_submitted: self.shard_io(primary_shard).mempool.locally_submitted.len(),
-            node_pending_block_commits: self.shard_io(primary_shard).block_commit.pending_len(),
-            node_validation_batch: self.shard_io(primary_shard).mempool.validation_batch.len(),
-            node_certified_header_batch: self
-                .shard_io(primary_shard)
-                .consensus
-                .certified_header_batch
-                .len(),
-            node_block_sync_queued_heights: block_sync_status.queued_heights,
-            node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
-            node_tx_fetch_blocks: fetches.transaction_pending,
-            node_local_provision_fetch_pending: fetches.local_provision_pending,
-            node_finalization_fetch_pending: fetches.finalization_pending,
-            node_provision_fetch_pending: fetches.provision_pending,
-            node_exec_cert_fetch_pending: fetches.exec_cert_pending,
-            node_remote_header_fetch_pending: self
-                .shard_io(primary_shard)
-                .cross_shard
-                .remote_header_sync
-                .in_flight_ranges(),
-            // Storage — filled in by record_metrics off-thread.
-            rocksdb_block_cache_usage_bytes: 0,
-            rocksdb_memtable_usage_bytes: 0,
-        };
-
-        MetricsSnapshot {
-            shards,
-            vnodes,
-            memory,
+        // `tx_status` is process-wide; every hosted shard reports the same
+        // figure under its own label.
+        let block_sync_status = self.io.consensus.block_sync.block_sync_status();
+        let caches = &self.io.caches;
+        let mempool_io = &self.io.mempool;
+        for (field, value) in [
+            ("tx_store", caches.tx_store.len()),
+            ("tx_status_cache", self.process.tx_status.len()),
+            ("finalization_cache", caches.finalization.len()),
+            ("provision_cache", caches.provision_store.len()),
+            ("exec_cert_cache", caches.exec_cert_store.len()),
+            ("prepared_commits", self.io.block_commit.prepared_len()),
+            ("pending_block_commits", self.io.block_commit.pending_len()),
+            ("pending_validation", mempool_io.pending_validation.len()),
+            ("locally_submitted", mempool_io.locally_submitted.len()),
+            ("validation_batch", mempool_io.validation_batch.len()),
+            (
+                "certified_header_batch",
+                self.io.consensus.certified_header_batch.len(),
+            ),
+            (
+                "block_sync_queued_heights",
+                block_sync_status.queued_heights,
+            ),
+            (
+                "block_sync_in_flight_fetches",
+                block_sync_status.pending_fetches,
+            ),
+            ("tx_fetch_blocks", fetches.transaction_pending),
+            (
+                "local_provision_fetch_pending",
+                fetches.local_provision_pending,
+            ),
+            ("finalization_fetch_pending", fetches.finalization_pending),
+            ("provision_fetch_pending", fetches.provision_pending),
+            ("exec_cert_fetch_pending", fetches.exec_cert_pending),
+            ("remote_header_fetch_pending", rh.in_flight_ranges()),
+        ] {
+            set_shard_memory_gauge(field, s, value);
         }
     }
 }

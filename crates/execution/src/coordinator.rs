@@ -243,6 +243,56 @@ pub struct ExecutionMemoryStats {
     pub unproven_ecs: usize,
 }
 
+impl ExecutionMemoryStats {
+    /// Every readout as a `(field, value)` pair for the metrics backend.
+    ///
+    /// The destructure is the drift guard: a field added above does not
+    /// compile here until it is given a gauge.
+    #[must_use]
+    pub fn gauges(&self) -> Vec<(&'static str, usize)> {
+        let Self {
+            tick_execution_receipts,
+            finalizations,
+            ticks,
+            unresolved_txs,
+            vote_trackers,
+            early_votes,
+            expected_exec_certs,
+            absorbed_provisions,
+            required_provision_shards,
+            ticks_with_ec,
+            pending_vote_retries,
+            tick_assignments,
+            early_attestations,
+            pending_routing,
+            fulfilled_exec_certs,
+            outbound_certs,
+            proven_remote_blocks,
+            unproven_ecs,
+        } = *self;
+        vec![
+            ("tick_execution_receipts", tick_execution_receipts),
+            ("finalizations", finalizations),
+            ("ticks", ticks),
+            ("unresolved_txs", unresolved_txs),
+            ("vote_trackers", vote_trackers),
+            ("early_votes", early_votes),
+            ("expected_exec_certs", expected_exec_certs),
+            ("absorbed_provisions", absorbed_provisions),
+            ("required_provision_shards", required_provision_shards),
+            ("ticks_with_ec", ticks_with_ec),
+            ("pending_vote_retries", pending_vote_retries),
+            ("tick_assignments", tick_assignments),
+            ("early_attestations", early_attestations),
+            ("pending_routing", pending_routing),
+            ("fulfilled_exec_certs", fulfilled_exec_certs),
+            ("outbound_certs", outbound_certs),
+            ("proven_remote_blocks", proven_remote_blocks),
+            ("unproven_ecs", unproven_ecs),
+        ]
+    }
+}
+
 /// The name a housekeeping member over held records takes on the chain
 /// disposing of them.
 ///
