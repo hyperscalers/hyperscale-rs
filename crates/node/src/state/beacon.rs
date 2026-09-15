@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BeaconProposal, BeaconProposalVerifyContext, Epoch, ValidatorId, Verifiable,
+    BeaconProposal, BeaconProposalVerifyContext, Epoch, ValidatorId, Verifiable, Verify,
 };
 use tracing::warn;
 
@@ -62,18 +62,11 @@ impl NodeStateMachine {
             ProtocolEvent::BeaconBlockReceived { block } => {
                 self.beacon_coordinator.on_beacon_block_received(block)
             }
-            ProtocolEvent::UnverifiedBeaconProposalReceived {
+            ProtocolEvent::BeaconProposalReceived {
                 from,
                 epoch,
                 proposal,
-            } => self.dispatch_unverified_beacon_proposal(from, epoch, proposal),
-            ProtocolEvent::VerifiedBeaconProposalReceived {
-                from,
-                epoch,
-                proposal,
-            } => self
-                .beacon_coordinator
-                .on_beacon_proposal_received(from, epoch, proposal),
+            } => self.dispatch_beacon_proposal(from, epoch, proposal),
             ProtocolEvent::UnverifiedRatifyVoteReceived { vote } => self
                 .beacon_coordinator
                 .on_unverified_ratify_vote_received(vote),
@@ -190,16 +183,34 @@ impl NodeStateMachine {
         }
     }
 
-    /// VRF-verify an inbound `BeaconProposal` against the sender's
-    /// pubkey, then hand the resulting `Verified` to the coordinator.
-    /// Drops with a warn if the sender isn't in `BeaconState.validators`
-    /// or the VRF reveal fails.
-    fn dispatch_unverified_beacon_proposal(
+    /// Hand a `BeaconProposal` to the coordinator, VRF-verifying it
+    /// against the sender's pubkey first when the marker isn't already
+    /// live.
+    ///
+    /// A sealed proposal goes straight through: this validator's own
+    /// sign-and-send produced the reveal, and a colocated sender's
+    /// notification keeps the marker because `notify` hands local
+    /// recipients the in-memory message. The `BeaconState.validators`
+    /// lookup exists to supply the key the predicate needs, so it sits
+    /// on the path that verifies. Drops with a warn if an unsealed
+    /// proposal's sender isn't in `BeaconState.validators`, or its VRF
+    /// reveal fails.
+    fn dispatch_beacon_proposal(
         &mut self,
         from: ValidatorId,
         epoch: Epoch,
         proposal: Arc<Verifiable<BeaconProposal>>,
     ) -> Vec<Action> {
+        let raw = match Arc::unwrap_or_clone(proposal).into_verified() {
+            Ok(verified) => {
+                return self.beacon_coordinator.on_beacon_proposal_received(
+                    from,
+                    epoch,
+                    Arc::new(verified),
+                );
+            }
+            Err(raw) => raw,
+        };
         let Some(record) = self
             .beacon_coordinator
             .current_state()
@@ -208,7 +219,7 @@ impl NodeStateMachine {
         else {
             warn!(
                 ?from,
-                "UnverifiedBeaconProposalReceived from validator not in BeaconState — dropping",
+                "BeaconProposalReceived from validator not in BeaconState — dropping",
             );
             return Vec::new();
         };
@@ -218,17 +229,17 @@ impl NodeStateMachine {
             epoch,
             sender_pk: record.pubkey,
         };
-        match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
+        match raw.verify(&ctx) {
             Ok(verified) => {
                 self.beacon_coordinator
                     .on_beacon_proposal_received(from, epoch, Arc::new(verified))
             }
-            Err((_, err)) => {
+            Err(err) => {
                 warn!(
                     ?from,
                     epoch = epoch.inner(),
                     ?err,
-                    "UnverifiedBeaconProposalReceived VRF verification failed — dropping",
+                    "BeaconProposalReceived VRF verification failed — dropping",
                 );
                 Vec::new()
             }

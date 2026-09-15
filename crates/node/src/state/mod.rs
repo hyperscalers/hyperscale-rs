@@ -482,8 +482,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::UnverifiedSpcEmptyViewReceived { .. }
             | ProtocolEvent::VerifiedSpcEmptyViewReceived { .. }
             | ProtocolEvent::BeaconBlockReceived { .. }
-            | ProtocolEvent::UnverifiedBeaconProposalReceived { .. }
-            | ProtocolEvent::VerifiedBeaconProposalReceived { .. }
+            | ProtocolEvent::BeaconProposalReceived { .. }
             | ProtocolEvent::UnverifiedRatifyVoteReceived { .. }
             | ProtocolEvent::VerifiedRatifyVoteReceived { .. }
             | ProtocolEvent::BeaconCandidateReceived { .. }

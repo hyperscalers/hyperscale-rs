@@ -571,17 +571,10 @@ where
                             sender_pk,
                         );
                     }
-                    let event = match Arc::unwrap_or_clone(gossip.proposal).into_verified() {
-                        Ok(upgraded) => ProtocolEvent::VerifiedBeaconProposalReceived {
-                            from,
-                            epoch,
-                            proposal: Arc::new(upgraded),
-                        },
-                        Err(unverified) => ProtocolEvent::UnverifiedBeaconProposalReceived {
-                            from,
-                            epoch,
-                            proposal: Arc::new(unverified.into()),
-                        },
+                    let event = ProtocolEvent::BeaconProposalReceived {
+                        from,
+                        epoch,
+                        proposal: gossip.proposal,
                     };
                     fan_beacon_event(&senders, &beacon_tx, &route_active, event);
                 },

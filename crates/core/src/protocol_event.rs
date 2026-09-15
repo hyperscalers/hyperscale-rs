@@ -904,32 +904,21 @@ pub enum ProtocolEvent {
         block: Arc<Verifiable<CertifiedBeaconBlock>>,
     },
 
-    /// A peer committee member's `BeaconProposal` arrived over the
-    /// wire. `IoLoop` has already authenticated the sender; the
-    /// coordinator dispatches the VRF reveal check before admission.
-    UnverifiedBeaconProposalReceived {
+    /// A `BeaconProposal` arrived. `IoLoop` has already authenticated
+    /// the sender. A wire decode lands the wrapper unverified and the
+    /// VRF reveal is checked before admission; the local
+    /// `Action::BuildAndBroadcastBeaconProposal` loopback and a
+    /// colocated sender both keep the marker, and admit directly.
+    BeaconProposalReceived {
         /// Authenticated sender id.
         from: ValidatorId,
         /// Epoch the proposal targets — bound by the VRF reveal
         /// inside `proposal`.
         epoch: Epoch,
-        /// Received proposal.
+        /// Received proposal, sealed via
+        /// [`Verified::<BeaconProposal>::sign_local`] when its producer
+        /// held the signing key.
         proposal: Arc<Verifiable<BeaconProposal>>,
-    },
-
-    /// A locally-signed `BeaconProposal` arrived via the
-    /// `Action::BuildAndBroadcastBeaconProposal` self-loopback path.
-    /// The signing-key holder produced the VRF reveal, so the proposal
-    /// is verified by construction — coordinator skips the VRF check
-    /// and admits directly.
-    VerifiedBeaconProposalReceived {
-        /// Local validator id (the loopback sender).
-        from: ValidatorId,
-        /// Epoch the proposal targets.
-        epoch: Epoch,
-        /// Verified proposal, sealed via
-        /// [`Verified::<BeaconProposal>::sign_local`].
-        proposal: Arc<Verified<BeaconProposal>>,
     },
 
     /// A [`RatifyVote`] arrived over the wire. Wire decode lands the
