@@ -20,10 +20,13 @@
 //! the composer that offered its content would have offered it against
 //! the same mirror.
 
+use std::collections::BTreeMap;
+
 use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
-    AbandonmentRecord, Block, CounterpartMirror, ProvenAnchors, ProvenCells, SettledSetVerdict,
-    ShardId, StateClaim, TopologySchedule, WeightedTimestamp, settled_set_verdict,
+    AbandonmentRecord, Anchor, Block, CounterpartMirror, ProvenAnchors, ProvenCells,
+    SettledSetVerdict, ShardId, StateClaim, SubstateKey, TopologySchedule, WeightedTimestamp,
+    settled_set_verdict,
 };
 
 use crate::precut::{Precut, PrecutStatus};
@@ -221,11 +224,29 @@ impl VoteFence<'_> {
     /// or everything it has yet to prove.
     pub fn state_claims(&self, block: &Block) -> Result<(), Withheld> {
         let mut wanted = Vec::new();
+        // Keys to relay, gathered by anchor across every claim naming it.
+        // A block may carry several claims at one anchor — admission only
+        // orders them — and the relay fetch retires by anchor, so one
+        // request per claim would retire the claims before it: each pass
+        // names fewer keys than the anchor is actually waiting on, and
+        // the ids the earlier claims asked for are released before they
+        // dispatch. Asking once per anchor is what makes that retirement
+        // the truth about the anchor.
+        let mut relay: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         let mut unread = 0usize;
         for claim in block.state_claims() {
             if self.anchor_stands(claim, &mut wanted)? {
-                unread += self.cells_stand(claim, &mut wanted)?;
+                unread += self.cells_stand(claim, &mut relay)?;
             }
+        }
+        for (anchor, keys) in relay {
+            wanted.push(Action::Fetch(FetchRequest::RelayedStateProof {
+                anchor,
+                keys,
+                shard: self.local_shard,
+                preferred: None,
+                class: None,
+            }));
         }
         if wanted.is_empty() {
             Ok(())
@@ -281,7 +302,11 @@ impl VoteFence<'_> {
     /// claim: they were proven together on the proposer, so one proof
     /// answers all of them and asking cell by cell would fetch the same
     /// bytes repeatedly.
-    fn cells_stand(&self, claim: &StateClaim, wanted: &mut Vec<Action>) -> Result<usize, Withheld> {
+    fn cells_stand(
+        &self,
+        claim: &StateClaim,
+        relay: &mut BTreeMap<Anchor, Vec<SubstateKey>>,
+    ) -> Result<usize, Withheld> {
         let mut unread = Vec::new();
         for &(key, stated) in &claim.cells {
             match self.proven_cells.reading(claim.anchor, key) {
@@ -299,13 +324,7 @@ impl VoteFence<'_> {
         }
         let count = unread.len();
         if !unread.is_empty() {
-            wanted.push(Action::Fetch(FetchRequest::RelayedStateProof {
-                anchor: claim.anchor,
-                keys: unread,
-                shard: self.local_shard,
-                preferred: None,
-                class: None,
-            }));
+            relay.entry(claim.anchor).or_default().extend(unread);
         }
         Ok(count)
     }
@@ -486,6 +505,46 @@ mod tests {
             panic!("a contradicted reading refuses rather than defers");
         };
         assert!(why.contains("this validator proved"), "{why}");
+    }
+
+    /// Two claims at one anchor ask once, for the union of what they
+    /// leave unread.
+    ///
+    /// Admission only orders claims, so a block may carry several at one
+    /// anchor. The relay fetch retires by anchor — every id it holds
+    /// under one that the fence no longer names — so a request per claim
+    /// would name fewer keys than the anchor is waiting on, and the
+    /// second would retire the first's ids before they ever dispatched.
+    /// The vote would then wait on a proof nobody is fetching.
+    #[test]
+    fn two_claims_at_one_anchor_ask_once_for_both() {
+        let (first, second) = (test_key(1), test_key(2));
+        let anchor = anchor_at(b"root", 4);
+        let held = Held::nothing().proved(anchor, []);
+
+        let block = block_claiming(vec![
+            StateClaim::new(anchor, [(first, Inclusion::Absent)]),
+            StateClaim::new(anchor, [(second, Inclusion::Absent)]),
+        ]);
+        let Withheld::Deferred { wanted, .. } = held.judge(&block).expect_err("nothing is proven")
+        else {
+            panic!("an unproven reading defers rather than refusing");
+        };
+        match wanted.as_slice() {
+            [
+                Action::Fetch(FetchRequest::RelayedStateProof {
+                    anchor: at, keys, ..
+                }),
+            ] => {
+                assert_eq!(*at, anchor);
+                assert_eq!(
+                    keys,
+                    &[first, second],
+                    "the anchor is asked for everything both claims leave unread",
+                );
+            }
+            other => panic!("expected one relay for the anchor, got {other:?}"),
+        }
     }
 
     /// A cell this validator has not proven defers, and the deferral
