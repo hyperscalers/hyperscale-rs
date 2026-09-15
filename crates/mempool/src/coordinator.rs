@@ -1172,6 +1172,19 @@ impl MempoolCoordinator {
         self.pending_count() >= self.config.max_pending
     }
 
+    /// Seed the committed frontier a restart resumes at.
+    ///
+    /// The admission gate compares a transaction's admissibility deadline
+    /// against [`Self::current_ts`], and the only other thing that moves
+    /// that clock is a commit. Left at zero the comparison is vacuous, so
+    /// a restarted node admits every gossiped transaction — expired ones
+    /// included — until its first commit lands. Execution's commit
+    /// frontier seeds from the same recovered tip for the same reason.
+    pub const fn seed_committed(&mut self, height: BlockHeight, ts: WeightedTimestamp) {
+        self.current_height = height;
+        self.current_ts = ts;
+    }
+
     /// Get the mempool configuration.
     #[must_use]
     pub const fn config(&self) -> &MempoolConfig {
@@ -2740,6 +2753,39 @@ mod tests {
         );
         assert!(actions.is_empty());
         assert!(mempool.status(&tx.hash()).is_none());
+    }
+
+    /// A fresh coordinator's clock sits at zero, where the admission
+    /// gate's `admissible_until <= current_ts` is vacuous and every
+    /// expired transaction gossiped at it is admitted. Only a commit
+    /// moves that clock, so between a restart and the first commit the
+    /// pool is wide open — unless the restart seeds it.
+    #[test]
+    fn an_unseeded_clock_admits_an_expired_transaction_and_a_seeded_one_does_not() {
+        let topology_snapshot = make_test_topology();
+        let tx = tx_with_end(1, 1_000);
+
+        let mut fresh = MempoolCoordinator::new(ShardId::ROOT);
+        fresh.on_transaction_gossip(
+            &topology_snapshot,
+            Arc::clone(&tx),
+            false,
+            LocalTimestamp::ZERO,
+        );
+        assert!(
+            fresh.status(&tx.hash()).is_some(),
+            "the vacuous gate this seeding exists to close",
+        );
+
+        let mut seeded = MempoolCoordinator::new(ShardId::ROOT);
+        seeded.seed_committed(BlockHeight::new(42), WeightedTimestamp::from_millis(2_000));
+        seeded.on_transaction_gossip(
+            &topology_snapshot,
+            Arc::clone(&tx),
+            false,
+            LocalTimestamp::ZERO,
+        );
+        assert!(seeded.status(&tx.hash()).is_none());
     }
 
     #[test]

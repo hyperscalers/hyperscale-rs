@@ -36,6 +36,7 @@ use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
     BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, ValidatorId, Verifier,
+    WeightedTimestamp,
 };
 
 /// The coordinators a vnode runs while seated on a shard.
@@ -129,8 +130,23 @@ impl ShardParticipation {
         exec_cert_store: Arc<ExecCertStore>,
         finalization_store: Arc<FinalizationStore>,
     ) -> Self {
-        let mempool_coordinator =
+        let mut mempool_coordinator =
             MempoolCoordinator::with_tx_store(local_shard, mempool_config, tx_store);
+        // The admission gate reads this clock, and only a commit moves it:
+        // unseeded it sits at zero and admits everything, expired
+        // transactions included, until the first post-restart commit.
+        mempool_coordinator.seed_committed(
+            recovered.committed_height,
+            recovered
+                .committed_block_anchor_wt
+                .or_else(|| {
+                    recovered
+                        .latest_qc
+                        .as_ref()
+                        .map(|qc| qc.weighted_timestamp())
+                })
+                .unwrap_or(WeightedTimestamp::ZERO),
+        );
         // Execution's commit frontier and its account of what is still in
         // flight both seed from the same recovered tip the shard
         // coordinator restores, so the first post-restart commit
