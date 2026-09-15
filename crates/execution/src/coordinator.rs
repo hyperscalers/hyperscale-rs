@@ -4090,7 +4090,7 @@ mod tests {
         Window,
     };
     use hyperscale_vm_effects::{CrossingCell, Hash32, SubintentHash};
-    use hyperscale_vm_types::{ResourceAddr, Seeded};
+    use hyperscale_vm_types::{Drawn, ResourceAddr};
 
     use super::*;
     use crate::counterparts::HeldRecord;
@@ -6776,7 +6776,7 @@ mod tests {
 
         assert_eq!(
             env.seeds.at(Epoch::GENESIS.inner()),
-            Seeded::Ready([0xA1; 32]),
+            Drawn::Ready([0xA1; 32]),
             "the tick reads the seed its block's committee carried",
         );
         // And the grid is the schedule's own window length, which is

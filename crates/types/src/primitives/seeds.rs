@@ -52,23 +52,6 @@ pub struct SeedRing(BTreeMap<Epoch, EpochSeed>);
 /// epochs.
 pub const SEED_WINDOW_EPOCHS: u64 = 64;
 
-/// What the ring holds for one epoch.
-///
-/// The three answers of
-/// [`ScheduleLookup`](crate::ScheduleLookup), for the same reason it has
-/// them: an epoch the fold has not reached yet is a wait, and one below
-/// the floor is a refusal, and telling them apart is what lets a caller
-/// know whether to try again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SeedLookup {
-    /// The epoch's seed, retained.
-    Seed(EpochSeed),
-    /// Newer than every entry — this node's beacon has not folded it.
-    NotYetCommitted,
-    /// Older than every entry, and gone for good.
-    Evicted,
-}
-
 impl SeedRing {
     /// Record `epoch`'s seed and drop whatever fell out of the window.
     pub fn record(&mut self, epoch: Epoch, seed: EpochSeed) {
@@ -77,17 +60,16 @@ impl SeedRing {
         self.0.retain(|held, _| *held >= floor);
     }
 
-    /// The seed `epoch` was rolled with, or which side of the window it
-    /// fell outside.
+    /// The seed `epoch` was rolled with, if the ring still holds it.
+    ///
+    /// Which side of the window a miss fell outside is deliberately not
+    /// answered. The distinction would be a wait-or-refuse for a caller
+    /// that branched on it, and none does: what a draw settles against
+    /// is the window [`Self::folded`] and [`Self::newest`] build, which
+    /// carries the same fact where the kernel reads it.
     #[must_use]
-    pub fn at(&self, epoch: Epoch) -> SeedLookup {
-        if let Some(seed) = self.0.get(&epoch) {
-            return SeedLookup::Seed(*seed);
-        }
-        match self.0.keys().next_back() {
-            Some(newest) if epoch <= *newest => SeedLookup::Evicted,
-            _ => SeedLookup::NotYetCommitted,
-        }
+    pub fn get(&self, epoch: Epoch) -> Option<EpochSeed> {
+        self.0.get(&epoch).copied()
     }
 
     /// The epochs whose seeds came from the reveal fold, which are the
@@ -137,40 +119,36 @@ mod tests {
     fn a_recorded_seed_reads_back_at_its_own_epoch() {
         let mut ring = SeedRing::default();
         ring.record(Epoch::new(7), seed(0x11));
-        assert_eq!(ring.at(Epoch::new(7)), SeedLookup::Seed(seed(0x11)));
+        assert_eq!(ring.get(Epoch::new(7)), Some(seed(0x11)));
     }
 
-    /// The two absences are different answers: one says wait and the
-    /// other says never, and a caller that cannot tell them apart either
-    /// spins on a refusal or gives up on a wait.
+    /// The window's extent: the floor is inside it, a step below is
+    /// gone, and anything past the newest fold was never in it.
     #[test]
-    fn the_two_sides_of_the_window_answer_apart() {
+    fn the_window_keeps_its_floor_and_drops_what_fell_below() {
         let mut ring = SeedRing::default();
         for epoch in 1..=(SEED_WINDOW_EPOCHS + 10) {
             ring.record(Epoch::new(epoch), seed(0x22));
         }
         let newest = SEED_WINDOW_EPOCHS + 10;
 
-        assert_eq!(ring.at(Epoch::new(newest)), SeedLookup::Seed(seed(0x22)));
-        assert_eq!(ring.at(Epoch::new(newest + 1)), SeedLookup::NotYetCommitted);
-        assert_eq!(ring.at(Epoch::new(1)), SeedLookup::Evicted);
+        assert_eq!(ring.get(Epoch::new(newest)), Some(seed(0x22)));
+        assert_eq!(ring.get(Epoch::new(newest + 1)), None);
+        assert_eq!(ring.get(Epoch::new(1)), None);
         assert_eq!(
-            ring.at(Epoch::new(newest - SEED_WINDOW_EPOCHS)),
-            SeedLookup::Seed(seed(0x22)),
+            ring.get(Epoch::new(newest - SEED_WINDOW_EPOCHS)),
+            Some(seed(0x22)),
             "the floor itself is inside the window"
         );
-        assert_eq!(
-            ring.at(Epoch::new(newest - SEED_WINDOW_EPOCHS - 1)),
-            SeedLookup::Evicted,
-        );
+        assert_eq!(ring.get(Epoch::new(newest - SEED_WINDOW_EPOCHS - 1)), None);
     }
 
-    /// Before the first fold every epoch is ahead of the ring, including
-    /// genesis: a network with no seed has nothing to be past.
+    /// Before the first fold the ring holds nothing, genesis included: a
+    /// network with no seed has nothing to be past.
     #[test]
-    fn an_empty_ring_is_ahead_of_everything() {
+    fn an_empty_ring_holds_nothing() {
         let ring = SeedRing::default();
-        assert_eq!(ring.at(Epoch::GENESIS), SeedLookup::NotYetCommitted);
+        assert_eq!(ring.get(Epoch::GENESIS), None);
         assert!(ring.is_empty());
         assert_eq!(ring.newest(), None);
     }

@@ -131,7 +131,7 @@ pub use primitives::merkle::{
 };
 pub use primitives::positional_bundle::PositionalBundle;
 pub use primitives::randomness::{RANDOMNESS_BYTES, Randomness};
-pub use primitives::seeds::{EpochSeed, SEED_WINDOW_EPOCHS, SeedLookup, SeedRing, SeedSource};
+pub use primitives::seeds::{EpochSeed, SEED_WINDOW_EPOCHS, SeedRing, SeedSource};
 pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRIES_PER_TX};

@@ -2010,7 +2010,7 @@ mod tests {
     use hyperscale_crypto_bls::public_key_from_u64_seed;
 
     use super::*;
-    use crate::{EpochSeed, Hash, JailReason, SeedLookup, SeedSource, TopologySnapshot};
+    use crate::{EpochSeed, Hash, JailReason, SeedSource, TopologySnapshot};
 
     fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
         ValidatorRecord {
@@ -2082,8 +2082,8 @@ mod tests {
             state.derive_topology_snapshot(NetworkDefinition::simulator()),
             state.derive_next_topology_snapshot(NetworkDefinition::simulator()),
         ] {
-            assert_eq!(snapshot.seed(Epoch::new(4)), SeedLookup::Seed(seed));
-            assert_eq!(snapshot.seed(Epoch::new(5)), SeedLookup::NotYetCommitted);
+            assert_eq!(snapshot.seeds().get(Epoch::new(4)), Some(seed));
+            assert_eq!(snapshot.seeds().get(Epoch::new(5)), None);
         }
     }
 
@@ -2098,9 +2098,9 @@ mod tests {
             ValidatorSet::new(Vec::new()),
         );
         assert_eq!(
-            snapshot.seed(Epoch::GENESIS),
-            SeedLookup::NotYetCommitted,
-            "an empty ring is ahead of every epoch"
+            snapshot.seeds().get(Epoch::GENESIS),
+            None,
+            "an empty ring holds no epoch"
         );
     }
 

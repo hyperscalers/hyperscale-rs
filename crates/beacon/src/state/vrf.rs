@@ -300,7 +300,7 @@ mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
         BeaconProposal, BeaconState, Epoch, EpochSeed, Hash, JailReason, MIN_STAKE_FLOOR,
-        Randomness, RevealChain, SeedLookup, SeedSource, ShardId, Stake, StakePoolId, ValidatorId,
+        Randomness, RevealChain, SeedSource, ShardId, Stake, StakePoolId, ValidatorId,
         ValidatorStatus,
     };
 
@@ -803,13 +803,13 @@ mod tests {
         roll(&mut state, &reveals);
 
         assert_eq!(
-            state.seeds.at(target),
-            SeedLookup::Seed(EpochSeed {
+            state.seeds.get(target),
+            Some(EpochSeed {
                 randomness: state.randomness,
                 source: SeedSource::Reveals,
             }),
         );
-        assert_eq!(state.seeds.at(target.next()), SeedLookup::NotYetCommitted);
+        assert_eq!(state.seeds.get(target.next()), None);
     }
 
     /// An epoch with no crossing falls back to the ceremony, and the
@@ -823,8 +823,8 @@ mod tests {
         roll(&mut state, &BTreeMap::new());
 
         assert_eq!(
-            state.seeds.at(target),
-            SeedLookup::Seed(EpochSeed {
+            state.seeds.get(target),
+            Some(EpochSeed {
                 randomness: state.randomness,
                 source: SeedSource::Ceremony,
             }),

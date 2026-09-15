@@ -22,8 +22,8 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
-    AccountSigner, Address, BlockHeight, Deadline, Epoch, SWEEP_BUCKET_MS, SchemeId, SeedLookup,
-    ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    AccountSigner, Address, BlockHeight, Deadline, Epoch, SWEEP_BUCKET_MS, SchemeId, ShardId,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
@@ -903,14 +903,12 @@ fn settled_on_its_seal<C: Cluster>(c: &C, shard: ShardId, lottery: &InstanceMeta
     let sealed_in =
         u64::from_le_bytes(epoch.try_into().expect("a seal is its tag and eight bytes"));
 
-    let SeedLookup::Seed(seed) = c
+    let seed = c
         .beacon_state()
         .expect("a folded beacon")
         .seeds
-        .at(Epoch::new(sealed_in + SEAL_MATURITY_EPOCHS))
-    else {
-        panic!("the seed the round matured into is not retained");
-    };
+        .get(Epoch::new(sealed_in + SEAL_MATURITY_EPOCHS))
+        .expect("the seed the round matured into is retained");
     // The seal's own cell is what the kernel mixes: the handle names it,
     // so nothing about the round's other leaves reaches the word.
     let mut preimage = Vec::new();

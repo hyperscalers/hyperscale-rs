@@ -13,9 +13,9 @@ use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
-    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, SeedLookup,
-    SeedRing, ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction,
-    ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
+    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, SeedRing,
+    ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction, ValidatorId,
+    ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -517,13 +517,6 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn seeds(&self) -> &SeedRing {
         &self.seeds
-    }
-
-    /// The seed `epoch` was rolled with, or which side of the retained
-    /// window it fell outside.
-    #[must_use]
-    pub fn seed(&self, epoch: Epoch) -> SeedLookup {
-        self.seeds.at(epoch)
     }
 
     /// Set the live produced-past-genesis set (see [`Self::successors_live`]).
