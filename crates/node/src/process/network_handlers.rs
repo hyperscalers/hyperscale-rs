@@ -387,8 +387,18 @@ where
                     // Votes in a batch all carry the same shard (sender's
                     // local shard) by construction. Use the first vote's
                     // shard to identify the target hosted shard and gate
-                    // before paying the signature verification cost.
+                    // before paying the signature verification cost — and
+                    // hold the rest of the batch to it, since the sender's
+                    // own signing message derives the shard from `votes[0]`
+                    // alone, as the certificate handler below does.
                     let target_shard = batch.votes[0].shard_id();
+                    if batch.votes.iter().any(|v| v.shard_id() != target_shard) {
+                        warn!(
+                            sender = batch.sender.inner(),
+                            "Execution vote batch contains mixed shard_ids — dropping"
+                        );
+                        return;
+                    }
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
