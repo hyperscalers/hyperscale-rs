@@ -140,7 +140,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_storage::RecoveredState;
+use hyperscale_storage::{CommittedProvisions, RecoveredState};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
@@ -1037,6 +1037,20 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn proven_cells(&self) -> &Arc<ProvenCells> {
         &self.proven_cells
+    }
+
+    /// The committed-provision window, which the provisions coordinator
+    /// reads at its receipt seam.
+    ///
+    /// One window rather than a mirror: the shard refuses a block that
+    /// re-includes a batch the chain already carries, and provisions drops
+    /// a re-arrival of one before dispatching verification for it. The
+    /// same question, and two copies of it are two things that can
+    /// disagree — the mirror was also process-lifetime, so after a restart
+    /// it re-verified every already-committed batch that re-arrived.
+    #[must_use]
+    pub const fn committed_provisions(&self) -> &Arc<CommittedProvisions> {
+        self.dedup_index.committed_provisions()
     }
 
     /// Retire the commit-proven anchors nothing can probe against any

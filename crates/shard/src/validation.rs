@@ -1917,7 +1917,7 @@ mod tests {
     fn validate_no_duplicate_provisions_rejects_retention_dup() {
         let p = provisions_with_seed(1);
         let block = block_with_provisions(BlockHeight::new(6), vec![Arc::clone(&p)]);
-        let mut against = plain();
+        let against = plain();
         against
             .dedup
             .register_committed_provisions(&[p.hash()], WeightedTimestamp::from_millis(1_000));

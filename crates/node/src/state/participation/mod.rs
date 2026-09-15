@@ -174,16 +174,25 @@ impl ShardParticipation {
             Arc::clone(shard_coordinator.proven_cells()),
             Arc::clone(shard_coordinator.mirror()),
         );
+        let committed_provisions = Arc::clone(shard_coordinator.committed_provisions());
         Self {
             local_shard,
             derivation,
             shard_coordinator,
             execution_coordinator,
             mempool_coordinator,
+            // The shard's committed-provision window, shared rather than
+            // mirrored — as the proven anchors, proven cells and mirror
+            // above are. Both coordinators ask whether the chain already
+            // carries a batch; two copies are two answers, and the
+            // provisions-side copy was process-lifetime, so a restart
+            // re-verified every already-committed batch that re-arrived
+            // for a whole retention horizon.
             provisions_coordinator: ProvisionCoordinator::with_config_and_store(
                 local_shard,
                 provision_config,
                 Arc::clone(&provision_store),
+                committed_provisions,
             ),
             outbound_provisions: OutboundProvisionTracker::new(provision_store),
             remote_headers_coordinator: RemoteHeaderCoordinator::new(local_shard),

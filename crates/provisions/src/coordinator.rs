@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, ProtocolEvent};
+use hyperscale_storage::CommittedProvisions;
 use hyperscale_types::{
     BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CompletedRecovery, ForkFence,
     LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardId,
@@ -23,7 +24,6 @@ use hyperscale_types::{
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::committed_tombstones::CommittedProvisionTombstones;
 use crate::expected::ExpectedProvisionTracker;
 use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
@@ -152,7 +152,11 @@ pub struct ProvisionCoordinator {
     /// `(source_shard, block_height)`-keyed pipeline guards and
     /// re-enter the proposer queue (which would then propose a batch
     /// the validator side rejects, causing view changes).
-    committed_tombstones: CommittedProvisionTombstones,
+    /// The shard's committed-provision window, shared rather than
+    /// mirrored. Chain-lifetime: seeded from the store on recovery, so a
+    /// restarted node drops an already-committed re-arrival instead of
+    /// re-verifying it for a whole retention horizon.
+    committed_provisions: Arc<CommittedProvisions>,
 
     /// This validator's home shard. Used to gate inbound provisions:
     /// only batches whose target shard matches ours are admitted.
@@ -192,6 +196,7 @@ impl ProvisionCoordinator {
             local_shard,
             ProvisionConfig::default(),
             Arc::new(ProvisionStore::new()),
+            Arc::new(CommittedProvisions::new()),
         )
     }
 
@@ -199,7 +204,12 @@ impl ProvisionCoordinator {
     /// local [`ProvisionStore`].
     #[must_use]
     pub fn with_config(local_shard: ShardId, config: ProvisionConfig) -> Self {
-        Self::with_config_and_store(local_shard, config, Arc::new(ProvisionStore::new()))
+        Self::with_config_and_store(
+            local_shard,
+            config,
+            Arc::new(ProvisionStore::new()),
+            Arc::new(CommittedProvisions::new()),
+        )
     }
 
     /// Create a new `ProvisionCoordinator` wired to an externally-owned
@@ -211,6 +221,7 @@ impl ProvisionCoordinator {
         local_shard: ShardId,
         config: ProvisionConfig,
         store: Arc<ProvisionStore>,
+        committed_provisions: Arc<CommittedProvisions>,
     ) -> Self {
         let queue = QueuedProvisionBuffer::new(config.min_dwell_time);
         Self {
@@ -218,7 +229,7 @@ impl ProvisionCoordinator {
             pipeline: ProvisionPipeline::new(store),
             expected: ExpectedProvisionTracker::new(),
             queue,
-            committed_tombstones: CommittedProvisionTombstones::new(),
+            committed_provisions,
             local_shard,
             fork_fence: ForkFence::new(),
             purged_fences: BTreeMap::new(),
@@ -254,14 +265,10 @@ impl ProvisionCoordinator {
     ///    reads `local_ts`.
     /// 2. `queue.on_block_committed` drops committed provisions from the
     ///    proposer queue so we don't re-include them next round.
-    /// 3. `committed_tombstones.register` mirrors the shard consensus
-    ///    `CommitDedupIndex` window so a late re-arrival can't slip past
-    ///    `pipeline.verified` (which evicts at `source_block_ts +
-    ///    RETENTION_HORIZON`) and re-enter the queue.
-    /// 4. Orphan cleanup evicts expectations whose fallback never resolved
+    /// 3. Orphan cleanup evicts expectations whose fallback never resolved
     ///    and prunes their matching headers.
-    /// 5. `drop_past_deadline` sweeps verified entries past their deadline.
-    /// 6. Recovery-fence sweep purges artifacts from shards whose pending
+    /// 4. `drop_past_deadline` sweeps verified entries past their deadline.
+    /// 5. Recovery-fence sweep purges artifacts from shards whose pending
     ///    recovery fences them above the attested frontier.
     /// 7. Timeout sweep emits fallback fetches for late expectations.
     pub fn on_block_committed(
@@ -276,22 +283,19 @@ impl ProvisionCoordinator {
         let local_ts = self.expected.local_ts();
 
         // Drop provisions committed in this block from the proposer queue
-        // so we don't re-include the same provisions in the next proposal,
-        // and tombstone them so a late re-arrival (gossip retransmit,
-        // fetch fall-through, range-sync delivery) is dropped at receipt
-        // rather than re-entering the queue and forcing a view change at
-        // the shard validation gate. Sourced from the block's manifest so a
-        // `Block::Sealed` reaching this path still enumerates its hashes
-        // via the manifest's `provision_hashes`.
+        // so we don't re-include the same provisions in the next proposal.
+        // Sourced from the block's manifest so a `Block::Sealed` reaching
+        // this path still enumerates its hashes via the manifest's
+        // `provision_hashes`.
+        //
+        // The committed-provision window itself is written by the shard
+        // coordinator on the same commit and only read here: one writer,
+        // because a window two coordinators both maintain is two windows
+        // that have to agree.
         let manifest = BlockManifest::from_block(block);
         let committed: std::collections::HashSet<ProvisionHash> =
             manifest.provision_hashes().iter().copied().collect();
         self.queue.on_block_committed(&committed);
-        for hash in manifest.provision_hashes() {
-            self.committed_tombstones.register(*hash, new_ts);
-        }
-        self.committed_tombstones.prune(new_ts);
-
         // Single retention cutoff for the orphan sweep — `local_ts -
         // RETENTION_HORIZON` is the conservative point past which any
         // expectation is provably useless on every shard.
@@ -616,7 +620,7 @@ impl ProvisionCoordinator {
             let source_block_ts = certified_header.header().parent_qc().weighted_timestamp();
             for provisions in drained {
                 let provisions_hash = provisions.hash();
-                if self.committed_tombstones.contains(&provisions_hash) {
+                if self.committed_provisions.contains(&provisions_hash) {
                     debug!(
                         shard = shard.inner(),
                         height = height.inner(),
@@ -701,7 +705,7 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
-        if self.committed_tombstones.contains(&provisions.hash()) {
+        if self.committed_provisions.contains(&provisions.hash()) {
             return Self::retire_fetches_for(&provisions);
         }
 
@@ -814,7 +818,7 @@ impl ProvisionCoordinator {
         // after they've evicted at `source_block_ts + RETENTION_HORIZON`
         // — the shard commit window runs to `local_committed_ts +
         // RETENTION_HORIZON`, which is strictly later.
-        if self.committed_tombstones.contains(&provisions.hash()) {
+        if self.committed_provisions.contains(&provisions.hash()) {
             return Self::retire_fetches_for(&provisions);
         }
 
@@ -921,7 +925,7 @@ impl ProvisionCoordinator {
         // The receipt-side tombstone check (`on_state_provisions_received`)
         // only catches arrivals that haven't started verifying yet — this
         // catches the verify-completes-after-commit race.
-        if self.committed_tombstones.contains(&provisions_hash) {
+        if self.committed_provisions.contains(&provisions_hash) {
             debug!(
                 source_shard = source_shard.inner(),
                 provisions_hash = ?provisions_hash,
@@ -2393,6 +2397,24 @@ mod tests {
     /// proposal includes a batch the shard consensus
     /// `validate_no_duplicate_provisions` window still rejects —
     /// triggering a view-change loop.
+    /// What the shard coordinator does on the same commit.
+    ///
+    /// The committed-provision window has one writer, and it is not this
+    /// coordinator — these tests stand in for it. The shard registers
+    /// under its *clamped* committed clock; the clock is monotone in these
+    /// tests, so the block's own anchor is that value.
+    fn shard_registers_committed(coordinator: &ProvisionCoordinator, block: &Block) {
+        let ts = block.header().parent_qc().weighted_timestamp();
+        coordinator.committed_provisions.register(
+            BlockManifest::from_block(block)
+                .provision_hashes()
+                .iter()
+                .copied(),
+            ts,
+        );
+        coordinator.committed_provisions.prune(ts);
+    }
+
     #[test]
     fn test_committed_tombstone_drops_re_arrival_after_pipeline_eviction() {
         let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
@@ -2445,8 +2467,9 @@ mod tests {
         let commit_h = BlockHeight::new(101);
         let committing_block = make_block_with_provisions(commit_h, Arc::new(provisions.clone()));
         coordinator.on_block_committed(&sched(), &committing_block);
+        shard_registers_committed(&coordinator, committing_block.block());
         assert_eq!(coordinator.queue.queue_len(), 0);
-        assert!(coordinator.committed_tombstones.contains(&provisions_hash));
+        assert!(coordinator.committed_provisions.contains(&provisions_hash));
 
         // Walk to a height where `pipeline.verified` (deadline = 0 +
         // RETENTION_HORIZON) has evicted but the tombstone (deadline =
@@ -2464,7 +2487,7 @@ mod tests {
             "pipeline.verified should have evicted by now"
         );
         assert!(
-            coordinator.committed_tombstones.contains(&provisions_hash),
+            coordinator.committed_provisions.contains(&provisions_hash),
             "tombstone should outlive pipeline.verified eviction"
         );
 
@@ -2520,7 +2543,8 @@ mod tests {
         let committing_block =
             make_block_with_provisions(BlockHeight::new(2), Arc::new(provisions.clone()));
         coordinator.on_block_committed(&sched(), &committing_block);
-        assert!(coordinator.committed_tombstones.contains(&provisions_hash));
+        shard_registers_committed(&coordinator, committing_block.block());
+        assert!(coordinator.committed_provisions.contains(&provisions_hash));
 
         // Second lifecycle: provisions re-arrive before any header. The
         // receipt-time tombstone guard short-circuits at receipt — no

@@ -17,7 +17,6 @@
 
 pub mod action_handlers;
 mod build;
-mod committed_tombstones;
 mod coordinator;
 mod expected;
 mod outbound;

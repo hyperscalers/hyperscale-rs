@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hyperscale_storage::DedupWindow;
+use hyperscale_storage::{CommittedProvisions, DedupWindow};
 use hyperscale_types::{
     DEDUP_WINDOW, Deadline, Finalization, FinalizationHash, ProvisionHash, Provisions,
     RETENTION_HORIZON, ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp, Window,
@@ -54,12 +54,13 @@ pub struct CommitDedupIndex {
     /// carried. The question `resolved_tx_retention` cannot answer for a
     /// certificate that resolves nothing.
     finalization_retention: HashMap<FinalizationHash, WeightedTimestamp>,
-    /// `provision_hash → local_committed_ts + RETENTION_HORIZON`. Pruned
-    /// when `deadline <= current_committed_ts`. Past the horizon, every tx
-    /// the batch carried has expired its `validity_range` and terminated
-    /// everywhere, so no future block can legitimately reference the same
-    /// content-addressed batch.
-    provision_retention: HashMap<ProvisionHash, WeightedTimestamp>,
+    /// The committed-provision window, shared with the provisions
+    /// coordinator rather than mirrored by it: the shard asks at
+    /// admission and provisions asks at the receipt seam, and two copies
+    /// of one window are two things that have to agree. Chain-lifetime,
+    /// so a restart seeds it from the store instead of re-verifying every
+    /// already-committed batch that re-arrives.
+    provision_retention: Arc<CommittedProvisions>,
     /// `(source_shard, tx_hash) → deadline`, from committed bundle
     /// *content* — the engagement-mirror evidence that a payer shard's
     /// bundle naming a transaction committed locally. Same deadline tier
@@ -93,7 +94,7 @@ impl CommitDedupIndex {
             tx_retention: HashMap::new(),
             resolved_tx_retention: HashMap::new(),
             finalization_retention: HashMap::new(),
-            provision_retention: HashMap::new(),
+            provision_retention: Arc::new(CommittedProvisions::new()),
             provision_tx_retention: HashMap::new(),
             covered_from: None,
             reached_origin: false,
@@ -120,7 +121,7 @@ impl CommitDedupIndex {
             .extend(window.finalizations.iter().copied());
         index
             .provision_retention
-            .extend(window.provisions.iter().copied());
+            .seed(window.provisions.iter().copied());
         index.covered_from = window.covered_from;
         index.reached_origin = window.reached_origin;
         index
@@ -212,14 +213,19 @@ impl CommitDedupIndex {
     /// `Block::Live`/`Sealed`) rather than depending on `block.provisions()`
     /// (which is empty for `Sealed`).
     pub fn register_committed_provisions(
-        &mut self,
+        &self,
         provision_hashes: &[ProvisionHash],
         local_committed_ts: WeightedTimestamp,
     ) {
-        let deadline = local_committed_ts.plus(RETENTION_HORIZON);
-        for hash in provision_hashes {
-            self.provision_retention.entry(*hash).or_insert(deadline);
-        }
+        self.provision_retention
+            .register(provision_hashes.iter().copied(), local_committed_ts);
+    }
+
+    /// The committed-provision window, for a coordinator that asks the
+    /// same question of it. See [`Self::provision_retention`].
+    #[must_use]
+    pub const fn committed_provisions(&self) -> &Arc<CommittedProvisions> {
+        &self.provision_retention
     }
 
     /// Record a committed block's bundle content in the engagement-mirror
@@ -251,8 +257,7 @@ impl CommitDedupIndex {
             .retain(|_, deadline| *deadline > now);
         self.finalization_retention
             .retain(|_, deadline| *deadline > now);
-        self.provision_retention
-            .retain(|_, deadline| *deadline > now);
+        self.provision_retention.prune(now);
         self.provision_tx_retention
             .retain(|_, deadline| *deadline > now);
     }
@@ -274,7 +279,7 @@ impl CommitDedupIndex {
     }
 
     pub fn contains_provision(&self, provision_hash: &ProvisionHash) -> bool {
-        self.provision_retention.contains_key(provision_hash)
+        self.provision_retention.contains(provision_hash)
     }
 
     /// Whether a committed bundle from `source` named `tx_hash` within
@@ -445,7 +450,7 @@ mod tests {
 
     #[test]
     fn register_provisions_populates_retention() {
-        let mut idx = CommitDedupIndex::new();
+        let idx = CommitDedupIndex::new();
         let p = make_provisions(1);
         idx.register_committed_provisions(&[p.hash()], WeightedTimestamp::from_millis(1_000));
         assert!(idx.contains_provision(&p.hash()));
