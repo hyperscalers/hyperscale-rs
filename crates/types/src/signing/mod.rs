@@ -63,9 +63,7 @@ pub use beacon_ratify::RatifyVoteMessage;
 pub use beacon_reveal::{
     BeaconRevealMessage, beacon_reveal_sign, beacon_reveal_verify, vrf_output_from_proof,
 };
-pub use execution::{
-    ExecutionCertificatesSenderMessage, ExecutionVoteMessage, ExecutionVotesSenderMessage,
-};
+pub use execution::{ExecutionCertificatesSenderMessage, ExecutionVoteMessage};
 pub use provisions::ProvisionsSenderMessage;
 pub use shard::{BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage};
 pub use shard_reveal::{ShardRevealMessage, shard_reveal_sign, shard_reveal_verify};
@@ -117,10 +115,6 @@ mod tests {
             ("RatifyVoteMessage", RatifyVoteMessage::SIGNING_DOMAIN),
             ("BeaconRevealMessage", BeaconRevealMessage::SIGNING_DOMAIN),
             ("ExecutionVoteMessage", ExecutionVoteMessage::SIGNING_DOMAIN),
-            (
-                "ExecutionVotesSenderMessage",
-                ExecutionVotesSenderMessage::SIGNING_DOMAIN,
-            ),
             (
                 "ExecutionCertificatesSenderMessage",
                 ExecutionCertificatesSenderMessage::SIGNING_DOMAIN,

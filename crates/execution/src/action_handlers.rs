@@ -21,13 +21,13 @@ use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput, fold_state_writes};
 use hyperscale_types::network::notification::{
-    ExecutionCertificatesNotification, ExecutionVotesNotification,
+    ExecutionCertificatesNotification, ExecutionVoteNotification,
 };
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
-    ExecutionCertificatesSenderMessage, ExecutionVote, ExecutionVotesSenderMessage,
-    FinalizationContext, Mode, StateWrites, Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash,
-    TxOutcome, Verifiable, Verified, signed_bytes,
+    ExecutionCertificatesSenderMessage, ExecutionVote, FinalizationContext, Mode, StateWrites,
+    Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, Verifiable, Verified,
+    signed_bytes,
 };
 
 // ============================================================================
@@ -377,23 +377,8 @@ where
             // `Verifiable::Verified` marker, letting the handler skip
             // re-verification of our own signature.
             if leader != validator_id {
-                let batch_msg = signed_bytes(
-                    &ExecutionVotesSenderMessage::new(local_shard, std::iter::once(&*verified)),
-                    network,
-                );
-                let Ok(batch_sig) = ctx.signer.sign(&batch_msg) else {
-                    tracing::error!(
-                        ?block_hash,
-                        "cannot sign execution vote batch; skipping send"
-                    );
-                    return;
-                };
-                let batch = ExecutionVotesNotification::new(
-                    vec![Verifiable::from(verified.clone())],
-                    validator_id,
-                    batch_sig,
-                );
-                ctx.network.notify(&[leader], &batch);
+                ctx.network
+                    .notify(&[leader], &ExecutionVoteNotification::new(verified.clone()));
             }
 
             // Feed own vote to state machine only if we are the leader.

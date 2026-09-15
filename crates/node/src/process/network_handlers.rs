@@ -19,7 +19,7 @@ use hyperscale_types::network::notification::beacon::{
 };
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
-    ExecutionVotesNotification, ProvisionsNotification, ReadySignalNotification,
+    ExecutionVoteNotification, ProvisionsNotification, ReadySignalNotification,
     TimeoutNotification,
 };
 use hyperscale_types::network::request::beacon::{
@@ -371,66 +371,37 @@ where
                 },
             );
 
-        // ── execution.vote.batch → verify sender sig, then ProtocolEvent::UnverifiedExecutionVoteReceived ─
+        // ── execution.vote → ProtocolEvent::ExecutionVoteReceived ─────
 
         let senders = self.process.shard_event_senders.clone();
-        let topology_snapshot = self.process.topology_snapshot.clone();
-        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
-            .register_notification_handler::<ExecutionVotesNotification>(
-                move |batch: ExecutionVotesNotification| {
-                    if batch.votes.is_empty() {
-                        return;
-                    }
-
-                    // Votes in a batch all carry the same shard (sender's
-                    // local shard) by construction. Use the first vote's
-                    // shard to identify the target hosted shard and gate
-                    // before paying the signature verification cost — and
-                    // hold the rest of the batch to it, since the sender's
-                    // own signing message derives the shard from `votes[0]`
-                    // alone, as the certificate handler below does.
-                    let target_shard = batch.votes[0].shard_id();
-                    if batch.votes.iter().any(|v| v.shard_id() != target_shard) {
-                        warn!(
-                            sender = batch.sender.inner(),
-                            "Execution vote batch contains mixed shard_ids — dropping"
-                        );
-                        return;
-                    }
+            .register_notification_handler::<ExecutionVoteNotification>(
+                move |gossip: ExecutionVoteNotification| {
+                    let shard = gossip.vote.shard_id();
                     let senders = senders.load();
-                    let Some(tx) = senders.get(&target_shard) else {
+                    let Some(tx) = senders.get(&shard) else {
                         warn!(
-                            target_shard = target_shard.inner(),
-                            "Dropping execution vote batch: shard not hosted"
+                            target_shard = shard.inner(),
+                            "Dropping execution vote: shard not hosted"
                         );
                         return;
                     };
-
-                    let topo = topology_snapshot.load();
-                    if !verify_signed_by_committee(
-                        verifier.as_ref(),
-                        &topo,
-                        target_shard,
-                        &batch,
-                        "exec_vote_batch",
-                        "execution vote batch",
-                    ) {
-                        return;
-                    }
-
-                    // Wire decode lands each vote as `Verifiable::Unverified`;
-                    // local-dispatched batches from a colocated voter arrive
-                    // already verified and skip the state machine's verify
-                    // round-trip.
-                    for vote in batch.into_votes() {
-                        push_protocol_event(
-                            tx,
-                            target_shard,
-                            ProtocolEvent::ExecutionVoteReceived { vote },
-                        );
-                    }
+                    // Wire decode lands the wrapper as
+                    // `Verifiable::Unverified`; local-dispatched sends
+                    // from a colocated voter arrive already verified and
+                    // skip the state machine's verify round-trip. The
+                    // vote carries its own voter and signature, so there
+                    // is no relay to authenticate: the coordinator holds
+                    // it to the committee seated at its anchor and then
+                    // to its own signature.
+                    push_protocol_event(
+                        tx,
+                        shard,
+                        ProtocolEvent::ExecutionVoteReceived {
+                            vote: gossip.into_vote(),
+                        },
+                    );
                 },
             );
 

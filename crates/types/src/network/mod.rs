@@ -87,7 +87,7 @@ pub enum MessageClass {
     /// Includes:
     /// - `CertifiedBlockHeader` gossip — proposer broadcast on commit
     /// - `ProvisionsNotification` — cross-shard state delivery
-    /// - `ExecutionVotesNotification` — execution votes
+    /// - `ExecutionVoteNotification` — an execution vote
     /// - `ExecutionCertificatesNotification` — execution certificates
     /// - `GetProvisionsRequest/Response` — cross-shard fallback
     /// - `GetExecutionCertsRequest/Response` — EC fallback
