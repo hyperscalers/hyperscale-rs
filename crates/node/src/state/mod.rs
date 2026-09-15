@@ -431,8 +431,7 @@ impl StateMachine for NodeStateMachine {
             // ── Execution ────────────────────────────────────────────────
             evt @ (ProtocolEvent::ExecutionBatchCompleted { .. }
             | ProtocolEvent::ExecutionBatchUnavailable { .. }
-            | ProtocolEvent::VerifiedExecutionVoteReceived { .. }
-            | ProtocolEvent::UnverifiedExecutionVoteReceived { .. }
+            | ProtocolEvent::ExecutionVoteReceived { .. }
             | ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. }
             | ProtocolEvent::ExecutionCertificateAggregated { .. }
             | ProtocolEvent::ExecutionCertificatesReceived { .. }

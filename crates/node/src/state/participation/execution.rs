@@ -36,12 +36,9 @@ impl ShardParticipation {
                 );
                 actions
             }
-            ProtocolEvent::VerifiedExecutionVoteReceived { vote } => self
+            ProtocolEvent::ExecutionVoteReceived { vote } => self
                 .execution_coordinator
-                .on_verified_execution_vote(topology_schedule, vote),
-            ProtocolEvent::UnverifiedExecutionVoteReceived { vote } => self
-                .execution_coordinator
-                .on_unverified_execution_vote(topology_schedule, vote),
+                .on_execution_vote(topology_schedule, vote),
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 tick_id,
                 block_hash,

@@ -710,7 +710,7 @@ impl ExecutionCoordinator {
     /// arrived before block commit.
     ///
     /// Returns the emitted dispatch actions plus any early execution votes
-    /// that need to be replayed through `dispatch_execution_vote()`.
+    /// that need to be replayed through `on_execution_vote()`.
     /// Register a new cross-shard tick's transactions: the dependency set
     /// execution waits on and the engagement echoes the payer's vote
     /// waits on.
@@ -1866,30 +1866,9 @@ impl ExecutionCoordinator {
     // Vote handling
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle a locally-produced, pre-verified execution vote.
-    /// Bypasses the batch-verify path and lands directly in the verified
-    /// tally. See [`Self::dispatch_execution_vote`] for the leader,
-    /// fallback, and early-buffer routing rules.
-    pub fn on_verified_execution_vote(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        vote: Verified<ExecutionVote>,
-    ) -> Vec<Action> {
-        self.dispatch_execution_vote(topology_schedule, vote.into())
-    }
-
-    /// Handle a wire-arrived execution vote. Buffered for batch
-    /// verification once combined power could reach quorum. See
-    /// [`Self::dispatch_execution_vote`] for the full routing rules.
-    pub fn on_unverified_execution_vote(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        vote: ExecutionVote,
-    ) -> Vec<Action> {
-        self.dispatch_execution_vote(topology_schedule, vote.into())
-    }
-
-    /// Routing hub for both ingestion paths.
+    /// Handle an execution vote. A sealed vote lands directly in the
+    /// verified tally; an unverified one is buffered for batch
+    /// verification once combined power could reach quorum.
     ///
     /// Only the tick leader (or a fallback leader via rotation)
     /// aggregates votes. If a vote arrives at a non-leader that has
@@ -1907,7 +1886,7 @@ impl ExecutionCoordinator {
     /// Panics if a vote tracker is created or recovered for a tick but
     /// is missing on the immediate `take_unverified_votes` lookup — the
     /// tracker is locked across `&mut self`, so this is unreachable.
-    fn dispatch_execution_vote(
+    pub fn on_execution_vote(
         &mut self,
         topology_schedule: &TopologySchedule,
         vote: Verifiable<ExecutionVote>,
@@ -1978,10 +1957,10 @@ impl ExecutionCoordinator {
                 );
                 let mut actions = Vec::new();
                 for ev in early {
-                    actions.extend(self.dispatch_execution_vote(topology_schedule, ev));
+                    actions.extend(self.on_execution_vote(topology_schedule, ev));
                 }
                 // Process the current vote that triggered fallback creation.
-                actions.extend(self.dispatch_execution_vote(topology_schedule, vote));
+                actions.extend(self.on_execution_vote(topology_schedule, vote));
                 return actions;
             }
         }
@@ -2997,7 +2976,7 @@ impl ExecutionCoordinator {
         let (pending, early_votes, members) =
             self.compose_tick(topology_schedule, block, &mut held);
         for vote in early_votes {
-            actions.extend(self.dispatch_execution_vote(topology_schedule, vote));
+            actions.extend(self.on_execution_vote(topology_schedule, vote));
         }
         // The members that just gained an assignment: a counterpart's
         // certificate that arrived while they waited has a tick to route
@@ -4730,7 +4709,7 @@ mod tests {
             ConsensusSignature::ZERO,
         );
 
-        state_non.on_unverified_execution_vote(&topo_non, fake_vote);
+        state_non.on_execution_vote(&topo_non, fake_vote.into());
 
         // Should have created a fallback VoteTracker.
         assert!(
@@ -4768,7 +4747,7 @@ mod tests {
             ConsensusSignature::ZERO,
         );
 
-        let actions = state.on_unverified_execution_vote(&topo, vote);
+        let actions = state.on_execution_vote(&topo, vote.into());
         assert!(actions.is_empty(), "non-committee vote must be dropped");
         assert!(
             !state.ticks.contains_tracker(&tick_id),
@@ -6175,7 +6154,7 @@ mod tests {
                 ConsensusSignature::ZERO,
             );
             actions.extend(
-                coord.on_verified_execution_vote(&schedule, Verified::new_unchecked_for_test(vote)),
+                coord.on_execution_vote(&schedule, Verified::new_unchecked_for_test(vote).into()),
             );
         }
 

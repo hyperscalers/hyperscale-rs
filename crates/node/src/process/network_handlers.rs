@@ -415,11 +415,11 @@ where
                     // already verified and skip the state machine's verify
                     // round-trip.
                     for vote in batch.into_votes() {
-                        let event = match vote.into_verified() {
-                            Ok(vote) => ProtocolEvent::VerifiedExecutionVoteReceived { vote },
-                            Err(vote) => ProtocolEvent::UnverifiedExecutionVoteReceived { vote },
-                        };
-                        push_protocol_event(tx, target_shard, event);
+                        push_protocol_event(
+                            tx,
+                            target_shard,
+                            ProtocolEvent::ExecutionVoteReceived { vote },
+                        );
                     }
                 },
             );

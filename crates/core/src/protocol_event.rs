@@ -514,24 +514,15 @@ pub enum ProtocolEvent {
         package: Hash,
     },
 
-    /// Received an execution vote whose signature has already been
-    /// established at emit time.
-    ///
-    /// Produced only by the local sign-and-send handler when this node
-    /// is the tick leader, so its own vote is fed straight into the
-    /// verified tally.
-    VerifiedExecutionVoteReceived {
-        /// Our locally-signed vote, sealed via
-        /// [`Verified::<ExecutionVote>::sign_local`].
-        vote: Verified<ExecutionVote>,
-    },
-
-    /// Received an execution vote whose signature still needs to be
-    /// checked. Produced by the wire handler after sender-batch
-    /// authentication.
-    UnverifiedExecutionVoteReceived {
-        /// Raw execution vote off the wire.
-        vote: ExecutionVote,
+    /// Received an execution vote. The tick leader's own sign-and-send
+    /// feeds a sealed vote straight into the verified tally; a wire
+    /// decode lands one unverified, and a colocated voter's batch keeps
+    /// its marker. The early-arrivals buffer holds either taxonomy under
+    /// one shape, so the marker rides on the payload rather than the arm.
+    ExecutionVoteReceived {
+        /// The vote, sealed via [`Verified::<ExecutionVote>::sign_local`]
+        /// when its producer held the signing key.
+        vote: Verifiable<ExecutionVote>,
     },
 
     /// Batch execution vote verification completed.
