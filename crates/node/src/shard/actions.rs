@@ -777,8 +777,9 @@ where
     /// call. With `SyncDispatch` (simulation), `spawn_*` runs inline so
     /// events enter the channel immediately and are drained by the harness.
     fn dispatch_delegated_action(&self, vnode_idx: usize, action: Action) {
-        let pool = action
-            .dispatch_pool()
+        let owner = action.owner();
+        let pool = owner
+            .pool()
             .expect("dispatch_delegated_action called for delegated actions only");
 
         let shard = self.shard;
@@ -883,7 +884,7 @@ where
                 cache_beacon_proposal: &cache_beacon_proposal,
                 par,
             };
-            match action.owner() {
+            match owner {
                 ActionOwner::Shard => handle_shard_action(action, &ctx),
                 ActionOwner::Execution => handle_execution_action(action, &ctx),
                 ActionOwner::Provisions => handle_provisions_action(action, &ctx),

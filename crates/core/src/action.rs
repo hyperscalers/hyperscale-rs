@@ -1729,74 +1729,6 @@ impl Action {
         self.into()
     }
 
-    /// Which thread pool this action should run on, or `None` if it's not
-    /// delegated (timers, network broadcasts, persist — handled inline by
-    /// the runner).
-    #[must_use]
-    pub const fn dispatch_pool(&self) -> Option<DispatchPool> {
-        use hyperscale_dispatch::DispatchPool;
-        match self {
-            // Liveness-critical: shard QC verify/build, state root,
-            // proposal building, sign-and-broadcast for shard
-            // consensus; plus beacon per-epoch crypto + sign work.
-            Self::VerifyAndBuildQuorumCertificate { .. }
-            | Self::VerifyQcSignature { .. }
-            | Self::VerifyTimeout { .. }
-            | Self::VerifyRemoteHeaderQc { .. }
-            | Self::VerifyShardForkProof { .. }
-            | Self::VerifyShardVoteEquivocation { .. }
-            | Self::VerifyTransactionRoot { .. }
-            | Self::VerifyProvisionRoot { .. }
-            | Self::VerifyCertificateRoot { .. }
-            | Self::VerifyProvisionTxRoots { .. }
-            | Self::VerifyReservations { .. }
-            | Self::VerifyResolutions { .. }
-            | Self::VerifyStateRoot { .. }
-            | Self::VerifyBeaconWitnessRoot { .. }
-            | Self::BuildProposal { .. }
-            | Self::BroadcastBlockHeader { .. }
-            | Self::SignAndBroadcastBlockVote { .. }
-            | Self::SignAndBroadcastTimeout { .. }
-            | Self::SignAndBroadcastReadySignal { .. }
-            | Self::BroadcastCertifiedBlockHeader { .. }
-            | Self::BroadcastShardForkProof { .. }
-            | Self::BroadcastShardVoteEquivocation { .. }
-            | Self::SignAndBroadcastPcVote1 { .. }
-            | Self::SignAndBroadcastPcVote2 { .. }
-            | Self::SignAndBroadcastPcVote3 { .. }
-            | Self::SignAndBroadcastEmptyView { .. }
-            | Self::BroadcastSpcNewView { .. }
-            | Self::BroadcastSpcNewCommit { .. }
-            | Self::BuildAndBroadcastBeaconProposal { .. }
-            | Self::BroadcastBeaconBlock { .. }
-            | Self::SignAndBroadcastRatifyVote { .. }
-            | Self::BroadcastBeaconCandidate { .. }
-            | Self::VerifyBeaconBlock { .. }
-            | Self::VerifyRatifyVote { .. }
-            | Self::VerifyBeaconCandidate { .. }
-            | Self::VerifyPcVote1 { .. }
-            | Self::VerifyPcVote2 { .. }
-            | Self::VerifyPcVote3 { .. }
-            | Self::VerifySpcNewView { .. }
-            | Self::VerifySpcNewCommit { .. }
-            | Self::VerifySpcEmptyView { .. } => Some(DispatchPool::Consensus),
-
-            // Throughput-bound: provision/cert/tick verification,
-            // execution-vote crypto, and engine execution.
-            Self::AggregateExecutionCertificate { .. }
-            | Self::VerifyAndAggregateExecutionVotes { .. }
-            | Self::VerifyExecutionCertificateSignature { .. }
-            | Self::VerifyFinalization { .. }
-            | Self::VerifyProvisions { .. }
-            | Self::FetchAndBroadcastProvisions { .. }
-            | Self::SignAndSendExecutionVote { .. }
-            | Self::BroadcastExecutionCertificate { .. }
-            | Self::ExecuteTransactions { .. } => Some(DispatchPool::Throughput),
-
-            _ => None,
-        }
-    }
-
     /// The SPC `(epoch, view)` position this action signs beacon
     /// consensus for under the emitting validator's identity, or
     /// `None` for everything else.
@@ -1987,7 +1919,29 @@ impl Action {
             | Self::VerifySpcNewCommit { .. }
             | Self::VerifySpcEmptyView { .. } => ActionOwner::Beacon,
 
-            _ => ActionOwner::Local,
+            // Run inline on the runner thread: timers, fetch driving,
+            // commits, sync starts, status emission, topology plumbing.
+            Self::AbandonFetch(..)
+            | Self::AttachCertifiedUncommitted { .. }
+            | Self::CancelTimer { .. }
+            | Self::ClearTickChain
+            | Self::CommitBeaconBlock { .. }
+            | Self::CommitBlock { .. }
+            | Self::CommitBlockByQcOnly { .. }
+            | Self::Continuation(..)
+            | Self::EmitTransactionStatus { .. }
+            | Self::Fetch(..)
+            | Self::FetchCommitProof { .. }
+            | Self::ReconfigureParticipation(..)
+            | Self::RecordTxEcCreated { .. }
+            | Self::ReofferTransactions { .. }
+            | Self::ResolveTicks { .. }
+            | Self::RestoreCommittedState
+            | Self::SetTimer { .. }
+            | Self::StartBeaconBlockSync { .. }
+            | Self::StartBlockSync { .. }
+            | Self::StartRemoteHeaderSync { .. }
+            | Self::TopologyChanged { .. } => ActionOwner::Local,
         }
     }
 }
@@ -2012,4 +1966,20 @@ pub enum ActionOwner {
     /// fetch driving, topology plumbing). Not delegated to a worker
     /// pool.
     Local,
+}
+
+impl ActionOwner {
+    /// Which thread pool this owner's work runs on, or `None` for
+    /// [`ActionOwner::Local`], which the runner handles inline.
+    ///
+    /// Shard and beacon work shares the liveness-critical pool; execution
+    /// and provision work shares the throughput-bound one.
+    #[must_use]
+    pub const fn pool(self) -> Option<DispatchPool> {
+        match self {
+            Self::Shard | Self::Beacon => Some(DispatchPool::Consensus),
+            Self::Execution | Self::Provisions => Some(DispatchPool::Throughput),
+            Self::Local => None,
+        }
+    }
 }
