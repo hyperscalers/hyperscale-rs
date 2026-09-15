@@ -115,6 +115,15 @@ keep_log_file_num = 10
 # only the public RPC entry point is. Set to roughly a few blocks worth.
 max_pending = 8192
 
+# Ceiling on pool entries however they arrived — the memory bound, where
+# max_pending is the backpressure knob. Unlike max_pending this one gates
+# gossip too, because gossip is the path that keeps arriving while the
+# committed clock — the only thing that expires a pool entry — is stopped,
+# which is what a halted shard looks like. A transaction refused here is
+# not lost to consensus: the fetch path that answers what a block names is
+# exempt from it. Set well above max_pending.
+max_pool = 32768
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Provisions Configuration
 # ═══════════════════════════════════════════════════════════════════════════════

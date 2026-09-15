@@ -27,6 +27,15 @@
 //!   so that arrival rate exceeding processing capacity translates to
 //!   rejected submissions rather than unbounded memory growth. Operator-
 //!   tunable: deployments with different RAM budgets pick different values.
+//! - [`MempoolConfig::max_pool`] is the ceiling on the pool itself,
+//!   whatever a transaction arrived by. What ordinarily bounds the pool is
+//!   the admission deadline, which is read against the committed clock —
+//!   and that clock only moves on commit. A shard that cannot commit
+//!   therefore sweeps nothing and expires nothing while gossip keeps
+//!   arriving, which is exactly when the node is under stress. The
+//!   ceiling refuses rather than evicts, and a transaction it refuses is
+//!   still reachable: what a block names is fetched, and the fetch path
+//!   is not subject to it.
 //!
 //! # Cross-shard DA
 //!
@@ -43,12 +52,14 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_engine::legs::Classified;
-use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
+use hyperscale_metrics::{
+    record_expected_tx_dropped, record_transaction_aborted, record_transaction_rejected,
+};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
-    LocalTimestamp, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId, ShardTrie,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxResolution,
-    Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
+    LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId,
+    ShardTrie, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxResolution, Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -66,6 +77,11 @@ pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(150);
 /// Default RPC-pending backpressure limit (≈ 2× block size).
 pub const DEFAULT_MAX_PENDING: usize = 8192;
 
+/// Default ceiling on pool entries, eight full blocks' worth — four times
+/// the RPC backpressure limit, so it bites only where that limit is not
+/// the thing doing the bounding.
+pub const DEFAULT_MAX_POOL: usize = 8 * MAX_TXS_PER_BLOCK;
+
 /// Mempool configuration. Operator-tunable knobs only.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MempoolConfig {
@@ -77,6 +93,17 @@ pub struct MempoolConfig {
     /// the public RPC entry point is.
     #[serde(default = "default_max_pending")]
     pub max_pending: usize,
+
+    /// Ceiling on pool entries however they arrived — the memory bound,
+    /// where `max_pending` is the backpressure knob.
+    ///
+    /// Unlike `max_pending` this one gates gossip as well as submission,
+    /// because gossip is the path that keeps arriving while the committed
+    /// clock — the only thing that expires a pool entry — is stopped. A
+    /// transaction refused here is not lost to consensus: the fetch path
+    /// that answers what a block names is exempt.
+    #[serde(default = "default_max_pool")]
+    pub max_pool: usize,
 
     /// Minimum time a transaction must spend in the mempool before it can be selected
     /// for block inclusion. Transactions that have not yet met this dwell time are
@@ -91,6 +118,10 @@ const fn default_max_pending() -> usize {
     DEFAULT_MAX_PENDING
 }
 
+const fn default_max_pool() -> usize {
+    DEFAULT_MAX_POOL
+}
+
 const fn default_min_dwell_time() -> Duration {
     DEFAULT_MIN_DWELL_TIME
 }
@@ -99,9 +130,24 @@ impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             max_pending: DEFAULT_MAX_PENDING,
+            max_pool: DEFAULT_MAX_POOL,
             min_dwell_time: DEFAULT_MIN_DWELL_TIME,
         }
     }
+}
+
+/// How a transaction reached admission — which decides whether the
+/// pool's ceiling applies to it.
+#[derive(Debug, Clone, Copy)]
+enum Offered {
+    /// Nobody here asked for it: gossip, or an RPC submission. Arrival is
+    /// driven from outside and unbounded, and a refusal costs nothing
+    /// that cannot be recovered — what a block names is fetched.
+    Unbidden,
+    /// A fetch answering an id this node asked for. Bounded already by
+    /// what it asked for, and refusing it would strand the block or the
+    /// tick that asked.
+    Asked,
 }
 
 /// Mempool memory statistics for monitoring collection sizes.
@@ -314,18 +360,34 @@ impl MempoolCoordinator {
     }
 
     /// Try to admit a single transaction. Returns `(was_newly_admitted,
-    /// cross_shard)`. Source-agnostic: callers append the appropriate
-    /// `Continuation(TransactionsAdmitted)` and any source-specific actions.
+    /// cross_shard)`. Source-agnostic beyond `offered`: callers append the
+    /// appropriate `Continuation(TransactionsAdmitted)` and any
+    /// source-specific actions.
     fn admit_internal(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         tx: &Arc<Verified<Transaction>>,
+        offered: Offered,
         submitted_locally: bool,
         now: LocalTimestamp,
     ) -> Option<bool> {
         let hash = tx.hash();
 
         if self.pool.contains_key(&hash) || self.is_tombstoned(&hash) {
+            return None;
+        }
+
+        // The ceiling, above the deadline rule below: that rule reads the
+        // committed clock, which a shard that cannot commit does not
+        // advance, so nothing here expires for as long as the halt lasts
+        // while gossip keeps arriving.
+        if matches!(offered, Offered::Unbidden) && self.pool.len() >= self.config.max_pool {
+            record_transaction_rejected("pool_full");
+            tracing::debug!(
+                tx_hash = ?hash,
+                pool = self.pool.len(),
+                "Refusing an offered transaction — the pool is at its ceiling"
+            );
             return None;
         }
 
@@ -447,7 +509,7 @@ impl MempoolCoordinator {
             }];
         }
 
-        match self.admit_internal(topology_snapshot, &tx, true, now) {
+        match self.admit_internal(topology_snapshot, &tx, Offered::Unbidden, true, now) {
             Some(cross_shard) => {
                 tracing::info!(
                     tx_hash = ?hash,
@@ -479,7 +541,13 @@ impl MempoolCoordinator {
         submitted_locally: bool,
         now: LocalTimestamp,
     ) -> Vec<Action> {
-        match self.admit_internal(topology_snapshot, &tx, submitted_locally, now) {
+        match self.admit_internal(
+            topology_snapshot,
+            &tx,
+            Offered::Unbidden,
+            submitted_locally,
+            now,
+        ) {
             Some(_) => {
                 tracing::trace!(
                     tx_hash = ?tx.hash(),
@@ -513,7 +581,7 @@ impl MempoolCoordinator {
         for tx in txs {
             let hash = tx.hash();
             if self
-                .admit_internal(topology_snapshot, &tx, false, now)
+                .admit_internal(topology_snapshot, &tx, Offered::Asked, false, now)
                 .is_some()
             {
                 admitted.push(tx);
@@ -1438,6 +1506,65 @@ mod tests {
             sealed @ Block::Sealed { .. } => sealed,
         };
         certify(block, height.inner() * TEST_BLOCK_INTERVAL_MS)
+    }
+
+    /// The pool's ceiling refuses what nobody here asked for, and lets
+    /// through what this node fetched.
+    ///
+    /// What ordinarily bounds the pool is the admission deadline, read
+    /// against the committed clock — and a shard that cannot commit does
+    /// not advance that clock, so a halt sweeps nothing while gossip
+    /// keeps arriving. A refusal costs nothing that cannot be recovered,
+    /// which is why the fetch path answering what a block names is
+    /// exempt.
+    #[test]
+    fn the_pools_ceiling_refuses_gossip_and_admits_a_fetch() {
+        let topology_snapshot = make_test_topology();
+        let config = MempoolConfig {
+            max_pool: 2,
+            ..MempoolConfig::default()
+        };
+        let mut mempool = MempoolCoordinator::with_config(ShardId::ROOT, config);
+
+        for seed in 1..=2u8 {
+            assert!(
+                !mempool
+                    .on_transaction_gossip(
+                        &topology_snapshot,
+                        Arc::new(verified(test_transaction(seed))),
+                        false,
+                        LocalTimestamp::ZERO,
+                    )
+                    .is_empty(),
+                "the pool is under its ceiling"
+            );
+        }
+        assert_eq!(mempool.pool.len(), 2);
+
+        let over = Arc::new(verified(test_transaction(3)));
+        assert!(
+            mempool
+                .on_transaction_gossip(
+                    &topology_snapshot,
+                    Arc::clone(&over),
+                    false,
+                    LocalTimestamp::ZERO,
+                )
+                .is_empty(),
+            "gossip past the ceiling is refused"
+        );
+        assert_eq!(mempool.pool.len(), 2, "and nothing held is evicted for it");
+
+        let fetched =
+            mempool.on_fetched_transactions(&topology_snapshot, vec![over], LocalTimestamp::ZERO);
+        assert!(
+            fetched.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::TransactionsAdmitted { .. })
+            )),
+            "a transaction this node asked for is admitted whatever the pool holds, got {fetched:?}"
+        );
+        assert_eq!(mempool.pool.len(), 3);
     }
 
     #[test]
