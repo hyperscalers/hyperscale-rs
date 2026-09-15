@@ -46,11 +46,13 @@ use crate::tree::JmtSnapshot;
 ///
 /// # Panics
 ///
-/// If a certified debit runs past what its cell holds. The kernel judged
-/// every movement against committed balance less outstanding holds
-/// before recording it, so this is a receipt disagreeing with the state
-/// it lands on, and the chain halts on it rather than settle a balance
-/// nothing produced.
+/// If a *judged* debit runs past what its cell holds. The kernel judged
+/// every movement it recorded against committed balance less outstanding
+/// holds, so this is a receipt disagreeing with the state it lands on,
+/// and the chain halts on it rather than settle a balance nothing
+/// produced. A fee charge no engine ever ran — an abandonment's, or an
+/// infeasible payer's — carries its own unjudged total instead, and
+/// takes what the vault holds.
 #[must_use]
 pub fn merge_writes_from_receipts(
     receipts: &[StoredReceipt],

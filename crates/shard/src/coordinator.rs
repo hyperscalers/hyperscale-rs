@@ -3515,8 +3515,10 @@ impl ShardCoordinator {
     /// block's own — ancestors answered for theirs at their own vote —
     /// and each must be one the payer's rule admits for the reservation
     /// to engage. Empty when the list names no local payer. A rare
-    /// manifest-only ancestor under view changes contributes nothing —
-    /// a bounded optimism the fee settlement's saturating debit absorbs.
+    /// manifest-only ancestor under view changes contributes nothing, so
+    /// the sum can sit under what is really in flight; a fee settled past
+    /// the vault takes what is there rather than refusing, because no
+    /// engine judged that charge against a balance.
     fn fee_demands(&self, fees: &[PayerFee], parent_block_hash: BlockHash) -> Vec<FeeDemand> {
         let mut demands: BTreeMap<SubstateKey, FeeDemand> = BTreeMap::new();
         for fee in fees {

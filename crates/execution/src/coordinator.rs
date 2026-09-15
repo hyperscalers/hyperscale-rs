@@ -9677,7 +9677,7 @@ mod tests {
     /// abandonment deadline, and the commits between that tick's
     /// composition and its certificate would otherwise abandon the member
     /// it is about to speak for — discarding the tick that carries the
-    /// charge. `abort_charges_the_price_on_deadline` is the scenario.
+    /// charge.
     #[test]
     fn a_tick_that_has_not_attested_withholds_the_abort() {
         let schedule = make_test_topology();
@@ -10458,8 +10458,7 @@ mod tests {
     /// counterpart's fate. It is about to attest the transaction itself,
     /// and that verdict can carry a charge an abandonment cannot — a
     /// payer's leg joins a tick at its engagement deadline, which *is* its
-    /// abandonment deadline. `abort_charges_the_price_on_deadline` is the
-    /// scenario.
+    /// abandonment deadline.
     #[test]
     fn the_tick_composing_now_keeps_the_member_it_just_took() {
         let sched = peer_terminating_schedule(60_000);
