@@ -57,9 +57,11 @@ impl Default for FetchConfig {
 #[derive(Debug)]
 pub enum FetchInput<Id> {
     /// Request `ids` against `shard`'s committee with `preferred` as the
-    /// canonical-source hint. Idempotent: ids already pending keep their
-    /// existing `(shard, preferred, class)` triple; new ids are added
-    /// with the supplied values.
+    /// canonical-source hint. Idempotent in the pending set — an id
+    /// already tracked is not added twice — but the route it carries is
+    /// the latest one asked for: an ask states where the answer is, and
+    /// an id can have more than one asker saying it. Takes effect on the
+    /// next dispatch, so a chunk already in flight is unaffected.
     Request {
         /// Ids to fetch.
         ids: Vec<Id>,
@@ -245,16 +247,30 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         }
         let mut added = 0usize;
         for id in ids {
-            self.pending.entry(id).or_insert_with(|| {
+            // Where an id is answerable from is what the asker just
+            // said, not what the first asker once said. Two owners of
+            // one id space route differently on purpose — a pending
+            // block asks the proposer that provably holds the body, the
+            // mempool asks the source shard — and both re-ask on their
+            // own cadence, so holding the first route forever leaves one
+            // of them asking a committee that may never answer.
+            if let Some(entry) = self.pending.get_mut(&id) {
+                entry.shard = shard;
+                entry.preferred = preferred;
+                entry.class = class;
+            } else {
                 added += 1;
-                Entry {
-                    shard,
-                    preferred,
-                    class,
-                    in_flight: false,
-                    dispatched_at: None,
-                }
-            });
+                self.pending.insert(
+                    id,
+                    Entry {
+                        shard,
+                        preferred,
+                        class,
+                        in_flight: false,
+                        dispatched_at: None,
+                    },
+                );
+            }
         }
         if added > 0 {
             for _ in 0..added {
@@ -828,6 +844,49 @@ mod tests {
             assert_eq!(*preferred, Some(vid(1)));
         }
         assert_eq!(p.in_flight_count(), 5);
+    }
+
+    /// An id with two askers routes where the latest one says.
+    ///
+    /// The transactions id space has two owners with incompatible
+    /// routes — a pending block asks the local shard with the proposer
+    /// preferred, the mempool asks the source shard on the recovery
+    /// class — and both re-ask on their own cadence. Holding whichever
+    /// got there first would leave the other asking a committee that may
+    /// never answer, for as long as the id is pending.
+    #[test]
+    fn a_re_ask_restates_where_the_answer_is() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        let source = ShardId::leaf(1, 1);
+        p.handle(FetchInput::Request {
+            ids: vec![tx(1)],
+            shard: source,
+            preferred: None,
+            class: Some(MessageClass::Recovery),
+        });
+        // In flight under the first route; the second ask lands while it
+        // is out, so it is the retry that takes the new route.
+        p.handle(FetchInput::Request {
+            ids: vec![tx(1)],
+            shard: SHARD,
+            preferred: Some(vid(7)),
+            class: None,
+        });
+        assert_eq!(p.pending_count(), 1, "the id is tracked once");
+
+        let retried = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        let [
+            FetchOutput::Send {
+                shard,
+                preferred,
+                class,
+                ..
+            },
+        ] = retried.as_slice()
+        else {
+            panic!("one re-send, got {retried:?}");
+        };
+        assert_eq!((*shard, *preferred, *class), (SHARD, Some(vid(7)), None));
     }
 
     /// A chunk the transport answered goes out again at once: the round
