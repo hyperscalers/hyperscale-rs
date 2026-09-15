@@ -1058,6 +1058,20 @@ struct FoldState {
 /// transaction that never reached the engine: both are the same charge
 /// on the same vault, and two builders would be two receipt hashes for
 /// one verdict.
+///
+/// The one place an unjudged charge is built, and the only reason it is
+/// safe to build one. A judged debit past what the vault holds halts the
+/// shard rather than settle a balance nothing produced; an unjudged one
+/// has no such backstop and takes what is there, so the vault named here
+/// and the amount carried with it are the whole of what separates a fee
+/// floor from a drain nobody priced.
+///
+/// What bounds the take is that the charge never exceeds what the
+/// committing block reserved: the declared price for an abandonment, the
+/// signed ceiling for everything [`PayerFee::burned`] caps. So it reaches
+/// only value already spoken for, which is what leaves a sibling's judged
+/// debit on the same vault — judged against committed balance less
+/// outstanding holds — still feasible when it settles.
 #[must_use]
 pub fn build_fee_receipt(
     local_shard: ShardId,
