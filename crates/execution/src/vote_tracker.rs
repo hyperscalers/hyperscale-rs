@@ -61,9 +61,11 @@ pub struct VoteTracker {
     unverified_votes: Vec<(ExecutionVote, ConsensusPublicKey)>,
     /// Number of unverified votes buffered.
     unverified_power: VoteCount,
-    /// Validators we've already seen votes from at each `vote_anchor_ts` (dedup).
-    /// Key is (`validator_id`, `vote_anchor_ts`).
-    seen: HashSet<(ValidatorId, WeightedTimestamp)>,
+    /// Validators with a vote buffered but not yet batch verified, keyed by
+    /// (`validator_id`, `vote_anchor_ts`). Transient: a slot reopens when the
+    /// batch drains, so a claimed identity cannot hold it. Permanent dedup is
+    /// [`Self::add_verified_vote`]'s scan over [`Self::votes_by_key`].
+    buffered: HashSet<(ValidatorId, WeightedTimestamp)>,
     /// Whether a verification batch is currently in flight.
     pending_verification: bool,
 }
@@ -80,7 +82,7 @@ impl VoteTracker {
             power_by_key: BTreeMap::new(),
             unverified_votes: Vec::new(),
             unverified_power: VoteCount::ZERO,
-            seen: HashSet::new(),
+            buffered: HashSet::new(),
             pending_verification: false,
         }
     }
@@ -103,9 +105,10 @@ impl VoteTracker {
 
     /// Buffer an unverified vote for later batch verification.
     ///
-    /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
-    /// Dedup is per (validator, `vote_anchor_ts`) — the same validator can vote at
-    /// multiple heights (round voting), but only once per height.
+    /// Returns `true` if the vote was buffered, `false` if one is already
+    /// buffered for this (validator, `vote_anchor_ts`). The claimed validator is
+    /// unauthenticated here, so the slot it takes is released again by
+    /// [`Self::take_unverified_votes`].
     pub fn buffer_unverified_vote(
         &mut self,
         vote: ExecutionVote,
@@ -113,11 +116,11 @@ impl VoteTracker {
     ) -> bool {
         let dedup_key = (vote.validator(), vote.vote_anchor_ts());
 
-        if self.seen.contains(&dedup_key) {
+        if self.buffered.contains(&dedup_key) {
             return false;
         }
 
-        self.seen.insert(dedup_key);
+        self.buffered.insert(dedup_key);
         self.unverified_votes.push((vote, public_key));
         self.unverified_power += VoteCount::MIN;
         true
@@ -152,6 +155,10 @@ impl VoteTracker {
     pub fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, ConsensusPublicKey)> {
         self.pending_verification = true;
         self.unverified_power = VoteCount::ZERO;
+        // Reopen the buffered slots: these votes are now in the batch, and only
+        // the ones whose signatures verify reach `add_verified_vote`. A voter
+        // whose buffered vote fails can then re-buffer rather than be censored.
+        self.buffered.clear();
         std::mem::take(&mut self.unverified_votes)
     }
 
@@ -435,5 +442,30 @@ mod tests {
 
         assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk));
         assert!(tracker.should_trigger_verification());
+    }
+
+    #[test]
+    fn forged_unverified_vote_does_not_censor_genuine_vote() {
+        // A vote buffered with a bad signature must not permanently occupy its
+        // voter's slot: once the batch drains and the signature fails, the
+        // genuine vote from the same validator is still admissible.
+        let pk = make_test_public_key();
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let mut tracker = VoteTracker::new(
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            VoteCount::new(3),
+        );
+
+        // An attacker buffers a (would-be-forged) vote attributed to validator 0.
+        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));
+
+        // The batch drains and every signature fails verification, so nothing
+        // is fed back through `add_verified_vote`.
+        let _ = tracker.take_unverified_votes();
+        tracker.on_verification_complete();
+
+        // Validator 0's genuine vote is not blocked by the failed forgery.
+        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));
     }
 }
