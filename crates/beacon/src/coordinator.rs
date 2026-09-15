@@ -2108,6 +2108,7 @@ impl BeaconCoordinator {
         if was_on_committee && !self.is_on_committee() {
             abandoned_witness_ids.extend(self.shard_source.evicted_from_committee());
         }
+        abandoned_witness_ids.extend(self.retire_departed_sources());
         let next_epoch = self.state.current_epoch.next();
         self.proposal_pool.reset(next_epoch);
         self.evaluated_proposers.clear();
@@ -2689,6 +2690,43 @@ impl BeaconCoordinator {
     /// from its weighted timestamp ([`TopologySchedule::at`]) and the routing
     /// head ([`TopologySchedule::head`]) through it, so no consensus-layer type
     /// crosses into their verification paths.
+    /// Retire the source tracking of every shard whose handoff evidence
+    /// window has closed, returning the in-flight chunk fetches dropped
+    /// with it.
+    ///
+    /// Nothing else sheds a shard from [`ShardSourceTracker`]: its
+    /// header window is bounded per shard and its crossings are bounded
+    /// per shard, but a shard whose chain has ended keeps both for the
+    /// life of the process. The bound here is the one the state's own
+    /// `gc_terminal_boundaries` closes on, so what goes is what the
+    /// proposer has already stopped sourcing and the fold has already
+    /// stopped consuming.
+    ///
+    /// Keyed on the beacon's handoff stamp, never on the shard being
+    /// absent from the routable set: a departure this acts on is one the
+    /// schedule states. A shard with no departure record is untouched,
+    /// which is what keeps a live shard the state has not seated yet
+    /// from being read as a dead one.
+    ///
+    /// The local chain's committed anchor is the clock, read raw: the
+    /// sweep is idempotent and re-runs on every beacon commit, so a
+    /// reading that slips back only delays it. A shard whose record
+    /// leaves the head before the sweep sees the window close is never
+    /// retired — the same bound the sibling sweep in the remote-header
+    /// store accepts.
+    fn retire_departed_sources(&mut self) -> Vec<ChunkFetchId> {
+        let now = self.local_block_anchor;
+        if now == WeightedTimestamp::ZERO {
+            return Vec::new();
+        }
+        let schedule = &self.topology_schedule;
+        self.shard_source.retire_departed(|shard| {
+            schedule
+                .handoff_evidence_expiry(shard)
+                .is_some_and(|expiry| now > expiry)
+        })
+    }
+
     #[must_use]
     pub const fn topology_schedule(&self) -> &TopologySchedule {
         &self.topology_schedule
@@ -5532,6 +5570,97 @@ mod tests {
     /// A state at `epoch` whose ROOT genesis-shard committee (active and
     /// lookahead) holds `size` members, so snapshots derived for different
     /// epochs are distinguishable by committee size.
+    /// A shard that dissolved at a reshape sends no further source
+    /// header, and nothing else sheds a shard from the tracker: its
+    /// header window, its crossings and its chunks are held for the life
+    /// of the process. The handoff evidence window is what ends one, and
+    /// a shard the schedule states nothing about is untouched.
+    #[test]
+    fn a_departed_shards_source_tracking_goes_when_its_evidence_window_closes() {
+        let departed = ShardId::leaf(1, 1);
+        let live = ShardId::leaf(1, 0);
+
+        let coord_with = |handoff_complete: Option<Epoch>| {
+            let mut state = state_at(1, 4);
+            let mut terminal = boundary_live_at(1);
+            // A zeroed hash is the genesis placeholder, which does not
+            // project into the snapshot the schedule reads.
+            terminal.block_hash = BlockHash::from_raw(Hash::from_bytes(b"terminal"));
+            terminal.terminal_epoch = Some(Epoch::new(1));
+            terminal.handoff_complete = handoff_complete;
+            state.boundaries.insert(departed, terminal);
+            state.boundaries.insert(live, boundary_live_at(1));
+            let mut coord = coord_from_history(vec![state]);
+            for shard in [departed, live] {
+                coord
+                    .shard_source
+                    .on_verified_source_header(boundary_block_header(
+                        shard,
+                        5,
+                        1_000,
+                        StateRoot::ZERO,
+                        4,
+                    ));
+                coord.shard_source.register_pending_fetch(
+                    shard,
+                    BlockHeight::new(5),
+                    BlockHash::ZERO,
+                    0,
+                    4,
+                );
+            }
+            coord
+        };
+        let holds = |coord: &BeaconCoordinator, shard: ShardId| {
+            coord
+                .shard_source
+                .header(shard, BlockHeight::new(5))
+                .is_some()
+        };
+
+        // Unstamped: the window is open, the terminal is still being
+        // sourced, and nothing is retired.
+        let mut open = coord_with(None);
+        open.local_block_anchor = WeightedTimestamp::from_millis(u64::MAX / 2);
+        assert!(open.retire_departed_sources().is_empty());
+        assert!(holds(&open, departed), "an open window holds");
+
+        let mut coord = coord_with(Some(Epoch::new(1)));
+        let expiry = coord
+            .topology_schedule()
+            .handoff_evidence_expiry(departed)
+            .expect("the stamp fixes an expiry");
+
+        coord.local_block_anchor = expiry;
+        assert!(coord.retire_departed_sources().is_empty());
+        assert!(holds(&coord, departed), "at the expiry it holds");
+
+        coord.local_block_anchor = expiry.plus(Duration::from_millis(1));
+        let abandoned = coord.retire_departed_sources();
+
+        assert!(!holds(&coord, departed), "past it the headers go");
+        assert_eq!(
+            abandoned,
+            vec![(
+                departed,
+                BlockHeight::new(5),
+                BlockHash::ZERO,
+                LeafIndex::new(0),
+                LeafIndex::new(4),
+            )],
+            "and the chunk fetch it was holding is handed back to be cancelled",
+        );
+        assert!(
+            holds(&coord, live),
+            "a shard with no departure record keeps everything"
+        );
+        assert!(
+            coord
+                .shard_source
+                .is_pending_fetch(live, BlockHash::ZERO, 0, 4)
+        );
+    }
+
     fn state_at(epoch: u64, size: u64) -> BeaconState {
         let mut s = build_genesis_beacon_state(&sample_genesis());
         s.current_epoch = Epoch::new(epoch);

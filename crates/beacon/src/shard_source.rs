@@ -356,6 +356,42 @@ impl ShardSourceTracker {
         abandoned
     }
 
+    /// Drop everything held for each shard `departed` answers `true`
+    /// for — headers, crossings, witness chunks and pending fetches.
+    ///
+    /// The tracker fills from every verified source header and never
+    /// sheds a shard otherwise, so a shard whose chain has ended keeps
+    /// its window for the life of the process. The caller states which
+    /// shards those are; the bound that makes the answer safe is the
+    /// handoff evidence expiry, past which the beacon's own boundary
+    /// record is dropped and no proposer sources the shard again.
+    ///
+    /// Returns the in-flight fetch ids that were dropped, so the caller
+    /// can cancel them — same contract as [`Self::evict_consumed`].
+    pub fn retire_departed(&mut self, departed: impl Fn(ShardId) -> bool) -> Vec<ChunkFetchId> {
+        let shards: Vec<ShardId> = self
+            .shard_headers
+            .keys()
+            .chain(self.boundary_crossings.keys())
+            .copied()
+            .filter(|shard| departed(*shard))
+            .collect();
+        let mut abandoned = Vec::new();
+        for shard in shards {
+            self.shard_headers.remove(&shard);
+            self.boundary_crossings.remove(&shard);
+            self.witness_chunks.retain(|(s, _), _| *s != shard);
+            self.pending_fetches.retain(|(s, anchor), pending| {
+                if *s != shard {
+                    return true;
+                }
+                abandoned.push(pending_id(*s, *anchor, pending));
+                false
+            });
+        }
+        abandoned
+    }
+
     /// Record any epoch-boundary crossing visible in `shard`'s header
     /// window whose boundary block's *commit* is established
     /// ([`Self::commit_established`]) — a certified crossing alone is not
