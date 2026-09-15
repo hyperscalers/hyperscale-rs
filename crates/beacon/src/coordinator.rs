@@ -1571,13 +1571,26 @@ impl BeaconCoordinator {
         vote: Arc<Verifiable<RatifyVote>>,
     ) -> Vec<Action> {
         let expected_epoch = self.state.current_epoch.next();
+        // Ahead of every other check, because the only one this vote is
+        // held to before its signature is checked is pool membership, and
+        // the far-future arm below skips the two that a vote naming an
+        // epoch we do not hold cannot pass.
+        if !self.ratify.pool_contains(vote.signer()) {
+            trace!(
+                signer = ?vote.signer(),
+                "RatifyVote signer absent from active pool — dropping",
+            );
+            return Vec::new();
+        }
         // A vote ratifying an epoch past the in-flight one means committed
         // beacon blocks exist that this replica never received. A stalled
         // epoch produces no new block gossip, so these votes are the only
         // traffic that reveals the gap — trigger gap-fill sync toward the
         // vote's anchor epoch. The target is a hint (mirrors
-        // `on_beacon_block_received`): sync backs off on epochs nobody
-        // serves, so a bogus far-future claim can't busy-loop the network.
+        // `on_beacon_block_received`), and the signature behind it is not
+        // checked, so what bounds a bogus claim is that an unreachable
+        // target stops being one: the sync engine reads a sustained
+        // not-found at the height above its own as the tip.
         if vote.epoch() > expected_epoch {
             return vec![Action::StartBeaconBlockSync {
                 target: vote.epoch().saturating_sub(1),
@@ -1596,13 +1609,6 @@ impl BeaconCoordinator {
                 epoch = vote.epoch().inner(),
                 expected = expected_epoch.inner(),
                 "RatifyVote at unexpected epoch — dropping",
-            );
-            return Vec::new();
-        }
-        if !self.ratify.pool_contains(vote.signer()) {
-            trace!(
-                signer = ?vote.signer(),
-                "RatifyVote signer absent from active pool — dropping",
             );
             return Vec::new();
         }

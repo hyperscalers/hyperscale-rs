@@ -53,6 +53,20 @@ const DEFERRAL_MULTIPLIER: f64 = 2.0;
 /// Backoff cap; subsequent rounds plateau here rather than growing unbounded.
 const DEFERRAL_MAX_MS: u64 = 30_000;
 
+/// Rounds of sustained not-found at the height just above `committed`
+/// before the target is read as unfounded rather than merely unreached.
+///
+/// A target is a claim by whoever raised it, and some of those claims
+/// arrive unauthenticated — the beacon's comes off gossip whose signature
+/// has not been checked. Backing off bounds what a false one costs the
+/// network but not what it costs this host: a target nothing can reach
+/// leaves the scope syncing for the life of the process, with the ticker
+/// armed and the node reporting itself behind. A committee answering that
+/// the next height does not exist, over and over across rotated peers, is
+/// the same evidence a contiguous-prefix responder's short answer carries,
+/// and it is read the same way. Real evidence raises the target again.
+const NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED: u32 = 6;
+
 /// How long a delivered-but-unadmitted height stays parked before we
 /// give up waiting for the consumer's admission and demote it back to
 /// `deferred` for re-fetch. Covers the async gap between
@@ -243,6 +257,11 @@ struct ScopeState<K: SyncKey> {
     /// Number of in-flight fetch ranges for this scope. Bounded by
     /// `max_concurrent_per_scope`.
     in_flight_ranges: usize,
+    /// Consecutive not-found answers about the height just above
+    /// `committed`, with nothing delivered in between. Counted here
+    /// rather than on the height's own backoff, which resets every time
+    /// the height is re-dispatched.
+    not_found_streak: u32,
 }
 
 impl<K: SyncKey> ScopeState<K> {
@@ -256,6 +275,7 @@ impl<K: SyncKey> ScopeState<K> {
             deferred: HashMap::new(),
             pending_admission: HashMap::new(),
             in_flight_ranges: 0,
+            not_found_streak: 0,
         }
     }
 
@@ -480,6 +500,7 @@ impl<B: SyncBinding> Sync<B> {
         );
 
         state.target = target;
+        state.not_found_streak = 0;
         Self::queue_window(state, &self.config);
         self.emit_fetches()
     }
@@ -541,6 +562,10 @@ impl<B: SyncBinding> Sync<B> {
             }
         }
 
+        if !delivered.is_empty() {
+            // Something is there after all.
+            state.not_found_streak = 0;
+        }
         for offset in 0..count {
             let h = from.offset(offset);
             state.in_flight.remove(&h);
@@ -591,6 +616,7 @@ impl<B: SyncBinding> Sync<B> {
             return vec![];
         };
         state.in_flight_ranges = state.in_flight_ranges.saturating_sub(1);
+        let mut unfounded = false;
         for offset in 0..count {
             let h = from.offset(offset);
             if state.in_flight.remove(&h) && h <= state.target && h > state.committed {
@@ -606,16 +632,38 @@ impl<B: SyncBinding> Sync<B> {
                         state.deferred.remove(&h);
                         state.queue_height(h);
                     }
-                    // Empty committee, transport fault, or a peer that
-                    // doesn't have this height yet — no point retrying
-                    // immediately. Apply the standard backoff.
-                    FetchFailureKind::NoPeers
-                    | FetchFailureKind::Transport
-                    | FetchFailureKind::NotFound => {
+                    // Empty committee or transport fault — no point
+                    // retrying immediately. Apply the standard backoff.
+                    FetchFailureKind::NoPeers | FetchFailureKind::Transport => {
                         state.deferred.entry(h).or_default().advance_round(now);
+                    }
+                    // A peer that answered and does not hold the height.
+                    // Backed off the same way, and counted: sustained at
+                    // the height just above `committed`, it says the
+                    // target was never there to reach.
+                    FetchFailureKind::NotFound => {
+                        state.deferred.entry(h).or_default().advance_round(now);
+                        if h == state.committed.offset(1) {
+                            state.not_found_streak = state.not_found_streak.saturating_add(1);
+                            unfounded = state.not_found_streak >= NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED;
+                        }
                     }
                 }
             }
+        }
+        if unfounded {
+            info!(
+                binding = B::NAME,
+                ?scope,
+                target = state.target.as_u64(),
+                committed = state.committed.as_u64(),
+                "sync: target unfounded — the committee does not hold the height above ours"
+            );
+            state.target = state.committed;
+            state.heights_to_fetch.clear();
+            state.heights_queued.clear();
+            state.deferred.clear();
+            state.not_found_streak = 0;
         }
         // The freed slot can carry other ready work immediately — heights
         // past the failed range, ready-deferred entries from earlier
@@ -632,6 +680,7 @@ impl<B: SyncBinding> Sync<B> {
             .scopes
             .entry(scope.clone())
             .or_insert_with(|| ScopeState::new(B::Key::GENESIS));
+        state.not_found_streak = 0;
 
         // `Complete` should only fire on the transition from "syncing" to
         // "caught up" — i.e. the consumer admitted the height that closes
@@ -1118,6 +1167,109 @@ mod tests {
             st.target,
             BlockHeight::new(40),
             "implicit advance should clamp at committed + window + max_per_request"
+        );
+    }
+
+    /// A target nothing serves stops being a target.
+    ///
+    /// The beacon's sync target comes off gossip whose signature has not
+    /// been checked, so a forged message can name any epoch. Backing off
+    /// keeps that off the network but leaves the scope syncing forever
+    /// with the ticker armed and the node reporting itself behind. A
+    /// committee answering not-found at the height above ours, over and
+    /// over, says the height is not there.
+    #[test]
+    fn a_target_nothing_serves_stops_being_one() {
+        // Serial, one height in flight at a time — the beacon's shape,
+        // and the one where the height above `committed` is the only
+        // thing ever asked about.
+        let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 1,
+            max_concurrent_per_scope: 1,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(9_000),
+        });
+
+        let mut now = 0u64;
+        for round in 1..NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED {
+            let _ = s.handle(SyncInput::FetchFailed {
+                scope: 1,
+                from: BlockHeight::new(1),
+                count: 1,
+                kind: FetchFailureKind::NotFound,
+                now: LocalTimestamp::from_millis(now),
+            });
+            assert_eq!(
+                s.scopes.get(&1).unwrap().target,
+                BlockHeight::new(9_000),
+                "one peer short of the bound is still a peer that may be lagging (round {round})"
+            );
+            // Past the backoff so the height re-dispatches and can fail again.
+            now += DEFERRAL_MAX_MS * 2;
+            let _ = s.handle(SyncInput::Tick {
+                now: LocalTimestamp::from_millis(now),
+            });
+        }
+        let _ = s.handle(SyncInput::FetchFailed {
+            scope: 1,
+            from: BlockHeight::new(1),
+            count: 1,
+            kind: FetchFailureKind::NotFound,
+            now: LocalTimestamp::from_millis(now),
+        });
+
+        let st = s.scopes.get(&1).unwrap();
+        assert_eq!(st.target, st.committed, "the target is read as unfounded");
+        assert!(st.deferred.is_empty(), "and nothing is left backing off");
+        assert!(
+            !s.is_syncing(),
+            "so the scope stops reporting itself behind"
+        );
+    }
+
+    /// A node genuinely behind, served slowly, keeps its target: the
+    /// streak counts consecutive not-founds, and anything delivered
+    /// between them is a peer proving the chain is there.
+    #[test]
+    fn a_delivery_between_not_founds_keeps_the_target() {
+        let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 1,
+            max_concurrent_per_scope: 1,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(9_000),
+        });
+
+        let mut now = 0u64;
+        for _ in 0..NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED * 3 {
+            let _ = s.handle(SyncInput::FetchFailed {
+                scope: 1,
+                from: BlockHeight::new(1),
+                count: 1,
+                kind: FetchFailureKind::NotFound,
+                now: LocalTimestamp::from_millis(now),
+            });
+            now += DEFERRAL_MAX_MS * 2;
+            let _ = s.handle(SyncInput::FetchSucceeded {
+                scope: 1,
+                from: BlockHeight::new(1),
+                count: 1,
+                delivered_heights: vec![BlockHeight::new(1)],
+                now: LocalTimestamp::from_millis(now),
+            });
+            let _ = s.handle(SyncInput::Tick {
+                now: LocalTimestamp::from_millis(now),
+            });
+        }
+        assert_eq!(
+            s.scopes.get(&1).unwrap().target,
+            BlockHeight::new(9_000),
+            "a peer that served proves the chain reaches past us"
         );
     }
 
