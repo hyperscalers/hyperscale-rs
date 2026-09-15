@@ -323,6 +323,10 @@ mod tests {
             fn message_type_id() -> &'static str {
                 "test.msg"
             }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
+            }
         }
         impl GossipMessage for TestMsg {
             const SCOPE: TopicScope = TopicScope::Shard;

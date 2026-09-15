@@ -163,11 +163,8 @@ pub trait NetworkMessage: Send + Sync + Sized + HborEncode + HborDecode {
     /// The class for this message type.
     ///
     /// Used by the network adaptor for queue ordering and backpressure.
-    /// Defaults to `Recovery` — override for higher-urgency messages.
     #[must_use]
-    fn class() -> MessageClass {
-        MessageClass::Recovery
-    }
+    fn class() -> MessageClass;
 
     /// Get the gossipsub topic for this message type.
     #[must_use]

@@ -730,6 +730,8 @@ impl Default for HandlerRegistry {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use hyperscale_types::MessageClass;
+
     use super::*;
 
     #[test]
@@ -742,6 +744,10 @@ mod tests {
         impl NetworkMessage for TestMsg {
             fn message_type_id() -> &'static str {
                 "test.gossip"
+            }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
             }
         }
         impl GossipMessage for TestMsg {
@@ -783,6 +789,10 @@ mod tests {
             fn message_type_id() -> &'static str {
                 "test.request"
             }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
+            }
         }
 
         #[derive(Debug, Hbor, PartialEq)]
@@ -790,6 +800,10 @@ mod tests {
         impl NetworkMessage for TestResp {
             fn message_type_id() -> &'static str {
                 "test.response"
+            }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
             }
         }
 
@@ -829,6 +843,10 @@ mod tests {
         impl NetworkMessage for SwapMsg {
             fn message_type_id() -> &'static str {
                 "test.hosted_swap"
+            }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
             }
         }
         impl GossipMessage for SwapMsg {
@@ -875,12 +893,20 @@ mod tests {
             fn message_type_id() -> &'static str {
                 "test.rejoin_request"
             }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
+            }
         }
         #[derive(Debug, Hbor, PartialEq)]
         struct RejoinResp(u32);
         impl NetworkMessage for RejoinResp {
             fn message_type_id() -> &'static str {
                 "test.rejoin_response"
+            }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
             }
         }
         impl Request for RejoinReq {
@@ -930,6 +956,10 @@ mod tests {
             fn message_type_id() -> &'static str {
                 "test"
             }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
+            }
         }
         impl GossipMessage for TestMsg {
             const SCOPE: TopicScope = TopicScope::Shard;
@@ -964,6 +994,10 @@ mod tests {
         impl NetworkMessage for VTestMsg {
             fn message_type_id() -> &'static str {
                 "test.local_dispatch_verified"
+            }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
             }
         }
         impl GossipMessage for VTestMsg {
@@ -1014,6 +1048,10 @@ mod tests {
             fn message_type_id() -> &'static str {
                 "test.host_gossip"
             }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
+            }
         }
         impl GossipMessage for GlobalMsg {
             const SCOPE: TopicScope = TopicScope::Global;
@@ -1052,6 +1090,10 @@ mod tests {
         impl NetworkMessage for GlobalMsg {
             fn message_type_id() -> &'static str {
                 "test.host_gossip_dup"
+            }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
             }
         }
         impl GossipMessage for GlobalMsg {
