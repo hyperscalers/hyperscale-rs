@@ -469,7 +469,7 @@ mod tests {
     use hyperscale_storage::{BoundaryStore, ImportCursor, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_key;
-    use hyperscale_types::{LEAF_KEY_BYTES, ShardWitnessPayload};
+    use hyperscale_types::{ChainOrigin, LEAF_KEY_BYTES, ShardWitnessPayload};
 
     use super::*;
     use crate::bootstrap::state_range_serve::serve_state_range_request;
@@ -546,7 +546,7 @@ mod tests {
         drive(
             &mut bootstrap,
             &serving,
-            &PendingChain::new(Arc::clone(&serving)),
+            &PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT),
             &first,
         );
         assert!(
@@ -559,14 +559,14 @@ mod tests {
         drive(
             &mut bootstrap,
             &first,
-            &PendingChain::new(Arc::clone(&first)),
+            &PendingChain::new(Arc::clone(&first), ChainOrigin::ROOT),
             &second,
         );
         let recovered = bootstrap.into_recovered_state();
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(second.state_root(), anchor.state_root);
         assert_eq!(
-            PendingChain::new(Arc::clone(&second))
+            PendingChain::new(Arc::clone(&second), ChainOrigin::ROOT)
                 .get_beacon_witness_payload_range(0, leaves.len() as u64),
             leaves,
         );
@@ -578,7 +578,7 @@ mod tests {
     fn sequences_state_import_and_witness_history() {
         let leaves = witness_leaves();
         let (serving, anchor) = replica(&leaves);
-        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
         let fresh = Arc::new(SimShardStorage::default());
 
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
@@ -598,7 +598,7 @@ mod tests {
         // beacon fold's witness fetches, without ever having executed
         // the pre-anchor chain.
         assert_eq!(
-            PendingChain::new(Arc::clone(&fresh))
+            PendingChain::new(Arc::clone(&fresh), ChainOrigin::ROOT)
                 .get_beacon_witness_payload_range(0, leaves.len() as u64),
             leaves,
         );
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn interrupted_assembly_resumes_without_refetching() {
         let (serving, anchor) = replica(&[]);
-        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
         let fresh = Arc::new(SimShardStorage::default());
 
         // First process: witness, then stage exactly two sub-ranges of
@@ -707,7 +707,7 @@ mod tests {
     #[test]
     fn fully_staged_assembly_resumes_straight_to_finalize() {
         let (serving, anchor) = replica(&[]);
-        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
         let fresh = Arc::new(SimShardStorage::default());
 
         let mut first = ShardBootstrap::new(ShardId::ROOT, anchor);
@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn import_root_mismatch_is_an_error() {
         let (serving, anchor) = replica(&[]);
-        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
         let mut imported = false;
         for _ in 0..1_000 {
@@ -828,7 +828,7 @@ mod tests {
     #[test]
     fn out_of_phase_responses_are_rejected() {
         let (serving, anchor) = replica(&[]);
-        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
 
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
         // Still in the witness phase: a state response is unsolicited.

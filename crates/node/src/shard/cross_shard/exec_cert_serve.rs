@@ -113,7 +113,7 @@ mod tests {
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHeight,
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHeight, ChainOrigin,
         ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, Role, ShardId,
         SignerBitfield, TickHalf, TxOutcome, Verified, WeightedTimestamp,
     };
@@ -177,7 +177,7 @@ mod tests {
             &[],
             &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );
-        let pending_chain = PendingChain::new(storage);
+        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
         let store = ExecCertStore::new();
         store.insert(Arc::new(Verified::new_unchecked_for_test(settling.clone())));
 

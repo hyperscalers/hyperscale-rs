@@ -54,24 +54,30 @@ type CachedTerminal = (BlockHeight, BlockHash, Arc<Vec<TxHash>>);
 
 impl CommittedTxsCache {
     /// The set for `terminal`, reconstructed by `walk` on a miss.
+    ///
+    /// A `walk` answering `None` reached below what this store holds, so
+    /// the set it could build is a prefix. Nothing is cached then: a
+    /// truncated set left here would answer every later request for this
+    /// terminal, and the absence proofs taken over it would name
+    /// transactions the chain did commit.
     fn get_or_insert(
         &self,
         height: BlockHeight,
         hash: BlockHash,
-        walk: impl FnOnce() -> Vec<TxHash>,
-    ) -> Arc<Vec<TxHash>> {
+        walk: impl FnOnce() -> Option<Vec<TxHash>>,
+    ) -> Option<Arc<Vec<TxHash>>> {
         if let Ok(entries) = self.entries.lock()
             && let Some((_, _, members)) =
                 entries.iter().find(|(h, b, _)| *h == height && *b == hash)
         {
-            return Arc::clone(members);
+            return Some(Arc::clone(members));
         }
-        let members = Arc::new(walk());
+        let members = Arc::new(walk()?);
         if let Ok(mut entries) = self.entries.lock() {
             entries.push_front((height, hash, Arc::clone(&members)));
             entries.truncate(CACHED_TERMINALS);
         }
-        members
+        Some(members)
     }
 }
 
@@ -105,16 +111,28 @@ pub fn serve_committed_txs_request<S: ShardStorage>(
         let own: Vec<TxHash> = block.transactions().iter().map(|tx| tx.hash()).collect();
         // Sorted and deduplicated by the walk's `BTreeSet`, which is what
         // the absence proofs' leaf indices are relative to.
-        pending_chain
-            .committed_txs_in_window(
-                block.header().parent_block_hash(),
-                parent_height,
-                block.header().parent_qc().weighted_timestamp(),
-                own,
-            )
-            .into_iter()
-            .collect()
+        let (set, coverage) = pending_chain.committed_txs_in_window(
+            block.header().parent_block_hash(),
+            parent_height,
+            block.header().parent_qc().weighted_timestamp(),
+            own,
+        );
+        coverage
+            .short_at()
+            .is_none()
+            .then(|| set.into_iter().collect())
     });
+    let Some(members) = members else {
+        // The window runs below what this store answers for. An absence
+        // proof over the prefix would say a committed transaction was
+        // never committed, so this node is not one that can answer.
+        tracing::warn!(
+            terminal_height = req.terminal_height.inner(),
+            "committed-transaction window runs below the blocks held here; serving not_found"
+        );
+        record_fetch_response_sent("committed_txs", 0);
+        return GetCommittedTxsResponse::not_found();
+    };
 
     let verdicts = req
         .tx_hashes
@@ -137,9 +155,9 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, Hash, ProposerTimestamp, QuorumCertificate,
-        RETENTION_HORIZON, Round, ShardId, SignerBitfield, Transaction, Verifiable,
-        WeightedTimestamp, WitnessSources, committed_txs_root_from_hashes,
+        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, ProposerTimestamp,
+        QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield, Transaction,
+        Verifiable, WeightedTimestamp, WitnessSources, committed_txs_root_from_hashes,
     };
 
     use super::*;
@@ -210,7 +228,10 @@ mod tests {
         for (h, seeds) in [(1u64, &[1u8, 2][..]), (2, &[3, 4]), (3, &[5, 6])] {
             parent = commit_block(&storage, h, parent, 1_000 * h, seeds);
         }
-        (PendingChain::new(Arc::new(storage)), parent)
+        (
+            PendingChain::new(Arc::new(storage), ChainOrigin::ROOT),
+            parent,
+        )
     }
 
     /// A transaction the chain committed answers `Committed`; one it never
@@ -288,7 +309,7 @@ mod tests {
         let mut parent = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[10]);
         parent = commit_block(&storage, 2, parent, rh_ms + 10_000, &[11]);
         let terminal = commit_block(&storage, 3, parent, rh_ms + 11_000, &[12]);
-        let pending_chain = PendingChain::new(Arc::new(storage));
+        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
 
         let below_floor = tx_hash(10);
         let req = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, vec![below_floor]);
@@ -347,7 +368,7 @@ mod tests {
             parent = commit_block(&storage, h, parent, 1_000 * h, seeds);
         }
         let storage = Arc::new(storage);
-        let pending_chain = PendingChain::new(Arc::clone(&storage));
+        let pending_chain = PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT);
         let cache = CommittedTxsCache::default();
 
         let ask = |probe: TxHash| {
@@ -406,7 +427,8 @@ mod tests {
     /// An unheld height serves `not_found`.
     #[test]
     fn unheld_height_serves_not_found() {
-        let pending_chain = PendingChain::new(Arc::new(SimShardStorage::default()));
+        let pending_chain =
+            PendingChain::new(Arc::new(SimShardStorage::default()), ChainOrigin::ROOT);
         let req =
             GetCommittedTxsRequest::new(BlockHeight::new(7), BlockHash::ZERO, vec![tx_hash(1)]);
         assert!(

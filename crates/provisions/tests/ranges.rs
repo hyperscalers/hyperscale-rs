@@ -14,8 +14,8 @@ use hyperscale_storage::{GenesisCommit, PendingChain, SubstateStore, entry_from_
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    BlockHeight, DeclaredRange, Hash, MAX_STATE_ENTRIES_PER_TX, ShardId, TxHash, TypedHash,
-    WeightedTimestamp,
+    BlockHeight, ChainOrigin, DeclaredRange, Hash, MAX_STATE_ENTRIES_PER_TX, ShardId, TxHash,
+    TypedHash, WeightedTimestamp,
 };
 
 /// The interval Alice's collection holds at genesis, served whole.
@@ -47,7 +47,7 @@ fn a_range_serves_its_leaves_and_the_receiver_rederives_the_interval() {
         }],
     };
 
-    let chain = Arc::new(PendingChain::new(Arc::new(storage)));
+    let chain = Arc::new(PendingChain::new(Arc::new(storage), ChainOrigin::ROOT));
     let view = chain.view_at_committed_tip();
     let provisions = build_provisions(
         &view,

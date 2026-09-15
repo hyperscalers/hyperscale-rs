@@ -875,10 +875,10 @@ mod settled_txs_tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ExecutionCertificate,
-        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-        ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, SignerBitfield, TickHalf,
-        TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin,
+        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
+        Hash, ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, SignerBitfield,
+        TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -988,7 +988,7 @@ mod settled_txs_tests {
     #[test]
     fn a_served_window_lifts_to_the_attested_root() {
         let (storage, terminal, root) = served_chain(3);
-        let pending_chain = PendingChain::new(storage);
+        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
         let scope = evidence(terminal, root);
         let response = serve_settled_txs_request(
             &pending_chain,
@@ -1017,7 +1017,7 @@ mod settled_txs_tests {
     #[test]
     fn a_window_off_the_attested_root_is_unusable() {
         let (storage, terminal, _) = served_chain(3);
-        let pending_chain = PendingChain::new(storage);
+        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
         let scope = evidence(terminal, settled_txs_root_from_hashes([&settled_tx(99)]));
         let response = serve_settled_txs_request(
             &pending_chain,

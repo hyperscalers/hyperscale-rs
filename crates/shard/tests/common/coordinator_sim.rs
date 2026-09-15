@@ -39,16 +39,16 @@ use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
     Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
-    CertificateRoot, CertifiedBlock, CheckOutcome, ConsensusPublicKey, ConsensusReceipt, Epoch,
-    Finalization, Hash, HborSigned, LocalReceiptRoot, LocalTimestamp, NetworkDefinition,
-    ProposerTimestamp, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal,
-    RootMismatch, Round, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload, Signer,
-    SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt,
-    SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight, ValidatorId,
-    Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof, WeightedTimestamp,
-    local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
+    CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey,
+    ConsensusReceipt, Epoch, Finalization, Hash, HborSigned, LocalReceiptRoot, LocalTimestamp,
+    NetworkDefinition, ProposerTimestamp, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
+    QuorumCertificate, ReadySignal, RootMismatch, Round, ShardId, ShardLoad, ShardVoteEquivocation,
+    ShardWitnessPayload, Signer, SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError,
+    StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight,
+    ValidatorId, Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -463,7 +463,8 @@ impl ShardCoordinatorSim {
             sks.push(sk);
 
             let storage = Arc::new(SimShardStorage::default());
-            let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));
+            let pending_chain =
+                Arc::new(PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT));
             pending_chains.push(pending_chain);
             storages.push(storage);
 
@@ -557,7 +558,10 @@ impl ShardCoordinatorSim {
             ShardConsensusConfig::default(),
             recovered,
         );
-        self.pending_chains[idx] = Arc::new(PendingChain::new(Arc::clone(&self.storages[idx])));
+        self.pending_chains[idx] = Arc::new(PendingChain::new(
+            Arc::clone(&self.storages[idx]),
+            ChainOrigin::ROOT,
+        ));
         self.tx_pools[idx].clear();
         // Re-seed the chain tip the way boot does; the genesis block is
         // deterministic over the store's installed genesis state root.
@@ -1507,17 +1511,19 @@ impl ShardCoordinatorSim {
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
                 let terminal_roots = carry_terminal_roots.then(|| {
-                    self.pending_chains[emitter_idx].terminal_roots_in_window(
-                        &TerminalWindow {
-                            local_shard: shard_id,
-                            parent_block_hash,
-                            parent_block_height,
-                            anchor_wt: parent_qc.weighted_timestamp(),
-                            settled_window_floor: settled_txs_window_floor,
-                        },
-                        &finalizations,
-                        transactions.iter().map(|tx| tx.hash()).collect(),
-                    )
+                    self.pending_chains[emitter_idx]
+                        .terminal_roots_in_window(
+                            &TerminalWindow {
+                                local_shard: shard_id,
+                                parent_block_hash,
+                                parent_block_height,
+                                anchor_wt: parent_qc.weighted_timestamp(),
+                                settled_window_floor: settled_txs_window_floor,
+                            },
+                            &finalizations,
+                            transactions.iter().map(|tx| tx.hash()).collect(),
+                        )
+                        .expect("the sim's stores hold every height in the window")
                 });
                 let result = build_proposal(
                     &view,
@@ -1836,17 +1842,19 @@ impl ShardCoordinatorSim {
                     return;
                 }
                 let computed_terminal_roots = terminal_roots_required.then(|| {
-                    self.pending_chains[emitter_idx].terminal_roots_in_window(
-                        &TerminalWindow {
-                            local_shard: self.shard,
-                            parent_block_hash,
-                            parent_block_height,
-                            anchor_wt: parent_weighted_timestamp,
-                            settled_window_floor: settled_txs_window_floor,
-                        },
-                        &finalizations,
-                        block_tx_hashes.clone(),
-                    )
+                    self.pending_chains[emitter_idx]
+                        .terminal_roots_in_window(
+                            &TerminalWindow {
+                                local_shard: self.shard,
+                                parent_block_hash,
+                                parent_block_height,
+                                anchor_wt: parent_weighted_timestamp,
+                                settled_window_floor: settled_txs_window_floor,
+                            },
+                            &finalizations,
+                            block_tx_hashes.clone(),
+                        )
+                        .expect("the sim's stores hold every height in the window")
                 });
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);

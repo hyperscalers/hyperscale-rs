@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusReceipt, DeclaredRange, EntryKey, ExecutionCertificate, Finalization,
+    ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey, ExecutionCertificate, Finalization,
     FinalizationHash, QuorumCertificate, RETENTION_HORIZON, ShardId, ShardWitnessPayload,
     StateRoot, SubstateKey, SweepBucket, SweepFrontier, TerminalRoots, TickId, Transaction, TxHash,
     Verifiable, Verified, WeightedTimestamp, committed_txs_root_from_hashes,
@@ -33,6 +33,38 @@ use crate::{
 /// can source priors without a fresh `multi_get_cf` on `StateCf`. Entries
 /// are `SubstateKey → value-at-anchor`.
 pub type BaseReadCache = HashMap<SubstateKey, Option<Vec<u8>>>;
+
+/// Whether a committed-tail walk reached everything its window covers.
+///
+/// The three ways a walk ends are not alike, and the attested folds used to
+/// spell all three as one `break`. Running to the floor and running to the
+/// bottom of the chain both mean the set is whole; stopping on a height this
+/// node does not hold means it is a prefix, and a root taken over a prefix is
+/// smaller than the one every full-history replica computes. The recovery
+/// folds have always made the distinction — see `DedupWindow::from_reader` —
+/// and this is the same distinction at the attesting altitude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCoverage {
+    /// The walk reached its floor or the bottom of the chain.
+    Whole,
+    /// The walk stopped at a height the local store does not answer for.
+    Short {
+        /// The height that could not be read.
+        at: BlockHeight,
+    },
+}
+
+impl WindowCoverage {
+    /// The height a short walk stopped at, if it was short.
+    #[must_use]
+    pub const fn short_at(self) -> Option<BlockHeight> {
+        match self {
+            Self::Whole => None,
+            Self::Short { at } => Some(at),
+        }
+    }
+}
+
 /// Where a terminal-roots walk starts and stops.
 ///
 /// Every field must resolve identically on the proposer and on each
@@ -110,6 +142,17 @@ pub struct ChainEntry {
 /// impossible by construction.
 pub struct PendingChain<S> {
     base: Arc<S>,
+    /// Where this chain begins, which is not generally height zero: a
+    /// reshape successor continues its predecessor's height line.
+    ///
+    /// A committed-tail walk that runs below it has reached the bottom of
+    /// the chain, not a hole — nothing beneath was ever committed here, so
+    /// there is nothing down there the walk could have missed. Without it
+    /// the two are indistinguishable from the store alone, and a split
+    /// child younger than the retention horizon reads its own origin as a
+    /// gap. `host.rs` floors the block-sync watermark on the same value
+    /// for the same reason.
+    origin: ChainOrigin,
     entries: RwLock<HashMap<BlockHash, ChainEntry>>,
     settled_window_memo: RwLock<Option<SettledWindowMemo>>,
 }
@@ -133,10 +176,16 @@ impl<S> PendingChain<S>
 where
     S: SubstateStore + TreeReader + ShardChainReader + Sync + 'static,
 {
-    /// Create a new empty `PendingChain` over the given base storage.
-    pub fn new(base: Arc<S>) -> Self {
+    /// Create a new empty `PendingChain` over the given base storage,
+    /// beginning at `origin`.
+    ///
+    /// The origin is stated rather than defaulted: a wrong one turns a
+    /// window walk's verdict from "short" to "whole" or the reverse, and
+    /// both directions are silent.
+    pub fn new(base: Arc<S>, origin: ChainOrigin) -> Self {
         Self {
             base,
+            origin,
             entries: RwLock::new(HashMap::new()),
             settled_window_memo: RwLock::new(None),
         }
@@ -145,6 +194,22 @@ where
     /// Append an entry.
     pub fn insert(&self, block_hash: BlockHash, entry: ChainEntry) {
         write_or_recover(&self.entries).insert(block_hash, entry);
+    }
+
+    /// What a committed-tail walk that could not read `height` has
+    /// actually found: the bottom of this chain, or a hole in it.
+    ///
+    /// At or below the chain's genesis height there is nothing to have
+    /// missed — the origin block itself is not always servable, and no
+    /// block exists beneath it on this chain anywhere. Above it, a height
+    /// the store cannot answer for is a hole, and every full-history
+    /// replica folds a block this one does not.
+    const fn coverage_at(&self, height: BlockHeight) -> WindowCoverage {
+        if height.inner() <= self.origin.genesis_height.inner() {
+            WindowCoverage::Whole
+        } else {
+            WindowCoverage::Short { at: height }
+        }
     }
 
     /// Drop all entries with `height ≤ committed_height`. Called on
@@ -352,14 +417,20 @@ where
     ///
     /// `window` is where both walks start and stop; `own_certificates` and
     /// `own_txs` are what the block under construction contributes.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`WindowCoverage::Short`] when either walk stops on a height this
+    /// node does not hold. The pair is then uncomputable here — not wrong,
+    /// absent — and a caller must decline to attest rather than carry a
+    /// root taken over a prefix.
     pub fn terminal_roots_in_window(
         &self,
         window: &TerminalWindow,
         own_certificates: &[Arc<Verifiable<Finalization>>],
         own_txs: Vec<TxHash>,
-    ) -> TerminalRoots {
-        let settled = self.settled_txs_in_window(
+    ) -> Result<TerminalRoots, WindowCoverage> {
+        let (settled, settled_coverage) = self.settled_txs_in_window(
             window.local_shard,
             window.parent_block_hash,
             window.parent_block_height,
@@ -367,16 +438,25 @@ where
             window.settled_window_floor,
             local_settled_tx_hashes(own_certificates, window.local_shard),
         );
-        let committed = self.committed_txs_in_window(
+        let (committed, committed_coverage) = self.committed_txs_in_window(
             window.parent_block_hash,
             window.parent_block_height,
             window.anchor_wt,
             own_txs,
         );
-        TerminalRoots {
+        // Either walk falling short makes the pair unattestable: a root
+        // over a prefix is a smaller root, and every full-history replica
+        // computes the whole one.
+        if settled_coverage.short_at().is_some() {
+            return Err(settled_coverage);
+        }
+        if committed_coverage.short_at().is_some() {
+            return Err(committed_coverage);
+        }
+        Ok(TerminalRoots {
             settled_txs: settled_txs_root_from_hashes(settled.iter()),
             committed_txs: committed_txs_root_from_hashes(committed.iter()),
-        }
+        })
     }
 
     /// Every transaction committed across the window, unioned with `own`
@@ -400,7 +480,7 @@ where
         parent_block_height: BlockHeight,
         anchor_wt: WeightedTimestamp,
         own: Vec<TxHash>,
-    ) -> std::collections::BTreeSet<TxHash> {
+    ) -> (std::collections::BTreeSet<TxHash>, WindowCoverage) {
         let mut set: std::collections::BTreeSet<TxHash> = own.into_iter().collect();
         // Pending prefix: walk by hash so a certified-but-unattached
         // ancestor still resolves. These sit within the window by
@@ -426,9 +506,9 @@ where
             .as_millis()
             .saturating_sub(RETENTION_HORIZON.as_secs() * 1000);
         let mut h = height;
-        loop {
+        let coverage = loop {
             let Some(entry) = self.block_for_sync(h) else {
-                break;
+                break self.coverage_at(h);
             };
             if entry
                 .block
@@ -438,13 +518,15 @@ where
                 .as_millis()
                 < floor
             {
-                break;
+                break WindowCoverage::Whole;
             }
             set.extend(entry.block.transactions().iter().map(|tx| tx.hash()));
-            let Some(prev) = h.prev() else { break };
+            let Some(prev) = h.prev() else {
+                break WindowCoverage::Whole;
+            };
             h = prev;
-        }
-        set
+        };
+        (set, coverage)
     }
 
     /// The tick-ids `local_shard` settled across the window, unioned with
@@ -472,7 +554,7 @@ where
         anchor_wt: WeightedTimestamp,
         window_floor: Option<WeightedTimestamp>,
         own: Vec<TxHash>,
-    ) -> std::collections::BTreeSet<TxHash> {
+    ) -> (std::collections::BTreeSet<TxHash>, WindowCoverage) {
         let mut set: std::collections::BTreeSet<TxHash> = own.into_iter().collect();
         // Pending prefix: walk by hash so a certified-but-unattached
         // ancestor still resolves. These ancestors sit within the window by
@@ -498,13 +580,15 @@ where
         let anchor_floor = anchor_wt
             .as_millis()
             .saturating_sub(RETENTION_HORIZON.as_secs() * 1000);
-        if let Some(floor) = window_floor.filter(|f| f.as_millis() <= anchor_floor) {
-            set.extend(self.committed_settled_window(local_shard, floor, height));
+        let coverage = if let Some(floor) = window_floor.filter(|f| f.as_millis() <= anchor_floor) {
+            let (folded, coverage) = self.committed_settled_window(local_shard, floor, height);
+            set.extend(folded);
+            coverage
         } else {
             let floor = WeightedTimestamp::from_millis(anchor_floor);
-            self.walk_committed_settled(local_shard, floor, height, None, &mut set);
-        }
-        set
+            self.walk_committed_settled(local_shard, floor, height, None, &mut set)
+        };
+        (set, coverage)
     }
 
     /// The committed-tail contribution to a settled-transaction window under a
@@ -524,7 +608,7 @@ where
         local_shard: ShardId,
         floor: WeightedTimestamp,
         upto: BlockHeight,
-    ) -> std::collections::BTreeSet<TxHash> {
+    ) -> (std::collections::BTreeSet<TxHash>, WindowCoverage) {
         let covered: Option<(BlockHeight, std::collections::BTreeSet<TxHash>)> =
             read_or_recover(&self.settled_window_memo)
                 .as_ref()
@@ -534,21 +618,30 @@ where
             Some((u, s)) => (Some(u), s),
             None => (None, std::collections::BTreeSet::new()),
         };
-        self.walk_committed_settled(local_shard, floor, upto, covered_upto, &mut set);
-
-        let mut memo = write_or_recover(&self.settled_window_memo);
-        if memo
-            .as_ref()
-            .is_none_or(|m| m.local_shard != local_shard || m.floor != floor || m.upto < upto)
-        {
-            *memo = Some(SettledWindowMemo {
-                local_shard,
-                floor,
-                upto,
-                set: set.clone(),
-            });
+        let coverage =
+            self.walk_committed_settled(local_shard, floor, upto, covered_upto, &mut set);
+        // A short walk is a prefix of the window, so memoizing it would
+        // pin the truncation for every later call at this floor — and the
+        // memo only ever extends, so nothing would ever correct it.
+        if coverage.short_at().is_some() {
+            return (set, coverage);
         }
-        set
+
+        {
+            let mut memo = write_or_recover(&self.settled_window_memo);
+            if memo
+                .as_ref()
+                .is_none_or(|m| m.local_shard != local_shard || m.floor != floor || m.upto < upto)
+            {
+                *memo = Some(SettledWindowMemo {
+                    local_shard,
+                    floor,
+                    upto,
+                    set: set.clone(),
+                });
+            }
+        }
+        (set, coverage)
     }
 
     /// Walk the committed chain downward from `upto`, folding
@@ -568,23 +661,28 @@ where
         upto: BlockHeight,
         covered_upto: Option<BlockHeight>,
         set: &mut std::collections::BTreeSet<TxHash>,
-    ) {
+    ) -> WindowCoverage {
         let mut h = upto;
         while covered_upto != Some(h) {
             let Some(entry) = self.block_for_sync(h) else {
-                break;
+                return self.coverage_at(h);
             };
             let block_wt = entry.block.header().parent_qc().weighted_timestamp();
             if block_wt.as_millis() < floor.as_millis() {
-                break;
+                return WindowCoverage::Whole;
             }
             set.extend(local_settled_tx_hashes(
                 entry.block.certificates().iter(),
                 local_shard,
             ));
-            let Some(prev) = h.prev() else { break };
+            let Some(prev) = h.prev() else {
+                return WindowCoverage::Whole;
+            };
             h = prev;
         }
+        // Stopped on the memo's own boundary: everything below it is
+        // already folded, and it was folded by a walk that reached.
+        WindowCoverage::Whole
     }
 
     /// Most recent QC observed by this chain. Pending entries shadow the
@@ -1450,7 +1548,23 @@ mod tests {
     }
 
     fn empty_chain() -> Arc<PendingChain<StubStore>> {
-        Arc::new(PendingChain::new(Arc::new(StubStore::default())))
+        Arc::new(PendingChain::new(
+            Arc::new(StubStore::default()),
+            ChainOrigin::ROOT,
+        ))
+    }
+
+    /// A chain that begins at `genesis_height`, the way a reshape
+    /// successor does — below it there is nothing for a walk to have
+    /// missed.
+    fn chain_from(origin_height: u64, stub: StubStore) -> Arc<PendingChain<StubStore>> {
+        Arc::new(PendingChain::new(
+            Arc::new(stub),
+            ChainOrigin {
+                genesis_height: BlockHeight::new(origin_height),
+                anchor_wt: WeightedTimestamp::ZERO,
+            },
+        ))
     }
 
     fn chain_with_persisted(blocks: Vec<CertifiedBlock>) -> Arc<PendingChain<StubStore>> {
@@ -1458,7 +1572,7 @@ mod tests {
         for b in blocks {
             stub = stub.with_block(b);
         }
-        Arc::new(PendingChain::new(Arc::new(stub)))
+        Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT))
     }
 
     #[test]
@@ -1807,7 +1921,7 @@ mod tests {
         // than expand the stub, exercise just the pending arm here. The
         // persisted fall-through is covered by integration tests in the
         // node crate where a real ShardChainReader is wired in.
-        let chain = Arc::new(PendingChain::new(Arc::new(stub)));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
         // No pending entry — pending arm misses, base arm returns None
         // because StubStore::get_block_for_sync is the trait default
         // (None). Documenting the boundary here.
@@ -1973,7 +2087,7 @@ mod tests {
                 certified_uncommitted: None,
             },
         );
-        let set = chain.settled_txs_in_window(
+        let (set, _) = chain.settled_txs_in_window(
             ShardId::ROOT,
             parent,
             BlockHeight::new(5),
@@ -2007,7 +2121,7 @@ mod tests {
                 BlockHeight::new(2),
                 settled_sync_block(BlockHeight::new(2), 9_999, &below_floor),
             );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub)));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         chain.insert(
             parent,
@@ -2021,7 +2135,7 @@ mod tests {
                 certified_uncommitted: None,
             },
         );
-        let set = chain.settled_txs_in_window(
+        let (set, _) = chain.settled_txs_in_window(
             ShardId::ROOT,
             parent,
             BlockHeight::new(4),
@@ -2117,7 +2231,7 @@ mod tests {
                 certified_uncommitted: None,
             },
         );
-        let set = chain.committed_txs_in_window(
+        let (set, _) = chain.committed_txs_in_window(
             parent,
             BlockHeight::new(5),
             WeightedTimestamp::from_millis(10_000),
@@ -2144,7 +2258,7 @@ mod tests {
                 BlockHeight::new(2),
                 committed_sync_block(BlockHeight::new(2), 9_999, &[12]),
             );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub)));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         chain.insert(
             parent,
@@ -2158,11 +2272,144 @@ mod tests {
                 certified_uncommitted: None,
             },
         );
-        let set = chain.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
+        let (set, _) =
+            chain.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
         assert_eq!(
             set,
             BTreeSet::from([tx_hash(13), tx_hash(10), tx_hash(11)]),
             "the below-floor block's transaction must not enter the window"
+        );
+    }
+
+    /// A hole in the committed tail is not the bottom of the window.
+    ///
+    /// The walk cannot tell the two apart from the store alone, and used
+    /// to spell both as one `break` — so a node missing history below its
+    /// snap-sync anchor computed a smaller root than every full-history
+    /// replica and read it back as a mismatch rather than as a gap.
+    #[test]
+    fn a_hole_in_the_committed_tail_is_reported_short_not_whole() {
+        let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
+        let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000);
+        // Height 3 is held; height 2 is a hole, and everything at and
+        // below it is well above the floor, so the window is not done.
+        let stub = StubStore::default().with_sync_block(
+            BlockHeight::new(3),
+            committed_sync_block(BlockHeight::new(3), anchor.as_millis(), &[10]),
+        );
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
+        chain.insert(
+            parent,
+            ChainEntry {
+                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
+                height: BlockHeight::new(4),
+                settled_txs: Vec::new(),
+                committed_txs: vec![tx_hash(13)],
+                jmt_snapshot: empty_snapshot(),
+                certified_block: None,
+                certified_uncommitted: None,
+            },
+        );
+
+        let (set, coverage) =
+            chain.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
+        assert_eq!(
+            coverage,
+            WindowCoverage::Short {
+                at: BlockHeight::new(2)
+            },
+        );
+        assert_eq!(
+            set,
+            BTreeSet::from([tx_hash(13), tx_hash(10)]),
+            "the prefix is still what it walked — it is the verdict that changes",
+        );
+
+        // And the pair refuses to be computed at all rather than handing
+        // back a root over that prefix.
+        assert!(
+            chain
+                .terminal_roots_in_window(
+                    &TerminalWindow {
+                        local_shard: ShardId::ROOT,
+                        parent_block_hash: parent,
+                        parent_block_height: BlockHeight::new(4),
+                        anchor_wt: anchor,
+                        settled_window_floor: None,
+                    },
+                    &[],
+                    Vec::new(),
+                )
+                .is_err(),
+        );
+    }
+
+    /// A split child's own origin is not a hole.
+    ///
+    /// The child continues its predecessor's height line, so a walk that
+    /// runs off the bottom of a child younger than the retention horizon
+    /// reaches heights that exist on no chain here. Reading that as a gap
+    /// would make every proposer of such a child skip its slot — the
+    /// liveness half of the same distinction the hole case is the safety
+    /// half of.
+    #[test]
+    fn a_walk_below_a_split_childs_origin_is_whole_not_short() {
+        let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
+        let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000);
+        // The child begins at height 3 and holds it; nothing below exists
+        // on this chain, and the floor is far below what it can reach.
+        let stub = StubStore::default().with_sync_block(
+            BlockHeight::new(3),
+            committed_sync_block(BlockHeight::new(3), anchor.as_millis(), &[10]),
+        );
+        let child = chain_from(3, stub);
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
+        let entry = |height: u64| ChainEntry {
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
+            height: BlockHeight::new(height),
+            settled_txs: Vec::new(),
+            committed_txs: vec![tx_hash(13)],
+            jmt_snapshot: empty_snapshot(),
+            certified_block: None,
+            certified_uncommitted: None,
+        };
+        child.insert(parent, entry(4));
+
+        let (_, coverage) =
+            child.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
+        assert_eq!(coverage, WindowCoverage::Whole);
+
+        // And the origin height itself, which is the case that actually
+        // occurs: a chain whose window never reaches the floor walks to
+        // its own genesis, and the genesis block is not always servable.
+        let at_origin = chain_from(3, StubStore::default());
+        at_origin.insert(parent, entry(4));
+        let (_, coverage) =
+            at_origin.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
+        assert_eq!(
+            coverage,
+            WindowCoverage::Whole,
+            "a miss at the chain's own genesis height is its bottom, not a hole",
+        );
+
+        // The same store read as a chain born at network genesis *is* a
+        // hole: height 2 should be there and is not.
+        let genesis_born = chain_from(
+            0,
+            StubStore::default().with_sync_block(
+                BlockHeight::new(3),
+                committed_sync_block(BlockHeight::new(3), anchor.as_millis(), &[10]),
+            ),
+        );
+        genesis_born.insert(parent, entry(4));
+        let (_, coverage) =
+            genesis_born.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
+        assert_eq!(
+            coverage,
+            WindowCoverage::Short {
+                at: BlockHeight::new(2)
+            },
         );
     }
 
@@ -2172,7 +2419,9 @@ mod tests {
     /// changes it.
     #[test]
     fn committed_txs_root_tracks_the_window_set() {
-        let chain = empty_chain();
+        // The chain begins at the block under construction's parent: there
+        // are no committed blocks beneath it, so the window is whole.
+        let chain = chain_from(2, StubStore::default());
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         chain.insert(
             parent,
@@ -2199,6 +2448,7 @@ mod tests {
                 &[],
                 vec![tx_hash(21)],
             )
+            .expect("the stub holds every height in the window")
             .committed_txs;
         assert_eq!(
             root,
@@ -2230,8 +2480,8 @@ mod tests {
                 BlockHeight::new(2),
                 settled_sync_block(BlockHeight::new(2), 9_999, &early_settled),
             );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub)));
-        let set = chain.settled_txs_in_window(
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        let (set, _) = chain.settled_txs_in_window(
             ShardId::ROOT,
             BlockHash::from_raw(Hash::from_bytes(b"missing-parent")),
             BlockHeight::new(3),
@@ -2267,16 +2517,18 @@ mod tests {
                 BlockHeight::new(4),
                 settled_sync_block(BlockHeight::new(4), 3_000, &w4),
             );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub)));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
         let at = |h: u64| {
-            chain.settled_txs_in_window(
-                ShardId::ROOT,
-                BlockHash::from_raw(Hash::from_bytes(b"missing-parent")),
-                BlockHeight::new(h),
-                WeightedTimestamp::from_millis(rh_ms + 10_000),
-                floor,
-                Vec::new(),
-            )
+            chain
+                .settled_txs_in_window(
+                    ShardId::ROOT,
+                    BlockHash::from_raw(Hash::from_bytes(b"missing-parent")),
+                    BlockHeight::new(h),
+                    WeightedTimestamp::from_millis(rh_ms + 10_000),
+                    floor,
+                    Vec::new(),
+                )
+                .0
         };
         assert_eq!(at(3), BTreeSet::from([settled_tx(&w2), settled_tx(&w3)]));
         // The higher call folds only block 4 onto the memo.

@@ -751,7 +751,14 @@ fn build_shard_io<S: ShardStorage>(
         Arc::clone(rep.state.execution_coordinator().proven_cells()),
     );
     let storage = Arc::new(storage);
-    let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));
+    // The chain's own origin, which the committed-window walks floor on
+    // exactly as the block-sync watermark below does: a split child or
+    // merge parent continues its predecessor's height line, and heights
+    // beneath that line exist on no chain here.
+    let pending_chain = Arc::new(PendingChain::new(
+        Arc::clone(&storage),
+        rep.state.shard_coordinator().chain_origin(),
+    ));
     let tick_chain = Arc::new(TickChain::new(Arc::clone(&storage)));
     let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);
     {

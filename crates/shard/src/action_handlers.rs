@@ -1119,7 +1119,7 @@ where
             // its successors and its surviving counterparts; recompute the
             // pair from the committed chain whenever the shard terminates
             // at the next boundary, split or merge.
-            let computed_terminal_roots = terminal_roots_required.then(|| {
+            let computed_terminal_roots = match terminal_roots_required.then(|| {
                 ctx.pending_chain.terminal_roots_in_window(
                     &TerminalWindow {
                         local_shard: ctx.shard,
@@ -1131,7 +1131,29 @@ where
                     &finalizations,
                     block_tx_hashes.clone(),
                 )
-            });
+            }) {
+                None => None,
+                Some(Ok(roots)) => Some(roots),
+                // The window reaches below what this store answers for, so
+                // the pair is not computable here. Refusing says that;
+                // carrying a root taken over the prefix would claim a
+                // smaller set than every full-history replica attests, and
+                // read back as a mismatch rather than as a gap.
+                Some(Err(coverage)) => {
+                    tracing::warn!(
+                        ?block_hash,
+                        height = block_height.inner(),
+                        missing_at = ?coverage.short_at(),
+                        "Declining a terminal block whose window runs below the blocks held here"
+                    );
+                    ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                        block_hash,
+                        kind: VerificationKind::StateRoot,
+                        outcome: CheckOutcome::Refused,
+                    });
+                    return;
+                }
+            };
             let verify_result = expected_root.verify(&StateRootContext {
                 computed_root: &computed_root,
                 claimed_split_child_roots,
@@ -1317,7 +1339,7 @@ where
             // A terminating shard's boundary header carries what it leaves
             // its successors and its surviving counterparts — whenever the
             // shard terminates at the next boundary, split or merge.
-            let terminal_roots = carry_terminal_roots.then(|| {
+            let terminal_roots = match carry_terminal_roots.then(|| {
                 ctx.pending_chain.terminal_roots_in_window(
                     &TerminalWindow {
                         local_shard: shard_id,
@@ -1329,7 +1351,26 @@ where
                     &finalizations,
                     block_tx_hashes.clone(),
                 )
-            });
+            }) {
+                None => None,
+                Some(Ok(roots)) => Some(roots),
+                // Nothing to propose: a boundary header carries this pair
+                // or it is not a boundary header, and the pair computed
+                // here would be short. Leaving the slot empty rotates it
+                // to a proposer whose store reaches, which is the same
+                // response the round already has for one that cannot
+                // answer in time.
+                Some(Err(coverage)) => {
+                    tracing::warn!(
+                        shard = ?shard_id,
+                        height = height.inner(),
+                        round = round.inner(),
+                        missing_at = ?coverage.short_at(),
+                        "Skipping a terminal proposal whose window runs below the blocks held here"
+                    );
+                    return;
+                }
+            };
             let result = build_proposal(
                 &view,
                 proposer,

@@ -55,7 +55,7 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
         record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
     };
-    let set = pending_chain.settled_txs_in_window(
+    let (set, coverage) = pending_chain.settled_txs_in_window(
         shard,
         block.header().parent_block_hash(),
         parent_height,
@@ -63,6 +63,19 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
         window_floor,
         own,
     );
+    if let Some(missing_at) = coverage.short_at() {
+        // The window runs below what this store answers for. Serving the
+        // prefix would tell the requester a settled transaction settled
+        // nowhere, which is worse than not answering.
+        tracing::warn!(
+            shard = ?shard,
+            terminal_height = req.terminal_height.inner(),
+            missing_at = missing_at.inner(),
+            "settled-transaction window runs below the blocks held here; serving not_found"
+        );
+        record_fetch_response_sent("settled_txs", 0);
+        return GetSettledTxsResponse::not_found();
+    }
 
     // A window exceeding the wire cap serves `not_found` rather than
     // shipping a response the receiver would reject at decode. The set is
@@ -97,11 +110,11 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ExecutionCertificate,
-        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-        ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
-        TickHalf, TickId, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
-        WitnessSources, settled_txs_root_from_hashes,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin,
+        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
+        Hash, ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, ShardId,
+        SignerBitfield, TickHalf, TickId, TxHash, TxOutcome, Verifiable, Verified,
+        WeightedTimestamp, WitnessSources, settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -212,7 +225,7 @@ mod tests {
             parent = commit_block(&storage, h, parent, 1_000 * h, &[finalization(h)]);
         }
         let terminal = parent;
-        let pending_chain = PendingChain::new(Arc::new(storage));
+        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
 
         let req = GetSettledTxsRequest::new(BlockHeight::new(3), terminal);
         let response = serve_settled_txs_request(&pending_chain, None, &req);
@@ -238,7 +251,7 @@ mod tests {
         let mut parent = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalization(1)]);
         parent = commit_block(&storage, 2, parent, rh_ms + 10_000, &[finalization(2)]);
         let terminal = commit_block(&storage, 3, parent, rh_ms + 11_000, &[finalization(3)]);
-        let pending_chain = PendingChain::new(Arc::new(storage));
+        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
         let req = GetSettledTxsRequest::new(BlockHeight::new(3), terminal);
 
         // Anchor-only floor: the early settlement falls outside the window.
@@ -263,7 +276,7 @@ mod tests {
     fn wrong_terminal_hash_serves_not_found() {
         let storage = SimShardStorage::default();
         let _ = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalization(1)]);
-        let pending_chain = PendingChain::new(Arc::new(storage));
+        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
         let req = GetSettledTxsRequest::new(
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"other-chain")),
@@ -279,7 +292,7 @@ mod tests {
     #[test]
     fn unheld_height_serves_not_found() {
         let storage = Arc::new(SimShardStorage::default());
-        let pending_chain = PendingChain::new(storage);
+        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
         let req = GetSettledTxsRequest::new(BlockHeight::new(7), BlockHash::ZERO);
         assert!(
             serve_settled_txs_request(&pending_chain, None, &req)

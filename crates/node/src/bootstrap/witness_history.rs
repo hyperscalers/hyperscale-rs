@@ -222,8 +222,8 @@ mod tests {
     use hyperscale_storage::{PendingChain, RecoveredState};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, ShardWitnessPayload, StateRoot,
-        WeightedTimestamp,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, ChainOrigin, ShardWitnessPayload,
+        StateRoot, WeightedTimestamp,
     };
 
     use super::*;
@@ -245,7 +245,10 @@ mod tests {
             terminal_roots: None,
             handoff_complete: None,
         };
-        (PendingChain::new(Arc::new(storage)), anchor)
+        (
+            PendingChain::new(Arc::new(storage), ChainOrigin::ROOT),
+            anchor,
+        )
     }
 
     /// Drive the assembly to completion against `peer`, asserting every
@@ -333,7 +336,7 @@ mod tests {
             terminal_roots: None,
             handoff_complete: None,
         };
-        let peer = PendingChain::new(Arc::new(storage));
+        let peer = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
 
         let mut sync = WitnessHistorySync::new(anchor, 2);
         drive(&mut sync, &peer);

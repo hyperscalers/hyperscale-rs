@@ -311,8 +311,8 @@ mod tests {
     use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, ShardAnchor, SubstateLeaf,
-        TopologySnapshot, ValidatorId, ValidatorSet,
+        ChainOrigin, GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, ShardAnchor,
+        SubstateLeaf, TopologySnapshot, ValidatorId, ValidatorSet,
     };
 
     use super::*;
@@ -343,7 +343,7 @@ mod tests {
         fn new(storage: Arc<SimShardStorage>, flaky_failures: usize) -> Self {
             Self {
                 honest: Arc::clone(&storage),
-                pending_chain: PendingChain::new(storage),
+                pending_chain: PendingChain::new(storage, ChainOrigin::ROOT),
                 flaky_failures: AtomicUsize::new(flaky_failures),
                 state_ranges_served: AtomicUsize::new(0),
             }
@@ -475,7 +475,7 @@ mod tests {
 
         // The "previous process": witness, then stage three sub-ranges
         // of the fan-out before dying.
-        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
         let mut first = ShardBootstrap::new(shard, anchor);
         let mut staged = 0usize;
         'outer: for _ in 0..1_000 {
