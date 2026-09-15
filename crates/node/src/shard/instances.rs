@@ -248,6 +248,7 @@ where
     /// address, and what an envelope was waiting on says nothing about
     /// how it re-enters.
     pub(crate) fn release_deferred(&mut self, arrived: &[Address]) {
+        let mut unplaced: Vec<TxHash> = Vec::new();
         for (tx, origin) in self.io.mempool.deferred_records.release(arrived) {
             match origin {
                 DeferredOrigin::Validation => self.queue_validation(tx),
@@ -256,10 +257,27 @@ where
                 // are all decisions the routing it can now derive makes.
                 DeferredOrigin::Submission => {
                     self.io.mempool.pending_validation.remove(&tx.hash());
-                    self.process.submit_transaction(&tx);
+                    if !self.process.submit_transaction(&tx) {
+                        unplaced.push(tx.hash());
+                    }
                 }
             }
         }
+        self.settle_deferred(&unplaced);
+    }
+
+    /// Retire the asks of the envelopes admission has answered for.
+    ///
+    /// The queue holds a re-offered envelope until this says what
+    /// became of it: re-admission either holds it back again, naming
+    /// what is still missing, or it leaves the node — and then the
+    /// names only it wanted are owed to nobody.
+    pub(crate) fn settle_deferred(&mut self, gone: &[TxHash]) {
+        if gone.is_empty() || self.io.mempool.deferred_records.is_empty() {
+            return;
+        }
+        let orphaned = self.io.mempool.deferred_records.settle(gone);
+        self.retire_orphaned(orphaned);
     }
 
     /// Drop the envelopes whose validity window has closed while they
@@ -285,7 +303,7 @@ where
     /// component that does not exist is one anyone can gossip — so
     /// without this the ask is re-dispatched every fetch tick for the
     /// life of the process.
-    fn retire_orphaned(&mut self, orphaned: Orphaned) {
+    pub(crate) fn retire_orphaned(&mut self, orphaned: Orphaned) {
         if orphaned.is_empty() {
             return;
         }

@@ -116,6 +116,10 @@ where
     pub(crate) fn handle_transaction_validated(&mut self, tx: Arc<Verified<Transaction>>) {
         let tx_hash = tx.hash();
         self.io.mempool.pending_validation.remove(&tx_hash);
+        // An envelope that derives wants nothing, so this retires only
+        // asks whose answers are already seated — but it is what frees
+        // the slot the re-offer was holding.
+        self.settle_deferred(&[tx_hash]);
         let submitted_locally = self.io.mempool.locally_submitted.remove(&tx_hash);
         // The earliest this node can know it will be asked to run this
         // code. Deriving the envelope needed the metadata and nothing
@@ -135,6 +139,7 @@ where
             self.io.mempool.pending_validation.remove(hash);
             self.io.mempool.locally_submitted.remove(hash);
         }
+        self.settle_deferred(hashes);
     }
 
     /// Passive co-host admission of a locally-submitted tx: admit to

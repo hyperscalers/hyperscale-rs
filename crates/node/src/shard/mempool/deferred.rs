@@ -96,6 +96,19 @@ impl Orphaned {
     }
 }
 
+/// An envelope the queue holds, and where it is.
+struct Held {
+    deferred: DeferredTransaction,
+    /// Whether an arrival has handed this envelope back to admission.
+    ///
+    /// A re-offered envelope is out of the index, so no second arrival
+    /// offers it again while the first offer is still being judged. It
+    /// stays a reason its asks stand, because admission can hold it
+    /// back on the same names — and the verdict that says otherwise is
+    /// what retires them.
+    reoffered: bool,
+}
+
 /// Envelopes waiting on records, indexed by the records they wait on.
 ///
 /// The index names only envelopes the queue is still holding, so the
@@ -104,9 +117,16 @@ impl Orphaned {
 /// exist is one anyone can gossip — so a key that outlived its envelopes
 /// would never be reached by an arrival, and the index would grow with
 /// what was asked for rather than with what is waiting.
+///
+/// An envelope leaves the queue three ways, and each returns the names
+/// no envelope still here wants: the bound evicts it, its validity
+/// window closes, or admission answers for it. Being offered back to
+/// admission is none of those — it is why the queue holds re-offered
+/// envelopes too.
 pub struct DeferredForRecords {
-    held: HashMap<TxHash, DeferredTransaction>,
-    /// Which envelopes each awaited record would release.
+    held: HashMap<TxHash, Held>,
+    /// Which envelopes each awaited record would release. Only
+    /// envelopes still waiting appear here.
     waiting: HashMap<Address, Vec<TxHash>>,
     order: VecDeque<TxHash>,
     capacity: usize,
@@ -135,7 +155,11 @@ impl DeferredForRecords {
                 queue.push(hash);
             }
         }
-        if self.held.insert(hash, deferred).is_none() {
+        let held = Held {
+            deferred,
+            reoffered: false,
+        };
+        if self.held.insert(hash, held).is_none() {
             self.order.push_back(hash);
         }
         let mut evicted = Vec::new();
@@ -146,7 +170,7 @@ impl DeferredForRecords {
             };
             if let Some(gone) = self.held.remove(&oldest) {
                 evicted.push(oldest);
-                dropped.push(gone);
+                dropped.push(gone.deferred);
             }
         }
         if evicted.is_empty() {
@@ -172,7 +196,7 @@ impl DeferredForRecords {
                     && !self
                         .held
                         .values()
-                        .any(|held| held.wanted.instances.contains(instance))
+                        .any(|held| held.deferred.wanted.instances.contains(instance))
                 {
                     orphaned.instances.push(*instance);
                 }
@@ -182,7 +206,7 @@ impl DeferredForRecords {
                     && !self
                         .held
                         .values()
-                        .any(|held| held.wanted.packages.contains(package))
+                        .any(|held| held.deferred.wanted.packages.contains(package))
                 {
                     orphaned.packages.push(*package);
                 }
@@ -212,6 +236,11 @@ impl DeferredForRecords {
     /// them: re-admission is what discovers whether the rest are there,
     /// and it holds itself back again naming what is still missing —
     /// including the packages a record it just learned points at.
+    ///
+    /// Released is not gone. The queue keeps the envelope as a reason
+    /// its other asks stand, because admission has not said yet whether
+    /// it wants them — only that it is no longer waiting here, which is
+    /// what leaving the index says.
     pub fn release(&mut self, arrived: &[Address]) -> Vec<(Arc<Transaction>, DeferredOrigin)> {
         let mut released = Vec::new();
         for name in arrived {
@@ -219,13 +248,42 @@ impl DeferredForRecords {
                 continue;
             };
             for hash in hashes {
-                if let Some(held) = self.held.remove(&hash) {
-                    released.push((held.tx, held.origin));
+                let Some(held) = self.held.get_mut(&hash) else {
+                    continue;
+                };
+                if held.reoffered {
+                    continue;
                 }
+                held.reoffered = true;
+                released.push((Arc::clone(&held.deferred.tx), held.deferred.origin));
             }
         }
         self.forget_dropped();
         released
+    }
+
+    /// Drop the envelopes admission has answered for, returning the
+    /// names no envelope still here wants.
+    ///
+    /// The answer is a verdict on the offer an arrival made, so a
+    /// `hash` the queue is holding again is one that answered for
+    /// itself by coming back: it keeps its asks, and retiring them
+    /// would cancel a fetch it is waiting on right now.
+    pub fn settle(&mut self, gone: &[TxHash]) -> Orphaned {
+        let mut dropped = Vec::new();
+        for hash in gone {
+            if !self.held.get(hash).is_some_and(|held| held.reoffered) {
+                continue;
+            }
+            if let Some(held) = self.held.remove(hash) {
+                dropped.push(held.deferred);
+            }
+        }
+        if dropped.is_empty() {
+            return Orphaned::default();
+        }
+        self.forget_dropped();
+        self.orphaned_among(&dropped)
     }
 
     /// Drop the envelopes whose validity window has closed by
@@ -238,13 +296,13 @@ impl DeferredForRecords {
         let expired: Vec<TxHash> = self
             .held
             .iter()
-            .filter(|(_, held)| held.tx.body().validity_end_ms <= now_ms)
+            .filter(|(_, held)| held.deferred.tx.body().validity_end_ms <= now_ms)
             .map(|(hash, _)| *hash)
             .collect();
         let mut dropped = Vec::new();
         for hash in &expired {
             if let Some(gone) = self.held.remove(hash) {
-                dropped.push(gone);
+                dropped.push(gone.deferred);
             }
         }
         if expired.is_empty() {
@@ -255,7 +313,7 @@ impl DeferredForRecords {
         (expired, orphaned)
     }
 
-    /// Whether nothing is waiting.
+    /// Whether the queue holds nothing, waiting or re-offered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
@@ -340,7 +398,11 @@ mod tests {
         let released = wait.release(&[instance(0xA1)]);
         assert_eq!(released.len(), 1);
         assert_eq!(released[0].0.hash(), first.hash());
-        assert_eq!(wait.held.len(), 1, "the other envelope is still waiting");
+        assert_eq!(
+            wait.release(&[instance(0xB2)])[0].0.hash(),
+            second.hash(),
+            "the other envelope is still waiting on its own record",
+        );
     }
 
     /// One record is enough to offer an envelope again. Whether the rest
@@ -356,7 +418,6 @@ mod tests {
         ));
 
         assert_eq!(wait.release(&[instance(0xB2)]).len(), 1);
-        assert!(wait.is_empty());
         assert!(
             wait.release(&[instance(0xA1)]).is_empty(),
             "the record it no longer waits on releases nothing"
@@ -438,5 +499,81 @@ mod tests {
         let released = wait.release(&[instance(0xA1)]);
         assert_eq!(released.len(), 1);
         assert_eq!(released[0].0.hash(), lasting.hash());
+    }
+
+    /// An envelope whose re-admission fails outright leaves no ask
+    /// standing. It is gone from the node, so the names it alone wanted
+    /// are owed to nobody, and the custodian may have none to give.
+    #[test]
+    fn an_envelope_that_fails_admission_again_orphans_what_it_wanted() {
+        let mut wait = DeferredForRecords::new();
+        let tx = envelope(3, u64::MAX);
+        wait.defer(deferred(
+            Arc::clone(&tx),
+            vec![instance(0xA1), instance(0xB2)],
+        ));
+
+        assert_eq!(wait.release(&[instance(0xB2)]).len(), 1);
+        let orphaned = wait.settle(&[tx.hash()]);
+        assert_eq!(orphaned.instances, vec![instance(0xA1), instance(0xB2)]);
+        assert!(wait.is_empty());
+    }
+
+    /// An envelope that holds itself back again keeps its asks: the
+    /// verdict that retires them is the one that says the envelope is
+    /// gone, and a re-deferral says the opposite.
+    #[test]
+    fn an_envelope_that_defers_again_keeps_its_asks() {
+        let mut wait = DeferredForRecords::new();
+        let tx = envelope(3, u64::MAX);
+        wait.defer(deferred(
+            Arc::clone(&tx),
+            vec![instance(0xA1), instance(0xB2)],
+        ));
+
+        assert_eq!(wait.release(&[instance(0xB2)]).len(), 1);
+        let (evicted, orphaned) = wait.defer(deferred(Arc::clone(&tx), vec![instance(0xA1)]));
+        assert!(evicted.is_empty());
+        assert!(orphaned.is_empty());
+
+        assert!(
+            wait.settle(&[tx.hash()]).is_empty(),
+            "a verdict on the offer it already came back from retires nothing",
+        );
+        assert_eq!(
+            wait.release(&[instance(0xA1)]).len(),
+            1,
+            "and the record it is waiting on still releases it",
+        );
+    }
+
+    /// A re-offered envelope is a reason its siblings' asks stand, and
+    /// no arrival offers it a second time while admission holds it.
+    #[test]
+    fn an_envelope_admission_holds_still_counts_as_a_wanter() {
+        let mut wait = DeferredForRecords::new();
+        let offered = envelope(1, 50_000);
+        let expiring = envelope(2, 5_000);
+        wait.defer(deferred(
+            Arc::clone(&offered),
+            vec![instance(0xA1), instance(0xB2)],
+        ));
+        wait.defer(deferred(Arc::clone(&expiring), vec![instance(0xB2)]));
+
+        assert_eq!(wait.release(&[instance(0xA1)]).len(), 1);
+        let second = wait.release(&[instance(0xB2)]);
+        assert_eq!(
+            second.len(),
+            1,
+            "and the envelope admission holds is not offered twice"
+        );
+        assert_eq!(second[0].0.hash(), expiring.hash());
+
+        let (expired, orphaned) = wait.sweep_expired(10_000);
+        assert_eq!(expired, vec![expiring.hash()]);
+        assert!(
+            orphaned.is_empty(),
+            "the re-offered envelope still wants what it was waiting on",
+        );
     }
 }
