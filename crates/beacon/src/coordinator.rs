@@ -1262,7 +1262,7 @@ impl BeaconCoordinator {
     fn drain_vote_equivocations_for(&mut self) -> Vec<ShardVoteEquivocation> {
         let mut pairs = self.vote_equivocations_observed.drain_for_proposal();
         for overflow in pairs.split_off(pairs.len().min(MAX_EQUIVOCATIONS_PER_PROPOSER)) {
-            self.vote_equivocations_observed.record(overflow);
+            self.vote_equivocations_observed.retain_overflow(overflow);
         }
         pairs
     }
@@ -1275,7 +1275,7 @@ impl BeaconCoordinator {
         for overflow in
             equivocations.split_off(equivocations.len().min(MAX_EQUIVOCATIONS_PER_PROPOSER))
         {
-            self.equivocations.record_pc_equivocation(overflow);
+            self.equivocations.retain_overflow(overflow);
         }
         equivocations
     }
@@ -2017,6 +2017,10 @@ impl BeaconCoordinator {
     /// still in flight rode a proposal this fold discarded (a Skip epoch
     /// drops every member's drained copy at once); restore it for the
     /// next build.
+    ///
+    /// All three buffers, because a drain is not a delivery for any of
+    /// them: evidence taken for a proposal that never folds and not
+    /// restored is gone from this node for good.
     fn prune_folded_evidence(&mut self) {
         let validators = &self.state.validators;
         self.equivocations.prune(|v| {
@@ -2039,6 +2043,8 @@ impl BeaconCoordinator {
                     .get(&shard)
                     .is_some_and(|r| r.cause == RecoveryCause::Fork)
         });
+        self.equivocations.restore_undelivered();
+        self.vote_equivocations_observed.restore_undelivered();
         self.fork_proofs.restore_undelivered();
     }
 
