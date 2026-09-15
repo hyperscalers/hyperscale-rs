@@ -106,6 +106,7 @@ where
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let process = Arc::clone(&self.process);
         self.process
             .network
             .register_gossip_handler::<CertifiedBlockHeaderGossip>(
@@ -119,12 +120,35 @@ where
                         return GossipVerdict::Reject;
                     };
                     let sender = gossip.sender;
-                    let header_shard = gossip.certified_header.header().shard_id();
-                    let topo = topology_snapshot.load();
-
-                    let Some(public_key) =
-                        resolve_sender_key(&topo, sender, header_shard, "certified header")
+                    let header = gossip.certified_header.header();
+                    let header_shard = header.shard_id();
+                    // The committee that signed the header, resolved at
+                    // the header's own hash-pinned anchor and clamped to
+                    // the shard's terminal window — not the head's.
+                    // A split parent leaves the head's committees at its
+                    // cut and keeps coasting, broadcasting exactly the
+                    // headers the crossing tracker reads its terminal
+                    // QC off; against the head those resolve to an empty
+                    // committee and every receiver rejects them.
+                    let schedule = process.topology_schedule();
+                    let Some((signing, _)) = schedule
+                        .at_for_shard(header_shard, header.parent_qc().weighted_timestamp())
                     else {
+                        warn!(
+                            sender = sender.inner(),
+                            shard = header_shard.inner(),
+                            "certified header gossip at a window the schedule does not hold"
+                        );
+                        return GossipVerdict::Reject;
+                    };
+                    let topo = topology_snapshot.load();
+                    let Some(public_key) = resolve_sender_key(
+                        signing,
+                        &topo,
+                        sender,
+                        header_shard,
+                        "certified header",
+                    ) else {
                         return GossipVerdict::Reject;
                     };
 

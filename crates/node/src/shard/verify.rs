@@ -23,15 +23,23 @@ pub fn verify_sig_with_metrics(
 
 /// Resolve a sender's public key after verifying committee membership.
 ///
+/// Membership is read from `committee_snapshot` and the key from
+/// `topology_snapshot`, which are the head for a live shard and differ
+/// only where the artifact's own window does: a split parent's coast
+/// headers are signed by the committee of its terminal window, which the
+/// head no longer carries, while its members' keys outlive it in the
+/// validator set.
+///
 /// Returns `None` (with a warning) if the sender is not in the shard's
 /// committee or their public key cannot be resolved.
 pub fn resolve_sender_key(
+    committee_snapshot: &TopologySnapshot,
     topology_snapshot: &TopologySnapshot,
     sender: ValidatorId,
     shard: ShardId,
     context: &str,
 ) -> Option<ConsensusPublicKey> {
-    let committee = topology_snapshot.committee_for_shard(shard);
+    let committee = committee_snapshot.committee_for_shard(shard);
     if !committee.contains(&sender) {
         warn!(
             sender = sender.inner(),
@@ -104,7 +112,9 @@ pub fn verify_signed_by_committee<T: Signed>(
     context: &str,
 ) -> bool {
     let signer = notification.signer();
-    let Some(public_key) = resolve_sender_key(topology_snapshot, signer, shard, context) else {
+    let Some(public_key) =
+        resolve_sender_key(topology_snapshot, topology_snapshot, signer, shard, context)
+    else {
         return false;
     };
     let start = Stopwatch::start();
