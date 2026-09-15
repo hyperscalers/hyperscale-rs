@@ -24,18 +24,17 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    AdmittedTree, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree,
-    IntentHeader, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, PrefixShardResolver,
-    Routing as RoutedTransaction, RuleBytes, Value, admit_tree, child_key, effect_units, legs_of,
-    package_hash, package_key as canonical_package_key, principal_address, protocol_resource,
-    route_tree,
+    Admitted, AdmittedTree, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree,
+    IntentHeader, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, RuleBytes, Value,
+    admit_tree, child_key, effect_units, legs_of, package_hash,
+    package_key as canonical_package_key, principal_address, protocol_resource,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectSet, EffectTarget,
-    LegShape, LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey,
-    TermsRefusal, admit_event_bounds, read_bytes, written_leaf,
+    AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectTarget, LegShape,
+    LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey, TermsRefusal,
+    admit_event_bounds, read_bytes, written_leaf,
 };
 
 use crate::ProtocolHasher;
@@ -163,7 +162,7 @@ fn artifact_terms(packages: &PackageCache, calls: &[NodeCall]) -> Vec<ArtifactTe
 pub fn declared_vector(
     packages: &PackageCache,
     vm: &TransactionEnvelope,
-    routing: &RoutedTransaction,
+    admitted: &Admitted,
     legs: &[LegShape],
     envelope_bytes: u64,
 ) -> Result<DeclaredVector, TermsRefusal> {
@@ -187,7 +186,7 @@ pub fn declared_vector(
     //
     // The write figure comes off the set rather than being folded here,
     // so this and the quote a wallet signs against read one rule.
-    let set = &routing.declaration().set;
+    let set = &admitted.declaration().set;
     for target in set.targets() {
         add(
             target_owner(&target),
@@ -247,13 +246,13 @@ pub fn declared_vector(
     // a core shard runs every core node whatever it holds, so what a
     // node may consume is owed wherever it runs and an owner prefix
     // cannot say where that is.
-    let node_terms: Vec<DeclaredWork> = (0..routing.calls.len())
+    let node_terms: Vec<DeclaredWork> = (0..admitted.calls().len())
         .map(|index| DeclaredWork {
             compute: vm.gas_limits.get(index).copied().unwrap_or(0),
             ..DeclaredWork::ZERO
         })
         .collect();
-    let artifacts = artifact_terms(packages, &routing.calls);
+    let artifacts = artifact_terms(packages, admitted.calls());
 
     let shares: Vec<OwnerShare> = by_owner
         .into_iter()
@@ -265,8 +264,8 @@ pub fn declared_vector(
     // others. The kernel meters each node against its own figure and
     // retention prices their sum.
     let metadata = packages.load();
-    let event_bytes: Vec<u32> = routing
-        .calls
+    let event_bytes: Vec<u32> = admitted
+        .calls()
         .iter()
         .map(|call| {
             metadata
@@ -279,7 +278,7 @@ pub fn declared_vector(
         retained,
         envelope_bytes,
         vm.signatures(),
-        admit_event_bounds(&event_bytes, routing.calls.len())?,
+        admit_event_bounds(&event_bytes, admitted.calls().len())?,
     );
     Ok(DeclaredVector {
         shares,
@@ -612,17 +611,14 @@ struct DeclaredAccess {
 /// shard that charges it — and the charge contends with whatever else
 /// reaches the vault on the mode a debit has, commutative with another
 /// debit and exclusive with a write.
-fn classify_declared_access(
-    routing: &RoutedTransaction,
-    fee_payer: PrincipalAddr,
-) -> DeclaredAccess {
+fn classify_declared_access(admitted: &Admitted, fee_payer: PrincipalAddr) -> DeclaredAccess {
     let mut access = DeclaredAccess {
         read_keys: BTreeSet::new(),
         write_keys: BTreeSet::new(),
         provision_keys: BTreeSet::new(),
         declared_modes: Vec::new(),
     };
-    for effect in routing.per_shard.values().flat_map(EffectSet::iter) {
+    for effect in admitted.declaration().set.iter() {
         let key = admission_key(&effect.target);
         match effect.mode {
             Mode::Read => {
@@ -975,7 +971,7 @@ impl Derivation for BridgeStatics {
         if !unresolved.is_empty() {
             return Err(DerivationError::Unresolved(unresolved));
         }
-        let admitted = admit_tree(
+        let admitted_tree = admit_tree(
             &tree,
             signer,
             envelope_identity(vm),
@@ -983,14 +979,14 @@ impl Derivation for BridgeStatics {
             &ProtocolHasher,
         )
         .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
-        let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
+        let admitted = &admitted_tree.admitted;
 
         let DeclaredAccess {
             read_keys,
             write_keys,
             provision_keys,
             declared_modes,
-        } = classify_declared_access(&routing, vm.fee_payer);
+        } = classify_declared_access(admitted, vm.fee_payer);
         check_provision_weight(&provision_keys)?;
         let prefixes = |keys: &BTreeSet<DeclaredKey>| -> Vec<Address> {
             keys.iter()
@@ -1001,8 +997,8 @@ impl Derivation for BridgeStatics {
         };
         // Every package the lowered calls run, deduplicated — what the
         // execution gate holds the transaction to on each shard.
-        let packages: Vec<Hash> = routing
-            .calls
+        let packages: Vec<Hash> = admitted
+            .calls()
             .iter()
             .map(|call| Hash::from(call.package.0))
             .collect::<BTreeSet<_>>()
@@ -1011,16 +1007,16 @@ impl Derivation for BridgeStatics {
         // One signed ceiling per lowered node, summing under the bound,
         // and a priority under its own: the composer's terms are held to
         // the manifest the tree lowered to.
-        vm.admit_terms(routing.calls.len())
+        vm.admit_terms(admitted.calls().len())
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
-        let legs = legs_of(&admitted.admitted);
+        let legs = legs_of(admitted);
         let DeclaredVector {
             shares,
             node_terms,
             artifacts,
             everywhere,
             ..
-        } = declared_vector(&self.cache, vm, &routing, &legs, envelope_bytes(vm)?)
+        } = declared_vector(&self.cache, vm, admitted, &legs, envelope_bytes(vm)?)
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         let work = whole_work(&shares, &node_terms, &artifacts, everywhere);
         Ok(Derived {
@@ -1031,12 +1027,12 @@ impl Derivation for BridgeStatics {
             artifacts,
             everywhere,
             legs,
-            nullifiers: admitted
+            nullifiers: admitted_tree
                 .subintents
                 .iter()
                 .map(|record| record.nullifier)
                 .collect(),
-            owners: route_owners(vm, signer, &admitted),
+            owners: route_owners(vm, signer, &admitted_tree),
             signer,
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),
@@ -1047,7 +1043,7 @@ impl Derivation for BridgeStatics {
                 provision_keys: provision_keys.into_iter().collect(),
                 declared_modes,
             },
-            subintent_hashes: admitted
+            subintent_hashes: admitted_tree
                 .subintents
                 .iter()
                 .map(|record| record.subintent.0.0)

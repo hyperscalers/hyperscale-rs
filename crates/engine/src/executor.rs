@@ -38,8 +38,7 @@ use hyperscale_types::{
 pub use hyperscale_vm_effects::TargetAuthority;
 use hyperscale_vm_effects::{
     Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, NodeCall,
-    PackageHash, PrefixShardResolver, SubintentRecord, admit_tree_with_authority, legs_of,
-    package_hash, route_tree,
+    PackageHash, SubintentRecord, admit_tree_with_authority, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
@@ -754,13 +753,12 @@ impl Executor {
             authority,
         )
         .map_err(|error| format!("admission: {error}"))?;
-        let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
         // One signed ceiling per lowered node, summing under the bound.
         // Held here and not only at derivation because a preview reaches
         // the kernel without deriving: an envelope carrying no ceilings
         // meters every node at `u64::MAX`, which is the in-crate
         // fixture's reading and never an embedder's.
-        vm.admit_terms(routing.calls.len())
+        vm.admit_terms(admitted.admitted.calls().len())
             .map_err(|refusal| refusal.to_string())?;
         // The same vector derivation puts on the envelope, so a preview
         // reports what a block would charge without running the
@@ -776,7 +774,7 @@ impl Executor {
         } = declared_vector(
             packages,
             vm,
-            &routing,
+            &admitted.admitted,
             &legs,
             envelope_bytes(vm).map_err(|error| error.to_string())?,
         )
@@ -784,19 +782,19 @@ impl Executor {
         let work = whole_work(&shares, &node_terms, &artifacts, everywhere);
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
-        // order capability materialization walks. Unioning `per_shard`
-        // here would reach the same set but discard the order, which is
-        // what a guest's positional handle parameters are indexed by.
-        let declaration = routing.declaration().clone();
+        // order capability materialization walks.
+        let declaration = admitted.admitted.declaration().clone();
         let calls = match authority {
-            TargetAuthority::Required => routing.calls,
+            TargetAuthority::Required => admitted.admitted.calls().to_vec(),
             // A preview shown before its counterparties have signed:
             // every guarded call is answered as if whoever it names
             // had presented themselves. The lie is told at admission's
             // door and here, and nowhere on the commit path.
-            TargetAuthority::Assumed => routing
-                .calls
-                .into_iter()
+            TargetAuthority::Assumed => admitted
+                .admitted
+                .calls()
+                .iter()
+                .cloned()
                 .map(|call| NodeCall {
                     requires: Vec::new(),
                     ..call
