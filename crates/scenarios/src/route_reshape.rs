@@ -45,7 +45,7 @@ use crate::support::wait::{
     await_anchor_seeded, await_merge_keeper_count, await_serves, await_split_admitted,
     await_tx_terminal, measure_blocks_per_epoch,
 };
-use crate::support::{Budget, Cluster, FaultableCluster, epochs};
+use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
 use crate::venue::{
     PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell,
     stand_up_venue, swappers_on, venue_genesis_accounts_on,
@@ -1227,6 +1227,33 @@ pub fn a_venue_sealed_on_a_fresh_split_child_runs<C: Cluster>(c: &mut C) {
     );
 }
 
+/// Both venues were genuinely held apart, and neither settled a route
+/// the other never certified.
+///
+/// The two halves of one claim: the channel carried something and was
+/// cut, so a run where the fault never fired proves nothing; and no
+/// venue reached an acceptance alone, which is what a core awaiting its
+/// counterpart's certificate may never do.
+fn assert_neither_venue_settled<C: FaultableCluster>(
+    c: &C,
+    cut: &[FaultHandle],
+    hash: TxHash,
+    venues: [ShardId; 2],
+) {
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut, or the venues \
+         were never held apart",
+    );
+    for shard in venues {
+        let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
+        assert!(
+            fate != Some(TransactionDecision::Accept),
+            "a venue settled a route its counterpart never certified; {shard} reached {fate:?}",
+        );
+    }
+}
+
 /// A record naming a commit from before its departure was ever voted
 /// still resolves the window that priced it.
 ///
@@ -1315,6 +1342,7 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
             < SWAPPER_FUNDING - ROUTE_INPUT),
         "the trader's leg must pay before the core is asked anything",
     );
+    let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
     // The activation carries the run past the floor the grow's own split
     // pinned and past the horizon the commit's window would otherwise
@@ -1346,17 +1374,25 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
          {baseline:?}",
         c.committed_txs_in_flight(survivor),
     );
+    // And the crossing the trader's leg issued comes back to it. Which
+    // of the two settles it is the epoch length's to decide and not this
+    // scenario's: `CLAIM_WINDOW` is counted in epochs, so on a long one
+    // the leg entry is gone before the record the cut licenses lands and
+    // the record leaf is all that is left to compose from, while on a
+    // short one the entry is still standing and settles it itself. The
+    // value comes back either way, which is the whole of what is owed.
     assert!(
-        cut.iter().any(|handle| handle.fired() > 0),
-        "the certificate channel must actually have been exercised and cut",
+        c.run_until(epochs(12), |c| held(
+            c,
+            trader.address(),
+            *PROTOCOL_RESOURCE
+        ) == paid + ROUTE_INPUT),
+        "the trader must get the route's input back however late the cut lands; holds {} \
+         against {}",
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+        paid + ROUTE_INPUT,
     );
-    for shard in [departing, survivor] {
-        let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
-        assert!(
-            fate != Some(TransactionDecision::Accept),
-            "a venue settled a route its counterpart never certified; {shard} reached {fate:?}",
-        );
-    }
+    assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
     c.clear_drops();
     let _ = protocol_resource;
 }
@@ -1422,20 +1458,9 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         held(c, route.trader.address(), *PROTOCOL_RESOURCE),
         paid + ROUTE_INPUT,
     );
-    assert!(
-        cut.iter().any(|handle| handle.fired() > 0),
-        "the certificate channel must actually have been exercised and cut, or the venues \
-         were never held apart",
-    );
     // The trader's own leg accepted and stays accepted; the core it
     // fed is abandoned on both shards, never settled one-sided.
-    for shard in [departing, survivor] {
-        let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
-        assert!(
-            fate != Some(TransactionDecision::Accept),
-            "a venue settled a route its counterpart never certified; {shard} reached {fate:?}",
-        );
-    }
+    assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
     for (reserve, before) in route.reserves.into_iter().zip(route.stocked) {
         assert_eq!(
             held_at(c, reserve),
