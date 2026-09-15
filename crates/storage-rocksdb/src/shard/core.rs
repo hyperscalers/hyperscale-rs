@@ -45,7 +45,6 @@ use super::column_families::{
 };
 use super::entry_key::VersionedEntryKeyCodec;
 use super::jmt_snapshot_store::SnapshotTreeStore;
-use super::jmt_stored::{StaleTreePart, StoredNode, StoredNodeKey, VersionedStoredNode};
 use super::metadata::{
     read_jmt_metadata, write_committed_hash, write_committed_height, write_committed_qc,
     write_jmt_metadata,
@@ -379,27 +378,15 @@ impl RocksDbShardStorage {
         snapshot: &JmtSnapshot,
         new_version: u64,
     ) {
-        // JMT nodes — serialize hydrated nodes to stored form at write time.
+        // JMT nodes — the codec packs them at write time.
         let cf = self.cf();
         for (jmt_key, jmt_node) in &snapshot.nodes {
-            let stored_key = StoredNodeKey::from_jmt(jmt_key);
-            let stored_node = StoredNode::from_jmt(jmt_node);
-            batch_put::<JmtNodesCf>(
-                batch,
-                JmtNodesCf::handle(&cf),
-                &stored_key,
-                &VersionedStoredNode::from_latest(stored_node),
-            );
+            batch_put::<JmtNodesCf>(batch, JmtNodesCf::handle(&cf), jmt_key, jmt_node);
         }
 
         // Stale nodes for deferred GC — keyed by the version at which they became stale.
         if !snapshot.stale_node_keys.is_empty() {
-            // Wrap keys as StaleTreePart::Node for wire serialization.
-            let stale_parts: Vec<StaleTreePart> = snapshot
-                .stale_node_keys
-                .iter()
-                .map(|k| StaleTreePart::Node(StoredNodeKey::from_jmt(k)))
-                .collect();
+            let stale_parts: Vec<JmtNodeKey> = snapshot.stale_node_keys.clone();
             batch_put::<StaleJmtNodesCf>(
                 batch,
                 StaleJmtNodesCf::handle(&cf),
@@ -847,15 +834,13 @@ impl Substates for RocksDbShardStorage {
 
 impl TreeReader for RocksDbShardStorage {
     fn get_node(&self, key: &JmtNodeKey) -> Option<Arc<JmtNode>> {
-        let stored_key = StoredNodeKey::from_jmt(key);
-        self.cf_get::<JmtNodesCf>(&stored_key)
-            .map(|v| Arc::new(v.into_latest().to_jmt()))
+        let stored_key = key;
+        self.cf_get::<JmtNodesCf>(stored_key).map(Arc::new)
     }
 
     fn get_root_key(&self, version: u64) -> Option<JmtNodeKey> {
         let root = JmtNodeKey::new(version, self.root_path.clone());
-        let stored_key = StoredNodeKey::from_jmt(&root);
-        if self.cf_get::<JmtNodesCf>(&stored_key).is_some() {
+        if self.cf_get::<JmtNodesCf>(&root).is_some() {
             Some(root)
         } else {
             None

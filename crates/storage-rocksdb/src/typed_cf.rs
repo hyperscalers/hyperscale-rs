@@ -11,14 +11,16 @@ use std::marker::PhantomData;
 use hyperscale_hbor::{
     HborDecode, HborEncode, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
 };
+use hyperscale_jmt::{
+    Child, ChildKind, Hash as JmtHash, InternalNode, KEY_BYTES as JMT_KEY_BYTES, LeafNode, Node,
+    NodeKey,
+};
 use hyperscale_storage::{ImportCursor, ImportProgress};
 use hyperscale_types::{
     BlockHeight, CertifiedBlockHeader, ChainOrigin, Hash, LEAF_KEY_BYTES, QuorumCertificate,
     StateRoot, WeightedTimestamp,
 };
 use rocksdb::{ColumnFamily, DB, DBRawIteratorWithThreadMode, Snapshot, WriteBatch};
-
-use crate::shard::jmt_stored::{StoredNodeKey, encode_key};
 
 // ─── Codec traits ─────────────────────────────────────────────────────────────
 
@@ -118,20 +120,187 @@ impl DbCodec<Vec<u8>> for RawCodec {
     }
 }
 
-/// JMT node key codec — wraps the existing `encode_key` function.
+/// JMT node key codec — the tree's own canonical encoding,
+/// `version_be (8B) || bits_be (2B) || path_bytes`. Version-first
+/// ordering groups a version's writes together, which is what makes
+/// pruning a range delete.
 ///
-/// Write-only: JMT keys are encoded for writes and point lookups but the
-/// format has no decoder in this codebase. Implementing only [`DbEncode`]
-/// (and not [`DbCodec`]) ensures any attempt to iterate the JMT-nodes CF
-/// or otherwise decode a key is a compile-time error rather than a runtime
+/// Write-only: nothing in this backend reads a node key back, and
+/// implementing only [`DbEncode`] (not [`DbCodec`]) makes any attempt to
+/// iterate the JMT-nodes CF a compile-time error rather than a runtime
 /// panic.
 #[derive(Default)]
 pub struct JmtKeyCodec;
 
-impl DbEncode<StoredNodeKey> for JmtKeyCodec {
-    fn encode_to(&self, value: &StoredNodeKey, buf: &mut Vec<u8>) {
-        let encoded = encode_key(value);
-        buf.extend_from_slice(&encoded);
+impl DbEncode<NodeKey> for JmtKeyCodec {
+    fn encode_to(&self, value: &NodeKey, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&value.encode());
+    }
+}
+
+/// Backend tree arity. Binary, and a child bitmask byte bounds it at 8 —
+/// changing either is a data migration.
+const JMT_ARITY: usize = 2;
+
+/// Stored layout version. Bump when the packing below changes.
+const JMT_NODE_FORMAT: u8 = 1;
+const JMT_NODE_INTERNAL: u8 = 0;
+const JMT_NODE_LEAF: u8 = 1;
+const JMT_CHILD_INTERNAL: u8 = 0;
+const JMT_CHILD_LEAF: u8 = 1;
+
+/// Take `n` bytes, or panic: a short record is storage corruption.
+fn jmt_split<'a>(bytes: &'a [u8], at: &mut usize, n: usize) -> &'a [u8] {
+    let end = *at + n;
+    assert!(end <= bytes.len(), "jmt node record truncated");
+    let out = &bytes[*at..end];
+    *at = end;
+    out
+}
+
+fn jmt_hash(bytes: &[u8]) -> JmtHash {
+    bytes.try_into().expect("jmt hash field is 32 bytes")
+}
+
+/// JMT node codec.
+///
+/// Packs [`Node`] directly. Every field is fixed width: hashes are 32
+/// bytes rather than length-prefixed vectors, the child set is a presence
+/// bitmask, and `ChildKind` keeps its two cases instead of collapsing to
+/// a bool. That width matters beyond size — an internal node's stored
+/// hash is returned as-is by `Node::hash` rather than recomputed from its
+/// children, so a decode that silently accepted a wrong-length hash would
+/// yield a wrong state root with no structural error to catch it.
+#[derive(Default)]
+pub struct JmtNodeCodec;
+
+impl DbEncode<Node> for JmtNodeCodec {
+    fn encode_to(&self, value: &Node, buf: &mut Vec<u8>) {
+        buf.push(JMT_NODE_FORMAT);
+        match value {
+            Node::Internal(internal) => {
+                buf.push(JMT_NODE_INTERNAL);
+                buf.extend_from_slice(&internal.hash);
+                let mut mask = 0u8;
+                for (bucket, child) in internal.children.iter().enumerate() {
+                    if child.is_some() {
+                        assert!(
+                            bucket < JMT_ARITY,
+                            "child bucket {bucket} exceeds backend arity"
+                        );
+                        mask |= 1u8 << bucket;
+                    }
+                }
+                buf.push(mask);
+                for child in internal.children.iter().flatten() {
+                    buf.extend_from_slice(&child.version.to_be_bytes());
+                    buf.extend_from_slice(&child.hash);
+                    buf.push(match child.kind {
+                        ChildKind::Internal => JMT_CHILD_INTERNAL,
+                        ChildKind::Leaf => JMT_CHILD_LEAF,
+                    });
+                }
+            }
+            Node::Leaf(leaf) => {
+                buf.push(JMT_NODE_LEAF);
+                buf.extend_from_slice(&leaf.key);
+                buf.extend_from_slice(&leaf.value_hash);
+                buf.extend_from_slice(&leaf.value_len.to_be_bytes());
+            }
+        }
+    }
+}
+
+impl DbCodec<Node> for JmtNodeCodec {
+    fn decode(&self, bytes: &[u8]) -> Node {
+        let mut at = 0usize;
+        let header = jmt_split(bytes, &mut at, 2);
+        assert_eq!(
+            header[0], JMT_NODE_FORMAT,
+            "unknown stored jmt node format {}",
+            header[0]
+        );
+        match header[1] {
+            JMT_NODE_INTERNAL => {
+                let hash = jmt_hash(jmt_split(bytes, &mut at, 32));
+                let mask = jmt_split(bytes, &mut at, 1)[0];
+                assert!(
+                    usize::from(mask) >> JMT_ARITY == 0,
+                    "stored child mask {mask:#b} names a bucket beyond the backend arity"
+                );
+                let mut children: Vec<Option<Child>> = vec![None; JMT_ARITY];
+                for (bucket, slot) in children.iter_mut().enumerate() {
+                    if mask & (1u8 << bucket) == 0 {
+                        continue;
+                    }
+                    let version = u64::from_be_bytes(
+                        jmt_split(bytes, &mut at, 8)
+                            .try_into()
+                            .expect("jmt child version is 8 bytes"),
+                    );
+                    let child_hash = jmt_hash(jmt_split(bytes, &mut at, 32));
+                    let kind = match jmt_split(bytes, &mut at, 1)[0] {
+                        JMT_CHILD_INTERNAL => ChildKind::Internal,
+                        JMT_CHILD_LEAF => ChildKind::Leaf,
+                        other => panic!("unknown stored jmt child kind {other}"),
+                    };
+                    *slot = Some(Child {
+                        version,
+                        hash: child_hash,
+                        kind,
+                    });
+                }
+                Node::Internal(InternalNode { children, hash })
+            }
+            JMT_NODE_LEAF => {
+                let key = jmt_split(bytes, &mut at, JMT_KEY_BYTES)
+                    .try_into()
+                    .expect("jmt leaf key is KEY_BYTES");
+                let value_hash = jmt_hash(jmt_split(bytes, &mut at, 32));
+                let value_len = u64::from_be_bytes(
+                    jmt_split(bytes, &mut at, 8)
+                        .try_into()
+                        .expect("jmt value length is 8 bytes"),
+                );
+                Node::Leaf(LeafNode {
+                    key,
+                    value_hash,
+                    value_len,
+                })
+            }
+            other => panic!("unknown stored jmt node tag {other}"),
+        }
+    }
+}
+
+/// Stale JMT node keys, as a run of canonical [`NodeKey`] encodings.
+///
+/// Each encoding carries its own path bit count, so the run needs no
+/// separators — the bit count fixes how many path bytes follow.
+#[derive(Default)]
+pub struct JmtStaleKeysCodec;
+
+impl DbEncode<Vec<NodeKey>> for JmtStaleKeysCodec {
+    fn encode_to(&self, value: &Vec<NodeKey>, buf: &mut Vec<u8>) {
+        for key in value {
+            buf.extend_from_slice(&key.encode());
+        }
+    }
+}
+
+impl DbCodec<Vec<NodeKey>> for JmtStaleKeysCodec {
+    fn decode(&self, bytes: &[u8]) -> Vec<NodeKey> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            assert!(at + 10 <= bytes.len(), "stale jmt key run truncated");
+            let bits = u16::from_be_bytes([bytes[at + 8], bytes[at + 9]]);
+            let len = 10 + usize::from(bits).div_ceil(8);
+            let key = NodeKey::decode(jmt_split(bytes, &mut at, len))
+                .expect("a stored stale key decodes");
+            out.push(key);
+        }
+        out
     }
 }
 
@@ -596,5 +765,82 @@ impl DbCodec<ChainOrigin> for ChainOriginCodec {
                 bytes[8..16].try_into().unwrap(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_jmt::{
+        Blake3Hasher, InternalNode as JmtInternal, KEY_BYTES, LeafNode as JmtLeaf,
+    };
+
+    use super::*;
+
+    #[test]
+    fn a_leaf_survives_the_packed_round_trip() {
+        let leaf = Node::Leaf(JmtLeaf::new([1u8; KEY_BYTES], [2u8; 32], 17));
+        let bytes = JmtNodeCodec.encode(&leaf);
+        assert_eq!(JmtNodeCodec.decode(&bytes), leaf);
+    }
+
+    /// Both child slots occupied, with the two `ChildKind` cases and
+    /// distinct versions — the fields the old mirror flattened to a bool
+    /// and a length-prefixed vector.
+    #[test]
+    fn an_internal_node_survives_the_packed_round_trip() {
+        let children = vec![
+            Some(Child {
+                version: 1,
+                hash: [0xAA; 32],
+                kind: ChildKind::Leaf,
+            }),
+            Some(Child {
+                version: 2,
+                hash: [0xBB; 32],
+                kind: ChildKind::Internal,
+            }),
+        ];
+        let node = Node::Internal(JmtInternal::new::<Blake3Hasher>(children));
+        let bytes = JmtNodeCodec.encode(&node);
+        let back = JmtNodeCodec.decode(&bytes);
+        assert_eq!(back, node);
+        // The stored hash is returned as-is rather than recomputed, so a
+        // decode that lost it would produce a wrong state root silently.
+        assert_eq!(back.hash::<Blake3Hasher>(), node.hash::<Blake3Hasher>());
+    }
+
+    #[test]
+    fn a_sparse_internal_node_survives_the_packed_round_trip() {
+        let children = vec![
+            None,
+            Some(Child {
+                version: 7,
+                hash: [0xCC; 32],
+                kind: ChildKind::Leaf,
+            }),
+        ];
+        let node = Node::Internal(JmtInternal::new::<Blake3Hasher>(children));
+        let bytes = JmtNodeCodec.encode(&node);
+        assert_eq!(JmtNodeCodec.decode(&bytes), node);
+    }
+
+    /// Version-first ordering is what lets pruning delete a version's
+    /// nodes as one range.
+    #[test]
+    fn node_keys_sort_by_version_then_path() {
+        let a = JmtKeyCodec.encode(&NodeKey::root(1));
+        let b = JmtKeyCodec.encode(&NodeKey::root(2));
+        assert!(a < b);
+    }
+
+    #[test]
+    fn a_stale_key_run_round_trips_with_mixed_path_lengths() {
+        let keys = vec![
+            NodeKey::root(1),
+            NodeKey::root(2).child(2, 1, 1),
+            NodeKey::root(3).child(3, 0, 1).child(3, 1, 1),
+        ];
+        let bytes = JmtStaleKeysCodec.encode(&keys);
+        assert_eq!(JmtStaleKeysCodec.decode(&bytes), keys);
     }
 }

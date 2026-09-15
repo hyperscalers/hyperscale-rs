@@ -338,7 +338,7 @@ impl NodeKey {
 // ============================================================
 
 /// A tree node — either internal (with children) or a leaf (terminal).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Node {
     /// An internal node with one or more child slots.
     Internal(InternalNode),
@@ -364,7 +364,7 @@ impl Node {
 /// This simplifies hashing (fixed-size input to `hash_internal`) at the
 /// cost of carrying `Option` overhead for sparse nodes; for small arity
 /// (2-16) that overhead is negligible.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InternalNode {
     /// Dense child slots; length equals `ARITY`. `None` means empty subtree.
     pub children: Vec<Option<Child>>,
@@ -404,7 +404,7 @@ impl InternalNode {
 }
 
 /// Reference to a child node held by an internal node's slot.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Child {
     /// Version at which the referenced node was written.
     pub version: u64,

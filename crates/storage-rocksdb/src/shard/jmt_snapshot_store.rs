@@ -7,7 +7,6 @@ use hyperscale_types::StateRoot;
 use rocksdb::{ColumnFamily, DB, Snapshot};
 
 use super::column_families::{CfHandles, JmtNodesCf};
-use super::jmt_stored::StoredNodeKey;
 use super::metadata::read_jmt_metadata;
 use crate::typed_cf::{self, TypedCf};
 
@@ -58,15 +57,12 @@ impl<'a> SnapshotTreeStore<'a> {
 
 impl TreeReader for SnapshotTreeStore<'_> {
     fn get_node(&self, key: &JmtNodeKey) -> Option<Arc<JmtNode>> {
-        let stored_key = StoredNodeKey::from_jmt(key);
-        typed_cf::get::<JmtNodesCf>(&self.snapshot, self.jmt_nodes_cf, &stored_key)
-            .map(|v| Arc::new(v.into_latest().to_jmt()))
+        typed_cf::get::<JmtNodesCf>(&self.snapshot, self.jmt_nodes_cf, key).map(Arc::new)
     }
 
     fn get_root_key(&self, version: u64) -> Option<JmtNodeKey> {
         let root = JmtNodeKey::new(version, self.root_path.clone());
-        let stored_key = StoredNodeKey::from_jmt(&root);
-        if typed_cf::get::<JmtNodesCf>(&self.snapshot, self.jmt_nodes_cf, &stored_key).is_some() {
+        if typed_cf::get::<JmtNodesCf>(&self.snapshot, self.jmt_nodes_cf, &root).is_some() {
             Some(root)
         } else {
             None

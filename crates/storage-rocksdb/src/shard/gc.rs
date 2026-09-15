@@ -14,7 +14,6 @@ use super::column_families::{
     StateHistoryCf, SubstateBytesCf,
 };
 use super::core::RocksDbShardStorage;
-use super::jmt_stored::StaleTreePart;
 use crate::typed_cf::{self, DbCodec, TypedCf};
 
 impl RocksDbShardStorage {
@@ -59,13 +58,9 @@ impl RocksDbShardStorage {
                 break;
             }
 
-            for stale_part in stale_parts {
-                match stale_part {
-                    StaleTreePart::Node(key) => {
-                        typed_cf::batch_delete::<JmtNodesCf>(&mut batch, jmt_cf, &key);
-                        deleted_nodes += 1;
-                    }
-                }
+            for key in stale_parts {
+                typed_cf::batch_delete::<JmtNodesCf>(&mut batch, jmt_cf, &key);
+                deleted_nodes += 1;
             }
 
             typed_cf::batch_delete::<StaleJmtNodesCf>(&mut batch, stale_cf, &version);

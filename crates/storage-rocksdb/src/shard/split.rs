@@ -29,7 +29,6 @@ use rocksdb::checkpoint::Checkpoint;
 
 use super::column_families::{CfHandles, JmtNodesCf, SubstateBytesCf, SweepIndexCf};
 use super::core::RocksDbShardStorage;
-use super::jmt_stored::{StoredNodeKey, VersionedStoredNode};
 use super::metadata::{
     delete_committed_qc, read_chain_origin, read_jmt_metadata, write_chain_origin,
     write_committed_hash, write_committed_height, write_jmt_metadata,
@@ -172,8 +171,7 @@ impl RocksDbShardStorage {
 
         let parent_root_key = JmtNodeKey::new(checkpoint_version, parent_path);
         let parent_root = self
-            .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&parent_root_key))
-            .map(|v| v.into_latest().to_jmt())
+            .cf_get::<JmtNodesCf>(&parent_root_key)
             .ok_or_else(|| "checkpoint carries no parent root node".to_string())?;
         let JmtNode::Internal(parent_root) = parent_root else {
             return Err("parent root collapsed to a leaf; a ≤1-key parent cannot split".into());
@@ -200,18 +198,11 @@ impl RocksDbShardStorage {
             return Ok(StateRoot::ZERO);
         };
         let source_key = JmtNodeKey::new(version, self.root_path.clone());
-        let node = self
-            .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&source_key))
-            .ok_or_else(|| {
-                StorageError::DatabaseError("store holds no root node at the source version".into())
-            })?;
+        let node = self.cf_get::<JmtNodesCf>(&source_key).ok_or_else(|| {
+            StorageError::DatabaseError("store holds no root node at the source version".into())
+        })?;
         let genesis_root_key = JmtNodeKey::new(genesis_version, source_key.path);
-        batch_put::<JmtNodesCf>(
-            batch,
-            JmtNodesCf::handle(cf),
-            &StoredNodeKey::from_jmt(&genesis_root_key),
-            &node,
-        );
+        batch_put::<JmtNodesCf>(batch, JmtNodesCf::handle(cf), &genesis_root_key, &node);
         let bytes = self.sum_subtree_value_lens(&genesis_root_key, &node)?;
         batch_put::<SubstateBytesCf>(batch, SubstateBytesCf::handle(cf), &genesis_version, &bytes);
         Ok(root)
@@ -253,7 +244,7 @@ impl RocksDbShardStorage {
     fn sum_subtree_value_lens(
         &self,
         root_key: &JmtNodeKey,
-        root_node: &VersionedStoredNode,
+        root_node: &JmtNode,
     ) -> Result<u64, StorageError> {
         let store = PreRootStore {
             inner: self,
@@ -270,17 +261,15 @@ impl RocksDbShardStorage {
 struct PreRootStore<'a> {
     inner: &'a RocksDbShardStorage,
     root_key: &'a JmtNodeKey,
-    root_node: &'a VersionedStoredNode,
+    root_node: &'a JmtNode,
 }
 
 impl TreeReader for PreRootStore<'_> {
     fn get_node(&self, key: &JmtNodeKey) -> Option<Arc<JmtNode>> {
         if key == self.root_key {
-            return Some(Arc::new(self.root_node.clone().into_latest().to_jmt()));
+            return Some(Arc::new(self.root_node.clone()));
         }
-        self.inner
-            .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(key))
-            .map(|v| Arc::new(v.into_latest().to_jmt()))
+        self.inner.cf_get::<JmtNodesCf>(key).map(Arc::new)
     }
 
     fn get_root_key(&self, version: u64) -> Option<JmtNodeKey> {
@@ -381,8 +370,7 @@ mod tests {
     fn child_root_from_parent(parent: &RocksDbShardStorage, version: u64, side: u8) -> StateRoot {
         let root_key = JmtNodeKey::new(version, NibblePath::empty());
         let node = parent
-            .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&root_key))
-            .map(|v| v.into_latest().to_jmt())
+            .cf_get::<JmtNodesCf>(&root_key)
             .expect("parent root node present");
         let JmtNode::Internal(internal) = node else {
             panic!("parent root must be an internal node");

@@ -38,7 +38,6 @@ use super::column_families::{
 use super::core::{RocksDbShardStorage, fold_sweep_rows};
 use super::entry_key::scan_entries;
 use super::jmt_snapshot_store::SnapshotTreeStore;
-use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
 use super::metadata::{read_jmt_metadata, write_boundary_header, write_jmt_metadata};
 use crate::StorageError;
 use crate::typed_cf::{
@@ -282,22 +281,13 @@ impl RocksDbShardStorage {
 
             let mut batch = WriteBatch::default();
             for (node_key, node) in &result.batch.new_nodes {
-                batch_put::<JmtNodesCf>(
-                    &mut batch,
-                    JmtNodesCf::handle(&cf),
-                    &StoredNodeKey::from_jmt(node_key),
-                    &VersionedStoredNode::from_latest(StoredNode::from_jmt(node)),
-                );
+                batch_put::<JmtNodesCf>(&mut batch, JmtNodesCf::handle(&cf), node_key, node);
             }
             // Boundary-path nodes superseded across batches are dead the
             // moment this batch lands; deleting them here (instead of
             // routing through GC) keeps a finalized store orphan-free.
             for stale in &result.batch.stale_nodes {
-                batch_delete::<JmtNodesCf>(
-                    &mut batch,
-                    JmtNodesCf::handle(&cf),
-                    &StoredNodeKey::from_jmt(&stale.node_key),
-                );
+                batch_delete::<JmtNodesCf>(&mut batch, JmtNodesCf::handle(&cf), &stale.node_key);
             }
             let sweep_rows = index_imported_leaves(&mut batch, &cf, &batch_leaves);
             fold_sweep_rows(&self.db, &mut batch, &cf, &sweep_rows);
@@ -472,9 +462,8 @@ impl CheckpointStore {
 impl TreeReader for CheckpointStore {
     fn get_node(&self, key: &JmtNodeKey) -> Option<Arc<JmtNode>> {
         let cf = CfHandles::resolve(&self.db);
-        let stored_key = StoredNodeKey::from_jmt(key);
-        get::<JmtNodesCf>(&self.db, JmtNodesCf::handle(&cf), &stored_key)
-            .map(|v| Arc::new(v.into_latest().to_jmt()))
+        let stored_key = key;
+        get::<JmtNodesCf>(&self.db, JmtNodesCf::handle(&cf), stored_key).map(Arc::new)
     }
 
     fn get_root_key(&self, version: u64) -> Option<JmtNodeKey> {

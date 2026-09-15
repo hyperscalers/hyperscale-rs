@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
 use hyperscale_hbor::{HborDecode, HborEncode};
+use hyperscale_jmt::{Node, NodeKey};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
     ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
@@ -16,13 +17,12 @@ use hyperscale_types::{
 use rocksdb::{ColumnFamily, DB};
 
 use super::entry_key::{EntryKeyCodec, VersionedEntryKeyCodec};
-use super::jmt_stored::{StaleTreePart, StoredNodeKey, VersionedStoredNode};
 use super::substate_key::SubstateKeyCodec;
 use super::sweep_key::SweepRowCodec;
 use super::versioned_key::VersionedSubstateKeyCodec;
 use crate::typed_cf::{
-    BeU64Codec, ChainOriginCodec, DbCodec, DbEncode, HashCodec, HborCodec, JmtKeyCodec, RawCodec,
-    TypedCf,
+    BeU64Codec, ChainOriginCodec, DbCodec, DbEncode, HashCodec, HborCodec, JmtKeyCodec,
+    JmtNodeCodec, JmtStaleKeysCodec, RawCodec, TypedCf,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -380,10 +380,10 @@ impl TypedCf for CertificatesCf {
 pub struct JmtNodesCf;
 impl TypedCf for JmtNodesCf {
     const NAME: &'static str = JMT_NODES_CF;
-    type Key = StoredNodeKey;
-    type Value = VersionedStoredNode;
+    type Key = NodeKey;
+    type Value = Node;
     type KeyCodec = JmtKeyCodec;
-    type ValueCodec = HborCodec<VersionedStoredNode>;
+    type ValueCodec = JmtNodeCodec;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.jmt_nodes
@@ -394,9 +394,9 @@ pub struct StaleJmtNodesCf;
 impl TypedCf for StaleJmtNodesCf {
     const NAME: &'static str = STALE_JMT_NODES_CF;
     type Key = u64; // version at which nodes became stale
-    type Value = Vec<StaleTreePart>;
+    type Value = Vec<NodeKey>;
     type KeyCodec = BeU64Codec;
-    type ValueCodec = HborCodec<Vec<StaleTreePart>>;
+    type ValueCodec = JmtStaleKeysCodec;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.stale_jmt_nodes
