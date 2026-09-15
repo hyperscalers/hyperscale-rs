@@ -41,9 +41,10 @@ struct OutboundEntry {
     pending_txs: HashSet<TxHash>,
     /// Hard deadline past which the provisions are provably useless: every
     /// tx in them has expired its `validity_range` and terminated.
-    /// Computed once at insert from the latest BFT-authenticated
-    /// `local_committed_ts` — conservatively ≥ the source block's true ts,
-    /// so eviction never fires before the deadline has actually passed.
+    /// Counted from the source block the bundle names, which the bundle
+    /// carries and this node built it from — not from a reading of the
+    /// local commit clock, which is behind it by however long the
+    /// broadcast took and reads zero on a replayed one.
     deadline: WeightedTimestamp,
 }
 
@@ -60,9 +61,6 @@ pub struct OutboundProvisionTracker {
     /// same across them). The set lets a single EC drain every matching
     /// entry in O(matched).
     by_tx: HashMap<TxHash, HashSet<ProvisionHash>>,
-    /// Latest BFT-authenticated weighted timestamp seen on local commits.
-    /// Drives the safety-timeout sweep deterministically across validators.
-    now: WeightedTimestamp,
 }
 
 impl OutboundProvisionTracker {
@@ -72,7 +70,6 @@ impl OutboundProvisionTracker {
             store,
             entries: HashMap::new(),
             by_tx: HashMap::new(),
-            now: WeightedTimestamp::ZERO,
         }
     }
 
@@ -121,7 +118,7 @@ impl OutboundProvisionTracker {
                 target_shard,
                 source_block_height: provisions.block_height(),
                 pending_txs: tx_hashes,
-                deadline: provisions.deadline(self.now),
+                deadline: provisions.deadline(provisions.source_block_ts()),
             },
         );
 
@@ -176,8 +173,6 @@ impl OutboundProvisionTracker {
     /// Panics if a stale hash collected for eviction is no longer in `entries`.
     /// Unreachable: the hashes are sourced from the same map under `&mut self`.
     pub fn on_block_committed(&mut self, now: WeightedTimestamp) {
-        self.now = now;
-
         let stale: Vec<ProvisionHash> = self
             .entries
             .iter()
@@ -249,6 +244,14 @@ mod tests {
     }
 
     fn make_provisions(source_block: BlockHeight, txs: &[TxHash]) -> Arc<Verified<Provisions>> {
+        make_provisions_at(source_block, WeightedTimestamp::ZERO, txs)
+    }
+
+    fn make_provisions_at(
+        source_block: BlockHeight,
+        source_block_ts: WeightedTimestamp,
+        txs: &[TxHash],
+    ) -> Arc<Verified<Provisions>> {
         let transactions = txs
             .iter()
             .map(|h| ProvisionEntry::new(*h, vec![]))
@@ -257,7 +260,7 @@ mod tests {
             ShardId::leaf(2, 0),
             ShardId::leaf(2, 1),
             source_block,
-            WeightedTimestamp::ZERO,
+            source_block_ts,
             MerkleInclusionProof::dummy(),
             transactions,
         )))
@@ -349,7 +352,7 @@ mod tests {
         tracker.on_block_committed(ts(1_000_000));
 
         let a = tx(b"a");
-        let provisions = make_provisions(BlockHeight::new(5), &[a]);
+        let provisions = make_provisions_at(BlockHeight::new(5), ts(1_000_000), &[a]);
         let provision_hash = provisions.hash();
         tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
 
@@ -359,6 +362,31 @@ mod tests {
         ));
         assert!(store.get(provision_hash).is_none());
         assert_eq!(tracker.memory_stats().tracked_provisions, 0);
+    }
+
+    /// A replayed block this node proposed re-emits its provision
+    /// broadcast before any live commit reaches the tracker, so the
+    /// registration runs against a tracker that has seen no block. The
+    /// deadline must still come from the bundle's own source block.
+    #[test]
+    fn deadline_anchors_on_the_bundle_source_block_not_the_tracker_clock() {
+        let store = Arc::new(ProvisionStore::new());
+        let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
+
+        let source_ts = ts(60_000_000);
+        let a = tx(b"a");
+        let provisions = make_provisions_at(BlockHeight::new(5), source_ts, &[a]);
+        let provision_hash = provisions.hash();
+        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
+
+        // The first live commit, one block past the source. The bundle is
+        // a block old, not a retention horizon old.
+        tracker.on_block_committed(source_ts.plus(Duration::from_millis(500)));
+        assert_eq!(tracker.memory_stats().tracked_provisions, 1);
+        assert!(
+            store.get(provision_hash).is_some(),
+            "a bundle one block old must survive the first commit after a restart"
+        );
     }
 
     #[test]
