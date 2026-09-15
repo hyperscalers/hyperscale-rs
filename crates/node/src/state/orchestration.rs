@@ -94,6 +94,13 @@ impl NodeStateMachine {
                 .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
         );
 
+        // Both take the block's own anchor and not a deadline clock's
+        // running maximum ([`WeightedTimestamp::advanced_by_commit`]).
+        // The eviction below has to be the same on every validator, and
+        // the beacon's is a retention floor over topology windows: a
+        // maximum there evicts a window the chain can still legitimately
+        // be asked to verify against, on whichever node happens to have
+        // seen the most history.
         s.outbound_provisions
             .on_block_committed(certified.block().header().parent_qc().weighted_timestamp());
 

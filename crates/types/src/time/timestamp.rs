@@ -63,6 +63,34 @@ impl WeightedTimestamp {
         self.0
     }
 
+    /// Advance a local deadline clock to the block that just committed,
+    /// where `block_anchor` is that block's `parent_qc` weighted timestamp.
+    ///
+    /// The anchor is hash-pinned, so every validator reads the same value
+    /// for a given block — but it is not monotone along the committed
+    /// chain. The per-block floor the vote path enforces is never asked of
+    /// a sync-admitted block, which commits on QC attestation with no
+    /// local vote. Anything keyed off a clock that runs backwards comes
+    /// back to life: a dedup tombstone prunes early and its artifact is
+    /// re-includable, a validity window reopens, a retention deadline
+    /// fires twice. So what a commit advances is the running maximum, and
+    /// that is what this says.
+    ///
+    /// **Only for readings that are this node's own.** The maximum is over
+    /// the blocks *this* node has seen commit, so a node with less history
+    /// holds a lower one — which makes it unfit for anything a peer must
+    /// agree with. A committee resolves on a block's own anchor; a
+    /// retention floor that evicts a topology window runs on the raw value
+    /// or it evicts a window the chain can still be asked about; and a
+    /// clock feeding what goes *into* a block — tick composition, an
+    /// abandonment deadline — must be the chain's reading and not this
+    /// node's. Those read `header.parent_qc().weighted_timestamp()`
+    /// directly.
+    #[must_use]
+    pub fn advanced_by_commit(self, block_anchor: Self) -> Self {
+        self.max(block_anchor)
+    }
+
     /// Duration elapsed between two weighted timestamps, saturating at zero.
     ///
     /// Reads as "how long after `earlier` was `self` produced". Used for
@@ -236,6 +264,29 @@ impl Display for LocalTimestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deadline clock advanced by a block whose anchor sits below it
+    /// holds where it is. Anything keyed off it — a dedup tombstone, a
+    /// validity window, a retention deadline — would otherwise come back
+    /// to life.
+    #[test]
+    fn a_deadline_clock_does_not_run_backwards() {
+        let held = WeightedTimestamp::from_millis(5_000);
+        assert_eq!(
+            held.advanced_by_commit(WeightedTimestamp::from_millis(4_000)),
+            held,
+        );
+        assert_eq!(
+            held.advanced_by_commit(WeightedTimestamp::from_millis(6_000)),
+            WeightedTimestamp::from_millis(6_000),
+        );
+        assert_eq!(held.advanced_by_commit(held), held, "and is idempotent");
+        assert_eq!(
+            WeightedTimestamp::ZERO.advanced_by_commit(WeightedTimestamp::ZERO),
+            WeightedTimestamp::ZERO,
+            "a root chain's genesis anchors at zero, which is a value and not a gap",
+        );
+    }
 
     #[test]
     fn elapsed_since_saturates_at_zero() {

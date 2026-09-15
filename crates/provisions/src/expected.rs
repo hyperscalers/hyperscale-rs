@@ -156,7 +156,11 @@ impl ExpectedProvisionTracker {
     /// trigger a fallback fetch storm.
     pub(crate) fn record_block_committed(&mut self, ts: WeightedTimestamp) {
         let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
-        self.local_committed_ts = ts;
+        // A deadline clock, by the rule
+        // [`WeightedTimestamp::advanced_by_commit`] states: the orphan
+        // cutoff and every receipt deadline are read against this, and one
+        // that runs backwards fires them twice.
+        self.local_committed_ts = self.local_committed_ts.advanced_by_commit(ts);
 
         if first_commit {
             for expected in self.expected.values_mut() {
@@ -284,6 +288,23 @@ mod tests {
         let t = ExpectedProvisionTracker::new();
         assert_eq!(t.len(), 0);
         assert_eq!(t.local_ts(), WeightedTimestamp::ZERO);
+    }
+
+    /// A block whose anchor sits below the one already committed does not
+    /// move the tracker's clock backwards. The orphan cutoff and every
+    /// receipt deadline are read against it, and a clock that runs
+    /// backwards fires them twice.
+    #[test]
+    fn the_local_clock_does_not_run_backwards() {
+        let mut t = ExpectedProvisionTracker::new();
+        t.record_block_committed(ts(9_000));
+        assert_eq!(t.local_ts(), ts(9_000));
+
+        t.record_block_committed(ts(4_000));
+        assert_eq!(t.local_ts(), ts(9_000), "a regressed anchor holds it");
+
+        t.record_block_committed(ts(11_000));
+        assert_eq!(t.local_ts(), ts(11_000), "and it still advances");
     }
 
     #[test]

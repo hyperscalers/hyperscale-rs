@@ -747,7 +747,14 @@ impl MempoolCoordinator {
         let mut actions = Vec::new();
 
         self.current_height = height;
-        self.current_ts = block.header().parent_qc().weighted_timestamp();
+        // A deadline clock, by the rule
+        // [`WeightedTimestamp::advanced_by_commit`] states: the admission
+        // gate, the expiry sweep and the tombstone prune all key off this,
+        // and an artifact a clock running backwards lets through is one
+        // this pool already decided about.
+        self.current_ts = self
+            .current_ts
+            .advanced_by_commit(block.header().parent_qc().weighted_timestamp());
 
         // A gossip-timed fork fence holds until the attested recovery for
         // its shard completes — clearing on the fold would reopen admission
@@ -1506,6 +1513,51 @@ mod tests {
             sealed @ Block::Sealed { .. } => sealed,
         };
         certify(block, height.inner() * TEST_BLOCK_INTERVAL_MS)
+    }
+
+    /// A block whose anchor sits below the one already committed does not
+    /// move the pool's clock backwards.
+    ///
+    /// The admission gate, the expiry sweep and the tombstone prune all
+    /// read this clock, and a transaction the pool already decided about
+    /// comes back to life if it runs backwards. Sync-admitted blocks
+    /// commit on QC attestation with no local vote, so the per-block
+    /// floor the vote path enforces was never asked of them.
+    #[test]
+    fn the_pools_clock_does_not_run_backwards() {
+        let topology_snapshot = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+
+        let committed = |height: u64, wt_ms: u64| {
+            certify(
+                make_live_block(
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    1_234_567_890,
+                    ValidatorId::new(0),
+                    vec![],
+                    vec![],
+                ),
+                wt_ms,
+            )
+        };
+
+        mempool.on_block_committed(&topology_snapshot, &committed(1, 9_000));
+        assert_eq!(mempool.current_ts, WeightedTimestamp::from_millis(9_000));
+
+        mempool.on_block_committed(&topology_snapshot, &committed(2, 4_000));
+        assert_eq!(
+            mempool.current_ts,
+            WeightedTimestamp::from_millis(9_000),
+            "a regressed anchor holds the clock where it is",
+        );
+
+        mempool.on_block_committed(&topology_snapshot, &committed(3, 11_000));
+        assert_eq!(
+            mempool.current_ts,
+            WeightedTimestamp::from_millis(11_000),
+            "and it still advances",
+        );
     }
 
     /// The pool's ceiling refuses what nobody here asked for, and lets

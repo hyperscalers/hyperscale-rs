@@ -682,7 +682,13 @@ impl RemoteHeaderCoordinator {
         topology_schedule: &TopologySchedule,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
-        let new_ts = certified.block().header().parent_qc().weighted_timestamp();
+        // A deadline clock, by the rule
+        // [`WeightedTimestamp::advanced_by_commit`] states: liveness
+        // baselines, the probe gate, the want-retry horizon and the
+        // departed-shard retirement are all read against this.
+        let new_ts = self
+            .local_committed_ts
+            .advanced_by_commit(certified.block().header().parent_qc().weighted_timestamp());
         let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
         self.local_committed_height = certified.block().height();
         self.local_committed_ts = new_ts;
@@ -2001,6 +2007,58 @@ mod tests {
         assert_eq!(
             *keys, expected_b,
             "must verify under the epoch-1 committee at the parent QC's WT, not the head",
+        );
+    }
+
+    /// A block whose anchor sits below the one already committed does not
+    /// move the store's clock backwards. Liveness baselines, the probe
+    /// gate, the want-retry horizon and the departed-shard retirement are
+    /// all read against it.
+    #[test]
+    fn the_local_clock_does_not_run_backwards() {
+        use hyperscale_types::test_utils::{certify, make_live_block};
+
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let sched = TopologySchedule::new(
+            ED,
+            Epoch::new(0),
+            Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)),
+        );
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        let committed = |height: u64, wt_ms: u64| {
+            certify(
+                make_live_block(
+                    local,
+                    BlockHeight::new(height),
+                    wt_ms,
+                    ValidatorId::new(0),
+                    vec![],
+                    vec![],
+                ),
+                wt_ms,
+            )
+        };
+
+        coord.on_block_committed(&sched, &committed(1, 9_000));
+        assert_eq!(
+            coord.local_committed_ts,
+            WeightedTimestamp::from_millis(9_000)
+        );
+
+        coord.on_block_committed(&sched, &committed(2, 4_000));
+        assert_eq!(
+            coord.local_committed_ts,
+            WeightedTimestamp::from_millis(9_000),
+            "a regressed anchor holds the clock where it is",
+        );
+
+        coord.on_block_committed(&sched, &committed(3, 11_000));
+        assert_eq!(
+            coord.local_committed_ts,
+            WeightedTimestamp::from_millis(11_000),
+            "and it still advances",
         );
     }
 

@@ -5217,18 +5217,14 @@ impl ShardCoordinator {
         // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
         // this block's header, so every validator reads the identical value —
         // unlike the block's own QC, whose timestamp rides outside the signed
-        // message and can be rewritten by a relay. The vote path enforces the
-        // per-block monotonicity floor, but sync-admitted blocks commit on QC
-        // attestation without a local vote, so the field is still not
-        // monotonicity-guaranteed here. Clamp to the prior committed value:
-        // deadlines keyed off `committed_ts` (dedup retention, validity
-        // windows) must never run backwards.
-        let weighted_ts = certified
-            .block()
-            .header()
-            .parent_qc()
-            .weighted_timestamp()
-            .max(self.committed_ts);
+        // message and can be rewritten by a relay. It is a deadline clock,
+        // so it advances by the rule
+        // [`WeightedTimestamp::advanced_by_commit`] states, which is also
+        // what the mempool's, the provisions pipeline's and the
+        // remote-header store's own clocks advance by.
+        let weighted_ts = self
+            .committed_ts
+            .advanced_by_commit(certified.block().header().parent_qc().weighted_timestamp());
 
         let (abandon, witness) = self.record_block_committed(
             topology_schedule,
