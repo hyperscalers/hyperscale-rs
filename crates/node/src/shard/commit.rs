@@ -721,13 +721,6 @@ impl BlockCommitCoordinator {
 
         let mut commits = std::mem::take(&mut self.pending);
 
-        // Drop blocks already persisted by the sync path.
-        let persisted = self.persisted_height.inner();
-        commits.retain(|c| c.certified.block().height().inner() > persisted);
-        if commits.is_empty() {
-            return;
-        }
-
         // Sort by height to ensure parent blocks are flushed before children.
         // Cascading commits (e.g. QC formation during BlockCommitted processing)
         // can push child blocks into pending before their parent
@@ -736,6 +729,34 @@ impl BlockCommitCoordinator {
         // and block the ready parent, causing a deadlock where BlockPersisted
         // never fires and sync_awaiting_persistence_height is never satisfied.
         commits.sort_by_key(|c| c.certified.block().height().inner());
+
+        // Blocks the sync path persisted under us need no write. Their
+        // `BlockCommitted` is a separate obligation, and one deferred
+        // under backpressure has not fired yet: dropping it silently
+        // skips the whole fan-out for that height — the mempool never
+        // marks its transactions committed, execution never applies the
+        // block, provisions never prunes, the beacon's anchor register
+        // skips a hop. Fired here in height order, ahead of everything
+        // the flush below will send.
+        let persisted = self.persisted_height.inner();
+        let (already_persisted, remaining): (Vec<_>, Vec<_>) = std::mem::take(&mut commits)
+            .into_iter()
+            .partition(|c| c.certified.block().height().inner() <= persisted);
+        for commit in already_persisted {
+            if !commit.committed_notified {
+                push_protocol_event(
+                    event_tx,
+                    self.shard,
+                    ProtocolEvent::BlockCommitted {
+                        certified: commit.certified,
+                    },
+                );
+            }
+        }
+        commits = remaining;
+        if commits.is_empty() {
+            return;
+        }
 
         // Release persists strictly height contiguous from the persisted
         // tip: a block flushes only when every height below it is durable
@@ -1425,6 +1446,52 @@ mod tests {
         assert_eq!(committed_heights(&sink), vec![2]);
         let events = drain_protocol_events(&rx);
         assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(2)));
+    }
+
+    /// A commit whose notification was deferred and whose height the
+    /// sync path then persisted still fires it.
+    ///
+    /// The write is what the sync path made unnecessary; the
+    /// notification is a separate obligation. Dropped silently, the
+    /// whole fan-out skips that height — the mempool never marks its
+    /// transactions committed, execution never applies the block,
+    /// provisions never prunes, the beacon's anchor register skips a hop.
+    #[test]
+    fn a_deferred_notification_fires_even_where_sync_persisted_the_block() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let (tx, rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        // Past the lag window, so accumulate defers the notification.
+        let deferred = BlockHeight::new(BlockCommitCoordinator::MAX_PERSISTENCE_LAG + 1);
+        enqueue(
+            &mut coord,
+            &committee,
+            deferred,
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        assert!(
+            drain_protocol_events(&rx).is_empty(),
+            "the notification was deferred, so nothing has fired yet"
+        );
+
+        // Sync races ahead and persists it before the flush.
+        coord.mark_persisted(deferred);
+        coord.flush(&tx, &dispatch);
+
+        assert!(
+            committed_heights(&sink).is_empty(),
+            "the write is what sync made unnecessary"
+        );
+        let events = drain_protocol_events(&rx);
+        assert_eq!(
+            count_committed(&events),
+            1,
+            "and the notification it never fired is still owed: {events:?}"
+        );
     }
 
     #[test]
