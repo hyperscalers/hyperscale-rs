@@ -3,13 +3,18 @@
 //! Tracks the collection of execution votes during the cross-shard
 //! atomic execution protocol.
 //!
-//! ## Round Voting
+//! ## What the anchor is in the key
 //!
-//! Validators vote at each block commit where their tick is complete.
-//! Votes include `vote_anchor_ts` in the signed message, so votes at
-//! different heights have different signatures and cannot be aggregated.
-//! The tracker groups by `(global_receipt_root, vote_anchor_ts)` and checks quorum
-//! per group.
+//! One honest validator emits one vote per tick: the builder is one-shot
+//! behind a `voted` flag, the anchor is the tick's own constant
+//! timestamp, and a retry re-sends the stored anchor to a rotated
+//! leader. So the anchor in the tally key is not there to separate one
+//! validator's votes at different heights — it is there because the
+//! certificate's signer bitfield is positional against the committee
+//! seated at the anchor, and a fork can produce two anchors at one tick
+//! height. Grouping by `(global_receipt_root, vote_anchor_ts)` is what
+//! lets a node aggregate a certificate for a tick whose block it does
+//! not hold.
 //!
 //! ## Deferred Verification Optimization
 //!

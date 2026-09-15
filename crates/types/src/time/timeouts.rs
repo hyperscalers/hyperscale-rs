@@ -49,7 +49,12 @@ pub const MAX_FINALIZATION_DELAY: Duration = Duration::from_secs(24);
 pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 
 /// Single principled retention bound for every artefact derived from a tx
-/// — provisions, ECs, mempool tombstones, conflict-detector entries.
+/// — provisions, ECs, conflict-detector entries.
+///
+/// Not the mempool's tombstones, which key on the `admissible_until` that
+/// let their transaction in: a tombstone has to stop refusing exactly
+/// where admission stops taking it back, and that instant is the
+/// transaction's own, not a horizon.
 ///
 /// A tx included at the latest possible moment
 /// (`weighted_ts ≈ end_timestamp_exclusive - 1ms`) gets `MAX_FINALIZATION_DELAY`

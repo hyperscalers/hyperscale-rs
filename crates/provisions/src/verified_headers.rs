@@ -12,9 +12,12 @@
 //!    provisions against this `(shard, height)` and the header is
 //!    their anchor.
 //!
-//! Eviction triggers from the coordinator: deadline sweep on the paired
-//! provisions, expectation cleared on verification, or orphan cutoff in
-//! `on_block_committed`.
+//! Eviction triggers, all from the coordinator: the deadline sweep on the
+//! paired provisions, the orphan cutoff in `on_block_committed`, and the
+//! fenced-shard purge that drops everything above a recovery or fork
+//! frontier. Clearing an expectation on verification does NOT evict —
+//! the header stays until one of those three reaches it, because a
+//! second bundle at the same source block still needs it as its anchor.
 //!
 //! Backed by [`papaya::HashMap`] so the network worker can read entries
 //! wait-free for the `local_provision.request` serve path while the

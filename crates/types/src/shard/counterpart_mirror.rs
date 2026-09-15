@@ -21,12 +21,16 @@
 //!
 //! # Retention
 //!
-//! A covered transaction is one this shard still owes an outcome for,
-//! and means nothing once it does not. The execution coordinator owns
-//! that ledger and is the only writer here, so it is the one that says
-//! what to drop, through [`CounterpartMirror::retain`]. There is no
-//! clock in this file: a second retention rule stated against one would
-//! be a second answer to when a fact stops being true.
+//! Two rules, both stated by the caller rather than here. A covered
+//! transaction is one this shard still owes an outcome for and means
+//! nothing once it does not, which the execution coordinator's ledger
+//! answers through [`CounterpartMirror::retain`]; a departed shard's
+//! settled set means nothing once the schedule stops reading its
+//! evidence, which [`CounterpartMirror::retain_departures`] asks of a
+//! predicate the coordinator closes over its own clock. No clock is held
+//! in this file, and neither rule is written here: one stated against a
+//! clock of its own would be a second answer to when a fact stops being
+//! true.
 //!
 //! # Generation
 //!
@@ -140,9 +144,10 @@ impl CounterpartMirror {
 
     /// Drop the coverage of every transaction `held` does not name.
     ///
-    /// The one retention rule. Called by the execution coordinator with
-    /// its own ledger's answer, since that ledger is what an entry here
-    /// speaks for.
+    /// Called by the execution coordinator with its own ledger's answer,
+    /// since that ledger is what an entry here speaks for.
+    /// [`retain_departures`](Self::retain_departures) is the other rule,
+    /// over the settled sets rather than the coverage.
     ///
     /// # Panics
     ///

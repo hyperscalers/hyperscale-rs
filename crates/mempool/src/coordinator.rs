@@ -1322,12 +1322,16 @@ impl MempoolCoordinator {
             .collect()
     }
 
-    /// Drop tombstones whose `end_timestamp_exclusive <= current_ts`, and
-    /// drop the matching bodies from [`Self::tx_store`]. Past
-    /// `end_timestamp_exclusive`, the validator-side validity check
-    /// rejects any re-submission, so the tombstone is no longer
-    /// load-bearing for correctness and the body is no longer fetchable.
-    /// Anchored on `current_ts` (updated in `on_block_committed`).
+    /// Drop tombstones whose own deadline has passed `current_ts`, and
+    /// drop the matching bodies from [`Self::tx_store`]. The deadline is
+    /// the `admissible_until` that let the transaction in — its validity
+    /// end, or the close of the delivery window that end opens where this
+    /// shard only delivers for it — so a tombstone stops refusing exactly
+    /// where admission stops taking it. Past that the validator-side
+    /// validity check rejects any re-submission, so the tombstone is no
+    /// longer load-bearing for correctness and the body is no longer
+    /// fetchable. Anchored on `current_ts` (updated in
+    /// `on_block_committed`).
     ///
     /// Returns the number of tombstones dropped.
     pub fn cleanup_expired_tombstones(&mut self) -> usize {

@@ -6,18 +6,23 @@
 //! when a tombstone is pruned, the coordinator drops the matching body from
 //! the store.
 //!
-//! Retention is `end_timestamp_exclusive`-derived: an entry is dropped once
-//! the latest committed [`WeightedTimestamp`] reaches the tx's
-//! `end_timestamp_exclusive`. Past that point, even a re-submission would be
-//! rejected by block validity (validator-side check on `validity_range`),
-//! so the tombstone is no longer needed for correctness — it becomes a pure
-//! perf optimisation. The maximum age of any entry is bounded by
-//! `MAX_VALIDITY_RANGE` because admission requires
+//! Retention is the deadline the caller passes, which is the same
+//! `admissible_until` that let the transaction in: its validity end,
+//! and for one this shard only ever delivers for, the close of the
+//! delivery window that end opens. A transaction admissible until some
+//! instant has to stay refusable until the same one, or the tombstone
+//! expires while admission would still take it back.
+//!
+//! Past that point even a re-submission is rejected by block validity
+//! (the validator-side check on `validity_range`), so the tombstone is no
+//! longer needed for correctness — it becomes a pure perf optimisation.
+//! The maximum age of an entry is bounded by `MAX_VALIDITY_RANGE` past
+//! its own deadline, because admission requires
 //! `end_timestamp_exclusive <= anchor + MAX_VALIDITY_RANGE`.
 //!
-//! Anchored on the shard consensus-authenticated weighted timestamp of the last committed
-//! block, so behavior is deterministic across validators regardless of block
-//! cadence.
+//! Anchored on the shard consensus-authenticated weighted timestamp of the
+//! last committed block, so behavior is deterministic across validators
+//! regardless of block cadence.
 
 use std::collections::HashMap;
 

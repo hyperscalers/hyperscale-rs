@@ -130,13 +130,13 @@ impl BlockManifest {
 
     /// Build a manifest from a full block (extracting hashes).
     ///
-    /// `Block::Sealed` carries no provisions, so the resulting manifest's
-    /// `provision_hashes` is empty for sealed blocks. The caller is
-    /// responsible for only invoking this on `Live` blocks (or accepting
-    /// the empty result) when provision-hash fidelity matters — e.g. the
-    /// commit-bookkeeping path that populates `CommitDedupIndex`.
-    /// `witness_sources` is carried on the block itself, so it
-    /// round-trips faithfully here — the commit-time beacon-witness leaf
+    /// Faithful for both variants. A `Block::Sealed` carries no provision
+    /// bodies but does carry their hashes, and
+    /// [`Block::provision_hashes`] reads them from whichever arm it is —
+    /// which is what lets the commit-bookkeeping path that populates
+    /// `CommitDedupIndex` take a sync-admitted block whose bodies rode
+    /// inline. `witness_sources` is likewise carried on the block itself,
+    /// so it round-trips here — the commit-time beacon-witness leaf
     /// derivation reads it and must match every node.
     #[must_use]
     pub fn from_block(block: &Block) -> Self {

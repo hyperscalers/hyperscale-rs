@@ -1922,7 +1922,10 @@ impl ExecutionCoordinator {
         // aggregation, producing an EC whose signature aggregate carries
         // signatures the verifier's bitfield-derived pubkey pool excludes
         // — guaranteed to fail verification and waste a leader rotation.
-        // Mirrors `vote_keeper::record_received_vote`.
+        // Mirrors the shard's own membership preflight, which drops a
+        // non-committee voter before anything else. Not its equivocation
+        // detector: that one runs AFTER signature verification, which is
+        // the opposite of what this check is for.
         if committee
             .committee_index_for_shard(self.local_shard, validator_id)
             .is_none()
