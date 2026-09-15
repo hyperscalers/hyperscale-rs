@@ -260,28 +260,12 @@ pub struct Counterparts {
 }
 
 impl Counterparts {
+    /// Holding the escrow records the store gives for this shard's
+    /// prefix, which is every start's first term and the only one a
+    /// store can answer before a block commits. A leaf that does not
+    /// decode is one no disposal could be composed from, so it is
+    /// dropped rather than held.
     #[must_use]
-    pub const fn new(
-        local_shard: ShardId,
-        proven_anchors: Arc<ProvenAnchors>,
-        proven_cells: Arc<ProvenCells>,
-        mirror: Arc<CounterpartMirror>,
-    ) -> Self {
-        Self {
-            ledger: Ledger::new(local_shard),
-            mirror,
-            proven_anchors,
-            proven_cells,
-            fetched: BTreeMap::new(),
-            held: BTreeMap::new(),
-            probes: BTreeMap::new(),
-        }
-    }
-
-    /// As [`Self::new`], holding the escrow records the store gives for
-    /// this shard's prefix. A leaf that does not decode is one no
-    /// disposal could be composed from, so it is dropped rather than
-    /// held.
     pub fn holding(
         local_shard: ShardId,
         proven_anchors: Arc<ProvenAnchors>,
@@ -289,14 +273,20 @@ impl Counterparts {
         mirror: Arc<CounterpartMirror>,
         records: &[(SubstateKey, Vec<u8>)],
     ) -> Self {
-        let mut counterparts = Self::new(local_shard, proven_anchors, proven_cells, mirror);
-        counterparts.held = records
-            .iter()
-            .filter_map(|(key, value)| {
-                Some((*key, HeldRecord::of(CrossingCell::from_bytes(value)?)))
-            })
-            .collect();
-        counterparts
+        Self {
+            ledger: Ledger::new(local_shard),
+            mirror,
+            proven_anchors,
+            proven_cells,
+            fetched: BTreeMap::new(),
+            held: records
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((*key, HeldRecord::of(CrossingCell::from_bytes(value)?)))
+                })
+                .collect(),
+            probes: BTreeMap::new(),
+        }
     }
 
     /// Fold what a committed block says about counterparts — the claims
@@ -902,7 +892,7 @@ impl Counterparts {
         let unresolved = &self.ledger;
         // A claim is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or an
-        // held record whose claim it speaks to. The second has no
+        // a held record whose claim it speaks to. The second has no
         // transaction here at all, which is why the keys are read rather
         // than the names.
         let held = &self.held;

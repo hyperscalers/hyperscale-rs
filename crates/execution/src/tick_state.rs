@@ -90,9 +90,9 @@ pub struct Divergence {
 /// issue, but a delivery that failed decides nothing either way — the
 /// value it claims stays in its cell for a later claim. And whether the
 /// member **executes** the transaction or settles what an execution left:
-/// a reclaim, an abandonment, an inherited record's member or a
-/// retirement runs no execution of the transaction's own, and the
-/// deadline holds only what does.
+/// a reclaim, an abandonment, a held record's disposal or a retirement
+/// runs no execution of the transaction's own, and the deadline holds
+/// only what does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     awaited: BTreeSet<ShardId>,
@@ -155,7 +155,7 @@ impl Membership {
 
     /// This membership for a member that settles what an execution left
     /// rather than executing the transaction: a reclaim, an abandonment,
-    /// an inherited record's. The awaited set stays as stated; the
+    /// a held record's disposal. The awaited set stays as stated; the
     /// member decides and executes nothing.
     #[must_use]
     pub const fn settling(mut self) -> Self {
