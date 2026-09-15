@@ -224,11 +224,25 @@ impl ExpectedCertTracker {
     }
 
     /// Drop expectations for transactions no outstanding local tick is
-    /// waiting on. The coordinator computes the set from `TickRegistry` and
-    /// passes it in — the tracker has no view of ticks.
-    pub fn retain_if_tx_needed(&mut self, txs_needed: &HashSet<TxHash>) {
-        self.expected
-            .retain(|(_, tx_hash), _| txs_needed.contains(tx_hash));
+    /// waiting on, returning their keys so the caller can abandon the
+    /// in-flight fallback fetches they left behind. The coordinator
+    /// computes the set from `TickRegistry` and passes it in — the
+    /// tracker has no view of ticks.
+    ///
+    /// A dropped expectation is exactly the case where the fallback fired
+    /// and the certificate never came, so the id is answered by nothing
+    /// and a caller that keeps the keys is the only thing that can retire
+    /// it.
+    pub fn retain_if_tx_needed(&mut self, txs_needed: &HashSet<TxHash>) -> Vec<ExpectedCertKey> {
+        let mut dropped = Vec::new();
+        self.expected.retain(|&key, _| {
+            let needed = txs_needed.contains(&key.1);
+            if !needed {
+                dropped.push(key);
+            }
+            needed
+        });
+        dropped
     }
 
     /// Drop every active expectation, returning its keys so the caller can
@@ -528,14 +542,23 @@ mod tests {
         );
     }
 
+    /// The drop is where the fallback fired and the certificate never
+    /// came, so the keys have to come back out for the caller to retire
+    /// the asks — the same shape `drain_expected` beside it has.
     #[test]
-    fn retain_if_tx_needed_drops_expectations_whose_tx_is_no_longer_tracked() {
+    fn retain_if_tx_needed_returns_the_expectations_it_drops() {
         let mut t = ExpectedCertTracker::new();
         t.register(shard(1), tx(5), ms(0));
+        t.register(shard(2), tx(5), ms(0));
+        t.register(shard(1), tx(6), ms(0));
 
-        t.retain_if_tx_needed(&HashSet::new());
-
-        assert_eq!(t.expected_len(), 0);
+        let mut dropped = t.retain_if_tx_needed(&HashSet::from([tx(6)]));
+        dropped.sort();
+        let mut orphaned = vec![(shard(1), tx(5)), (shard(2), tx(5))];
+        orphaned.sort();
+        assert_eq!(dropped, orphaned);
+        assert_eq!(t.expected_len(), 1);
+        assert!(t.is_expected(shard(1), tx(6)));
     }
 
     #[test]
@@ -543,7 +566,7 @@ mod tests {
         let mut t = ExpectedCertTracker::new();
         t.register(shard(1), tx(5), ms(0));
 
-        t.retain_if_tx_needed(&HashSet::from([tx(5)]));
+        assert!(t.retain_if_tx_needed(&HashSet::from([tx(5)])).is_empty());
 
         assert!(t.is_expected(shard(1), tx(5)));
     }

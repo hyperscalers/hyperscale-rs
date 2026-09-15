@@ -1106,6 +1106,20 @@ impl Ledger {
         self.owed.get(&tx_hash).is_some_and(Owed::covered)
     }
 
+    /// Whether a counterpart's certificate for `tx_hash` is still worth
+    /// having here — the entry is held and nothing committed has settled
+    /// what it waits on.
+    ///
+    /// The ledger asks for those certificates itself, when a claim reads
+    /// the counterpart's cell present, under the same fetch ids the
+    /// expectation tracker asks under — and that ask is one-shot. So a
+    /// caller retiring an id one of the two owners has finished with has
+    /// to put this question to the other first.
+    #[must_use]
+    pub fn awaits_certificate(&self, tx_hash: TxHash) -> bool {
+        self.owed.get(&tx_hash).is_some_and(|owed| !owed.covered())
+    }
+
     /// Record where a departed participant's chain ended, and when what it
     /// left stops being readable.
     ///

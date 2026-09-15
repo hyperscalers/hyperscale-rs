@@ -2657,7 +2657,21 @@ impl ExecutionCoordinator {
             }));
         }
 
-        self.expected_certs.retain_if_tx_needed(&awaited);
+        // What the expectation tracker lets go of leaves its fallback
+        // fetch in flight, answered by nothing: the drop happens exactly
+        // where the certificate never came. The ledger asks under the
+        // same ids for its own reclaim backstop, so only a key neither
+        // owner wants is retired.
+        let mut dropped: Vec<_> = self
+            .expected_certs
+            .retain_if_tx_needed(&awaited)
+            .into_iter()
+            .filter(|&(_, tx_hash)| !self.counterparts.ledger.awaits_certificate(tx_hash))
+            .collect();
+        dropped.sort();
+        if !dropped.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::ExecutionCerts(dropped)));
+        }
         self.expected_certs.prune_fulfilled(now_ts);
 
         actions
@@ -6332,11 +6346,61 @@ mod tests {
         state.ticks.remove_assignment(tx_hash);
         state.committed_height = BlockHeight::new(600);
         state.committed_ts = WeightedTimestamp::from_millis(120_000);
-        let _ = state.check_exec_cert_timeouts();
+        let actions = state.check_exec_cert_timeouts();
         assert_eq!(
             state.expected_certs.expected_len(),
             0,
             "expectation must be pruned once no tick needs the source shard"
+        );
+        // The fallback fetch fired above and the certificate never came,
+        // which is what the prune means. Nothing else answers the id, so
+        // the prune has to retire it.
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::AbandonFetch(FetchIds::ExecutionCerts(ids))
+                    if ids == &vec![(remote_shard, tx_hash)]
+            )),
+            "pruning an expectation must abandon its fetch, got: {actions:?}"
+        );
+    }
+
+    /// The ledger asks for a counterpart's certificate under the same
+    /// fetch ids, one-shot, for transactions no tick speaks for. Retiring
+    /// the expectation tracker's copy must not cancel that ask — a fetch
+    /// binding with a second producer has no refcount.
+    #[test]
+    fn pruning_an_expectation_leaves_the_ledgers_own_ask_alone() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+
+        state
+            .expected_certs
+            .register(PEER, tx_hash, state.committed_ts);
+
+        // The ledger holds the transaction and nothing committed has
+        // settled what it waits on, so the counterpart's certificate is
+        // still worth having here.
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&transaction, &Classified::whole())],
+        );
+        assert!(state.counterparts.ledger.awaits_certificate(tx_hash));
+
+        state.committed_height = BlockHeight::new(600);
+        state.committed_ts = WeightedTimestamp::from_millis(120_000);
+        let actions = state.check_exec_cert_timeouts();
+
+        assert_eq!(state.expected_certs.expected_len(), 0);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::AbandonFetch(FetchIds::ExecutionCerts(..)))),
+            "the ledger still wants the certificate, got: {actions:?}"
         );
     }
 
