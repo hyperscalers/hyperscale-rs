@@ -7811,6 +7811,12 @@ mod tests {
     /// terminal anchors where no vote tracker exists, so it is never
     /// votable — an execution batch dispatched and a write into the tick
     /// chain just cleared, for an outcome that can never certify.
+    ///
+    /// Two things stand between the coast commit and that tick, and the
+    /// test separates them: the sweep clears what is held, and the latch
+    /// refuses what arrives after. The re-registration below is the
+    /// second case — the shape a cross-shard provision landing past the
+    /// terminal leaves — and it is what the clear alone does not cover.
     #[test]
     fn a_terminated_chain_composes_no_further_tick() {
         let schedule = two_shard_topology();
@@ -7859,6 +7865,20 @@ mod tests {
             "the sweep clears the tick chain, got {swept:?}",
         );
 
+        assert!(
+            state.candidates.is_empty(),
+            "the sweep took the candidates with the ticks",
+        );
+
+        // A candidate that lands after the sweep: composition admitted
+        // exactly this one on the live chain above, so nothing but the
+        // latch stands between it and a tick.
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&transaction, &Classified::whole())],
+        );
+
         // A coast commit past it.
         let coast = make_live_block_on_shard(
             HOME,
@@ -7874,16 +7894,8 @@ mod tests {
                 .ticks
                 .get_tick(&TickId::new(HOME, BlockHeight::new(1)))
                 .is_none(),
-            "a terminated chain composes no tick",
-        );
-        assert!(
-            state.candidates.is_empty(),
-            "the sweep took the candidates with the ticks",
-        );
-        assert!(
-            state.terminated,
-            "and latched the chain, so a candidate registered afterwards \
-             composes nothing either",
+            "a terminated chain composes no tick, not even for a candidate \
+             registered after the sweep",
         );
     }
 
