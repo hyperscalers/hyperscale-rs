@@ -642,7 +642,7 @@ impl ShardCoordinator {
         // predecessor is refused on validity rather than on dedup — a
         // transaction whose window opened before this chain did cannot be
         // admitted here however the index reads.
-        let mut dedup_index = CommitDedupIndex::seeded(&recovered.dedup);
+        let mut dedup_index = CommitDedupIndex::seeded(&recovered.dedup, committed_block_anchor_wt);
         if recovered.committed_hash.is_none() {
             dedup_index.cover_to_origin();
         }

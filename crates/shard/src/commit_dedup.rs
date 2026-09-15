@@ -110,7 +110,7 @@ impl CommitDedupIndex {
     /// conservatively on the engagement mirror across the window — the
     /// same position a freshly synced validator already holds.
     #[must_use]
-    pub fn seeded(window: &DedupWindow) -> Self {
+    pub fn seeded(window: &DedupWindow, now: WeightedTimestamp) -> Self {
         let mut index = Self::new();
         index.tx_retention.extend(window.committed.iter().copied());
         index
@@ -124,6 +124,12 @@ impl CommitDedupIndex {
             .seed(window.provisions.iter().copied());
         index.covered_from = window.covered_from;
         index.reached_origin = window.reached_origin;
+        // Pruned at the clock the chain resumes at, not left to the first
+        // commit. The walk is floored at the widest tier's window, so it
+        // folds entries the narrower tiers have already let go of — and
+        // this index is a consensus admission gate, so carrying them
+        // means refusing artifacts every peer that stayed up admits.
+        index.prune(now);
         index
     }
 
@@ -313,6 +319,47 @@ mod tests {
     };
 
     use super::*;
+
+    /// A seeded index holds nothing already past its deadline.
+    ///
+    /// The recovery walk is floored at the widest tier's window, so it
+    /// folds entries the narrower tiers have already let go of. Carried
+    /// into the index, they make a just-restarted node refuse artifacts
+    /// every peer that stayed up admits — and this index is a consensus
+    /// admission gate.
+    #[test]
+    fn a_seeded_index_holds_nothing_past_its_deadline() {
+        let live = TxHash::from(Hash::from_bytes(b"live"));
+        let expired = TxHash::from(Hash::from_bytes(b"expired"));
+        let receipt_live = FinalizationHash::from_raw(Hash::from_bytes(b"fw-live"));
+        let receipt_expired = FinalizationHash::from_raw(Hash::from_bytes(b"fw-expired"));
+        let now = WeightedTimestamp::from_millis(10_000);
+
+        let window = DedupWindow {
+            committed: vec![
+                (live, WeightedTimestamp::from_millis(10_001)),
+                (expired, WeightedTimestamp::from_millis(9_999)),
+            ],
+            resolved: vec![
+                (live, WeightedTimestamp::from_millis(10_001)),
+                (expired, WeightedTimestamp::from_millis(9_999)),
+            ],
+            finalizations: vec![
+                (receipt_live, WeightedTimestamp::from_millis(10_001)),
+                (receipt_expired, WeightedTimestamp::from_millis(9_999)),
+            ],
+            ..DedupWindow::default()
+        };
+
+        let index = CommitDedupIndex::seeded(&window, now);
+
+        assert!(index.contains_tx(&live));
+        assert!(!index.contains_tx(&expired));
+        assert!(index.contains_resolved_tx(&live));
+        assert!(!index.contains_resolved_tx(&expired));
+        assert!(index.contains_finalization(&receipt_live));
+        assert!(!index.contains_finalization(&receipt_expired));
+    }
 
     /// Build a test tx whose `validity_range.end_timestamp_exclusive == end_ms`.
     fn tx_with_end(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
