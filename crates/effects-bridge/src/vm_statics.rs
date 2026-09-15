@@ -1028,8 +1028,7 @@ impl Derivation for BridgeStatics {
             everywhere,
             legs,
             nullifiers: admitted_tree
-                .subintents
-                .iter()
+                .records()
                 .map(|record| record.nullifier)
                 .collect(),
             owners: route_owners(vm, signer, &admitted_tree),
@@ -1338,9 +1337,10 @@ mod tests {
             "the record sits under the producing node's target"
         );
 
-        assert!(
-            derived.nullifiers.is_empty(),
-            "nothing bound, nothing spent"
+        assert_eq!(
+            derived.nullifiers.len(),
+            1,
+            "the root's own, which is what holds one declaration to one execution"
         );
 
         // The crossing's record and claim are priced beside what the
@@ -1507,8 +1507,12 @@ mod tests {
             "the root's record moves with the root's window"
         );
         assert_eq!(
-            one.nullifiers[0], other.nullifiers[0],
+            one.nullifiers[1], other.nullifiers[1],
             "and so is his nullifier"
+        );
+        assert_ne!(
+            one.nullifiers[0], other.nullifiers[0],
+            "while the root's moves with the root's window, as its record does"
         );
     }
 
@@ -1788,7 +1792,22 @@ mod tests {
         let mut reads = vec![rule_cell, landing];
         reads.sort_unstable();
         assert_eq!(derived.routing.read_keys, reads);
-        assert_eq!(derived.routing.provision_keys, reads);
+        // The root's nullifier is a creation, so its absence is
+        // provisioned to every participant beside what the calls read.
+        let root_hash = tree.root.hash(&ProtocolHasher);
+        let root_nullifier = nullifier_key(
+            &ProtocolHasher,
+            composer_addr(),
+            root_hash,
+            nullifier_expiry_ms(&tree.root.header),
+        );
+        let mut provisioned = reads.clone();
+        provisioned.push(DeclaredKey::substate(
+            composer_addr().address(),
+            root_nullifier.local.0,
+        ));
+        provisioned.sort_unstable();
+        assert_eq!(derived.routing.provision_keys, provisioned);
         let mut provisioning = vec![composer_addr().address(), bob_addr().address()];
         provisioning.sort_unstable();
         assert_eq!(derived.routing.provision_prefixes, provisioning);

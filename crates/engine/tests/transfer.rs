@@ -3312,3 +3312,55 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         "the seal writes the record the component's address derives"
     );
 }
+
+/// One declaration is one execution, whatever terms carry it.
+///
+/// The fee ceiling is signed content and the composer's key is not, so a
+/// resubmission at a higher ceiling enters the transaction hash while the
+/// signature does not — two identities over one graph, which dedup never
+/// sees. What holds them to one execution is the nullifier under the
+/// composer's own prefix, the rule every subintent is already held to. A
+/// transaction that runs whole writes no escrow record, so there is
+/// nothing else under that prefix to say the declaration already ran.
+#[test]
+fn a_resubmit_at_a_higher_ceiling_runs_the_declaration_once() {
+    let executor = executor(ExecutionMode::Serial);
+    let bump = |max_fee| {
+        Arc::new(Verified::<Transaction>::from_persisted(
+            signed_transfer_with_fee(ALICE_SEED, alice(), bob(), 100, max_fee),
+        ))
+    };
+    let first = bump(TRANSFER_FEE);
+    let second = bump(TRANSFER_FEE + 1);
+    assert_eq!(
+        first.body().call_tree(),
+        second.body().call_tree(),
+        "the premise: one declaration under two sets of terms",
+    );
+    assert_ne!(first.hash(), second.hash(), "which dedup cannot collapse");
+
+    let accounts = [(alice(), 1_000), (bob(), 50)];
+    let mut store = MapDb::genesis(&accounts);
+    let mut outcomes = Vec::new();
+    for tx in [&first, &second] {
+        let executed = execute_batch_on(&store, &executor, &[Arc::clone(tx)]);
+        outcomes.push(matches!(
+            executed[0].consensus,
+            ConsensusReceipt::Succeeded { .. }
+        ));
+        for e in &executed {
+            if let Some(writes) = e.consensus.writes() {
+                store.apply(writes);
+            }
+            if let Some(writes) = e.fee_receipt.as_ref().and_then(ConsensusReceipt::writes) {
+                store.apply(writes);
+            }
+        }
+    }
+    assert_eq!(outcomes, vec![true, false], "the second is already spent");
+    assert_eq!(
+        store.cell(vault_key(bob(), *PROTOCOL_RESOURCE)),
+        Some(encode_amount(150).to_vec()),
+        "the recipient is paid once",
+    );
+}

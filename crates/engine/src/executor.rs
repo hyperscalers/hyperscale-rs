@@ -37,8 +37,8 @@ use hyperscale_types::{
 };
 pub use hyperscale_vm_effects::TargetAuthority;
 use hyperscale_vm_effects::{
-    Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, NodeCall,
-    PackageHash, SubintentRecord, admit_tree_with_authority, legs_of, package_hash,
+    Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, IntentRecord,
+    NodeCall, PackageHash, admit_tree_with_authority, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
@@ -75,7 +75,7 @@ pub struct PreparedTx {
     pub(crate) declaration: Declaration,
     /// One record per bound subintent: the nullifier the batch entry
     /// enforces, and what the cell recording its spend says.
-    pub(crate) nullifiers: Vec<SubintentRecord>,
+    pub(crate) nullifiers: Vec<IntentRecord>,
     /// The envelope's signed compute ceilings, in fuel: one per manifest
     /// node, in node order, each metering its own node and nothing else.
     pub(crate) gas_limits: Vec<u64>,
@@ -810,7 +810,7 @@ impl Executor {
                     legs: LegPlan::whole(0),
                 },
                 declaration,
-                nullifiers: admitted.subintents,
+                nullifiers: admitted.records().copied().collect(),
                 gas_limits: vm.gas_limits.clone(),
                 event_bytes,
                 work,
