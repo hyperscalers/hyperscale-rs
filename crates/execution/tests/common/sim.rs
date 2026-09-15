@@ -691,6 +691,7 @@ fn stub_execute(
             resource: RESOURCE,
             credit: CREDIT,
             debit: 0,
+            unjudged_debit: 0,
         };
         movements
             .entry(vault_of(key.owner()))
@@ -742,6 +743,7 @@ fn stub_charge(owner: Address) -> ConsensusReceipt {
             resource: RESOURCE,
             credit: FLOOR,
             debit: 0,
+            unjudged_debit: 0,
         },
     );
     let receipt_hash = GlobalReceipt::new(

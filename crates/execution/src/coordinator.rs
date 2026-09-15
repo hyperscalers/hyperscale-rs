@@ -50,7 +50,7 @@ use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
-use hyperscale_engine::{CodeAvailability, TickEnvironment, build_fee_receipt};
+use hyperscale_engine::{CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{
     record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
 };
@@ -60,7 +60,7 @@ use hyperscale_types::{
     CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
     FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    MerkleInclusionProof, Mode, PriceTable, ProvenAnchors, ProvenCells, Provisions,
+    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions,
     SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey,
     TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
     TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
@@ -1062,8 +1062,13 @@ impl ExecutionCoordinator {
             // vault settles it — the same question the engine asks of the
             // payers it prices.
             if trie.shard_for_prefix(charge.vault.owner) == local_shard {
-                let fee =
-                    build_fee_receipt(local_shard, trie, tx_hash, charge.vault, charge.amount);
+                let fee = build_fee_receipt(
+                    local_shard,
+                    trie,
+                    tx_hash,
+                    charge.vault,
+                    Movement::unjudged(*PROTOCOL_RESOURCE, charge.amount),
+                );
                 state.record_fee_receipt(StoredReceipt::synced(tx_hash, Arc::new(fee)));
             }
             self.candidates.remove(tx_hash);
@@ -7158,7 +7163,7 @@ mod tests {
             state.counterpart_trie(&schedule),
             tx.hash(),
             tx.fee_vault(),
-            tx.price(&PriceTable::GENESIS),
+            Movement::unjudged(*PROTOCOL_RESOURCE, tx.price(&PriceTable::GENESIS)),
         );
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 

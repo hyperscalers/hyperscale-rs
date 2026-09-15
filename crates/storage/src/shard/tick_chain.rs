@@ -889,6 +889,7 @@ mod tests {
                 resource: RESOURCE,
                 credit: 0,
                 debit: amount,
+                unjudged_debit: 0,
             },
         );
         moved

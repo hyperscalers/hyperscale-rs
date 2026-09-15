@@ -1064,11 +1064,12 @@ pub fn build_fee_receipt(
     shard_trie: &ShardTrie,
     tx_hash: TxHash,
     vault: SubstateKey,
-    amount: u128,
+    charge: Movement,
 ) -> ConsensusReceipt {
+    let amount = charge.debit.saturating_add(charge.unjudged_debit);
     let writes = StateWrites {
         cells: BTreeMap::new(),
-        movements: BTreeMap::from([(vault, Movement::debit(*PROTOCOL_RESOURCE, amount))]),
+        movements: BTreeMap::from([(vault, charge)]),
         entries: BTreeMap::new(),
     };
     let receipt_hash = GlobalReceipt::new(
@@ -1165,7 +1166,7 @@ fn assemble_published_tx(
             ctx.shard_trie,
             tx_hash,
             payer.vault,
-            charged,
+            Movement::unjudged(*PROTOCOL_RESOURCE, charged),
         )),
         _ => None,
     };
@@ -1274,12 +1275,21 @@ fn assemble_executed_tx(
     let fee_receipt = fee
         .filter(|payer| settled_apart(&receipt.outcome, *payer))
         .map(|payer| {
+            // A completed run was priced against the vault the kernel
+            // read, so its charge is judged. Every other outcome — an
+            // infeasible payer above all — settles a price nothing ever
+            // executed them against.
+            let charge = if matches!(receipt.outcome, Outcome::Completed { .. }) {
+                Movement::debit(*PROTOCOL_RESOURCE, payer.burned())
+            } else {
+                Movement::unjudged(*PROTOCOL_RESOURCE, payer.burned())
+            };
             build_fee_receipt(
                 ctx.local_shard,
                 ctx.shard_trie,
                 tx_hash,
                 payer.vault,
-                payer.burned(),
+                charge,
             )
         });
     let cached = if matches!(receipt.outcome, Outcome::Completed { .. }) {
@@ -1788,7 +1798,7 @@ impl Executor {
                             ctx.shard_trie,
                             vm_tx,
                             payer.vault,
-                            charged,
+                            Movement::unjudged(*PROTOCOL_RESOURCE, charged),
                         )
                     });
                     executed

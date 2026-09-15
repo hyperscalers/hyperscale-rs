@@ -212,6 +212,10 @@ pub(crate) fn compose_movements(key: SubstateKey, standing: Movement, next: Move
                 resource: standing.resource,
                 credit: if gains { magnitude } else { 0 },
                 debit: if gains { 0 } else { magnitude },
+                // The floor is not part of the net: it applies after the
+                // judged sides and takes what they leave, so clamping the
+                // net cannot absorb it.
+                unjudged_debit: standing.unjudged_debit.saturating_add(next.unjudged_debit),
             }
         }
     }
@@ -611,17 +615,20 @@ mod tests {
             resource,
             credit: u128::MAX,
             debit: 0,
+            unjudged_debit: 0,
         };
         let cycled = Movement {
             resource,
             credit: 5,
             debit: u128::MAX,
+            unjudged_debit: 0,
         };
         // Exact while it fits: nothing about a small pair is reduced.
         let small = Movement {
             resource,
             credit: 3,
             debit: 1,
+            unjudged_debit: 0,
         };
         assert_eq!(compose_movements(key(1), small, small).credit, 6);
         assert_eq!(compose_movements(key(1), small, small).debit, 2);
@@ -639,11 +646,13 @@ mod tests {
                 resource,
                 credit: 0,
                 debit: u128::MAX,
+                unjudged_debit: 0,
             },
             Movement {
                 resource,
                 credit: u128::MAX,
                 debit: 3,
+                unjudged_debit: 0,
             },
         );
         assert_eq!((drained.credit, drained.debit), (0, 3));
