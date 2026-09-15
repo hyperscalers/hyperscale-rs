@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash, ProvisionHash,
-    Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash, Verifiable,
-    Verified,
+    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
+    ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash,
+    Verifiable, Verified,
 };
 
 /// A sync-ready block retrieved from storage.
@@ -54,6 +54,19 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// fan-out reads needed to rehydrate a full block. Used by the
     /// remote-header fallback serve path, which never needs the body.
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>>;
+
+    /// Get the block's stored metadata row by height: its header, its
+    /// manifest, and the QC that committed it.
+    ///
+    /// The whole row is one read. What the attested window folds need of
+    /// a block is all inside it — the parent-QC anchor their floors test,
+    /// and the manifest's transaction hashes the committed set folds — so
+    /// they read this rather than [`Self::get_block_for_sync`], which
+    /// multi-gets every body, every certificate and a receipt per
+    /// settling outcome to rehydrate what the folds then discard. That
+    /// rehydration is also all-or-nothing, so one absent receipt used to
+    /// read as an absent block.
+    fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata>;
 
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;

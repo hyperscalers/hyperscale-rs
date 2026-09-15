@@ -368,24 +368,6 @@ impl RocksDbShardStorage {
         }
     }
 
-    /// Get block metadata only (without fetching transactions/certificates).
-    ///
-    /// This is much faster than `get_block_denormalized` because it only
-    /// reads the block metadata from storage, not the full transaction and
-    /// certificate data.
-    ///
-    /// Used for partial sync responses when the full block cannot be
-    /// reconstructed (e.g., missing transactions or certificates).
-    #[must_use]
-    pub fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
-        let start = Instant::now();
-        let metadata = self.cf_get::<BlocksCf>(&height.inner())?;
-        let elapsed = start.elapsed().as_secs_f64();
-        record_storage_read(elapsed);
-        record_storage_operation("get_block_metadata", elapsed);
-        Some(metadata)
-    }
-
     /// Get a complete block for serving sync requests.
     ///
     /// Returns `Some((block, qc))` only if the full block is available with all

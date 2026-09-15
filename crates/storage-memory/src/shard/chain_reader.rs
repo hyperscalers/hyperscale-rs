@@ -6,7 +6,7 @@ use std::sync::Arc;
 use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, CertifiedBlock,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
     Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction,
     TxHash, Verifiable, Verified,
@@ -30,6 +30,13 @@ impl ShardChainReader for SimShardStorage {
             .take_while(|((at, _), _)| *at == height)
             .map(|(_, provisions)| Arc::new(Verifiable::from((**provisions).clone())))
             .collect()
+    }
+
+    fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
+        read_or_recover(&self.consensus)
+            .blocks
+            .get(&height)
+            .map(|certified| BlockMetadata::from_block(certified.block(), certified.qc().clone()))
     }
 
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {

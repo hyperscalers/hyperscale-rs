@@ -2,16 +2,20 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
+use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash, Hash, ProvisionHash,
-    Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash, Verifiable,
-    Verified,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
+    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction,
+    TxHash, Verifiable, Verified,
 };
 
-use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf, ProvisionsCf, TxCertIndexCf};
+use super::column_families::{
+    BeaconWitnessesCf, BlocksCf, ExecutionCertsCf, ProvisionsCf, TxCertIndexCf,
+};
 use super::core::RocksDbShardStorage;
 use super::metadata::read_boundary_header;
 use crate::typed_cf::{TypedCf, get, iter_all, iter_from};
@@ -33,6 +37,15 @@ impl ShardChainReader for RocksDbShardStorage {
         .take_while(|((at, _), _)| *at == height)
         .map(|(_, provisions)| Arc::new(Verifiable::from(provisions)))
         .collect()
+    }
+
+    fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
+        let start = Instant::now();
+        let metadata = self.cf_get::<BlocksCf>(&height.inner())?;
+        let elapsed = start.elapsed().as_secs_f64();
+        record_storage_read(elapsed);
+        record_storage_operation("get_block_metadata", elapsed);
+        Some(metadata)
     }
 
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {

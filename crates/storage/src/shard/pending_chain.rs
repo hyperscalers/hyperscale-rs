@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey, ExecutionCertificate, Finalization,
-    FinalizationHash, QuorumCertificate, RETENTION_HORIZON, ShardId, ShardWitnessPayload,
-    StateRoot, SubstateKey, SweepBucket, SweepFrontier, TerminalRoots, TickId, Transaction, TxHash,
-    Verifiable, Verified, WeightedTimestamp, committed_txs_root_from_hashes,
-    local_settled_tx_hashes, settled_txs_root_from_hashes,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
+    CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey,
+    ExecutionCertificate, Finalization, FinalizationHash, QuorumCertificate, RETENTION_HORIZON,
+    ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SweepBucket, SweepFrontier,
+    TerminalRoots, TickId, Transaction, TxHash, Verifiable, Verified, WeightedTimestamp,
+    committed_txs_root_from_hashes, local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -402,6 +402,43 @@ where
         self.base.get_block_for_sync(height)
     }
 
+    /// The stored metadata row for the block at `height`, spanning
+    /// pending and persisted — what the attested window folds read of a
+    /// block, and one read rather than the whole-block rehydration
+    /// [`Self::block_for_sync`] does.
+    fn block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
+        if let Some(certified) = self
+            .pending_certified_at(height)
+            .or_else(|| self.pending_certified_uncommitted_at(height))
+        {
+            return Some(BlockMetadata::from_block(
+                certified.block(),
+                certified.qc().clone(),
+            ));
+        }
+        self.base.get_block_metadata(height)
+    }
+
+    /// The finalizations the block at `height` carried, as stored — the
+    /// attestations, without the receipts rehydrating one takes.
+    ///
+    /// `None` where the block itself is absent or any of the
+    /// finalizations its manifest names is: the settled fold derives its
+    /// set from these, so a short read is a hole and not a shorter block.
+    fn attestations_at(&self, height: BlockHeight) -> Option<Vec<Arc<Verifiable<Finalization>>>> {
+        if let Some(certified) = self
+            .pending_certified_at(height)
+            .or_else(|| self.pending_certified_uncommitted_at(height))
+        {
+            return Some(certified.block().certificates().as_ref().clone());
+        }
+        let metadata = self.base.get_block_metadata(height)?;
+        let ids = metadata.manifest().cert_ids();
+        let stored = self.base.get_certificates_batch(ids);
+        (stored.len() == ids.len())
+            .then(|| stored.into_iter().map(|fw| Arc::new(fw.into())).collect())
+    }
+
     /// The commitments a terminating boundary header carries, both walked
     /// over the block being built or verified and the committed window
     /// behind it.
@@ -507,11 +544,13 @@ where
             .saturating_sub(RETENTION_HORIZON.as_secs() * 1000);
         let mut h = height;
         let coverage = loop {
-            let Some(entry) = self.block_for_sync(h) else {
+            // The metadata row alone: the anchor the floor tests and the
+            // transaction hashes the set folds are both in it, and the
+            // bodies this fold would otherwise rehydrate are discarded.
+            let Some(metadata) = self.block_metadata(h) else {
                 break self.coverage_at(h);
             };
-            if entry
-                .block
+            if metadata
                 .header()
                 .parent_qc()
                 .weighted_timestamp()
@@ -520,7 +559,7 @@ where
             {
                 break WindowCoverage::Whole;
             }
-            set.extend(entry.block.transactions().iter().map(|tx| tx.hash()));
+            set.extend(metadata.manifest().tx_hashes().iter().copied());
             let Some(prev) = h.prev() else {
                 break WindowCoverage::Whole;
             };
@@ -664,17 +703,21 @@ where
     ) -> WindowCoverage {
         let mut h = upto;
         while covered_upto != Some(h) {
-            let Some(entry) = self.block_for_sync(h) else {
+            let Some(metadata) = self.block_metadata(h) else {
                 return self.coverage_at(h);
             };
-            let block_wt = entry.block.header().parent_qc().weighted_timestamp();
+            let block_wt = metadata.header().parent_qc().weighted_timestamp();
             if block_wt.as_millis() < floor.as_millis() {
                 return WindowCoverage::Whole;
             }
-            set.extend(local_settled_tx_hashes(
-                entry.block.certificates().iter(),
-                local_shard,
-            ));
+            // The stored attestations, read only once the floor admits
+            // the block: what the settled set derives from is each
+            // certificate's outcomes, and the receipts a whole
+            // finalization carries are no part of it.
+            let Some(attestations) = self.attestations_at(h) else {
+                return self.coverage_at(h);
+            };
+            set.extend(local_settled_tx_hashes(attestations.iter(), local_shard));
             let Some(prev) = h.prev() else {
                 return WindowCoverage::Whole;
             };
@@ -1263,6 +1306,7 @@ impl<S: TreeReader + Send + Sync> TreeReader for SubstateView<S> {
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::PoisonError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use hyperscale_types::test_utils::{test_prefix, test_transaction};
     use hyperscale_types::{
@@ -1293,6 +1337,10 @@ mod tests {
         /// What the store has persisted, for the sweep walk's guard —
         /// the one question that compares the base against the anchor.
         persisted: BlockHeight,
+        /// Calls to [`ShardChainReader::get_block_for_sync`], the
+        /// whole-block rehydration. The attested window folds read the
+        /// metadata row instead, and a test pins that they make none.
+        sync_block_reads: AtomicUsize,
     }
 
     impl StubStore {
@@ -1449,13 +1497,30 @@ mod tests {
             None
         }
         fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
+            self.sync_block_reads.fetch_add(1, Ordering::Relaxed);
             self.sync_blocks.get(&height).cloned()
+        }
+        fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
+            self.sync_blocks
+                .get(&height)
+                .map(|entry| BlockMetadata::from_block(&entry.block, entry.qc.clone()))
         }
         fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<Verified<Transaction>> {
             Vec::new()
         }
-        fn get_certificates_batch(&self, _ids: &[FinalizationHash]) -> Vec<Finalization> {
-            Vec::new()
+        fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
+            ids.iter()
+                .filter_map(|id| {
+                    self.sync_blocks.values().find_map(|entry| {
+                        entry
+                            .block
+                            .certificates()
+                            .iter()
+                            .find(|fw| fw.receipt_hash() == *id)
+                            .map(|fw| fw.as_unverified().clone())
+                    })
+                })
+                .collect()
         }
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
             None
@@ -2278,6 +2343,74 @@ mod tests {
             set,
             BTreeSet::from([tx_hash(13), tx_hash(10), tx_hash(11)]),
             "the below-floor block's transaction must not enter the window"
+        );
+    }
+
+    /// Neither attested walk rehydrates a block.
+    ///
+    /// What each fold reads of a block is in its stored metadata row —
+    /// the parent-QC anchor their floors test, and the manifest's
+    /// transaction hashes the committed set folds — plus, on the settled
+    /// side, the stored attestations. Going through the whole-block read
+    /// multi-gets every body, every certificate, and a receipt per
+    /// settling outcome, per walked height, for data both folds discard.
+    #[test]
+    fn the_attested_walks_read_no_block_bodies() {
+        let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
+        let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000);
+        let stub = StubStore::default()
+            .with_sync_block(
+                BlockHeight::new(3),
+                committed_sync_block(BlockHeight::new(3), anchor.as_millis(), &[10, 11]),
+            )
+            .with_sync_block(
+                BlockHeight::new(2),
+                committed_sync_block(BlockHeight::new(2), anchor.as_millis(), &[12]),
+            )
+            .with_sync_block(
+                BlockHeight::new(1),
+                committed_sync_block(BlockHeight::new(1), 9_999, &[14]),
+            );
+        let store = Arc::new(stub);
+        let chain = Arc::new(PendingChain::new(Arc::clone(&store), ChainOrigin::ROOT));
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
+        chain.insert(
+            parent,
+            ChainEntry {
+                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
+                height: BlockHeight::new(4),
+                settled_txs: Vec::new(),
+                committed_txs: vec![tx_hash(13)],
+                jmt_snapshot: empty_snapshot(),
+                certified_block: None,
+                certified_uncommitted: None,
+            },
+        );
+
+        let (set, coverage) =
+            chain.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
+        assert_eq!(coverage, WindowCoverage::Whole);
+        assert_eq!(
+            set,
+            BTreeSet::from([tx_hash(13), tx_hash(10), tx_hash(11), tx_hash(12)]),
+            "the manifest's hashes are the set, and they are in the metadata row",
+        );
+
+        let (_, coverage) = chain.settled_txs_in_window(
+            ShardId::ROOT,
+            parent,
+            BlockHeight::new(4),
+            anchor,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(coverage, WindowCoverage::Whole);
+
+        assert_eq!(
+            store.sync_block_reads.load(Ordering::Relaxed),
+            0,
+            "an attested walk that rehydrates a block pays a point-get per \
+             transaction per height for what it throws away",
         );
     }
 
