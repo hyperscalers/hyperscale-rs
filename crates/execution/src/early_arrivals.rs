@@ -130,7 +130,28 @@ impl EarlyArrivalBuffer {
     /// Buffer a vote whose tick isn't yet tracked. Called from the
     /// non-leader ingress path. Returns `false` if the vote was dropped
     /// because the buffer is at [`MAX_BUFFERED_EARLY_VOTES`] capacity.
+    ///
+    /// One slot per voter per tick, and a second vote from the same voter
+    /// takes the slot rather than being refused. Without the slot, one
+    /// committee member fills the global budget with copies of a single
+    /// vote and denies early buffering to every other tick on the node
+    /// until the retention sweep — the budget is one count shared by
+    /// every tick and every hosted shard. Taking the slot rather than
+    /// holding it is what keeps this from becoming a censorship gate: a
+    /// vote here has not had its signature checked, so a forged copy
+    /// under a voter's name must not be able to keep that voter's
+    /// genuine vote out. An overwritten vote costs its sender one retry
+    /// interval, which is what a drop costs here anyway.
     pub fn buffer_vote(&mut self, tick_id: TickId, vote: Verifiable<ExecutionVote>) -> bool {
+        let voter = vote.validator();
+        if let Some(held) = self
+            .votes
+            .get_mut(&tick_id)
+            .and_then(|held| held.iter_mut().find(|held| held.validator() == voter))
+        {
+            *held = vote;
+            return true;
+        }
         if self.buffered >= MAX_BUFFERED_EARLY_VOTES {
             tracing::debug!(
                 tick = %tick_id,
@@ -349,7 +370,7 @@ mod tests {
         )))
     }
 
-    fn make_vote(tick_id: TickId, anchor_ts: WeightedTimestamp) -> ExecutionVote {
+    fn make_vote(tick_id: TickId, anchor_ts: WeightedTimestamp, voter: u64) -> ExecutionVote {
         let tx_outcomes = vec![make_tx_outcome(TxHash::from(Hash::from_bytes(b"tx")))];
         let global_receipt_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let msg = signed_bytes(
@@ -373,14 +394,16 @@ mod tests {
             global_receipt_root,
             u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
             tx_outcomes,
-            ValidatorId::new(0),
+            ValidatorId::new(voter),
             signature,
         )
     }
 
     /// A vote with a zero signature — cheap to build (no signing), for
-    /// exercising the buffer's size cap at scale.
-    fn cheap_vote(tick_id: TickId) -> Verifiable<ExecutionVote> {
+    /// exercising the buffer's size cap at scale. The voter is explicit
+    /// because the buffer keeps one slot per voter per tick, so filling
+    /// it takes distinct voters.
+    fn cheap_vote(tick_id: TickId, voter: u64) -> Verifiable<ExecutionVote> {
         ExecutionVote::new(
             BlockHash::ZERO,
             BlockHeight::new(1),
@@ -390,7 +413,7 @@ mod tests {
             GlobalReceiptRoot::ZERO,
             0,
             vec![],
-            ValidatorId::new(0),
+            ValidatorId::new(voter),
             ConsensusSignature::ZERO,
         )
         .into()
@@ -402,8 +425,8 @@ mod tests {
     fn drain_votes_returns_buffered_and_leaves_buffer_empty() {
         let mut b = EarlyArrivalBuffer::new();
         let w = tick(1);
-        b.buffer_vote(w, make_vote(w, ms(100)).into());
-        b.buffer_vote(w, make_vote(w, ms(200)).into());
+        b.buffer_vote(w, make_vote(w, ms(100), 0).into());
+        b.buffer_vote(w, make_vote(w, ms(200), 1).into());
 
         let drained = b.drain_votes_for_tick(&w);
         assert_eq!(drained.len(), 2);
@@ -418,8 +441,8 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w1 = tick(1);
         let w2 = tick(2);
-        b.buffer_vote(w1, make_vote(w1, ms(100)).into());
-        b.buffer_vote(w2, make_vote(w2, ms(100)).into());
+        b.buffer_vote(w1, make_vote(w1, ms(100), 0).into());
+        b.buffer_vote(w2, make_vote(w2, ms(100), 0).into());
 
         let drained = b.drain_votes_for_tick(&w1);
         assert_eq!(drained.len(), 1);
@@ -431,8 +454,8 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w1 = tick(1);
         let w2 = tick(2);
-        b.buffer_vote(w1, make_vote(w1, ms(100)).into());
-        b.buffer_vote(w2, make_vote(w2, ms(100)).into());
+        b.buffer_vote(w1, make_vote(w1, ms(100), 0).into());
+        b.buffer_vote(w2, make_vote(w2, ms(100), 0).into());
 
         b.retain_votes(|tick_id, _| tick_id == &w1);
 
@@ -441,17 +464,57 @@ mod tests {
         assert!(b.drain_votes_for_tick(&w2).is_empty());
     }
 
+    /// One voter holds one slot per tick, and a second vote from it takes
+    /// that slot rather than a second one.
+    ///
+    /// The budget is one count shared by every tick and every hosted
+    /// shard, so without the slot a single committee member fills it with
+    /// copies of one vote and denies early buffering to everything else
+    /// on the node until the retention sweep.
+    #[test]
+    fn one_voter_holds_one_slot_per_tick() {
+        let mut b = EarlyArrivalBuffer::new();
+        let w = tick(1);
+        for _ in 0..MAX_BUFFERED_EARLY_VOTES * 2 {
+            assert!(b.buffer_vote(w, cheap_vote(w, 0)));
+        }
+        assert_eq!(b.vote_len(), 1, "one voter, one slot");
+        assert!(
+            b.buffer_vote(tick(2), cheap_vote(tick(2), 0)),
+            "and the budget is still there for every other tick",
+        );
+    }
+
+    /// The slot is taken rather than held, because a vote here has not had
+    /// its signature checked: a forged copy under a voter's name must not
+    /// keep that voter's genuine vote out of the buffer.
+    #[test]
+    fn a_second_vote_from_a_voter_takes_its_slot() {
+        let mut b = EarlyArrivalBuffer::new();
+        let w = tick(1);
+        let forged = cheap_vote(w, 3);
+        assert!(b.buffer_vote(w, forged));
+
+        let genuine: Verifiable<ExecutionVote> = make_vote(w, ms(1_000), 3).into();
+        let expected = genuine.as_unverified().clone();
+        assert!(b.buffer_vote(w, genuine));
+
+        let drained = b.drain_votes_for_tick(&w);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].as_unverified(), &expected);
+    }
+
     #[test]
     fn buffer_vote_enforces_global_cap() {
         let mut b = EarlyArrivalBuffer::new();
         let w = tick(1);
-        for _ in 0..MAX_BUFFERED_EARLY_VOTES {
-            assert!(b.buffer_vote(w, cheap_vote(w)));
+        for voter in 0..MAX_BUFFERED_EARLY_VOTES {
+            assert!(b.buffer_vote(w, cheap_vote(w, voter as u64)));
         }
         // At capacity, further votes are dropped — including for a tick the
         // buffer has never seen, so a fabricated-`TickId` flood can't grow it.
-        assert!(!b.buffer_vote(w, cheap_vote(tick(1))));
-        assert!(!b.buffer_vote(tick(2), cheap_vote(tick(2))));
+        assert!(!b.buffer_vote(w, cheap_vote(tick(1), u64::MAX)));
+        assert!(!b.buffer_vote(tick(2), cheap_vote(tick(2), 0)));
         assert!(!b.votes.contains_key(&tick(2)));
     }
 
@@ -459,15 +522,15 @@ mod tests {
     fn draining_a_tick_frees_buffer_capacity() {
         let mut b = EarlyArrivalBuffer::new();
         let w = tick(1);
-        for _ in 0..MAX_BUFFERED_EARLY_VOTES {
-            b.buffer_vote(w, cheap_vote(w));
+        for voter in 0..MAX_BUFFERED_EARLY_VOTES {
+            b.buffer_vote(w, cheap_vote(w, voter as u64));
         }
-        assert!(!b.buffer_vote(tick(2), cheap_vote(tick(2))));
+        assert!(!b.buffer_vote(tick(2), cheap_vote(tick(2), 0)));
 
         let drained = b.drain_votes_for_tick(&w);
         assert_eq!(drained.len(), MAX_BUFFERED_EARLY_VOTES);
         // The reclaimed budget lets fresh votes buffer again.
-        assert!(b.buffer_vote(tick(2), cheap_vote(tick(2))));
+        assert!(b.buffer_vote(tick(2), cheap_vote(tick(2), 0)));
     }
 
     #[test]
@@ -476,20 +539,20 @@ mod tests {
         let w1 = tick(1);
         let w2 = tick(2);
         let half = MAX_BUFFERED_EARLY_VOTES / 2;
-        for _ in 0..half {
-            b.buffer_vote(w1, cheap_vote(w1));
+        for voter in 0..half {
+            b.buffer_vote(w1, cheap_vote(w1, voter as u64));
         }
-        for _ in 0..(MAX_BUFFERED_EARLY_VOTES - half) {
-            b.buffer_vote(w2, cheap_vote(w2));
+        for voter in 0..(MAX_BUFFERED_EARLY_VOTES - half) {
+            b.buffer_vote(w2, cheap_vote(w2, voter as u64));
         }
-        assert!(!b.buffer_vote(tick(3), cheap_vote(tick(3))));
+        assert!(!b.buffer_vote(tick(3), cheap_vote(tick(3), 0)));
 
         // Dropping `w1` returns exactly its share of the budget.
         b.retain_votes(|tick_id, _| tick_id != &w1);
-        for _ in 0..half {
-            assert!(b.buffer_vote(tick(3), cheap_vote(tick(3))));
+        for voter in 0..half {
+            assert!(b.buffer_vote(tick(3), cheap_vote(tick(3), voter as u64)));
         }
-        assert!(!b.buffer_vote(tick(3), cheap_vote(tick(3))));
+        assert!(!b.buffer_vote(tick(3), cheap_vote(tick(3), u64::MAX)));
     }
 
     // ─── ECs ────────────────────────────────────────────────────────────
@@ -638,7 +701,10 @@ mod tests {
             for (i, h) in heights.iter().enumerate() {
                 let w = tick(*h);
                 let anchor = ms(anchors[i % anchors.len()]);
-                b.buffer_vote(w, make_vote(w, anchor).into());
+                // A distinct voter each time: the buffer keeps one slot
+                // per voter per tick, so repeats would collapse and the
+                // drained total would not be the buffered total.
+                b.buffer_vote(w, make_vote(w, anchor, i as u64).into());
             }
 
             // Drain every tick once; collect counts. A second drain of each
