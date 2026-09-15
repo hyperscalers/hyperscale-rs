@@ -27,13 +27,8 @@ use hyperscale_types::network::request::CellRange;
 use hyperscale_types::{
     Address, BlockHeight, CollectionId, Event, ShardId, ShardTrie, Transaction, WeightedTimestamp,
 };
-// The vm's own shard vocabulary, which a source's anchor is stated in;
-// the consensus `ShardId` above is what a trie routes to.
-use hyperscale_vm_effects::ShardId as SourceShard;
-use hyperscale_vm_kernel::{EnvInputs, OwnerSet, decode_amount};
-use hyperscale_vm_preview::{
-    CellSource, Local, Report as PreviewRun, Slack, preview as preview_run,
-};
+use hyperscale_vm_kernel::{EnvInputs, OwnerSet, Substates as KernelReads, decode_amount};
+use hyperscale_vm_preview::{Report as PreviewRun, Slack, preview as preview_run};
 use hyperscale_vm_types::{EffectSet, EffectTarget, Outcome, PriceTable, SubstateKey};
 
 use crate::batch::TickEnvironment;
@@ -695,17 +690,10 @@ impl Executor {
         // the same answer in the same shape. What stays here is what
         // needs the chain: the price, the payer's vault and the amounts
         // behind the cells the run moved.
-        // One shard nominally: a preview reads a whole snapshot, so what
-        // the anchor says is when it was read rather than who held it.
-        let source: Arc<dyn CellSource> = Arc::new(Local::at(
-            Arc::clone(&base),
-            SourceShard(0),
-            inputs.clock.as_millis(),
-        ));
         let report = preview_run(
             &batch[0],
             Some(&admitted),
-            source,
+            Arc::clone(&base) as Arc<dyn KernelReads>,
             &self.backend,
             protocol_hash,
             Slack::GENEROUS,
