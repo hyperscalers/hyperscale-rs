@@ -349,6 +349,14 @@ pub struct ExecutionCoordinator {
     /// outstanding.
     tick_in_flight: bool,
 
+    /// Whether this chain's terminal block has committed.
+    ///
+    /// Set by [`abort_pending_ticks`](Self::abort_pending_ticks), which
+    /// fires once on the first coast commit. Composition runs on every
+    /// commit after it, so without the latch a candidate unblocked past
+    /// the terminal would compose into a tick nothing can certify.
+    terminated: bool,
+
     /// What this node can run, asked where a tick dispatches.
     ///
     /// A queued tick whose members run code this node cannot resolve
@@ -593,6 +601,7 @@ impl ExecutionCoordinator {
             pending_ticks: VecDeque::new(),
             code,
             tick_in_flight: false,
+            terminated: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
             replay_blocks: recovered.replay.blocks.clone(),
@@ -2990,10 +2999,15 @@ impl ExecutionCoordinator {
             .absorb_engagement_evidence(&self.provisioning);
 
         // What earlier ticks hold provisionally, and the set this commit's
-        // own composition adds to.
+        // own composition adds to. A terminated chain composes nothing:
+        // no later block of it can carry a finalization, so a tick it
+        // composed could never reach a verdict.
         let mut held = self.provisional_cells();
-        let (pending, early_votes, members) =
-            self.compose_tick(topology_schedule, block, &mut held);
+        let (pending, early_votes, members) = if self.terminated {
+            (None, Vec::new(), Vec::new())
+        } else {
+            self.compose_tick(topology_schedule, block, &mut held)
+        };
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology_schedule, vote));
         }
@@ -3925,6 +3939,16 @@ impl ExecutionCoordinator {
         self.pending_ticks.clear();
         self.ticked.clear();
         self.tick_in_flight = false;
+        // And the candidates behind them, with the latch that keeps
+        // composition from admitting more. The sweep fires once, on the
+        // first coast commit, while composition runs on every one after
+        // it: a candidate whose cross-shard provisions land past the
+        // terminal would otherwise compose into a tick at a
+        // past-terminal anchor, which gets no vote tracker and is never
+        // votable — an execution batch dispatched and written into the
+        // chain just cleared, for an outcome that can never certify.
+        self.candidates.clear();
+        self.terminated = true;
         let mut actions = vec![Action::ClearTickChain];
         if !expected.is_empty() {
             actions.push(Action::AbandonFetch(FetchIds::ExecutionCerts(expected)));
@@ -7774,6 +7798,90 @@ mod tests {
                 ),
             )));
         state.scan_votable_ticks(&schedule);
+    }
+
+    /// A terminated chain composes nothing, however its candidates
+    /// unblock afterwards.
+    ///
+    /// The sweep fires once, on the first coast commit, while
+    /// composition runs on every one after it. A tick composed past the
+    /// terminal anchors where no vote tracker exists, so it is never
+    /// votable — an execution batch dispatched and a write into the tick
+    /// chain just cleared, for an outcome that can never certify.
+    #[test]
+    fn a_terminated_chain_composes_no_further_tick() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&transaction, &Classified::whole())],
+        );
+
+        // BASELINE: the same commit on a live chain composes a tick.
+        {
+            let mut live = make_test_state_for_shard(ValidatorId::new(0), HOME);
+            live.counterparts.ledger.register_committed(
+                test_committed(),
+                &PriceTable::GENESIS,
+                [(&transaction, &Classified::whole())],
+            );
+            let block = make_live_block_on_shard(
+                HOME,
+                BlockHeight::new(1),
+                deadline_ms,
+                ValidatorId::new(0),
+                vec![],
+            );
+            live.on_block_committed(&schedule, &test_certify(block, deadline_ms));
+            assert!(
+                live.ticks
+                    .get_tick(&TickId::new(HOME, BlockHeight::new(1)))
+                    .is_some(),
+                "the fixture must reach composition, or the assertion below is vacuous",
+            );
+        }
+
+        // The chain's terminal block committed and the sweep ran.
+        let swept = state.abort_pending_ticks();
+        assert!(
+            swept
+                .iter()
+                .any(|action| matches!(action, Action::ClearTickChain)),
+            "the sweep clears the tick chain, got {swept:?}",
+        );
+
+        // A coast commit past it.
+        let coast = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(1),
+            deadline_ms,
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.on_block_committed(&schedule, &test_certify(coast, deadline_ms));
+
+        assert!(
+            state
+                .ticks
+                .get_tick(&TickId::new(HOME, BlockHeight::new(1)))
+                .is_none(),
+            "a terminated chain composes no tick",
+        );
+        assert!(
+            state.candidates.is_empty(),
+            "the sweep took the candidates with the ticks",
+        );
+        assert!(
+            state.terminated,
+            "and latched the chain, so a candidate registered afterwards \
+             composes nothing either",
+        );
     }
 
     /// A member that never ran joins on the shards holding the keyspace
