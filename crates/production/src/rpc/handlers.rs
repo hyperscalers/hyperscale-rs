@@ -169,6 +169,11 @@ pub async fn preview_transaction_handler(
         fee: report.fee.to_string(),
         fuel: report.fuel,
         ceilings: report.ceilings.clone(),
+        anchors: report
+            .anchors
+            .iter()
+            .map(|(shard, height)| (shard.to_string(), height.inner()))
+            .collect(),
     })
     .into_response()
 }

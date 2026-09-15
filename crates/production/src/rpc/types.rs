@@ -1,5 +1,7 @@
 //! Request and response types for the RPC API.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub use super::state::VnodeStatusEntry;
@@ -126,6 +128,16 @@ pub struct PreviewTransactionResponse {
     /// The ceiling each node's run asks for, in node order — the vector
     /// a composer signs into `gas_limits`, and the reason to ask at all.
     pub ceilings: Vec<u64>,
+    /// The committed height each answering shard read at, keyed by the
+    /// shard's `Shard(dNpM)` spelling.
+    ///
+    /// What the ceilings above were measured against. A server picks its
+    /// own height, so a report is a run over snapshots that were never
+    /// simultaneous and may sit well behind the tip — and a ceiling
+    /// measured over stale state is one a real run can trip, burning the
+    /// fee on the trap. A composer that watches these can tell a fresh
+    /// answer from an old one; without them it cannot.
+    pub anchors: BTreeMap<String, u64>,
 }
 
 /// Generic error response.

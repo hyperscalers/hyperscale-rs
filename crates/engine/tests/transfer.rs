@@ -2704,6 +2704,40 @@ fn a_preview_speaks_for_a_shard_a_fan_out_answered() {
         "a shard that answered is not a shard this node cannot see: {:?}",
         report.outcome
     );
+    // And the height it answered at comes back out. The ceilings beside
+    // it are what a composer signs, so a report taken over state far
+    // behind the tip yields ceilings a real run can trip — a caller that
+    // cannot see the age cannot see that coming.
+    assert_eq!(
+        report.anchors,
+        BTreeMap::from([(ShardId::leaf(1, 0), BlockHeight::new(4))]),
+    );
+}
+
+/// A preview that read no shard's state names no anchor: there is no
+/// moment to disclose.
+#[test]
+fn a_refused_preview_names_no_anchor() {
+    let PreviewFixture { accounts, tx, .. } = preview_fixture();
+    let executor = executor(ExecutionMode::Serial);
+    let snapshot_store = MapDb::genesis(&accounts);
+    let report = executor.preview(
+        &snapshot_store,
+        &tx,
+        &PreviewInputs {
+            prices: PriceTable::GENESIS,
+            clock: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: Holds {
+                trie: ShardTrie::uniform_from_count(2),
+                shards: BTreeSet::from([ShardId::leaf(1, 1)]),
+                fetched: FetchedCells::default(),
+            },
+            grants: PreviewGrants::default(),
+        },
+    );
+    assert!(matches!(report.outcome, PreviewOutcome::Refused { .. }));
+    assert!(report.anchors.is_empty());
 }
 
 /// A cell this node does not hold is not an empty cell.

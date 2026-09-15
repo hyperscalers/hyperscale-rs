@@ -479,6 +479,20 @@ pub struct PreviewReport {
     pub ceilings: Vec<u64>,
     /// What the run emitted.
     pub events: Vec<Event>,
+    /// The committed height each answering shard read at, by shard.
+    ///
+    /// A preview is a statement about state at a moment, and the moment
+    /// is the server's: each height is chosen by whoever answered, so a
+    /// run over several shards is a run over snapshots that were never
+    /// simultaneous. Carried out rather than discarded because the
+    /// ceilings beside it are what a composer signs — a report taken over
+    /// state far behind the tip yields ceilings a real run can trip, and
+    /// the fee burns on the trap. A caller that cannot judge the age
+    /// cannot see that coming.
+    ///
+    /// Empty for a verdict that read no shard: a refusal before the run,
+    /// or a publish, whose answer is a pure function of its bytes.
+    pub anchors: BTreeMap<ShardId, BlockHeight>,
 }
 
 impl PreviewReport {
@@ -493,6 +507,7 @@ impl PreviewReport {
             fuel: 0,
             ceilings: Vec::new(),
             events: Vec::new(),
+            anchors: BTreeMap::new(),
         }
     }
 }
@@ -707,6 +722,7 @@ impl Executor {
             fuel: report.spent.iter().fold(0u64, |t, n| t.saturating_add(*n)),
             ceilings: report.ceilings,
             events: report.events,
+            anchors: inputs.holds.fetched.anchors.clone(),
         }
     }
 }
@@ -742,6 +758,9 @@ fn preview_publish(
         fuel: 0,
         ceilings: Vec::new(),
         events: Vec::new(),
+        // A publish reads no shard's state: its verdict is a pure
+        // function of the artifact's bytes.
+        anchors: BTreeMap::new(),
     }
 }
 
