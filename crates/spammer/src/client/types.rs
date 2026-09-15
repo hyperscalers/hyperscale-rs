@@ -88,13 +88,14 @@ pub struct NodeStatus {
 pub struct TransactionStatusResponse {
     /// Transaction hash (hex-encoded).
     pub hash: String,
-    /// Current status of the transaction.
-    /// Possible values: "pending", "committed", "executed", "completed", "aborted", "unknown", "error"
+    /// Current status of the transaction. Possible values: `pending`,
+    /// `committed`, `leg_finalized`, `completed`, plus `unknown` when the
+    /// server holds no record and `error` when the lookup itself failed.
     pub status: String,
     /// Block height where committed (if committed).
     #[serde(default)]
     pub committed_height: Option<u64>,
-    /// Final decision (if executed): "accept" or "reject".
+    /// Final decision (when completed): `accept`, `reject` or `aborted`.
     #[serde(default)]
     pub decision: Option<String>,
     /// Error message if status lookup failed.
@@ -112,6 +113,7 @@ impl TransactionStatusResponse {
             match self.decision.as_deref()? {
                 "accept" => Some(TransactionDecision::Accept),
                 "reject" => Some(TransactionDecision::Reject),
+                "aborted" => Some(TransactionDecision::Aborted),
                 _ => None,
             }
         };
@@ -148,5 +150,38 @@ impl TransactionStatusResponse {
             self.to_status(),
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completed(decision: &str) -> TransactionStatusResponse {
+        TransactionStatusResponse {
+            hash: String::new(),
+            status: "completed".to_string(),
+            committed_height: None,
+            decision: Some(decision.to_string()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn every_decision_the_server_emits_decodes_and_terminates() {
+        for decision in ["accept", "reject", "aborted"] {
+            let response = completed(decision);
+            assert!(
+                response.to_status().is_some(),
+                "decision {decision} failed to decode"
+            );
+            assert!(
+                response.is_terminal(),
+                "decision {decision} never terminates"
+            );
+        }
+        assert!(completed("accept").is_success());
+        assert!(!completed("reject").is_success());
+        assert!(!completed("aborted").is_success());
     }
 }
