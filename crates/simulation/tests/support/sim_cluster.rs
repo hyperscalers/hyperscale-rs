@@ -391,23 +391,6 @@ impl SimCluster {
             .and_then(|storage| storage.get_block(height))
     }
 
-    /// Restart `host`'s replica of `shard`: tear the shard loop down and
-    /// seat every member it carried again on the storage it kept.
-    ///
-    /// What a process restart leaves behind. The committed chain
-    /// survives on disk; everything consensus and execution held in
-    /// memory — tick assignments, tick outputs, absorbed provisions —
-    /// does not, and has to come back out of committed content.
-    ///
-    /// Sim-only, and deliberately not on [`FaultableCluster`]: that trait
-    /// is the intersection of what both harnesses can do, and bouncing a
-    /// real node process is a larger commitment than this needs.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `host` does not serve `shard`, or if the rejoin does not
-    /// take the retained-storage path — a snap-sync there would be a
-    /// different test entirely.
     /// Make `host` answer requests of `type_id` with what `rewrite`
     /// returns, given the request's bytes and the answer it was about to
     /// send.
@@ -467,6 +450,23 @@ impl SimCluster {
         FaultHandle::new(move || handle.fired())
     }
 
+    /// Restart `host`'s replica of `shard`: tear the shard loop down and
+    /// seat every member it carried again on the storage it kept.
+    ///
+    /// What a process restart leaves behind. The committed chain
+    /// survives on disk; everything consensus and execution held in
+    /// memory — tick assignments, tick outputs, absorbed provisions —
+    /// does not, and has to come back out of committed content.
+    ///
+    /// Sim-only, and deliberately not on [`FaultableCluster`]: that trait
+    /// is the intersection of what both harnesses can do, and bouncing a
+    /// real node process is a larger commitment than this needs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `host` does not serve `shard`, or if the rejoin does not
+    /// take the retained-storage path — a snap-sync there would be a
+    /// different test entirely.
     pub fn restart_host(&mut self, host: usize, shard: ShardId) {
         let kind = self.runner.restart_shard(host_index(host), shard);
         assert!(
