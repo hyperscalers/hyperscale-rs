@@ -373,10 +373,17 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// proofs going missing.
     fn record_reclaim_probe_answered(&self, present: bool) {}
 
-    /// Record a reclaim admitted into a tick — one transaction whose
-    /// escrowed value this shard is taking back on the evidence its
-    /// chain committed.
-    fn record_reclaim_admitted(&self) {}
+    /// Record a settlement of escrowed value admitted into a tick, by
+    /// what composed it: an entry this shard still holds for the
+    /// transaction, or the record leaf alone.
+    ///
+    /// A leaf-composed settlement is one no entry could have reached —
+    /// the transaction's own clock ran out before the evidence landed,
+    /// or this chain never held it at all. A rising leaf rate is the
+    /// stranding path carrying traffic, which is what it is for.
+    fn record_reclaim_admitted(&self, from_leaf: bool) {
+        let _ = from_leaf;
+    }
 
     /// Record a counterpart cell this validator's own fetch read as
     /// answering nothing — a committed cell present while its member is
@@ -862,10 +869,10 @@ pub fn record_reclaim_probe_answered(present: bool) {
     recorder().record_reclaim_probe_answered(present);
 }
 
-/// Record a reclaim admitted into a tick.
+/// Record a settlement of escrowed value admitted into a tick.
 #[inline]
-pub fn record_reclaim_admitted() {
-    recorder().record_reclaim_admitted();
+pub fn record_reclaim_admitted(from_leaf: bool) {
+    recorder().record_reclaim_admitted(from_leaf);
 }
 
 /// Record a counterpart cell a fetch read as answering nothing yet.

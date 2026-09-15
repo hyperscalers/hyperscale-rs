@@ -1067,7 +1067,7 @@ impl ExecutionCoordinator {
                 continue;
             }
             self.counterparts.ledger.admit_reclaim(tx_hash);
-            record_reclaim_admitted();
+            record_reclaim_admitted(false);
             // A mixed shard's delivering member waits on what the core
             // returns, and the evidence this reclaim is composed from is
             // that the core never claimed. Nothing is coming, so the
@@ -1196,7 +1196,7 @@ impl ExecutionCoordinator {
             for key in &records {
                 self.counterparts.held.remove(key);
             }
-            record_reclaim_admitted();
+            record_reclaim_admitted(true);
             // No body reached this shard: the chain that issued the
             // crossing ended at the cut, and the price it owed was
             // settled there.
@@ -9215,6 +9215,91 @@ mod tests {
         assert!(
             state.counterparts.held.is_empty(),
             "and the record is taken once",
+        );
+    }
+
+    /// The defect's own sequence: a leg entry stands, is pruned at its
+    /// horizon, and only then does the departure that licenses the
+    /// reclaim land.
+    ///
+    /// This is the shape measured as stranding. The entry owns the
+    /// record while it lives, so nothing composes beside it; the entry
+    /// goes on its own clock, which no evidence extends; and the record
+    /// a cut licenses afterwards arrives to a chain that reconstructs a
+    /// whole entry keeping no classification. Before the leaf answered,
+    /// the reclaim had nothing left to compose from and the value stood
+    /// on the prefix for good.
+    #[test]
+    fn a_record_outlives_the_entry_that_owned_it_and_is_reclaimed_after() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let (record_key, _, cell) = held_record(0x6A, 400_000);
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(cell));
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&transaction, &leg_classified())],
+        );
+        assert!(
+            state.counterparts.ledger.settles_records(cell.tx),
+            "the entry owns the record while it stands",
+        );
+
+        // Past the horizon the entry stands to, which is the whole of
+        // what ends it: a leg entry goes on the transaction's clock and
+        // no evidence extends it.
+        let horizon = Window::LegEntry
+            .of(Deadline::of_transaction(&transaction))
+            .end
+            .plus(Duration::from_secs(1));
+        commit_carrying(&mut state, &schedule, 1, horizon.as_millis(), vec![]);
+        assert!(
+            !state.counterparts.ledger.settles_records(cell.tx),
+            "and is gone at its horizon",
+        );
+        assert!(
+            state.counterparts.held.contains_key(&record_key),
+            "while the record it owned is still here",
+        );
+
+        let actions = commit_recording(
+            &mut state,
+            &schedule,
+            2,
+            horizon.plus(Duration::from_secs(1)).as_millis(),
+            vec![AbandonmentRecord::new(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                [UnsettledTx::for_transaction(
+                    &transaction,
+                    test_committed(),
+                    transaction.price(&PriceTable::GENESIS),
+                    &PriceTable::GENESIS,
+                )],
+            )],
+        );
+        let runs = actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => {
+                requests.first().map(|request| request.runs.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            matches!(
+                runs,
+                Some(Runs::Settle {
+                    on: Licence::Unclaimed,
+                    ..
+                })
+            ),
+            "the cut lands past the entry and the crossing still comes back; \
+             dispatched {runs:?}",
         );
     }
 

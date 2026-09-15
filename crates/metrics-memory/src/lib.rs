@@ -267,8 +267,9 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("reclaim_probes_answered", Some(label), 1);
     }
 
-    fn record_reclaim_admitted(&self) {
-        self.inc("reclaims_admitted", None, 1);
+    fn record_reclaim_admitted(&self, from_leaf: bool) {
+        let label = if from_leaf { "leaf" } else { "entry" };
+        self.inc("reclaims_admitted", Some(label), 1);
     }
 
     fn record_reclaim_probe_pending(&self) {
