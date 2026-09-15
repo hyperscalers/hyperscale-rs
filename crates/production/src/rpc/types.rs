@@ -1,7 +1,5 @@
 //! Request and response types for the RPC API.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 pub use super::state::VnodeStatusEntry;
@@ -54,37 +52,6 @@ pub struct NodeStatusResponse {
     pub version: String,
     /// Per-hosted-vnode status entries.
     pub vnodes: Vec<VnodeStatusEntry>,
-}
-
-/// Response for `/api/v1/sync` endpoint.
-///
-/// Each hosted shard runs its own block-sync FSM, so the response is
-/// keyed by shard id. `sync_peers` is process-level (one libp2p
-/// adapter across hosted shards) and lives at the top level.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncStatusResponse {
-    /// Per-hosted-shard sync status, keyed by shard id.
-    pub shards: HashMap<u64, ShardSyncStatus>,
-    /// Number of connected peers capable of sync.
-    pub sync_peers: usize,
-}
-
-/// One hosted shard's view of its block-sync FSM, embedded in
-/// [`SyncStatusResponse::shards`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShardSyncStatus {
-    /// Current sync state.
-    pub state: String,
-    /// Current block height.
-    pub current_height: u64,
-    /// Target height (if syncing).
-    pub target_height: Option<u64>,
-    /// Number of blocks behind.
-    pub blocks_behind: u64,
-    /// Number of pending block fetches.
-    pub pending_fetches: usize,
-    /// Number of heights queued for fetch.
-    pub queued_heights: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -70,7 +70,7 @@ use crate::rpc::state::{PreviewSender, RpcPublishers, VnodeMempoolSnapshot};
 use crate::rpc::{
     MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
 };
-use crate::status::{ShardSyncState, SyncStatus};
+use crate::status::SyncStatus;
 use crate::supervisor::{ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1545,17 +1545,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
         let block_sync = shard_loop.io.block_sync_status();
         sync_status.rcu(|current| {
             let mut updated = (**current).clone();
-            updated.shards.insert(
-                shard_key,
-                ShardSyncState {
-                    state: block_sync.state.clone(),
-                    current_height: block_sync.current_height,
-                    target_height: block_sync.target_height,
-                    blocks_behind: block_sync.blocks_behind,
-                    pending_fetches: block_sync.pending_fetches,
-                    queued_heights: block_sync.queued_heights,
-                },
-            );
+            updated.shards.insert(shard_key, block_sync.clone());
             Arc::new(updated)
         });
     }

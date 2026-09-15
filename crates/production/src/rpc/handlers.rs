@@ -43,8 +43,8 @@ use tokio::task::spawn_blocking;
 use super::state::RpcState;
 use super::types::{
     ErrorResponse, HealthResponse, NodeStatusResponse, PreviewTransactionRequest,
-    PreviewTransactionResponse, ReadyResponse, ShardSyncStatus, SubmitTransactionRequest,
-    SubmitTransactionResponse, SyncStatusResponse, TransactionStatusResponse,
+    PreviewTransactionResponse, ReadyResponse, SubmitTransactionRequest, SubmitTransactionResponse,
+    TransactionStatusResponse,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -118,30 +118,9 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
 
 /// Handler for `GET /api/v1/sync` - sync status.
 pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
-    let sync_status = state.sync_status.load();
-
-    let shards = sync_status
-        .shards
-        .iter()
-        .map(|(shard, s)| {
-            (
-                *shard,
-                ShardSyncStatus {
-                    state: format!("{:?}", s.state).to_lowercase(),
-                    current_height: s.current_height,
-                    target_height: s.target_height,
-                    blocks_behind: s.blocks_behind,
-                    pending_fetches: s.pending_fetches,
-                    queued_heights: s.queued_heights,
-                },
-            )
-        })
-        .collect();
-
-    Json(SyncStatusResponse {
-        shards,
-        sync_peers: sync_status.sync_peers,
-    })
+    // `BlockSyncStateKind` renames to snake case on the way out, so the
+    // published `state` tag comes from the enum itself.
+    Json((*state.sync_status.load_full()).clone())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -458,7 +437,7 @@ mod tests {
     use axum::http::Request;
     use axum::routing::{get, post};
     use hyperscale_hbor::to_vec as hbor_to_vec;
-    use hyperscale_node::{BlockSyncStateKind, TxStatusCache};
+    use hyperscale_node::{BlockSyncStateKind, BlockSyncStatus, TxStatusCache};
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{BlockHeight, ShardId, TransactionDecision};
     use serde_json::{from_slice, to_string};
@@ -467,7 +446,7 @@ mod tests {
     use super::super::state::TxSubmissionSender;
     use super::*;
     use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
-    use crate::status::{ShardSyncState, SyncStatus};
+    use crate::status::SyncStatus;
 
     fn create_test_state() -> RpcState {
         let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
@@ -689,7 +668,7 @@ mod tests {
         let mut shards = std::collections::HashMap::new();
         shards.insert(
             0,
-            ShardSyncState {
+            BlockSyncStatus {
                 state: BlockSyncStateKind::Syncing,
                 current_height: 100u64.saturating_sub(blocks_behind),
                 target_height: Some(100),

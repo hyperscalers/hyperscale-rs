@@ -50,7 +50,7 @@ pub use bootstrap::witness_history_serve::serve_witness_history_request;
 pub use config::NodeConfig;
 pub use host::{NodeHost, ShardGenesis};
 pub use process::TxStatusCache;
-pub use shard::consensus::{BlockSyncStateKind, serve_block_request};
+pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_request};
 pub use shard::cross_shard::{
     serve_committed_txs_request, serve_local_certified_headers, serve_settled_txs_request,
     serve_state_proof_request,

@@ -573,14 +573,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_status_endpoint() {
-        use hyperscale_node::BlockSyncStateKind;
-
-        use crate::status::ShardSyncState;
+        use hyperscale_node::{BlockSyncStateKind, BlockSyncStatus};
 
         let mut shards = std::collections::HashMap::new();
         shards.insert(
             0u64,
-            ShardSyncState {
+            BlockSyncStatus {
                 state: BlockSyncStateKind::Syncing,
                 current_height: 100,
                 target_height: Some(200),

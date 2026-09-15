@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use hyperscale_node::BlockSyncStateKind;
+use hyperscale_node::BlockSyncStatus;
 use serde::Serialize;
 
 /// Cross-shard sync status for external APIs.
@@ -18,38 +18,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncStatus {
     /// Per-hosted-shard sync state, keyed by shard id.
-    pub shards: HashMap<u64, ShardSyncState>,
+    pub shards: HashMap<u64, BlockSyncStatus>,
     /// Number of connected peers capable of sync. Process-level — the
     /// libp2p adapter is shared across hosted shards.
     pub sync_peers: usize,
-}
-
-/// One hosted shard's view of its block-sync FSM.
-#[derive(Debug, Clone, Serialize)]
-pub struct ShardSyncState {
-    /// Current sync state ("idle" or "syncing").
-    pub state: BlockSyncStateKind,
-    /// Current committed height.
-    pub current_height: u64,
-    /// Target height (if syncing).
-    pub target_height: Option<u64>,
-    /// Number of blocks behind target.
-    pub blocks_behind: u64,
-    /// Number of pending fetch requests.
-    pub pending_fetches: usize,
-    /// Number of heights queued for fetch.
-    pub queued_heights: usize,
-}
-
-impl Default for ShardSyncState {
-    fn default() -> Self {
-        Self {
-            state: BlockSyncStateKind::Idle,
-            current_height: 0,
-            target_height: None,
-            blocks_behind: 0,
-            pending_fetches: 0,
-            queued_heights: 0,
-        }
-    }
 }
