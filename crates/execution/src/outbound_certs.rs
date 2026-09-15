@@ -75,7 +75,6 @@ pub struct OutboundExecutionCertificateTracker {
     /// (`tick_id`, `target_shard`) → entry. One EC may be tracked once per
     /// remote target shard it was sent to.
     entries: HashMap<(TickId, ShardId), OutboundCertEntry>,
-    now: WeightedTimestamp,
 }
 
 impl Default for OutboundExecutionCertificateTracker {
@@ -88,7 +87,6 @@ impl OutboundExecutionCertificateTracker {
     pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            now: WeightedTimestamp::ZERO,
         }
     }
 
@@ -101,11 +99,17 @@ impl OutboundExecutionCertificateTracker {
     /// Register an EC the tick leader just broadcast to a remote shard.
     /// Idempotent on duplicate (tick, target) — preserves the original
     /// `first_sent_at` so the safety horizon counts from the first send.
+    ///
+    /// `now` is the caller's commit frontier, which is where the attested
+    /// clock lives: a tracker holding its own copy would read zero for
+    /// every send a restart's replay drives before the first live commit,
+    /// and pace the first re-broadcast off that.
     pub(crate) fn on_broadcast(
         &mut self,
         certificate: Arc<Verified<ExecutionCertificate>>,
         target_shard: ShardId,
         recipients: Vec<ValidatorId>,
+        now: WeightedTimestamp,
     ) {
         if recipients.is_empty() {
             return;
@@ -128,7 +132,7 @@ impl OutboundExecutionCertificateTracker {
                 target_shard,
                 recipients,
                 deadline,
-                last_sent_at: self.now,
+                last_sent_at: now,
                 rebroadcast_count: 0,
             },
         );
@@ -168,8 +172,6 @@ impl OutboundExecutionCertificateTracker {
         &mut self,
         now: WeightedTimestamp,
     ) -> Vec<RebroadcastDirective> {
-        self.now = now;
-
         let mut directives = Vec::new();
         let mut to_evict = Vec::new();
 
@@ -224,9 +226,16 @@ mod tests {
     }
 
     fn cert(tick_id: TickId) -> Arc<Verified<ExecutionCertificate>> {
+        cert_at(tick_id, WeightedTimestamp::ZERO)
+    }
+
+    fn cert_at(
+        tick_id: TickId,
+        vote_anchor_ts: WeightedTimestamp,
+    ) -> Arc<Verified<ExecutionCertificate>> {
         Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
-            WeightedTimestamp::ZERO,
+            vote_anchor_ts,
             GlobalReceiptRoot::from_raw(Hash::ZERO),
             Vec::new(),
             AggregateSignature::new([0u8; 96]),
@@ -244,7 +253,7 @@ mod tests {
         t.on_block_committed(ts(1_000));
 
         let w = tick(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5, 6, 7]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5, 6, 7]), ts(1_000));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 
@@ -252,7 +261,7 @@ mod tests {
     fn on_broadcast_skips_when_no_recipients() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = tick(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vec![]);
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vec![], ts(0));
         assert_eq!(t.memory_stats().tracked_certificates, 0);
     }
 
@@ -260,8 +269,8 @@ mod tests {
     fn on_broadcast_is_idempotent_per_target() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = tick(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
-        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]), ts(0));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5]), ts(0));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 
@@ -271,7 +280,7 @@ mod tests {
         t.on_block_committed(ts(0));
 
         let w = tick(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]), ts(0));
 
         // Just before interval — no directive.
         let directives = t.on_block_committed(ts(u64::try_from(REBROADCAST_INTERVAL.as_millis())
@@ -294,7 +303,7 @@ mod tests {
         t.on_block_committed(ts(0));
 
         let w = tick(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]), ts(0));
 
         let interval_ms = u64::try_from(REBROADCAST_INTERVAL.as_millis()).unwrap_or(u64::MAX);
         let d1 = t.on_block_committed(ts(interval_ms));
@@ -305,13 +314,38 @@ mod tests {
         assert_eq!(d3.len(), 1);
     }
 
+    /// A tick attested during the replay a restart runs broadcasts its
+    /// certificate before any live commit reaches the tracker. The
+    /// re-broadcast interval has to count from when the send happened,
+    /// not from a clock that has seen no block.
+    #[test]
+    fn a_send_before_the_first_commit_still_waits_the_interval() {
+        let mut t = OutboundExecutionCertificateTracker::new();
+
+        let resumed = ts(60_000_000);
+        let w = tick(0, 100, &[1]);
+        t.on_broadcast(
+            cert_at(w, resumed),
+            ShardId::leaf(2, 1),
+            vids(&[4]),
+            resumed,
+        );
+
+        let directives = t.on_block_committed(resumed.plus(Duration::from_millis(500)));
+        assert!(
+            directives.is_empty(),
+            "a certificate sent half a second ago is not due a re-broadcast"
+        );
+        assert_eq!(t.memory_stats().tracked_certificates, 1);
+    }
+
     #[test]
     fn safety_horizon_evicts_with_warning() {
         let mut t = OutboundExecutionCertificateTracker::new();
         t.on_block_committed(ts(1_000));
 
         let w = tick(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]), ts(1_000));
 
         let past = RETENTION_HORIZON + Duration::from_secs(1);
         t.on_block_committed(ts(
@@ -324,8 +358,8 @@ mod tests {
     fn finalization_evicts_all_targets() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = tick(0, 100, &[1, 2]);
-        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
-        t.on_broadcast(cert(w), ShardId::leaf(2, 2), vids(&[8]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]), ts(0));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 2), vids(&[8]), ts(0));
         assert_eq!(t.memory_stats().tracked_certificates, 2);
 
         t.on_tick_finalized(&w);
@@ -337,7 +371,7 @@ mod tests {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w1 = tick(0, 100, &[1]);
         let w2 = tick(0, 101, &[1]);
-        t.on_broadcast(cert(w1), ShardId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w1), ShardId::leaf(2, 1), vids(&[4]), ts(0));
         t.on_tick_finalized(&w2);
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }

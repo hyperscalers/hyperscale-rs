@@ -2258,6 +2258,7 @@ impl ExecutionCoordinator {
                 Arc::clone(&projected),
                 *target_shard,
                 recipients.clone(),
+                self.committed_ts,
             );
             actions.push(Action::BroadcastExecutionCertificate {
                 shard: *target_shard,
