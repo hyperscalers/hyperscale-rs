@@ -37,8 +37,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    Attempt, BlockHash, BlockHeight, ExecutionCertificate, GlobalReceiptRoot, TickId, TxHash,
-    TxOutcome, VoteCount, WeightedTimestamp,
+    Attempt, BlockHash, ExecutionCertificate, GlobalReceiptRoot, TickId, TxHash, TxOutcome,
+    VoteCount, WeightedTimestamp,
 };
 
 use crate::tick_state::TickState;
@@ -63,7 +63,6 @@ pub struct PendingVoteRetry {
     pub(crate) sent_at: WeightedTimestamp,
     pub(crate) attempt: Attempt,
     pub(crate) block_hash: BlockHash,
-    pub(crate) block_height: BlockHeight,
     pub(crate) vote_anchor_ts: WeightedTimestamp,
     pub(crate) global_receipt_root: GlobalReceiptRoot,
     pub(crate) tx_outcomes: Arc<Vec<TxOutcome>>,
@@ -77,7 +76,6 @@ pub struct RetryEffect {
     pub(crate) tick_id: TickId,
     pub(crate) attempt: Attempt,
     pub(crate) block_hash: BlockHash,
-    pub(crate) block_height: BlockHeight,
     pub(crate) vote_anchor_ts: WeightedTimestamp,
     pub(crate) global_receipt_root: GlobalReceiptRoot,
     pub(crate) tx_outcomes: Arc<Vec<TxOutcome>>,
@@ -254,7 +252,6 @@ impl TickRegistry {
                 tick_id,
                 attempt: pending.attempt,
                 block_hash: pending.block_hash,
-                block_height: pending.block_height,
                 vote_anchor_ts: pending.vote_anchor_ts,
                 global_receipt_root: pending.global_receipt_root,
                 tx_outcomes: Arc::clone(&pending.tx_outcomes),
@@ -543,7 +540,6 @@ mod tests {
             sent_at,
             attempt: Attempt::INITIAL,
             block_hash: BlockHash::ZERO,
-            block_height: BlockHeight::new(1),
             vote_anchor_ts: ms(0),
             global_receipt_root: GlobalReceiptRoot::ZERO,
             tx_outcomes: Arc::new(vec![]),

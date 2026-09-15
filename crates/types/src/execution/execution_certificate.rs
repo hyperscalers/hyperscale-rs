@@ -776,7 +776,7 @@ mod tests {
     use hyperscale_hbor::from_slice as hbor_from_slice;
 
     use super::*;
-    use crate::{BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Role, TxHash};
+    use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, Role, TxHash};
 
     fn outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -802,8 +802,6 @@ mod tests {
     ) -> Verified<ExecutionVote> {
         Verified::<ExecutionVote>::sign_local(
             net,
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            BlockHeight::new(7),
             WeightedTimestamp::from_millis(11),
             tick_id(),
             ShardId::leaf(1, 0),

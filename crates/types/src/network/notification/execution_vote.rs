@@ -54,14 +54,12 @@ impl NetworkMessage for ExecutionVoteNotification {
 mod tests {
     use super::*;
     use crate::{
-        BlockHash, BlockHeight, ConsensusSignature, GlobalReceiptRoot, Hash, ShardId, TickId,
-        ValidatorId, WeightedTimestamp,
+        BlockHeight, ConsensusSignature, GlobalReceiptRoot, ShardId, TickId, ValidatorId,
+        WeightedTimestamp,
     };
 
     fn vote() -> ExecutionVote {
         ExecutionVote::new(
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            BlockHeight::new(10),
             WeightedTimestamp::from_millis(1_000),
             TickId::new(ShardId::ROOT, BlockHeight::new(3)),
             ShardId::ROOT,

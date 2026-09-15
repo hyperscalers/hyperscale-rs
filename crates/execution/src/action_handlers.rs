@@ -346,7 +346,6 @@ where
         // ── Sign + broadcast actions ──────────────────────────────────────
         Action::SignAndSendExecutionVote {
             block_hash,
-            block_height,
             vote_anchor_ts,
             tick_id,
             global_receipt_root: _,
@@ -359,8 +358,6 @@ where
 
             let Ok(verified) = Verified::<ExecutionVote>::sign_local(
                 network,
-                block_hash,
-                block_height,
                 vote_anchor_ts,
                 tick_id,
                 local_shard,

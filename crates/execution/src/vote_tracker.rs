@@ -298,8 +298,6 @@ mod tests {
 
     fn make_vote(validator: u64, global_receipt_root: GlobalReceiptRoot) -> ExecutionVote {
         ExecutionVote::new(
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            BlockHeight::new(10),
             WeightedTimestamp::from_millis(11),
             TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             ShardId::ROOT,

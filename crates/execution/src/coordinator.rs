@@ -186,8 +186,6 @@ impl PendingTick {
 pub struct CompletionData {
     /// Block this tick belongs to; pairs with `tick_id` to identify the vote target.
     pub(crate) block_hash: BlockHash,
-    /// Height of the tick-starting block.
-    pub(crate) block_height: BlockHeight,
     /// BFT-authenticated weighted timestamp at which this tick's outcome is
     /// fixed. Included in the vote payload and the EC canonical hash, so all
     /// validators aggregate under the same identifier.
@@ -1648,7 +1646,6 @@ impl ExecutionCoordinator {
                 .get_tick_mut(&tick_id)
                 .expect("tick_id was just produced by ticks_iter() in this method");
             let block_hash = tick.block_hash();
-            let block_height = tick.block_height();
             let Some((vote_anchor_ts, global_receipt_root, tx_outcomes)) = tick.build_vote_data()
             else {
                 continue;
@@ -1656,7 +1653,6 @@ impl ExecutionCoordinator {
 
             completions.push(CompletionData {
                 block_hash,
-                block_height,
                 vote_anchor_ts,
                 tick_id,
                 global_receipt_root,
@@ -1807,7 +1803,6 @@ impl ExecutionCoordinator {
                         sent_at: self.committed_ts,
                         attempt: Attempt::INITIAL,
                         block_hash: completion.block_hash,
-                        block_height: completion.block_height,
                         vote_anchor_ts: completion.vote_anchor_ts,
                         global_receipt_root: completion.global_receipt_root,
                         tx_outcomes: Arc::clone(&tx_outcomes),
@@ -1816,7 +1811,6 @@ impl ExecutionCoordinator {
             }
             actions.push(Action::SignAndSendExecutionVote {
                 block_hash: completion.block_hash,
-                block_height: completion.block_height,
                 vote_anchor_ts: completion.vote_anchor_ts,
                 tick_id: completion.tick_id,
                 global_receipt_root: completion.global_receipt_root,
@@ -2728,7 +2722,6 @@ impl ExecutionCoordinator {
             tick_id,
             attempt,
             block_hash,
-            block_height,
             vote_anchor_ts,
             global_receipt_root,
             tx_outcomes,
@@ -2757,7 +2750,6 @@ impl ExecutionCoordinator {
             );
             actions.push(Action::SignAndSendExecutionVote {
                 block_hash,
-                block_height,
                 vote_anchor_ts,
                 tick_id,
                 global_receipt_root,
@@ -4714,8 +4706,6 @@ mod tests {
             ValidatorId::new(0),
             vec![Arc::new(tx.clone())],
         );
-        let block_hash = block.hash();
-
         let mut state = make_test_state();
         state.on_block_committed(&topo, &certify(block));
 
@@ -4744,8 +4734,6 @@ mod tests {
 
         // Simulate receiving a vote (as if we're a fallback leader).
         let fake_vote = ExecutionVote::new(
-            block_hash,
-            BlockHeight::new(1),
             WeightedTimestamp::ZERO,
             tick_id,
             ShardId::ROOT,
@@ -4782,8 +4770,6 @@ mod tests {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
         let tick_id = TickId::new(ShardId::leaf(1, 0), BlockHeight::new(1));
         let vote = ExecutionVote::new(
-            BlockHash::ZERO,
-            BlockHeight::new(1),
             WeightedTimestamp::ZERO,
             tick_id,
             ShardId::leaf(1, 0),
@@ -4826,7 +4812,6 @@ mod tests {
                 sent_at: WeightedTimestamp::from_millis(10_000),
                 attempt: Attempt::INITIAL,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
-                block_height: BlockHeight::new(1),
                 vote_anchor_ts: WeightedTimestamp::ZERO,
                 global_receipt_root: GlobalReceiptRoot::ZERO,
                 tx_outcomes: Arc::new(vec![]),
@@ -4881,7 +4866,6 @@ mod tests {
                 sent_at: WeightedTimestamp::from_millis(5_000),
                 attempt: Attempt::INITIAL,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
-                block_height: BlockHeight::new(1),
                 vote_anchor_ts: WeightedTimestamp::ZERO,
                 global_receipt_root: GlobalReceiptRoot::ZERO,
                 tx_outcomes: Arc::new(vec![]),
@@ -6175,7 +6159,6 @@ mod tests {
             ValidatorId::new(4),
             vec![Arc::new(test_transaction(1))],
         );
-        let block_hash = block.hash();
         coord.on_block_committed(&schedule, &test_certify(block, ED));
         let tick_id = coord
             .ticks
@@ -6189,8 +6172,6 @@ mod tests {
         let mut actions = Vec::new();
         for v in [4u64, 5, 6] {
             let vote = ExecutionVote::new(
-                block_hash,
-                BlockHeight::new(1),
                 WeightedTimestamp::from_millis(ED),
                 tick_id,
                 shard,

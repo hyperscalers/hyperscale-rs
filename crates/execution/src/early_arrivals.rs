@@ -331,7 +331,7 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeight, ConsensusSignature, ExecutionOutcome,
+        AggregateSignature, BlockHeight, ConsensusSignature, ExecutionOutcome,
         ExecutionVoteMessage, GlobalReceiptHash, GlobalReceiptRoot, Hash, NetworkDefinition,
         RETENTION_HORIZON, ShardId, Signer, SignerBitfield, TxHash, TxOutcome, ValidatorId,
         signed_bytes,
@@ -397,8 +397,6 @@ mod tests {
         let kp = BlsSigner::from_seed(&[7u8; 32]);
         let signature = kp.sign(&msg).expect("sign");
         ExecutionVote::new(
-            BlockHash::ZERO,
-            BlockHeight::new(1),
             anchor_ts,
             tick_id,
             shard(),
@@ -416,8 +414,6 @@ mod tests {
     /// it takes distinct voters.
     fn cheap_vote(tick_id: TickId, voter: u64) -> Verifiable<ExecutionVote> {
         ExecutionVote::new(
-            BlockHash::ZERO,
-            BlockHeight::new(1),
             WeightedTimestamp::ZERO,
             tick_id,
             shard(),

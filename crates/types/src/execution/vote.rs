@@ -11,9 +11,9 @@ use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, ConsensusPublicKey, ConsensusSignature, ExecutionVoteMessage,
-    GlobalReceiptRoot, MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, TickId, TxOutcome,
-    ValidatorId, Verified, Verify, WeightedTimestamp, compute_global_receipt_root, signed_bytes,
+    ConsensusPublicKey, ConsensusSignature, ExecutionVoteMessage, GlobalReceiptRoot,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, TickId, TxOutcome, ValidatorId, Verified,
+    Verify, WeightedTimestamp, compute_global_receipt_root, signed_bytes,
 };
 
 /// A validator's vote on all transactions in an execution tick.
@@ -26,8 +26,6 @@ use crate::{
 /// [`tx_outcome_leaf`]: crate::tx_outcome_leaf
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ExecutionVote {
-    block_hash: BlockHash,
-    block_height: BlockHeight,
     vote_anchor_ts: WeightedTimestamp,
     tick_id: TickId,
     shard_id: ShardId,
@@ -45,11 +43,9 @@ impl ExecutionVote {
     /// # Panics
     ///
     /// Panics if `tx_outcomes.len() > MAX_TXS_PER_BLOCK`.
-    #[allow(clippy::too_many_arguments)] // mirrors the 10 stored fields
+    #[allow(clippy::too_many_arguments)] // mirrors the 8 stored fields
     #[must_use]
     pub const fn new(
-        block_hash: BlockHash,
-        block_height: BlockHeight,
         vote_anchor_ts: WeightedTimestamp,
         tick_id: TickId,
         shard_id: ShardId,
@@ -60,8 +56,6 @@ impl ExecutionVote {
         signature: ConsensusSignature,
     ) -> Self {
         Self {
-            block_hash,
-            block_height,
             vote_anchor_ts,
             tick_id,
             shard_id,
@@ -71,18 +65,6 @@ impl ExecutionVote {
             validator,
             signature,
         }
-    }
-
-    /// Block this tick belongs to.
-    #[must_use]
-    pub const fn block_hash(&self) -> BlockHash {
-        self.block_hash
-    }
-
-    /// Block height (the block containing the tick's transactions).
-    #[must_use]
-    pub const fn block_height(&self) -> BlockHeight {
-        self.block_height
     }
 
     /// BFT-authenticated anchor at which this vote was cast.
@@ -145,13 +127,11 @@ impl ExecutionVote {
     }
 
     /// Decompose into the raw fields, in struct-declaration order.
-    #[allow(clippy::type_complexity)] // mirrors the 10 stored fields
+    #[allow(clippy::type_complexity)] // mirrors the 8 stored fields
     #[must_use]
     pub fn into_parts(
         self,
     ) -> (
-        BlockHash,
-        BlockHeight,
         WeightedTimestamp,
         TickId,
         ShardId,
@@ -162,8 +142,6 @@ impl ExecutionVote {
         ConsensusSignature,
     ) {
         (
-            self.block_hash,
-            self.block_height,
             self.vote_anchor_ts,
             self.tick_id,
             self.shard_id,
@@ -283,8 +261,6 @@ impl Verified<ExecutionVote> {
     #[allow(clippy::too_many_arguments)] // matches the ExecutionVote field set
     pub fn sign_local(
         network: &NetworkDefinition,
-        block_hash: BlockHash,
-        block_height: BlockHeight,
         vote_anchor_ts: WeightedTimestamp,
         tick_id: TickId,
         shard_id: ShardId,
@@ -311,8 +287,6 @@ impl Verified<ExecutionVote> {
         // `ExecutionVoteMessage`, which is exactly the verify
         // predicate's check against this voter's matching pubkey.
         Ok(Self::new_unchecked(ExecutionVote::new(
-            block_hash,
-            block_height,
             vote_anchor_ts,
             tick_id,
             shard_id,
@@ -400,7 +374,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ExecutionOutcome, GlobalReceiptHash, Hash, TxHash};
+    use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash, TxHash};
 
     fn sample_outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -414,8 +388,6 @@ mod tests {
     fn sample_vote() -> ExecutionVote {
         let outcomes = vec![sample_outcome(1), sample_outcome(2)];
         ExecutionVote::new(
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            BlockHeight::new(7),
             WeightedTimestamp::from_millis(11),
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(7)),
             ShardId::leaf(1, 0),
@@ -441,8 +413,6 @@ mod tests {
         validator: u64,
         signer: &BlsSigner,
     ) -> ExecutionVote {
-        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"block"));
-        let block_height = BlockHeight::new(7);
         let vote_anchor_ts = WeightedTimestamp::from_millis(11);
         let tick_id = TickId::new(ShardId::leaf(1, 0), BlockHeight::new(7));
         let shard_id = ShardId::leaf(1, 0);
@@ -460,8 +430,6 @@ mod tests {
         );
         let signature = signer.sign(&message).expect("sign");
         ExecutionVote::new(
-            block_hash,
-            block_height,
             vote_anchor_ts,
             tick_id,
             shard_id,
@@ -500,23 +468,11 @@ mod tests {
 
         // Swap in a wrong root while leaving the (honestly-signed)
         // signature intact: the predicate's first half must catch it.
-        let (
-            block_hash,
-            block_height,
-            vote_anchor_ts,
-            tick_id,
-            shard_id,
-            _root,
-            tx_count,
-            tx_outcomes,
-            validator,
-            signature,
-        ) = honest.into_parts();
+        let (vote_anchor_ts, tick_id, shard_id, _root, tx_count, tx_outcomes, validator, signature) =
+            honest.into_parts();
         let bogus_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"bogus"));
         assert_ne!(bogus_root, compute_global_receipt_root(&tx_outcomes));
         let tampered = ExecutionVote::new(
-            block_hash,
-            block_height,
             vote_anchor_ts,
             tick_id,
             shard_id,
@@ -611,21 +567,9 @@ mod tests {
         let signer = BlsSigner::generate();
         let vote = sign_sample_vote(&net, vec![sample_outcome(11)], 0, &signer);
 
-        let (
-            block_hash,
-            block_height,
-            vote_anchor_ts,
-            tick_id,
-            shard_id,
-            _root,
-            tx_count,
-            tx_outcomes,
-            validator,
-            signature,
-        ) = vote.into_parts();
+        let (vote_anchor_ts, tick_id, shard_id, _root, tx_count, tx_outcomes, validator, signature) =
+            vote.into_parts();
         let tampered = ExecutionVote::new(
-            block_hash,
-            block_height,
             vote_anchor_ts,
             tick_id,
             shard_id,
@@ -662,8 +606,6 @@ mod tests {
 
         let verified = Verified::<ExecutionVote>::sign_local(
             &net,
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            BlockHeight::new(7),
             WeightedTimestamp::from_millis(11),
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(7)),
             ShardId::leaf(1, 0),
@@ -690,8 +632,6 @@ mod tests {
         let vote = sample_vote();
         let mut buf = Vec::new();
         for part in [
-            hbor_to_vec(&vote.block_hash).unwrap(),
-            hbor_to_vec(&vote.block_height).unwrap(),
             hbor_to_vec(&vote.vote_anchor_ts).unwrap(),
             hbor_to_vec(&vote.tick_id).unwrap(),
             hbor_to_vec(&vote.shard_id).unwrap(),

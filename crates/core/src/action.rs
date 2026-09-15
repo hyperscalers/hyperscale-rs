@@ -332,8 +332,6 @@ pub enum Action {
     SignAndSendExecutionVote {
         /// Block whose tick is being voted on.
         block_hash: BlockHash,
-        /// Block height (for correlation).
-        block_height: BlockHeight,
         /// Consensus timestamp at which this vote is being cast.
         vote_anchor_ts: WeightedTimestamp,
         /// Tick identifier whose execution is being attested to.

@@ -972,8 +972,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AggregateSignature, BlockHash, BlockHeight, ExecutionVote, Hash, ShardId, SignerBitfield,
-        ValidatorId, WeightedTimestamp, compute_global_receipt_root,
+        AggregateSignature, BlockHeight, ExecutionVote, Hash, ShardId, SignerBitfield, ValidatorId,
+        WeightedTimestamp, compute_global_receipt_root,
     };
 
     /// The half is part of what a finalization is, so it is part of its
@@ -1042,8 +1042,6 @@ mod tests {
             .map(|(i, sk)| {
                 Verified::<ExecutionVote>::sign_local(
                     net,
-                    BlockHash::from_raw(Hash::from_bytes(b"block")),
-                    tick_id.block_height(),
                     WeightedTimestamp::from_millis(tick_id.block_height().inner() + 1),
                     *tick_id,
                     tick_id.shard_id(),
