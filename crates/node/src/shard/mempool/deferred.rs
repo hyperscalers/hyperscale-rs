@@ -18,7 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use hyperscale_engine::Executor;
-use hyperscale_types::{Address, MAX_TXS_PER_BLOCK, Transaction, TxHash, Unresolved};
+use hyperscale_types::{Address, Hash, MAX_TXS_PER_BLOCK, Transaction, TxHash, Unresolved};
 
 /// How many envelopes one shard holds back at once.
 ///
@@ -74,6 +74,28 @@ impl DeferredTransaction {
     }
 }
 
+/// The names no held envelope waits on any more, in the forms a fetch
+/// asks for.
+///
+/// An id nothing wants is one whose answer nobody will admit, and the
+/// custodian may have none to give — so the ask has to be retired, or it
+/// is re-dispatched every tick for the process's life.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Orphaned {
+    /// Component addresses no held envelope awaits.
+    pub instances: Vec<Address>,
+    /// Content addresses no held envelope awaits.
+    pub packages: Vec<Hash>,
+}
+
+impl Orphaned {
+    /// Whether nothing was orphaned.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.instances.is_empty() && self.packages.is_empty()
+    }
+}
+
 /// Envelopes waiting on records, indexed by the records they wait on.
 ///
 /// The index names only envelopes the queue is still holding, so the
@@ -83,7 +105,7 @@ impl DeferredTransaction {
 /// would never be reached by an arrival, and the index would grow with
 /// what was asked for rather than with what is waiting.
 pub struct DeferredForRecords {
-    held: HashMap<TxHash, (Arc<Transaction>, DeferredOrigin)>,
+    held: HashMap<TxHash, DeferredTransaction>,
     /// Which envelopes each awaited record would release.
     waiting: HashMap<Address, Vec<TxHash>>,
     order: VecDeque<TxHash>,
@@ -105,34 +127,68 @@ impl DeferredForRecords {
     /// Hold `deferred` until its records land, evicting the oldest
     /// entries the bound leaves no room for and returning their hashes
     /// so the caller can release their pipeline bookkeeping.
-    pub fn defer(&mut self, deferred: DeferredTransaction) -> Vec<TxHash> {
+    pub fn defer(&mut self, deferred: DeferredTransaction) -> (Vec<TxHash>, Orphaned) {
         let hash = deferred.tx.hash();
-        if self
-            .held
-            .insert(hash, (deferred.tx, deferred.origin))
-            .is_none()
-        {
-            self.order.push_back(hash);
-        }
-        for awaited in deferred.awaited {
+        for awaited in deferred.awaited.clone() {
             let queue = self.waiting.entry(awaited).or_default();
             if !queue.contains(&hash) {
                 queue.push(hash);
             }
         }
+        if self.held.insert(hash, deferred).is_none() {
+            self.order.push_back(hash);
+        }
         let mut evicted = Vec::new();
+        let mut dropped = Vec::new();
         while self.order.len() > self.capacity {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            if self.held.remove(&oldest).is_some() {
+            if let Some(gone) = self.held.remove(&oldest) {
                 evicted.push(oldest);
+                dropped.push(gone);
             }
         }
-        if !evicted.is_empty() {
-            self.forget_dropped();
+        if evicted.is_empty() {
+            return (evicted, Orphaned::default());
         }
-        evicted
+        self.forget_dropped();
+        let orphaned = self.orphaned_among(&dropped);
+        (evicted, orphaned)
+    }
+
+    /// Of the names `dropped` was waiting on, the ones no envelope still
+    /// held waits on.
+    ///
+    /// Scanned rather than indexed: the queue is bounded by its own
+    /// capacity and this runs only where an envelope leaves, so the cost
+    /// is small and there is no second index to drift out of step with
+    /// the first.
+    fn orphaned_among(&self, dropped: &[DeferredTransaction]) -> Orphaned {
+        let mut orphaned = Orphaned::default();
+        for gone in dropped {
+            for instance in &gone.wanted.instances {
+                if !orphaned.instances.contains(instance)
+                    && !self
+                        .held
+                        .values()
+                        .any(|held| held.wanted.instances.contains(instance))
+                {
+                    orphaned.instances.push(*instance);
+                }
+            }
+            for package in &gone.wanted.packages {
+                if !orphaned.packages.contains(package)
+                    && !self
+                        .held
+                        .values()
+                        .any(|held| held.wanted.packages.contains(package))
+                {
+                    orphaned.packages.push(*package);
+                }
+            }
+        }
+        orphaned
     }
 
     /// Drop from the order and the index every envelope the queue has
@@ -163,8 +219,8 @@ impl DeferredForRecords {
                 continue;
             };
             for hash in hashes {
-                if let Some(tx) = self.held.remove(&hash) {
-                    released.push(tx);
+                if let Some(held) = self.held.remove(&hash) {
+                    released.push((held.tx, held.origin));
                 }
             }
         }
@@ -178,20 +234,25 @@ impl DeferredForRecords {
     /// The window is signed content, so this reads it without deriving
     /// anything. Nothing will include a transaction past it, and the
     /// record it waits on may never arrive at all.
-    pub fn sweep_expired(&mut self, now_ms: u64) -> Vec<TxHash> {
+    pub fn sweep_expired(&mut self, now_ms: u64) -> (Vec<TxHash>, Orphaned) {
         let expired: Vec<TxHash> = self
             .held
             .iter()
-            .filter(|(_, (tx, _))| tx.body().validity_end_ms <= now_ms)
+            .filter(|(_, held)| held.tx.body().validity_end_ms <= now_ms)
             .map(|(hash, _)| *hash)
             .collect();
+        let mut dropped = Vec::new();
         for hash in &expired {
-            self.held.remove(hash);
+            if let Some(gone) = self.held.remove(hash) {
+                dropped.push(gone);
+            }
         }
-        if !expired.is_empty() {
-            self.forget_dropped();
+        if expired.is_empty() {
+            return (expired, Orphaned::default());
         }
-        expired
+        self.forget_dropped();
+        let orphaned = self.orphaned_among(&dropped);
+        (expired, orphaned)
     }
 
     /// Whether nothing is waiting.
@@ -311,14 +372,52 @@ mod tests {
         let first = envelope(1, u64::MAX);
         wait.defer(deferred(Arc::clone(&first), vec![instance(0xA1)]));
         wait.defer(deferred(envelope(2, u64::MAX), vec![instance(0xA1)]));
-        let evicted = wait.defer(deferred(envelope(3, u64::MAX), vec![instance(0xA1)]));
+        let (evicted, orphaned) = wait.defer(deferred(envelope(3, u64::MAX), vec![instance(0xA1)]));
 
         assert_eq!(evicted, vec![first.hash()]);
+        assert!(
+            orphaned.is_empty(),
+            "two envelopes still wait on the evicted one's record",
+        );
         assert_eq!(wait.held.len(), 2);
         assert_eq!(
             wait.release(&[instance(0xA1)]).len(),
             2,
             "an evicted hash left behind in the index releases nothing"
+        );
+    }
+
+    /// The last envelope waiting on a name takes the name with it: the
+    /// ask has to be retired, or nothing ever will.
+    #[test]
+    fn the_last_envelope_waiting_on_a_record_orphans_it() {
+        let mut wait = DeferredForRecords::new();
+        let expiring = envelope(1, 5_000);
+        wait.defer(deferred(Arc::clone(&expiring), vec![instance(0xA1)]));
+
+        let (expired, orphaned) = wait.sweep_expired(10_000);
+        assert_eq!(expired, vec![expiring.hash()]);
+        assert_eq!(orphaned.instances, vec![instance(0xA1)]);
+        assert!(orphaned.packages.is_empty());
+    }
+
+    /// A name another envelope still waits on is not orphaned, so one
+    /// owner cannot retire an ask a sibling is still owed.
+    #[test]
+    fn a_record_another_envelope_waits_on_is_not_orphaned() {
+        let mut wait = DeferredForRecords::new();
+        let expiring = envelope(1, 5_000);
+        wait.defer(deferred(
+            Arc::clone(&expiring),
+            vec![instance(0xA1), instance(0xB2)],
+        ));
+        wait.defer(deferred(envelope(2, 50_000), vec![instance(0xB2)]));
+
+        let (_, orphaned) = wait.sweep_expired(10_000);
+        assert_eq!(
+            orphaned.instances,
+            vec![instance(0xA1)],
+            "only the name the surviving envelope does not await",
         );
     }
 
@@ -330,7 +429,12 @@ mod tests {
         wait.defer(deferred(Arc::clone(&expiring), vec![instance(0xA1)]));
         wait.defer(deferred(Arc::clone(&lasting), vec![instance(0xA1)]));
 
-        assert_eq!(wait.sweep_expired(10_000), vec![expiring.hash()]);
+        let (expired, orphaned) = wait.sweep_expired(10_000);
+        assert_eq!(expired, vec![expiring.hash()]);
+        assert!(
+            orphaned.is_empty(),
+            "the lasting envelope still waits on it"
+        );
         let released = wait.release(&[instance(0xA1)]);
         assert_eq!(released.len(), 1);
         assert_eq!(released[0].0.hash(), lasting.hash());

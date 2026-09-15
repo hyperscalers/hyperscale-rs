@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use deferred::{DeferredForRecords, DeferredOrigin, DeferredTransaction};
+pub use deferred::{DeferredForRecords, DeferredOrigin, DeferredTransaction, Orphaned};
 pub use fetch::{TransactionBinding, TransactionFetch};
 use hyperscale_types::{ShardId, Transaction, TxHash};
 pub use serve::serve_transaction_request;

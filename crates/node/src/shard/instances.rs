@@ -30,7 +30,8 @@ use hyperscale_types::{Address, Hash, LocalTimestamp, MessageClass, ShardId, TxH
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
-use crate::shard::mempool::{DeferredOrigin, DeferredTransaction};
+use crate::shard::mempool::{DeferredOrigin, DeferredTransaction, Orphaned};
+use crate::shard::packages::PackageArtifactBinding;
 use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
 
 /// Per-component record fetch, keyed by the address the record derives.
@@ -183,7 +184,9 @@ where
                 .mempool
                 .pending_validation
                 .insert(deferred.tx.hash());
-            evicted.extend(self.io.mempool.deferred_records.defer(deferred));
+            let (dropped, orphaned) = self.io.mempool.deferred_records.defer(deferred);
+            evicted.extend(dropped);
+            self.retire_orphaned(orphaned);
         }
         // An evicted envelope leaves the pipeline entirely: nothing will
         // offer it again unless it is gossiped or fetched afresh, and
@@ -265,11 +268,36 @@ where
         if self.io.mempool.deferred_records.is_empty() {
             return;
         }
-        let expired = self
+        let (expired, orphaned) = self
             .io
             .mempool
             .deferred_records
             .sweep_expired(now.as_millis());
+        self.retire_orphaned(orphaned);
         self.handle_transaction_validations_failed(&expired);
+    }
+
+    /// Retire the asks nothing waits on any more.
+    ///
+    /// An envelope that leaves the queue takes its reasons with it, and
+    /// an id no envelope names is one whose answer nobody would admit.
+    /// The custodian may have none to give — an envelope naming a
+    /// component that does not exist is one anyone can gossip — so
+    /// without this the ask is re-dispatched every fetch tick for the
+    /// life of the process.
+    fn retire_orphaned(&mut self, orphaned: Orphaned) {
+        if orphaned.is_empty() {
+            return;
+        }
+        if !orphaned.instances.is_empty() {
+            self.drive_fetch::<InstanceRecordBinding>(FetchInput::Abandoned {
+                ids: orphaned.instances,
+            });
+        }
+        if !orphaned.packages.is_empty() {
+            self.drive_fetch::<PackageArtifactBinding>(FetchInput::Abandoned {
+                ids: orphaned.packages,
+            });
+        }
     }
 }
