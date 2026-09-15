@@ -19,7 +19,7 @@ use hyperscale_storage::CommittedProvisions;
 use hyperscale_types::{
     BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CompletedRecovery, ForkFence,
     LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardId,
-    TopologySchedule, Verified,
+    TopologySchedule, Verified, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -982,6 +982,13 @@ impl ProvisionCoordinator {
     #[must_use]
     pub fn get_provisions_by_hash(&self, hash: ProvisionHash) -> Option<Arc<Verified<Provisions>>> {
         self.pipeline.get_provisions_by_hash(hash)
+    }
+
+    /// Resume the commit clock every deadline here is read against at
+    /// the tip the store recovered. See
+    /// [`ExpectedProvisionTracker::seed_committed`].
+    pub const fn seed_committed(&mut self, ts: WeightedTimestamp) {
+        self.expected.seed_committed(ts);
     }
 
     /// Shared provision store — same `Arc` the io-loop request handler
@@ -2083,6 +2090,79 @@ mod tests {
             )
         };
         CertifiedBlock::new_unchecked(block, qc)
+    }
+
+    /// A restart resumes a chain whose clock is already far past the
+    /// retention horizon. Provisions gossip that lands before the first
+    /// post-restart commit parks in the pending buffer, stamped with
+    /// whatever the coordinator reads as "now" — and the first commit
+    /// sweeps that buffer against the chain's real clock.
+    #[test]
+    fn a_bundle_parked_before_the_first_commit_after_a_restart_survives_it() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+        let resumed_at = BlockHeight::new(100_000);
+        coordinator.seed_committed(WeightedTimestamp::from_millis(
+            resumed_at.inner() * TEST_BLOCK_INTERVAL_MS,
+        ));
+
+        // No paired header yet, so the bundle parks.
+        let provisions = make_provisions(
+            TxHash::from(Hash::from_bytes(b"parked")),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(99_999),
+        );
+        coordinator.on_state_provisions_received(&sched(), provisions);
+        assert_eq!(coordinator.pipeline.pending_len(), 1, "the bundle parks");
+
+        // The first commit after the restart, one block on.
+        let actions = coordinator.on_block_committed(&sched(), &make_block(resumed_at.next()));
+        assert_eq!(
+            coordinator.pipeline.pending_len(),
+            1,
+            "a bundle parked a block ago is not past its deadline"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::AbandonFetch(FetchIds::LocalProvisions(_)))),
+            "and nothing releases the fetch that is still wanted"
+        );
+    }
+
+    /// The receipt gate drops a bundle whose source block has aged past
+    /// the retention horizon. A restarted coordinator reads the same
+    /// clock its peers do, so it drops the same bundles.
+    #[test]
+    fn a_bundle_past_its_deadline_is_refused_at_receipt_after_a_restart() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+        coordinator.seed_committed(WeightedTimestamp::from_millis(
+            100_000 * TEST_BLOCK_INTERVAL_MS,
+        ));
+
+        // The fixture header's QC carries `WeightedTimestamp::ZERO`, so
+        // the bundle's deadline is one retention horizon past zero —
+        // decades below the clock the restart resumed at.
+        let tx_hash = TxHash::from(Hash::from_bytes(b"stale"));
+        let header = make_certified_header_committing(
+            ShardId::leaf(2, 1),
+            BlockHeight::new(10),
+            ShardId::leaf(2, 0),
+            &[tx_hash],
+        );
+        deliver_committed_header(&mut coordinator, &header);
+
+        let provisions = make_provisions(
+            tx_hash,
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let actions = coordinator.on_state_provisions_received(&sched(), provisions);
+        assert!(
+            actions.is_empty(),
+            "a bundle past its retention horizon dispatches no verification work"
+        );
     }
 
     #[test]

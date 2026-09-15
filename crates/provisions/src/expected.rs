@@ -106,6 +106,18 @@ impl ExpectedProvisionTracker {
         self.local_committed_ts
     }
 
+    /// Resume the clock at the tip the store recovered, before any block
+    /// commits through this process.
+    ///
+    /// Every gate below reads this as "now", so an unseeded zero leaves
+    /// each of them vacuous for as long as a resumed chain takes to
+    /// commit its next block — admitting what peers refuse — and stamps
+    /// whatever arrives in that window with a deadline the next commit
+    /// reads as long past.
+    pub(crate) const fn seed_committed(&mut self, ts: WeightedTimestamp) {
+        self.local_committed_ts = ts;
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.expected.len()
     }

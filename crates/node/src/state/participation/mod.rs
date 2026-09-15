@@ -175,25 +175,32 @@ impl ShardParticipation {
             Arc::clone(shard_coordinator.mirror()),
         );
         let committed_provisions = Arc::clone(shard_coordinator.committed_provisions());
+        // The shard's committed-provision window, shared rather than
+        // mirrored — as the proven anchors, proven cells and mirror above
+        // are. Both coordinators ask whether the chain already carries a
+        // batch; two copies are two answers, and the provisions-side copy
+        // was process-lifetime, so a restart re-verified every
+        // already-committed batch that re-arrived for a whole retention
+        // horizon.
+        let mut provisions_coordinator = ProvisionCoordinator::with_config_and_store(
+            local_shard,
+            provision_config,
+            Arc::clone(&provision_store),
+            committed_provisions,
+        );
+        // Every deadline gate in that crate compares against this clock,
+        // and only a commit moves it: unseeded it sits at zero, which
+        // leaves each of them vacuous until the resumed chain commits its
+        // next block and stamps what arrives meanwhile with a deadline
+        // that same commit reads as long past.
+        provisions_coordinator.seed_committed(recovered.block_anchor_wt());
         Self {
             local_shard,
             derivation,
             shard_coordinator,
             execution_coordinator,
             mempool_coordinator,
-            // The shard's committed-provision window, shared rather than
-            // mirrored — as the proven anchors, proven cells and mirror
-            // above are. Both coordinators ask whether the chain already
-            // carries a batch; two copies are two answers, and the
-            // provisions-side copy was process-lifetime, so a restart
-            // re-verified every already-committed batch that re-arrived
-            // for a whole retention horizon.
-            provisions_coordinator: ProvisionCoordinator::with_config_and_store(
-                local_shard,
-                provision_config,
-                Arc::clone(&provision_store),
-                committed_provisions,
-            ),
+            provisions_coordinator,
             outbound_provisions: OutboundProvisionTracker::new(provision_store),
             remote_headers_coordinator: RemoteHeaderCoordinator::new(local_shard),
             now: LocalTimestamp::ZERO,
