@@ -3,7 +3,7 @@
 mod common;
 
 use common::{ByzantineBehaviour, ShardCoordinatorSim};
-use hyperscale_types::{BlockHeight, Round, VIEW_CHANGE_TIMEOUT, ValidatorId};
+use hyperscale_types::{BlockHeight, Round, VIEW_CHANGE_TIMEOUT, ValidatorId, WeightedTimestamp};
 
 const MAX_STEPS: usize = 5_000;
 
@@ -279,6 +279,71 @@ fn assert_no_fork(sim: &ShardCoordinatorSim, target: usize) {
                 "replica {r} diverged on state root at height {:?}",
                 reference.height,
             );
+        }
+    }
+}
+
+/// A genesis-SHAPED parent QC cannot carry a forged anchor onto the live vote
+/// path at the tip.
+///
+/// `QuorumCertificate::is_genesis()` keys on a zero block hash and an empty
+/// signer set alone — never on height, round or weighted timestamp — so a
+/// proposer can mint one at any height and put any anchor on it. Every gate
+/// the vote path writes as `if !parent_qc.is_genesis()` is then skipped: the
+/// anchor floor, the quorum pre-check, the parent-QC height match and the
+/// parent-hash link. The anchor is what the transaction-validity window and
+/// the aggregation floor key on, and the far-past direction is bounded by
+/// nothing — `qc_weighted_timestamp_too_far_ahead` bounds only the other side.
+///
+/// What closes it is one height gate that is not written as a genesis check:
+/// `validation::validate_header` admits a genesis QC only at
+/// `committed_height.next()`. Under the two-chain commit rule the tip runs
+/// above the committed frontier, so a tip proposal carrying a genesis-shaped
+/// QC fails that gate before any of the skipped checks would have mattered.
+/// The forged proposal is declined, the round times out, and the chain rotates
+/// past it.
+///
+/// Swept across seeds: one seed is one sample, and the gate is a height
+/// relation whose slack varies with how far commit lags the tip.
+#[test]
+fn forged_genesis_parent_qc_is_not_voted_on() {
+    const TARGET: usize = 25;
+    const FORGE_AT: u64 = 20;
+
+    for seed in [0xE9_2A, 0xE9_2B, 0xE9_2C, 0xE9_2D, 0xE9_2E, 0xE9_2F] {
+        let mut sim = ShardCoordinatorSim::new(4, seed);
+        let leader = ValidatorId::new(1);
+        sim.with_byzantine(
+            leader,
+            ByzantineBehaviour::ForgeGenesisParentQc {
+                anchor: WeightedTimestamp::from_millis(1),
+                min_height: BlockHeight::new(FORGE_AT),
+            },
+        );
+        sim.kick_off();
+        let all: Vec<usize> = (0..sim.n()).collect();
+        sim.run_until_committed_paced(&all, TARGET, 400);
+
+        assert_eq!(
+            sim.byzantine_fires[1], 1,
+            "seed {seed:#x}: the forging proposer must have fired exactly once",
+        );
+
+        // A genesis-shaped parent QC is legitimate only on the chain's first
+        // real block, one height above the origin. Anything higher got there
+        // by way of the gates the shape check bypasses.
+        for (idx, commits) in sim.commits.iter().enumerate() {
+            for commit in commits {
+                let header = commit.certified.block().header();
+                assert!(
+                    !header.parent_qc().is_genesis() || header.height() <= BlockHeight::new(1),
+                    "seed {seed:#x}: idx {idx} committed block {:?} at height \
+                     {} with a genesis-shaped parent QC at height {}",
+                    commit.block_hash,
+                    header.height().inner(),
+                    header.parent_qc().height().inner(),
+                );
+            }
         }
     }
 }

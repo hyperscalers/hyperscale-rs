@@ -37,18 +37,18 @@ use hyperscale_storage::{
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
-    BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
-    BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote, CertificateRoot,
-    CertifiedBlock, CheckOutcome, ConsensusPublicKey, ConsensusReceipt, Epoch, Finalization, Hash,
-    HborSigned, LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round,
-    ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload, Signer, StateRoot,
-    StateRootContext, StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext,
-    TxHash, TxRootVerifyError, TxsInFlight, ValidatorId, Verifiable, VerificationKind, Verified,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign,
-    signed_bytes,
+    AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
+    Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
+    CertificateRoot, CertifiedBlock, CheckOutcome, ConsensusPublicKey, ConsensusReceipt, Epoch,
+    Finalization, Hash, HborSigned, LocalReceiptRoot, LocalTimestamp, NetworkDefinition,
+    ProposerTimestamp, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal,
+    RootMismatch, Round, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload, Signer,
+    SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt,
+    SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight, ValidatorId,
+    Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof, WeightedTimestamp,
+    local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -189,6 +189,21 @@ pub enum ByzantineBehaviour {
     /// high QC — a proposer that ignores the freshest certificate and
     /// tries to orphan its predecessor's certified block. One-shot.
     ExtendStaleParent,
+    /// On the next proposal turn, replace the parent QC with a
+    /// genesis-SHAPED one — zero block hash, empty signers — at the real
+    /// parent's height and round, carrying `anchor` as its weighted
+    /// timestamp. `is_genesis()` keys on the hash and signer set alone, so
+    /// every gate written as `if !parent_qc.is_genesis()` is skipped: the
+    /// anchor floor, the quorum pre-check, the parent-height match and the
+    /// parent-hash link. One-shot.
+    ForgeGenesisParentQc {
+        /// The anchor the forged QC carries, in place of the parent's own.
+        anchor: WeightedTimestamp,
+        /// Stays armed until the flagged replica leads a slot at or above
+        /// this height, so the forgery lands at the tip rather than where a
+        /// genesis QC would be legitimate anyway (the first block of a chain).
+        min_height: BlockHeight,
+    },
 }
 
 /// Wire-shape events translated from emitted [`Action`]s by
@@ -1466,6 +1481,29 @@ impl ShardCoordinatorSim {
                         height,
                     )
                 };
+                // A genesis-shaped parent QC skips every gate keyed on
+                // `!is_genesis()`, including the anchor floor, so the forged
+                // anchor reaches the validity window unchallenged.
+                let parent_qc =
+                    if let Some(ByzantineBehaviour::ForgeGenesisParentQc { anchor, min_height }) =
+                        self.byzantine[emitter_idx]
+                        && height >= min_height
+                    {
+                        self.byzantine[emitter_idx] = None;
+                        self.byzantine_fires[emitter_idx] += 1;
+                        QuorumCertificate::new(
+                            BlockHash::ZERO,
+                            parent_qc.shard_id(),
+                            parent_qc.height(),
+                            BlockHash::ZERO,
+                            parent_qc.round(),
+                            SignerBitfield::empty(),
+                            AggregateSignature::ZERO,
+                            anchor,
+                        )
+                    } else {
+                        parent_qc
+                    };
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
                 let terminal_roots = carry_terminal_roots.then(|| {
