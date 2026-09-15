@@ -14,11 +14,6 @@ pub struct ShardConsensusConfig {
     /// the missing transactions directly from the proposer or a peer.
     pub transaction_fetch_timeout: Duration,
 
-    /// Timeout before fetching missing certificates from peers.
-    /// If a pending block is still missing certificates after this duration,
-    /// request them directly from the proposer or a peer.
-    pub certificate_fetch_timeout: Duration,
-
     /// Interval between cleanup timer fires.
     /// The cleanup timer performs periodic housekeeping tasks:
     /// - Checks sync health and triggers catch-up sync if needed
@@ -34,7 +29,6 @@ impl Default for ShardConsensusConfig {
     fn default() -> Self {
         Self {
             transaction_fetch_timeout: Duration::from_millis(150),
-            certificate_fetch_timeout: Duration::from_millis(500),
             cleanup_interval: Duration::from_secs(1),
             max_parallel_sync_verifications: 16,
         }

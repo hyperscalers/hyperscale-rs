@@ -921,14 +921,6 @@ impl RemoteHeaderCoordinator {
         self.verified.contains_key(&(shard, height))
     }
 
-    /// Whether the held header at `(shard, height)` is commit-proven: its
-    /// committing structure — a round-contiguous certified child, or a
-    /// parent-hash link under a proven descendant — is also held.
-    #[must_use]
-    pub fn has_commit_proof(&self, shard: ShardId, height: BlockHeight) -> bool {
-        self.proven.contains(&(shard, height))
-    }
-
     /// The highest contiguously-verified height for `shard` — the sync
     /// frontier. The remote-header-sync FSM advances its watermark to this,
     /// not to a header's own height, so an out-of-band admission above the
@@ -1703,6 +1695,21 @@ impl RemoteHeaderCoordinator {
             topology_schedule.lookup_for_shard(shard, wt).0,
             ScheduleLookup::Committee(snapshot) if !snapshot.committee_for_shard(shard).is_empty()
         )
+    }
+}
+
+#[cfg(test)]
+impl RemoteHeaderCoordinator {
+    /// Whether the held header at `(shard, height)` is commit-proven: its
+    /// committing structure — a round-contiguous certified child, or a
+    /// parent-hash link under a proven descendant — is also held.
+    ///
+    /// An observation seam, not a query anyone makes: what a consumer
+    /// waits on is the `RemoteHeaderCommitted` continuation the promotion
+    /// drives, and nothing in the tree asks this. Public, it reads as
+    /// something execution consults.
+    fn has_commit_proof(&self, shard: ShardId, height: BlockHeight) -> bool {
+        self.proven.contains(&(shard, height))
     }
 }
 
