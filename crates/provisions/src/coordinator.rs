@@ -720,7 +720,11 @@ impl ProvisionCoordinator {
             count = provisions.transactions().len(),
             "Buffering verified provisions as raw (waiting for remote header)"
         );
-        self.pipeline.buffer_pending(
+        // A refusal at the ceiling needs no cancellation: an in-flight
+        // fetch for this bundle is still wanted, and a bundle nobody
+        // fetched is re-acquired by the expectation the commit-proven
+        // header registers.
+        let _buffered = self.pipeline.buffer_pending(
             key,
             Arc::unwrap_or_clone(provisions).into_inner(),
             self.expected.local_ts(),
@@ -834,7 +838,12 @@ impl ProvisionCoordinator {
             count = provisions.transactions().len(),
             "Buffering provisions (waiting for remote header)"
         );
-        self.pipeline
+        // A refusal at the ceiling needs no cancellation: an in-flight
+        // fetch for this bundle is still wanted, and a bundle nobody
+        // fetched is re-acquired by the expectation the commit-proven
+        // header registers.
+        let _buffered = self
+            .pipeline
             .buffer_pending(key, provisions, self.expected.local_ts());
         vec![]
     }
