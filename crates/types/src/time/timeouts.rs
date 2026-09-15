@@ -94,13 +94,10 @@ const _: () = assert!(
     "an artifact lives its signed window plus the retention horizon",
 );
 
-/// A committed cell's floor is `Window::Core`, which opens at the
-/// deadline and runs two [`MAX_VALIDITY_RANGE`]s on — one for the
-/// refusal that retracts the cell, one for a leg to read the absence it
-/// leaves — and the cell is swept exactly where that window closes.
-/// Shorter and an absence inside the window would be a swept cell read
-/// as a shard that never committed, which licenses taking back a
-/// crossing the core may have taken.
+/// A committed cell's floor is the close of `Window::Core`, which is
+/// where the argument for the span it runs is. The VM spells the figure
+/// and this chain spells the window; they are the same instant or an
+/// absence read inside the window is a swept cell.
 const _: () = assert!(
     (MAX_FINALIZATION_DELAY.as_secs() + MAX_VALIDITY_RANGE.as_secs() * 2) * 1_000
         == COMMITTED_GRACE_MS,

@@ -162,7 +162,9 @@ pub struct RecoveredState {
     /// with their committed bytes.
     ///
     /// Value this shard owes an answer for, read from the leaves that
-    /// hold it and from nothing else. Nothing else can name them: the
+    /// hold it and from nothing else — every start's first term, which
+    /// the commits after it add to and take from. Nothing else can name
+    /// them: the
     /// entry that would is a fold over a chain a successor never
     /// replays and a restart replays only a window of, and the cell is
     /// outside every sweep's reach. The state is the authority, and it
