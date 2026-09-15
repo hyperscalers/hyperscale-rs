@@ -2685,11 +2685,6 @@ impl BeaconCoordinator {
         self.topology_schedule.head()
     }
 
-    /// The per-epoch committee schedule — the verification interface handed to
-    /// shard and execution coordinators. They resolve an artifact's committee
-    /// from its weighted timestamp ([`TopologySchedule::at`]) and the routing
-    /// head ([`TopologySchedule::head`]) through it, so no consensus-layer type
-    /// crosses into their verification paths.
     /// Retire the source tracking of every shard whose handoff evidence
     /// window has closed, returning the in-flight chunk fetches dropped
     /// with it.
@@ -2727,6 +2722,11 @@ impl BeaconCoordinator {
         })
     }
 
+    /// The per-epoch committee schedule — the verification interface handed to
+    /// shard and execution coordinators. They resolve an artifact's committee
+    /// from its weighted timestamp ([`TopologySchedule::at`]) and the routing
+    /// head ([`TopologySchedule::head`]) through it, so no consensus-layer type
+    /// crosses into their verification paths.
     #[must_use]
     pub const fn topology_schedule(&self) -> &TopologySchedule {
         &self.topology_schedule
