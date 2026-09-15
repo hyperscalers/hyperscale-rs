@@ -7,10 +7,12 @@
 //! in by once that lands. Holding is bounded per reason and shard,
 //! oldest dropped: a node this far behind re-fetches through ordinary
 //! sync regardless, and the expected-certificate tracker re-fetches a
-//! certificate on timeout. A finalization built here and held on its
-//! settlement is the exception: it is content-addressed, held once,
-//! and never dropped on a clock — a deadline verdict could contradict a
-//! settlement the partner already committed.
+//! certificate on timeout.
+//!
+//! A finalization built here and held on its settlement is the
+//! locally-produced class of [`hyperscale_types::verifiable`]: content-
+//! addressed, held once, and never dropped on a clock — a deadline
+//! verdict could contradict a settlement the partner already committed.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;

@@ -29,17 +29,22 @@
 //!
 //! ## Retention
 //!
+//! The two halves are bounded differently, and the asymmetry is the rule
+//! rather than an oversight: a vote here is committee-gated at ingress and
+//! not signature-verified until a tracker exists, where a certificate is
+//! quorum-signed — see the holding classes in
+//! [`hyperscale_types::verifiable`].
+//!
 //! - [`EARLY_VOTE_RETENTION`]: how long to hold votes whose block has never
 //!   committed locally. Cleanup at commit time drops older entries since
 //!   failure to commit past this window signals shard consensus is broken.
-//! - [`MAX_BUFFERED_EARLY_VOTES`]: a hard ceiling on total buffered votes.
-//!   Early votes are committee-gated at ingress but not signature-verified until a
-//!   vote tracker exists, so without a size bound a Byzantine committee
-//!   member could flood votes for fabricated `TickId`s up to the time-based
-//!   sweep. Past the ceiling new early votes are dropped; the voter's own
-//!   vote-retry retransmits once the block commits, so a drop costs at most
-//!   one retry interval of latency.
-//! - Buffered ECs evict at the EC's own
+//! - [`MAX_BUFFERED_EARLY_VOTES`]: the count cap a single-signer class
+//!   takes. Without it a Byzantine committee member floods votes for
+//!   fabricated `TickId`s up to the time-based sweep. Past the ceiling new
+//!   early votes are dropped; the voter's own vote-retry retransmits once
+//!   the block commits, so a drop costs at most one retry interval of
+//!   latency.
+//! - Buffered ECs take no count cap and evict at the EC's own
 //!   [`ExecutionCertificate::deadline`] — `vote_anchor_ts +
 //!   RETENTION_HORIZON`. Past that point every tx the EC could mention
 //!   has expired its `validity_range` and either terminated or aborted,

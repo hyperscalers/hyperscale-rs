@@ -322,6 +322,13 @@ pub struct VerificationPipeline {
     /// it is retried when the beacon advances (`on_beacon_block_persisted`).
     /// Without this a block dropped during a transient beacon lag would stay
     /// `NOT_STARTED` forever and wedge the shard on a view-change loop.
+    ///
+    /// Holds no artifact — only the key that re-drives work held
+    /// elsewhere, which is the class of
+    /// [`hyperscale_types::verifiable`] that never evicts: there is
+    /// nothing to re-acquire, and dropping the key destroys the only edge
+    /// that restarts the verification. Bounded at all, it would have to
+    /// refuse a new key rather than drop an old one.
     beacon_witness_awaiting_committee: HashSet<BlockHash>,
 
     // === Drain total verification ===

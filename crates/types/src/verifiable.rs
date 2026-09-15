@@ -26,6 +26,48 @@
 //! Both are generic and unambiguous: `T` and `Verified<T>` are distinct
 //! types, so the impls don't overlap.
 //!
+//! # Holding one until its prerequisite lands
+//!
+//! Several coordinators hold an artifact that arrived before the thing it
+//! needs — a block that has not committed, a beacon epoch, a source
+//! shard's commit proof, a departed partner's settled set. What bounds
+//! such a holder is not a matter of local taste: it follows from what
+//! authenticated the artifact at ingress, which is the distinction this
+//! module carries. Four classes, and every holder in the tree is one of
+//! them:
+//!
+//! **One signer vouched for it and nothing else has been checked.** An
+//! envelope cleared a committee-membership gate; the content, and each
+//! item's own signature, have not been looked at — so a single Byzantine
+//! member can mint them for free. A holder of these takes a hard COUNT
+//! CAP, dropping the newest past it, because the cap is the only
+//! admission gate there is. What a drop costs is bounded by the sender's
+//! own retransmit.
+//!
+//! **A quorum signed it.** A certificate, a QC, a `Verified<T>` whose
+//! predicate is a quorum. NO count cap: forging one costs a corrupt
+//! committee that can already do worse, and a cap would let a flood of
+//! cheap forgeries evict the genuine article. The only bound is the
+//! BFT-attested deadline the artifact carries, which every replica reads
+//! identically.
+//!
+//! **This node produced it.** Its own verdict, held content-addressed.
+//! NEVER evicted on a clock: a deadline that drops it can contradict a
+//! settlement a partner already committed on the strength of it.
+//!
+//! **Nothing is held at all** — only a key that re-drives work held
+//! elsewhere. NEVER evicted, because there is no artifact to re-acquire:
+//! dropping the key destroys the only edge that restarts the work. Where
+//! such a holder is bounded it must REFUSE a new key rather than drop an
+//! old one.
+//!
+//! The release relation is the holder's own and is not part of this: some
+//! release when any one prerequisite lands and re-defer on what is still
+//! missing, some when all of them have, some hold a single prerequisite.
+//! That is why this is a rule about bounds rather than a shared
+//! container: a container carries the map and not the wake edge, so every
+//! holder writes its own anyway.
+//!
 //! # Local-dispatch trust assumption
 //!
 //! The marker is preserved across the in-process local-dispatch fast path

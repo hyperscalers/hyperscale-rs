@@ -32,7 +32,9 @@ use crate::store::ProvisionStore;
 
 type Key = (ShardId, BlockHeight);
 
-/// Hard ceiling on provision entries buffered across every pending key.
+/// Hard ceiling on provision entries buffered across every pending key —
+/// the count cap a single-signer holding class takes (see
+/// [`hyperscale_types::verifiable`]).
 ///
 /// A pending bundle is committee-gated at ingress but its merkle proof is
 /// not checked until the paired header arrives, and the source block height
