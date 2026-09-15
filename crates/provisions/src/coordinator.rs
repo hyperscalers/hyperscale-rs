@@ -456,6 +456,27 @@ impl ProvisionCoordinator {
             .then(|| Action::AbandonFetch(FetchIds::LocalProvisions(sweep.evicted_pending)))
     }
 
+    /// Release every fetch a bundle this coordinator is dropping was
+    /// wanted by.
+    ///
+    /// A drop has to satisfy the asker. Admission releases two bindings —
+    /// the local one keyed by content hash and the remote one keyed by
+    /// `(source, target, height)` — so a path that drops the bundle
+    /// instead has to release both, or the ids outlive every reason for
+    /// them: `Fetch::handle_request` keeps an unanswered id pending for
+    /// the process's life, and the matching remote header is pinned with
+    /// it until the orphan cleanup a full retention horizon later.
+    fn retire_fetches_for(provisions: &Provisions) -> Vec<Action> {
+        vec![
+            Action::AbandonFetch(FetchIds::LocalProvisions(vec![provisions.hash()])),
+            Action::AbandonFetch(FetchIds::RemoteProvisions(vec![(
+                provisions.source_shard(),
+                provisions.target_shard(),
+                provisions.block_height(),
+            )])),
+        ]
+    }
+
     /// Immediately emit an `Action::Fetch` of remote provisions for all outstanding expected
     /// provisions, bypassing the normal liveness timeout.
     ///
@@ -601,9 +622,7 @@ impl ProvisionCoordinator {
                         height = height.inner(),
                         "Dropping drained provisions: already committed"
                     );
-                    actions.push(Action::AbandonFetch(FetchIds::LocalProvisions(vec![
-                        provisions_hash,
-                    ])));
+                    actions.extend(Self::retire_fetches_for(&provisions));
                     continue;
                 }
                 if provisions.deadline(source_block_ts) <= local_ts {
@@ -612,9 +631,7 @@ impl ProvisionCoordinator {
                         height = height.inner(),
                         "Dropping drained provisions past deadline"
                     );
-                    actions.push(Action::AbandonFetch(FetchIds::LocalProvisions(vec![
-                        provisions_hash,
-                    ])));
+                    actions.extend(Self::retire_fetches_for(&provisions));
                     continue;
                 }
                 actions.extend(build_verify_action(
@@ -685,11 +702,11 @@ impl ProvisionCoordinator {
         }
 
         if self.committed_tombstones.contains(&provisions.hash()) {
-            return vec![];
+            return Self::retire_fetches_for(&provisions);
         }
 
         if self.pipeline.has_verified(&provisions.hash()) {
-            return vec![];
+            return Self::retire_fetches_for(&provisions);
         }
 
         let key = (source_shard, block_height);
@@ -798,7 +815,7 @@ impl ProvisionCoordinator {
         // — the shard commit window runs to `local_committed_ts +
         // RETENTION_HORIZON`, which is strictly later.
         if self.committed_tombstones.contains(&provisions.hash()) {
-            return vec![];
+            return Self::retire_fetches_for(&provisions);
         }
 
         let key = (source_shard, block_height);
@@ -809,7 +826,7 @@ impl ProvisionCoordinator {
         // hash so a different proposal round at the same
         // `(shard, height)` is treated as a fresh batch, not a dup.
         if self.pipeline.has_verified(&provisions.hash()) {
-            return vec![];
+            return Self::retire_fetches_for(&provisions);
         }
 
         // Look for matching verified remote header (pre-verified by RemoteHeaderCoordinator).
@@ -910,6 +927,7 @@ impl ProvisionCoordinator {
                 provisions_hash = ?provisions_hash,
                 "Dropping post-commit verify result — batch already committed"
             );
+            actions.extend(Self::retire_fetches_for(&verified));
             return actions;
         }
 
@@ -1612,6 +1630,26 @@ mod tests {
         assert!(actions.is_empty());
     }
 
+    /// Every path that drops a bundle must release both fetch bindings
+    /// admission would have released — the local one keyed by content
+    /// hash and the remote one keyed by `(source, target, height)`.
+    /// Asserting merely that a drop is silent is what let the leak stand:
+    /// an unanswered id stays pending for the life of the process.
+    fn assert_abandons_both(actions: &[Action]) {
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::AbandonFetch(FetchIds::LocalProvisions(_)))),
+            "the local-provisions fetch was not released: {actions:?}",
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::AbandonFetch(FetchIds::RemoteProvisions(_)))),
+            "the remote-provisions fetch was not released: {actions:?}",
+        );
+    }
+
     #[test]
     fn test_duplicate_provision_ignored_after_verification() {
         let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
@@ -1650,8 +1688,14 @@ mod tests {
             ShardId::leaf(2, 0),
             BlockHeight::new(10),
         );
+        // Short-circuited — no verification action, no buffering — but the
+        // drop still satisfies whoever asked for it.
         let actions = coordinator.on_state_provisions_received(&sched(), batch2);
-        assert!(actions.is_empty());
+        assert!(
+            actions.iter().all(|a| matches!(a, Action::AbandonFetch(_))),
+            "a dropped duplicate dispatches no work",
+        );
+        assert_abandons_both(&actions);
         assert_eq!(coordinator.pipeline.pending_len(), 0);
     }
 
@@ -2428,7 +2472,11 @@ mod tests {
         // The tombstone must drop it before it reaches the verify path
         // and re-enters the queue.
         let actions = coordinator.on_state_provisions_received(&sched(), provisions);
-        assert!(actions.is_empty(), "re-arrival should be dropped silently");
+        assert!(
+            actions.iter().all(|a| matches!(a, Action::AbandonFetch(_))),
+            "a tombstoned re-arrival dispatches no verification work",
+        );
+        assert_abandons_both(&actions);
         assert_eq!(
             coordinator.queue.queue_len(),
             0,
