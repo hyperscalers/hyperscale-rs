@@ -694,7 +694,10 @@ impl ShardCoordinator {
             deferred_qc: DeferredQc::new(),
             pending_blocks,
             recovered_blocks,
-            fee_ledger: FeeReservationLedger::new(),
+            // Seeded from the same descent the dedup index takes: an
+            // empty ledger under-counts held demand for every payer
+            // whose transactions committed before this process did.
+            fee_ledger: FeeReservationLedger::seeded(&recovered.dedup.fee_holds),
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
@@ -5094,11 +5097,10 @@ impl ShardCoordinator {
     ) {
         let trie = topology_schedule.head().shard_trie();
         let local_shard = self.local_shard;
-        self.fee_ledger
-            .register_committed(block.transactions(), |payer| {
-                trie.shard_for_prefix(payer) == local_shard
-            });
+        self.fee_ledger.register_committed(block.transactions());
         self.fee_ledger.release_finalized(block.certificates());
+        self.fee_ledger
+            .retain_payers(|payer| trie.shard_for_prefix(payer) == local_shard);
         self.fee_ledger.prune(commit_ts);
     }
 
