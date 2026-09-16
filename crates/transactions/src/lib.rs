@@ -370,7 +370,7 @@ mod tests {
     use hyperscale_types::test_utils::{test_principal, test_validity_range};
     use hyperscale_types::{Ed25519PrivateKey, MAX_ENVELOPE_BYTES};
     use hyperscale_vm_effects::{
-        Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Value, admit_tree, package_hash,
+        ClaimRef, Constraint, EdgeRef, GraphArg, GraphNode, Value, admit_tree, package_hash,
     };
 
     use super::*;
@@ -399,18 +399,18 @@ mod tests {
                             GraphArg::Literal(Value::Address(PROTOCOL_RESOURCE.address())),
                             GraphArg::Literal(Value::U128(100)),
                         ],
-                        evidence: [EvidenceRef::Account(from)].into(),
+                        evidence: [ClaimRef::Account(from)].into(),
                     },
                     GraphNode {
                         target: to.into(),
                         method: "deposit".into(),
-                        args: vec![GraphArg::Edge {
-                            edge: EdgeRef {
+                        args: vec![GraphArg::edge(
+                            EdgeRef {
                                 producer: 0,
                                 output: 0,
                             },
-                            constraints: vec![Constraint::ResourceIs(*PROTOCOL_RESOURCE)],
-                        }],
+                            vec![Constraint::ResourceIs(*PROTOCOL_RESOURCE)]
+                        )],
                         evidence: BTreeSet::new(),
                     },
                 ],
