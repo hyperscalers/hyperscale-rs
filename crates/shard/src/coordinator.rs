@@ -1566,12 +1566,40 @@ impl ShardCoordinator {
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         match self.block_sync.ingest(certified, self.committed_height) {
-            IngestOutcome::Drop => vec![],
+            // A delivery the applied-dedup discards still answers the
+            // target it was fetched for, and it is the only signal that
+            // will: nothing further applies, so the drain never runs and
+            // its completion check never fires.
+            IngestOutcome::Drop => self.complete_sync_if_frontier_reached(topology_schedule),
             IngestOutcome::Submit(certified) => {
                 self.submit_synced_block_for_verification(topology_schedule, *certified)
             }
             IngestOutcome::Buffered => self.try_drain_buffered_synced_blocks(topology_schedule),
         }
+    }
+
+    /// Resume consensus once the applied frontier reaches the sync target.
+    ///
+    /// Completion tracks the applied frontier rather than the committed
+    /// height, which lags it by a block: under the round-contiguous commit
+    /// rule the trailing synced block finalizes through live consensus.
+    ///
+    /// Evaluated wherever the frontier can meet the target, which includes
+    /// the arrival that dedups away. A target at or below the frontier is
+    /// met the moment it is set — every delivery for it is a duplicate —
+    /// and a sync that cannot report that latches `is_syncing`, which pins
+    /// the target below the heights that would carry the commit forward.
+    fn complete_sync_if_frontier_reached(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+    ) -> Vec<Action> {
+        if self.block_sync.is_syncing()
+            && let Some(target) = self.block_sync.sync_target_height()
+            && self.block_sync.sync_applied_height() >= target
+        {
+            return self.on_block_sync_complete(topology_schedule);
+        }
+        vec![]
     }
 
     /// Handle sync complete (from runner via `Event::SyncComplete`).
@@ -5697,17 +5725,7 @@ impl ShardCoordinator {
             actions.extend(self.apply_synced_block(topology_schedule, block, verified_qc));
         }
         actions.extend(self.try_drain_buffered_synced_blocks(topology_schedule));
-
-        // Sync completes when the verified frontier reaches the target. Under
-        // the round-contiguous commit rule the trailing block finalizes
-        // through live consensus, so completion tracks the processed frontier
-        // rather than the committed height, which lags it by a block.
-        if self.block_sync.is_syncing()
-            && let Some(target) = self.block_sync.sync_target_height()
-            && self.block_sync.sync_applied_height() >= target
-        {
-            actions.extend(self.on_block_sync_complete(topology_schedule));
-        }
+        actions.extend(self.complete_sync_if_frontier_reached(topology_schedule));
         actions
     }
 
@@ -10561,6 +10579,55 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::VerifyBeaconWitnessRoot { .. })),
             "epoch adoption must replay the parked beacon-witness verification; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn sync_completes_on_a_delivery_the_applied_dedup_discards() {
+        // A target at a height already applied is met the moment it is
+        // set: the block is in chain state, so every delivery for it
+        // dedups away, nothing reaches the drain, and the drain's
+        // completion check never runs. The arrival itself has to answer
+        // the target — otherwise `is_syncing` latches, and while it is
+        // set `start_block_sync` refuses to raise the target, pinning it
+        // below the heights whose QCs would carry the commit forward.
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+
+        // Height 4 admitted to chain state, its commit waiting on a
+        // round-contiguous child that live consensus has yet to certify.
+        let block = block_with_parent_qc_ts(BlockHeight::new(4), 100);
+        let block_hash = block.hash();
+        state
+            .block_sync
+            .mark_applied(BlockHeight::new(4), block_hash);
+
+        state.set_block_syncing(true);
+        state.block_sync.set_sync_target(BlockHeight::new(4));
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let qc = QuorumCertificate::new(
+            block_hash,
+            ShardId::ROOT,
+            BlockHeight::new(4),
+            block.header().parent_block_hash(),
+            block.header().round(),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100),
+        );
+        let _ = state.on_sync_block_ready_to_apply(
+            &topology_schedule,
+            CertifiedBlock::new_unchecked(block, qc),
+        );
+
+        assert!(
+            !state.is_block_syncing(),
+            "a target the applied frontier already covers must resume consensus"
         );
     }
 
