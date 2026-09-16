@@ -1224,9 +1224,9 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        Binding, Claim, Constraint, EdgeRef, EvidenceRef, Give, GiveRef, GraphArg, GraphNode,
-        Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash, ManifestGraph, Member,
-        MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket, StoredRule, ValueSource,
+        Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg, GraphNode, Hash32,
+        Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash, ManifestGraph, Member,
+        MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket, StoredRule, ValueRef,
         child_key, never, nullifier_expiry_ms, nullifier_key, package_slot,
     };
     use hyperscale_vm_manifest_builder::signing::wrap_publish;
@@ -1280,7 +1280,7 @@ mod tests {
                 GraphArg::Literal(Value::Address(resource.address())),
                 GraphArg::Literal(Value::U128(amount)),
             ],
-            evidence: [EvidenceRef::Account(account)].into(),
+            evidence: [ClaimRef::Account(account)].into(),
         }
     }
 
@@ -1292,13 +1292,13 @@ mod tests {
         GraphNode {
             target: target.into(),
             method: "deposit".into(),
-            args: vec![GraphArg::Edge {
-                edge: EdgeRef {
+            args: vec![GraphArg::edge(
+                EdgeRef {
                     producer,
                     output: 0,
                 },
-                constraints: vec![Constraint::ResourceIs(resource)],
-            }],
+                vec![Constraint::ResourceIs(resource)],
+            )],
             evidence: BTreeSet::new(),
         }
     }
@@ -1307,7 +1307,7 @@ mod tests {
         GraphNode {
             target: target.into(),
             method: "deposit".into(),
-            args: vec![GraphArg::Socket(socket)],
+            args: vec![GraphArg::socket(socket)],
             evidence: BTreeSet::new(),
         }
     }
@@ -1342,10 +1342,10 @@ mod tests {
                     GraphNode {
                         target: composer_addr().into(),
                         method: "deposit".into(),
-                        args: vec![GraphArg::Give {
-                            give: GiveRef { member: 0, give: 0 },
-                            constraints: vec![Constraint::MinAmount(10)],
-                        }],
+                        args: vec![GraphArg::give(
+                            GiveRef { member: 0, give: 0 },
+                            vec![Constraint::MinAmount(10)],
+                        )],
                         evidence: BTreeSet::new(),
                     },
                 ],
@@ -1356,7 +1356,7 @@ mod tests {
                 resource: RES_X,
                 constraints: vec![Constraint::MinAmount(100)],
             }],
-            gives: vec![Give::Edge(EdgeRef {
+            gives: vec![ValueRef::Edge(EdgeRef {
                 producer: 0,
                 output: 0,
             })],
@@ -1373,7 +1373,7 @@ mod tests {
         };
         root.members = vec![Member {
             signed: SignedIntent::unsigned(bob),
-            wiring: vec![Binding::Value(ValueSource::Edge(EdgeRef {
+            wiring: vec![Binding::Value(ValueRef::Edge(EdgeRef {
                 producer: 0,
                 output: 0,
             }))],
@@ -2171,7 +2171,7 @@ mod tests {
     /// rule a withdrawal is.
     #[test]
     fn a_leaf_write_presenting_nothing_is_refused() {
-        let node = |evidence: BTreeSet<EvidenceRef>| GraphNode {
+        let node = |evidence: BTreeSet<ClaimRef>| GraphNode {
             target: composer_addr().into(),
             method: "securify".into(),
             args: vec![
@@ -2206,7 +2206,7 @@ mod tests {
                 .derive(&envelope(
                     &intent_tree(
                         composer_addr(),
-                        vec![node([EvidenceRef::Account(composer_addr())].into())],
+                        vec![node([ClaimRef::Account(composer_addr())].into())],
                     ),
                     &[],
                 ))
