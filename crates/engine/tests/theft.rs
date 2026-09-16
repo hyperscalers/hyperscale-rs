@@ -20,9 +20,9 @@ use hyperscale_engine::{
 use hyperscale_storage::Substates;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId,
-    PriceTable, PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateWrites,
-    SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp,
+    ConsensusReceipt, Ed25519PrivateKey, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable,
+    PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey,
+    TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
@@ -173,8 +173,6 @@ fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u
 fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
     let executor = Executor::new(ExecutionMode::Serial);
     let theft = signed_transfer(VICTIM, thief(), 5_000);
-
-    assert!(theft.body().signature_is_valid());
     theft
         .try_derived(executor.derivation().as_ref())
         .expect_err("the gate names the victim and the signature names the thief");

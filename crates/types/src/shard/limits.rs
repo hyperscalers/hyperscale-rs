@@ -12,7 +12,7 @@
 use hyperscale_jmt::MAX_PROOF_CLAIMS;
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
-    MAX_GAS_LIMIT, MAX_INTENTS, MAX_KEY_BYTES, MAX_SIG_BYTES, VERIFY_WEIGHT,
+    MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS, VERIFY_WEIGHT,
 };
 
 use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
@@ -511,14 +511,14 @@ pub const TX_CAPS: DeclaredWork = DeclaredWork {
         + MAX_EVENT_BYTES_PER_TX as u64,
 };
 
-/// The most verifying one envelope's signatures can cost: one per
-/// intent at the slowest registered scheme.
-const MAX_TX_SIGNATURE_COMPUTE: u64 = MAX_INTENTS as u64 * 3 * VERIFY_WEIGHT;
+/// The most verifying one envelope's attestations can cost: every one
+/// the transaction may carry, at the slowest registered scheme.
+const MAX_TX_SIGNATURE_COMPUTE: u64 = MAX_TX_ATTESTATIONS as u64 * 3 * VERIFY_WEIGHT;
 
-/// The auth material those same signatures carry, which retention holds
-/// beside the envelope that carries them.
+/// The auth material those same attestations carry, which retention
+/// holds beside the envelope that carries them.
 const MAX_TX_SIGNATURE_BYTES: u64 =
-    MAX_INTENTS as u64 * (MAX_KEY_BYTES as u64 + MAX_SIG_BYTES as u64);
+    MAX_TX_ATTESTATIONS as u64 * (MAX_KEY_BYTES as u64 + MAX_SIG_BYTES as u64);
 
 /// Whether a transaction declaring `work` is one a block may carry at
 /// all, whatever else it carries.

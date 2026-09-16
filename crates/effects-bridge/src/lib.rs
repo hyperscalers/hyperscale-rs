@@ -22,9 +22,9 @@ pub use records::{LocalCells, NodeRecords};
 pub use staking::{PoolRegistry, witness_from_event};
 pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metadata};
 pub use vm_statics::{
-    BridgeStatics, CallEnvelope, DeclaredVector, PROTOCOL_RESOURCE, account_address,
-    attesting_sets, declared_vector, decode_tree, draw_key, encode_tree, envelope_bytes,
-    envelope_identity, validator_key, vault_key,
+    BridgeStatics, CallEnvelope, DeclaredVector, PROTOCOL_RESOURCE, account_address, attestations,
+    declared_vector, decode_tree, draw_key, encode_tree, envelope_bytes, envelope_identity,
+    validator_key, vault_key,
 };
 
 #[cfg(test)]

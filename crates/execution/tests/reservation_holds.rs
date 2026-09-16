@@ -26,7 +26,7 @@ use hyperscale_types::{
     SubstateKey, Terms, TimestampRange, Transaction, TransactionEnvelope, TxHash, Verified,
     WeightedTimestamp,
 };
-use hyperscale_vm_types::Moves;
+use hyperscale_vm_types::{Moves, attestation_work};
 
 /// The two amount cells every fixture transaction declares a reservation
 /// on. Real derivation folds duplicate reservations per cell before the
@@ -84,7 +84,7 @@ impl Derivation for ReservingStatics {
             footprint: 4,
             ..DeclaredWork::ZERO
         }
-        .saturating_add(vm.signatures());
+        .saturating_add(attestation_work(&vm.signatures));
         Ok(Derived {
             accounts: Vec::new(),
             // This stub derives no tree; the root's window stands.
@@ -99,8 +99,8 @@ impl Derivation for ReservingStatics {
                 provision_prefixes: Vec::new(),
                 declared_modes,
             },
-            signer: stub.terms.fee_payer,
-            subintent_hashes: Vec::new(),
+            attested_by: vec![stub.terms.fee_payer],
+            attestations: Vec::new(),
             fee_vault_local: [0xEE; 16],
             auth_cell_local: [0xAE; 16],
             work,
@@ -128,13 +128,14 @@ fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
             message: Vec::new(),
         },
         network: NetworkId(242),
+        members: 0,
         validity: TimestampRange::new(
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(u64::MAX),
         ),
         body: vec![seed],
     }
-    .envelope(Vec::new());
+    .envelope();
     let tx = Transaction::new(vm);
     tx.try_derived(&ReservingStatics)
         .expect("the fixture declaration is fixed");

@@ -12,10 +12,10 @@
 use std::sync::OnceLock;
 
 pub use hyperscale_vm_types::{
-    AccountSigner, MAX_INTENTS, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier,
-    SubintentSig, Terms, TransactionEnvelope,
+    AccountSigner, Attestation, MAX_ATTESTATIONS, MAX_INTENTS, MAX_MESSAGE_LEN,
+    MAX_TX_ATTESTATIONS, Mode, SchemeId, SchemeVerifier, Terms, TransactionEnvelope,
 };
-use hyperscale_vm_types::{DeclaredWork, LegShape, NetworkId, SubstateKey};
+use hyperscale_vm_types::{DeclaredWork, LegShape, NetworkId, SubstateKey, attest};
 use thiserror::Error;
 
 use crate::crypto::{
@@ -89,19 +89,16 @@ impl SchemeVerifier for ProtocolVerifier {
 /// hash, signature, and time vocabulary.
 pub trait EnvelopeExt: Sized {
     /// The domain-separated hash of the envelope's signed content —
-    /// everything but the composer's signature. This is also the
-    /// identity fresh derivations root at: distinct signed envelopes
-    /// never mint the same fresh key.
+    /// everything but the attestations. This is also the identity fresh
+    /// derivations root at: distinct signed envelopes never mint the
+    /// same fresh key.
     fn signing_hash(&self) -> Hash;
 
-    /// Sign the envelope's content with the composer's key, filling the
-    /// scheme, signer, and signature fields.
+    /// Attest the envelope's content with `key`, standing the attestation
+    /// beside those already given. The caller signs in the order the
+    /// root intent declares its attesting principals.
     #[must_use]
     fn sign<S: AccountSigner>(self, key: &S) -> Self;
-
-    /// Whether the composer's signature covers the envelope content
-    /// under the signer's key, in the scheme the envelope names.
-    fn signature_is_valid(&self) -> bool;
 }
 
 impl EnvelopeExt for TransactionEnvelope {
@@ -117,29 +114,31 @@ impl EnvelopeExt for TransactionEnvelope {
     }
 
     fn sign<S: AccountSigner>(mut self, key: &S) -> Self {
-        // The scheme and the key are signed content, so both are stamped
-        // before the digest is taken; the signature is not, and is filled
-        // after. `manifest-builder`'s own signing tier does the same over
-        // its own hasher — this is the protocol hash's spelling of it,
-        // for the fixtures and call sites that already hold a key.
-        self.signer_scheme = key.scheme();
-        self.signer = key.public_key_bytes();
+        // `manifest-builder`'s own signing tier does the same over its
+        // own hasher — this is the protocol hash's spelling of it, for
+        // the fixtures and call sites that already hold a key.
         let digest = self
             .signing_digest(&ProtocolHasher)
             .expect("a fixture envelope stays within the wire caps");
-        self.signature = key.sign_digest(&digest);
+        self.signatures.push(attest(key, &digest));
         self
     }
+}
 
-    fn signature_is_valid(&self) -> bool {
-        let hash = self.signing_hash();
-        ProtocolVerifier.verify(
-            self.signer_scheme,
-            &self.signer,
-            &self.signature,
-            hash.as_bytes(),
-        )
-    }
+/// One attestation and the hash it covers, as derivation reads them off
+/// an envelope: the root's over the envelope's digest, a member's over
+/// its intent hash.
+///
+/// Derivation has already held each to the declaration it stands
+/// beside — the key derives the principal at its position, and every
+/// intent carries one attestation per principal it declares — so what
+/// is left for verification is the signature itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attested {
+    /// What the signature covers.
+    pub hash: [u8; 32],
+    /// The scheme, key and signature.
+    pub attestation: Attestation,
 }
 
 /// A transaction's derived routing identity.
@@ -231,10 +230,10 @@ impl Routing {
 
 /// Everything the bridge derives from an envelope.
 ///
-/// The routing identity, the terms and network read off the tree's
-/// root, and the intent hash each member's signature must cover, in
-/// tree order. Which account a key may act as is not checked here: that
-/// is the account's own rule, judged on its shard as the sign-in.
+/// The routing identity, the terms and the network, and every
+/// attestation the envelope and its tree carry with the hash each must
+/// cover. Which account a key may act as is not checked here: that is
+/// the account's own rule, judged on its shard as the sign-in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Derived {
     /// The routing identity.
@@ -249,18 +248,19 @@ pub struct Derived {
     /// The network the root names, which every intent beneath it names
     /// too. What verification holds a transaction to a session by.
     pub network: NetworkId,
-    /// The principal the envelope's own key derives — the key attesting
-    /// the composition's intent, and the one the payer's rule is judged
-    /// against at the fee gate.
+    /// The principals attesting the root intent, in declared order —
+    /// the set the payer's rule is judged against at the fee gate.
     ///
     /// Deliberately not compared against the envelope's `fee_payer`
-    /// here: whether the payer's rule admits this identity is the payer
+    /// here: whether the payer's rule admits this set is the payer
     /// shard's verdict, taken where the payer's state is, so derivation
-    /// records the identity and leaves the judgement to the one shard
-    /// that can reach it.
-    pub signer: PrincipalAddr,
-    /// One declaration hash per bound subintent, in tree order.
-    pub subintent_hashes: Vec<[u8; 32]>,
+    /// records the set and leaves the judgement to the one shard that
+    /// can reach it.
+    pub attested_by: Vec<PrincipalAddr>,
+    /// Every attestation the transaction carries with the hash it
+    /// covers: the root's over the envelope's digest, then each member's
+    /// over its intent hash, in tree order. What verification checks.
+    pub attestations: Vec<Attested>,
     /// The local half of the fee payer's native-resource vault cell —
     /// the substate the payer shard's reservation check reads and the
     /// fee settlement debits. The owner half is the envelope's
@@ -485,14 +485,15 @@ impl Unresolved {
 /// resolves nothing a node that has resolves fine — a real difference,
 /// and one a single shared installation would erase.
 pub trait Derivation: Send + Sync {
-    /// Derive the envelope's routing identity and subintent claims, or
+    /// Derive the envelope's routing identity and attestations, or
     /// refuse it.
     ///
     /// # Errors
     ///
     /// [`DerivationError`] on an undecodable or inadmissible envelope,
-    /// a subintent signature list that does not match the tree, or a
-    /// bound signer address the matching public key does not derive.
+    /// an intent carrying a different number of attestations than the
+    /// principals it declares, or an attesting key that does not derive
+    /// the principal declared at its position.
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError>;
 
     /// Offer one committed cell to the published-package cache.

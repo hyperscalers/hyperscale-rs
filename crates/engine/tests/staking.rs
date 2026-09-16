@@ -22,7 +22,7 @@ use hyperscale_engine::{
 use hyperscale_storage::Substates;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EnvelopeExt,
+    BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey,
     MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, ShardId,
     ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
     Verified, WeightedTimestamp, absorb_committed_cells,
@@ -215,7 +215,7 @@ fn signed_stake_composed(seat: &StakePoolSeat, amount: u128) -> Transaction {
         .none()
         .expect("the root declares no socket");
     let tree = env.build().expect("the intent declares no hole");
-    Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000)))
+    Transaction::new(client().sign_tree(&tree, &key, terms(1_000)))
 }
 
 fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
@@ -490,7 +490,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
         .none()
         .expect("the root declares no socket");
     let tree = env.build().expect("the intent declares no hole");
-    Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000)))
+    Transaction::new(client().sign_tree(&tree, &key, terms(1_000)))
 }
 
 /// A pool nobody seated brings itself up, and the cells it ends holding
@@ -681,7 +681,6 @@ fn only_the_badge_holder_may_register_a_validator() {
     // badge is what they do not hold, and the gate says so when the
     // call reaches it.
     let outsider = signed_registration(pool_at(POOL_ID), OUTSIDER);
-    assert!(outsider.body().signature_is_valid());
     assert!(
         outsider.try_derived(executor.derivation().as_ref()).is_ok(),
         "the shape is well-formed"

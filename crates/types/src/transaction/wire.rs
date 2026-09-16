@@ -488,16 +488,15 @@ impl Transaction {
         }
     }
 
-    /// The principal the envelope's key derives: the key attesting the
-    /// composition's intent, judged against the payer's rule at the fee
-    /// gate.
+    /// The principals attesting the root intent, judged against the
+    /// payer's rule at the fee gate.
     ///
     /// # Panics
     ///
     /// Panics under the same conditions as [`Self::routing`].
     #[must_use]
-    pub fn signer(&self) -> PrincipalAddr {
-        self.derived().signer
+    pub fn attested_by(&self) -> &[PrincipalAddr] {
+        &self.derived().attested_by
     }
 
     /// The fee payer's stored-authority cell — what the payer shard's
@@ -515,16 +514,15 @@ impl Transaction {
         }
     }
 
-    /// Whether the fee payer's rule admits the envelope signer, given
-    /// the payer's stored-authority cell as read at the caller's own
-    /// anchored height — `None` or empty meaning absent, the virtual
-    /// rule. Through [`ProtocolStatics::rule_admits`], over the one key
-    /// the envelope carries.
+    /// Whether the fee payer's rule admits the root's attesting set,
+    /// given the payer's stored-authority cell as read at the caller's
+    /// own anchored height — `None` or empty meaning absent, the virtual
+    /// rule. Through [`ProtocolStatics::rule_admits`].
     ///
     /// Every fee rule debits the account the envelope's `fee_payer`
     /// names — the reservation the payer shard enforces as block
     /// validity, the burn a completed transaction writes, the floor an
-    /// abort settles — so a payer whose rule does not admit the signer
+    /// abort settles — so a payer whose rule does not admit the set
     /// would be a debit on an account that authorised nothing,
     /// spendable by anyone who knows its address.
     ///
@@ -538,8 +536,8 @@ impl Transaction {
     ///
     /// [`ProtocolStatics::rule_admits`]: crate::ProtocolStatics::rule_admits
     #[must_use]
-    pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>) -> bool {
-        protocol_statics().rule_admits(auth_cell, self.terms().fee_payer, &[self.signer()])
+    pub fn payer_admits_attesters(&self, auth_cell: Option<&[u8]>) -> bool {
+        protocol_statics().rule_admits(auth_cell, self.terms().fee_payer, self.attested_by())
     }
 
     /// The cached derivation, or a panic saying it was never derived.
@@ -640,12 +638,12 @@ pub enum TransactionVerifyError {
         /// The network this node verifies for.
         session: u8,
     },
-    /// The envelope's composer signature does not cover its content.
-    #[error("transaction signature is invalid")]
-    InvalidSignature,
-    /// A member's signature does not cover its intent hash.
-    #[error("subintent {0} signature is invalid")]
-    InvalidSubintentSignature(u32),
+    /// An attestation does not cover the hash it stands beside: the
+    /// envelope's digest for the root's, an intent hash for a member's.
+    /// Indexed over every attestation the transaction carries, the
+    /// root's first.
+    #[error("attestation {0} is invalid")]
+    InvalidAttestation(u32),
     /// Static derivation refused the envelope.
     #[error(transparent)]
     Derivation(#[from] DerivationError),
@@ -676,14 +674,12 @@ impl Verify<TransactionContext<'_>> for Transaction {
     type Error = TransactionVerifyError;
 
     fn verify(&self, ctx: TransactionContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        let vm = self.try_body()?;
-        if !vm.signature_is_valid() {
-            return Err(TransactionVerifyError::InvalidSignature);
-        }
-        // Derivation checks the tree and the signature arity; the
-        // signatures themselves verify here, over the derived intent
-        // hashes. Which account a key may act as is neither stage's —
-        // that is the account's own rule, read on its shard.
+        self.try_body()?;
+        // Derivation checks the tree, and holds every attestation to the
+        // declaration it stands beside; the signatures themselves verify
+        // here, over the hashes derivation paired them with. Which
+        // account a key may act as is neither stage's — that is the
+        // account's own rule, read on its shard.
         let derived = self.try_derived(ctx.derivation)?;
         if derived.network != ctx.network {
             return Err(TransactionVerifyError::WrongNetwork {
@@ -695,16 +691,16 @@ impl Verify<TransactionContext<'_>> for Transaction {
         // price is the table's, the table is the anchor's, and a
         // signature check holds no snapshot. Admission judges it where
         // the window is resolved.
-        for (index, (sig, subintent)) in vm
-            .subintent_sigs
-            .iter()
-            .zip(&derived.subintent_hashes)
-            .enumerate()
-        {
-            let valid =
-                ProtocolVerifier.verify(sig.scheme, &sig.public_key, &sig.signature, subintent);
+        for (index, attested) in derived.attestations.iter().enumerate() {
+            let attestation = &attested.attestation;
+            let valid = ProtocolVerifier.verify(
+                attestation.scheme,
+                &attestation.public_key,
+                &attestation.signature,
+                &attested.hash,
+            );
             if !valid {
-                return Err(TransactionVerifyError::InvalidSubintentSignature(
+                return Err(TransactionVerifyError::InvalidAttestation(
                     u32::try_from(index).unwrap_or(u32::MAX),
                 ));
             }
@@ -744,17 +740,13 @@ mod tests {
     use hyperscale_vm_types::{Address, AddressClass, IntentHash, LegRole, Mode, Moves, ValueEdge};
 
     use super::*;
-    use crate::test_utils::{StubTree, test_prefix, test_validity_range};
+    use crate::test_utils::{StubTree, envelope_attestations, test_prefix, test_validity_range};
     use crate::{
         Derivation, Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId,
-        Secp256k1PrivateKey, SubintentSig,
+        Secp256k1PrivateKey,
     };
 
     struct StubStatics;
-
-    /// The intent hash the stub claims for `b"with-subintent"` trees;
-    /// the fixture's member signature covers it.
-    const STUB_SUBINTENT_HASH: [u8; 32] = [0x5A; 32];
 
     impl Derivation for StubStatics {
         fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
@@ -762,19 +754,15 @@ mod tests {
             if stub.body == b"inadmissible" {
                 return Err(DerivationError::Refused("stub refusal".into()));
             }
-            let subintent_hashes = if stub.body == b"with-subintent" {
-                vec![STUB_SUBINTENT_HASH]
-            } else {
-                Vec::new()
-            };
             Ok(Derived {
                 // A stub derives no tree, so the root's own window is
                 // the whole of it.
                 effective_window: stub.window(),
                 // The stub cannot derive an address from a key, so it
-                // binds the signer to the payer field — every stubbed
-                // transaction's payer admits its signer.
-                signer: stub.terms.fee_payer,
+                // binds the attesting set to the payer field — every
+                // stubbed transaction's payer admits its attesters.
+                attested_by: vec![stub.terms.fee_payer],
+                attestations: envelope_attestations(vm),
                 accounts: vec![stub.terms.fee_payer.address()],
                 network: stub.network,
                 terms: stub.terms,
@@ -798,7 +786,6 @@ mod tests {
                         ),
                     ],
                 },
-                subintent_hashes,
                 work: DeclaredWork::ZERO,
                 shares: Vec::new(),
                 node_terms: Vec::new(),
@@ -829,12 +816,13 @@ mod tests {
             },
             network: TEST_NETWORK,
             validity: test_validity_range(),
+            members: 0,
             body: tree.to_vec(),
         }
     }
 
     fn unsigned_envelope(tree: &[u8]) -> TransactionEnvelope {
-        stub_tree(tree).envelope(Vec::new())
+        stub_tree(tree).envelope()
     }
 
     fn fixture(tree: &[u8]) -> Transaction {
@@ -943,12 +931,14 @@ mod tests {
         assert_eq!(tx.validity_range(), test_validity_range());
     }
 
-    /// One content under two composer keys is two transactions. The key
-    /// attests the composition's own intent, so the identity a block
-    /// names has to fix it — a copy re-signed by a stranger is a
-    /// different transaction, never the same one judged another way.
+    /// The identity is the signed content and nothing about who signed
+    /// it: the principals attesting an intent are declared inside the
+    /// tree, so one content admits one attesting set, and the
+    /// attestations themselves are transport. A copy re-signed by a
+    /// stranger is the same transaction, and is judged against the set
+    /// the tree declares.
     #[test]
-    fn the_same_content_under_another_key_is_another_transaction() {
+    fn the_same_content_under_another_key_is_the_same_transaction() {
         let one = fixture(b"graph bytes");
         let other = Transaction::new(
             unsigned_envelope(b"graph bytes")
@@ -956,12 +946,12 @@ mod tests {
         );
         assert!(one.verify(ctx(TEST_NETWORK)).is_ok());
         assert!(other.verify(ctx(TEST_NETWORK)).is_ok());
-        assert_ne!(one.hash(), other.hash());
+        assert_eq!(one.hash(), other.hash());
 
-        // And the signature bytes are outside the identity: the same
-        // content and key with any signature at all is the same one.
+        // And the attestations are outside the identity: the same
+        // content with any signature at all is the same one.
         let mut rerolled = one.body().clone();
-        rerolled.signature = vec![0xAA; 64];
+        rerolled.signatures[0].signature = vec![0xAA; 64];
         assert_eq!(Transaction::new(rerolled).hash(), one.hash());
     }
 
@@ -972,11 +962,11 @@ mod tests {
 
         // A tampered signature refuses.
         let mut vm = good.body().clone();
-        vm.signature[0] ^= 1;
+        vm.signatures[0].signature[0] ^= 1;
         let bad_signature = Transaction::new(vm);
         assert_eq!(
             bad_signature.verify(ctx(TEST_NETWORK)).unwrap_err(),
-            TransactionVerifyError::InvalidSignature
+            TransactionVerifyError::InvalidAttestation(0)
         );
 
         // A refused tree surfaces the derivation error.
@@ -1026,7 +1016,7 @@ mod tests {
             Transaction::new(retargeted)
                 .verify(ctx(NetworkId(7)))
                 .unwrap_err(),
-            TransactionVerifyError::InvalidSignature,
+            TransactionVerifyError::InvalidAttestation(0),
         );
     }
 
@@ -1042,9 +1032,9 @@ mod tests {
         let ml_dsa = unsigned_envelope(b"graph bytes")
             .sign(&MlDsa65PrivateKey::from_bytes(&[7u8; 32]).unwrap());
 
-        assert_eq!(ed.signer_scheme, SchemeId::ED25519);
-        assert_eq!(secp.signer_scheme, SchemeId::SECP256K1);
-        assert_eq!(ml_dsa.signer_scheme, SchemeId::ML_DSA_65);
+        assert_eq!(ed.signatures[0].scheme, SchemeId::ED25519);
+        assert_eq!(secp.signatures[0].scheme, SchemeId::SECP256K1);
+        assert_eq!(ml_dsa.signatures[0].scheme, SchemeId::ML_DSA_65);
 
         for envelope in [ed, secp, ml_dsa] {
             let bytes = hbor_to_vec(&Transaction::new(envelope)).unwrap();
@@ -1055,10 +1045,10 @@ mod tests {
         }
     }
 
-    /// The scheme rides inside the preimage, so re-tagging signed material
-    /// to the other registered scheme loses the signature that covered it.
-    /// The re-tagged envelope still decodes: this is a signature verdict,
-    /// not a codec one.
+    /// An attestation re-tagged to another registered scheme is judged
+    /// under that scheme, which its material does not satisfy. The
+    /// re-tagged envelope still decodes: this is a signature verdict, not
+    /// a codec one.
     #[test]
     fn re_tagging_between_schemes_loses_the_signature() {
         let ed = unsigned_envelope(b"graph bytes")
@@ -1074,7 +1064,7 @@ mod tests {
             (ml_dsa, SchemeId::ED25519),
         ] {
             let mut retagged = envelope;
-            retagged.signer_scheme = other;
+            retagged.signatures[0].scheme = other;
             let bytes = hbor_to_vec(&Transaction::new(retagged)).unwrap();
             let carried: Transaction = hbor_from_slice(&bytes).unwrap();
             carried
@@ -1082,37 +1072,31 @@ mod tests {
                 .expect("a re-tagged envelope still decodes");
             assert_eq!(
                 carried.verify(ctx(TEST_NETWORK)).unwrap_err(),
-                TransactionVerifyError::InvalidSignature,
+                TransactionVerifyError::InvalidAttestation(0),
             );
         }
     }
 
+    /// Every attestation is verified, each over the hash derivation
+    /// paired it with, and a refusal names the one that failed.
     #[test]
-    fn verification_checks_subintent_signatures() {
-        // A subintent signature must cover the derived declaration hash.
-        let subintent_key = Ed25519PrivateKey::from_bytes(&[9u8; 32]).unwrap();
-        let composer_key = Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap();
-        let mut envelope = test_envelope(b"with-subintent");
-        envelope.subintent_sigs = vec![SubintentSig {
-            scheme: SchemeId::ED25519,
-            public_key: subintent_key.public_key().0.to_vec(),
-            signature: subintent_key.sign(STUB_SUBINTENT_HASH).0.to_vec(),
-        }];
-        let composed = envelope.sign(&composer_key);
+    fn verification_checks_every_attestation() {
+        let first = Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap();
+        let second = Ed25519PrivateKey::from_bytes(&[9u8; 32]).unwrap();
+        let twice = unsigned_envelope(b"graph bytes").sign(&first).sign(&second);
         assert!(
-            Transaction::new(composed.clone())
+            Transaction::new(twice.clone())
                 .verify(ctx(TEST_NETWORK))
                 .is_ok()
         );
 
-        let mut forged = composed;
-        forged.subintent_sigs[0].signature[0] ^= 1;
-        let forged = forged.sign(&composer_key);
+        let mut forged = twice;
+        forged.signatures[1].signature[0] ^= 1;
         assert_eq!(
             Transaction::new(forged)
                 .verify(ctx(TEST_NETWORK))
                 .unwrap_err(),
-            TransactionVerifyError::InvalidSubintentSignature(0)
+            TransactionVerifyError::InvalidAttestation(1)
         );
     }
 
@@ -1164,8 +1148,8 @@ mod tests {
         let key = Ed25519PrivateKey::from_bytes(&[9u8; 32]).unwrap();
         let signed = test_envelope(b"graph bytes").sign(&key);
         let mut rerolled = signed.clone();
-        rerolled.signature[0] ^= 0xFF;
-        assert_ne!(signed.signature, rerolled.signature);
+        rerolled.signatures[0].signature[0] ^= 0xFF;
+        assert_ne!(signed.signatures, rerolled.signatures);
         assert_eq!(
             Transaction::new(signed).hash(),
             Transaction::new(rerolled).hash(),

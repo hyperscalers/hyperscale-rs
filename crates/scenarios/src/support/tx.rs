@@ -27,12 +27,11 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, Intent, IntentHeader, ManifestGraph,
-    ResourceKind, SlotId, Totality, Value, child_key, issued_resource, package_hash,
+    ResourceKind, SignedIntent, SlotId, Totality, Value, child_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
-use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{
-    EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
+    EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError, signing,
 };
 use hyperscale_vm_sdk::client::VaultField;
 use hyperscale_vm_stdlib::{STAKING_MODULE, account, account_artifact, instantiate, staking};
@@ -1314,7 +1313,6 @@ pub(crate) fn build_instantiate_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        Vec::new(),
         payer,
         Terms {
             max_fee: MAX_FEE,
@@ -1412,7 +1410,6 @@ fn build_lottery_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        Vec::new(),
         payer,
         Terms {
             max_fee: MAX_FEE,
@@ -1547,9 +1544,12 @@ pub(crate) fn build_transfer_paid_by<S: AccountSigner>(
         .transfer_graph(from, to, amount)
         .expect("the stdlib account answers a transfer");
     let gas_limits = default_gas_limits(graph.nodes.len());
+    // The intent acts as `from` and declares the signer's own key as
+    // what attests it — the shape a delegate's transaction has.
+    let mut root = Intent::leaf(scenario_header(validity), from, graph);
+    root.attested_by = vec![principal_of(signer)];
     let envelope = signing::wrap(
-        &EnvelopeTree::of_one(Intent::leaf(scenario_header(validity), from, graph)),
-        Vec::new(),
+        &EnvelopeTree::of_one(root),
         signing::Terms {
             fee_payer: payer,
             max_fee: MAX_FEE,
@@ -2092,7 +2092,6 @@ fn build_venues_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        Vec::new(),
         payer,
         Terms {
             max_fee: MAX_FEE,
@@ -2153,7 +2152,6 @@ pub(crate) fn build_instance_instantiate_tx(
     tree.instances = vec![meta];
     Transaction::new(client().sign_tree(
         &tree,
-        Vec::new(),
         payer,
         Terms {
             max_fee: MAX_FEE,
@@ -2431,10 +2429,10 @@ pub(crate) fn build_composed_tx(
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
-    // The signer signs its own declaration's hash, which no part of the
-    // envelope enters — the composer binds it afterwards and signs the
-    // whole, subintent signatures included.
-    let signed = sign_subintent(signer_key, &request.hash(&ProtocolHasher).0.0);
+    // The signer attests its own declaration's hash, and the attestation
+    // travels with the declaration into whatever composes it.
+    let mut signed = SignedIntent::unsigned(request.clone());
+    signed.attest(signer_key, &ProtocolHasher);
 
     let client = client();
     let chain = client.records();
@@ -2448,7 +2446,7 @@ pub(crate) fn build_composed_tx(
         .expect("an account answers a withdrawal");
     let paid = root.export(funds);
     let wants = env
-        .adopt(request.clone())
+        .adopt(signed)
         .expect("the request discharges its own hole")
         .one()
         .expect("the request declares one parameter");
@@ -2462,7 +2460,6 @@ pub(crate) fn build_composed_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        vec![signed],
         composer,
         Terms {
             max_fee: 1_000,

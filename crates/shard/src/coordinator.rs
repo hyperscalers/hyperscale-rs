@@ -268,9 +268,9 @@ struct PayerFee {
     /// The signed ceiling; zero where the caller only seeds prior
     /// demand.
     max_fee: u128,
-    /// The envelope signer the payer's rule must admit — carried at
-    /// vote, where the binding is judged, and absent at proposal seed.
-    signer: Option<PrincipalAddr>,
+    /// The attesting set the payer's rule must admit — carried at vote,
+    /// where the binding is judged, and absent at proposal seed.
+    attested_by: Option<Vec<PrincipalAddr>>,
 }
 
 /// Shard consensus state machine (HotStuff-2).
@@ -2583,7 +2583,7 @@ impl ShardCoordinator {
                         vault: tx.fee_vault(),
                         auth_cell: tx.auth_cell(),
                         max_fee: 0,
-                        signer: None,
+                        attested_by: None,
                     }),
                 );
                 self.fee_demands(&payer_seeds, parent_block_hash)
@@ -3627,7 +3627,7 @@ impl ShardCoordinator {
                     vault: tx.fee_vault(),
                     auth_cell: tx.auth_cell(),
                     max_fee: tx.terms().max_fee,
-                    signer: Some(tx.signer()),
+                    attested_by: Some(tx.attested_by().to_vec()),
                 }),
             );
             let fee_demands = self.fee_demands(&block_fees, block.header().parent_block_hash());
@@ -3702,10 +3702,10 @@ impl ShardCoordinator {
                 vault: fee.vault,
                 auth_cell: fee.auth_cell,
                 demand: 0,
-                signers: BTreeSet::new(),
+                attesting_sets: BTreeSet::new(),
             });
             entry.demand = entry.demand.saturating_add(fee.max_fee);
-            entry.signers.extend(fee.signer);
+            entry.attesting_sets.extend(fee.attested_by.clone());
         }
         if demands.is_empty() {
             return Vec::new();

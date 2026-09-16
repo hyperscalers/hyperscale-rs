@@ -220,14 +220,15 @@ pub struct FeeDemand {
     /// engaged fee ceilings plus the in-flight holds derived from chain
     /// content.
     pub demand: u128,
-    /// The distinct signer identities behind this block's demands on
-    /// this payer, each of which the payer's rule must admit for the
-    /// reservation to engage. Ancestor and in-flight holds contribute
-    /// demand but no signers — their blocks answered for their own.
+    /// The distinct attesting sets behind this block's demands on this
+    /// payer, one per transaction, each of which the payer's rule must
+    /// admit whole for the reservation to engage. Ancestor and in-flight
+    /// holds contribute demand but no sets — their blocks answered for
+    /// their own.
     ///
     /// Empty when the demand seeds a proposal builder, whose candidate
-    /// transactions carry their own signers.
-    pub signers: BTreeSet<PrincipalAddr>,
+    /// transactions carry their own sets.
+    pub attesting_sets: BTreeSet<Vec<PrincipalAddr>>,
 }
 
 /// Actions the state machine wants to perform.

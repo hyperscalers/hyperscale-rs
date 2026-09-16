@@ -500,7 +500,7 @@ fn payer_binding_holds<S: SubstateStore>(
     let auth_cell = storage
         .and_then(|storage| storage.get_substate_at_height(tx.auth_cell(), storage.jmt_height()))
         .flatten();
-    if !tx.payer_admits_signer(auth_cell.as_deref()) {
+    if !tx.payer_admits_attesters(auth_cell.as_deref()) {
         tracing::debug!(
             tx_hash = ?tx.hash(),
             "Refusing admission: the payer's rule does not admit the signer"
