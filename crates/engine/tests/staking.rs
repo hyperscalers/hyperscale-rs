@@ -31,7 +31,7 @@ use hyperscale_vm_effects::{
     ChainRecords, Composed, IntentHeader, holdings_collection, instance_data_key, package_hash,
     resource_record_key,
 };
-use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
+use hyperscale_vm_manifest_builder::{IntentBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, instantiate, staking};
 use hyperscale_vm_types::{Address, CallTarget, CollectionId};
 
@@ -203,18 +203,14 @@ fn signed_stake_composed(seat: &StakePoolSeat, amount: u128) -> Transaction {
     let pool = meta.address(&ProtocolHasher);
     let chain = client().records();
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
-    let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, HEADER);
+    let mut b = IntentBuilder::new(&composed, &ProtocolHasher, from, HEADER);
     let funds =
         account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
         .stake(&mut b, funds)
         .expect("a pool takes a delegation");
     account::deposit(&mut b, from, units).expect("an account banks its position");
-    env.seal(b)
-        .expect("the root declares nothing to discharge")
-        .none()
-        .expect("the root declares no socket");
-    let tree = env.build().expect("the intent declares no hole");
+    let tree = b.build().expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, &key, terms(1_000)))
 }
 
@@ -478,18 +474,14 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     // answer for yet: the seal is what makes it answer.
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
     let pool = meta.address(&ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, HEADER);
+    let mut root = IntentBuilder::new(&composed, &ProtocolHasher, from, HEADER);
     // The composition every bring-up writes: the seal, and the supply it
     // yields filed where the founder keeps it. Which method seals and
     // which of those nodes exist are the package's own declaration to
     // say.
     instantiate(&mut root, pool, ()).expect("a derivable pool answers its seal");
-    env.register_instance(meta);
-    env.seal(root)
-        .expect("the root declares nothing to discharge")
-        .none()
-        .expect("the root declares no socket");
-    let tree = env.build().expect("the intent declares no hole");
+    root.register_instance(meta);
+    let tree = root.build().expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, &key, terms(1_000)))
 }
 
@@ -585,7 +577,7 @@ fn a_pool_nobody_instantiated_answers_nothing() {
     let unseated = seat(56);
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
     let chain = client().records();
-    let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher, delegator(), HEADER);
+    let mut root = IntentBuilder::new(&chain, &ProtocolHasher, delegator(), HEADER);
     let funds = account::withdraw(&mut root, delegator(), *PROTOCOL_RESOURCE, 500)
         .expect("an account withdraws");
     let refusal = staking::Staking::at(pool)
