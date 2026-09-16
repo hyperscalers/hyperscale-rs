@@ -312,12 +312,20 @@ pub fn attestations(
     let mut all = Vec::new();
     let root = vm.signing_hash().as_hash32().0;
     held_to(&tree.root, &vm.signatures, root, 0, &mut all)?;
-    for (offset, signed) in tree.root.signed_members().into_iter().enumerate() {
-        let hash = signed.intent.hash(&ProtocolHasher).0.0;
+    // Every intent's hash once, bottom-up; the root's is the envelope's
+    // and stays unused here.
+    let hashes = tree.hashes(&ProtocolHasher);
+    for (offset, (signed, hash)) in tree
+        .root
+        .signed_members()
+        .into_iter()
+        .zip(hashes.into_iter().skip(1))
+        .enumerate()
+    {
         held_to(
             &signed.intent,
             &signed.signatures,
-            hash,
+            hash.0.0,
             offset + 1,
             &mut all,
         )?;
@@ -882,6 +890,8 @@ fn unresolved_targets(tree: &IntentTree, chain: &dyn ChainRecords) -> Unresolved
         .map(|meta| (meta.address(&ProtocolHasher).address(), meta.package))
         .collect();
     let mut wanted = Unresolved::default();
+    let mut seen_instances = BTreeSet::new();
+    let mut seen_packages = BTreeSet::new();
     let intents = tree.intents();
     for node in intents.iter().flat_map(|intent| &intent.graph.nodes) {
         let address = node.target.address();
@@ -893,14 +903,14 @@ fn unresolved_targets(tree: &IntentTree, chain: &dyn ChainRecords) -> Unresolved
             .map(|meta| meta.package)
             .or_else(|| carried.get(&address).copied())
         else {
-            if !wanted.instances.contains(&address) {
+            if seen_instances.insert(address) {
                 wanted.instances.push(address);
             }
             continue;
         };
         let package = Hash::from(package.0);
         if chain.package(PackageHash(package.as_hash32())).is_none()
-            && !wanted.packages.contains(&package)
+            && seen_packages.insert(package)
         {
             wanted.packages.push(package);
         }
