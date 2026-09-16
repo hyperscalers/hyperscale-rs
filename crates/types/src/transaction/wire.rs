@@ -382,11 +382,12 @@ impl Transaction {
     /// One identity for every job — dedup, canonical ordering, receipt
     /// and certificate naming, and the root every fresh derivation and
     /// nullifier already grows from — and it covers exactly what the
-    /// composer signed. The signature and key sit outside it, so a
-    /// re-rolled signature over the same content is the same
-    /// transaction rather than a distinct one minting the same fresh
-    /// keys: the envelope's "distinct transactions never mint the same
-    /// fresh key" guarantee holds structurally.
+    /// composer signed, their key included. The signature alone sits
+    /// outside it, so a re-rolled signature over the same content is
+    /// the same transaction rather than a distinct one minting the same
+    /// fresh keys, while the same content under another key is another
+    /// transaction: the key attests the composition's own intent, and
+    /// every replica must judge one identity against one key.
     ///
     /// Computed on first call and cached; `::new` pre-populates. Bytes
     /// that do not decode as an envelope hash as themselves — such a
@@ -926,6 +927,28 @@ mod tests {
         let tx = fixture(b"graph bytes");
         tx.try_derived(&StubStatics).expect("the stub derives");
         assert_eq!(tx.validity_range(), test_validity_range());
+    }
+
+    /// One content under two composer keys is two transactions. The key
+    /// attests the composition's own intent, so the identity a block
+    /// names has to fix it — a copy re-signed by a stranger is a
+    /// different transaction, never the same one judged another way.
+    #[test]
+    fn the_same_content_under_another_key_is_another_transaction() {
+        let one = fixture(b"graph bytes");
+        let other = Transaction::new(
+            unsigned_envelope(b"graph bytes")
+                .sign(&Ed25519PrivateKey::from_bytes(&[8u8; 32]).unwrap()),
+        );
+        assert!(one.verify(ctx(TEST_NETWORK)).is_ok());
+        assert!(other.verify(ctx(TEST_NETWORK)).is_ok());
+        assert_ne!(one.hash(), other.hash());
+
+        // And the signature bytes are outside the identity: the same
+        // content and key with any signature at all is the same one.
+        let mut rerolled = one.body().clone();
+        rerolled.signature = vec![0xAA; 64];
+        assert_eq!(Transaction::new(rerolled).hash(), one.hash());
     }
 
     #[test]
