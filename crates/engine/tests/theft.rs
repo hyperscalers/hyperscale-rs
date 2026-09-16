@@ -20,7 +20,7 @@ use hyperscale_engine::{
 use hyperscale_storage::Substates;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    ConsensusReceipt, Ed25519PrivateKey, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable,
+    ConsensusReceipt, Ed25519PrivateKey, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable,
     PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey,
     TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
@@ -28,7 +28,7 @@ use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
 /// The widest window an intent may stand for, which these fixtures use
 /// wherever they mean "does not expire during the test".
-const OFFER_MS: u64 = MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000;
+const OFFER_MS: u64 = MAX_INTENT_VALIDITY_RANGE.as_secs() * 1_000;
 
 /// A funded account whose key nothing in this binary holds — the address
 /// is all an attacker has, and the address is public.

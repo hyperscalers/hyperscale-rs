@@ -64,7 +64,7 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 /// every node simultaneously.
 ///
 /// Sized from the transaction window and never from
-/// [`MAX_SUBINTENT_VALIDITY_RANGE`](crate::MAX_SUBINTENT_VALIDITY_RANGE),
+/// [`MAX_INTENT_VALIDITY_RANGE`](crate::MAX_INTENT_VALIDITY_RANGE),
 /// which is far wider: what is retained here is derived from a
 /// transaction, and a transaction binding a long-standing offer still
 /// runs inside its own window.

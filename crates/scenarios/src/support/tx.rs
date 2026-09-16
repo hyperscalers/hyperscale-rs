@@ -20,13 +20,13 @@ use hyperscale_hbor::TypeShape;
 use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits, principal_of};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
-    EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
+    EnvelopeExt, Epoch, MAX_INTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
     MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr, SchemeId, ShardId,
     ShardTrie, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
     TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, Intent, IntentHeader, ManifestGraph,
+    Composed, Constraint, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree, ManifestGraph,
     ResourceKind, SignedIntent, SlotId, Totality, Value, child_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
@@ -682,7 +682,7 @@ pub(crate) const fn offer_header() -> IntentHeader {
         validity_start_ms: 0,
         // The cap in milliseconds, which a `u64` holds with room: the
         // constant is days and the type counts to half a billion years.
-        validity_end_ms: MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000,
+        validity_end_ms: MAX_INTENT_VALIDITY_RANGE.as_secs() * 1_000,
         discriminator: 0,
     }
 }
@@ -1541,7 +1541,7 @@ pub(crate) fn build_transfer_paid_by<S: AccountSigner>(
     let mut root = Intent::leaf(scenario_header(validity), from, graph);
     root.attested_by = vec![principal_of(signer)];
     let envelope = signing::wrap(
-        &EnvelopeTree::of_one(root),
+        &IntentTree::of_one(root),
         signing::Terms {
             fee_payer: payer,
             max_fee: MAX_FEE,
@@ -2132,7 +2132,7 @@ pub(crate) fn build_instance_instantiate_tx(
     let [] = b.call(founder, "deposit-nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
 
-    let mut tree = EnvelopeTree::of_one(Intent::leaf(
+    let mut tree = IntentTree::of_one(Intent::leaf(
         scenario_header(validity),
         principal_of(payer),
         graph,

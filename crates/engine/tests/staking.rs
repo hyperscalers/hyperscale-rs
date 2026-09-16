@@ -23,7 +23,7 @@ use hyperscale_storage::Substates;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey,
-    MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, ShardId,
+    MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, ShardId,
     ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
     Verified, WeightedTimestamp, absorb_committed_cells,
 };
@@ -40,7 +40,7 @@ const NETWORK: NetworkId = NetworkId(242);
 
 /// The widest window an intent may stand for, which these fixtures use
 /// wherever they mean "does not expire during the test".
-const OFFER_MS: u64 = MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000;
+const OFFER_MS: u64 = MAX_INTENT_VALIDITY_RANGE.as_secs() * 1_000;
 
 /// The terms every intent in these tests is sealed under. The window is
 /// the widest an intent may name, so nothing here narrows a transaction.

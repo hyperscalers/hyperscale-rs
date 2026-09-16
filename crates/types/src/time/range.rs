@@ -47,12 +47,13 @@ use crate::WeightedTimestamp;
 /// [`SKIP_TIMEOUT`]: crate::SKIP_TIMEOUT
 pub const MAX_VALIDITY_RANGE: Duration = Duration::from_secs(120);
 
-/// Hard upper bound on how long a subintent may stand open.
+/// Hard upper bound on how long an intent carried as a member may stand
+/// open.
 ///
 /// A standing offer wants to outlive a transaction, and it may: the
 /// bounds above are the *transaction* window's, and neither reaches
 /// here. The reshape argument bounds artifacts a successor must read
-/// from a predecessor's chain, and a subintent's window governs no such
+/// from a predecessor's chain, and a member's window governs no such
 /// artifact — it governs a nullifier cell, which is state, and state
 /// migrates with its owner's prefix at every split and merge. Each
 /// transaction binding an offer still carries its own
@@ -71,7 +72,7 @@ pub const MAX_VALIDITY_RANGE: Duration = Duration::from_secs(120);
 /// every artifact on the chain.
 ///
 /// [`RETENTION_HORIZON`]: crate::RETENTION_HORIZON
-pub const MAX_SUBINTENT_VALIDITY_RANGE: Duration = Duration::from_hours(24 * 30);
+pub const MAX_INTENT_VALIDITY_RANGE: Duration = Duration::from_hours(24 * 30);
 
 /// Half-open `[start, end)` range of [`WeightedTimestamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Hbor)]

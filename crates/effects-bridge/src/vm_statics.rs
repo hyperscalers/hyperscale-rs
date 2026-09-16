@@ -19,14 +19,14 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
     ArtifactTerm, Attestation, Attested, DeclaredKey, DeclaredRange, Derivation, DerivationError,
-    Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE,
+    Derived, EnvelopeExt, Hash, MAX_INTENT_VALIDITY_RANGE, MAX_STATE_ENTRIES_PER_TX,
     MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing, TimestampRange,
     TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    Admitted, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree, Intent,
-    IntentHeader, IntentRecord, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, Value,
+    Admitted, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, Intent, IntentHeader,
+    IntentRecord, IntentTree, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, Value,
     admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes, effect_units,
     legs_of, package_hash, package_key as canonical_package_key, principal_address,
     protocol_resource,
@@ -307,7 +307,7 @@ pub fn declared_vector(
 /// declaration, or a key that does not derive its declared principal.
 pub fn attestations(
     vm: &TransactionEnvelope,
-    tree: &EnvelopeTree,
+    tree: &IntentTree,
 ) -> Result<Vec<Attested>, DerivationError> {
     let mut all = Vec::new();
     let root = vm.signing_hash().as_hash32().0;
@@ -364,7 +364,7 @@ fn held_to(
 /// What verifying every attestation the envelope and its tree carry
 /// costs, each priced as its scheme is registered.
 #[must_use]
-pub fn signature_work(vm: &TransactionEnvelope, tree: &EnvelopeTree) -> DeclaredWork {
+pub fn signature_work(vm: &TransactionEnvelope, tree: &IntentTree) -> DeclaredWork {
     attestation_work(
         vm.signatures.iter().chain(
             tree.root
@@ -385,7 +385,7 @@ pub fn signature_work(vm: &TransactionEnvelope, tree: &EnvelopeTree) -> Declared
 pub struct CallEnvelope<'a> {
     vm: &'a TransactionEnvelope,
     /// The bound tree the envelope carries.
-    pub tree: EnvelopeTree,
+    pub tree: IntentTree,
     /// Every attestation the envelope and its tree carry, held to the
     /// declarations they stand beside, with the hash each covers.
     pub attestations: Vec<Attested>,
@@ -627,7 +627,7 @@ pub fn account_address(public_key: &[u8; 32]) -> PrincipalAddr {
 /// On a tree past the vocabulary's own caps — one no admission path can
 /// have accepted.
 #[must_use]
-pub fn encode_tree(tree: &EnvelopeTree) -> Vec<u8> {
+pub fn encode_tree(tree: &IntentTree) -> Vec<u8> {
     hbor_to_vec(tree).expect("a tree within its caps encodes")
 }
 
@@ -636,7 +636,7 @@ pub fn encode_tree(tree: &EnvelopeTree) -> Vec<u8> {
 /// # Errors
 ///
 /// [`DerivationError`] on malformed or non-canonical bytes.
-pub fn decode_tree(bytes: &[u8]) -> Result<EnvelopeTree, DerivationError> {
+pub fn decode_tree(bytes: &[u8]) -> Result<IntentTree, DerivationError> {
     decode_tree_bytes(bytes)
         .map_err(|error| DerivationError::Refused(format!("tree decode: {error}")))
 }
@@ -655,7 +655,7 @@ pub fn decode_tree(bytes: &[u8]) -> Result<EnvelopeTree, DerivationError> {
 /// would stop being a pure function of the envelope. The session's own
 /// check on the derived network covers the tree transitively, and the
 /// anchor check runs once, on the window returned here.
-fn effective_window(tree: &EnvelopeTree) -> Result<(TimestampRange, NetworkId), DerivationError> {
+fn effective_window(tree: &IntentTree) -> Result<(TimestampRange, NetworkId), DerivationError> {
     let intents = tree.intents();
     let network = tree.root.header.network;
     let mut window = window_of(&tree.root.header);
@@ -675,7 +675,7 @@ fn effective_window(tree: &EnvelopeTree) -> Result<(TimestampRange, NetworkId), 
             )));
         }
         let offered = window_of(header);
-        if !offered.is_well_formed_length(MAX_SUBINTENT_VALIDITY_RANGE) {
+        if !offered.is_well_formed_length(MAX_INTENT_VALIDITY_RANGE) {
             return Err(DerivationError::Refused(format!(
                 "{} stands for longer than an intent may",
                 named()
@@ -875,7 +875,7 @@ impl BridgeStatics {
 /// holding each one's seal can answer for it. Collected whole, in the
 /// order the flattened manifest names them, so the answer is stable
 /// wherever it is computed.
-fn unresolved_targets(tree: &EnvelopeTree, chain: &dyn ChainRecords) -> Unresolved {
+fn unresolved_targets(tree: &IntentTree, chain: &dyn ChainRecords) -> Unresolved {
     let carried: BTreeMap<Address, PackageHash> = tree
         .instances
         .iter()
@@ -1270,7 +1270,7 @@ mod tests {
                 GraphArg::Literal(Value::Address(resource.address())),
                 GraphArg::Literal(Value::U128(amount)),
             ],
-            evidence: [EvidenceRef::IntentSignature].into(),
+            evidence: [EvidenceRef::Attestation].into(),
         }
     }
 
@@ -1317,12 +1317,12 @@ mod tests {
 
     /// A tree of one intent acting as `account` — whose key has to be the
     /// one the envelope around it is signed with.
-    fn intent_tree(account: PrincipalAddr, nodes: Vec<GraphNode>) -> EnvelopeTree {
-        EnvelopeTree::of_one(Intent::leaf(HEADER, account, ManifestGraph { nodes }))
+    fn intent_tree(account: PrincipalAddr, nodes: Vec<GraphNode>) -> IntentTree {
+        IntentTree::of_one(Intent::leaf(HEADER, account, ManifestGraph { nodes }))
     }
 
     /// The two-signer composition: the composer pays X for Bob's Y.
-    fn composed_tree() -> EnvelopeTree {
+    fn composed_tree() -> IntentTree {
         let mut root = Intent::leaf(
             HEADER,
             composer_addr(),
@@ -1368,11 +1368,11 @@ mod tests {
                 output: 0,
             }))],
         }];
-        EnvelopeTree::of_one(root)
+        IntentTree::of_one(root)
     }
 
     /// The terms every envelope here signs, over `tree`.
-    fn terms(tree: &EnvelopeTree) -> Terms {
+    fn terms(tree: &IntentTree) -> Terms {
         Terms {
             fee_payer: composer_addr(),
             max_fee: 1_000,
@@ -1384,7 +1384,7 @@ mod tests {
 
     /// `tree` wrapped and signed: each member attested by the key at its
     /// position in tree order, and the root by the composer's key.
-    fn envelope(tree: &EnvelopeTree, member_keys: &[&Ed25519PrivateKey]) -> TransactionEnvelope {
+    fn envelope(tree: &IntentTree, member_keys: &[&Ed25519PrivateKey]) -> TransactionEnvelope {
         let mut tree = tree.clone();
         let mut keys = member_keys.iter();
         tree.root.for_each_signed_member(&mut |signed| {
@@ -1593,7 +1593,7 @@ mod tests {
         let first = composed_tree();
         let mut second = composed_tree();
         second.root.header.validity_end_ms -= 1_000;
-        let derive = |tree: &EnvelopeTree| {
+        let derive = |tree: &IntentTree| {
             statics()
                 .derive(&envelope(tree, &[&key(9)]))
                 .expect("derives")
@@ -2196,7 +2196,7 @@ mod tests {
                 .derive(&envelope(
                     &intent_tree(
                         composer_addr(),
-                        vec![node([EvidenceRef::IntentSignature].into())],
+                        vec![node([EvidenceRef::Attestation].into())],
                     ),
                     &[],
                 ))

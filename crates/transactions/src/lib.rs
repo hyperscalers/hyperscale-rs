@@ -24,7 +24,7 @@ use hyperscale_effects_bridge::{NodeRecords, PROTOCOL_RESOURCE};
 use hyperscale_types::{
     AccountSigner, NetworkId, ProtocolHasher, TimestampRange, Transaction, TransactionEnvelope,
 };
-use hyperscale_vm_effects::{Claim, EnvelopeTree, Intent, IntentHeader, ManifestGraph, StoredRule};
+use hyperscale_vm_effects::{Claim, Intent, IntentHeader, IntentTree, ManifestGraph, StoredRule};
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::PrincipalAddr;
@@ -256,7 +256,7 @@ impl Client {
         terms: Terms,
     ) -> TransactionEnvelope {
         self.sign_tree(
-            &EnvelopeTree::of_one(Intent::leaf(
+            &IntentTree::of_one(Intent::leaf(
                 IntentHeader {
                     network: self.network,
                     validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
@@ -298,7 +298,7 @@ impl Client {
     #[must_use]
     pub fn sign_tree<S: AccountSigner>(
         &self,
-        tree: &EnvelopeTree,
+        tree: &IntentTree,
         payer: &S,
         terms: Terms,
     ) -> TransactionEnvelope {
@@ -378,7 +378,7 @@ mod tests {
                             GraphArg::Literal(Value::Address(PROTOCOL_RESOURCE.address())),
                             GraphArg::Literal(Value::U128(100)),
                         ],
-                        evidence: [EvidenceRef::IntentSignature].into(),
+                        evidence: [EvidenceRef::Attestation].into(),
                     },
                     GraphNode {
                         target: to.into(),
@@ -403,7 +403,7 @@ mod tests {
         let graph = client
             .transfer_graph(test_principal(0x11), test_principal(0x22), 100)
             .unwrap();
-        let tree = EnvelopeTree::of_one(Intent::leaf(
+        let tree = IntentTree::of_one(Intent::leaf(
             IntentHeader {
                 network: NETWORK,
                 validity_start_ms: 0,
