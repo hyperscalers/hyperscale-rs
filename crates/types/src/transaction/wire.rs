@@ -506,9 +506,8 @@ impl Transaction {
     /// Whether the fee payer's rule admits the envelope signer, given
     /// the payer's stored-authority cell as read at the caller's own
     /// anchored height — `None` or empty meaning absent, the virtual
-    /// rule. `clock_ms` reaches [`ProtocolStatics::rule_admits`], which
-    /// does not read it: the cell holds one rule, and replacing one is a
-    /// write.
+    /// rule. Through [`ProtocolStatics::rule_admits`], over the one key
+    /// the envelope carries.
     ///
     /// Every fee rule debits the account the envelope's `fee_payer`
     /// names — the reservation the payer shard enforces as block
@@ -527,8 +526,8 @@ impl Transaction {
     ///
     /// [`ProtocolStatics::rule_admits`]: crate::ProtocolStatics::rule_admits
     #[must_use]
-    pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>, clock_ms: u64) -> bool {
-        protocol_statics().rule_admits(auth_cell, self.body().fee_payer, self.signer(), clock_ms)
+    pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>) -> bool {
+        protocol_statics().rule_admits(auth_cell, self.body().fee_payer, &[self.signer()])
     }
 
     /// The cached derivation, or a panic saying it was never derived.
