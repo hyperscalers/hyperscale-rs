@@ -20,11 +20,11 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::records::{PackageCache, record_address};
-use hyperscale_effects_bridge::vm_statics::{config_key, package_key, principal_for};
+use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_effects_bridge::{
-    BridgeStatics, DeclaredVector, LocalCells, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry,
-    ProtocolHasher, admit_package, attesting_sets, declared_vector, decode_tree, envelope_bytes,
-    envelope_identity, witness_from_event,
+    BridgeStatics, CallEnvelope, DeclaredVector, LocalCells, NodeRecords, PROTOCOL_RESOURCE,
+    PoolRegistry, ProtocolHasher, admit_package, declared_vector, envelope_bytes,
+    witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
@@ -37,7 +37,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, IntentRecord,
-    PackageHash, admit_tree, legs_of, package_hash,
+    PackageHash, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
@@ -709,42 +709,19 @@ impl Executor {
         packages: &PackageCache,
     ) -> Result<(PreparedTx, Admitted), String> {
         let vm = tx.body();
-        let tree = decode_tree(
-            vm.call_tree()
-                .ok_or_else(|| "publish body in a call sub-batch".to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        // The key has to be material its scheme admits before anything
-        // reads the tree it signed. Which account it attests is the
-        // tree's own statement, and whether that account admits this key
-        // is that account's shard's to judge; what is refused here is a
-        // key that names no principal at all.
-        let signer = principal_for(vm.signer_scheme, &vm.signer)
-            .ok_or_else(|| "the envelope's signer key derives no principal".to_string())?;
-        // Whose keys attested each intent, read off the envelope's own
-        // signatures. A preview reads them the same way a commit path
-        // does: a gate names an account, and only an intent that account
-        // signed presents it, so there is nothing an unsigned envelope
-        // could be assumed into that signing it would not also do.
-        let attested_by = attesting_sets(vm, &tree, signer).map_err(|error| error.to_string())?;
-        // The records the caller answers with. Admission composes the
-        // envelope's own over these itself, and holds each to standing
-        // for the seal of the component it derives.
-        let admitted = admit_tree(
-            &tree,
-            &attested_by,
-            envelope_identity(vm),
-            chain,
-            &ProtocolHasher,
-        )
-        .map_err(|error| format!("admission: {error}"))?;
-        // One signed ceiling per lowered node, summing under the bound.
-        // Held here and not only at derivation because a preview reaches
-        // the kernel without deriving: an envelope carrying no ceilings
-        // meters every node at `u64::MAX`, which is the in-crate
-        // fixture's reading and never an embedder's.
-        vm.admit_terms(admitted.admitted.calls().len())
-            .map_err(|refusal| refusal.to_string())?;
+        // The same decode, attesting sets and admission a derivation
+        // runs, and the same terms held to the manifest — a preview
+        // reaches the kernel without deriving, and what it reports has
+        // to be the verdict the chain would reach. Whose keys attested
+        // each intent is read off the envelope's own material, verified
+        // or not: a gate names an account, and only an intent that
+        // account signed presents it, so there is nothing an unsigned
+        // envelope could be assumed into that signing it would not also
+        // do. The records the caller answers with come through `chain`;
+        // admission composes the envelope's own over them itself.
+        let admitted = CallEnvelope::decode(vm)
+            .and_then(|call| call.admit(chain))
+            .map_err(|error| error.to_string())?;
         // The same vector derivation puts on the envelope, so a preview
         // reports what a block would charge without running the
         // derivation — which admits under the rule as the chain applies
