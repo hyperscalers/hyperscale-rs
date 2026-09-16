@@ -261,6 +261,18 @@ impl Transaction {
         &self.derived().owners
     }
 
+    /// The fee payer among [`Self::owners`], whose vault the reservation
+    /// and the burn reach and whose home bears the core where no node
+    /// can.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::body`], on a transaction whose bytes do not decode.
+    #[must_use]
+    pub fn fee_payer(&self) -> Address {
+        self.body().fee_payer.address()
+    }
+
     /// The cells the kernel writes of its own accord.
     ///
     /// # Panics

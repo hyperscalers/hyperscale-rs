@@ -647,11 +647,11 @@ mod tests {
     /// participant.
     #[test]
     fn a_divided_member_joins_on_its_classified_membership() {
-        use crate::fixtures::{leaf, swap, trie};
+        use crate::fixtures::{leaf, payer, swap, trie};
 
         let trie = trie();
         let (local, venue) = (leaf(0), leaf(1));
-        let classified = Classified::freeze(&swap(), &[], &trie);
+        let classified = Classified::freeze(&swap(), payer(), &[], &trie);
         assert!(classified.decomposed());
 
         let mut candidates = TickCandidates::new(local);
@@ -690,7 +690,7 @@ mod tests {
     /// queue in one tick rather than one member per tick.
     #[test]
     fn a_member_nothing_can_retract_takes_no_provisional_claim() {
-        use crate::fixtures::{leaf, swap, trie};
+        use crate::fixtures::{leaf, payer, swap, trie};
 
         let trie = trie();
         let (caller, venue) = (leaf(0), leaf(1));
@@ -725,7 +725,7 @@ mod tests {
         assert!(admitted[0].request.runs.abortable());
         assert_eq!(whole.len(), 1, "and the other waits on its fate");
 
-        let classified = Classified::freeze(&swap(), &[], &trie);
+        let classified = Classified::freeze(&swap(), payer(), &[], &trie);
         assert_eq!(classified.core(), &BTreeSet::from([venue]));
         let mut divided = TickCandidates::new(venue);
         for seed in [1, 2] {

@@ -1672,12 +1672,12 @@ mod tests {
     /// whatever the case.
     #[test]
     fn membership_follows_the_two_case_rule() {
-        use crate::fixtures::{leaf, route, swap, trie};
+        use crate::fixtures::{leaf, payer, route, swap, trie};
 
         let trie = trie();
         let (low, high, third) = (leaf(0), leaf(1), leaf(2));
 
-        let swap = Classified::freeze(&swap(), &[], &trie);
+        let swap = Classified::freeze(&swap(), payer(), &[], &trie);
         assert!(swap.decomposed());
         let participating = BTreeSet::from([low, high]);
         let member_of = |classified: &Classified, local, participating: &BTreeSet<ShardId>| {
@@ -1709,7 +1709,7 @@ mod tests {
         assert_eq!(venue.reach(), &participating);
         assert_eq!(venue.role(), Role::Core, "and decides");
 
-        let route = Classified::freeze(&route(), &[], &trie);
+        let route = Classified::freeze(&route(), payer(), &[], &trie);
         let participating = BTreeSet::from([low, high, third]);
         let core_member = Membership::of(&member_of(&route, high, &participating));
         assert_eq!(
@@ -1735,7 +1735,7 @@ mod tests {
         use hyperscale_types::BlockHeight;
         use hyperscale_vm_types::LegRole;
 
-        use crate::fixtures::{leaf, leg, swap, trie};
+        use crate::fixtures::{leaf, leg, payer, swap, trie};
 
         let trie = trie();
         let placement = &trie;
@@ -1746,6 +1746,7 @@ mod tests {
                 leg(0, LegRole::Core, &[]),
                 leg(1, LegRole::Outbound, &[(0, 0)]),
             ],
+            payer(),
             &[],
             placement,
         );
@@ -1755,7 +1756,7 @@ mod tests {
             !transfer.only_delivers_at(sender),
             "the core bears the verdict"
         );
-        let swap = Classified::freeze(&swap(), &[], placement);
+        let swap = Classified::freeze(&swap(), payer(), &[], placement);
         assert!(
             !swap.only_delivers_at(leaf(0)),
             "a shard that also issues runs on the transaction's window"
@@ -1810,11 +1811,11 @@ mod tests {
     fn a_leg_certifies_alone_and_is_still_routed_to_its_reach() {
         use hyperscale_types::BlockHeight;
 
-        use crate::fixtures::{leaf, swap, trie};
+        use crate::fixtures::{leaf, payer, swap, trie};
 
         let trie = trie();
         let (local, venue) = (leaf(0), leaf(1));
-        let classified = Classified::freeze(&swap(), &[], &trie);
+        let classified = Classified::freeze(&swap(), payer(), &[], &trie);
         let leg = tx(1);
         let mut tick = TickState::new(
             TickId::new(local, BlockHeight::new(1)),

@@ -118,7 +118,7 @@ fn committed_members(
     assign_participants(classification, transactions)
         .into_iter()
         .map(|(tx, participating)| {
-            let classified = Classified::freeze(tx.legs(), tx.owners(), trie);
+            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), trie);
             let side = classified.first_side_at(local_shard);
             CommittedMember {
                 member: Member::of(classified, local_shard, side, participating),
@@ -10008,7 +10008,7 @@ mod tests {
             leg(0, LegRole::Inbound, &[]),
             leg(2, LegRole::Core, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([PEER]));
         classified
     }
@@ -10027,7 +10027,7 @@ mod tests {
             leg(3, LegRole::Core, &[(1, 0)]),
         ];
         let trie = ShardTrie::from_leaves([HOME, CORE, CORE_SIBLING]);
-        let classified = Classified::freeze(&legs, &[], &trie);
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &trie);
         assert_eq!(classified.core(), &BTreeSet::from([CORE, CORE_SIBLING]));
         assert!(classified.decomposed());
         classified
@@ -10047,7 +10047,7 @@ mod tests {
             leg(3, LegRole::Outbound, &[(0, 0)]),
         ];
         let trie = ShardTrie::from_leaves([HOME, BEARER, DELIVERER]);
-        let classified = Classified::freeze(&legs, &[], &trie);
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &trie);
         assert_eq!(classified.core(), &BTreeSet::from([BEARER]));
         assert!(classified.decomposed());
         classified
