@@ -72,8 +72,8 @@ pub struct PreparedTx {
     /// reads, and the clause order the capability table is built in —
     /// which is what a lowered call's handle positions index.
     pub(crate) declaration: Declaration,
-    /// One record per bound subintent: the nullifier the batch entry
-    /// enforces, and what the cell recording its spend says.
+    /// One record per intent: the nullifier the batch entry enforces,
+    /// and what the cell recording its spend says.
     pub(crate) nullifiers: Vec<IntentRecord>,
     /// The envelope's signed compute ceilings, in fuel: one per manifest
     /// node, in node order, each metering its own node and nothing else.

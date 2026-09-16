@@ -241,16 +241,17 @@ impl Routing {
 
 /// Everything the bridge derives from an envelope.
 ///
-/// The routing identity plus the declaration hash each subintent
-/// signature must cover, in tree order. Derivation has already checked
-/// that every bound signer address is the one the matching public key
-/// derives.
+/// The routing identity plus the declaration hash each offered intent's
+/// signature must cover, in tree order. Which account a key may act as
+/// is not checked here: that is the account's own rule, judged on its
+/// shard as the sign-in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Derived {
     /// The routing identity.
     pub routing: Routing,
-    /// The principal the envelope's own signature opens — the identity
-    /// the root intent's signature badge carries.
+    /// The principal the envelope's own key derives — the key attesting
+    /// the composition's intent, and the one the payer's rule is judged
+    /// against at the fee gate.
     ///
     /// Deliberately not compared against the envelope's `fee_payer`
     /// here: whether the payer's rule admits this identity is the payer
@@ -330,8 +331,8 @@ pub struct Derived {
     /// any side, an account's sign-in needs one that issues — so they
     /// reach the classifier apart.
     pub accounts: Vec<Address>,
-    /// The nullifier cell of every bound subintent, in tree order, each
-    /// under its own signer.
+    /// The nullifier cell of every intent, in tree order, each under
+    /// the account it acts as.
     ///
     /// One of the cells the kernel writes of its own accord; the others
     /// — the record and claim of every value edge that crosses — are

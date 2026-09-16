@@ -260,9 +260,10 @@ impl Transaction {
         &self.derived().accounts
     }
 
-    /// The fee payer among [`Self::accounts`], whose vault the reservation
-    /// and the burn reach and whose home bears the core where no node
-    /// can.
+    /// The fee payer, whose vault the reservation and the burn reach and
+    /// whose home bears the core where no node can. Not necessarily
+    /// among [`Self::accounts`]: a payer's rule may admit a key that
+    /// acts as some other account.
     ///
     /// # Panics
     ///
@@ -477,8 +478,9 @@ impl Transaction {
         }
     }
 
-    /// The principal the envelope's signature opens — the identity the
-    /// root intent presents as evidence.
+    /// The principal the envelope's key derives: the key attesting the
+    /// composition's intent, judged against the payer's rule at the fee
+    /// gate.
     ///
     /// # Panics
     ///
@@ -640,11 +642,11 @@ pub enum TransactionVerifyError {
 }
 
 /// Construction asserts: the body decodes, the envelope names this
-/// session's network, the composer's ed25519 signature covers the
-/// envelope content, the tree admits and routes under the context's
+/// session's network, the composer's signature covers the envelope
+/// content, the tree admits and routes under the context's
 /// [`crate::Derivation`] (which caches the derived identity on the
-/// transaction and binds every subintent signer address to its public
-/// key), and every subintent signature covers its declaration hash.
+/// transaction), and every offered intent's signature covers its
+/// declaration hash.
 ///
 /// The network check runs before the signature: the named network is
 /// signed content, so a transaction composed for another network fails
