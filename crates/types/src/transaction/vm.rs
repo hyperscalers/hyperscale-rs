@@ -11,8 +11,8 @@
 use std::sync::OnceLock;
 
 pub use hyperscale_vm_types::{
-    AccountSigner, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier, SubintentSig,
-    TransactionBody, TransactionEnvelope,
+    AccountSigner, MAX_INTENTS, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier,
+    SubintentSig, TransactionBody, TransactionEnvelope,
 };
 use hyperscale_vm_types::{DeclaredWork, LegShape, SubstateKey};
 use thiserror::Error;

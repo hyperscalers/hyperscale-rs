@@ -551,8 +551,8 @@ mod tests {
         stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, MAX_SUBINTENTS,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
+        Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, MAX_INTENTS,
+        MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
         PredecessorTerminal, RoutePrefix, TimestampRange, TransactionDecision, UnsettledTx,
         ValidatorSet,
     };
@@ -1100,13 +1100,13 @@ mod tests {
         // Fill the cap, then offer one that cannot fit followed by one
         // that can. Skipping rather than stopping is what keeps a large
         // composition from starving the small ones behind it. Each fully
-        // composed transaction creates its subintents' nullifiers, all
-        // on this one shard, and its committed cell beside them — which
-        // every transaction writes, so the smallest one still costs one.
+        // composed transaction creates one nullifier per intent, all on
+        // this one shard, and its committed cell beside them — which
+        // every transaction writes, so the smallest one still costs two.
         // Every nullifier is a signature to verify, so enough fully
         // composed transactions to fill the cap would pass the compute
         // cap first; the fold starts near the cap and three fill it.
-        let cells = MAX_SUBINTENTS + 1;
+        let cells = MAX_INTENTS + 1;
         let full = 3;
         let provisions = ProvisionsFold::default();
         let mut fold = TransactionsFold::beside(&provisions);
