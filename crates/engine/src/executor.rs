@@ -37,7 +37,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, IntentRecord,
-    JudgedLeaf, NodeCall, PackageHash, admit_tree, legs_of, package_hash,
+    PackageHash, admit_tree, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
@@ -322,24 +322,6 @@ impl CodeAvailability for AllCodeRuns {
     }
 }
 
-/// Whether a preparation holds each intent's sign-in to the keys that
-/// attested it.
-///
-/// The engine's own, and only a preview waives it: a wallet asking what
-/// an envelope would do before its counterparties have signed has no
-/// keys to judge, so admission is told to assume each account attested
-/// its own intent and the conditions that judgment would answer are
-/// dropped below. Nothing on a commit path prepares under `Assumed`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TargetAuthority {
-    /// The sign-in as the chain judges it, from the envelope's own keys.
-    Required,
-    /// Every account taken to have attested its own intent, and the
-    /// injected sign-in conditions dropped with the rest of the
-    /// judgment a preview does not hold.
-    Assumed,
-}
-
 impl Executor {
     /// Build the engine, its derivation, and the process-wide protocol
     /// answers (first installation wins, so co-hosted nodes sharing one
@@ -564,7 +546,7 @@ impl Executor {
         chain: &dyn ChainRecords,
         packages: &PackageCache,
     ) -> Result<PreparedTx, String> {
-        Self::prepare_with_authority(tx, chain, packages, TargetAuthority::Required)
+        Self::prepare_admitting(tx, chain, packages).map(|(prepared, _)| prepared)
     }
 
     /// [`Self::prepare`] for a member running the transaction's shape:
@@ -715,23 +697,7 @@ impl Executor {
         })
     }
 
-    /// [`Self::prepare`] with the target-authority rule made optional.
-    ///
-    /// Only a preview waives it, and only when its caller asked to be
-    /// shown what an envelope would do before its counterparties have
-    /// signed. Nothing on the commit path reaches this with
-    /// [`TargetAuthority::Assumed`].
-    pub(crate) fn prepare_with_authority(
-        tx: &Transaction,
-        chain: &dyn ChainRecords,
-        packages: &PackageCache,
-        authority: TargetAuthority,
-    ) -> Result<PreparedTx, String> {
-        Self::prepare_admitting(tx, chain, packages, authority).map(|(prepared, _)| prepared)
-    }
-
-    /// [`Self::prepare_with_authority`], keeping the admitted form it
-    /// lowered from.
+    /// [`Self::prepare`], keeping the admitted form it lowered from.
     ///
     /// The commit path drops it — what a block runs is the entry — and a
     /// preview keeps it, because a refusal is explained against the
@@ -741,7 +707,6 @@ impl Executor {
         tx: &Transaction,
         chain: &dyn ChainRecords,
         packages: &PackageCache,
-        authority: TargetAuthority,
     ) -> Result<(PreparedTx, Admitted), String> {
         let vm = tx.body();
         let tree = decode_tree(
@@ -756,15 +721,12 @@ impl Executor {
         // key that names no principal at all.
         let signer = principal_for(vm.signer_scheme, &vm.signer)
             .ok_or_else(|| "the envelope's signer key derives no principal".to_string())?;
-        // Whose keys attested each intent. A preview asked before the
-        // counterparties have signed has none to read, so it says what
-        // it is assuming; a commit path reads the envelope's own.
-        let attested_by = match authority {
-            TargetAuthority::Required => {
-                attesting_sets(vm, &tree, signer).map_err(|error| error.to_string())?
-            }
-            TargetAuthority::Assumed => tree.assume_self_attested(),
-        };
+        // Whose keys attested each intent, read off the envelope's own
+        // signatures. A preview reads them the same way a commit path
+        // does: a gate names an account, and only an intent that account
+        // signed presents it, so there is nothing an unsigned envelope
+        // could be assumed into that signing it would not also do.
+        let attested_by = attesting_sets(vm, &tree, signer).map_err(|error| error.to_string())?;
         // The records the caller answers with. Admission composes the
         // envelope's own over these itself, and holds each to standing
         // for the seal of the component it derives.
@@ -806,36 +768,8 @@ impl Executor {
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
         // order capability materialization walks.
-        let mut declaration = admitted.admitted.declaration().clone();
-        if authority == TargetAuthority::Assumed {
-            // The sign-in admission injected is a judgment on keys this
-            // preview does not have, so it goes with the `requires`
-            // below rather than being answered on an assumption the
-            // account never made.
-            declaration.conditions.retain(|condition| {
-                !condition
-                    .rule
-                    .leaves()
-                    .any(|leaf| matches!(leaf, JudgedLeaf::Signed { .. }))
-            });
-        }
-        let calls = match authority {
-            TargetAuthority::Required => admitted.admitted.calls().to_vec(),
-            // A preview shown before its counterparties have signed:
-            // every guarded call is answered as if whoever it names
-            // had presented themselves. The lie is told at admission's
-            // door and here, and nowhere on the commit path.
-            TargetAuthority::Assumed => admitted
-                .admitted
-                .calls()
-                .iter()
-                .cloned()
-                .map(|call| NodeCall {
-                    requires: Vec::new(),
-                    ..call
-                })
-                .collect(),
-        };
+        let declaration = admitted.admitted.declaration().clone();
+        let calls = admitted.admitted.calls().to_vec();
         Ok((
             PreparedTx {
                 // Whole until the batch pipeline plans the member for its

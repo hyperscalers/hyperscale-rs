@@ -371,11 +371,14 @@ mod tests {
 
     const NETWORK: NetworkId = NetworkId(242);
 
+    /// A transfer is two nodes: the withdrawal the sender's account
+    /// gates, and the deposit nobody refuses.
+    ///
+    /// The withdrawal presents the intent's own signature, which resolves
+    /// to the account it acts as — so nothing signs in ahead of it and
+    /// the edge the deposit consumes is the first node's.
     #[test]
-    fn a_transfer_is_the_graph_the_hand_written_one_was() {
-        // The signatures type the edge exactly as the hand-assembled graph
-        // asserted it, so adopting the builder moved no manifest hash and
-        // therefore no transaction identity.
+    fn a_transfer_is_a_withdrawal_and_a_deposit() {
         let client = Client::genesis(NETWORK);
         let from = test_principal(0x11);
         let to = test_principal(0x22);
@@ -385,25 +388,19 @@ mod tests {
                 nodes: vec![
                     GraphNode {
                         target: from.into(),
-                        method: "authorize".into(),
-                        args: vec![],
-                        evidence: [EvidenceRef::IntentSignature].into(),
-                    },
-                    GraphNode {
-                        target: from.into(),
                         method: "withdraw".into(),
                         args: vec![
                             GraphArg::Literal(Value::Address(PROTOCOL_RESOURCE.address())),
                             GraphArg::Literal(Value::U128(100)),
                         ],
-                        evidence: [EvidenceRef::Node(0)].into(),
+                        evidence: [EvidenceRef::IntentSignature].into(),
                     },
                     GraphNode {
                         target: to.into(),
                         method: "deposit".into(),
                         args: vec![GraphArg::Edge {
                             edge: EdgeRef {
-                                producer: 1,
+                                producer: 0,
                                 output: 0,
                             },
                             constraints: vec![Constraint::ResourceIs(*PROTOCOL_RESOURCE)],
@@ -488,9 +485,9 @@ mod tests {
             message: Vec::new(),
         };
 
-        // A transfer lowers to three nodes, so a preview reporting three
+        // A transfer lowers to two nodes, so a preview reporting two
         // figures is what the envelope signs.
-        let measured = vec![1_234, 5_678, 9_012];
+        let measured = vec![1_234, 5_678];
         let previewed = client
             .transfer(
                 &signer,

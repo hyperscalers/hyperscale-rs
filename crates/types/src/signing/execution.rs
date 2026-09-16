@@ -8,7 +8,7 @@ use crate::{ExecutionCertificate, GlobalReceiptRoot, Hash, ShardId, TickId, Weig
 
 /// What an execution vote's signature covers.
 ///
-/// Used for both individual [`ExecutionVote`] signatures and
+/// Used for both individual [`ExecutionVote`](crate::ExecutionVote) signatures and
 /// [`ExecutionCertificate`] aggregated signature verification. The
 /// `tick_id` is self-contained (shard + block height + remote shards), so
 /// no separate block hash is needed.

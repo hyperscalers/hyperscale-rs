@@ -1279,9 +1279,13 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
     assert_eq!(mine.footprint + theirs.footprint, whole.footprint);
     assert_eq!(mine.retention, whole.retention);
     assert_eq!(theirs.retention, whole.retention);
-    assert!(
-        mine.compute > theirs.compute,
-        "the payer's shard runs the sign-in and the withdraw"
+    // A node each, and a verification each: the withdrawal the payer's
+    // shard runs and the deposit the recipient's are the whole of it,
+    // since the sign-in that used to sit beside the withdrawal is the
+    // signature the intent already carries.
+    assert_eq!(
+        mine.compute, theirs.compute,
+        "one node and one verification on each side"
     );
     assert!(
         theirs.compute > verification,
@@ -2897,10 +2901,7 @@ fn free_credit_reports_the_fee_without_charging_it() {
         &accounts,
         &executor,
         &tx,
-        PreviewGrants {
-            free_credit: true,
-            ..PreviewGrants::default()
-        },
+        PreviewGrants { free_credit: true },
     );
 
     assert_eq!(credited.fee, charged.fee, "the fee is priced either way");
@@ -3080,16 +3081,17 @@ fn a_preview_refuses_an_envelope_that_signed_no_ceilings() {
     assert!(report.changes.is_empty());
 }
 
-/// A preview holds a node to its target's authority like the chain does,
-/// and the grant is what a wallet reaches for when it wants an answer
-/// about an envelope its counterparties have not signed yet.
+/// A preview holds a node to its target's authority exactly as the chain
+/// does, and nothing a caller may grant moves it.
 ///
-/// Without it, a wallet composing a two-party trade would be told the
-/// gate refused and have nothing to show the user. With it, the report
-/// is what the composition would do once signed — which is exactly the
-/// question being asked.
+/// The withdrawal names Alice and the intent acts as the payer; both are
+/// signed content, so admission compares them itself and the shape never
+/// becomes a transaction. There is nothing to assume past: acting as
+/// Alice means an intent Alice signed, so an envelope without one is not
+/// an envelope waiting for a signature — it is a different envelope, and
+/// a wallet composing a two-party trade assembles that one instead.
 #[test]
-fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
+fn a_node_reaching_for_another_partys_authority_never_previews() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (alice(), 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
@@ -3098,37 +3100,17 @@ fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
     let tx = signed_transfer_with_fee(7, alice(), bob(), 100, PREVIEW_CEILING);
 
     let held = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
-    let PreviewOutcome::Aborted { reason } = &held.outcome else {
+    let PreviewOutcome::Refused { reason } = &held.outcome else {
         panic!("outcome = {:?}", held.outcome);
     };
     assert!(
-        reason.contains("satisfies a required rule"),
+        reason.contains("does not satisfy what it must"),
         "reason = {reason}"
     );
-    // The one change is the fee the payer would pay for the attempt.
-    // Neither party to the transfer appears at all: nothing left the
-    // account the gate refused for, and nothing arrived.
-    assert_eq!(
-        held.changes.len(),
-        1,
-        "only the fee for the attempt: {:?}",
-        held.changes
-    );
-    assert_eq!(held.changes[0].key.owner, payer.address());
-
-    let granted = preview_on(
-        &accounts,
-        &executor,
-        &tx,
-        PreviewGrants {
-            assume_target_auth: true,
-            ..PreviewGrants::default()
-        },
-    );
-    assert_eq!(granted.outcome, PreviewOutcome::Completed);
-    assert_eq!(change_for(&granted, alice()).debit, 0);
-    assert_eq!(change_for(&granted, alice()).settled, 100);
-    assert_eq!(change_for(&granted, bob()).credit, 100);
+    // Nothing is priced and nothing moves: a shape admission refuses is
+    // not a transaction, so there is no attempt for the payer to fund.
+    assert_eq!(held.fee, 0);
+    assert!(held.changes.is_empty(), "{:?}", held.changes);
 }
 
 /// A publish previews too, and it prices through the table like
