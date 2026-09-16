@@ -92,7 +92,7 @@ Divergence recovery defends against one failure mode: a replica whose local exec
 
 ## 8. Retiring state
 
-A committed cell can be written and overwritten; nothing retires one on a schedule. Some kernel state is owed only for a bounded time — a subintent nullifier stops being replay protection once no chain can still be deciding a spend of the subintent — and without a sweep that state is permanent.
+A committed cell can be written and overwritten; nothing retires one on a schedule. Some kernel state is owed only for a bounded time — an intent's nullifier stops being replay protection once no chain can still be deciding a spend of the intent — and without a sweep that state is permanent.
 
 Removing a cell moves the state root, so a sweep is a consensus operation. Three things follow.
 
