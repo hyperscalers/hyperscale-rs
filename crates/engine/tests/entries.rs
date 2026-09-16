@@ -58,14 +58,19 @@ fn client() -> &'static Client {
 const fn terms() -> Terms {
     Terms {
         max_fee: 1_000,
-        validity: TimestampRange::new(
-            WeightedTimestamp::from_millis(0),
-            WeightedTimestamp::from_millis(OFFER_MS),
-        ),
         ceilings: Ceilings::Guessed,
         priority_bp: 0,
         message: Vec::new(),
     }
+}
+
+/// The window every envelope here is signed for: the widest an intent
+/// may name, so nothing narrows a transaction.
+const fn validity() -> TimestampRange {
+    TimestampRange::new(
+        WeightedTimestamp::from_millis(0),
+        WeightedTimestamp::from_millis(OFFER_MS),
+    )
 }
 
 /// The holdings interval of `who`'s instances of `resource`.
@@ -118,7 +123,7 @@ fn signed_nf_transfer(from: u8, to: u8, ids: &[u64]) -> Transaction {
     let funds = account::withdraw_nf(&mut b, principal(from), NF, ids).expect("withdraw-nf types");
     account::deposit_nf(&mut b, principal(to), funds).expect("deposit-nf types");
     let graph = b.build().expect("every output is consumed");
-    Transaction::new(client().sign(graph, &key_of(from), terms()))
+    Transaction::new(client().sign(graph, &key_of(from), validity(), terms()))
 }
 
 /// `who.present-instance(badge, id)`: custody presented as evidence,
@@ -131,7 +136,7 @@ fn signed_present(who: u8, badge: ResourceAddr, id: u64) -> Transaction {
     let _ = account::present_instance(&mut b, principal(who), badge, id)
         .expect("present-instance types");
     let graph = b.build().expect("a dangling proof is not an output");
-    Transaction::new(client().sign(graph, &key_of(who), terms()))
+    Transaction::new(client().sign(graph, &key_of(who), validity(), terms()))
 }
 
 /// Execute one transaction as one tick's batch over the store's current

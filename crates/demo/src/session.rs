@@ -469,9 +469,9 @@ impl Session {
                 &signer_from_seed(from),
                 account_from_seed(to),
                 TRANSFER_AMOUNT,
+                validity_around(self.now),
                 Terms {
                     max_fee: TRANSFER_MAX_FEE,
-                    validity: validity_around(self.now),
                     ceilings: Ceilings::Guessed,
                     priority_bp: 0,
                     message: self.nonce.to_le_bytes().to_vec(),
