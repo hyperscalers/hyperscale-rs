@@ -285,31 +285,35 @@ pub fn declared_vector(
     })
 }
 
-/// Whether the envelope's subintent signatures answer the tree it binds:
-/// one per subintent, each key deriving the address that subintent
-/// names.
+/// Whose keys attest each intent, in tree order, read off the envelope.
 ///
 /// The addresses only. The signatures themselves verify at the
-/// transaction gate, over the declaration hashes admission returns —
-/// what is checked here is that the material a gate would verify belongs
-/// to the account the tree declared for each intent.
+/// transaction gate, over the declaration hashes admission returns; and
+/// whether a key may act as the account its intent names is neither
+/// stage's — that is the account's own rule, read on its own shard as
+/// the sign-in. A key reaching for an account it does not derive is
+/// admissible and refused there, before any body runs, at the price of
+/// the reach. What is refused here is a key that names no principal at
+/// all, and an arity that does not match: the composition's own intent
+/// leads and is attested by the envelope's key, every intent after it
+/// by one of `subintent_sigs` in the same order, so an envelope
+/// carrying a signature for an intent it does not hold — or holding an
+/// intent nothing signs — never reaches admission.
 ///
-/// The composition's own intent leads and is attested by the envelope's
-/// signature; every intent after it carries one of `subintent_sigs`, in
-/// the same order. So the arity is one fewer signature than intents, and
-/// an envelope carrying a signature for an intent it does not hold —
-/// or holding an intent nothing signs — is refused before anything is
-/// admitted.
 /// # Errors
 ///
 /// [`DerivationError::Refused`] on a body with no intent, a count of
 /// signatures that does not match the offered intents, or a key that
-/// derives no principal at all.
+/// derives no principal.
 pub fn attesting_sets(
     vm: &TransactionEnvelope,
     tree: &EnvelopeTree,
-    signer: PrincipalAddr,
 ) -> Result<Vec<Vec<PrincipalAddr>>, DerivationError> {
+    let Some(signer) = principal_for(vm.signer_scheme, &vm.signer) else {
+        return Err(DerivationError::Refused(
+            "the envelope's signer key derives no principal".into(),
+        ));
+    };
     let Some((_, offered)) = tree.intents.split_first() else {
         return Err(DerivationError::Refused(
             "a call body carries no intent at all".into(),
@@ -322,13 +326,6 @@ pub fn attesting_sets(
             vm.subintent_sigs.len()
         )));
     }
-    // What derivation records is which key attested which intent, and
-    // never whether that key derives the account the intent acts as.
-    // Those are two facts, and only the second is anybody's to judge
-    // here: whether an account admits a key is state its own cell holds,
-    // read on its own shard as the sign-in. A key reaching for an account
-    // it does not derive is admissible and refused there, before any body
-    // runs, at the price of the reach.
     let mut sets = vec![vec![signer]];
     for (index, sig) in vm.subintent_sigs.iter().enumerate() {
         let Some(key) = principal_for(sig.scheme, &sig.public_key) else {
@@ -340,6 +337,75 @@ pub fn attesting_sets(
         sets.push(vec![key]);
     }
     Ok(sets)
+}
+
+/// A call envelope decoded and read for who attests what, ahead of
+/// admission.
+///
+/// The half of a derivation a preview shares. Both read the tree, the
+/// attesting sets and the identity off the envelope and admit under the
+/// same rule, and holding that in one place is what keeps a preview
+/// from reporting a verdict the chain would not reach.
+pub struct CallEnvelope<'a> {
+    vm: &'a TransactionEnvelope,
+    /// The bound tree the envelope carries.
+    pub tree: EnvelopeTree,
+    /// Whose keys attest each intent, in tree order.
+    pub attested_by: Vec<Vec<PrincipalAddr>>,
+}
+
+impl<'a> CallEnvelope<'a> {
+    /// Decode the tree and read the attesting sets.
+    ///
+    /// # Errors
+    ///
+    /// [`DerivationError::Refused`] on a publish body, a tree that does
+    /// not decode, or the arity and key refusals of [`attesting_sets`].
+    pub fn decode(vm: &'a TransactionEnvelope) -> Result<Self, DerivationError> {
+        let Some(bytes) = vm.call_tree() else {
+            return Err(DerivationError::Refused(
+                "a publish body carries no call tree".into(),
+            ));
+        };
+        let tree = decode_tree(bytes)?;
+        let attested_by = attesting_sets(vm, &tree)?;
+        Ok(Self {
+            vm,
+            tree,
+            attested_by,
+        })
+    }
+
+    /// The principal the envelope's own key derives: the key attesting
+    /// the composition's intent, and the one the payer's rule is judged
+    /// against at the fee gate.
+    #[must_use]
+    pub fn signer(&self) -> PrincipalAddr {
+        self.attested_by[0][0]
+    }
+
+    /// Admit the tree against `chain`, and hold the signed terms to the
+    /// manifest it lowered to: one ceiling per node, summing under the
+    /// bound, and a priority under its own.
+    ///
+    /// # Errors
+    ///
+    /// [`DerivationError::Refused`] with admission's own explanation, or
+    /// the terms refusal.
+    pub fn admit(&self, chain: &dyn ChainRecords) -> Result<AdmittedTree, DerivationError> {
+        let admitted = admit_tree(
+            &self.tree,
+            &self.attested_by,
+            envelope_identity(self.vm),
+            chain,
+            &ProtocolHasher,
+        )
+        .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
+        self.vm
+            .admit_terms(admitted.admitted.calls().len())
+            .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
+        Ok(admitted)
+    }
 }
 
 /// What a transaction declares, as the derivation reads it off the tree:
@@ -967,9 +1033,8 @@ impl Derivation for BridgeStatics {
         if let Some(artifact) = vm.artifact() {
             return Self::derive_publish(vm, signer, artifact);
         }
-        let tree = decode_tree(vm.call_tree().unwrap_or_default())?;
-        let effective_window = effective_window(vm, &tree)?;
-        let attested_by = attesting_sets(vm, &tree, signer)?;
+        let call = CallEnvelope::decode(vm)?;
+        let effective_window = effective_window(vm, &call.tree)?;
         // What the chain answers a target with: genesis, grown by every
         // seal that has committed since. Admission layers the tree's own
         // records behind these itself, holding each to standing for the
@@ -983,18 +1048,11 @@ impl Derivation for BridgeStatics {
         // admission runs. Admission refuses at the first one it meets,
         // and a fetch wants the whole set: one round trip rather than
         // one per component the envelope calls.
-        let unresolved = unresolved_targets(&tree, &chain);
+        let unresolved = unresolved_targets(&call.tree, &chain);
         if !unresolved.is_empty() {
             return Err(DerivationError::Unresolved(unresolved));
         }
-        let admitted_tree = admit_tree(
-            &tree,
-            &attested_by,
-            envelope_identity(vm),
-            &chain,
-            &ProtocolHasher,
-        )
-        .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
+        let admitted_tree = call.admit(&chain)?;
         let admitted = &admitted_tree.admitted;
 
         let DeclaredAccess {
@@ -1020,11 +1078,6 @@ impl Derivation for BridgeStatics {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        // One signed ceiling per lowered node, summing under the bound,
-        // and a priority under its own: the composer's terms are held to
-        // the manifest the tree lowered to.
-        vm.admit_terms(admitted.calls().len())
-            .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         let legs = legs_of(admitted);
         let DeclaredVector {
             shares,
