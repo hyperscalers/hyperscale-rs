@@ -132,12 +132,17 @@ impl Classified {
     /// block's window here would flip at the boundary into that window
     /// while the trie did not, and two shards committing one transaction
     /// on either side of it would freeze different shapes.
+    ///
+    /// `payer` and `owners` are the routing the envelope declares beyond
+    /// any node's frame: the fee payer, whose home bears the core where
+    /// no node can, and every party the routing names.
     #[must_use]
-    pub fn freeze(legs: &[LegShape], owners: &[Address], trie: &ShardTrie) -> Self {
+    pub fn freeze(legs: &[LegShape], payer: Address, owners: &[Address], trie: &ShardTrie) -> Self {
         let trie = Arc::new(trie.clone());
         let placement = Placement::Read(Arc::clone(&trie));
         let star = star_at(
             legs,
+            payer,
             owners,
             &TrieShardResolver { trie: &trie },
             &ProtocolHasher,
@@ -503,7 +508,8 @@ pub fn local_work_over<'a>(
         .into_iter()
         .fold(DeclaredWork::ZERO, |total, tx| {
             total.saturating_add(
-                Classified::freeze(tx.legs(), tx.owners(), trie).local_work(tx, shard),
+                Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), trie)
+                    .local_work(tx, shard),
             )
         })
 }
@@ -981,7 +987,7 @@ mod tests {
     }
 
     fn frozen(legs: &[LegShape]) -> Classified {
-        let classified = Classified::freeze(legs, &[], &trie());
+        let classified = Classified::freeze(legs, legs[0].target, &[], &trie());
         assert!(classified.decomposed(), "the fixture has to decompose");
         classified
     }
@@ -1142,7 +1148,7 @@ mod tests {
     fn a_non_participant_is_a_defect() {
         let legs = swap();
         let elsewhere = ShardTrie::uniform(2);
-        let divided_deeper = Classified::freeze(&legs, &[], &elsewhere);
+        let divided_deeper = Classified::freeze(&legs, legs[0].target, &[], &elsewhere);
         assert!(divided_deeper.decomposed());
         // Under a four-leaf trie the low owners sit at path 0 and the
         // venue at path 2, so leaf 1 runs nothing.
@@ -1233,7 +1239,7 @@ mod tests {
             leg(owner_at(0x13, 2), LegRole::Core, &[(2, 0)], 3),
             leg(owner_at(0x14, 1), LegRole::Outbound, &[(3, 0)], 4),
         ];
-        let classified = Classified::freeze(&legs, &[], &trie);
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &trie);
         assert!(classified.decomposed());
         assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
         let edges = classified.edges();
@@ -1279,7 +1285,7 @@ mod tests {
             leg(owner_at(0x13, 2), LegRole::Core, &[(2, 0)], 3),
             leg(owner_at(0x14, 1), LegRole::Outbound, &[(3, 0)], 4),
         ];
-        let classified = Classified::freeze(&legs, &[], &trie);
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &trie);
         assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
         for shard in [leaf0, leaf2] {
             assert_eq!(
@@ -1333,7 +1339,7 @@ mod tests {
             leg(owner_at(0x14, 0), LegRole::Inbound, &[], 3),
             leg(owner_at(0x15, 0), LegRole::Outbound, &[(2, 0), (3, 0)], 4),
         ];
-        let classified = Classified::freeze(&legs, &[], &trie);
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &trie);
         assert!(classified.decomposed());
         assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
         assert_eq!(
@@ -1387,7 +1393,7 @@ mod tests {
             leg(here, LegRole::Core, &[(0, 0)], 1),
             leg(sibling, LegRole::Core, &[(1, 0)], 2),
         ];
-        let classified = Classified::freeze(&legs, &[], &trie);
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &trie);
         assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
 
         let core = classified.judges_for(leaf0);
@@ -1463,7 +1469,7 @@ mod tests {
             leg(alice, LegRole::Inbound, &[], 3),
             leg(alice, LegRole::Outbound, &[(2, 0), (3, 0)], 4),
         ];
-        let whole = Classified::freeze(&legs, &[], &trie());
+        let whole = Classified::freeze(&legs, legs[0].target, &[], &trie());
         assert!(!whole.decomposed());
         assert!(
             !whole.only_delivers_at(low()) && !whole.mixed_at(low()),
@@ -1472,6 +1478,6 @@ mod tests {
         let mut one_sided = legs;
         one_sided[4] = leg(alice, LegRole::Outbound, &[(2, 0)], 4);
         one_sided[3] = leg(alice, LegRole::Outbound, &[], 3);
-        assert!(Classified::freeze(&one_sided, &[], &trie()).decomposed());
+        assert!(Classified::freeze(&one_sided, one_sided[0].target, &[], &trie()).decomposed());
     }
 }

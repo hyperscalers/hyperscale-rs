@@ -18,11 +18,22 @@ pub fn leaf(path: u64) -> ShardId {
     ShardId::leaf(2, path)
 }
 
-/// A leg on the leaf at `path`, consuming `edges` as `(source, output)`.
-pub fn leg(path: u8, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
+/// The address a node on the leaf at `path` targets.
+pub fn owner_at(path: u8) -> Address {
     let mut body = [0x11; 31];
     body[0] = path << 6;
-    let target = Address::new(body, AddressClass::Component);
+    Address::new(body, AddressClass::Component)
+}
+
+/// The fee payer every shape here is composed by: the caller on leaf 0,
+/// which each shape's first node targets.
+pub fn payer() -> Address {
+    owner_at(0)
+}
+
+/// A leg on the leaf at `path`, consuming `edges` as `(source, output)`.
+pub fn leg(path: u8, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
+    let target = owner_at(path);
     LegShape {
         target,
         role,

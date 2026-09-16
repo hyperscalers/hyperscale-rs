@@ -1024,8 +1024,13 @@ impl MempoolCoordinator {
     ) -> WeightedTimestamp {
         let validity_end = tx.validity_range().end_timestamp_exclusive;
         let delivers = cross_shard
-            && Classified::freeze(tx.legs(), tx.owners(), topology_snapshot.shard_trie())
-                .only_delivers_at(self.local_shard);
+            && Classified::freeze(
+                tx.legs(),
+                tx.fee_payer(),
+                tx.owners(),
+                topology_snapshot.shard_trie(),
+            )
+            .only_delivers_at(self.local_shard);
         if delivers {
             Window::Delivery.of(Deadline::of(validity_end)).end
         } else {
@@ -1194,7 +1199,12 @@ impl MempoolCoordinator {
             // passed over rather than ending selection — otherwise one
             // outsized envelope would stall every lighter one behind it
             // until the block cleared.
-            let classified = Classified::freeze(entry.tx.legs(), entry.tx.owners(), trie);
+            let classified = Classified::freeze(
+                entry.tx.legs(),
+                entry.tx.fee_payer(),
+                entry.tx.owners(),
+                trie,
+            );
             let next = filled.saturating_add(classified.local_work(&entry.tx, self.local_shard));
             if !budget_admits_block(&next) {
                 continue;
@@ -3307,7 +3317,8 @@ mod tests {
         let offered = mempool.ready_transactions(100, 0, trie, now, |_| true);
         let filled = offered.iter().fold(DeclaredWork::ZERO, |total, tx| {
             total.saturating_add(
-                Classified::freeze(tx.legs(), tx.owners(), trie).local_work(tx, ShardId::ROOT),
+                Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), trie)
+                    .local_work(tx, ShardId::ROOT),
             )
         });
         assert!(

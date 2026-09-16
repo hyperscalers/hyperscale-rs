@@ -856,7 +856,7 @@ where
                     && UnsettledTx::for_transaction(
                         tx,
                         entry.committed,
-                        Classified::freeze(tx.legs(), tx.owners(), &at.trie)
+                        Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &at.trie)
                             .local_price(tx, ctx.shard, &at.prices),
                         &at.prices,
                     ) == *entry;
@@ -868,7 +868,8 @@ where
                 // the lapse, and a body this shard delivers for is one
                 // frozen divided with this shard delivering.
                 held.get(&tx_hash).map(|tx| {
-                    Classified::freeze(tx.legs(), tx.owners(), &trie).only_delivers_at(ctx.shard)
+                    Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &trie)
+                        .only_delivers_at(ctx.shard)
                         && anchor >= Window::Lapse.of(Deadline::of_transaction(tx)).start
                 })
             })

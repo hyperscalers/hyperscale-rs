@@ -1531,7 +1531,7 @@ mod tests {
             leg(0, LegRole::Inbound, &[]),
             leg(2, LegRole::Core, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([PARTNER]));
         classified
     }
@@ -1593,7 +1593,7 @@ mod tests {
             leg(3, LegRole::Core, &[]),
             leg(2, LegRole::Outbound, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &[], &delivery_trie());
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &delivery_trie());
         assert_eq!(classified.core(), &BTreeSet::from([BEARER]));
         assert!(classified.decomposed());
         classified
@@ -1616,7 +1616,7 @@ mod tests {
             leg(2, LegRole::Core, &[(1, 0)]),
         ];
         let trie = ShardTrie::from_leaves([LOCAL, SIBLING, ShardId::leaf(2, 3)]);
-        let classified = Classified::freeze(&legs, &[], &trie);
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &trie);
         assert_eq!(classified.core(), &BTreeSet::from([LOCAL, SIBLING]));
         assert!(classified.decomposed());
         classified
@@ -1635,7 +1635,7 @@ mod tests {
             leg(0, LegRole::Inbound, &[]),
             leg(2, LegRole::Outbound, &[(1, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([LOCAL]));
         assert!(classified.decomposed());
         classified
@@ -1698,8 +1698,13 @@ mod tests {
         UnsettledTx {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
-            charged: Classified::freeze(tx.legs(), tx.owners(), &ShardTrie::uniform(1))
-                .local_price(tx, LOCAL, &PriceTable::GENESIS),
+            charged: Classified::freeze(
+                tx.legs(),
+                tx.fee_payer(),
+                tx.owners(),
+                &ShardTrie::uniform(1),
+            )
+            .local_price(tx, LOCAL, &PriceTable::GENESIS),
             charge: charge(tx),
             committed: committed_at(tx),
             reach: tx.routing().all_routes(),
