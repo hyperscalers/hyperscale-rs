@@ -38,7 +38,7 @@ use hyperscale_vm_effects::{
     PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
-use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder, signing};
+use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
 use hyperscale_vm_stdlib::{STAKING_MODULE, account, instantiate, staking};
 use hyperscale_vm_types::{
     Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, attestation_work,
@@ -345,16 +345,11 @@ fn signed_settle_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
     let lottery_addr = lottery_meta(salt).address(&ProtocolHasher);
-    let (mut env, mut root) =
-        EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(seed), HEADER);
+    let mut root = IntentBuilder::new(&composed, &ProtocolHasher, fee_payer(seed), HEADER);
     lottery::Lottery::at(lottery_addr)
         .settle(&mut root, 64)
         .expect("a lottery answers a settlement");
-    env.seal(root)
-        .expect("the root declares nothing to discharge")
-        .none()
-        .expect("the root declares no socket");
-    let tree = env.build().expect("the intent declares no hole");
+    let tree = root.build().expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, &key, terms(max_fee)))
 }
 
@@ -385,15 +380,11 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         let chain = client().records();
         let composed = Composed::new(&chain, &[lottery_meta(*salt)], &ProtocolHasher);
         let round = lottery_meta(*salt).address(&ProtocolHasher);
-        let (mut env, mut root) =
-            EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED), HEADER);
+        let mut root =
+            IntentBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED), HEADER);
         instantiate(&mut root, round, ()).expect("a derivable round answers its seal");
-        env.register_instance(lottery_meta(*salt));
-        env.seal(root)
-            .expect("the root declares nothing to discharge")
-            .none()
-            .expect("the root declares no socket");
-        let tree = env.build().expect("the intent declares no hole");
+        root.register_instance(lottery_meta(*salt));
+        let tree = root.build().expect("the intent declares no hole");
         let seal = Transaction::new(client().sign_tree(&tree, &key, terms(1_000_000)));
         let executed = execute_batch_on(
             &store,
@@ -428,15 +419,11 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
 fn closing_tree(salt: u8, signer: PrincipalAddr) -> EnvelopeTree {
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, signer, HEADER);
+    let mut root = IntentBuilder::new(&composed, &ProtocolHasher, signer, HEADER);
     lottery::Lottery::at(lottery_meta(salt).address(&ProtocolHasher))
         .close(&mut root)
         .expect("a lottery answers a close");
-    env.seal(root)
-        .expect("the root declares nothing to discharge")
-        .none()
-        .expect("the root declares no socket");
-    env.build().expect("the intent declares no hole")
+    root.build().expect("the intent declares no hole")
 }
 
 /// The environment a round sealed in this file's epoch grid opens

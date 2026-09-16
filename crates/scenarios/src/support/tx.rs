@@ -31,7 +31,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{
-    EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError, signing,
+    GraphBuilder, IntentBuilder, TypedBuilder, TypedError, signing,
 };
 use hyperscale_vm_sdk::client::VaultField;
 use hyperscale_vm_stdlib::{STAKING_MODULE, account, account_artifact, instantiate, staking};
@@ -1293,7 +1293,7 @@ pub(crate) fn build_instantiate_tx(
         .map(|meta| meta.address(&ProtocolHasher))
         .collect();
     let founder = account_address(&payer.public_key().0);
-    let (mut env, mut root) = EnvelopeBuilder::new(
+    let mut root = IntentBuilder::new(
         &composed,
         &ProtocolHasher,
         founder,
@@ -1303,13 +1303,9 @@ pub(crate) fn build_instantiate_tx(
         instantiate(&mut root, address, ()).expect("a derivable lottery answers its seal");
     }
     for meta in lotteries {
-        env.register_instance(meta.clone());
+        root.register_instance(meta.clone());
     }
-    env.seal(root)
-        .expect("the root declares nothing to discharge")
-        .none()
-        .expect("the root declares no socket");
-    let tree = env.build().expect("the intent declares no hole");
+    let tree = root.build().expect("the intent declares no hole");
 
     Transaction::new(client.sign_tree(
         &tree,
@@ -1393,7 +1389,7 @@ fn build_lottery_tx(
         .iter()
         .map(|meta| meta.address(&ProtocolHasher))
         .collect();
-    let (mut env, mut root) = EnvelopeBuilder::new(
+    let mut root = IntentBuilder::new(
         &composed,
         &ProtocolHasher,
         account_address(&payer.public_key().0),
@@ -1402,11 +1398,7 @@ fn build_lottery_tx(
     for address in addresses {
         leg(&lottery::Lottery::at(address), &mut root);
     }
-    env.seal(root)
-        .expect("the root declares nothing to discharge")
-        .none()
-        .expect("the root declares no socket");
-    let tree = env.build().expect("the intent declares no hole");
+    let tree = root.build().expect("the intent declares no hole");
 
     Transaction::new(client.sign_tree(
         &tree,
@@ -2077,18 +2069,14 @@ fn build_venues_tx(
         .iter()
         .map(|venue| amm::Amm::at(venue.address(&ProtocolHasher)))
         .collect();
-    let (mut env, mut root) = EnvelopeBuilder::new(
+    let mut root = IntentBuilder::new(
         &composed,
         &ProtocolHasher,
         account_address(&payer.public_key().0),
         scenario_header(validity),
     );
     route(&pools, &mut root).expect("every venue call types against its signature");
-    env.seal(root)
-        .expect("the root declares nothing to discharge")
-        .none()
-        .expect("the root declares no socket");
-    let tree = env.build().expect("the intent declares no hole");
+    let tree = root.build().expect("the intent declares no hole");
 
     Transaction::new(client.sign_tree(
         &tree,
@@ -2436,7 +2424,7 @@ pub(crate) fn build_composed_tx(
 
     let client = client();
     let chain = client.records();
-    let (mut env, mut root) = EnvelopeBuilder::new(
+    let mut root = IntentBuilder::new(
         &chain,
         &ProtocolHasher,
         account_address(&composer.public_key().0),
@@ -2444,19 +2432,15 @@ pub(crate) fn build_composed_tx(
     );
     let funds = account::withdraw(&mut root, from, *PROTOCOL_RESOURCE, amount)
         .expect("an account answers a withdrawal");
-    let paid = root.export(funds);
-    let wants = env
+    let wants = root
         .adopt(signed)
         .expect("the request discharges its own hole")
+        .sockets
         .one()
         .expect("the request declares one parameter");
-    env.seal(root)
-        .expect("the composer declares no hole")
-        .none()
-        .expect("the composer declares no socket");
-    env.bind(wants, paid)
+    root.bind(wants, funds)
         .expect("the request's hole takes an edge");
-    let tree = env.build().expect("the request's hole is bound");
+    let tree = root.build().expect("the request's hole is bound");
 
     Transaction::new(client.sign_tree(
         &tree,
@@ -2544,7 +2528,7 @@ fn declaration_under(
 ) -> Intent {
     let client = client();
     let chain = client.records();
-    let mut decl = IntentBuilder::declaration(&chain, &ProtocolHasher, signer, header);
+    let mut decl = IntentBuilder::new(&chain, &ProtocolHasher, signer, header);
     write(&mut decl).expect("every scenario call types against its signature");
     decl.into_decl()
         .expect("the declaration discharges its own holes")
