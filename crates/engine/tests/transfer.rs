@@ -386,8 +386,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         let round = lottery_meta(*salt).address(&ProtocolHasher);
         let (mut env, mut root) =
             EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED), HEADER);
-        instantiate(&mut root, fee_payer(SEALER_SEED), round, ())
-            .expect("a derivable round answers its seal");
+        instantiate(&mut root, round, ()).expect("a derivable round answers its seal");
         env.register_instance(lottery_meta(*salt));
         env.seal(root)
             .expect("the root declares nothing to discharge")

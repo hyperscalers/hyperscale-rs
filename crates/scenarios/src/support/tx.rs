@@ -1302,7 +1302,7 @@ pub(crate) fn build_instantiate_tx(
         scenario_header(validity),
     );
     for address in addresses {
-        instantiate(&mut root, founder, address, ()).expect("a derivable lottery answers its seal");
+        instantiate(&mut root, address, ()).expect("a derivable lottery answers its seal");
     }
     for meta in lotteries {
         env.register_instance(meta.clone());

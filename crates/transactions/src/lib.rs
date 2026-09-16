@@ -331,8 +331,10 @@ impl Client {
             .expect("a composed envelope stays within the wire caps")
     }
 
-    /// A signed native-resource transfer from `from` to `to`, composed
-    /// by `payer`'s own account.
+    /// A signed native-resource transfer to `to` from the account
+    /// `payer`'s own key derives, which is the account the intent acts
+    /// as. Paying from an account the key does not derive is
+    /// [`build_transfer_paid_by`](crate::build_transfer_paid_by)'s.
     ///
     /// # Errors
     ///
@@ -340,12 +342,11 @@ impl Client {
     pub fn transfer<S: AccountSigner>(
         &self,
         payer: &S,
-        from: PrincipalAddr,
         to: PrincipalAddr,
         amount: u128,
         terms: Terms,
     ) -> Result<Transaction, TypedError> {
-        let graph = self.transfer_graph(from, to, amount)?;
+        let graph = self.transfer_graph(principal_of(payer), to, amount)?;
         Ok(Transaction::new(self.sign(graph, payer, terms)))
     }
 }
@@ -435,7 +436,6 @@ mod tests {
         let transfer = client
             .transfer(
                 &signer,
-                principal_of(&signer),
                 test_principal(0x22),
                 100,
                 Terms {
@@ -466,7 +466,6 @@ mod tests {
     fn a_signed_envelope_carries_the_ceilings_it_was_given() {
         let client = Client::genesis(NETWORK);
         let signer = Ed25519PrivateKey::from_bytes(&[0x31; 32]).expect("a fixture key");
-        let from = principal_of(&signer);
         let terms = |ceilings| Terms {
             max_fee: 1_000_000,
             validity: test_validity_range(),
@@ -481,7 +480,6 @@ mod tests {
         let previewed = client
             .transfer(
                 &signer,
-                from,
                 test_principal(0x22),
                 100,
                 terms(Ceilings::Measured(measured.clone())),
@@ -490,13 +488,7 @@ mod tests {
         assert_eq!(previewed.body().gas_limits, measured);
 
         let guessed = client
-            .transfer(
-                &signer,
-                from,
-                test_principal(0x22),
-                100,
-                terms(Ceilings::Guessed),
-            )
+            .transfer(&signer, test_principal(0x22), 100, terms(Ceilings::Guessed))
             .expect("an unmeasured transfer builds");
         assert_eq!(
             guessed.body().gas_limits,
