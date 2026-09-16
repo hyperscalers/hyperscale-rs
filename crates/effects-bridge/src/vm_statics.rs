@@ -25,8 +25,8 @@ use hyperscale_types::{
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
     Admitted, AdmittedTree, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree,
-    IntentHeader, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, RuleBytes, Value,
-    admit_tree, child_key, effect_units, legs_of, package_hash,
+    IntentHeader, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, Value, admit_tree,
+    auth_cell_admits, child_key, effect_units, legs_of, package_hash,
     package_key as canonical_package_key, principal_address, protocol_resource,
 };
 use hyperscale_vm_fixtures::lottery;
@@ -44,18 +44,19 @@ use crate::records::{
     sweepable_cell,
 };
 
-/// The parties a transaction's routing declares beyond any node's
-/// frame: the payer, whose vault the reservation and the burn reach,
-/// and every signer, whose nullifier a bound subintent writes. Sorted
-/// and unique, so two derivations of one envelope agree byte for byte.
-fn route_owners(vm: &TransactionEnvelope, admitted: &AdmittedTree) -> Vec<Address> {
-    std::iter::once(vm.fee_payer.address())
-        .chain(
-            admitted
-                .intents
-                .iter()
-                .map(|record| record.account.address()),
-        )
+/// The accounts a transaction's intents act as: the owner of each
+/// intent's nullifier, and of the `auth` cell its sign-in is judged
+/// against. Sorted and unique, so two derivations of one envelope agree
+/// byte for byte.
+///
+/// The payer is not folded in. Its shard needs a member of any side,
+/// which is a weaker thing than the issuing member an account's sign-in
+/// needs, so the classifier is handed the two apart.
+fn intent_accounts(admitted: &AdmittedTree) -> Vec<Address> {
+    admitted
+        .intents
+        .iter()
+        .map(|record| record.account.address())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -299,21 +300,21 @@ pub fn declared_vector(
 /// an envelope carrying a signature for an intent it does not hold —
 /// or holding an intent nothing signs — is refused before anything is
 /// admitted.
-fn check_intent_accounts(
+/// # Errors
+///
+/// [`DerivationError::Refused`] on a body with no intent, a count of
+/// signatures that does not match the offered intents, or a key that
+/// derives no principal at all.
+pub fn attesting_sets(
     vm: &TransactionEnvelope,
     tree: &EnvelopeTree,
     signer: PrincipalAddr,
-) -> Result<(), DerivationError> {
-    let Some((composed, offered)) = tree.intents.split_first() else {
+) -> Result<Vec<Vec<PrincipalAddr>>, DerivationError> {
+    let Some((_, offered)) = tree.intents.split_first() else {
         return Err(DerivationError::Refused(
             "a call body carries no intent at all".into(),
         ));
     };
-    if composed.account != signer {
-        return Err(DerivationError::Refused(
-            "the composition's intent names an account its signer's key does not derive".into(),
-        ));
-    }
     if vm.subintent_sigs.len() != offered.len() {
         return Err(DerivationError::Refused(format!(
             "envelope carries {} offered intents but {} signatures for them",
@@ -321,15 +322,24 @@ fn check_intent_accounts(
             vm.subintent_sigs.len()
         )));
     }
-    for (index, (sig, intent)) in vm.subintent_sigs.iter().zip(offered).enumerate() {
-        if principal_for(sig.scheme, &sig.public_key) != Some(intent.account) {
+    // What derivation records is which key attested which intent, and
+    // never whether that key derives the account the intent acts as.
+    // Those are two facts, and only the second is anybody's to judge
+    // here: whether an account admits a key is state its own cell holds,
+    // read on its own shard as the sign-in. A key reaching for an account
+    // it does not derive is admissible and refused there, before any body
+    // runs, at the price of the reach.
+    let mut sets = vec![vec![signer]];
+    for (index, sig) in vm.subintent_sigs.iter().enumerate() {
+        let Some(key) = principal_for(sig.scheme, &sig.public_key) else {
             return Err(DerivationError::Refused(format!(
-                "intent {} names an account its public key does not derive",
+                "the key attesting intent {} derives no principal",
                 index + 1
             )));
-        }
+        };
+        sets.push(vec![key]);
     }
-    Ok(())
+    Ok(sets)
 }
 
 /// What a transaction declares, as the derivation reads it off the tree:
@@ -893,11 +903,11 @@ impl BridgeStatics {
             // No manifest, so nothing to divide, nothing crossing, and no
             // subintent bound; the publisher pays and signs.
             legs: Vec::new(),
-            owners: [publisher.address(), signer.address()]
-                .into_iter()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+            // A publish carries no intent, so nothing acts as an
+            // account and nothing signs in. What holds the publisher's
+            // shard to the transaction is the artifact's own cell, which
+            // the write prefixes below name.
+            accounts: Vec::new(),
             nullifiers: Vec::new(),
             signer,
             routing: Routing {
@@ -959,7 +969,7 @@ impl Derivation for BridgeStatics {
         }
         let tree = decode_tree(vm.call_tree().unwrap_or_default())?;
         let effective_window = effective_window(vm, &tree)?;
-        check_intent_accounts(vm, &tree, signer)?;
+        let attested_by = attesting_sets(vm, &tree, signer)?;
         // What the chain answers a target with: genesis, grown by every
         // seal that has committed since. Admission layers the tree's own
         // records behind these itself, holding each to standing for the
@@ -977,8 +987,14 @@ impl Derivation for BridgeStatics {
         if !unresolved.is_empty() {
             return Err(DerivationError::Unresolved(unresolved));
         }
-        let admitted_tree = admit_tree(&tree, envelope_identity(vm), &chain, &ProtocolHasher)
-            .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
+        let admitted_tree = admit_tree(
+            &tree,
+            &attested_by,
+            envelope_identity(vm),
+            &chain,
+            &ProtocolHasher,
+        )
+        .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
         let admitted = &admitted_tree.admitted;
 
         let DeclaredAccess {
@@ -1032,7 +1048,7 @@ impl Derivation for BridgeStatics {
                 .iter()
                 .map(|record| record.nullifier)
                 .collect(),
-            owners: route_owners(vm, &admitted_tree),
+            accounts: intent_accounts(&admitted_tree),
             signer,
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),
@@ -1080,23 +1096,17 @@ impl ProtocolStatics for BridgeStatics {
         signer: PrincipalAddr,
         clock_ms: u64,
     ) -> bool {
-        // The verdict is the kernel gate's own, judged over the envelope
-        // signer alone — paying is governed by whatever governs
-        // `authorize`, which is the one rule the cell holds.
+        // The same function the sign-in condition is judged through, so
+        // the gate that decides inclusion and the one that decides
+        // execution cannot read one cell differently. What differs is
+        // only the question: this asks whether the payer's rule admits
+        // the envelope's signer, before anything is included at all.
         let _ = clock_ms;
-        match auth_cell {
-            // An address with nothing stored governs itself, which is the
-            // rule's own second branch rather than anything supplied here.
-            None | Some([]) => payer == signer,
-            // Bytes that are not a rule admit nobody, the same fail-closed
-            // verdict the execution gate gives them — as does a rule
-            // asking about a holding, which this judge holds nothing to
-            // answer with.
-            Some(bytes) => RuleBytes::rule_in_cell(bytes)
-                .ok()
-                .and_then(|rule| rule.claims_only())
-                .is_some_and(|claims| claims.satisfied_by(&[Claim::of_subject(signer)])),
-        }
+        auth_cell_admits(
+            payer.address(),
+            auth_cell,
+            &[Claim::of_subject(signer.address())],
+        )
     }
 }
 
@@ -1109,8 +1119,8 @@ mod tests {
     use hyperscale_vm_effects::{
         Binding, Claim, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hash32, Hasher,
         InstanceMeta, InstanceRegistry, Intent, IntentDecl, IntentHash, ManifestGraph,
-        MetadataCache, PackageHash, Socket, StoredRule, child_key, never, nullifier_expiry_ms,
-        nullifier_key, package_slot,
+        MetadataCache, PackageHash, RuleBytes, Socket, StoredRule, child_key, never,
+        nullifier_expiry_ms, nullifier_key, package_slot,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
@@ -2083,21 +2093,20 @@ mod tests {
             "{}",
             refused.to_string()
         );
-        // A signature proof is not this method's to read either: it signs
-        // in, and the write takes what the sign-in minted.
-        let refused = statics()
-            .derive(&envelope(
-                &intent_tree(
-                    composer_addr(),
-                    vec![node([EvidenceRef::IntentSignature].into())],
-                ),
-                &[],
-            ))
-            .expect_err("refuses");
+        // The signature is the account's own badge, so a method gated on
+        // that account reads it directly — and whether the key behind it
+        // still opens the account is the account's shard's to answer, as
+        // the sign-in, not derivation's.
         assert!(
-            refused.to_string().contains("signature"),
-            "{}",
-            refused.to_string()
+            statics()
+                .derive(&envelope(
+                    &intent_tree(
+                        composer_addr(),
+                        vec![node([EvidenceRef::IntentSignature].into())],
+                    ),
+                    &[],
+                ))
+                .is_ok()
         );
         assert!(
             statics()
@@ -2142,14 +2151,18 @@ mod tests {
     }
 
     #[test]
-    fn a_mismatched_subintent_signer_is_refused() {
+    fn a_key_attesting_an_account_it_does_not_derive_still_derives() {
         // The tree binds BOB's address, but the carried key is another's.
+        // Admissible: whether Bob's account admits that key is state only
+        // Bob's own cell holds, so his shard answers it as the sign-in,
+        // before any body runs and at the price of the reach.
         let tree = composed_tree();
         let impostor = key(11);
-        let refused = statics().derive(&envelope(&tree, &[&impostor]));
-        assert!(refused.is_err());
+        assert!(statics().derive(&envelope(&tree, &[&impostor])).is_ok());
 
-        // A missing signature list is a distinct refusal.
+        // A missing signature list is a different thing: the envelope
+        // does not say who attested an intent it carries, which nothing
+        // downstream could answer.
         let mut unsigned = envelope(&tree, &[&key(9)]);
         unsigned.subintent_sigs.clear();
         assert!(statics().derive(&unsigned).is_err());

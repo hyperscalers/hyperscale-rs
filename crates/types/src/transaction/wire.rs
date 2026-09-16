@@ -250,15 +250,14 @@ impl Transaction {
         &self.derived().legs
     }
 
-    /// The parties the routing declares beyond any node's frame: the
-    /// fee payer and every signer.
+    /// The accounts this transaction's intents act as.
     ///
     /// # Panics
     ///
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn owners(&self) -> &[Address] {
-        &self.derived().owners
+    pub fn accounts(&self) -> &[Address] {
+        &self.derived().accounts
     }
 
     /// The fee payer among [`Self::owners`], whose vault the reservation
@@ -675,9 +674,10 @@ impl Verify<TransactionContext<'_>> for Transaction {
         if !vm.signature_is_valid() {
             return Err(TransactionVerifyError::InvalidSignature);
         }
-        // Derivation checks the tree, the signature arity, and the
-        // signer-address binding; the signatures themselves verify here,
-        // over the derived declaration hashes.
+        // Derivation checks the tree and the signature arity; the
+        // signatures themselves verify here, over the derived
+        // declaration hashes. Which account a key may act as is neither
+        // stage's — that is the account's own rule, read on its shard.
         let derived = self.try_derived(ctx.derivation)?;
         // What the signed ceiling has to cover is not decided here: the
         // price is the table's, the table is the anchor's, and a
@@ -762,7 +762,7 @@ mod tests {
                 // binds the signer to the payer field — every stubbed
                 // transaction's payer admits its signer.
                 signer: vm.fee_payer,
-                owners: vec![vm.fee_payer.address()],
+                accounts: vec![vm.fee_payer.address()],
                 fee_vault_local: [0xEE; 16],
                 auth_cell_local: [0xAE; 16],
                 routing: Routing {

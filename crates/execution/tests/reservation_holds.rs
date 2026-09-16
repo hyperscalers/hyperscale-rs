@@ -84,7 +84,7 @@ impl Derivation for ReservingStatics {
         }
         .saturating_add(vm.signatures());
         Ok(Derived {
-            owners: Vec::new(),
+            accounts: Vec::new(),
             // This stub derives no tree; the envelope's window stands.
             effective_window: vm.validity_window(),
             routing: Routing {

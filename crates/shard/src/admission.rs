@@ -342,7 +342,7 @@ impl<'p> Section for TransactionsSection<'p> {
             ));
         }
         let budget = fold.budget.saturating_add(
-            Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), trie)
+            Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie)
                 .local_work(tx, ctx.local_shard),
         );
         if !budget_admits_block(&budget) {

@@ -1701,7 +1701,7 @@ mod tests {
             charged: Classified::freeze(
                 tx.legs(),
                 tx.fee_payer(),
-                tx.owners(),
+                tx.accounts(),
                 &ShardTrie::uniform(1),
             )
             .local_price(tx, LOCAL, &PriceTable::GENESIS),
