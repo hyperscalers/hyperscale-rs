@@ -89,9 +89,9 @@ impl SchemeVerifier for ProtocolVerifier {
 /// hash, signature, and time vocabulary.
 pub trait EnvelopeExt: Sized {
     /// The domain-separated hash of the envelope's signed content —
-    /// everything but the composer's own key and signature. This is
-    /// also the identity fresh derivations root at: distinct signed
-    /// envelopes never mint the same fresh key.
+    /// everything but the composer's signature. This is also the
+    /// identity fresh derivations root at: distinct signed envelopes
+    /// never mint the same fresh key.
     fn signing_hash(&self) -> Hash;
 
     /// Sign the envelope's content with the composer's key, filling the
@@ -120,16 +120,16 @@ impl EnvelopeExt for TransactionEnvelope {
     }
 
     fn sign<S: AccountSigner>(mut self, key: &S) -> Self {
-        // The scheme is signed content, so it is stamped before the
-        // digest is taken; the key and signature are not, and are filled
+        // The scheme and the key are signed content, so both are stamped
+        // before the digest is taken; the signature is not, and is filled
         // after. `manifest-builder`'s own signing tier does the same over
         // its own hasher — this is the protocol hash's spelling of it,
         // for the fixtures and call sites that already hold a key.
         self.signer_scheme = key.scheme();
+        self.signer = key.public_key_bytes();
         let digest = self
             .signing_digest(&ProtocolHasher)
             .expect("a fixture envelope stays within the wire caps");
-        self.signer = key.public_key_bytes();
         self.signature = key.sign_digest(&digest);
         self
     }
