@@ -321,10 +321,15 @@ pub struct Derived {
     /// Each manifest node's placement-free shape, in node order. Empty
     /// for a publish, which has no manifest to divide.
     pub legs: Vec<LegShape>,
-    /// The parties the routing declares beyond any node's frame — the
-    /// fee payer and every signer — which the classifier holds to some
-    /// member's scope before it divides the shape. Sorted and unique.
-    pub owners: Vec<Address>,
+    /// The accounts this transaction's intents act as, which the
+    /// classifier holds to a shard running an issuing member before it
+    /// divides the shape. Sorted and unique.
+    ///
+    /// The fee payer is not among them unless an intent acts as it. The
+    /// two are held to different rules — a reservation needs a member of
+    /// any side, an account's sign-in needs one that issues — so they
+    /// reach the classifier apart.
+    pub accounts: Vec<Address>,
     /// The nullifier cell of every bound subintent, in tree order, each
     /// under its own signer.
     ///

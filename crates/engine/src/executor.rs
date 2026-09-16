@@ -23,8 +23,8 @@ use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key, principal_for};
 use hyperscale_effects_bridge::{
     BridgeStatics, DeclaredVector, LocalCells, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry,
-    ProtocolHasher, admit_package, declared_vector, decode_tree, envelope_bytes, envelope_identity,
-    witness_from_event,
+    ProtocolHasher, admit_package, attesting_sets, declared_vector, decode_tree, envelope_bytes,
+    envelope_identity, witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
@@ -35,10 +35,9 @@ use hyperscale_types::{
     Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
     install_protocol_statics, whole_work,
 };
-pub use hyperscale_vm_effects::TargetAuthority;
 use hyperscale_vm_effects::{
     Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, IntentRecord,
-    NodeCall, PackageHash, admit_tree_with_authority, legs_of, package_hash,
+    JudgedLeaf, NodeCall, PackageHash, admit_tree, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
@@ -321,6 +320,24 @@ impl CodeAvailability for AllCodeRuns {
     fn can_run(&self, _package: Hash) -> bool {
         true
     }
+}
+
+/// Whether a preparation holds each intent's sign-in to the keys that
+/// attested it.
+///
+/// The engine's own, and only a preview waives it: a wallet asking what
+/// an envelope would do before its counterparties have signed has no
+/// keys to judge, so admission is told to assume each account attested
+/// its own intent and the conditions that judgment would answer are
+/// dropped below. Nothing on a commit path prepares under `Assumed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetAuthority {
+    /// The sign-in as the chain judges it, from the envelope's own keys.
+    Required,
+    /// Every account taken to have attested its own intent, and the
+    /// injected sign-in conditions dropped with the rest of the
+    /// judgment a preview does not hold.
+    Assumed,
 }
 
 impl Executor {
@@ -734,22 +751,29 @@ impl Executor {
         .map_err(|error| error.to_string())?;
         // The key has to be material its scheme admits before anything
         // reads the tree it signed. Which account it attests is the
-        // tree's own statement and derivation's to check against this;
-        // what is refused here is a key that names no principal at all.
-        principal_for(vm.signer_scheme, &vm.signer)
+        // tree's own statement, and whether that account admits this key
+        // is that account's shard's to judge; what is refused here is a
+        // key that names no principal at all.
+        let signer = principal_for(vm.signer_scheme, &vm.signer)
             .ok_or_else(|| "the envelope's signer key derives no principal".to_string())?;
+        // Whose keys attested each intent. A preview asked before the
+        // counterparties have signed has none to read, so it says what
+        // it is assuming; a commit path reads the envelope's own.
+        let attested_by = match authority {
+            TargetAuthority::Required => {
+                attesting_sets(vm, &tree, signer).map_err(|error| error.to_string())?
+            }
+            TargetAuthority::Assumed => tree.assume_self_attested(),
+        };
         // The records the caller answers with. Admission composes the
         // envelope's own over these itself, and holds each to standing
         // for the seal of the component it derives.
-        // Under an assumed authority admission admits the signature
-        // wherever the envelope presents it; the judgment it would fail
-        // is dropped below.
-        let admitted = admit_tree_with_authority(
+        let admitted = admit_tree(
             &tree,
+            &attested_by,
             envelope_identity(vm),
             chain,
             &ProtocolHasher,
-            authority,
         )
         .map_err(|error| format!("admission: {error}"))?;
         // One signed ceiling per lowered node, summing under the bound.
@@ -782,7 +806,19 @@ impl Executor {
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
         // order capability materialization walks.
-        let declaration = admitted.admitted.declaration().clone();
+        let mut declaration = admitted.admitted.declaration().clone();
+        if authority == TargetAuthority::Assumed {
+            // The sign-in admission injected is a judgment on keys this
+            // preview does not have, so it goes with the `requires`
+            // below rather than being answered on an assumption the
+            // account never made.
+            declaration.conditions.retain(|condition| {
+                !condition
+                    .rule
+                    .leaves()
+                    .any(|leaf| matches!(leaf, JudgedLeaf::Signed { .. }))
+            });
+        }
         let calls = match authority {
             TargetAuthority::Required => admitted.admitted.calls().to_vec(),
             // A preview shown before its counterparties have signed:
@@ -893,6 +929,10 @@ pub fn abort_reason(outcome: &Outcome) -> String {
             UnmetCondition::Satisfies { node } => {
                 format!("node {node} presents nothing that satisfies a required rule")
             }
+            UnmetCondition::SignedIn { account } => format!(
+                "the rule stored at {account:?} does not admit the keys that attested the intent \
+                 acting as it"
+            ),
             UnmetCondition::Unanswerable { node } => node.map_or_else(
                 || "a condition the judge it reached could not answer".to_owned(),
                 |node| format!("node {node} declared a condition its judge could not answer"),

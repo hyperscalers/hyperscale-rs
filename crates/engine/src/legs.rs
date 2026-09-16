@@ -508,7 +508,7 @@ pub fn local_work_over<'a>(
         .into_iter()
         .fold(DeclaredWork::ZERO, |total, tx| {
             total.saturating_add(
-                Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), trie)
+                Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie)
                     .local_work(tx, shard),
             )
         })

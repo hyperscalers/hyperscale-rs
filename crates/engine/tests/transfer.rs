@@ -1201,7 +1201,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let divided = Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &trie);
+    let divided = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     assert!(divided.decomposed(), "a transfer decomposes");
     assert_eq!(divided.core(), &BTreeSet::from([near_shard]));
 
@@ -1266,7 +1266,7 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
     derived_through(&executor, std::slice::from_ref(&tx));
     let whole = tx.work();
 
-    let divided = Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &trie);
+    let divided = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     let mine = divided.local_work(&tx, near_shard);
     let theirs = divided.local_work(&tx, far_shard);
 
@@ -1290,7 +1290,7 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
 
     let one = ShardTrie::from_leaves([ShardId::ROOT]);
     assert_eq!(
-        Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &one)
+        Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &one)
             .local_work(&tx, ShardId::ROOT),
         *whole,
         "one shard holding everything bears the whole"
@@ -1343,7 +1343,7 @@ fn a_transfer_executes_divided_on_both_shards() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &trie);
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     assert!(classified.decomposed());
     let edge = classified.edges()[0].clone();
 
@@ -1439,7 +1439,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &trie);
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     assert!(classified.decomposed());
     let edge = classified.edges()[0].clone();
 
@@ -1530,7 +1530,7 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &trie);
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     let edge = classified.edges()[0].clone();
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
@@ -1635,7 +1635,7 @@ fn an_inherited_record_decides_itself_against_its_claim() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &trie);
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     let edge = classified.edges()[0].clone();
 
     // The sending half, which writes the record the successor inherits.
@@ -1793,7 +1793,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             clock: WeightedTimestamp::from_millis(1_000),
             runs: Runs::Settle {
                 member: Member::whole(near_shard),
-                records: Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), &trie)
+                records: Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie)
                     .records_issued(near_shard),
                 on: Licence::Unclaimed,
                 charged,
@@ -3084,26 +3084,37 @@ fn a_preview_refuses_an_envelope_that_signed_no_ceilings() {
 /// and the grant is what a wallet reaches for when it wants an answer
 /// about an envelope its counterparties have not signed yet.
 ///
-/// Without it, a wallet composing a two-party trade would be told
-/// "refused" and have nothing to show the user. With it, the report is
-/// what the composition would do once signed — which is exactly the
+/// Without it, a wallet composing a two-party trade would be told the
+/// gate refused and have nothing to show the user. With it, the report
+/// is what the composition would do once signed — which is exactly the
 /// question being asked.
 #[test]
 fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (alice(), 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
-    // Signed by 7, signing in at Alice: the shape the gate refuses from
-    // signed content alone, so it never enters a block and nobody pays.
+    // Signed by 7 and reaching for Alice's account: the signature
+    // presents 7, and Alice's rule names Alice, so the gate refuses.
     let tx = signed_transfer_with_fee(7, alice(), bob(), 100, PREVIEW_CEILING);
 
     let held = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
-    let PreviewOutcome::Refused { reason } = &held.outcome else {
+    let PreviewOutcome::Aborted { reason } = &held.outcome else {
         panic!("outcome = {:?}", held.outcome);
     };
-    assert!(reason.contains("signature"), "reason = {reason}");
-    assert_eq!(held.fee, 0);
-    assert!(held.changes.is_empty());
+    assert!(
+        reason.contains("satisfies a required rule"),
+        "reason = {reason}"
+    );
+    // The one change is the fee the payer would pay for the attempt.
+    // Neither party to the transfer appears at all: nothing left the
+    // account the gate refused for, and nothing arrived.
+    assert_eq!(
+        held.changes.len(),
+        1,
+        "only the fee for the attempt: {:?}",
+        held.changes
+    );
+    assert_eq!(held.changes[0].key.owner, payer.address());
 
     let granted = preview_on(
         &accounts,

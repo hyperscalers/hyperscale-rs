@@ -1093,7 +1093,7 @@ impl Derivation for StubVmStatics {
             // A stub derives no manifest, so it has no legs to divide;
             // its payer is the one party its routing declares.
             legs: Vec::new(),
-            owners: vec![vm.fee_payer.address()],
+            accounts: vec![vm.fee_payer.address()],
             // One per bound signature, which is what a real derivation
             // files: a subintent's signature and its nullifier come in a
             // pair. Under the payer, since the stub cannot derive the

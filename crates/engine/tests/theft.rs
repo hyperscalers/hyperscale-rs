@@ -159,24 +159,34 @@ fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u
         .flatten()
 }
 
-/// The defect, closed: an address is public, and knowing one buys nothing.
+/// The defect, closed: an address is public, and knowing one buys
+/// nothing.
 ///
-/// The envelope is well-formed as a shape and the thief's signature is
-/// valid — but the one place a signature is judged is the signer's own
-/// account, and the sign-in this manifest leads with is the victim's.
-/// The gate refuses that from signed content alone, so the theft never
-/// reaches a block: the victim's balance is never asked, and the thief
-/// pays nothing for having asked.
+/// The envelope is well-formed and the thief's signature is valid, and
+/// both of those are true of any envelope. What the signature presents
+/// is the thief's own account — signed content, saying nothing false —
+/// and what the withdrawal's gate reads is the victim's rule, which
+/// names the victim. So the shape is admissible and the refusal is a
+/// verdict on the victim's own state, taken where that state is and
+/// before the balance is asked. The thief pays for having asked.
 #[test]
 fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
     let executor = Executor::new(ExecutionMode::Serial);
     let theft = signed_transfer(VICTIM, thief(), 5_000);
 
     assert!(theft.body().signature_is_valid());
-    let refused = theft
+    theft
         .try_derived(executor.derivation().as_ref())
-        .expect_err("a sign-in at someone else's account is refused at the gate");
-    assert!(refused.to_string().contains("signature"), "{refused}");
+        .expect("nothing in the signed form is false, so it derives");
+
+    let executed = execute(&executor, signed_transfer(VICTIM, thief(), 5_000));
+    // A failed receipt carries no writes at all, which is the whole of
+    // what the gate protects: the victim's balance is never asked.
+    assert_eq!(
+        executed[0].consensus,
+        ConsensusReceipt::Failed,
+        "the theft must not settle",
+    );
 
     // The same shape signed by its own account settles: the gate refuses
     // the signer, not the manifest.

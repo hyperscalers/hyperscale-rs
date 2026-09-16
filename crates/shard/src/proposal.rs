@@ -265,7 +265,7 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
     txs.iter()
         .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
         .filter(|tx| {
-            Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), trie)
+            Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie)
                 .only_delivers_at(local_shard)
         })
         .map(|tx| tx.hash())

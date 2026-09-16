@@ -118,7 +118,7 @@ fn committed_members(
     assign_participants(classification, transactions)
         .into_iter()
         .map(|(tx, participating)| {
-            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.owners(), trie);
+            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
             let side = classified.first_side_at(local_shard);
             CommittedMember {
                 member: Member::of(classified, local_shard, side, participating),
