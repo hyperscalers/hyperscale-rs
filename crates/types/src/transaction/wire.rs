@@ -260,7 +260,7 @@ impl Transaction {
         &self.derived().accounts
     }
 
-    /// The fee payer among [`Self::owners`], whose vault the reservation
+    /// The fee payer among [`Self::accounts`], whose vault the reservation
     /// and the burn reach and whose home bears the core where no node
     /// can.
     ///

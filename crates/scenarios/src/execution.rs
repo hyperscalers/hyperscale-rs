@@ -2164,10 +2164,7 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
         .preview(
             ShardId::ROOT,
             &candidate,
-            PreviewGrants {
-                free_credit: true,
-                ..PreviewGrants::default()
-            },
+            PreviewGrants { free_credit: true },
         )
         .expect("the root shard serves a preview");
     assert_eq!(credited.fee, report.fee, "the fee is priced either way");

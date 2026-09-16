@@ -165,10 +165,10 @@ fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u
 /// The envelope is well-formed and the thief's signature is valid, and
 /// both of those are true of any envelope. What the signature presents
 /// is the thief's own account — signed content, saying nothing false —
-/// and what the withdrawal's gate reads is the victim's rule, which
-/// names the victim. So the shape is admissible and the refusal is a
-/// verdict on the victim's own state, taken where that state is and
-/// before the balance is asked. The thief pays for having asked.
+/// and what the withdrawal's gate names is the victim. Both are signed
+/// content, so admission compares them itself: the shape never becomes
+/// a transaction, never reaches a block, and costs the thief nothing
+/// because there was nothing to include.
 #[test]
 fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
     let executor = Executor::new(ExecutionMode::Serial);
@@ -177,19 +177,10 @@ fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
     assert!(theft.body().signature_is_valid());
     theft
         .try_derived(executor.derivation().as_ref())
-        .expect("nothing in the signed form is false, so it derives");
+        .expect_err("the gate names the victim and the signature names the thief");
 
-    let executed = execute(&executor, signed_transfer(VICTIM, thief(), 5_000));
-    // A failed receipt carries no writes at all, which is the whole of
-    // what the gate protects: the victim's balance is never asked.
-    assert_eq!(
-        executed[0].consensus,
-        ConsensusReceipt::Failed,
-        "the theft must not settle",
-    );
-
-    // The same shape signed by its own account settles: the gate refuses
-    // the signer, not the manifest.
+    // The same shape signed by its own account derives and settles: what
+    // refuses the theft is the signer, not the manifest.
     let executed = execute(&executor, signed_transfer(thief(), VICTIM, 5_000));
     assert!(matches!(
         &executed[0].consensus,

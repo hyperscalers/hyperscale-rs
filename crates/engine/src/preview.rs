@@ -33,8 +33,7 @@ use hyperscale_vm_types::{EffectSet, EffectTarget, Outcome, PriceTable, Substate
 
 use crate::batch::TickEnvironment;
 use crate::executor::{
-    PayerFee, TargetAuthority, TickBaseline, abort_reason, batch_entry, materialize_declared,
-    protocol_hash,
+    PayerFee, TickBaseline, abort_reason, batch_entry, materialize_declared, protocol_hash,
 };
 use crate::genesis::vault_key;
 use crate::{Executor, PROTOCOL_RESOURCE};
@@ -49,14 +48,6 @@ pub struct PreviewGrants {
     /// payer's vault. This is what lets a wallet price an envelope whose
     /// payer could not cover the ceiling it names.
     pub free_credit: bool,
-    /// Treat every gated node as carrying its target's authority.
-    ///
-    /// A composition is priced and displayed before its counterparties
-    /// sign, so a wallet needs an answer about an envelope that is not
-    /// yet admissible — and refusing it would leave the wallet unable to
-    /// show the user what they are being asked to sign. Granting this is
-    /// the caller saying they know the difference.
-    pub assume_target_auth: bool,
 }
 
 /// The transaction environment a preview reads, supplied by the caller
@@ -169,12 +160,7 @@ impl Executor {
         held: &BTreeSet<ShardId>,
         by_shard: &mut BTreeMap<ShardId, DeclaredReads>,
     ) -> Result<(), String> {
-        let (prepared, _) = Self::prepare_admitting(
-            tx,
-            &self.records(),
-            &self.world.cache,
-            TargetAuthority::Assumed,
-        )?;
+        let (prepared, _) = Self::prepare_admitting(tx, &self.records(), &self.world.cache)?;
         for target in prepared.declaration.set.targets() {
             let owner = match target {
                 EffectTarget::Point(key) => key.owner,
@@ -625,18 +611,13 @@ impl Executor {
             return preview_publish(&cells, artifact, payer, inputs.grants);
         }
 
-        let authority = if inputs.grants.assume_target_auth {
-            TargetAuthority::Assumed
-        } else {
-            TargetAuthority::Required
-        };
         // A preview is advisory, so it answers from what this node
         // holds rather than from what a block carries: it is not
         // producing a receipt root, and a client asking what an envelope
         // would do wants the answer for a component whose seal landed on
         // some other shard.
         let (prepared, admitted) =
-            match Self::prepare_admitting(tx, &self.records(), &self.world.cache, authority) {
+            match Self::prepare_admitting(tx, &self.records(), &self.world.cache) {
                 Ok(derived) => derived,
                 Err(reason) => return PreviewReport::refused(reason),
             };
@@ -644,8 +625,9 @@ impl Executor {
             vault,
             max_fee: vm.max_fee,
             // The declaration's price, read off what prepared rather
-            // than derived again: a preview under an assumed authority
-            // admits what derivation would refuse.
+            // than derived again: the preparation above already lowered
+            // the envelope, and deriving a second time would price the
+            // same fold twice.
             price: inputs.prices.price(&prepared.work, vm.priority_bp),
             // A preview is one envelope against one snapshot: no tick can
             // discard effects it completed, so the reserve-receipt shape
