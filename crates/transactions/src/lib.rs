@@ -349,7 +349,7 @@ mod tests {
     use hyperscale_types::test_utils::{test_principal, test_validity_range};
     use hyperscale_types::{Ed25519PrivateKey, MAX_ENVELOPE_BYTES};
     use hyperscale_vm_effects::{
-        Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Value, admit, package_hash,
+        Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Value, admit_tree, package_hash,
     };
 
     use super::*;
@@ -403,9 +403,19 @@ mod tests {
         let graph = client
             .transfer_graph(test_principal(0x11), test_principal(0x22), 100)
             .unwrap();
-        admit(
-            &graph,
+        let tree = EnvelopeTree::of_one(Intent::leaf(
+            IntentHeader {
+                network: NETWORK,
+                validity_start_ms: 0,
+                validity_end_ms: 3_600_000,
+                discriminator: 0,
+            },
             test_principal(0x11),
+            graph,
+        ));
+        admit_tree(
+            &tree,
+            tree.hash(&ProtocolHasher),
             &client.records(),
             &ProtocolHasher,
         )

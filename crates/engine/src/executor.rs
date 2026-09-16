@@ -726,7 +726,7 @@ impl Executor {
         // reports what a block would charge without running the
         // derivation — which admits under the rule as the chain applies
         // it, and caches what it derived onto the transaction.
-        let legs = legs_of(&admitted.admitted);
+        let legs = legs_of(&admitted);
         let DeclaredVector {
             shares,
             node_terms,
@@ -737,7 +737,7 @@ impl Executor {
             packages,
             terms,
             call.signature_work(),
-            &admitted.admitted,
+            &admitted,
             &legs,
             envelope_bytes(vm).map_err(|error| error.to_string())?,
         )
@@ -746,8 +746,8 @@ impl Executor {
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
         // order capability materialization walks.
-        let declaration = admitted.admitted.declaration().clone();
-        let calls = admitted.admitted.calls().to_vec();
+        let declaration = admitted.declaration().clone();
+        let calls = admitted.calls().to_vec();
         Ok((
             PreparedTx {
                 // Whole until the batch pipeline plans the member for its
@@ -757,13 +757,13 @@ impl Executor {
                     legs: LegPlan::whole(0),
                 },
                 declaration,
-                nullifiers: admitted.intents.clone(),
+                nullifiers: admitted.intents().to_vec(),
                 gas_limits: terms.gas_limits.clone(),
                 event_bytes,
                 work,
                 judges: OwnerSet::whole(),
             },
-            admitted.admitted,
+            admitted,
         ))
     }
 }

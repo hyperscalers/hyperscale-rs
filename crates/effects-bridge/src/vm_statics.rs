@@ -25,9 +25,9 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    Admitted, AdmittedTree, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree,
-    Intent, IntentHeader, IntentRecord, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash,
-    Value, admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes, effect_units,
+    Admitted, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree, Intent,
+    IntentHeader, IntentRecord, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, Value,
+    admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes, effect_units,
     legs_of, package_hash, package_key as canonical_package_key, principal_address,
     protocol_resource,
 };
@@ -54,9 +54,9 @@ use crate::records::{
 /// The payer is not folded in. Its shard needs a member of any side,
 /// which is a weaker thing than the awaited shard an account's sign-in
 /// needs, so the classifier is handed the two apart.
-fn intent_accounts(admitted: &AdmittedTree) -> Vec<Address> {
+fn intent_accounts(admitted: &Admitted) -> Vec<Address> {
     admitted
-        .intents
+        .intents()
         .iter()
         .flat_map(IntentRecord::accounts)
         .map(PrincipalAddr::address)
@@ -435,7 +435,7 @@ impl<'a> CallEnvelope<'a> {
     ///
     /// [`DerivationError::Refused`] with admission's own explanation, or
     /// the terms refusal.
-    pub fn admit(&self, chain: &dyn ChainRecords) -> Result<AdmittedTree, DerivationError> {
+    pub fn admit(&self, chain: &dyn ChainRecords) -> Result<Admitted, DerivationError> {
         let admitted = admit_tree(
             &self.tree,
             envelope_identity(self.vm),
@@ -444,7 +444,7 @@ impl<'a> CallEnvelope<'a> {
         )
         .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
         self.terms()
-            .admit(admitted.admitted.calls().len())
+            .admit(admitted.calls().len())
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         Ok(admitted)
     }
@@ -1095,9 +1095,9 @@ impl Derivation for BridgeStatics {
         if !unresolved.is_empty() {
             return Err(DerivationError::Unresolved(unresolved));
         }
-        let admitted_tree = call.admit(&chain)?;
+        let admitted = call.admit(&chain)?;
         let terms = call.terms().clone();
-        let admitted = &admitted_tree.admitted;
+        let admitted = &admitted;
 
         let DeclaredAccess {
             read_keys,
@@ -1148,13 +1148,13 @@ impl Derivation for BridgeStatics {
             artifacts,
             everywhere,
             legs,
-            nullifiers: admitted_tree
-                .intents
+            nullifiers: admitted
+                .intents()
                 .iter()
                 .flat_map(|record| &record.nullifiers)
                 .map(|nullifier| nullifier.key)
                 .collect(),
-            accounts: intent_accounts(&admitted_tree),
+            accounts: intent_accounts(admitted),
             attested_by: call.attested_by().to_vec(),
             attestations: call.attestations.clone(),
             routing: Routing {
