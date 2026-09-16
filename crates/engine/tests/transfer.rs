@@ -28,13 +28,13 @@ use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
-    GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
+    GlobalReceipt, Hash, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
     ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
     TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, Window,
     absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, Intent, IntentHeader,
+    AbiParam, Composed, CrossingCell, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree,
     PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
@@ -50,7 +50,7 @@ const NETWORK: NetworkId = NetworkId(242);
 
 /// The widest window an intent may stand for, which these fixtures use
 /// wherever they mean "does not expire during the test".
-const OFFER_MS: u64 = MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000;
+const OFFER_MS: u64 = MAX_INTENT_VALIDITY_RANGE.as_secs() * 1_000;
 
 /// The terms every intent in these tests is sealed under. The window is
 /// the widest an intent may name, so nothing here narrows a transaction.
@@ -416,7 +416,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
 }
 
 /// The intent that closes the round at `salt`, for `signer` to sign.
-fn closing_tree(salt: u8, signer: PrincipalAddr) -> EnvelopeTree {
+fn closing_tree(salt: u8, signer: PrincipalAddr) -> IntentTree {
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
     let mut root = IntentBuilder::new(&composed, &ProtocolHasher, signer, HEADER);
@@ -2187,7 +2187,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let [] = b.call(unsealed, "draw", (64u64,));
     let graph = b.build().expect("every output is consumed");
     let gap = Transaction::new(client().sign_tree(
-        &EnvelopeTree::of_one(Intent::leaf(
+        &IntentTree::of_one(Intent::leaf(
             HEADER,
             account_address(&key.public_key().0),
             graph,
@@ -2215,7 +2215,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let [] = b.call(unsealed, "draw", (64u64,));
     let graph = b.build().expect("every output is consumed");
     let carried = Transaction::new(client().sign_tree(
-        &EnvelopeTree {
+        &IntentTree {
             root: Intent::leaf(HEADER, account_address(&key.public_key().0), graph),
             instances: vec![meta],
             resources: Vec::new(),
@@ -2244,7 +2244,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let [] = b.call(payer, "deposit", ());
     let graph = b.build().expect("every output is consumed");
     let refused = Transaction::new(client().sign_tree(
-        &EnvelopeTree::of_one(Intent::leaf(
+        &IntentTree::of_one(Intent::leaf(
             HEADER,
             account_address(&key.public_key().0),
             graph,
@@ -3211,7 +3211,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     );
     let [] = b.call(payer, "deposit-nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
-    let tree = EnvelopeTree {
+    let tree = IntentTree {
         root: Intent::leaf(HEADER, account_address(&key.public_key().0), graph),
         instances: vec![meta.clone()],
         resources: Vec::new(),

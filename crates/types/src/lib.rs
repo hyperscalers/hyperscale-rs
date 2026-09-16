@@ -219,7 +219,7 @@ pub use state_holds::ProvisionalHolds;
 pub use time::deadline::{CLAIM_WINDOW, Deadline, Probed, TRANSACTION_EVIDENCE_HORIZON, Window};
 pub use time::epoch_windows::EpochWindows;
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
-pub use time::range::{MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, TimestampRange};
+pub use time::range::{MAX_INTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
     CLAIM_VISIBILITY_LAG, DEDUP_WINDOW, EPOCH_DURATION, FEE_HOLD_WINDOW, MAX_FINALIZATION_DELAY,
