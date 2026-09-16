@@ -300,7 +300,7 @@ fn signed_transfer_with_fee(
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let graph = client()
-        .transfer_graph(from, from, to, amount)
+        .transfer_graph(from, to, amount)
         .expect("an account answers a transfer");
     Transaction::new(client().sign(graph, &key, terms(max_fee)))
 }
@@ -3058,7 +3058,7 @@ fn a_preview_refuses_an_envelope_that_signed_no_ceilings() {
     let executor = executor(ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
     let graph = client()
-        .transfer_graph(payer, payer, bob(), 100)
+        .transfer_graph(payer, bob(), 100)
         .expect("an account answers a transfer");
     let mut vm = client().sign(graph, &key, terms(PREVIEW_CEILING));
     vm.gas_limits.clear();
@@ -3230,14 +3230,12 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     };
     let component = meta.address(&ProtocolHasher);
 
-    // The founder its configuration names signs in, and the owner badge
-    // the seal mints is filed in that same account: bringing up is one
-    // node, and the supply a component comes up holding leaves with
-    // whoever composed it.
+    // The seal answers its gate from the founder's own signature, and
+    // the owner badge it mints is filed in that same account: bringing up
+    // is one node, and the supply a component comes up holding leaves
+    // with whoever composed it.
     let mut b = GraphBuilder::new();
-    let signed_in = 0;
-    let [] = b.call_signed(payer, "authorize", ());
-    let [badge] = b.call_bearing(component, "instantiate", (), signed_in);
+    let [badge] = b.call_signed(component, "instantiate", ());
     let owner_badge = issued_resource(
         &ProtocolHasher,
         component,

@@ -203,21 +203,16 @@ impl Client {
     /// stdlib rather than anything about the transfer.
     pub fn transfer_graph(
         &self,
-        signer: PrincipalAddr,
         from: PrincipalAddr,
         to: PrincipalAddr,
         amount: u128,
     ) -> Result<ManifestGraph, TypedError> {
         let chain = self.records();
-        let mut b = self.builder(&chain, signer);
-        let funds = if signer == from {
-            account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount)?
-        } else {
-            let proof = account::authorize(&mut b, from)?;
-            b.presenting(proof, |b| {
-                account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)
-            })?
-        };
+        // Composed for the account it spends from, whoever ends up
+        // attesting the intent: the withdrawal's gate names `from`, and
+        // the claim answering it rides that intent's own signature.
+        let mut b = self.builder(&chain, from);
+        let funds = account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount)?;
         account::deposit(&mut b, to, funds)?;
         b.build()
     }
@@ -350,7 +345,7 @@ impl Client {
         amount: u128,
         terms: Terms,
     ) -> Result<Transaction, TypedError> {
-        let graph = self.transfer_graph(principal_of(payer), from, to, amount)?;
+        let graph = self.transfer_graph(from, to, amount)?;
         Ok(Transaction::new(self.sign(graph, payer, terms)))
     }
 }
@@ -383,7 +378,7 @@ mod tests {
         let from = test_principal(0x11);
         let to = test_principal(0x22);
         assert_eq!(
-            client.transfer_graph(from, from, to, 100).unwrap(),
+            client.transfer_graph(from, to, 100).unwrap(),
             ManifestGraph {
                 nodes: vec![
                     GraphNode {
@@ -416,12 +411,7 @@ mod tests {
     fn a_built_transfer_admits() {
         let client = Client::genesis(NETWORK);
         let graph = client
-            .transfer_graph(
-                test_principal(0x11),
-                test_principal(0x11),
-                test_principal(0x22),
-                100,
-            )
+            .transfer_graph(test_principal(0x11), test_principal(0x22), 100)
             .unwrap();
         admit(
             &graph,
