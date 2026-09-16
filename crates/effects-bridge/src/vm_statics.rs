@@ -52,7 +52,7 @@ use crate::records::{
 /// byte for byte.
 ///
 /// The payer is not folded in. Its shard needs a member of any side,
-/// which is a weaker thing than the issuing member an account's sign-in
+/// which is a weaker thing than the awaited shard an account's sign-in
 /// needs, so the classifier is handed the two apart.
 fn intent_accounts(admitted: &AdmittedTree) -> Vec<Address> {
     admitted
@@ -2035,6 +2035,47 @@ mod tests {
             bob_addr().address(),
             nullifier.local.0
         )));
+    }
+
+    /// An intent acting as two accounts derives both: a nullifier
+    /// write under each account's prefix, and both accounts handed to
+    /// the classifier as the parties whose sign-ins the core must wait
+    /// on.
+    #[test]
+    fn an_intent_acting_as_two_accounts_derives_both() {
+        let mut tree = intent_tree(
+            composer_addr(),
+            vec![
+                withdraw(composer_addr(), RES_X, 100),
+                deposit_edge(bob_addr(), 0, RES_X),
+                withdraw(bob_addr(), RES_Y, 10),
+                deposit_edge(composer_addr(), 2, RES_Y),
+            ],
+        );
+        tree.root.accounts = vec![composer_addr(), bob_addr()];
+        let derived = statics()
+            .derive(&envelope(&tree, &[]))
+            .expect("one intent acts as both");
+
+        let mut accounts = vec![composer_addr().address(), bob_addr().address()];
+        accounts.sort();
+        assert_eq!(derived.accounts, accounts);
+
+        let hash = tree.root.hash(&ProtocolHasher);
+        let expiry_ms = nullifier_expiry_ms(&tree.root.header);
+        for account in [composer_addr(), bob_addr()] {
+            let nullifier = nullifier_key(&ProtocolHasher, account, hash, expiry_ms);
+            assert!(
+                derived.nullifiers.contains(&nullifier),
+                "{account:?} nullifies the intent under its own prefix",
+            );
+            assert!(
+                derived
+                    .routing
+                    .write_keys
+                    .contains(&DeclaredKey::substate(account.address(), nullifier.local.0))
+            );
+        }
     }
 
     #[test]
