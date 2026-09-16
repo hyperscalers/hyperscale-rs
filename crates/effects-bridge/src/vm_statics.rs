@@ -9,9 +9,9 @@
 //! signing hash, projected into the workspace's admission vocabulary:
 //! substate-granular keys for point effects, interval-granular keys for
 //! collection effects (an entry is its width-one interval), reads and
-//! snapshots in the shared class, every other mode exclusive. Subintent
-//! nullifier creation writes ride the routed sets, so admission
-//! conflicts on them like any other exclusive key.
+//! snapshots in the shared class, every other mode exclusive. Nullifier
+//! creation writes ride the routed sets, so admission conflicts on them
+//! like any other exclusive key.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -495,7 +495,8 @@ pub fn vault_key(owner: impl Into<Address>, resource: impl Into<Address>) -> Sub
 }
 
 /// The stored-authority cell under `owner` — what `securify` writes,
-/// `authorize` reads, and the payer shard's binding verdict consults.
+/// and what the injected sign-in condition and the payer shard's
+/// reservation verdict both read through `auth_cell_admits`.
 #[must_use]
 pub(crate) fn auth_key(owner: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, owner, AUTH, &[])

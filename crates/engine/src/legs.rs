@@ -133,17 +133,25 @@ impl Classified {
     /// while the trie did not, and two shards committing one transaction
     /// on either side of it would freeze different shapes.
     ///
-    /// `payer` and `owners` are the routing the envelope declares beyond
-    /// any node's frame: the fee payer, whose home bears the core where
-    /// no node can, and every party the routing names.
+    /// `payer` and `accounts` are the routing the envelope declares
+    /// beyond any node's frame: the fee payer, whose home bears the core
+    /// where no node can, and the accounts its intents act as. The two
+    /// are held to different rules — a payer needs a member of any side,
+    /// an account a shard the core waits on — which is why they arrive
+    /// apart rather than folded into one list.
     #[must_use]
-    pub fn freeze(legs: &[LegShape], payer: Address, owners: &[Address], trie: &ShardTrie) -> Self {
+    pub fn freeze(
+        legs: &[LegShape],
+        payer: Address,
+        accounts: &[Address],
+        trie: &ShardTrie,
+    ) -> Self {
         let trie = Arc::new(trie.clone());
         let placement = Placement::Read(Arc::clone(&trie));
         let star = star_at(
             legs,
             payer,
-            owners,
+            accounts,
             &TrieShardResolver { trie: &trie },
             &ProtocolHasher,
         )

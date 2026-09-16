@@ -103,7 +103,7 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// for every transaction it commits. Sized at five times
 /// [`MAX_TXS_PER_BLOCK`] so a full block of any shape the corpus
 /// produces stays admissible on its busiest shard — every transaction
-/// carries its committed cell and its root intent's nullifier, so a
+/// carries its committed cell and its own intent's nullifier, so a
 /// transfer's payer writes those and the record, three; a swap's caller
 /// adds the claim of what the venue issued, four; a liquidity provider
 /// paying two resources writes two records and one claim beside them,
