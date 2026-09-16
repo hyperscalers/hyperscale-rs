@@ -736,7 +736,7 @@ impl Executor {
         } = declared_vector(
             packages,
             terms,
-            vm.signatures(),
+            call.signature_work(),
             &admitted.admitted,
             &legs,
             envelope_bytes(vm).map_err(|error| error.to_string())?,

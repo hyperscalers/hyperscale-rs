@@ -246,10 +246,10 @@ pub use transaction::status::{
     TxResolution,
 };
 pub use transaction::vm::{
-    ArtifactTerm, Derivation, DerivationError, Derived, EnvelopeExt, MAX_INTENTS, MAX_MESSAGE_LEN,
-    MAX_SUBINTENTS, OwnerShare, ProtocolStatics, ProtocolVerifier, Routing, SchemeVerifier,
-    SubintentSig, Terms, TransactionEnvelope, Unresolved, install_protocol_statics,
-    protocol_statics, protocol_statics_installed, whole_work,
+    ArtifactTerm, Attestation, Attested, Derivation, DerivationError, Derived, EnvelopeExt,
+    MAX_ATTESTATIONS, MAX_INTENTS, MAX_MESSAGE_LEN, MAX_TX_ATTESTATIONS, OwnerShare,
+    ProtocolStatics, ProtocolVerifier, Routing, SchemeVerifier, Terms, TransactionEnvelope,
+    Unresolved, install_protocol_statics, protocol_statics, protocol_statics_installed, whole_work,
 };
 pub use transaction::wire::{Transaction, TransactionContext, TransactionVerifyError};
 pub use verifiable::{Verifiable, Verified, Verify};

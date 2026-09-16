@@ -552,7 +552,7 @@ mod tests {
     };
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, MAX_INTENTS,
-        MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
         PredecessorTerminal, RoutePrefix, TimestampRange, TransactionDecision, UnsettledTx,
         ValidatorSet,
     };
@@ -1115,11 +1115,11 @@ mod tests {
             .map(|i| {
                 binding(
                     u32::try_from(i).expect("fewer than u32 transactions"),
-                    MAX_SUBINTENTS,
+                    MAX_INTENTS - 1,
                 )
             })
             .collect();
-        let overflows = binding(u32::MAX, MAX_SUBINTENTS);
+        let overflows = binding(u32::MAX, MAX_INTENTS - 1);
         let fits = binding(u32::MAX - 1, 0);
         txs.push(overflows.clone());
         txs.push(fits.clone());

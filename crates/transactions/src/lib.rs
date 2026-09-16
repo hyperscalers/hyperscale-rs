@@ -22,8 +22,7 @@ use hyperscale_effects_bridge::genesis::{World, genesis_world};
 use hyperscale_effects_bridge::vm_statics::principal_for;
 use hyperscale_effects_bridge::{NodeRecords, PROTOCOL_RESOURCE};
 use hyperscale_types::{
-    AccountSigner, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
-    TransactionEnvelope,
+    AccountSigner, NetworkId, ProtocolHasher, TimestampRange, Transaction, TransactionEnvelope,
 };
 use hyperscale_vm_effects::{Claim, EnvelopeTree, Intent, IntentHeader, ManifestGraph, StoredRule};
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
@@ -271,7 +270,6 @@ impl Client {
                 principal_of(payer),
                 graph,
             )),
-            Vec::new(),
             payer,
             terms,
         )
@@ -279,11 +277,12 @@ impl Client {
 
     /// Wrap a composed tree in an envelope signed by `payer`.
     ///
-    /// `sigs` are what the tree's members' signers produced over their
-    /// intents; what `payer` signs is the whole envelope, those
-    /// signatures included. The root's terms and window are `terms`,
-    /// stamped here: the root is the composer's own and is signed last,
-    /// so nothing a member signed is touched.
+    /// Every member carries its own attestations inside the tree; what
+    /// `payer` signs is the envelope: the root's hash, the terms and the
+    /// artifact. The root's window and its attesting principal — the
+    /// one `payer` derives — are stamped here: the root is the
+    /// composer's own and is signed last, so nothing a member signed is
+    /// touched.
     ///
     /// The terms name the principal `payer`'s own scheme and key
     /// derive, which is the account it can open by signing. A scheme is
@@ -300,16 +299,15 @@ impl Client {
     pub fn sign_tree<S: AccountSigner>(
         &self,
         tree: &EnvelopeTree,
-        sigs: Vec<SubintentSig>,
         payer: &S,
         terms: Terms,
     ) -> TransactionEnvelope {
         let mut tree = tree.clone();
         tree.root.header.validity_start_ms = terms.validity.start_timestamp_inclusive.as_millis();
         tree.root.header.validity_end_ms = terms.validity.end_timestamp_exclusive.as_millis();
+        tree.root.attested_by = vec![principal_of(payer)];
         let envelope = signing::wrap(
             &tree,
-            sigs,
             signing::Terms {
                 fee_payer: principal_of(payer),
                 max_fee: terms.max_fee,

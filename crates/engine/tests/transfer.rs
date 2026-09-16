@@ -41,7 +41,8 @@ use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder, signing};
 use hyperscale_vm_stdlib::{STAKING_MODULE, account, instantiate, staking};
 use hyperscale_vm_types::{
-    Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, encode_amount,
+    Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, attestation_work,
+    encode_amount,
 };
 
 /// The network every envelope in these tests is signed for.
@@ -354,7 +355,7 @@ fn signed_settle_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
         .none()
         .expect("the root declares no socket");
     let tree = env.build().expect("the intent declares no hole");
-    Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(max_fee)))
+    Transaction::new(client().sign_tree(&tree, &key, terms(max_fee)))
 }
 
 /// Genesis state with the lottery this binary draws on made actual.
@@ -393,7 +394,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
             .none()
             .expect("the root declares no socket");
         let tree = env.build().expect("the intent declares no hole");
-        let seal = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000_000)));
+        let seal = Transaction::new(client().sign_tree(&tree, &key, terms(1_000_000)));
         let executed = execute_batch_on(
             &store,
             executor,
@@ -407,7 +408,6 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
 
         let close = Transaction::new(client().sign_tree(
             &closing_tree(*salt, fee_payer(SEALER_SEED)),
-            Vec::new(),
             &key,
             terms(1_000_000),
         ));
@@ -1273,7 +1273,7 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
     // compute and writes sum past the whole by exactly one verification
     // and one marker; footprint sums exactly, since a cell is excluded
     // where it lives.
-    let verification = tx.body().signatures().compute;
+    let verification = attestation_work(&tx.body().signatures).compute;
     assert_eq!(mine.compute + theirs.compute, whole.compute + verification);
     assert_eq!(mine.footprint + theirs.footprint, whole.footprint);
     assert_eq!(mine.retention, whole.retention);
@@ -2205,7 +2205,6 @@ fn derivation_tells_a_gap_from_a_refusal() {
             account_address(&key.public_key().0),
             graph,
         )),
-        Vec::new(),
         &key,
         terms(TRANSFER_FEE),
     ));
@@ -2234,7 +2233,6 @@ fn derivation_tells_a_gap_from_a_refusal() {
             instances: vec![meta],
             resources: Vec::new(),
         },
-        Vec::new(),
         &key,
         terms(TRANSFER_FEE),
     ));
@@ -2264,7 +2262,6 @@ fn derivation_tells_a_gap_from_a_refusal() {
             account_address(&key.public_key().0),
             graph,
         )),
-        Vec::new(),
         &key,
         terms(TRANSFER_FEE),
     ));
@@ -3240,8 +3237,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // this node cannot yet judge.
     let mut unpresented = tree.clone();
     unpresented.instances.clear();
-    let bare =
-        Transaction::new(client().sign_tree(&unpresented, Vec::new(), &key, terms(TRANSFER_FEE)));
+    let bare = Transaction::new(client().sign_tree(&unpresented, &key, terms(TRANSFER_FEE)));
     let refusal = bare
         .try_derived(executor.derivation().as_ref())
         .expect_err("an unresolved instance target does not derive");
@@ -3256,7 +3252,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // Claim: the call admits, the invocation resolves the freshly
     // compiled package — waiting out the compile if it is still in
     // flight — and the leaf holds the record the address derives from.
-    let call = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(TRANSFER_FEE)));
+    let call = Transaction::new(client().sign_tree(&tree, &key, terms(TRANSFER_FEE)));
     let executed = execute_on(
         &[(payer, 1_000)],
         &executor,

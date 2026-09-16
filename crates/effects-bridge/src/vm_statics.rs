@@ -18,16 +18,16 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
-    ArtifactTerm, DeclaredKey, DeclaredRange, Derivation, DerivationError, Derived, EnvelopeExt,
-    Hash, MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, OwnerShare,
-    ProtocolStatics, Routing, TimestampRange, TransactionEnvelope, Unresolved, WeightedTimestamp,
-    whole_work,
+    ArtifactTerm, Attestation, Attested, DeclaredKey, DeclaredRange, Derivation, DerivationError,
+    Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE,
+    MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing, TimestampRange,
+    TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
     Admitted, AdmittedTree, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree,
-    IntentHeader, IntentRecord, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, Value,
-    admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes, effect_units,
+    Intent, IntentHeader, IntentRecord, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash,
+    Value, admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes, effect_units,
     legs_of, package_hash, package_key as canonical_package_key, principal_address,
     protocol_resource,
 };
@@ -36,7 +36,7 @@ use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectTarget, LegShape,
     LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey, Terms, TermsRefusal,
-    admit_event_bounds, read_bytes, written_leaf,
+    admit_event_bounds, attestation_work, read_bytes, written_leaf,
 };
 
 use crate::ProtocolHasher;
@@ -289,53 +289,90 @@ pub fn declared_vector(
     })
 }
 
-/// Whose keys attest each intent, in tree order, read off the envelope.
+/// Every attestation the envelope and its tree carry, each held to the
+/// declaration it stands beside, with the hash it covers.
 ///
-/// The addresses only. The signatures themselves verify at the
-/// transaction gate, over the declaration hashes admission returns; and
-/// whether a key may act as the account its intent names is neither
-/// stage's — that is the account's own rule, read on its own shard as
-/// the sign-in. A key reaching for an account it does not derive is
-/// admissible and refused there, before any body runs, at the price of
-/// the reach. What is refused here is a key that names no principal at
-/// all, and an arity that does not match: the root leads and is
-/// attested by the envelope's key, every intent after it in tree order
-/// by one of `subintent_sigs` in the same order, so an envelope
-/// carrying a signature for an intent it does not hold — or holding an
-/// intent nothing signs — never reaches admission.
+/// An intent declares the principals attesting it; an attestation pairs
+/// by position with one of them, and its key under its scheme must
+/// derive exactly that principal. So a re-keyed or re-tagged attestation
+/// is refused against the declaration, and a count that differs pairs
+/// nothing. The root's attestations are the envelope's and cover its
+/// digest; a member's are inside the tree and cover its intent hash.
+/// Whether any account admits the set is the account's own rule, judged
+/// on its shard as the sign-in.
 ///
 /// # Errors
 ///
-/// [`DerivationError::Refused`] on a count of signatures that does not
-/// match the members, or a key that derives no principal.
-pub fn attesting_sets(
+/// [`DerivationError::Refused`] on an arity that differs from the
+/// declaration, or a key that does not derive its declared principal.
+pub fn attestations(
     vm: &TransactionEnvelope,
     tree: &EnvelopeTree,
-) -> Result<Vec<Vec<PrincipalAddr>>, DerivationError> {
-    let Some(signer) = principal_for(vm.signer_scheme, &vm.signer) else {
-        return Err(DerivationError::Refused(
-            "the envelope's signer key derives no principal".into(),
-        ));
-    };
-    let members = tree.intents().len() - 1;
-    if vm.subintent_sigs.len() != members {
+) -> Result<Vec<Attested>, DerivationError> {
+    let mut all = Vec::new();
+    let root = vm.signing_hash().as_hash32().0;
+    held_to(&tree.root, &vm.signatures, root, 0, &mut all)?;
+    for (offset, signed) in tree.root.signed_members().into_iter().enumerate() {
+        let hash = signed.intent.hash(&ProtocolHasher).0.0;
+        held_to(
+            &signed.intent,
+            &signed.signatures,
+            hash,
+            offset + 1,
+            &mut all,
+        )?;
+    }
+    if all.len() > MAX_TX_ATTESTATIONS {
         return Err(DerivationError::Refused(format!(
-            "envelope carries {} member intents but {} signatures for them",
-            members,
-            vm.subintent_sigs.len()
+            "envelope carries {} attestations, more than {MAX_TX_ATTESTATIONS}",
+            all.len()
         )));
     }
-    let mut sets = vec![vec![signer]];
-    for (index, sig) in vm.subintent_sigs.iter().enumerate() {
-        let Some(key) = principal_for(sig.scheme, &sig.public_key) else {
-            return Err(DerivationError::Refused(format!(
-                "the key attesting intent {} derives no principal",
-                index + 1
-            )));
-        };
-        sets.push(vec![key]);
+    Ok(all)
+}
+
+/// Pair `carried` with what `intent` declares, appending each over `hash`.
+fn held_to(
+    intent: &Intent,
+    carried: &[Attestation],
+    hash: [u8; 32],
+    position: usize,
+    into: &mut Vec<Attested>,
+) -> Result<(), DerivationError> {
+    if carried.len() != intent.attested_by.len() {
+        return Err(DerivationError::Refused(format!(
+            "intent {position} declares {} attesting principals and carries {} attestations",
+            intent.attested_by.len(),
+            carried.len()
+        )));
     }
-    Ok(sets)
+    for (declared, attestation) in intent.attested_by.iter().zip(carried) {
+        let derived = principal_for(attestation.scheme, &attestation.public_key);
+        if derived != Some(*declared) {
+            return Err(DerivationError::Refused(format!(
+                "intent {position}: an attesting key does not derive {declared:?}"
+            )));
+        }
+        into.push(Attested {
+            hash,
+            attestation: attestation.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// What verifying every attestation the envelope and its tree carry
+/// costs, each priced as its scheme is registered.
+#[must_use]
+pub fn signature_work(vm: &TransactionEnvelope, tree: &EnvelopeTree) -> DeclaredWork {
+    attestation_work(
+        vm.signatures.iter().chain(
+            tree.root
+                .signed_members()
+                .into_iter()
+                .flat_map(|signed| signed.signatures.iter()),
+        ),
+    )
 }
 
 /// A call envelope decoded and read for who attests what, ahead of
@@ -349,24 +386,25 @@ pub struct CallEnvelope<'a> {
     vm: &'a TransactionEnvelope,
     /// The bound tree the envelope carries.
     pub tree: EnvelopeTree,
-    /// Whose keys attest each intent, in tree order.
-    pub attested_by: Vec<Vec<PrincipalAddr>>,
+    /// Every attestation the envelope and its tree carry, held to the
+    /// declarations they stand beside, with the hash each covers.
+    pub attestations: Vec<Attested>,
 }
 
 impl<'a> CallEnvelope<'a> {
-    /// Decode the tree and read the attesting sets.
+    /// Decode the tree and hold its attestations to it.
     ///
     /// # Errors
     ///
     /// [`DerivationError::Refused`] on a tree that does not decode, or
-    /// the arity and key refusals of [`attesting_sets`].
+    /// the arity and key refusals of [`attestations`].
     pub fn decode(vm: &'a TransactionEnvelope) -> Result<Self, DerivationError> {
         let tree = decode_tree(&vm.tree)?;
-        let attested_by = attesting_sets(vm, &tree)?;
+        let attestations = attestations(vm, &tree)?;
         Ok(Self {
             vm,
             tree,
-            attested_by,
+            attestations,
         })
     }
 
@@ -376,12 +414,17 @@ impl<'a> CallEnvelope<'a> {
         &self.vm.terms
     }
 
-    /// The principal the envelope's own key derives: the key attesting
-    /// the composition's intent, and the one the payer's rule is judged
-    /// against at the fee gate.
+    /// The principals attesting the root intent, judged against the
+    /// payer's rule at the fee gate.
     #[must_use]
-    pub fn signer(&self) -> PrincipalAddr {
-        self.attested_by[0][0]
+    pub fn attested_by(&self) -> &[PrincipalAddr] {
+        &self.tree.root.attested_by
+    }
+
+    /// What verifying every attestation the envelope carries costs.
+    #[must_use]
+    pub fn signature_work(&self) -> DeclaredWork {
+        signature_work(self.vm, &self.tree)
     }
 
     /// Admit the tree against `chain`, and hold the signed terms to the
@@ -395,7 +438,6 @@ impl<'a> CallEnvelope<'a> {
     pub fn admit(&self, chain: &dyn ChainRecords) -> Result<AdmittedTree, DerivationError> {
         let admitted = admit_tree(
             &self.tree,
-            &self.attested_by,
             envelope_identity(self.vm),
             chain,
             &ProtocolHasher,
@@ -883,14 +925,8 @@ impl BridgeStatics {
     /// happens to name the same vault.
     fn derive_publish(
         vm: &TransactionEnvelope,
-        signer: PrincipalAddr,
         artifact: &[u8],
     ) -> Result<Derived, DerivationError> {
-        if !vm.subintent_sigs.is_empty() {
-            return Err(DerivationError::Refused(
-                "a publish carries no members".into(),
-            ));
-        }
         // A publish's tree is one root that calls nothing: the intent
         // that states the terms and the window, composing nobody and
         // presenting no interface.
@@ -961,7 +997,8 @@ impl BridgeStatics {
         shares.sort_unstable_by_key(|share| share.owner);
         // A publish keeps exactly what it writes: the artifact sits in
         // the package cell and the vault holds its amount.
-        let everywhere = everywhere(retained, envelope_bytes(vm)?, vm.signatures(), 0);
+        let attestations = attestations(vm, &tree)?;
+        let everywhere = everywhere(retained, envelope_bytes(vm)?, signature_work(vm, &tree), 0);
         let work = whole_work(&shares, &[], &[], everywhere);
 
         Ok(Derived {
@@ -985,7 +1022,8 @@ impl BridgeStatics {
             // own cell, which the write prefixes below name.
             accounts: Vec::new(),
             nullifiers: Vec::new(),
-            signer,
+            attested_by: tree.root.attested_by.clone(),
+            attestations,
             routing: Routing {
                 read_prefixes: Vec::new(),
                 // Both owners: the artifact's cell sits under its own
@@ -1006,7 +1044,6 @@ impl BridgeStatics {
                 write_keys,
                 provision_keys: Vec::new(),
             },
-            subintent_hashes: Vec::new(),
             fee_vault_local: vault.local.0,
             auth_cell_local: auth_key(publisher).local.0,
             // A publish runs no package: it writes one and calls nothing.
@@ -1036,13 +1073,8 @@ impl Derivation for BridgeStatics {
         // taken where the payer's state is, as a condition of the fee
         // reservation engaging — so derivation records the identity and
         // never compares it against the payer field.
-        let Some(signer) = principal_for(vm.signer_scheme, &vm.signer) else {
-            return Err(DerivationError::Refused(
-                "the envelope's signer key derives no principal".into(),
-            ));
-        };
         if let Some(artifact) = &vm.artifact {
-            return Self::derive_publish(vm, signer, artifact);
+            return Self::derive_publish(vm, artifact);
         }
         let call = CallEnvelope::decode(vm)?;
         let (effective_window, network) = effective_window(&call.tree)?;
@@ -1100,7 +1132,7 @@ impl Derivation for BridgeStatics {
         } = declared_vector(
             &self.cache,
             &terms,
-            vm.signatures(),
+            call.signature_work(),
             admitted,
             &legs,
             envelope_bytes(vm)?,
@@ -1123,7 +1155,8 @@ impl Derivation for BridgeStatics {
                 .map(|nullifier| nullifier.key)
                 .collect(),
             accounts: intent_accounts(&admitted_tree),
-            signer,
+            attested_by: call.attested_by().to_vec(),
+            attestations: call.attestations.clone(),
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),
                 write_prefixes: prefixes(&write_keys),
@@ -1133,15 +1166,6 @@ impl Derivation for BridgeStatics {
                 provision_keys: provision_keys.into_iter().collect(),
                 declared_modes,
             },
-            // The members alone, in the order `subintent_sigs` pairs
-            // with: the root is attested by the envelope's signature and
-            // carries none of them.
-            subintent_hashes: admitted_tree
-                .intents
-                .iter()
-                .skip(1)
-                .map(|record| record.intent.0.0)
-                .collect(),
             fee_vault_local: vault_key(terms.fee_payer, *PROTOCOL_RESOURCE).local.0,
             auth_cell_local: auth_key(terms.fee_payer).local.0,
             packages,
@@ -1192,10 +1216,10 @@ mod tests {
     use hyperscale_vm_effects::{
         Binding, Claim, Constraint, EdgeRef, EvidenceRef, Give, GiveRef, GraphArg, GraphNode,
         Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash, ManifestGraph, Member,
-        MetadataCache, PackageHash, RuleBytes, Socket, StoredRule, ValueSource, child_key, never,
-        nullifier_expiry_ms, nullifier_key, package_slot,
+        MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket, StoredRule, ValueSource,
+        child_key, never, nullifier_expiry_ms, nullifier_key, package_slot,
     };
-    use hyperscale_vm_manifest_builder::signing::{sign_subintent, wrap_publish};
+    use hyperscale_vm_manifest_builder::signing::wrap_publish;
     use hyperscale_vm_stdlib::account;
     use hyperscale_vm_types::{
         AMOUNT_CELL_BYTES, CollectionId, LegRole, MAX_GAS_LIMIT, ResourceAddr, WRITE_LEAF_BYTES,
@@ -1338,7 +1362,7 @@ mod tests {
             )
         };
         root.members = vec![Member {
-            intent: bob,
+            signed: SignedIntent::unsigned(bob),
             wiring: vec![Binding::Value(ValueSource::Edge(EdgeRef {
                 producer: 0,
                 output: 0,
@@ -1358,27 +1382,21 @@ mod tests {
         }
     }
 
-    fn envelope(tree: &EnvelopeTree, subintent_keys: &[&Ed25519PrivateKey]) -> TransactionEnvelope {
-        // The root leads and the envelope's signature attests it, so the
-        // members are what these keys pair with.
-        let subintent_sigs = tree
-            .intents()
-            .into_iter()
-            .skip(1)
-            .zip(subintent_keys)
-            .map(|(intent, signer)| {
-                let hash = intent.hash(&ProtocolHasher);
-                sign_subintent(*signer, &hash.0.0)
-            })
-            .collect();
+    /// `tree` wrapped and signed: each member attested by the key at its
+    /// position in tree order, and the root by the composer's key.
+    fn envelope(tree: &EnvelopeTree, member_keys: &[&Ed25519PrivateKey]) -> TransactionEnvelope {
+        let mut tree = tree.clone();
+        let mut keys = member_keys.iter();
+        tree.root.for_each_signed_member(&mut |signed| {
+            if let Some(key) = keys.next() {
+                signed.attest(*key, &ProtocolHasher);
+            }
+        });
         TransactionEnvelope {
-            tree: encode_tree(tree),
-            terms: terms(tree),
+            tree: encode_tree(&tree),
+            terms: terms(&tree),
             artifact: None,
-            subintent_sigs,
-            signer_scheme: SchemeId::NONE,
-            signer: Vec::new(),
-            signature: Vec::new(),
+            signatures: Vec::new(),
         }
         .sign(&key(7))
     }
@@ -1391,6 +1409,7 @@ mod tests {
     ) -> TransactionEnvelope {
         let mut edited = vm.clone();
         edit(&mut edited.terms);
+        edited.signatures.clear();
         edited.sign(signer)
     }
 
@@ -1471,7 +1490,7 @@ mod tests {
         );
         assert_eq!(
             derived.work.compute,
-            ceilings_total(&vm) + vm.signatures().compute,
+            ceilings_total(&vm) + attestation_work(&vm.signatures).compute,
             "compute is the ceilings and the verification"
         );
         assert_eq!(
@@ -1580,7 +1599,7 @@ mod tests {
                 .expect("derives")
         };
         let (one, other) = (derive(&first), derive(&second));
-        let bob = first.root.members[0].intent.hash(&ProtocolHasher);
+        let bob = first.root.members[0].signed.intent.hash(&ProtocolHasher);
 
         // The interleave puts Bob's withdraw at manifest node 1, first
         // in his own intent — and the leg says which of those it is.
@@ -1630,10 +1649,10 @@ mod tests {
 
         assert_eq!(
             derived.work.compute,
-            ceilings_total(&vm) + vm.signatures().compute
+            ceilings_total(&vm) + attestation_work(&vm.signatures).compute
         );
         assert!(
-            derived.work.retention >= envelope_bytes + vm.signatures().retention,
+            derived.work.retention >= envelope_bytes + attestation_work(&vm.signatures).retention,
             "retention carries the envelope and the auth material"
         );
         assert!(
@@ -1925,7 +1944,7 @@ mod tests {
         let mut provisioning = vec![composer_addr().address(), bob_addr().address()];
         provisioning.sort_unstable();
         assert_eq!(derived.routing.provision_prefixes, provisioning);
-        assert!(derived.subintent_hashes.is_empty());
+        assert_eq!(derived.attestations.len(), 1, "the root's alone");
         let mut owners = vec![composer_addr(), bob_addr()];
         owners.sort_unstable();
         assert_eq!(derived.routing.write_prefixes, owners);
@@ -1990,13 +2009,13 @@ mod tests {
             .derive(&envelope(&tree, &[&bob]))
             .expect("derives");
 
-        let hash = tree.root.members[0].intent.hash(&ProtocolHasher);
-        assert_eq!(derived.subintent_hashes, vec![hash.0.0]);
+        let hash = tree.root.members[0].signed.intent.hash(&ProtocolHasher);
+        assert_eq!(derived.attestations[1].hash, hash.0.0);
         let nullifier = nullifier_key(
             &ProtocolHasher,
             bob_addr(),
             hash,
-            nullifier_expiry_ms(&tree.root.members[0].intent.header),
+            nullifier_expiry_ms(&tree.root.members[0].signed.intent.header),
         );
         assert!(derived.routing.write_keys.contains(&DeclaredKey::substate(
             bob_addr().address(),
@@ -2065,15 +2084,14 @@ mod tests {
             terms.fee_payer = bob_addr();
         });
 
-        assert!(stolen.signature_is_valid(), "the composer signed it");
         let derived = statics().derive(&stolen).expect("derives");
         assert_eq!(
-            derived.signer,
-            composer_addr(),
-            "the recorded identity is the key's, not the payer field's"
+            derived.attested_by,
+            [composer_addr()],
+            "the recorded set is the key's, not the payer field's"
         );
         assert_ne!(
-            derived.signer, derived.terms.fee_payer,
+            derived.attested_by[0], derived.terms.fee_payer,
             "which is exactly the mismatch the payer shard's verdict reads"
         );
     }
@@ -2099,13 +2117,13 @@ mod tests {
                 deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
-        let signed = reterm(&envelope(&tree, &[]), &secp, |terms| {
-            terms.fee_payer = payer;
-        });
+        let mut secp_signed = envelope(&tree, &[]);
+        secp_signed.terms.fee_payer = payer;
+        secp_signed.signatures.clear();
+        let signed = secp_signed.sign(&secp);
 
-        assert!(signed.signature_is_valid());
         let derived = statics().derive(&signed).expect("derives");
-        assert_eq!(derived.signer, payer);
+        assert_eq!(derived.attested_by, [payer]);
     }
 
     /// A withdrawal from an account the envelope carries no signature for
@@ -2218,15 +2236,29 @@ mod tests {
         // Admissible: whether Bob's account admits that key is state only
         // Bob's own cell holds, so his shard answers it as the sign-in,
         // before any body runs and at the price of the reach.
-        let tree = composed_tree();
         let impostor = key(11);
+        let mut tree = composed_tree();
+        tree.root.members[0].signed.intent.attested_by =
+            vec![account_address(&impostor.public_key().0)];
         assert!(statics().derive(&envelope(&tree, &[&impostor])).is_ok());
 
-        // A missing signature list is a different thing: the envelope
-        // does not say who attested an intent it carries, which nothing
+        // Declaring Bob and attesting with another key is a different
+        // thing: the attestation does not stand for the principal at its
+        // position, and nothing downstream could pair it.
+        let declared_bob = composed_tree();
+        assert!(
+            statics()
+                .derive(&envelope(&declared_bob, &[&impostor]))
+                .is_err()
+        );
+
+        // A missing attestation is a different thing: the member
+        // declares a principal nothing stands beside, which nothing
         // downstream could answer.
         let mut unsigned = envelope(&tree, &[&key(9)]);
-        unsigned.subintent_sigs.clear();
+        let mut stripped = decode_tree(&unsigned.tree).expect("the tree decodes");
+        stripped.root.members[0].signed.signatures.clear();
+        unsigned.tree = encode_tree(&stripped);
         assert!(statics().derive(&unsigned).is_err());
     }
 
@@ -2238,7 +2270,7 @@ mod tests {
         // that makes the subintent once-only lives on the network they
         // did name.
         let mut foreign = composed_tree();
-        foreign.root.members[0].intent.header.network = NetworkId(1);
+        foreign.root.members[0].signed.intent.header.network = NetworkId(1);
         assert!(statics().derive(&envelope(&foreign, &[&key(9)])).is_err());
 
         // The root's own network is the transaction's: a root naming
@@ -2264,8 +2296,8 @@ mod tests {
         // transaction its own tighter edges: a composer cannot bind a
         // signer past what that signer offered.
         let mut tight = composed_tree();
-        tight.root.members[0].intent.header.validity_start_ms = 10;
-        tight.root.members[0].intent.header.validity_end_ms = 900;
+        tight.root.members[0].signed.intent.header.validity_start_ms = 10;
+        tight.root.members[0].signed.intent.header.validity_end_ms = 900;
         let derived = statics()
             .derive(&envelope(&tight, &[&key(9)]))
             .expect("an offer inside the window composes");
@@ -2285,7 +2317,7 @@ mod tests {
         // the envelope leaves the transaction exactly as wide as its
         // composer signed for.
         let mut wide = composed_tree();
-        wide.root.members[0].intent.header.validity_end_ms = 5_000_000;
+        wide.root.members[0].signed.intent.header.validity_end_ms = 5_000_000;
         let derived = statics()
             .derive(&envelope(&wide, &[&key(9)]))
             .expect("a wider offer composes");
@@ -2300,15 +2332,19 @@ mod tests {
         // The offer closed before the transaction opens. There is no
         // instant both signers agreed to, so there is no transaction.
         let mut lapsed = composed_tree();
-        lapsed.root.members[0].intent.header.validity_start_ms = 2_000_000;
-        lapsed.root.members[0].intent.header.validity_end_ms = 2_000_001;
+        lapsed.root.members[0]
+            .signed
+            .intent
+            .header
+            .validity_start_ms = 2_000_000;
+        lapsed.root.members[0].signed.intent.header.validity_end_ms = 2_000_001;
         assert!(statics().derive(&envelope(&lapsed, &[&key(9)])).is_err());
     }
 
     #[test]
     fn an_intent_standing_longer_than_the_cap_is_refused() {
         let mut forever = composed_tree();
-        forever.root.members[0].intent.header.validity_end_ms = u64::MAX;
+        forever.root.members[0].signed.intent.header.validity_end_ms = u64::MAX;
         assert!(statics().derive(&envelope(&forever, &[&key(9)])).is_err());
     }
 
@@ -2320,7 +2356,7 @@ mod tests {
         // declarations that conflict on nothing.
         let once = composed_tree();
         let mut twice = composed_tree();
-        twice.root.members[0].intent.header.discriminator = 1;
+        twice.root.members[0].signed.intent.header.discriminator = 1;
 
         let first = statics()
             .derive(&envelope(&once, &[&key(9)]))
@@ -2328,7 +2364,7 @@ mod tests {
         let second = statics()
             .derive(&envelope(&twice, &[&key(9)]))
             .expect("the same offer, said twice, composes");
-        assert_ne!(first.subintent_hashes, second.subintent_hashes);
+        assert_ne!(first.attestations[1].hash, second.attestations[1].hash);
 
         // The nullifier is derived from that identity, so the two spend
         // different cells — which is the whole of what the field buys.
@@ -2361,10 +2397,10 @@ mod tests {
         let tree = composed_tree();
         let decoded = decode_tree(&encode_tree(&tree)).unwrap();
         assert_eq!(
-            decoded.root.members[0].intent.hash(&ProtocolHasher),
-            tree.root.members[0].intent.hash(&ProtocolHasher)
+            decoded.root.members[0].signed.intent.hash(&ProtocolHasher),
+            tree.root.members[0].signed.intent.hash(&ProtocolHasher)
         );
-        let _typed: IntentHash = tree.root.members[0].intent.hash(&ProtocolHasher);
+        let _typed: IntentHash = tree.root.members[0].signed.intent.hash(&ProtocolHasher);
     }
 
     /// The provision-weight cap: cells count one, ranges count their

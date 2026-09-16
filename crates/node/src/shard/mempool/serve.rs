@@ -97,8 +97,7 @@ pub fn serve_transaction_request<S: ShardStorage>(
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        MAX_ARTIFACT_BYTES, MAX_WIRE_MESSAGE_BYTES, PrincipalAddr, SchemeId, Terms,
-        TransactionEnvelope,
+        MAX_ARTIFACT_BYTES, MAX_WIRE_MESSAGE_BYTES, PrincipalAddr, Terms, TransactionEnvelope,
     };
 
     use super::*;
@@ -116,10 +115,7 @@ mod tests {
                 message: Vec::new(),
             },
             artifact: Some(vec![seed; MAX_ARTIFACT_BYTES]),
-            subintent_sigs: Vec::new(),
-            signer_scheme: SchemeId::NONE,
-            signer: Vec::new(),
-            signature: Vec::new(),
+            signatures: Vec::new(),
         }))
     }
 

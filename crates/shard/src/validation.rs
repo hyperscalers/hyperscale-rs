@@ -481,13 +481,13 @@ mod tests {
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
         BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline,
         ExecutionOutcome, Finalization, Hash, Inclusion, LocalKey, MAX_INTENTS,
-        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition, PriceTable,
-        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, Round,
-        RoutePrefix, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
-        StateRoot, SubstateKey, TimestampRange, Transaction, TransactionDecision, TxHash,
-        TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
-        WeightedTimestamp, WitnessSources, test_utils,
+        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
+        ProvisionEntry, Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad,
+        Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
+        TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
+        WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1045,7 +1045,7 @@ mod tests {
         let composed = |seed: u32| {
             Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
                 seed,
-                MAX_SUBINTENTS,
+                MAX_INTENTS - 1,
                 test_utils::test_validity_range(),
             )))
         };

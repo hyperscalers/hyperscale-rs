@@ -12,10 +12,9 @@ use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass, Anchor,
     BlockHeight, CommittedAt, Deadline, Hash, Inclusion, LocalKey, MAX_ARTIFACT_BYTES,
-    MAX_ENVELOPE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS, MAX_UNSETTLED_PER_BLOCK,
-    ROUTE_PREFIX_BYTES, RoutePrefix, SchemeId, ShardId, StateClaim, StateRoot, SubintentSig,
-    SubstateKey, TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp,
-    evidence_admits_block,
+    MAX_ENVELOPE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_UNSETTLED_PER_BLOCK, ROUTE_PREFIX_BYTES,
+    RoutePrefix, SchemeId, ShardId, StateClaim, StateRoot, SubstateKey, TransactionEnvelope,
+    TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp, evidence_admits_block,
 };
 
 /// The widest envelope the caps admit: an artifact at its ceiling,
@@ -28,13 +27,13 @@ use hyperscale_types::{
 #[test]
 fn a_maximal_envelope_encodes_under_the_bound_it_is_budgeted_at() {
     use hyperscale_vm_types::{
-        MAX_CALL_BYTES, MAX_KEY_BYTES, MAX_MANIFEST_NODES, MAX_MESSAGE_LEN, MAX_SIG_BYTES,
-        PrincipalAddr, Terms,
+        Attestation, MAX_ATTESTATIONS, MAX_KEY_BYTES, MAX_MANIFEST_NODES, MAX_MESSAGE_LEN,
+        MAX_SIG_BYTES, MAX_TREE_BYTES, PrincipalAddr, Terms,
     };
 
     let widest = SchemeId::ML_DSA_65;
     let vm = TransactionEnvelope {
-        tree: vec![0xAB; MAX_CALL_BYTES],
+        tree: vec![0xAB; MAX_TREE_BYTES],
         terms: Terms {
             fee_payer: PrincipalAddr::new([0xAA; 31]),
             max_fee: u128::MAX,
@@ -43,16 +42,13 @@ fn a_maximal_envelope_encodes_under_the_bound_it_is_budgeted_at() {
             message: vec![0xAB; MAX_MESSAGE_LEN],
         },
         artifact: Some(vec![0xAB; MAX_ARTIFACT_BYTES]),
-        subintent_sigs: (0..MAX_SUBINTENTS)
-            .map(|_| SubintentSig {
+        signatures: (0..MAX_ATTESTATIONS)
+            .map(|_| Attestation {
                 scheme: widest,
                 public_key: vec![0x11; MAX_KEY_BYTES],
                 signature: vec![0x22; MAX_SIG_BYTES],
             })
             .collect(),
-        signer_scheme: widest,
-        signer: vec![0x55; MAX_KEY_BYTES],
-        signature: vec![0x66; MAX_SIG_BYTES],
     };
     let encoded = hbor_to_vec(&vm).expect("a maximal envelope encodes").len();
     println!("widest envelope: {encoded} bytes against a {MAX_ENVELOPE_BYTES} budget");

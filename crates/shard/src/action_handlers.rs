@@ -759,14 +759,10 @@ where
                     ));
                     break;
                 };
-                for signer in &demand.signers {
-                    if !protocol_statics().rule_admits(
-                        auth_cell.as_deref(),
-                        payer,
-                        std::slice::from_ref(signer),
-                    ) {
+                for attested_by in &demand.attesting_sets {
+                    if !protocol_statics().rule_admits(auth_cell.as_deref(), payer, attested_by) {
                         result = Err(format!(
-                            "payer {:?}: rule does not admit signer {signer:?}",
+                            "payer {:?}: rule does not admit the attesting set {attested_by:?}",
                             demand.vault.owner
                         ));
                         break 'demands;
@@ -1299,7 +1295,7 @@ where
                         // read, so a proposal never self-rejects on a
                         // signer the payer's rule refuses.
                         let auth_cell = auth_cells.get(&vault).and_then(Option::as_deref);
-                        if !tx.payer_admits_signer(auth_cell) {
+                        if !tx.payer_admits_attesters(auth_cell) {
                             unbound += 1;
                             return false;
                         }
