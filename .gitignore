@@ -17,6 +17,12 @@
 /simulation-failures/
 /reference/
 
+# Proptest failure seeds: one machine's record of one run, written the
+# moment a property fails and never read back deliberately — so tracking
+# them turns every incidental failure into a diff to review.
+*.proptest-regressions
+proptest-regressions/
+
 # Benchmarks
 /target/criterion/
 profile.json.gz
