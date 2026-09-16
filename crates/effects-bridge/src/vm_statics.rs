@@ -1165,17 +1165,6 @@ mod tests {
         }
     }
 
-    /// The sign-in every fixture graph leads with: node 0 of its intent,
-    /// which is what the withdraw fixtures point their proofs at.
-    fn sign_in(target: impl Into<CallTarget>) -> GraphNode {
-        GraphNode {
-            target: target.into(),
-            method: "authorize".into(),
-            args: vec![],
-            evidence: [EvidenceRef::IntentSignature].into(),
-        }
-    }
-
     fn withdraw(target: impl Into<CallTarget>, resource: ResourceAddr, amount: u128) -> GraphNode {
         GraphNode {
             target: target.into(),
@@ -1184,7 +1173,7 @@ mod tests {
                 GraphArg::Literal(Value::Address(resource.address())),
                 GraphArg::Literal(Value::U128(amount)),
             ],
-            evidence: [EvidenceRef::Node(0)].into(),
+            evidence: [EvidenceRef::IntentSignature].into(),
         }
     }
 
@@ -1256,7 +1245,6 @@ mod tests {
                     header: HEADER,
                     graph: ManifestGraph {
                         nodes: vec![
-                            sign_in(composer_addr()),
                             withdraw(composer_addr(), RES_X, 100),
                             deposit_socket(composer_addr(), 0),
                         ],
@@ -1270,7 +1258,7 @@ mod tests {
                 bindings: vec![Binding::Value {
                     intent: 1,
                     edge: EdgeRef {
-                        producer: 1,
+                        producer: 0,
                         output: 0,
                     },
                 }],
@@ -1280,7 +1268,6 @@ mod tests {
                     header: HEADER,
                     graph: ManifestGraph {
                         nodes: vec![
-                            sign_in(bob_addr()),
                             withdraw(bob_addr(), RES_Y, 10),
                             deposit_socket(bob_addr(), 0),
                         ],
@@ -1294,7 +1281,7 @@ mod tests {
                 bindings: vec![Binding::Value {
                     intent: 0,
                     edge: EdgeRef {
-                        producer: 1,
+                        producer: 0,
                         output: 0,
                     },
                 }],
@@ -1337,28 +1324,24 @@ mod tests {
         .sign(&key(7))
     }
 
-    /// A transfer divides into a sign-in, a withdraw and a deposit. Its
-    /// one value edge is one crossing, whose record sits under the
-    /// sender and names the vault the withdraw reserved; and it binds
-    /// nothing, so it files no nullifier.
+    /// A transfer divides into a withdraw and a deposit. Its one value
+    /// edge is one crossing, whose record sits under the sender and
+    /// names the vault the withdraw reserved; and it binds nothing, so
+    /// it files no nullifier.
     #[test]
     fn a_transfer_derives_one_crossing_per_value_edge() {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let vm = envelope(&tree, &[]);
         let derived = statics().derive(&vm).expect("derives");
 
         let roles: Vec<LegRole> = derived.legs.iter().map(|leg| leg.role).collect();
-        assert_eq!(
-            roles,
-            vec![LegRole::Attesting, LegRole::Inbound, LegRole::Outbound]
-        );
+        assert_eq!(roles, vec![LegRole::Inbound, LegRole::Outbound]);
         let records = crossing_records(&derived.legs);
         assert_eq!(records.len(), 1);
         assert_eq!(
@@ -1429,25 +1412,24 @@ mod tests {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let mut vm = envelope(&tree, &[]);
-        assert_eq!(vm.gas_limits.len(), 3);
+        assert_eq!(vm.gas_limits.len(), 2);
         statics().derive(&vm).expect("one ceiling per node derives");
 
         vm.gas_limits.pop();
         let short = statics()
             .derive(&vm)
-            .expect_err("two ceilings for three nodes");
-        assert!(short.to_string().contains("3 manifest nodes"), "{short}");
+            .expect_err("one ceiling for two nodes");
+        assert!(short.to_string().contains("2 manifest nodes"), "{short}");
 
-        vm.gas_limits = vec![250_000; 4];
+        vm.gas_limits = vec![250_000; 3];
         assert!(
             statics().derive(&vm).is_err(),
-            "four ceilings for three nodes"
+            "three ceilings for two nodes"
         );
     }
 
@@ -1457,19 +1439,18 @@ mod tests {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let mut vm = envelope(&tree, &[]);
-        vm.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2, 1];
+        vm.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2 + 1];
         let heavy = statics()
             .derive(&vm)
             .expect_err("the sum is past the bound");
         assert!(heavy.to_string().contains("sum"), "{heavy}");
 
-        vm.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2, 0];
+        vm.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2];
         statics().derive(&vm).expect("at the bound derives");
     }
 
@@ -1523,12 +1504,12 @@ mod tests {
         let (one, other) = (derive(&first), derive(&second));
         let bob = first.intents[1].decl.hash(&ProtocolHasher);
 
-        // The interleave puts Bob's withdraw at manifest node 3, second
+        // The interleave puts Bob's withdraw at manifest node 1, first
         // in his own intent — and the leg says which of those it is.
-        assert_eq!(one.legs[3].intent, bob);
-        assert_eq!(one.legs[3].local, 1);
+        assert_eq!(one.legs[1].intent, bob);
+        assert_eq!(one.legs[1].local, 0);
         assert_eq!(
-            one.legs[1].intent,
+            one.legs[0].intent,
             first.intents[0].decl.hash(&ProtocolHasher)
         );
 
@@ -1536,13 +1517,13 @@ mod tests {
             CrossingSite::record_of(&ProtocolHasher, &derived.legs[node], 0).key()
         };
         assert_eq!(
-            record_of(&one, 3),
-            record_of(&other, 3),
+            record_of(&one, 1),
+            record_of(&other, 1),
             "Bob's record is fixed by Bob's signature"
         );
         assert_ne!(
-            record_of(&one, 1),
-            record_of(&other, 1),
+            record_of(&one, 0),
+            record_of(&other, 0),
             "the root's record moves with the root's window"
         );
         assert_eq!(
@@ -1564,9 +1545,8 @@ mod tests {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let vm = envelope(&tree, &[]);
@@ -1591,8 +1571,7 @@ mod tests {
             derived.work.write_bytes
         );
         // Each call carries the bound its own method declares, so a
-        // transfer's sign-in carries nothing and its withdraw and
-        // deposit carry theirs.
+        // transfer's withdraw and deposit carry theirs.
         let metadata = account::metadata();
         let bound = |method: &str| {
             u64::from(
@@ -1603,8 +1582,7 @@ mod tests {
                     .event_bytes,
             )
         };
-        let (signing_in, moving) = (bound("authorize"), bound("withdraw") + bound("deposit"));
-        assert_eq!(signing_in, 0, "signing in emits nothing and pays nothing");
+        let moving = bound("withdraw") + bound("deposit");
         assert!(moving > 0, "the movements bound what they may emit");
         assert!(
             derived.work.retention >= envelope_bytes + moving,
@@ -1617,11 +1595,10 @@ mod tests {
         let twice = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 3, RES_X),
+                deposit_edge(bob_addr(), 2, RES_X),
             ],
         );
         let wider_vm = envelope(&twice, &[]);
@@ -1655,11 +1632,10 @@ mod tests {
         let wider = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
                 withdraw(composer_addr(), RES_Y, 10),
-                deposit_edge(bob_addr(), 3, RES_Y),
+                deposit_edge(bob_addr(), 2, RES_Y),
             ],
         );
         let wider = statics().derive(&envelope(&wider, &[])).expect("derives");
@@ -1692,17 +1668,15 @@ mod tests {
         let plain = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let itself = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(composer_addr(), 1, RES_X),
+                deposit_edge(composer_addr(), 0, RES_X),
             ],
         );
         let write_of = |tree| {
@@ -1738,9 +1712,8 @@ mod tests {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
@@ -1756,9 +1729,8 @@ mod tests {
         let itself = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(composer_addr(), 1, RES_X),
+                deposit_edge(composer_addr(), 0, RES_X),
             ],
         );
         let fewer = statics().derive(&envelope(&itself, &[])).expect("derives");
@@ -1782,9 +1754,8 @@ mod tests {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let ed = statics().derive(&envelope(&tree, &[])).expect("derives");
@@ -1795,9 +1766,8 @@ mod tests {
         let secp_tree = intent_tree(
             payer,
             vec![
-                sign_in(payer),
                 withdraw(payer, RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let mut wider = envelope(&secp_tree, &[]);
@@ -1825,9 +1795,8 @@ mod tests {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
@@ -1977,9 +1946,8 @@ mod tests {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let mut stolen = envelope(&tree, &[]);
@@ -2016,9 +1984,8 @@ mod tests {
         let tree = intent_tree(
             payer,
             vec![
-                sign_in(payer),
                 withdraw(payer, RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         let mut signed = envelope(&tree, &[]);
@@ -2040,9 +2007,8 @@ mod tests {
         let tree = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(bob_addr(), RES_X, 100),
-                deposit_edge(composer_addr(), 1, RES_X),
+                deposit_edge(composer_addr(), 0, RES_X),
             ],
         );
         assert!(statics().derive(&envelope(&tree, &[])).is_err());
@@ -2053,9 +2019,8 @@ mod tests {
         let transfer = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         assert!(statics().derive(&envelope(&transfer, &[])).is_ok());
@@ -2105,20 +2070,6 @@ mod tests {
                         vec![node([EvidenceRef::IntentSignature].into())],
                     ),
                     &[],
-                ))
-                .is_ok()
-        );
-        assert!(
-            statics()
-                .derive(&envelope(
-                    &intent_tree(
-                        composer_addr(),
-                        vec![
-                            sign_in(composer_addr()),
-                            node([EvidenceRef::Node(0)].into()),
-                        ]
-                    ),
-                    &[]
                 ))
                 .is_ok()
         );
@@ -2185,9 +2136,8 @@ mod tests {
         let mut root_foreign = intent_tree(
             composer_addr(),
             vec![
-                sign_in(composer_addr()),
                 withdraw(composer_addr(), RES_X, 100),
-                deposit_edge(bob_addr(), 1, RES_X),
+                deposit_edge(bob_addr(), 0, RES_X),
             ],
         );
         root_foreign.intents[0].decl.header.network = NetworkId(1);

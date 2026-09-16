@@ -1447,7 +1447,7 @@ pub fn build_transfer_tx<S: AccountSigner>(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = client()
-        .transfer_graph(principal_of(payer), from, to, amount)
+        .transfer_graph(from, to, amount)
         .expect("the stdlib account answers a transfer");
     Transaction::new(envelope(graph, payer, validity))
 }
@@ -1471,7 +1471,7 @@ pub(crate) fn build_transfer_at_priority<S: AccountSigner>(
     priority_bp: u32,
 ) -> Transaction {
     let graph = client()
-        .transfer_graph(principal_of(payer), from, to, amount)
+        .transfer_graph(from, to, amount)
         .expect("the stdlib account answers a transfer");
     Transaction::new(client().sign(
         graph,
@@ -1505,7 +1505,7 @@ pub(crate) fn build_transfer_at_ceilings<S: AccountSigner>(
     ceilings: Vec<u64>,
 ) -> Transaction {
     let graph = client()
-        .transfer_graph(principal_of(payer), from, to, amount)
+        .transfer_graph(from, to, amount)
         .expect("the stdlib account answers a transfer");
     Transaction::new(client().sign(
         graph,
@@ -1525,10 +1525,10 @@ pub(crate) fn build_transfer_at_ceilings<S: AccountSigner>(
 ///
 /// The payer field names `payer`, and whether the signer's identity may
 /// spend it is the payer shard's binding verdict — refused where the
-/// payer's rule does not admit it, engaged where it does. The graph is
-/// composed by the signer's own account, so a `from` the signer's key
-/// does not derive is answered by its stored rule with the signer's
-/// sign-in.
+/// payer's rule does not admit it, engaged where it does. The intent
+/// acts as `from` and the signer's key is what attests it, so a `from`
+/// the key does not derive is answered by that account's own stored rule
+/// at the sign-in its shard judges.
 ///
 /// # Panics
 ///
@@ -1545,12 +1545,12 @@ pub(crate) fn build_transfer_paid_by<S: AccountSigner>(
 ) -> Transaction {
     let client = client();
     let graph = client
-        .transfer_graph(principal_of(signer), from, to, amount)
+        .transfer_graph(from, to, amount)
         .expect("the stdlib account answers a transfer");
     let gas_limits = default_gas_limits(graph.nodes.len());
     let envelope = signing::wrap(
         &EnvelopeTree::of_one(
-            principal_of(signer),
+            from,
             IntentDecl {
                 header: scenario_header(validity),
                 graph,
@@ -2144,12 +2144,11 @@ pub(crate) fn build_instance_instantiate_tx(
     let meta = published_instance(artifact, salt, founder);
     let component = meta.address(&ProtocolHasher);
 
-    // Bringing up is one node: the founder its configuration names signs
-    // in, the seal mints the owner badge the component comes up holding,
-    // and that edge is filed in the founder's own account.
+    // Bringing up is one node: the seal mints the owner badge the
+    // component comes up holding, answering its gate from the founder's
+    // own signature, and that edge is filed in the founder's account.
     let mut b = GraphBuilder::new();
-    let [] = b.call_signed(founder, "authorize", ());
-    let [badge] = b.call_bearing(component, "instantiate", (), 0);
+    let [badge] = b.call_signed(component, "instantiate", ());
     let owner_badge = issued_resource(
         &ProtocolHasher,
         component,

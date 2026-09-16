@@ -107,7 +107,7 @@ const fn terms(max_fee: u128) -> Terms {
 fn signed_transfer(from: PrincipalAddr, to: PrincipalAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[THIEF; 32]).unwrap();
     let graph = client()
-        .transfer_graph(from, from, to, amount)
+        .transfer_graph(from, to, amount)
         .expect("an account answers a transfer");
     Transaction::new(client().sign(graph, &key, terms(2_000)))
 }
