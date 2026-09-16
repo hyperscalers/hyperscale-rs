@@ -166,14 +166,19 @@ fn client() -> &'static Client {
 const fn terms(max_fee: u128) -> Terms {
     Terms {
         max_fee,
-        validity: TimestampRange::new(
-            WeightedTimestamp::from_millis(0),
-            WeightedTimestamp::from_millis(OFFER_MS),
-        ),
         ceilings: Ceilings::Guessed,
         priority_bp: 0,
         message: Vec::new(),
     }
+}
+
+/// The window every envelope here is signed for: the widest an intent
+/// may name, so nothing narrows a transaction.
+const fn validity() -> TimestampRange {
+    TimestampRange::new(
+        WeightedTimestamp::from_millis(0),
+        WeightedTimestamp::from_millis(OFFER_MS),
+    )
 }
 
 /// `delegator.withdraw(*PROTOCOL_RESOURCE) -> pool.stake -> delegator.deposit(units)`.
@@ -189,7 +194,7 @@ fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
         .expect("a pool takes a delegation");
     account::deposit(&mut b, from, units).expect("an account banks its position");
     let graph = b.build().expect("every output is consumed");
-    Transaction::new(client().sign(graph, &key, terms(1_000)))
+    Transaction::new(client().sign(graph, &key, validity(), terms(1_000)))
 }
 
 /// The same delegation, typed against a record the base chain does not
@@ -211,7 +216,7 @@ fn signed_stake_composed(seat: &StakePoolSeat, amount: u128) -> Transaction {
         .expect("a pool takes a delegation");
     account::deposit(&mut b, from, units).expect("an account banks its position");
     let tree = b.build().expect("the intent declares no hole");
-    Transaction::new(client().sign_tree(&tree, &key, terms(1_000)))
+    Transaction::new(client().sign_tree(&tree, &[&key], terms(1_000)))
 }
 
 fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
@@ -482,7 +487,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     instantiate(&mut root, pool, ()).expect("a derivable pool answers its seal");
     root.register_instance(meta);
     let tree = root.build().expect("the intent declares no hole");
-    Transaction::new(client().sign_tree(&tree, &key, terms(1_000)))
+    Transaction::new(client().sign_tree(&tree, &[&key], terms(1_000)))
 }
 
 /// A pool nobody seated brings itself up, and the cells it ends holding
@@ -634,7 +639,7 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
     let graph = client()
         .transfer_graph(from, from, 100)
         .expect("an account answers a transfer");
-    let tx = Transaction::new(client().sign(graph, &key, terms(1_000)));
+    let tx = Transaction::new(client().sign(graph, &key, validity(), terms(1_000)));
     let executed = execute(&executor, tx);
     assert!(
         witnesses(&executed[0]).is_empty(),
@@ -657,7 +662,7 @@ fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     })
     .expect("a pool answers a registration");
     let graph = b.build().expect("a registration produces nothing");
-    Transaction::new(client().sign(graph, &key, terms(1_000)))
+    Transaction::new(client().sign(graph, &key, validity(), terms(1_000)))
 }
 
 /// A pool instance is owned by nobody, so its own authority is

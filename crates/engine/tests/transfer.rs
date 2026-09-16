@@ -239,14 +239,19 @@ fn lottery_addr(salt: u8) -> ComponentAddr {
 const fn terms(max_fee: u128) -> Terms {
     Terms {
         max_fee,
-        validity: TimestampRange::new(
-            WeightedTimestamp::from_millis(0),
-            WeightedTimestamp::from_millis(OFFER_MS),
-        ),
         ceilings: Ceilings::Guessed,
         priority_bp: 0,
         message: Vec::new(),
     }
+}
+
+/// The window every envelope here is signed for: the widest an intent
+/// may name, so nothing narrows a transaction.
+const fn validity() -> TimestampRange {
+    TimestampRange::new(
+        WeightedTimestamp::from_millis(0),
+        WeightedTimestamp::from_millis(OFFER_MS),
+    )
 }
 
 fn signed_transfer(seed: u8, from: PrincipalAddr, to: PrincipalAddr, amount: u128) -> Transaction {
@@ -269,7 +274,7 @@ fn signed_transfer_under_bound(
         account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount).expect("an account withdraws");
     account::deposit(&mut b, to, funds.min(min)).expect("an account deposits");
     let graph = b.build().expect("every output is consumed");
-    Transaction::new(client().sign(graph, &key, terms(max_fee)))
+    Transaction::new(client().sign(graph, &key, validity(), terms(max_fee)))
 }
 
 /// A transfer drawing on an instance nothing registered.
@@ -289,7 +294,7 @@ fn signed_transfer_from_unknown(
     let [funds] = b.call_signed(from, "withdraw", (*PROTOCOL_RESOURCE, amount));
     let [] = b.call(to, "deposit", (funds.resource_is(*PROTOCOL_RESOURCE),));
     let graph = b.build().expect("every output is consumed");
-    Transaction::new(client().sign(graph, &key, terms(max_fee)))
+    Transaction::new(client().sign(graph, &key, validity(), terms(max_fee)))
 }
 
 fn signed_transfer_with_fee(
@@ -303,7 +308,7 @@ fn signed_transfer_with_fee(
     let graph = client()
         .transfer_graph(from, to, amount)
         .expect("an account answers a transfer");
-    Transaction::new(client().sign(graph, &key, terms(max_fee)))
+    Transaction::new(client().sign(graph, &key, validity(), terms(max_fee)))
 }
 
 /// The account address the fee-paying tests derive from their signing key.
@@ -350,7 +355,7 @@ fn signed_settle_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
         .settle(&mut root, 64)
         .expect("a lottery answers a settlement");
     let tree = root.build().expect("the intent declares no hole");
-    Transaction::new(client().sign_tree(&tree, &key, terms(max_fee)))
+    Transaction::new(client().sign_tree(&tree, &[&key], terms(max_fee)))
 }
 
 /// Genesis state with the lottery this binary draws on made actual.
@@ -385,7 +390,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         instantiate(&mut root, round, ()).expect("a derivable round answers its seal");
         root.register_instance(lottery_meta(*salt));
         let tree = root.build().expect("the intent declares no hole");
-        let seal = Transaction::new(client().sign_tree(&tree, &key, terms(1_000_000)));
+        let seal = Transaction::new(client().sign_tree(&tree, &[&key], terms(1_000_000)));
         let executed = execute_batch_on(
             &store,
             executor,
@@ -399,7 +404,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
 
         let close = Transaction::new(client().sign_tree(
             &closing_tree(*salt, fee_payer(SEALER_SEED)),
-            &key,
+            &[&key],
             terms(1_000_000),
         ));
         let executed = execute_batch_on(
@@ -734,6 +739,48 @@ fn a_transfer_folds_to_identity_keyed_absolute_updates() {
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), bob()),
         Some(encode_amount(150).to_vec())
+    );
+}
+
+/// A root acting as two accounts is attested by both, and the client
+/// signs it with both keys in the order the root declares: what reaches
+/// the chain is the set the builder wrote, each account's sign-in is
+/// judged over it, and both commit.
+#[test]
+fn a_two_account_root_signed_through_the_client_keeps_both_attesters() {
+    let executor = executor(ExecutionMode::Serial);
+    let alice_key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
+    let bob_key = Ed25519PrivateKey::from_bytes(&[BOB_SEED; 32]).unwrap();
+    let chain = client().records();
+    let mut root = IntentBuilder::acting_as(&chain, &ProtocolHasher, &[alice(), bob()], HEADER)
+        .expect("two accounts");
+    let to_bob = account::withdraw(&mut root, alice(), *PROTOCOL_RESOURCE, 100).unwrap();
+    account::deposit(&mut root, bob(), to_bob).unwrap();
+    let to_alice = account::withdraw(&mut root, bob(), *PROTOCOL_RESOURCE, 10).unwrap();
+    account::deposit(&mut root, alice(), to_alice).unwrap();
+    let tree = root.build().expect("one intent, two accounts");
+    let tx =
+        Transaction::new(client().sign_tree(&tree, &[&alice_key, &bob_key], terms(TRANSFER_FEE)));
+    assert_eq!(
+        decode_tree(&tx.body().tree).unwrap().root.attested_by,
+        [alice(), bob()]
+    );
+    assert_eq!(tx.body().signatures.len(), 2);
+
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(tx));
+    let price = price_of(&executor, &tx);
+    let executed = execute(&executor, &[Arc::clone(&tx)]);
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!("both sign-ins hold: {:?}", executed[0].consensus);
+    };
+    let settled = settled(writes, &world_accounts());
+    assert_eq!(
+        vault_cell(&settled, alice()),
+        Some(encode_amount(1_000 - 100 + 10 - price).to_vec())
+    );
+    assert_eq!(
+        vault_cell(&settled, bob()),
+        Some(encode_amount(50 + 100 - 10).to_vec())
     );
 }
 
@@ -1971,7 +2018,7 @@ fn a_two_recipient_fan_out_executes() {
     }
     let graph = b.build().expect("every output is consumed");
     let tx = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
-        client().sign(graph, &key, terms(10)),
+        client().sign(graph, &key, validity(), terms(10)),
     )));
     let executed = execute_on(
         &[(alice(), 1_000), (bob(), 50), (fee_payer(7), 1_000)],
@@ -2192,7 +2239,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
             account_address(&key.public_key().0),
             graph,
         )),
-        &key,
+        &[&key],
         terms(TRANSFER_FEE),
     ));
     let error = gap
@@ -2220,7 +2267,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
             instances: vec![meta],
             resources: Vec::new(),
         },
-        &key,
+        &[&key],
         terms(TRANSFER_FEE),
     ));
     let error = carried
@@ -2249,7 +2296,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
             account_address(&key.public_key().0),
             graph,
         )),
-        &key,
+        &[&key],
         terms(TRANSFER_FEE),
     ));
     let error = refused
@@ -3027,7 +3074,7 @@ fn a_preview_refuses_an_envelope_that_signed_no_ceilings() {
     let graph = client()
         .transfer_graph(payer, bob(), 100)
         .expect("an account answers a transfer");
-    let mut vm = client().sign(graph, &key, terms(PREVIEW_CEILING));
+    let mut vm = client().sign(graph, &key, validity(), terms(PREVIEW_CEILING));
     vm.terms.gas_limits.clear();
     let tx = Transaction::new(vm);
 
@@ -3224,7 +3271,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // this node cannot yet judge.
     let mut unpresented = tree.clone();
     unpresented.instances.clear();
-    let bare = Transaction::new(client().sign_tree(&unpresented, &key, terms(TRANSFER_FEE)));
+    let bare = Transaction::new(client().sign_tree(&unpresented, &[&key], terms(TRANSFER_FEE)));
     let refusal = bare
         .try_derived(executor.derivation().as_ref())
         .expect_err("an unresolved instance target does not derive");
@@ -3239,7 +3286,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // Claim: the call admits, the invocation resolves the freshly
     // compiled package — waiting out the compile if it is still in
     // flight — and the leaf holds the record the address derives from.
-    let call = Transaction::new(client().sign_tree(&tree, &key, terms(TRANSFER_FEE)));
+    let call = Transaction::new(client().sign_tree(&tree, &[&key], terms(TRANSFER_FEE)));
     let executed = execute_on(
         &[(payer, 1_000)],
         &executor,

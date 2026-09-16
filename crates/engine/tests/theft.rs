@@ -92,14 +92,19 @@ fn client() -> &'static Client {
 const fn terms(max_fee: u128) -> Terms {
     Terms {
         max_fee,
-        validity: TimestampRange::new(
-            WeightedTimestamp::from_millis(0),
-            WeightedTimestamp::from_millis(OFFER_MS),
-        ),
         ceilings: Ceilings::Guessed,
         priority_bp: 0,
         message: Vec::new(),
     }
+}
+
+/// The window every envelope here is signed for: the widest an intent
+/// may name, so nothing narrows a transaction.
+const fn validity() -> TimestampRange {
+    TimestampRange::new(
+        WeightedTimestamp::from_millis(0),
+        WeightedTimestamp::from_millis(OFFER_MS),
+    )
 }
 
 /// `from.withdraw(*PROTOCOL_RESOURCE, amount) -> to.deposit(..)`, signed and paid for by
@@ -109,7 +114,7 @@ fn signed_transfer(from: PrincipalAddr, to: PrincipalAddr, amount: u128) -> Tran
     let graph = client()
         .transfer_graph(from, to, amount)
         .expect("an account answers a transfer");
-    Transaction::new(client().sign(graph, &key, terms(2_000)))
+    Transaction::new(client().sign(graph, &key, validity(), terms(2_000)))
 }
 
 fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {

@@ -667,9 +667,9 @@ impl PartitionWorkload {
                 &from.keypair,
                 to.address,
                 self.amount,
+                validity_range_for_now(),
                 Terms {
                     max_fee: TRANSFER_MAX_FEE,
-                    validity: validity_range_for_now(),
                     ceilings: Ceilings::Guessed,
                     priority_bp: 0,
                     message: nonce.to_le_bytes().to_vec(),

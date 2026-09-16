@@ -80,17 +80,15 @@ impl Ceilings {
 /// What a signer commits to beyond the manifest, in this workspace's
 /// vocabulary.
 ///
-/// The VM's own terms carry a validity window as plain milliseconds and
-/// the compute ceilings the caller chooses; this names the window with
-/// the clock type the rest of the workspace speaks and asks for the
-/// ceilings as a [`Ceilings`], which is what makes it deployment
-/// binding rather than a second spelling of the same struct.
+/// The VM's own terms take the compute ceilings as figures; this asks
+/// for them as a [`Ceilings`], which is what makes it deployment
+/// binding rather than a second spelling of the same struct. The
+/// window is not here: it is every intent's own header, stated when
+/// the intent was opened and signed by whoever attests it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Terms {
     /// The most the signer will pay to have this transaction carried.
     pub max_fee: u128,
-    /// When the transaction may be included.
-    pub validity: TimestampRange,
     /// The compute ceilings the envelope signs.
     pub ceilings: Ceilings,
     /// What the signer will pay over the table price to be included, in
@@ -124,7 +122,7 @@ static GENESIS: LazyLock<World> = LazyLock::new(genesis_world);
 /// If the key is not material its own scheme admits, which is a defect
 /// in the signer rather than in anything it was asked to sign.
 #[must_use]
-pub fn principal_of<S: AccountSigner>(signer: &S) -> PrincipalAddr {
+pub fn principal_of<S: AccountSigner + ?Sized>(signer: &S) -> PrincipalAddr {
     principal_for(signer.scheme(), &signer.public_key_bytes())
         .expect("a signer's key is material its own scheme admits")
 }
@@ -253,14 +251,15 @@ impl Client {
         &self,
         graph: ManifestGraph,
         payer: &S,
+        validity: TimestampRange,
         terms: Terms,
     ) -> TransactionEnvelope {
         self.sign_tree(
             &IntentTree::of_one(Intent::leaf(
                 IntentHeader {
                     network: self.network,
-                    validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
-                    validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
+                    validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
+                    validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
                     // One offer, so one nullifier: a second submission
                     // of this declaration inside this window replaces
                     // it rather than running beside it. A caller who
@@ -270,53 +269,74 @@ impl Client {
                 principal_of(payer),
                 graph,
             )),
-            payer,
+            &[payer],
             terms,
         )
     }
 
-    /// Wrap a composed tree in an envelope signed by `payer`.
+    /// Wrap a composed tree in an envelope and attest it with `signers`.
     ///
     /// Every member carries its own attestations inside the tree; what
-    /// `payer` signs is the envelope: the root's hash, the terms and the
-    /// artifact. The root's window and its attesting principal — the
-    /// one `payer` derives — are stamped here: the root is the
-    /// composer's own and is signed last, so nothing a member signed is
-    /// touched.
+    /// `signers` attest is the envelope: the tree, the terms and the
+    /// artifact. The root declares who attests it, and the signers are
+    /// those principals' keys in that order — one per declared
+    /// principal, each deriving the one at its position. The window is
+    /// the root's own header, as every intent's is; nothing here
+    /// restates it.
     ///
-    /// The terms name the principal `payer`'s own scheme and key
-    /// derive, which is the account it can open by signing. A scheme is
-    /// part of that derivation, so the same key under two schemes names
-    /// two accounts and neither pays for the other.
+    /// The first signer pays: the terms name the principal its scheme
+    /// and key derive, which is the account it can open by signing. A
+    /// scheme is part of that derivation, so the same key under two
+    /// schemes names two accounts and neither pays for the other.
     ///
     /// # Panics
     ///
-    /// If `payer` produces a key its own scheme does not admit, which is
-    /// a defect in the signer rather than in what it was asked to sign —
-    /// or if the composed envelope outgrows the wire caps, which nothing
-    /// this client composes does.
+    /// If the signers are not one per declared attesting principal,
+    /// each deriving the principal at its position — a caller asking
+    /// for a signature the declaration did not name — or if a signer
+    /// produces a key its own scheme does not admit; or if the composed
+    /// envelope outgrows the wire caps, which nothing this client
+    /// composes does.
     #[must_use]
-    pub fn sign_tree<S: AccountSigner>(
+    pub fn sign_tree<S: AccountSigner + ?Sized>(
         &self,
         tree: &IntentTree,
-        payer: &S,
+        signers: &[&S],
         terms: Terms,
     ) -> TransactionEnvelope {
-        let mut tree = tree.clone();
-        tree.root.header.validity_start_ms = terms.validity.start_timestamp_inclusive.as_millis();
-        tree.root.header.validity_end_ms = terms.validity.end_timestamp_exclusive.as_millis();
-        tree.root.attested_by = vec![principal_of(payer)];
+        let declared = &tree.root.attested_by;
+        assert_eq!(
+            signers.len(),
+            declared.len(),
+            "the root declares {} attesting principals; {} signers given",
+            declared.len(),
+            signers.len()
+        );
+        for (position, (signer, principal)) in signers.iter().zip(declared).enumerate() {
+            assert_eq!(
+                principal_of(*signer),
+                *principal,
+                "signer {position} does not derive the principal the root declares there"
+            );
+        }
+        let payer = signers
+            .first()
+            .expect("a root is attested by at least one principal");
         let envelope = signing::wrap(
-            &tree,
+            tree,
             signing::Terms {
-                fee_payer: principal_of(payer),
+                fee_payer: principal_of(*payer),
                 max_fee: terms.max_fee,
                 gas_limits: terms.ceilings.over(tree.node_count()),
                 priority_bp: terms.priority_bp,
                 message: terms.message,
             },
         );
-        signing::sign(envelope, payer, &ProtocolHasher)
+        signers
+            .iter()
+            .try_fold(envelope, |envelope, signer| {
+                signing::sign(envelope, *signer, &ProtocolHasher)
+            })
             .expect("a composed envelope stays within the wire caps")
     }
 
@@ -333,10 +353,11 @@ impl Client {
         payer: &S,
         to: PrincipalAddr,
         amount: u128,
+        validity: TimestampRange,
         terms: Terms,
     ) -> Result<Transaction, TypedError> {
         let graph = self.transfer_graph(principal_of(payer), to, amount)?;
-        Ok(Transaction::new(self.sign(graph, payer, terms)))
+        Ok(Transaction::new(self.sign(graph, payer, validity, terms)))
     }
 }
 
@@ -437,9 +458,9 @@ mod tests {
                 &signer,
                 test_principal(0x22),
                 100,
+                test_validity_range(),
                 Terms {
                     max_fee: 1_000_000,
-                    validity: test_validity_range(),
                     ceilings: Ceilings::Guessed,
                     priority_bp: 0,
                     message: Vec::new(),
@@ -467,7 +488,6 @@ mod tests {
         let signer = Ed25519PrivateKey::from_bytes(&[0x31; 32]).expect("a fixture key");
         let terms = |ceilings| Terms {
             max_fee: 1_000_000,
-            validity: test_validity_range(),
             ceilings,
             priority_bp: 0,
             message: Vec::new(),
@@ -481,6 +501,7 @@ mod tests {
                 &signer,
                 test_principal(0x22),
                 100,
+                test_validity_range(),
                 terms(Ceilings::Measured(measured.clone())),
             )
             .expect("a measured transfer builds");
@@ -488,7 +509,13 @@ mod tests {
         assert_eq!(ceilings(&previewed), measured);
 
         let guessed = client
-            .transfer(&signer, test_principal(0x22), 100, terms(Ceilings::Guessed))
+            .transfer(
+                &signer,
+                test_principal(0x22),
+                100,
+                test_validity_range(),
+                terms(Ceilings::Guessed),
+            )
             .expect("an unmeasured transfer builds");
         assert_eq!(
             ceilings(&guessed),

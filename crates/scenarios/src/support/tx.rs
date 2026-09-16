@@ -1309,10 +1309,9 @@ pub(crate) fn build_instantiate_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        payer,
+        &[payer],
         Terms {
             max_fee: MAX_FEE,
-            validity,
             ceilings: Ceilings::Guessed,
             priority_bp: 0,
             message: Vec::new(),
@@ -1402,10 +1401,9 @@ fn build_lottery_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        payer,
+        &[payer],
         Terms {
             max_fee: MAX_FEE,
-            validity,
             ceilings: Ceilings::Guessed,
             priority_bp: 0,
             message: Vec::new(),
@@ -1464,9 +1462,9 @@ pub(crate) fn build_transfer_at_priority<S: AccountSigner>(
     Transaction::new(client().sign(
         graph,
         payer,
+        validity,
         Terms {
             max_fee: MAX_FEE,
-            validity,
             ceilings: Ceilings::Guessed,
             priority_bp,
             message: Vec::new(),
@@ -1498,9 +1496,9 @@ pub(crate) fn build_transfer_at_ceilings<S: AccountSigner>(
     Transaction::new(client().sign(
         graph,
         payer,
+        validity,
         Terms {
             max_fee: MAX_FEE,
-            validity,
             ceilings: Ceilings::Measured(ceilings),
             priority_bp: 0,
             message: Vec::new(),
@@ -2080,10 +2078,9 @@ fn build_venues_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        payer,
+        &[payer],
         Terms {
             max_fee: MAX_FEE,
-            validity,
             ceilings: Ceilings::Guessed,
             priority_bp: 0,
             message: Vec::new(),
@@ -2140,10 +2137,9 @@ pub(crate) fn build_instance_instantiate_tx(
     tree.instances = vec![meta];
     Transaction::new(client().sign_tree(
         &tree,
-        payer,
+        &[payer],
         Terms {
             max_fee: MAX_FEE,
-            validity,
             ceilings: Ceilings::Guessed,
             priority_bp: 0,
             message: Vec::new(),
@@ -2444,10 +2440,9 @@ pub(crate) fn build_composed_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        composer,
+        &[composer],
         Terms {
             max_fee: 1_000,
-            validity,
             ceilings: Ceilings::Guessed,
             priority_bp: 0,
             message: Vec::new(),
@@ -2544,9 +2539,9 @@ fn envelope<S: AccountSigner>(
     client().sign(
         graph,
         payer,
+        validity,
         Terms {
             max_fee: MAX_FEE,
-            validity,
             ceilings: Ceilings::Guessed,
             priority_bp: 0,
             message: Vec::new(),
