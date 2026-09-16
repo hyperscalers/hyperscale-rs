@@ -50,16 +50,16 @@ const fn cross_shard_config() -> ScenarioConfig {
 /// claim cell absent from the recipient's committed state past `L`, and
 /// that absence is what licenses taking the crossing back. Every part of
 /// that is checked at the fetch — the anchor's root, the keys asked, the
-/// proof's own reconstruction — and this is the scenario that makes one
+/// proof's own reconstruction — and this is the scenario that makes a
 /// responder attack it rather than assuming the checks hold.
 ///
-/// One host of the recipient's committee answers every state-proof
-/// request with a payload that reconstructs nothing. The requester must
-/// refuse it and rotate: the proof it eventually carries into a block is
-/// an honest peer's, the reclaim commits, and the payment comes back. A
-/// checker that took the forgery would reclaim on a proof of nothing —
-/// which, for a delivery that had claimed, is the crossing disposed
-/// twice.
+/// The first state-proof answer the recipient's committee gives, whichever
+/// host gives it, carries a payload that reconstructs nothing. The
+/// requester must refuse it and rotate: the proof it eventually carries
+/// into a block is an honest peer's, the reclaim commits, and the payment
+/// comes back. A checker that took the forgery would reclaim on a proof of
+/// nothing — which, for a delivery that had claimed, is the crossing
+/// disposed twice.
 #[test]
 fn a_forged_state_proof_convinces_nobody() {
     let mut cluster =
@@ -76,31 +76,40 @@ fn a_forged_state_proof_convinces_nobody() {
             Some("state_proof:unusable_proof"),
         );
 
-        // Every host but one of the shard the proof is asked of answers
-        // with a well-formed response carrying a proof that reconstructs
-        // nothing. Well-formed is the whole point: rubbish bytes are
-        // refused at the decode as an unusable *answer*, which says
-        // nothing about the proof check, so the forgery is built as the
-        // response type and the rubbish put where the multiproof goes.
-        // One peer answers honestly, which is what makes this a rotation
-        // rather than an outage — and all but one lie so the rotation is
-        // exercised whichever probe's fetch lands first.
-        let hosts = c.committee_hosts(recipient_shard);
-        let (_honest, liars) = hosts
-            .split_last()
-            .expect("the recipient's shard has a seated committee");
+        // Every host of the shard the proof is asked of answers its first
+        // state-proof request with a well-formed response carrying a proof
+        // that reconstructs nothing, and answers honestly after. Well-formed
+        // is the whole point: rubbish bytes are refused at the decode as an
+        // unusable *answer*, which says nothing about the proof check, so the
+        // forgery is built as the response type and the rubbish put where the
+        // multiproof goes.
+        //
+        // Lying on the first answer, whoever gives it, rather than picking one
+        // host to lie always: the fetch chooses its peer, a committee this size
+        // offers two, and a run where it never chose the liar passes without an
+        // attack. An honest answer waiting behind the refusal is what makes
+        // this a rotation rather than an outage.
         let unreconstructable = hbor_to_vec(&GetStateProofResponse::found(
             MerkleInclusionProof::new(vec![0xFF; 64]),
         ))
         .expect("a state-proof response encodes");
-        let forged: Vec<_> = liars
-            .iter()
-            .map(|&liar| {
+        let lies = Arc::new(AtomicUsize::new(0));
+        let forged: Vec<FaultHandle> = c
+            .committee_hosts(recipient_shard)
+            .into_iter()
+            .map(|host| {
                 let unreconstructable = unreconstructable.clone();
+                let lies = Arc::clone(&lies);
                 c.rewrite_responses(
-                    liar,
+                    host,
                     "state_proof.request",
-                    Arc::new(move |_asked: &[u8], _honest: &[u8]| unreconstructable.clone()),
+                    Arc::new(move |_asked: &[u8], honest: &[u8]| {
+                        if lies.fetch_add(1, Ordering::Relaxed) == 0 {
+                            unreconstructable.clone()
+                        } else {
+                            honest.to_vec()
+                        }
+                    }),
                 )
             })
             .collect();
