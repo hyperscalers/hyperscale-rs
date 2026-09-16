@@ -665,7 +665,6 @@ impl PartitionWorkload {
         self.client
             .transfer(
                 &from.keypair,
-                from.address,
                 to.address,
                 self.amount,
                 Terms {

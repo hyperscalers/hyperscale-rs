@@ -467,7 +467,6 @@ impl Session {
         self.client
             .transfer(
                 &signer_from_seed(from),
-                account_from_seed(from),
                 account_from_seed(to),
                 TRANSFER_AMOUNT,
                 Terms {
