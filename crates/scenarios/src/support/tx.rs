@@ -2119,7 +2119,7 @@ pub(crate) fn build_instance_instantiate_tx(
     // component comes up holding, answering its gate from the founder's
     // own signature, and that edge is filed in the founder's account.
     let mut b = GraphBuilder::new();
-    let [badge] = b.call_signed(component, "instantiate", ());
+    let [badge] = b.call_signed(founder, component, "instantiate", ());
     let owner_badge = issued_resource(
         &ProtocolHasher,
         component,

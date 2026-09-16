@@ -399,7 +399,7 @@ mod tests {
                             GraphArg::Literal(Value::Address(PROTOCOL_RESOURCE.address())),
                             GraphArg::Literal(Value::U128(100)),
                         ],
-                        evidence: [EvidenceRef::Attestation].into(),
+                        evidence: [EvidenceRef::Account(from)].into(),
                     },
                     GraphNode {
                         target: to.into(),

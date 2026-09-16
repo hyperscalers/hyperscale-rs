@@ -291,7 +291,12 @@ fn signed_transfer_from_unknown(
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let mut b = GraphBuilder::new();
-    let [funds] = b.call_signed(from, "withdraw", (*PROTOCOL_RESOURCE, amount));
+    let [funds] = b.call_signed(
+        fee_payer(seed),
+        from,
+        "withdraw",
+        (*PROTOCOL_RESOURCE, amount),
+    );
     let [] = b.call(to, "deposit", (funds.resource_is(*PROTOCOL_RESOURCE),));
     let graph = b.build().expect("every output is consumed");
     Transaction::new(client().sign(graph, &key, validity(), terms(max_fee)))
@@ -3109,18 +3114,16 @@ fn a_node_reaching_for_another_partys_authority_never_previews() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (alice(), 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
-    // Signed by 7 and reaching for Alice's account: the signature
-    // presents 7, and Alice's rule names Alice, so the gate refuses.
+    // Signed by 7 and reaching for Alice's account: the withdrawal
+    // presents Alice, and the intent acts as 7 alone, so admission
+    // refuses the presentation before any gate is asked.
     let tx = signed_transfer_with_fee(7, alice(), bob(), 100, PREVIEW_CEILING);
 
     let held = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
     let PreviewOutcome::Refused { reason } = &held.outcome else {
         panic!("outcome = {:?}", held.outcome);
     };
-    assert!(
-        reason.contains("does not satisfy what it must"),
-        "reason = {reason}"
-    );
+    assert!(reason.contains("does not act as"), "reason = {reason}");
     // Nothing is priced and nothing moves: a shape admission refuses is
     // not a transaction, so there is no attempt for the payer to fund.
     assert_eq!(held.fee, 0);
@@ -3249,7 +3252,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // is one node, and the supply a component comes up holding leaves
     // with whoever composed it.
     let mut b = GraphBuilder::new();
-    let [badge] = b.call_signed(component, "instantiate", ());
+    let [badge] = b.call_signed(payer, component, "instantiate", ());
     let owner_badge = issued_resource(
         &ProtocolHasher,
         component,
