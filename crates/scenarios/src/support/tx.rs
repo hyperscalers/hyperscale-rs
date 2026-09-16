@@ -23,12 +23,11 @@ use hyperscale_types::{
     EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
     MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr, SchemeId, ShardId,
     ShardTrie, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
-    TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
-    ed25519_keypair_from_seed,
+    TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
-    ManifestGraph, ResourceKind, SlotId, Totality, Value, child_key, issued_resource, package_hash,
+    Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, Intent, IntentHeader, ManifestGraph,
+    ResourceKind, SlotId, Totality, Value, child_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
@@ -1549,23 +1548,13 @@ pub(crate) fn build_transfer_paid_by<S: AccountSigner>(
         .expect("the stdlib account answers a transfer");
     let gas_limits = default_gas_limits(graph.nodes.len());
     let envelope = signing::wrap(
-        &EnvelopeTree::of_one(
-            from,
-            IntentDecl {
-                header: scenario_header(validity),
-                graph,
-                sockets: Vec::new(),
-            },
-        ),
+        &EnvelopeTree::of_one(Intent::leaf(scenario_header(validity), from, graph)),
         Vec::new(),
-        payer,
-        client.network(),
         signing::Terms {
+            fee_payer: payer,
             max_fee: MAX_FEE,
             gas_limits,
             priority_bp: 0,
-            validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
-            validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
             message: Vec::new(),
         },
     );
@@ -1873,22 +1862,20 @@ pub(crate) fn build_publish_tx(
     artifact: Vec<u8>,
     validity: TimestampRange,
 ) -> Transaction {
+    let publisher = account_address(&payer.public_key().0);
     Transaction::new(
-        TransactionEnvelope {
-            body: TransactionBody::Publish(artifact),
-            subintent_sigs: Vec::new(),
-            fee_payer: account_address(&payer.public_key().0),
-            max_fee: PUBLISH_MAX_FEE,
-            gas_limits: vec![1_000_000],
-            priority_bp: 0,
-            validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
-            validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
-            message: Vec::new(),
-            network: SCENARIO_NETWORK,
-            signer_scheme: SchemeId::NONE,
-            signer: Vec::new(),
-            signature: Vec::new(),
-        }
+        signing::wrap_publish(
+            artifact,
+            publisher,
+            scenario_header(validity),
+            signing::Terms {
+                fee_payer: publisher,
+                max_fee: PUBLISH_MAX_FEE,
+                gas_limits: vec![1_000_000],
+                priority_bp: 0,
+                message: Vec::new(),
+            },
+        )
         .sign(payer),
     )
 }
@@ -2158,14 +2145,11 @@ pub(crate) fn build_instance_instantiate_tx(
     let [] = b.call(founder, "deposit-nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
 
-    let mut tree = EnvelopeTree::of_one(
+    let mut tree = EnvelopeTree::of_one(Intent::leaf(
+        scenario_header(validity),
         principal_of(payer),
-        IntentDecl {
-            header: scenario_header(validity),
-            graph,
-            sockets: Vec::new(),
-        },
-    );
+        graph,
+    ));
     tree.instances = vec![meta];
     Transaction::new(client().sign_tree(
         &tree,
@@ -2401,7 +2385,7 @@ pub(crate) fn build_stake_tx(
 /// lets the signer sign it before any composer exists and lets two
 /// composers bind the identical declaration afterwards.
 #[must_use]
-pub(crate) fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
+pub(crate) fn payment_request(signer: PrincipalAddr, amount: u128) -> Intent {
     declaration(signer, |b| {
         let incoming = b.declare(*PROTOCOL_RESOURCE, [Constraint::MinAmount(amount)]);
         account::deposit(b, signer, incoming)
@@ -2419,7 +2403,7 @@ pub(crate) fn payment_request_for(
     signer: PrincipalAddr,
     amount: u128,
     window: TimestampRange,
-) -> IntentDecl {
+) -> Intent {
     declaration_under(signer, scenario_header(window), |b| {
         let incoming = b.declare(*PROTOCOL_RESOURCE, [Constraint::MinAmount(amount)]);
         account::deposit(b, signer, incoming)
@@ -2443,7 +2427,7 @@ pub(crate) fn build_composed_tx(
     composer: &Ed25519PrivateKey,
     from: PrincipalAddr,
     signer_key: &Ed25519PrivateKey,
-    request: &IntentDecl,
+    request: &Intent,
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
@@ -2464,7 +2448,7 @@ pub(crate) fn build_composed_tx(
         .expect("an account answers a withdrawal");
     let paid = root.export(funds);
     let wants = env
-        .adopt(account_address(&signer_key.public_key().0), request.clone())
+        .adopt(request.clone())
         .expect("the request discharges its own hole")
         .one()
         .expect("the request declares one parameter");
@@ -2546,7 +2530,7 @@ fn graph(
 fn declaration(
     signer: PrincipalAddr,
     write: impl FnOnce(&mut IntentBuilder<'_>) -> Result<(), TypedError>,
-) -> IntentDecl {
+) -> Intent {
     declaration_under(signer, offer_header(), write)
 }
 
@@ -2560,7 +2544,7 @@ fn declaration_under(
     signer: PrincipalAddr,
     header: IntentHeader,
     write: impl FnOnce(&mut IntentBuilder<'_>) -> Result<(), TypedError>,
-) -> IntentDecl {
+) -> Intent {
     let client = client();
     let chain = client.records();
     let mut decl = IntentBuilder::declaration(&chain, &ProtocolHasher, signer, header);

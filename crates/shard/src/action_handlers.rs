@@ -1303,7 +1303,7 @@ where
                             unbound += 1;
                             return false;
                         }
-                        let max_fee = tx.body().max_fee;
+                        let max_fee = tx.terms().max_fee;
                         let wanted = used.saturating_add(max_fee);
                         if wanted > balances.get(&vault).copied().unwrap_or(0) {
                             dropped += 1;

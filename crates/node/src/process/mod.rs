@@ -23,7 +23,7 @@ use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{
     CodeAvailability, FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport,
-    TickEnvironment,
+    TickEnvironment, terms_of,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage, SubstateStore};
@@ -630,7 +630,10 @@ where
         grants: PreviewGrants,
     ) -> Option<Box<PreviewReport>> {
         let topology = self.topology_snapshot.load();
-        let payer_shard = topology.shard_trie().shard_for_prefix(tx.body().fee_payer);
+        // Off the tree rather than the derivation: a preview answers for
+        // envelopes derivation may refuse.
+        let payer = terms_of(tx.body()).ok()?.fee_payer;
+        let payer_shard = topology.shard_trie().shard_for_prefix(payer);
         let handles = self.dispatch_handles.per_shard.load();
         let chain = &handles.get(&payer_shard)?.pending_chain;
 

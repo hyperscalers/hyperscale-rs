@@ -108,7 +108,7 @@ impl ShardParticipation {
         if topology.is_single_shard_transaction(tx.as_ref()) {
             return true;
         }
-        let payer_shard = topology.shard_trie().shard_for_prefix(tx.body().fee_payer);
+        let payer_shard = topology.shard_trie().shard_for_prefix(tx.fee_payer());
         if payer_shard == self.local_shard {
             return true;
         }

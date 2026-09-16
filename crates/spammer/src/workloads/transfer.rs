@@ -285,9 +285,8 @@ mod tests {
     /// thing the workload chose.
     fn shards_touched(tx: &Transaction, num_shards: u64) -> HashSet<ShardId> {
         let partition = ShardTrie::uniform_from_count(num_shards);
-        let tree = decode_tree(tx.body().call_tree().expect("a transfer is a call")).unwrap();
-        tree.intents[0]
-            .decl
+        let tree = decode_tree(&tx.body().tree).unwrap();
+        tree.root
             .graph
             .nodes
             .iter()

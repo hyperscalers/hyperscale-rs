@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
-use hyperscale_vm_types::{DeclaredWork, LegShape, PriceTable};
+use hyperscale_vm_types::{DeclaredWork, LegShape, PriceTable, Terms};
 use thiserror::Error;
 
 use crate::transaction::vm::{ArtifactTerm, Derivation, ProtocolVerifier, SchemeVerifier};
@@ -221,7 +221,7 @@ impl Transaction {
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
     pub fn price(&self, table: &PriceTable) -> u128 {
-        table.price(self.work(), self.body().priority_bp)
+        table.price(self.work(), self.terms().priority_bp)
     }
 
     /// [`Self::price`] for an envelope that may not have been derived
@@ -236,8 +236,8 @@ impl Transaction {
         derivation: &dyn Derivation,
         table: &PriceTable,
     ) -> Result<u128, DerivationError> {
-        let work = self.try_derived(derivation)?.work;
-        Ok(table.price(&work, self.body().priority_bp))
+        let derived = self.try_derived(derivation)?;
+        Ok(table.price(&derived.work, derived.terms.priority_bp))
     }
 
     /// Each manifest node's placement-free shape, in node order.
@@ -267,10 +267,20 @@ impl Transaction {
     ///
     /// # Panics
     ///
-    /// As [`Self::body`], on a transaction whose bytes do not decode.
+    /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
     pub fn fee_payer(&self) -> Address {
-        self.body().fee_payer.address()
+        self.terms().fee_payer.address()
+    }
+
+    /// The signing-time terms the tree's root states.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn terms(&self) -> &Terms {
+        &self.derived().terms
     }
 
     /// The cells the kernel writes of its own accord.
@@ -473,7 +483,7 @@ impl Transaction {
     #[must_use]
     pub fn fee_vault(&self) -> SubstateKey {
         SubstateKey {
-            owner: self.body().fee_payer.address(),
+            owner: self.fee_payer(),
             local: LocalKey(self.derived().fee_vault_local),
         }
     }
@@ -500,7 +510,7 @@ impl Transaction {
     #[must_use]
     pub fn auth_cell(&self) -> SubstateKey {
         SubstateKey {
-            owner: self.body().fee_payer.address(),
+            owner: self.fee_payer(),
             local: LocalKey(self.derived().auth_cell_local),
         }
     }
@@ -529,7 +539,7 @@ impl Transaction {
     /// [`ProtocolStatics::rule_admits`]: crate::ProtocolStatics::rule_admits
     #[must_use]
     pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>) -> bool {
-        protocol_statics().rule_admits(auth_cell, self.body().fee_payer, &[self.signer()])
+        protocol_statics().rule_admits(auth_cell, self.terms().fee_payer, &[self.signer()])
     }
 
     /// The cached derivation, or a panic saying it was never derived.
@@ -622,7 +632,7 @@ pub enum TransactionVerifyError {
     /// The body bytes do not decode as an envelope.
     #[error("transaction body bytes are undecodable")]
     UndecodableBody,
-    /// The envelope names a different network than this session's.
+    /// The tree's root names a different network than this session's.
     #[error("transaction is signed for network {signed}, not this network {session}")]
     WrongNetwork {
         /// The network the envelope names.
@@ -633,7 +643,7 @@ pub enum TransactionVerifyError {
     /// The envelope's composer signature does not cover its content.
     #[error("transaction signature is invalid")]
     InvalidSignature,
-    /// A subintent signature does not cover its declaration hash.
+    /// A member's signature does not cover its intent hash.
     #[error("subintent {0} signature is invalid")]
     InvalidSubintentSignature(u32),
     /// Static derivation refused the envelope.
@@ -641,16 +651,16 @@ pub enum TransactionVerifyError {
     Derivation(#[from] DerivationError),
 }
 
-/// Construction asserts: the body decodes, the envelope names this
-/// session's network, the composer's signature covers the envelope
-/// content, the tree admits and routes under the context's
-/// [`crate::Derivation`] (which caches the derived identity on the
-/// transaction), and every offered intent's signature covers its
-/// declaration hash.
+/// Construction asserts: the body decodes, the composer's signature
+/// covers the envelope content, the tree admits and routes under the
+/// context's [`crate::Derivation`] (which caches the derived identity on
+/// the transaction), the tree's root names this session's network, and
+/// every member's signature covers its intent hash.
 ///
-/// The network check runs before the signature: the named network is
-/// signed content, so a transaction composed for another network fails
-/// here whatever its signature says, and a re-targeted one fails the
+/// The network is the root's, inside the tree the envelope carries as
+/// bytes, so it is read after derivation decodes the tree. It is signed
+/// content, so a transaction composed for another network fails here
+/// whatever its signature says, and a re-targeted one fails the
 /// signature.
 ///
 /// Construction goes through one of two gates:
@@ -667,20 +677,20 @@ impl Verify<TransactionContext<'_>> for Transaction {
 
     fn verify(&self, ctx: TransactionContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let vm = self.try_body()?;
-        if vm.network != ctx.network {
-            return Err(TransactionVerifyError::WrongNetwork {
-                signed: vm.network.0,
-                session: ctx.network.0,
-            });
-        }
         if !vm.signature_is_valid() {
             return Err(TransactionVerifyError::InvalidSignature);
         }
         // Derivation checks the tree and the signature arity; the
-        // signatures themselves verify here, over the derived
-        // declaration hashes. Which account a key may act as is neither
-        // stage's — that is the account's own rule, read on its shard.
+        // signatures themselves verify here, over the derived intent
+        // hashes. Which account a key may act as is neither stage's —
+        // that is the account's own rule, read on its shard.
         let derived = self.try_derived(ctx.derivation)?;
+        if derived.network != ctx.network {
+            return Err(TransactionVerifyError::WrongNetwork {
+                signed: derived.network.0,
+                session: ctx.network.0,
+            });
+        }
         // What the signed ceiling has to cover is not decided here: the
         // price is the table's, the table is the anchor's, and a
         // signature check holds no snapshot. Admission judges it where
@@ -734,37 +744,40 @@ mod tests {
     use hyperscale_vm_types::{Address, AddressClass, IntentHash, LegRole, Mode, Moves, ValueEdge};
 
     use super::*;
-    use crate::test_utils::{test_prefix, test_validity_range};
+    use crate::test_utils::{StubTree, test_prefix, test_validity_range};
     use crate::{
         Derivation, Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId,
-        Secp256k1PrivateKey, SubintentSig, TransactionBody,
+        Secp256k1PrivateKey, SubintentSig,
     };
 
     struct StubStatics;
 
-    /// The declaration hash the stub claims for `b"with-subintent"`
-    /// trees; the fixture's subintent signature covers it.
+    /// The intent hash the stub claims for `b"with-subintent"` trees;
+    /// the fixture's member signature covers it.
     const STUB_SUBINTENT_HASH: [u8; 32] = [0x5A; 32];
 
     impl Derivation for StubStatics {
         fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
-            if vm.call_tree().unwrap_or_default() == b"inadmissible" {
+            let stub = StubTree::decode(vm)?;
+            if stub.body == b"inadmissible" {
                 return Err(DerivationError::Refused("stub refusal".into()));
             }
-            let subintent_hashes = if vm.call_tree().unwrap_or_default() == b"with-subintent" {
+            let subintent_hashes = if stub.body == b"with-subintent" {
                 vec![STUB_SUBINTENT_HASH]
             } else {
                 Vec::new()
             };
             Ok(Derived {
-                // A stub derives no tree, so the envelope's own window
-                // is the whole of it.
-                effective_window: vm.validity_window(),
+                // A stub derives no tree, so the root's own window is
+                // the whole of it.
+                effective_window: stub.window(),
                 // The stub cannot derive an address from a key, so it
                 // binds the signer to the payer field — every stubbed
                 // transaction's payer admits its signer.
-                signer: vm.fee_payer,
-                accounts: vec![vm.fee_payer.address()],
+                signer: stub.terms.fee_payer,
+                accounts: vec![stub.terms.fee_payer.address()],
+                network: stub.network,
+                terms: stub.terms,
                 fee_vault_local: [0xEE; 16],
                 auth_cell_local: [0xAE; 16],
                 routing: Routing {
@@ -805,23 +818,23 @@ mod tests {
         unsigned_envelope(tree).sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap())
     }
 
-    fn unsigned_envelope(tree: &[u8]) -> TransactionEnvelope {
-        let range = test_validity_range();
-        TransactionEnvelope {
-            body: TransactionBody::Call(tree.to_vec()),
-            subintent_sigs: Vec::new(),
-            fee_payer: PrincipalAddr::new([0xAA; 31]),
-            max_fee: 1_000,
-            gas_limits: vec![1_000_000],
-            priority_bp: 0,
-            validity_start_ms: range.start_timestamp_inclusive.as_millis(),
-            validity_end_ms: range.end_timestamp_exclusive.as_millis(),
-            message: Vec::new(),
+    fn stub_tree(tree: &[u8]) -> StubTree {
+        StubTree {
+            terms: Terms {
+                fee_payer: PrincipalAddr::new([0xAA; 31]),
+                max_fee: 1_000,
+                gas_limits: vec![1_000_000],
+                priority_bp: 0,
+                message: Vec::new(),
+            },
             network: TEST_NETWORK,
-            signer_scheme: SchemeId::NONE,
-            signer: Vec::new(),
-            signature: Vec::new(),
+            validity: test_validity_range(),
+            body: tree.to_vec(),
         }
+    }
+
+    fn unsigned_envelope(tree: &[u8]) -> TransactionEnvelope {
+        stub_tree(tree).envelope(Vec::new())
     }
 
     fn fixture(tree: &[u8]) -> Transaction {
@@ -1006,7 +1019,9 @@ mod tests {
         );
 
         let mut retargeted = tx.body().clone();
-        retargeted.network = NetworkId(7);
+        let mut stub = stub_tree(b"graph bytes");
+        stub.network = NetworkId(7);
+        retargeted.tree = stub.encode();
         assert_eq!(
             Transaction::new(retargeted)
                 .verify(ctx(NetworkId(7)))
@@ -1109,7 +1124,14 @@ mod tests {
         let key = Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap();
         let base = test_envelope(b"graph bytes");
         let mut shifted = base.clone();
-        shifted.validity_start_ms += 1;
+        let mut stub = stub_tree(b"graph bytes");
+        stub.validity = TimestampRange::new(
+            stub.validity
+                .start_timestamp_inclusive
+                .plus(std::time::Duration::from_millis(1)),
+            stub.validity.end_timestamp_exclusive,
+        );
+        shifted.tree = stub.encode();
         let shifted = shifted.sign(&key);
         assert_ne!(
             Transaction::new(base.clone()).hash(),

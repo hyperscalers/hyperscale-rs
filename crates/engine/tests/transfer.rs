@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_effects_bridge::{
     ProtocolHasher, account_address, admit_package, admit_protocol_package, attach_metadata,
+    decode_tree, encode_tree,
 };
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
@@ -28,17 +29,16 @@ use hyperscale_types::{
     BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
     GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
-    ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
-    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, TxHash,
-    Verified, WeightedTimestamp, Window, absorb_committed_cells, compute_merkle_root,
+    ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
+    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, Window,
+    absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, Intent, IntentDecl,
-    IntentHeader, PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource,
-    package_hash,
+    AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, Intent, IntentHeader,
+    PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
-use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
+use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder, signing};
 use hyperscale_vm_stdlib::{STAKING_MODULE, account, instantiate, staking};
 use hyperscale_vm_types::{
     Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, encode_amount,
@@ -2016,21 +2016,19 @@ fn signed_publish(seed: u8, artifact: Vec<u8>) -> Transaction {
 /// The same, under a ceiling the caller names.
 fn signed_publish_under(seed: u8, artifact: Vec<u8>, max_fee: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Publish(artifact),
-        subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0),
-        max_fee,
-        gas_limits: vec![1_000_000],
-        priority_bp: 0,
-        validity_start_ms: 0,
-        validity_end_ms: OFFER_MS,
-        message: Vec::new(),
-        network: NETWORK,
-        signer_scheme: SchemeId::NONE,
-        signer: Vec::new(),
-        signature: Vec::new(),
-    }
+    let publisher = account_address(&key.public_key().0);
+    let vm = signing::wrap_publish(
+        artifact,
+        publisher,
+        HEADER,
+        signing::Terms {
+            fee_payer: publisher,
+            max_fee,
+            gas_limits: vec![1_000_000],
+            priority_bp: 0,
+            message: Vec::new(),
+        },
+    )
     .sign(&key);
     Transaction::new(vm)
 }
@@ -2202,14 +2200,11 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let [] = b.call(unsealed, "draw", (64u64,));
     let graph = b.build().expect("every output is consumed");
     let gap = Transaction::new(client().sign_tree(
-        &EnvelopeTree::of_one(
+        &EnvelopeTree::of_one(Intent::leaf(
+            HEADER,
             account_address(&key.public_key().0),
-            IntentDecl {
-                header: HEADER,
-                graph,
-                sockets: Vec::new(),
-            },
-        ),
+            graph,
+        )),
         Vec::new(),
         &key,
         terms(TRANSFER_FEE),
@@ -2235,15 +2230,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let graph = b.build().expect("every output is consumed");
     let carried = Transaction::new(client().sign_tree(
         &EnvelopeTree {
-            intents: vec![Intent {
-                decl: IntentDecl {
-                    header: HEADER,
-                    graph,
-                    sockets: Vec::new(),
-                },
-                account: account_address(&key.public_key().0),
-                bindings: Vec::new(),
-            }],
+            root: Intent::leaf(HEADER, account_address(&key.public_key().0), graph),
             instances: vec![meta],
             resources: Vec::new(),
         },
@@ -2272,14 +2259,11 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let [] = b.call(payer, "deposit", ());
     let graph = b.build().expect("every output is consumed");
     let refused = Transaction::new(client().sign_tree(
-        &EnvelopeTree::of_one(
+        &EnvelopeTree::of_one(Intent::leaf(
+            HEADER,
             account_address(&key.public_key().0),
-            IntentDecl {
-                header: HEADER,
-                graph,
-                sockets: Vec::new(),
-            },
-        ),
+            graph,
+        )),
         Vec::new(),
         &key,
         terms(TRANSFER_FEE),
@@ -3060,7 +3044,14 @@ fn a_preview_refuses_an_envelope_that_signed_no_ceilings() {
         .transfer_graph(payer, bob(), 100)
         .expect("an account answers a transfer");
     let mut vm = client().sign(graph, &key, terms(PREVIEW_CEILING));
-    vm.gas_limits.clear();
+    let mut tree = decode_tree(&vm.tree).expect("the tree decodes");
+    tree.root
+        .terms
+        .as_mut()
+        .expect("the root states terms")
+        .gas_limits
+        .clear();
+    vm.tree = encode_tree(&tree);
     let tx = Transaction::new(vm);
 
     let report = preview_on(
@@ -3244,15 +3235,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let [] = b.call(payer, "deposit-nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
     let tree = EnvelopeTree {
-        intents: vec![Intent {
-            decl: IntentDecl {
-                header: HEADER,
-                graph,
-                sockets: Vec::new(),
-            },
-            account: account_address(&key.public_key().0),
-            bindings: Vec::new(),
-        }],
+        root: Intent::leaf(HEADER, account_address(&key.public_key().0), graph),
         instances: vec![meta.clone()],
         resources: Vec::new(),
     };
@@ -3323,8 +3306,8 @@ fn a_resubmit_at_a_higher_ceiling_runs_the_declaration_once() {
     let first = bump(TRANSFER_FEE);
     let second = bump(TRANSFER_FEE + 1);
     assert_eq!(
-        first.body().call_tree(),
-        second.body().call_tree(),
+        decode_tree(&first.body().tree).unwrap().root.graph,
+        decode_tree(&second.body().tree).unwrap().root.graph,
         "the premise: one declaration under two sets of terms",
     );
     assert_ne!(first.hash(), second.hash(), "which dedup cannot collapse");

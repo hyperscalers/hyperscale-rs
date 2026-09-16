@@ -18,12 +18,13 @@ use hyperscale_engine::ExecutedTx;
 use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
+use hyperscale_types::test_utils::StubTree;
 use hyperscale_types::{
     Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange,
-    DeclaredWork, Derivation, DerivationError, Derived, EnvelopeExt, ExecutionMetadata,
-    GlobalReceiptHash, Hash, LocalKey, Mode, NetworkId, PriceTable, PrincipalAddr, Routing,
-    SchemeId, ShardId, StateWrites, SubstateKey, Transaction, TransactionBody, TransactionEnvelope,
-    TxHash, Verified, WeightedTimestamp,
+    DeclaredWork, Derivation, DerivationError, Derived, ExecutionMetadata, GlobalReceiptHash, Hash,
+    LocalKey, Mode, NetworkId, PriceTable, PrincipalAddr, Routing, ShardId, StateWrites,
+    SubstateKey, Terms, TimestampRange, Transaction, TransactionEnvelope, TxHash, Verified,
+    WeightedTimestamp,
 };
 use hyperscale_vm_types::Moves;
 
@@ -77,16 +78,18 @@ impl Derivation for ReservingStatics {
             (ranged, Mode::Delta { moves: Moves::Both }),
         ];
         declared_modes.sort_unstable();
+        let stub = StubTree::decode(vm)?;
         let work = DeclaredWork {
-            compute: vm.gas_limit_total(),
+            compute: stub.terms.gas_limit_total(),
             footprint: 4,
             ..DeclaredWork::ZERO
         }
         .saturating_add(vm.signatures());
         Ok(Derived {
             accounts: Vec::new(),
-            // This stub derives no tree; the envelope's window stands.
-            effective_window: vm.validity_window(),
+            // This stub derives no tree; the root's window stands.
+            effective_window: stub.window(),
+            network: stub.network,
             routing: Routing {
                 read_keys: Vec::new(),
                 write_keys: declared_modes.iter().map(|(key, _)| *key).collect(),
@@ -96,7 +99,7 @@ impl Derivation for ReservingStatics {
                 provision_prefixes: Vec::new(),
                 declared_modes,
             },
-            signer: vm.fee_payer,
+            signer: stub.terms.fee_payer,
             subintent_hashes: Vec::new(),
             fee_vault_local: [0xEE; 16],
             auth_cell_local: [0xAE; 16],
@@ -108,6 +111,7 @@ impl Derivation for ReservingStatics {
             legs: Vec::new(),
             nullifiers: Vec::new(),
             packages: Vec::new(),
+            terms: stub.terms,
         })
     }
 }
@@ -115,21 +119,22 @@ impl Derivation for ReservingStatics {
 /// A transaction distinguished only by `seed`; its declaration is fixed
 /// by [`ReservingStatics`].
 fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(vec![seed]),
-        subintent_sigs: Vec::new(),
-        fee_payer: PrincipalAddr::new([0xAA; 31]),
-        max_fee: 1_000,
-        gas_limits: vec![1_000_000],
-        priority_bp: 0,
-        validity_start_ms: 0,
-        validity_end_ms: u64::MAX,
-        message: Vec::new(),
+    let vm = StubTree {
+        terms: Terms {
+            fee_payer: PrincipalAddr::new([0xAA; 31]),
+            max_fee: 1_000,
+            gas_limits: vec![1_000_000],
+            priority_bp: 0,
+            message: Vec::new(),
+        },
         network: NetworkId(242),
-        signer_scheme: SchemeId::NONE,
-        signer: Vec::new(),
-        signature: Vec::new(),
-    };
+        validity: TimestampRange::new(
+            WeightedTimestamp::from_millis(0),
+            WeightedTimestamp::from_millis(u64::MAX),
+        ),
+        body: vec![seed],
+    }
+    .envelope(Vec::new());
     let tx = Transaction::new(vm);
     tx.try_derived(&ReservingStatics)
         .expect("the fixture declaration is fixed");

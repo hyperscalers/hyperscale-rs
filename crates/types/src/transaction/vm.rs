@@ -1,20 +1,21 @@
 //! The VM seam: the envelope re-exported, its crypto binding, and the
 //! derivation trait admission runs through.
 //!
-//! [`TransactionEnvelope`] and its body live in `hyperscale-vm-types` —
+//! [`TransactionEnvelope`] and its terms live in `hyperscale-vm-types` —
 //! the envelope is the VM's artifact, and its signed content is defined
 //! there through the derived preimage. What binds here is what the leaf
 //! crate deliberately does not know: the protocol hash and the signature
-//! arithmetic behind [`EnvelopeExt`], the clock behind the validity
-//! window, and the workspace's admission vocabulary behind [`Derivation`].
+//! arithmetic behind [`EnvelopeExt`], and the workspace's admission
+//! vocabulary behind [`Derivation`], which reads the terms and the window
+//! off the tree's root.
 
 use std::sync::OnceLock;
 
 pub use hyperscale_vm_types::{
     AccountSigner, MAX_INTENTS, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier,
-    SubintentSig, TransactionBody, TransactionEnvelope,
+    SubintentSig, Terms, TransactionEnvelope,
 };
-use hyperscale_vm_types::{DeclaredWork, LegShape, SubstateKey};
+use hyperscale_vm_types::{DeclaredWork, LegShape, NetworkId, SubstateKey};
 use thiserror::Error;
 
 use crate::crypto::{
@@ -23,7 +24,6 @@ use crate::crypto::{
 };
 use crate::{
     Address, DeclaredKey, Hash, PrincipalAddr, ProtocolHasher, RoutePrefix, TimestampRange,
-    WeightedTimestamp,
 };
 
 /// The arithmetic behind the VM's scheme registry.
@@ -102,9 +102,6 @@ pub trait EnvelopeExt: Sized {
     /// Whether the composer's signature covers the envelope content
     /// under the signer's key, in the scheme the envelope names.
     fn signature_is_valid(&self) -> bool;
-
-    /// The signed validity window as the wire's range form.
-    fn validity_window(&self) -> TimestampRange;
 }
 
 impl EnvelopeExt for TransactionEnvelope {
@@ -141,13 +138,6 @@ impl EnvelopeExt for TransactionEnvelope {
             &self.signer,
             &self.signature,
             hash.as_bytes(),
-        )
-    }
-
-    fn validity_window(&self) -> TimestampRange {
-        TimestampRange::new(
-            WeightedTimestamp::from_millis(self.validity_start_ms),
-            WeightedTimestamp::from_millis(self.validity_end_ms),
         )
     }
 }
@@ -241,14 +231,24 @@ impl Routing {
 
 /// Everything the bridge derives from an envelope.
 ///
-/// The routing identity plus the declaration hash each offered intent's
-/// signature must cover, in tree order. Which account a key may act as
-/// is not checked here: that is the account's own rule, judged on its
-/// shard as the sign-in.
+/// The routing identity, the terms and network read off the tree's
+/// root, and the intent hash each member's signature must cover, in
+/// tree order. Which account a key may act as is not checked here: that
+/// is the account's own rule, judged on its shard as the sign-in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Derived {
     /// The routing identity.
     pub routing: Routing,
+    /// The signing-time terms the root states: the payer, the fee
+    /// ceiling, the compute ceilings, the priority and the message.
+    ///
+    /// Read off the tree at derivation, since the envelope carries the
+    /// tree as bytes; every consumer reads these rather than decoding
+    /// the tree again.
+    pub terms: Terms,
+    /// The network the root names, which every intent beneath it names
+    /// too. What verification holds a transaction to a session by.
+    pub network: NetworkId,
     /// The principal the envelope's own key derives — the key attesting
     /// the composition's intent, and the one the payer's rule is judged
     /// against at the fee gate.
@@ -275,14 +275,14 @@ pub struct Derived {
     /// shard dispatches the transaction only once it holds all of them.
     pub packages: Vec<Hash>,
     /// The window the transaction is actually admissible in: the
-    /// envelope's, narrowed by every subintent it binds.
+    /// root's, narrowed by every member beneath it.
     ///
-    /// A subintent signs the window its own signer offered it for, and a
-    /// composition cannot widen it — so the answer is the intersection,
+    /// A member signs the window its own signer offered it for, and a
+    /// composer cannot widen it — so the answer is the intersection,
     /// and an empty one is refused at derivation rather than admitted
     /// into a window no signer agreed to. Every consumer reads this
-    /// rather than the envelope's raw fields, which are the composer's
-    /// claim alone.
+    /// rather than the root's own header, which is the composer's claim
+    /// alone.
     pub effective_window: TimestampRange,
     /// What this transaction declares it may consume, whole: the sum of
     /// every owner's share and what every participating shard bears.

@@ -719,9 +719,9 @@ impl Executor {
         // envelope could be assumed into that signing it would not also
         // do. The records the caller answers with come through `chain`;
         // admission composes the envelope's own over them itself.
-        let admitted = CallEnvelope::decode(vm)
-            .and_then(|call| call.admit(chain))
-            .map_err(|error| error.to_string())?;
+        let call = CallEnvelope::decode(vm).map_err(|error| error.to_string())?;
+        let admitted = call.admit(chain).map_err(|error| error.to_string())?;
+        let terms = call.terms().map_err(|error| error.to_string())?;
         // The same vector derivation puts on the envelope, so a preview
         // reports what a block would charge without running the
         // derivation — which admits under the rule as the chain applies
@@ -735,7 +735,8 @@ impl Executor {
             event_bytes,
         } = declared_vector(
             packages,
-            vm,
+            terms,
+            vm.signatures(),
             &admitted.admitted,
             &legs,
             envelope_bytes(vm).map_err(|error| error.to_string())?,
@@ -757,7 +758,7 @@ impl Executor {
                 },
                 declaration,
                 nullifiers: admitted.intents.clone(),
-                gas_limits: vm.gas_limits.clone(),
+                gas_limits: terms.gas_limits.clone(),
                 event_bytes,
                 work,
                 judges: OwnerSet::whole(),
@@ -1446,9 +1447,9 @@ impl Executor {
         let publishes: BTreeMap<TxHash, (PrincipalAddr, Vec<u8>)> = members
             .iter()
             .filter_map(|member| {
-                let vm = member.body.as_ref()?.body();
-                let artifact = vm.artifact()?;
-                Some((member.tx_hash, (vm.fee_payer, artifact.to_vec())))
+                let tx = member.body.as_ref()?;
+                let artifact = tx.body().artifact.as_ref()?;
+                Some((member.tx_hash, (tx.terms().fee_payer, artifact.clone())))
             })
             .collect();
 
@@ -1574,7 +1575,6 @@ impl Executor {
             .iter()
             .filter_map(|member| {
                 let tx = member.body.as_ref()?;
-                let vm = tx.body();
                 let vault = tx.fee_vault();
                 if ctx.shard_trie.shard_for_prefix(vault.owner) != ctx.local_shard {
                     return None;
@@ -1596,7 +1596,7 @@ impl Executor {
                     tx.hash(),
                     PayerFee {
                         vault,
-                        max_fee: vm.max_fee,
+                        max_fee: tx.terms().max_fee,
                         price: tx.price(&member.prices),
                         abortable: shapes
                             .get(&tx.hash())

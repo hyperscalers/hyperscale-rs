@@ -126,7 +126,7 @@ impl Verified<ProvisionTxRootsMap> {
             // of the transaction is what the payer's vote waits for, and
             // nobody else consumes anything from it.
             let trie = topology_snapshot.shard_trie();
-            let payer_shard = trie.shard_for_prefix(tx.body().fee_payer);
+            let payer_shard = trie.shard_for_prefix(tx.fee_payer());
             let owns_read_set = tx
                 .routing()
                 .provision_prefixes

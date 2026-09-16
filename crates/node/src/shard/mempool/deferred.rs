@@ -299,7 +299,14 @@ impl DeferredForRecords {
         let expired: Vec<TxHash> = self
             .held
             .iter()
-            .filter(|(_, held)| held.deferred.tx.body().validity_end_ms <= now_ms)
+            .filter(|(_, held)| {
+                held.deferred
+                    .tx
+                    .validity_range()
+                    .end_timestamp_exclusive
+                    .as_millis()
+                    <= now_ms
+            })
             .map(|(hash, _)| *hash)
             .collect();
         let mut dropped = Vec::new();

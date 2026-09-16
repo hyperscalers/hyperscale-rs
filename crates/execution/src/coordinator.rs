@@ -758,11 +758,7 @@ impl ExecutionCoordinator {
             // the window closed without one. Keyed on the same participant
             // set the tick was grouped by, so every replica waits on the
             // same shards.
-            if classification
-                .shard_trie()
-                .shard_for_prefix(tx.body().fee_payer)
-                == local_shard
-            {
+            if classification.shard_trie().shard_for_prefix(tx.fee_payer()) == local_shard {
                 engagement_waits.push((
                     tx_hash,
                     remote_participants(),
@@ -784,7 +780,7 @@ impl ExecutionCoordinator {
                 .map(|prefix| trie.shard_for_prefix(*prefix))
                 .filter(|&s| s != local_shard)
                 .collect();
-            let payer_shard = trie.shard_for_prefix(tx.body().fee_payer);
+            let payer_shard = trie.shard_for_prefix(tx.fee_payer());
             if payer_shard != local_shard {
                 remote_shards.insert(payer_shard);
                 // The payer's bundle carries the transaction clock;
