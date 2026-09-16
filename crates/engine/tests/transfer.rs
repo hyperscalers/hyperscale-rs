@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_effects_bridge::{
     ProtocolHasher, account_address, admit_package, admit_protocol_package, attach_metadata,
-    decode_tree, encode_tree,
+    decode_tree,
 };
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
@@ -3044,14 +3044,7 @@ fn a_preview_refuses_an_envelope_that_signed_no_ceilings() {
         .transfer_graph(payer, bob(), 100)
         .expect("an account answers a transfer");
     let mut vm = client().sign(graph, &key, terms(PREVIEW_CEILING));
-    let mut tree = decode_tree(&vm.tree).expect("the tree decodes");
-    tree.root
-        .terms
-        .as_mut()
-        .expect("the root states terms")
-        .gas_limits
-        .clear();
-    vm.tree = encode_tree(&tree);
+    vm.terms.gas_limits.clear();
     let tx = Transaction::new(vm);
 
     let report = preview_on(

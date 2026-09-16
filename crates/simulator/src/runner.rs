@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use hyperscale_effects_bridge::terms_of;
 use hyperscale_network_memory::{BandwidthReport, NodeIndex};
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::SimulationRunner;
@@ -326,11 +325,9 @@ impl Simulator {
     }
 
     /// Determine the target shard for a transaction: the payer's, read
-    /// off the tree since a submission has not been derived yet.
+    /// off the envelope since a submission has not been derived yet.
     fn get_target_shard(&self, tx: &Transaction) -> ShardId {
-        let payer = terms_of(tx.body())
-            .expect("a simulated submission states its terms")
-            .fee_payer;
+        let payer = tx.body().terms.fee_payer;
         ShardTrie::uniform_from_count(u64::from(self.config.num_shards)).shard_for_prefix(payer)
     }
 

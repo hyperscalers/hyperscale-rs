@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_effects_bridge::{admit_package, terms_of};
+use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
 use hyperscale_types::network::request::CellRange;
 use hyperscale_types::{
@@ -140,8 +140,7 @@ impl Executor {
         // declaration names. Added once: a payer spending its own vault
         // already named it, and asking twice buys two leaves of one
         // shard's proof and two spends of its query budget.
-        let terms = terms_of(tx.body()).map_err(|error| error.to_string())?;
-        let vault = vault_key(terms.fee_payer, *PROTOCOL_RESOURCE);
+        let vault = vault_key(tx.body().terms.fee_payer, *PROTOCOL_RESOURCE);
         let shard = trie.shard_for_prefix(vault.owner);
         if !held.contains(&shard) {
             let asks = by_shard.entry(shard).or_default();
@@ -576,13 +575,10 @@ impl Executor {
         inputs: &PreviewInputs,
     ) -> PreviewReport {
         let vm = tx.body();
-        // Read off the tree rather than off `fee_vault`, which panics on
-        // an envelope derivation refuses — the exact envelope a preview
-        // exists to give an answer about.
-        let terms = match terms_of(vm) {
-            Ok(terms) => terms,
-            Err(error) => return PreviewReport::refused(error.to_string()),
-        };
+        // Read off the envelope rather than off `fee_vault`, which
+        // panics on an envelope derivation refuses — the exact envelope
+        // a preview exists to give an answer about.
+        let terms = &vm.terms;
         let vault = vault_key(terms.fee_payer, *PROTOCOL_RESOURCE);
         // Local cells and fetched ones through the one call: which store
         // answered is the routing's business and nothing below it.

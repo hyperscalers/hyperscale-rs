@@ -24,7 +24,7 @@ pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metada
 pub use vm_statics::{
     BridgeStatics, CallEnvelope, DeclaredVector, PROTOCOL_RESOURCE, account_address,
     attesting_sets, declared_vector, decode_tree, draw_key, encode_tree, envelope_bytes,
-    envelope_identity, terms_of, validator_key, vault_key,
+    envelope_identity, validator_key, vault_key,
 };
 
 #[cfg(test)]
