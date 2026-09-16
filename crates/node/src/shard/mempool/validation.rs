@@ -371,11 +371,6 @@ where
         // since fetched transactions are chain content a valid block
         // already carries.
         let topology = self.process.topology_snapshot.load_full();
-        // The advisory instant the payer binding's maturity comparison
-        // uses: local admission time approximates the clock a block
-        // committing this transaction will carry. The builder and vote
-        // checks stay the deterministic authorities.
-        let clock_ms = self.now.as_millis();
         let storage = self
             .process
             .dispatch_handles
@@ -408,7 +403,7 @@ where
                         Err(_) => None,
                     };
                     let verified = verified.filter(|v| {
-                        payer_binding_holds(v, &topology, local_shard, storage.as_deref(), clock_ms)
+                        payer_binding_holds(v, &topology, local_shard, storage.as_deref())
                             && payer_covers_fee_ceiling(
                                 v,
                                 &topology,
@@ -489,8 +484,7 @@ where
 }
 
 /// Whether the payer's rule admits the signer of a transaction whose
-/// payer is local, with maturity judged at `clock_ms` — the local
-/// admission instant. `true` for a remote payer — the rule is the payer
+/// payer is local. `true` for a remote payer — the rule is the payer
 /// shard's state, so only that shard's admission judges it. Advisory
 /// like the ceiling check beside it: the builder and vote checks stay
 /// the deterministic authorities.
@@ -499,7 +493,6 @@ fn payer_binding_holds<S: SubstateStore>(
     topology: &TopologySnapshot,
     local_shard: ShardId,
     storage: Option<&S>,
-    clock_ms: u64,
 ) -> bool {
     if topology.shard_trie().shard_for_prefix(tx.fee_vault().owner) != local_shard {
         return true;
@@ -507,7 +500,7 @@ fn payer_binding_holds<S: SubstateStore>(
     let auth_cell = storage
         .and_then(|storage| storage.get_substate_at_height(tx.auth_cell(), storage.jmt_height()))
         .flatten();
-    if !tx.payer_admits_signer(auth_cell.as_deref(), clock_ms) {
+    if !tx.payer_admits_signer(auth_cell.as_deref()) {
         tracing::debug!(
             tx_hash = ?tx.hash(),
             "Refusing admission: the payer's rule does not admit the signer"

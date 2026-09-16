@@ -1114,6 +1114,21 @@ impl Derivation for StubVmStatics {
 }
 
 impl ProtocolStatics for StubVmStatics {
+    /// A stub, not a judgment: an unwritten cell admits the payer's own
+    /// key and nothing else, and no stored rule is read. A test that
+    /// needs a rule judged needs the bridge's statics.
+    fn rule_admits(
+        &self,
+        auth_cell: Option<&[u8]>,
+        payer: PrincipalAddr,
+        keys: &[PrincipalAddr],
+    ) -> bool {
+        match auth_cell {
+            None | Some([]) => keys == [payer],
+            Some(_) => false,
+        }
+    }
+
     fn package_cell(&self, _owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<Hash> {
         (local[0] == STUB_PACKAGE_MARKER)
             .then(|| Hash::from_hash_bytes(&[*value.first().unwrap_or(&0); 32]))

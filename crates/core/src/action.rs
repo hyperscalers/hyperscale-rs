@@ -929,10 +929,6 @@ pub enum Action {
         demands: Vec<FeeDemand>,
         /// The ancestry-proven committed height balances are read at.
         read_height: BlockHeight,
-        /// The judged block's own parent-QC weighted timestamp — the
-        /// transaction clock its members execute under if it commits
-        /// them.
-        clock: WeightedTimestamp,
     },
 
     /// Check the figures a block's abandonment records restate against

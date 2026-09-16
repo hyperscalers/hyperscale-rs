@@ -5203,12 +5203,11 @@ impl ShardCoordinator {
                 if *anchor > height {
                     return true;
                 }
-                if let Some(pending) = pending_blocks.get(*deferred_hash) {
+                if pending_blocks.get(*deferred_hash).is_some() {
                     actions.push(Action::VerifyReservations {
                         block_hash: *deferred_hash,
                         demands: std::mem::take(demands),
                         read_height: *anchor,
-                        clock: pending.header().parent_qc().weighted_timestamp(),
                     });
                 }
                 false

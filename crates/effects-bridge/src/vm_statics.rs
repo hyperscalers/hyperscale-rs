@@ -1093,20 +1093,18 @@ impl ProtocolStatics for BridgeStatics {
         &self,
         auth_cell: Option<&[u8]>,
         payer: PrincipalAddr,
-        signer: PrincipalAddr,
-        clock_ms: u64,
+        keys: &[PrincipalAddr],
     ) -> bool {
         // The same function the sign-in condition is judged through, so
         // the gate that decides inclusion and the one that decides
         // execution cannot read one cell differently. What differs is
         // only the question: this asks whether the payer's rule admits
         // the envelope's signer, before anything is included at all.
-        let _ = clock_ms;
-        auth_cell_admits(
-            payer.address(),
-            auth_cell,
-            &[Claim::of_subject(signer.address())],
-        )
+        let keys: Vec<Claim> = keys
+            .iter()
+            .map(|key| Claim::of_subject(key.address()))
+            .collect();
+        auth_cell_admits(payer.address(), auth_cell, &keys)
     }
 }
 
@@ -1875,41 +1873,35 @@ mod tests {
                 .in_cell()
         };
 
-        // Virtual: the payer's own identity and no other, whatever the
-        // clock says.
-        assert!(statics.rule_admits(None, composer_addr(), composer_addr(), 0));
-        assert!(statics.rule_admits(Some(&[]), composer_addr(), composer_addr(), u64::MAX));
-        assert!(!statics.rule_admits(None, composer_addr(), bob_addr(), 0));
+        let admits = |cell: Option<&[u8]>, key: PrincipalAddr| {
+            statics.rule_admits(cell, composer_addr(), &[key])
+        };
+
+        // Virtual: the payer's own identity and no other.
+        assert!(admits(None, composer_addr()));
+        assert!(admits(Some(&[]), composer_addr()));
+        assert!(!admits(None, bob_addr()));
 
         // Securified to Bob: the old identity is dead, the rule's lives.
         let cell = stored(&StoredRule::claim(Claim::of_subject(bob_addr())));
-        assert!(statics.rule_admits(Some(&cell), composer_addr(), bob_addr(), 0));
-        assert!(!statics.rule_admits(Some(&cell), composer_addr(), composer_addr(), 0));
-
-        // And the cell is the whole of it. A replacement an account has
-        // waiting sits in that package's own cells and moves this binding
-        // only once it is enacted here — so no instant a verdict is
-        // judged at can part two nodes reading one cell.
-        for clock in [0, 4_999, 5_000, u64::MAX] {
-            assert!(statics.rule_admits(Some(&cell), composer_addr(), bob_addr(), clock));
-            assert!(!statics.rule_admits(Some(&cell), composer_addr(), composer_addr(), clock));
-        }
+        assert!(admits(Some(&cell), bob_addr()));
+        assert!(!admits(Some(&cell), composer_addr()));
 
         // A frozen account binds no fees: the rule nobody satisfies is
         // written rather than removed, because an unwritten cell is what
         // the address's own key still governs.
         let frozen = stored(&never());
-        assert!(!statics.rule_admits(Some(&frozen), composer_addr(), bob_addr(), 0));
-        assert!(!statics.rule_admits(Some(&frozen), composer_addr(), composer_addr(), 0));
+        assert!(!admits(Some(&frozen), bob_addr()));
+        assert!(!admits(Some(&frozen), composer_addr()));
 
         // Bytes no cell decodes from admit nobody — fail closed, like
         // the execution gate. Bare rule bytes are among them: the write
         // path stores frames.
-        assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), composer_addr(), 0));
+        assert!(!admits(Some(&[0xFF, 0xFF]), composer_addr()));
         let bare = StoredRule::claim(Claim::of_subject(bob_addr()))
             .to_bytes()
             .unwrap();
-        assert!(!statics.rule_admits(Some(&bare), composer_addr(), bob_addr(), 0));
+        assert!(!admits(Some(&bare), bob_addr()));
     }
 
     #[test]

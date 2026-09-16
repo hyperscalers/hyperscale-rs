@@ -523,35 +523,31 @@ pub trait Derivation: Send + Sync {
 /// the effects bridge to this crate: consensus cannot call into the VM,
 /// so the VM installs its answers here.
 pub trait ProtocolStatics: Send + Sync {
-    /// Whether `payer`'s rule admits `signer`, given the payer's
-    /// stored-authority cell as read at the caller's own anchored
-    /// height — `None` or empty meaning absent.
+    /// Whether `payer`'s rule admits the attesting set `keys`, given the
+    /// payer's stored-authority cell as read at the caller's own
+    /// anchored height — `None` or empty meaning absent.
     ///
     /// The rule's encoding is the VM's fact, so consensus hands the
     /// bytes across this seam and stays blind to them. Absent means the
     /// account is virtual and the rule is the identity its address
     /// derives; stored bytes that do not decode admit nobody, the same
-    /// fail-closed verdict the execution gate gives them.
+    /// fail-closed verdict the execution gate gives them. The one
+    /// implementation is the same function the kernel judges an
+    /// intent's sign-in through, so the two gates cannot read one cell
+    /// differently — which is why there is no default body here for a
+    /// second reading to hide in.
     ///
     /// The cell holds one rule and the verdict is that rule's, so what
     /// replaces one is a write to the cell: a replacement an account has
     /// waiting sits in that package's own cells and governs here only
-    /// once a call enacts it. `clock_ms` is passed and not read — no
-    /// implementation consults it, and two nodes reading one cell reach
-    /// one verdict whatever instant each judges at.
+    /// once a call enacts it. No instant enters the verdict, so two
+    /// nodes reading one cell reach one answer whenever each judges.
     fn rule_admits(
         &self,
         auth_cell: Option<&[u8]>,
         payer: PrincipalAddr,
-        signer: PrincipalAddr,
-        clock_ms: u64,
-    ) -> bool {
-        let _ = clock_ms;
-        match auth_cell {
-            None | Some([]) => payer == signer,
-            Some(_) => false,
-        }
-    }
+        keys: &[PrincipalAddr],
+    ) -> bool;
 
     /// The content address of the package this committed cell publishes,
     /// or `None` for every other cell.
