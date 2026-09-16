@@ -1094,12 +1094,10 @@ impl Derivation for StubVmStatics {
             // its payer is the one party its routing declares.
             legs: Vec::new(),
             accounts: vec![vm.fee_payer.address()],
-            // One per bound signature, which is what a real derivation
-            // files: a subintent's signature and its nullifier come in a
-            // pair. Under the payer, since the stub cannot derive the
-            // signer's address from a key. Every fixture that binds none
-            // creates nothing, so a test opts in by binding.
-            nullifiers: (0..vm.subintent_sigs.len())
+            // One per intent, which is what a real derivation files: the
+            // composition's own and one per signature it binds. Under the
+            // payer, since the stub cannot derive an account from a key.
+            nullifiers: (0..=vm.subintent_sigs.len())
                 .map(|bound| {
                     let mut local = [0xAF; 16];
                     local[..8].copy_from_slice(&(bound as u64).to_le_bytes());

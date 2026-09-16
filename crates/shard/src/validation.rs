@@ -480,14 +480,14 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
         BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline,
-        ExecutionOutcome, Finalization, Hash, Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES,
-        MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
-        ProvisionEntry, Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad,
-        Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
-        TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
-        WitnessSources, test_utils,
+        ExecutionOutcome, Finalization, Hash, Inclusion, LocalKey, MAX_INTENTS,
+        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+        MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition, PriceTable,
+        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, Round,
+        RoutePrefix, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
+        StateRoot, SubstateKey, TimestampRange, Transaction, TransactionDecision, TxHash,
+        TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
+        WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1026,7 +1026,7 @@ mod tests {
     /// the header claims, so a proposer cannot understate what its block
     /// will make the chain carry.
     ///
-    /// An envelope binds at most `MAX_SUBINTENTS`, so the cap is reached
+    /// An envelope carries at most `MAX_INTENTS`, so the cap is reached
     /// by a block of fully composed transactions rather than by one
     /// transaction — which is the shape it is sized for. Every nullifier
     /// is a signature to verify, so enough of them to fill the cap would
@@ -1037,10 +1037,10 @@ mod tests {
     fn a_block_may_create_sweepable_cells_up_to_the_cap() {
         use crate::admission::ProvisionsFold;
 
-        // Each fully composed transaction creates its subintents'
-        // nullifiers, all on this one shard, and its committed cell
-        // beside them.
-        let cells = MAX_SUBINTENTS + 1;
+        // Each fully composed transaction creates one nullifier per
+        // intent, all on this one shard, and its committed cell beside
+        // them.
+        let cells = MAX_INTENTS + 1;
         let full = 3;
         let composed = |seed: u32| {
             Arc::new(Verifiable::from(test_utils::stub_transaction_binding(

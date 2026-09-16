@@ -246,7 +246,7 @@ pub use transaction::status::{
     TxResolution,
 };
 pub use transaction::vm::{
-    ArtifactTerm, Derivation, DerivationError, Derived, EnvelopeExt, MAX_MESSAGE_LEN,
+    ArtifactTerm, Derivation, DerivationError, Derived, EnvelopeExt, MAX_INTENTS, MAX_MESSAGE_LEN,
     MAX_SUBINTENTS, OwnerShare, ProtocolStatics, ProtocolVerifier, Routing, SchemeVerifier,
     SubintentSig, TransactionBody, TransactionEnvelope, Unresolved, install_protocol_statics,
     protocol_statics, protocol_statics_installed, whole_work,
