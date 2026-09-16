@@ -721,7 +721,7 @@ impl Executor {
         // admission composes the envelope's own over them itself.
         let call = CallEnvelope::decode(vm).map_err(|error| error.to_string())?;
         let admitted = call.admit(chain).map_err(|error| error.to_string())?;
-        let terms = call.terms().map_err(|error| error.to_string())?;
+        let terms = call.terms();
         // The same vector derivation puts on the envelope, so a preview
         // reports what a block would charge without running the
         // derivation — which admits under the rule as the chain applies

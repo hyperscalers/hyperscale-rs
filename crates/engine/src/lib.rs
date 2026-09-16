@@ -46,7 +46,7 @@ pub use executor::{
     instance_of_record, protocol_hash,
 };
 pub use genesis::{GenesisConfig, PROTOCOL_RESOURCE, World, genesis_world, genesis_writes};
-pub use hyperscale_effects_bridge::{LocalCells, account_address, terms_of};
+pub use hyperscale_effects_bridge::{LocalCells, account_address};
 pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, ExecutionMode};
 pub use output::ExecutedTx;
 pub use preview::{

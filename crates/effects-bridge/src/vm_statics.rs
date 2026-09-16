@@ -370,18 +370,10 @@ impl<'a> CallEnvelope<'a> {
         })
     }
 
-    /// The terms the root states.
-    ///
-    /// # Errors
-    ///
-    /// [`DerivationError::Refused`] on a root that states none: the
-    /// chain has nothing to charge or to meter such a transaction by.
-    pub fn terms(&self) -> Result<&Terms, DerivationError> {
-        self.tree
-            .root
-            .terms
-            .as_ref()
-            .ok_or_else(|| DerivationError::Refused("the root states no terms".into()))
+    /// The terms the envelope states.
+    #[must_use]
+    pub const fn terms(&self) -> &Terms {
+        &self.vm.terms
     }
 
     /// The principal the envelope's own key derives: the key attesting
@@ -409,7 +401,7 @@ impl<'a> CallEnvelope<'a> {
             &ProtocolHasher,
         )
         .map_err(|error| DerivationError::Refused(format!("admission: {error}")))?;
-        self.terms()?
+        self.terms()
             .admit(admitted.admitted.calls().len())
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         Ok(admitted)
@@ -788,23 +780,6 @@ const fn admission_key(target: &EffectTarget) -> DeclaredKey {
     }
 }
 
-/// The terms the tree's root states, read off the envelope without
-/// deriving it.
-///
-/// What a preview reads, since it answers for envelopes derivation may
-/// refuse and still has to name the payer's vault and the ceiling.
-///
-/// # Errors
-///
-/// [`DerivationError::Refused`] on a tree that does not decode or a
-/// root that states no terms.
-pub fn terms_of(vm: &TransactionEnvelope) -> Result<Terms, DerivationError> {
-    decode_tree(&vm.tree)?
-        .root
-        .terms
-        .ok_or_else(|| DerivationError::Refused("the root states no terms".into()))
-}
-
 /// The envelope's identity: its signing hash through the workspace's
 /// protocol hash, as the vocabulary's hash type.
 #[must_use]
@@ -932,10 +907,7 @@ impl BridgeStatics {
                 "a publish's root calls nothing and composes nobody".into(),
             ));
         }
-        let terms = root
-            .terms
-            .clone()
-            .ok_or_else(|| DerivationError::Refused("the root states no terms".into()))?;
+        let terms = vm.terms.clone();
         // A publish lowers to one node and signs one ceiling for it.
         terms
             .admit(1)
@@ -1092,7 +1064,7 @@ impl Derivation for BridgeStatics {
             return Err(DerivationError::Unresolved(unresolved));
         }
         let admitted_tree = call.admit(&chain)?;
-        let terms = call.terms()?.clone();
+        let terms = call.terms().clone();
         let admitted = &admitted_tree.admitted;
 
         let DeclaredAccess {
@@ -1399,10 +1371,9 @@ mod tests {
                 sign_subintent(*signer, &hash.0.0)
             })
             .collect();
-        let mut tree = tree.clone();
-        tree.root.terms = Some(terms(&tree));
         TransactionEnvelope {
-            tree: encode_tree(&tree),
+            tree: encode_tree(tree),
+            terms: terms(tree),
             artifact: None,
             subintent_sigs,
             signer_scheme: SchemeId::NONE,
@@ -1412,24 +1383,20 @@ mod tests {
         .sign(&key(7))
     }
 
-    /// `vm` with its root's terms edited, re-signed by `signer`.
+    /// `vm` with its terms edited, re-signed by `signer`.
     fn reterm<S: AccountSigner>(
         vm: &TransactionEnvelope,
         signer: &S,
         edit: impl FnOnce(&mut Terms),
     ) -> TransactionEnvelope {
-        let mut tree = decode_tree(&vm.tree).expect("the tree decodes");
-        edit(tree.root.terms.as_mut().expect("the root states terms"));
         let mut edited = vm.clone();
-        edited.tree = encode_tree(&tree);
+        edit(&mut edited.terms);
         edited.sign(signer)
     }
 
-    /// The compute the root's terms sign for.
+    /// The compute the terms sign for.
     fn ceilings_total(vm: &TransactionEnvelope) -> u64 {
-        terms_of(vm)
-            .expect("the root states terms")
-            .gas_limit_total()
+        vm.terms.gas_limit_total()
     }
 
     /// A transfer divides into a withdraw and a deposit. Its one value
@@ -1525,7 +1492,7 @@ mod tests {
             ],
         );
         let vm = envelope(&tree, &[]);
-        assert_eq!(terms_of(&vm).unwrap().gas_limits.len(), 2);
+        assert_eq!(vm.terms.gas_limits.len(), 2);
         statics().derive(&vm).expect("one ceiling per node derives");
 
         let one = reterm(&vm, &key(7), |terms| {

@@ -346,8 +346,8 @@ impl Client {
 mod tests {
     use std::collections::BTreeSet;
 
+    use hyperscale_effects_bridge::envelope_bytes;
     use hyperscale_effects_bridge::genesis::account_artifact;
-    use hyperscale_effects_bridge::{decode_tree, envelope_bytes};
     use hyperscale_types::test_utils::{test_principal, test_validity_range};
     use hyperscale_types::{Ed25519PrivateKey, MAX_ENVELOPE_BYTES};
     use hyperscale_vm_effects::{
@@ -476,14 +476,7 @@ mod tests {
                 terms(Ceilings::Measured(measured.clone())),
             )
             .expect("a measured transfer builds");
-        let ceilings = |tx: &Transaction| {
-            decode_tree(&tx.body().tree)
-                .expect("the tree decodes")
-                .root
-                .terms
-                .expect("the root states terms")
-                .gas_limits
-        };
+        let ceilings = |tx: &Transaction| tx.body().terms.gas_limits.clone();
         assert_eq!(ceilings(&previewed), measured);
 
         let guessed = client

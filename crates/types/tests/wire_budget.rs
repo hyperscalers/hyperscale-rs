@@ -27,11 +27,21 @@ use hyperscale_types::{
 /// to prevent, and nothing else ties the figure to what HBOR writes.
 #[test]
 fn a_maximal_envelope_encodes_under_the_bound_it_is_budgeted_at() {
-    use hyperscale_vm_types::{MAX_CALL_BYTES, MAX_KEY_BYTES, MAX_SIG_BYTES};
+    use hyperscale_vm_types::{
+        MAX_CALL_BYTES, MAX_KEY_BYTES, MAX_MANIFEST_NODES, MAX_MESSAGE_LEN, MAX_SIG_BYTES,
+        PrincipalAddr, Terms,
+    };
 
     let widest = SchemeId::ML_DSA_65;
     let vm = TransactionEnvelope {
         tree: vec![0xAB; MAX_CALL_BYTES],
+        terms: Terms {
+            fee_payer: PrincipalAddr::new([0xAA; 31]),
+            max_fee: u128::MAX,
+            gas_limits: vec![u64::MAX; MAX_MANIFEST_NODES],
+            priority_bp: u32::MAX,
+            message: vec![0xAB; MAX_MESSAGE_LEN],
+        },
         artifact: Some(vec![0xAB; MAX_ARTIFACT_BYTES]),
         subintent_sigs: (0..MAX_SUBINTENTS)
             .map(|_| SubintentSig {

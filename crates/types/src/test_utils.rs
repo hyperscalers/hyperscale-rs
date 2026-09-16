@@ -1034,6 +1034,7 @@ impl StubTree {
     pub fn envelope(&self, subintent_sigs: Vec<SubintentSig>) -> TransactionEnvelope {
         TransactionEnvelope {
             tree: self.encode(),
+            terms: self.terms.clone(),
             artifact: None,
             subintent_sigs,
             signer_scheme: SchemeId::NONE,
