@@ -1272,15 +1272,15 @@ mod tests {
         }
     }
 
-    fn withdraw(target: impl Into<CallTarget>, resource: ResourceAddr, amount: u128) -> GraphNode {
+    fn withdraw(account: PrincipalAddr, resource: ResourceAddr, amount: u128) -> GraphNode {
         GraphNode {
-            target: target.into(),
+            target: account.into(),
             method: "withdraw".into(),
             args: vec![
                 GraphArg::Literal(Value::Address(resource.address())),
                 GraphArg::Literal(Value::U128(amount)),
             ],
-            evidence: [EvidenceRef::Attestation].into(),
+            evidence: [EvidenceRef::Account(account)].into(),
         }
     }
 
@@ -2206,7 +2206,7 @@ mod tests {
                 .derive(&envelope(
                     &intent_tree(
                         composer_addr(),
-                        vec![node([EvidenceRef::Attestation].into())],
+                        vec![node([EvidenceRef::Account(composer_addr())].into())],
                     ),
                     &[],
                 ))
