@@ -81,14 +81,14 @@ impl FeeReservationLedger {
     /// against the trie rather than here and at the seed separately.
     pub(crate) fn register_committed(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
         for tx in transactions {
-            let vm = tx.body();
+            let terms = tx.terms();
             let deadline = tx
                 .validity_range()
                 .end_timestamp_exclusive
                 .plus(RETENTION_HORIZON);
             self.holds.entry(tx.hash()).or_insert(Hold {
-                payer: vm.fee_payer,
-                max_fee: vm.max_fee,
+                payer: terms.fee_payer,
+                max_fee: terms.max_fee,
                 deadline,
             });
         }

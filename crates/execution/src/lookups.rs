@@ -143,7 +143,7 @@ pub fn provision_request(
         .filter_map(DeclaredKey::range)
         .filter(|range| trie.shard_for_prefix(range.owner) == local_shard)
         .collect();
-    let payer_shard = trie.shard_for_prefix(tx.body().fee_payer);
+    let payer_shard = trie.shard_for_prefix(tx.fee_payer());
     let targets: Vec<ShardId> =
         if local_keys.is_empty() && local_ranges.is_empty() && payer_shard != local_shard {
             // The engagement echo: a counterpart with nothing to serve still

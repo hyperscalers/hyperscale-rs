@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-use hyperscale_hbor::Hash32;
+use hyperscale_hbor::{Hash32, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_vm_types::{
     Address, AddressClass, DeclaredWork, IntentHash, LegRole, LegShape, LocalKey, Mode, Moves,
-    PrincipalAddr, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey, SweepBucket, ValueEdge,
+    PrincipalAddr, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey, SweepBucket, Terms, ValueEdge,
 };
 
 use crate::crypto::Ed25519PrivateKey;
@@ -19,10 +19,10 @@ use crate::{
     GlobalReceiptHash, Hash, MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp,
     ProtocolStatics, QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId, ShardLoad,
     SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubintentSig, TickHalf, TickId,
-    TimestampRange, TopologySnapshot, Transaction, TransactionBody, TransactionDecision,
-    TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    install_protocol_statics, protocol_statics_installed, signed_bytes,
+    TimestampRange, TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope,
+    TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, install_protocol_statics,
+    protocol_statics_installed, signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -109,7 +109,9 @@ pub fn test_transaction(seed: u8) -> Transaction {
 pub fn test_transaction_at_priority(seed: u8, priority_bp: u32) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[0x5A; 32]).expect("fixture key");
     let mut vm = test_transaction(seed).body().clone();
-    vm.priority_bp = priority_bp;
+    let mut stub = StubTree::decode(&vm).expect("a test transaction carries a stub tree");
+    stub.terms.priority_bp = priority_bp;
+    vm.tree = stub.encode();
     let tx = Transaction::new(vm.sign(&key));
     tx.try_derived(&StubVmStatics)
         .expect("the fixture builds a tree the stub derivation routes");
@@ -985,20 +987,83 @@ pub const fn stub_abort_charge(seed: u8) -> AbortCharge {
     }
 }
 
+/// What a stub envelope carries where a real one carries a tree: the
+/// terms and the window a real root states, and a body the stub
+/// derivation routes by.
+///
+/// A real tree is the vocabulary's own encoding, which the consensus
+/// crates never decode; this is the same seam at the same place — bytes
+/// inside the envelope, read by the derivation and by nothing else — so
+/// a stubbed transaction is shaped like a real one wherever the
+/// envelope is read without deriving.
+#[derive(Clone, Debug, PartialEq, Eq, Hbor)]
+pub struct StubTree {
+    /// The terms the stub's root states.
+    pub terms: Terms,
+    /// The network the stub's root names.
+    pub network: NetworkId,
+    /// The window the stub's root stands in.
+    pub validity: TimestampRange,
+    /// What the stub derivation routes by.
+    pub body: Vec<u8>,
+}
+
+impl StubTree {
+    /// The stub's canonical bytes, in the envelope's tree field.
+    ///
+    /// # Panics
+    ///
+    /// Never: a stub is scalars and a byte string.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        hbor_to_vec(self).expect("a stub tree encodes")
+    }
+
+    /// The stub `vm` carries.
+    ///
+    /// # Errors
+    ///
+    /// [`DerivationError::Refused`] for a tree that is not a stub.
+    pub fn decode(vm: &TransactionEnvelope) -> Result<Self, DerivationError> {
+        hbor_from_slice(&vm.tree)
+            .map_err(|error| DerivationError::Refused(format!("stub tree: {error}")))
+    }
+
+    /// An unsigned envelope around this stub, carrying `subintent_sigs`.
+    #[must_use]
+    pub fn envelope(&self, subintent_sigs: Vec<SubintentSig>) -> TransactionEnvelope {
+        TransactionEnvelope {
+            tree: self.encode(),
+            artifact: None,
+            subintent_sigs,
+            signer_scheme: SchemeId::NONE,
+            signer: Vec::new(),
+            signature: Vec::new(),
+        }
+    }
+
+    /// The window the stub stands in.
+    #[must_use]
+    pub const fn window(&self) -> TimestampRange {
+        self.validity
+    }
+}
+
 /// A deterministic [`Derivation`] stub for consensus-crate
 /// tests.
 ///
-/// The envelope's tree is a leading read count followed by that many
-/// 32-byte shared-mode owner prefixes and then the exclusive ones, and
-/// its message is a run of 32-byte package addresses the transaction
-/// runs. Routing and package set are thus fully controlled per
-/// transaction by [`stub_transaction`] and
+/// The envelope's tree is a [`StubTree`] whose body is a leading read
+/// count followed by that many 32-byte shared-mode owner prefixes and
+/// then the exclusive ones, and whose message is a run of 32-byte
+/// package addresses the transaction runs. Routing and package set are
+/// thus fully controlled per transaction by [`stub_transaction`] and
 /// [`stub_transaction_running`], with no effects-bridge dependency.
 pub struct StubVmStatics;
 
 impl Derivation for StubVmStatics {
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
-        let tree = vm.call_tree().unwrap_or_default();
+        let stub = StubTree::decode(vm)?;
+        let tree = stub.body.as_slice();
         let Some((&read_count, prefixes)) = tree.split_first() else {
             return Err(DerivationError::Refused("stub tree is empty".into()));
         };
@@ -1024,29 +1089,31 @@ impl Derivation for StubVmStatics {
         let (reads, writes) = prefixes.split_at(usize::from(read_count) * 32);
         let read_prefixes = canonical(reads)?;
         let write_prefixes = canonical(writes)?;
-        if !vm.message.len().is_multiple_of(32) {
+        let message = &stub.terms.message;
+        if !message.len().is_multiple_of(32) {
             return Err(DerivationError::Refused(
                 "stub message must be 32-byte package addresses".into(),
             ));
         }
-        let packages: Vec<Hash> = vm
-            .message
+        let packages: Vec<Hash> = message
             .as_chunks::<32>()
             .0
             .iter()
             .map(|bytes| Hash::from_hash_bytes(bytes))
             .collect();
         let work = DeclaredWork {
-            compute: vm.gas_limit_total(),
+            compute: stub.terms.gas_limit_total(),
             footprint: (read_prefixes.len() + write_prefixes.len()) as u64,
-            retention: vm.message.len() as u64,
+            retention: message.len() as u64,
             ..DeclaredWork::ZERO
         }
         .saturating_add(vm.signatures());
+        let payer = stub.terms.fee_payer;
         Ok(Derived {
-            // A stub derives no tree, so the envelope's own window is
-            // the whole of it.
-            effective_window: vm.validity_window(),
+            // A stub derives no tree, so the root's own window is the
+            // whole of it.
+            effective_window: stub.window(),
+            network: stub.network,
             routing: Routing {
                 read_keys: read_prefixes.iter().copied().map(stub_cell).collect(),
                 write_keys: write_prefixes.iter().copied().map(stub_cell).collect(),
@@ -1075,7 +1142,7 @@ impl Derivation for StubVmStatics {
             // The stub cannot derive an address from a key, so it binds
             // the signer to the payer field — every stubbed
             // transaction's payer admits its signer.
-            signer: vm.fee_payer,
+            signer: payer,
             fee_vault_local: [0xEE; 16],
             auth_cell_local: [0xAE; 16],
             packages,
@@ -1093,20 +1160,21 @@ impl Derivation for StubVmStatics {
             // A stub derives no manifest, so it has no legs to divide;
             // its payer is the one party its routing declares.
             legs: Vec::new(),
-            accounts: vec![vm.fee_payer.address()],
+            accounts: vec![payer.address()],
             // One per intent, which is what a real derivation files: the
-            // composition's own and one per signature it binds. Under the
+            // root's own and one per signature it binds. Under the
             // payer, since the stub cannot derive an account from a key.
             nullifiers: (0..=vm.subintent_sigs.len())
                 .map(|bound| {
                     let mut local = [0xAF; 16];
                     local[..8].copy_from_slice(&(bound as u64).to_le_bytes());
                     SubstateKey {
-                        owner: vm.fee_payer.address(),
+                        owner: payer.address(),
                         local: LocalKey(local),
                     }
                 })
                 .collect(),
+            terms: stub.terms,
         })
     }
 }
@@ -1243,27 +1311,27 @@ pub fn stub_transaction_binding(seed: u32, bound: usize, validity: TimestampRang
     let key = Ed25519PrivateKey::from_bytes(&key_bytes).expect("fixture key");
     let mut payer = [0x5Eu8; 31];
     payer[..4].copy_from_slice(&seed.to_le_bytes());
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(vec![0]),
-        subintent_sigs: (0..bound)
+    let vm = StubTree {
+        terms: Terms {
+            fee_payer: PrincipalAddr::new(payer),
+            max_fee: 1_000,
+            gas_limits: vec![1_000_000],
+            priority_bp: 0,
+            message: Vec::new(),
+        },
+        network: NetworkId::from(&NetworkDefinition::simulator()),
+        validity,
+        body: vec![0],
+    }
+    .envelope(
+        (0..bound)
             .map(|_| SubintentSig {
                 scheme: SchemeId::ED25519,
                 public_key: vec![0x11; 32],
                 signature: vec![0x22; 64],
             })
             .collect(),
-        fee_payer: PrincipalAddr::new(payer),
-        max_fee: 1_000,
-        gas_limits: vec![1_000_000],
-        priority_bp: 0,
-        validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
-        validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
-        message: Vec::new(),
-        network: NetworkId::from(&NetworkDefinition::simulator()),
-        signer_scheme: SchemeId::NONE,
-        signer: Vec::new(),
-        signature: Vec::new(),
-    }
+    )
     .sign(&key);
     let tx = Transaction::new(vm);
     tx.try_derived(&StubVmStatics)
@@ -1372,21 +1440,19 @@ pub fn stub_transaction_declaring(
     for package in packages {
         message.extend_from_slice(package.as_bytes());
     }
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(tree),
-        subintent_sigs: Vec::new(),
-        fee_payer,
-        max_fee,
-        gas_limits,
-        priority_bp: 0,
-        validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
-        validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
-        message,
+    let vm = StubTree {
+        terms: Terms {
+            fee_payer,
+            max_fee,
+            gas_limits,
+            priority_bp: 0,
+            message,
+        },
         network: NetworkId::from(&NetworkDefinition::simulator()),
-        signer_scheme: SchemeId::NONE,
-        signer: Vec::new(),
-        signature: Vec::new(),
+        validity,
+        body: tree,
     }
+    .envelope(Vec::new())
     .sign(&key);
     let tx = Transaction::new(vm);
     tx.try_derived(&StubVmStatics)

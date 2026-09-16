@@ -435,11 +435,11 @@ impl MempoolCoordinator {
         // own deadline, where nothing has to guess which window was
         // right.
         let price = tx.price(&topology_snapshot.prices());
-        if price > tx.body().max_fee {
+        if price > tx.terms().max_fee {
             tracing::debug!(
                 tx_hash = ?hash,
                 price,
-                max_fee = tx.body().max_fee,
+                max_fee = tx.terms().max_fee,
                 "Rejecting transaction whose ceiling the table has outgrown"
             );
             return None;
@@ -1051,7 +1051,7 @@ impl MempoolCoordinator {
         }
         let payer_shard = topology_snapshot
             .shard_trie()
-            .shard_for_prefix(tx.body().fee_payer);
+            .shard_for_prefix(tx.fee_payer());
         if payer_shard == self.local_shard {
             return None;
         }
@@ -1184,7 +1184,7 @@ impl MempoolCoordinator {
                     && now.saturating_sub(entry.admitted_at) >= min_dwell
                     && engaged(&entry.tx)
             })
-            .map(|(hash, entry)| (Reverse(entry.tx.body().priority_bp), *hash, entry))
+            .map(|(hash, entry)| (Reverse(entry.tx.terms().priority_bp), *hash, entry))
             .collect();
         candidates.sort_unstable_by_key(|(priority, hash, _)| (*priority, *hash));
 
@@ -2589,7 +2589,7 @@ mod tests {
         let ready = mempool.ready_transactions(2, 0, &ShardTrie::single(), now, |_| true);
         assert_eq!(ready.len(), 2, "the room the caller named");
         assert!(
-            ready.iter().all(|tx| tx.body().priority_bp == 500),
+            ready.iter().all(|tx| tx.terms().priority_bp == 500),
             "the higher multipliers are the ones offered"
         );
         assert!(

@@ -3626,7 +3626,7 @@ impl ShardCoordinator {
                 block.transactions().iter().map(|tx| PayerFee {
                     vault: tx.fee_vault(),
                     auth_cell: tx.auth_cell(),
-                    max_fee: tx.body().max_fee,
+                    max_fee: tx.terms().max_fee,
                     signer: Some(tx.signer()),
                 }),
             );
@@ -3718,7 +3718,7 @@ impl ShardCoordinator {
             if let Some(block) = pending.block() {
                 for tx in block.transactions().iter() {
                     if let Some(entry) = demands.get_mut(&tx.fee_vault()) {
-                        let fee = tx.body().max_fee;
+                        let fee = tx.terms().max_fee;
                         entry.demand = entry.demand.saturating_add(fee);
                     }
                 }

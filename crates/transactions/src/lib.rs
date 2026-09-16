@@ -25,9 +25,7 @@ use hyperscale_types::{
     AccountSigner, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
     TransactionEnvelope,
 };
-use hyperscale_vm_effects::{
-    Claim, EnvelopeTree, Intent, IntentDecl, IntentHeader, ManifestGraph, StoredRule,
-};
+use hyperscale_vm_effects::{Claim, EnvelopeTree, Intent, IntentHeader, ManifestGraph, StoredRule};
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::PrincipalAddr;
@@ -259,29 +257,20 @@ impl Client {
         terms: Terms,
     ) -> TransactionEnvelope {
         self.sign_tree(
-            &EnvelopeTree {
-                intents: vec![Intent {
-                    decl: IntentDecl {
-                        header: IntentHeader {
-                            network: self.network,
-                            validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
-                            validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
-                            // One offer, so one nullifier: a second
-                            // submission of this declaration inside this
-                            // window replaces it rather than running
-                            // beside it. A caller who means two picks two
-                            // discriminators.
-                            discriminator: 0,
-                        },
-                        graph,
-                        sockets: Vec::new(),
-                    },
-                    account: principal_of(payer),
-                    bindings: Vec::new(),
-                }],
-                instances: Vec::new(),
-                resources: Vec::new(),
-            },
+            &EnvelopeTree::of_one(Intent::leaf(
+                IntentHeader {
+                    network: self.network,
+                    validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
+                    validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
+                    // One offer, so one nullifier: a second submission
+                    // of this declaration inside this window replaces
+                    // it rather than running beside it. A caller who
+                    // means two picks two discriminators.
+                    discriminator: 0,
+                },
+                principal_of(payer),
+                graph,
+            )),
             Vec::new(),
             payer,
             terms,
@@ -290,11 +279,13 @@ impl Client {
 
     /// Wrap a composed tree in an envelope signed by `payer`.
     ///
-    /// `sigs` are what the tree's own signers produced over their
-    /// declarations; what `payer` signs is the whole envelope, those
-    /// signatures included.
+    /// `sigs` are what the tree's members' signers produced over their
+    /// intents; what `payer` signs is the whole envelope, those
+    /// signatures included. The root's terms and window are `terms`,
+    /// stamped here: the root is the composer's own and is signed last,
+    /// so nothing a member signed is touched.
     ///
-    /// The envelope names the principal `payer`'s own scheme and key
+    /// The terms name the principal `payer`'s own scheme and key
     /// derive, which is the account it can open by signing. A scheme is
     /// part of that derivation, so the same key under two schemes names
     /// two accounts and neither pays for the other.
@@ -313,17 +304,17 @@ impl Client {
         payer: &S,
         terms: Terms,
     ) -> TransactionEnvelope {
+        let mut tree = tree.clone();
+        tree.root.header.validity_start_ms = terms.validity.start_timestamp_inclusive.as_millis();
+        tree.root.header.validity_end_ms = terms.validity.end_timestamp_exclusive.as_millis();
         let envelope = signing::wrap(
-            tree,
+            &tree,
             sigs,
-            principal_of(payer),
-            self.network,
             signing::Terms {
+                fee_payer: principal_of(payer),
                 max_fee: terms.max_fee,
                 gas_limits: terms.ceilings.over(tree.node_count()),
                 priority_bp: terms.priority_bp,
-                validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
-                validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
                 message: terms.message,
             },
         );
@@ -355,8 +346,8 @@ impl Client {
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_effects_bridge::envelope_bytes;
     use hyperscale_effects_bridge::genesis::account_artifact;
+    use hyperscale_effects_bridge::{decode_tree, envelope_bytes};
     use hyperscale_types::test_utils::{test_principal, test_validity_range};
     use hyperscale_types::{Ed25519PrivateKey, MAX_ENVELOPE_BYTES};
     use hyperscale_vm_effects::{
@@ -485,13 +476,21 @@ mod tests {
                 terms(Ceilings::Measured(measured.clone())),
             )
             .expect("a measured transfer builds");
-        assert_eq!(previewed.body().gas_limits, measured);
+        let ceilings = |tx: &Transaction| {
+            decode_tree(&tx.body().tree)
+                .expect("the tree decodes")
+                .root
+                .terms
+                .expect("the root states terms")
+                .gas_limits
+        };
+        assert_eq!(ceilings(&previewed), measured);
 
         let guessed = client
             .transfer(&signer, test_principal(0x22), 100, terms(Ceilings::Guessed))
             .expect("an unmeasured transfer builds");
         assert_eq!(
-            guessed.body().gas_limits,
+            ceilings(&guessed),
             default_gas_limits(measured.len()),
             "a caller that did not preview signs the deployment default"
         );

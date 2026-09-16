@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_crypto_bls::BlsSigner;
+use hyperscale_effects_bridge::terms_of;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, Derivation, Event, PriceTable, ShardId, Signer, StateRoot,
@@ -24,9 +25,19 @@ use super::query::RanAs;
 /// strands it there. Routing to the payer's shard is what a client does,
 /// and it is what keeps a gossip fault a fault in delivery rather than in
 /// submission.
+///
+/// # Panics
+///
+/// On a transaction whose root states no terms, which no scenario
+/// builds.
 #[must_use]
 pub fn submission_shards(snapshot: &TopologySnapshot, tx: &Transaction) -> Vec<ShardId> {
-    let payer = snapshot.shard_for_prefix(tx.body().fee_payer);
+    // Read off the tree rather than the derivation: a submission has
+    // not been verified yet, and routing it is what a client does.
+    let payer = terms_of(tx.body())
+        .expect("a scenario submission states its terms")
+        .fee_payer;
+    let payer = snapshot.shard_for_prefix(payer);
     let mut shards = vec![payer];
     shards.extend(
         snapshot

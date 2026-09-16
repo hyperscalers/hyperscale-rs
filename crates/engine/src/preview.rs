@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_effects_bridge::admit_package;
+use hyperscale_effects_bridge::{admit_package, terms_of};
 use hyperscale_storage::Substates;
 use hyperscale_types::network::request::CellRange;
 use hyperscale_types::{
@@ -133,14 +133,15 @@ impl Executor {
         let mut by_shard: BTreeMap<ShardId, DeclaredReads> = BTreeMap::new();
         // A publish writes its own two cells and reads nobody else's, so
         // its fee vault below is the whole of what it fans out for.
-        if tx.body().call_tree().is_some() {
+        if tx.body().artifact.is_none() {
             self.declared_reads(tx, trie, held, &mut by_shard)?;
         }
         // The fee payer's vault, which the charge reads and no
         // declaration names. Added once: a payer spending its own vault
         // already named it, and asking twice buys two leaves of one
         // shard's proof and two spends of its query budget.
-        let vault = vault_key(tx.body().fee_payer, *PROTOCOL_RESOURCE);
+        let terms = terms_of(tx.body()).map_err(|error| error.to_string())?;
+        let vault = vault_key(terms.fee_payer, *PROTOCOL_RESOURCE);
         let shard = trie.shard_for_prefix(vault.owner);
         if !held.contains(&shard) {
             let asks = by_shard.entry(shard).or_default();
@@ -575,17 +576,21 @@ impl Executor {
         inputs: &PreviewInputs,
     ) -> PreviewReport {
         let vm = tx.body();
-        // Derived rather than read off `fee_vault`, which panics on an
-        // envelope derivation refuses — the exact envelope a preview
+        // Read off the tree rather than off `fee_vault`, which panics on
+        // an envelope derivation refuses — the exact envelope a preview
         // exists to give an answer about.
-        let vault = vault_key(vm.fee_payer, *PROTOCOL_RESOURCE);
+        let terms = match terms_of(vm) {
+            Ok(terms) => terms,
+            Err(error) => return PreviewReport::refused(error.to_string()),
+        };
+        let vault = vault_key(terms.fee_payer, *PROTOCOL_RESOURCE);
         // Local cells and fetched ones through the one call: which store
         // answered is the routing's business and nothing below it.
         let cells = PreviewCells {
             local: snapshot,
             holds: &inputs.holds,
         };
-        if let Some(artifact) = vm.artifact() {
+        if let Some(artifact) = &vm.artifact {
             // The report says what the charge would leave, which is a
             // reading of the payer's vault. A node that cannot answer
             // for it names the shard rather than reporting a cell it
@@ -598,7 +603,7 @@ impl Executor {
             }
             let payer = PayerFee {
                 vault,
-                max_fee: vm.max_fee,
+                max_fee: terms.max_fee,
                 // A publish is priced through the table like anything
                 // else: its artifact is retention and its two point
                 // writes are writes, all of it in the declared vector.
@@ -623,12 +628,12 @@ impl Executor {
             };
         let payer = PayerFee {
             vault,
-            max_fee: vm.max_fee,
+            max_fee: terms.max_fee,
             // The declaration's price, read off what prepared rather
             // than derived again: the preparation above already lowered
             // the envelope, and deriving a second time would price the
             // same fold twice.
-            price: inputs.prices.price(&prepared.work, vm.priority_bp),
+            price: inputs.prices.price(&prepared.work, terms.priority_bp),
             // A preview is one envelope against one snapshot: no tick can
             // discard effects it completed, so the reserve-receipt shape
             // does not arise.

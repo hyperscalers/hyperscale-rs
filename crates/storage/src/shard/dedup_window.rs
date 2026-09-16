@@ -250,7 +250,7 @@ impl DedupWindow {
             if released.contains(&tx_hash) {
                 continue;
             }
-            let vm = tx.body();
+            let terms = tx.terms();
             let deadline = tx
                 .validity_range()
                 .end_timestamp_exclusive
@@ -260,8 +260,8 @@ impl DedupWindow {
             }
             self.fee_holds.push(FeeHold {
                 tx_hash,
-                payer: vm.fee_payer,
-                max_fee: vm.max_fee,
+                payer: terms.fee_payer,
+                max_fee: terms.max_fee,
                 deadline,
             });
         }

@@ -2562,6 +2562,7 @@ dependencies = [
  "clap",
  "hdrhistogram",
  "hyperscale-core",
+ "hyperscale-effects-bridge",
  "hyperscale-mempool",
  "hyperscale-network-memory",
  "hyperscale-node",

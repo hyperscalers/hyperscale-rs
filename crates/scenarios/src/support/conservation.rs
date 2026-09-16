@@ -264,11 +264,7 @@ impl Charges {
                 if self.finalized_aborts.borrow().contains(&hash) {
                     return true;
                 }
-                let payer = self.owed[&hash]
-                    .try_body()
-                    .expect("a scenario fixture decodes")
-                    .fee_payer
-                    .address();
+                let payer = self.owed[&hash].fee_payer();
                 let finalized =
                     covering_chains(payer).any(|shard| c.chain_fate(shard, hash).1.is_some());
                 if finalized {

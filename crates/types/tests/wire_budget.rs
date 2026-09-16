@@ -12,10 +12,9 @@ use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass, Anchor,
     BlockHeight, CommittedAt, Deadline, Hash, Inclusion, LocalKey, MAX_ARTIFACT_BYTES,
-    MAX_ENVELOPE_BYTES, MAX_MESSAGE_LEN, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS,
-    MAX_UNSETTLED_PER_BLOCK, NetworkId, PrincipalAddr, ROUTE_PREFIX_BYTES, RoutePrefix, SchemeId,
-    ShardId, StateClaim, StateRoot, SubintentSig, SubstateKey, TransactionBody,
-    TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp,
+    MAX_ENVELOPE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS, MAX_UNSETTLED_PER_BLOCK,
+    ROUTE_PREFIX_BYTES, RoutePrefix, SchemeId, ShardId, StateClaim, StateRoot, SubintentSig,
+    SubstateKey, TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp,
     evidence_admits_block,
 };
 
@@ -28,11 +27,12 @@ use hyperscale_types::{
 /// to prevent, and nothing else ties the figure to what HBOR writes.
 #[test]
 fn a_maximal_envelope_encodes_under_the_bound_it_is_budgeted_at() {
-    use hyperscale_vm_types::{MAX_KEY_BYTES, MAX_MANIFEST_NODES, MAX_SIG_BYTES};
+    use hyperscale_vm_types::{MAX_CALL_BYTES, MAX_KEY_BYTES, MAX_SIG_BYTES};
 
     let widest = SchemeId::ML_DSA_65;
     let vm = TransactionEnvelope {
-        body: TransactionBody::Publish(vec![0xAB; MAX_ARTIFACT_BYTES]),
+        tree: vec![0xAB; MAX_CALL_BYTES],
+        artifact: Some(vec![0xAB; MAX_ARTIFACT_BYTES]),
         subintent_sigs: (0..MAX_SUBINTENTS)
             .map(|_| SubintentSig {
                 scheme: widest,
@@ -40,14 +40,6 @@ fn a_maximal_envelope_encodes_under_the_bound_it_is_budgeted_at() {
                 signature: vec![0x22; MAX_SIG_BYTES],
             })
             .collect(),
-        fee_payer: PrincipalAddr::new([0x33; 31]),
-        max_fee: u128::MAX,
-        gas_limits: vec![u64::MAX; MAX_MANIFEST_NODES],
-        priority_bp: u32::MAX,
-        validity_start_ms: u64::MAX / 2,
-        validity_end_ms: u64::MAX / 2,
-        message: vec![0x44; MAX_MESSAGE_LEN],
-        network: NetworkId(u8::MAX),
         signer_scheme: widest,
         signer: vec![0x55; MAX_KEY_BYTES],
         signature: vec![0x66; MAX_SIG_BYTES],

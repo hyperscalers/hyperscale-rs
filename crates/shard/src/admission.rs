@@ -287,7 +287,7 @@ impl<'p> Section for TransactionsSection<'p> {
             ));
         }
         let trie = ctx.snapshot.shard_trie();
-        let payer_shard = trie.shard_for_prefix(tx.body().fee_payer);
+        let payer_shard = trie.shard_for_prefix(tx.fee_payer());
         if !ctx.snapshot.is_single_shard_transaction(tx)
             && payer_shard != ctx.local_shard
             && !fold
@@ -325,10 +325,10 @@ impl<'p> Section for TransactionsSection<'p> {
         // transaction on one shard and refuse it on another.
         if payer_shard == ctx.local_shard {
             let price = tx.price(&ctx.snapshot.prices());
-            if price > tx.body().max_fee {
+            if price > tx.terms().max_fee {
                 return Err(format!(
                     "transaction {tx_hash} signs a ceiling of {} and prices at {price}",
-                    tx.body().max_fee
+                    tx.terms().max_fee
                 ));
             }
         }

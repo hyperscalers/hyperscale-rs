@@ -521,7 +521,7 @@ fn payer_covers_fee_ceiling<S: SubstateStore>(
     local_shard: ShardId,
     storage: Option<&S>,
 ) -> bool {
-    let vm = tx.body();
+    let terms = tx.terms();
     let vault = tx.fee_vault();
     if topology.shard_trie().shard_for_prefix(vault.owner) != local_shard {
         return true;
@@ -535,11 +535,11 @@ fn payer_covers_fee_ceiling<S: SubstateStore>(
     let balance = cell
         .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
         .map_or(0u128, u128::from_le_bytes);
-    if balance < vm.max_fee {
+    if balance < terms.max_fee {
         tracing::debug!(
             tx_hash = ?tx.hash(),
             balance,
-            max_fee = vm.max_fee,
+            max_fee = terms.max_fee,
             "Refusing admission: payer cannot cover the signed fee ceiling"
         );
         return false;

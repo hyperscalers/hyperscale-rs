@@ -334,7 +334,7 @@ impl Classified {
     /// As [`Self::local_work`].
     #[must_use]
     pub fn local_price(&self, tx: &Transaction, shard: ShardId, table: &PriceTable) -> Quanta {
-        table.price(&self.local_work(tx, shard), tx.body().priority_bp)
+        table.price(&self.local_work(tx, shard), tx.terms().priority_bp)
     }
 
     /// The value edges that cross, in `(producer, output)` order.
