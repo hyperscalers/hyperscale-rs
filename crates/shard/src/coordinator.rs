@@ -149,6 +149,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_metrics::record_halt_recovery_offer_refused;
 use hyperscale_storage::{CommittedProvisions, RecoveredState};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
@@ -422,8 +423,9 @@ pub struct ShardCoordinator {
     /// across a halt recovery — read off the timeouts
     /// [`Self::harvest_retained_tip`] harvests, which is the only signal
     /// carrying the halted tip to an incomer seated at the beacon's
-    /// frontier. Gates this member's proposals until its own `high_qc`
-    /// reaches it; see [`Self::recovery_behind_retained_tip`].
+    /// frontier. Gates this member's proposals until the harvest sync
+    /// delivers that tip and its QC becomes `high_qc`; see
+    /// [`Self::recovery_behind_retained_tip`].
     retained_tip_offered: Option<BlockHeight>,
 
     /// When this member first stood seated under a pending halt recovery
@@ -2174,8 +2176,8 @@ impl ShardCoordinator {
     /// The offer is the retained ex-members' own timeouts, which
     /// [`Self::harvest_retained_tip`] already reads for exactly this
     /// purpose. Holding until `high_qc` reaches the highest one seen
-    /// terminates on its own: the harvest drives the fetch that supplies
-    /// the block, and adopting the carried QC closes the gap. A shard
+    /// terminates on its own: the harvest syncs to the offered tip, and
+    /// the tip arrives with the QC over it, which its apply adopts. A shard
     /// whose retained cohort offers nothing — no suffix above the
     /// frontier, or no ex-member left to answer — is never held, which is
     /// the case where extending the frontier is the only move there is.
@@ -6078,12 +6080,24 @@ impl ShardCoordinator {
     /// with no QC past it, and the halted chain gossips nothing, so the
     /// old committee's timeout retransmissions — resolved onto the fresh
     /// committee by the recovery bridge — are the only signal carrying the
-    /// certified frontier. The share itself is never tallied. The carried
-    /// QC is adopted only if it verifies against the committee that signed
-    /// it (its block's header in hand); otherwise it serves as a fetch
-    /// target — sync admits the real certified blocks through the normal
-    /// verified pipeline, so a fabricated height costs a bounded fetch
-    /// round, never state.
+    /// certified frontier. The share itself is never tallied, and the
+    /// carried QC is never adopted from the timeout: its block is unknown
+    /// here, so nothing can resolve the committee that signed it. The
+    /// carried height is a fetch target instead — a sync to the tip
+    /// itself, which the retained members serve certified but
+    /// uncommitted, and which arrives with the QC over it. Sync admits
+    /// the real certified blocks through the normal verified pipeline, so
+    /// a fabricated height costs a bounded fetch round, never state.
+    ///
+    /// The offer is refused once this member's `high_qc` was formed by
+    /// the fresh committee itself, which shows as a QC whose timestamp no
+    /// longer rides the recovery bridge. From then on the fresh chain has
+    /// extended the anchor or the harvested suffix on its own authority,
+    /// and a retained tip arriving later is a sibling of what it built —
+    /// the halted chain's tail, abandoned the way any uncommitted block is
+    /// once the pacemaker moved past it. Before that, while `high_qc` is
+    /// the anchor or a harvested suffix QC, a higher offer is still
+    /// harvested.
     ///
     /// The harvest is halt-only. A fork-caused recovery's retained
     /// committee provably committed two branches, so no retained tip is
@@ -6121,33 +6135,34 @@ impl ShardCoordinator {
             );
             return Some(Vec::new());
         }
-        info!(
+        if let Some(latest) = self.latest_qc.as_ref()
+            && !self.recovery_bridging(topology_schedule, latest.weighted_timestamp())
+        {
+            warn!(
+                validator = ?self.me,
+                voter = ?timeout.voter(),
+                carried_height = carried.height().inner(),
+                high_qc_height = latest.height().inner(),
+                "Refusing a retained ex-member's tip; the fresh chain has certified past the anchor"
+            );
+            record_halt_recovery_offer_refused();
+            return Some(Vec::new());
+        }
+        debug!(
             validator = ?self.me,
             voter = ?timeout.voter(),
             carried_height = carried.height().inner(),
             committed_height = self.committed_height.inner(),
             "Harvesting the halted tip from a retained ex-member's timeout"
         );
-        // Remember what was offered even when the QC cannot be adopted
-        // yet: the block it certifies is still being fetched, and until
-        // this member's own `high_qc` reaches it, proposing would build
-        // over heights the halted chain already holds.
+        // Remember what was offered: until the tip's own QC becomes this
+        // member's `high_qc`, proposing would build over heights the
+        // halted chain already holds.
         self.retained_tip_offered = Some(
             self.retained_tip_offered
                 .map_or_else(|| carried.height(), |seen| seen.max(carried.height())),
         );
-        if carried.round() > self.high_qc_round()
-            && let Some(verified) = self.verify_qc_sync(topology_schedule, carried)
-        {
-            return Some(self.try_adopt_verified_qc(&verified));
-        }
-        // Sync to the committable prefix, not the certified tip: the tip
-        // block commits only under a successor QC, and on a halted chain
-        // none exists yet — a sync targeted at it never completes, and a
-        // committee parked in sync mode never drives the view changes
-        // that would produce that successor.
-        let prefix = BlockHeight::new(carried.height().inner().saturating_sub(1));
-        Some(self.start_block_sync(prefix))
+        Some(self.start_block_sync(carried.height()))
     }
 
     /// Tally a verified timeout: amplify at f+1 (Bracha), advance at 2f+1.
@@ -9625,6 +9640,129 @@ mod tests {
             state.anchor_qc.is_some(),
             "an offered tip keeps the anchor buffered"
         );
+    }
+
+    /// A retained timeout carrying a QC over `height`, from validator 9.
+    fn retained_offer_of(height: BlockHeight) -> Timeout {
+        let carried = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"retained-tip")),
+            ShardId::ROOT,
+            height,
+            BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
+            Round::new(1),
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        Timeout::new(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            Round::new(2),
+            carried,
+            ValidatorId::new(9),
+            &BlsSigner::generate(),
+        )
+        .expect("sign")
+    }
+
+    /// The harvest syncs to the offered tip itself, not the block below
+    /// it: the retained members serve the tip certified but uncommitted,
+    /// and it arrives with the QC that lifts the proposal hold.
+    #[test]
+    fn the_harvest_targets_the_offered_tip() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+
+        let actions =
+            state.on_unverified_timeout(&schedule, &retained_offer_of(BlockHeight::new(5)));
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::StartBlockSync { target } if *target == BlockHeight::new(5)
+        )));
+        assert_eq!(state.retained_tip_offered, Some(BlockHeight::new(5)));
+        assert!(state.recovery_behind_retained_tip());
+    }
+
+    /// The synced tip's own QC becomes `high_qc` on apply, which is what
+    /// ends the hold: no verification of the timeout's carried QC is
+    /// needed, and none is attempted.
+    #[test]
+    fn a_synced_tip_adopts_its_own_qc_and_lifts_the_hold() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(4);
+
+        let _ = state.on_unverified_timeout(&schedule, &retained_offer_of(BlockHeight::new(5)));
+        assert!(state.recovery_behind_retained_tip());
+        assert!(state.is_block_syncing());
+
+        let (tip, _) = deliver_synced(
+            &mut state,
+            &schedule,
+            block_with_parent_qc_ts(BlockHeight::new(5), 100),
+        );
+        let qc = make_test_qc(tip, BlockHeight::new(5));
+        let _ = state.on_qc_signature_verified(&schedule, tip, Ok(qc));
+
+        assert_eq!(
+            state.latest_qc.as_ref().map(|qc| qc.height()),
+            Some(BlockHeight::new(5))
+        );
+        assert!(!state.recovery_behind_retained_tip());
+    }
+
+    /// Once `high_qc` is a QC the fresh committee formed, a retained
+    /// offer names the halted chain's abandoned tail and is refused; while
+    /// `high_qc` still rides the bridge, the offer is harvested.
+    #[test]
+    fn a_retained_offer_is_refused_once_the_fresh_chain_certified() {
+        let (mut state, schedule) = make_test_state();
+        // Seated at epoch 2 with one-second windows: the bridge window
+        // opens at 3000ms, and a QC stamped past it is the fresh
+        // committee's own.
+        let head = with_pending_halt_recovery(&schedule, vec![ValidatorId::new(9)], Epoch::new(2));
+        let schedule = TopologySchedule::new(1_000, Epoch::new(3), head);
+        state.set_time(LocalTimestamp::from_millis(5_000));
+        let high_qc_stamped_at = |ms: u64| {
+            // SAFETY: synthetic test fixture, no real signature.
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+                BlockHash::from_raw(Hash::from_bytes(b"fresh-block")),
+                ShardId::ROOT,
+                BlockHeight::new(2),
+                BlockHash::ZERO,
+                Round::new(3),
+                SignerBitfield::new(4),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(ms),
+            ))
+        };
+
+        state.latest_qc = Some(high_qc_stamped_at(3_500));
+        let refused = state
+            .harvest_retained_tip(&schedule, &retained_offer_of(BlockHeight::new(5)))
+            .expect("a retained voter is harvested, not dropped as an outsider");
+        assert!(refused.is_empty(), "got {refused:?}");
+        assert_eq!(state.retained_tip_offered, None);
+
+        state.latest_qc = Some(high_qc_stamped_at(0));
+        let harvested = state
+            .harvest_retained_tip(&schedule, &retained_offer_of(BlockHeight::new(5)))
+            .expect("retained voter");
+        assert!(harvested.iter().any(|a| matches!(
+            a,
+            Action::StartBlockSync { target } if *target == BlockHeight::new(5)
+        )));
+        assert_eq!(state.retained_tip_offered, Some(BlockHeight::new(5)));
     }
 
     /// A sync-delivered certified block above the fork recovery's attested

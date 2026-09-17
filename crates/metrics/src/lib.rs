@@ -314,6 +314,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record a sync range round-trip started (network request emitted).
     fn record_sync_round_started(&self, kind: &str) {}
 
+    /// Record a retained ex-member's tip offer refused by a halt
+    /// recovery's fresh committee because the fresh chain had already
+    /// certified past the anchor.
+    fn record_halt_recovery_offer_refused(&self) {}
+
     /// Record a sync range round-trip that completed successfully.
     fn record_sync_round_completed(&self, kind: &str) {}
 
@@ -819,6 +824,12 @@ pub fn record_sync_response_error(kind: &str, error_type: &str) {
 #[inline]
 pub fn record_sync_round_started(kind: &str) {
     recorder().record_sync_round_started(kind);
+}
+
+/// Record a retained tip offer refused after the fresh chain moved on.
+#[inline]
+pub fn record_halt_recovery_offer_refused() {
+    recorder().record_halt_recovery_offer_refused();
 }
 
 /// Record a sync range round-trip completed successfully.

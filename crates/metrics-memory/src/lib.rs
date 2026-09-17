@@ -320,6 +320,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("sync_round_started", Some(kind), 1);
     }
 
+    fn record_halt_recovery_offer_refused(&self) {
+        self.inc("halt_recovery_offers_refused", None, 1);
+    }
+
     fn record_sync_round_completed(&self, kind: &str) {
         self.inc("sync_round_completed", Some(kind), 1);
     }
