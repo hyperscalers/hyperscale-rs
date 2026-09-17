@@ -1585,10 +1585,6 @@ fn a_swap_committed_after_the_venues_cut_is_disposed_once_sim() {
     cluster.run_faultable(a_swap_committed_after_the_venues_cut_is_disposed_once);
 }
 
-// TEMPSWEEP
-// TEMPSWEEP
-// TEMPSWEEP
-// TEMPSWEEP
 #[test]
 fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
     let mut cluster = departing_route_cluster();
