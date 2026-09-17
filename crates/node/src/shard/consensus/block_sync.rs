@@ -57,6 +57,30 @@ where
         self.process_block_sync_outputs(outputs);
     }
 
+    /// Handle `Action::SyncBlockApplied`: the height is in chain state
+    /// with its commit pending. The FSM holds it out of the window and
+    /// may report the sync complete.
+    pub(crate) fn process_sync_block_applied(&mut self, height: BlockHeight) {
+        let outputs = self
+            .io
+            .consensus
+            .block_sync
+            .handle(BlockSyncInput::Applied { scope: (), height });
+        self.process_block_sync_outputs(outputs);
+    }
+
+    /// Handle `Action::ReopenSyncHeight`: the block applied at `height`
+    /// has a certified sibling that is committing instead. The FSM
+    /// fetches the height again.
+    pub(crate) fn process_reopen_sync_height(&mut self, height: BlockHeight) {
+        let outputs = self
+            .io
+            .consensus
+            .block_sync
+            .handle(BlockSyncInput::Reopen { scope: (), height });
+        self.process_block_sync_outputs(outputs);
+    }
+
     // ─── step() handlers ────────────────────────────────────────────────
 
     /// Handle a sync block response: rehydrate the elided block against
