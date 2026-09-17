@@ -270,10 +270,12 @@ struct ScopeState<K: SyncKey> {
     /// Number of in-flight fetch ranges for this scope. Bounded by
     /// `max_concurrent_per_scope`.
     in_flight_ranges: usize,
-    /// Consecutive not-found answers about the height just above
-    /// `committed`, with nothing delivered in between. Counted here
-    /// rather than on the height's own backoff, which resets every time
-    /// the height is re-dispatched.
+    /// Consecutive not-found answers about the height just above the
+    /// frontier, with that height never delivered in between. Counted
+    /// here rather than on the height's own backoff, which resets every
+    /// time the height is re-dispatched. Deliveries of higher heights do
+    /// not reset it: a window fetches many heights at once, and a peer
+    /// serving the ones above the gap says nothing about the gap.
     not_found_streak: u32,
 }
 
@@ -604,8 +606,8 @@ impl<B: SyncBinding> Sync<B> {
             }
         }
 
-        if !delivered.is_empty() {
-            // Something is there after all.
+        if delivered.contains(&state.frontier().offset(1)) {
+            // The height the streak counts is there after all.
             state.not_found_streak = 0;
         }
         for offset in 0..count {
@@ -661,6 +663,7 @@ impl<B: SyncBinding> Sync<B> {
         };
         state.in_flight_ranges = state.in_flight_ranges.saturating_sub(1);
         let mut unfounded = false;
+        let above_frontier = state.frontier().offset(1);
         for offset in 0..count {
             let h = from.offset(offset);
             if state.in_flight.remove(&h) && h <= state.target && h > state.committed {
@@ -683,11 +686,11 @@ impl<B: SyncBinding> Sync<B> {
                     }
                     // A peer that answered and does not hold the height.
                     // Backed off the same way, and counted: sustained at
-                    // the height just above `committed`, it says the
+                    // the height just above the frontier, it says the
                     // target was never there to reach.
                     FetchFailureKind::NotFound => {
                         state.deferred.entry(h).or_default().advance_round(now);
-                        if h == state.committed.offset(1) {
+                        if h == above_frontier {
                             state.not_found_streak = state.not_found_streak.saturating_add(1);
                             unfounded = state.not_found_streak >= NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED;
                         }
@@ -884,23 +887,28 @@ impl<B: SyncBinding> Sync<B> {
     // Window + Emission
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Queue heights `[committed+1, min(committed+window_size, target)]`.
-    /// Idempotent — already-tracked heights are skipped.
+    /// Queue heights `[frontier+1, min(frontier+window_size, target)]`.
+    /// Idempotent — already-tracked heights are skipped. Anchored at the
+    /// frontier rather than `committed`: applied heights are contiguous
+    /// above `committed`, and a window anchored below them would hold
+    /// nothing but applied heights once the applied run outgrew it,
+    /// starving the fetch of the block that ends the run. A height
+    /// reopened below the frontier enters through `queue_height`.
     fn queue_window(state: &mut ScopeState<B::Key>, config: &SyncConfig) {
-        if state.committed >= state.target {
+        let frontier = state.frontier();
+        if frontier >= state.target {
             return;
         }
-        let committed = state.committed.as_u64();
+        let base = frontier.as_u64();
         let window_end = if config.window_size == 0 {
             state.target.as_u64()
         } else {
-            (committed + config.window_size).min(state.target.as_u64())
+            (base + config.window_size).min(state.target.as_u64())
         };
-        // Queue `(committed, window_end]` via forward offsets so the key
+        // Queue `(frontier, window_end]` via forward offsets so the key
         // type stays opaque (no construction from a raw ordinal).
-        let base = state.committed;
-        for i in 1..=window_end.saturating_sub(committed) {
-            state.queue_height(base.offset(i));
+        for i in 1..=window_end.saturating_sub(base) {
+            state.queue_height(frontier.offset(i));
         }
     }
 
@@ -1910,6 +1918,189 @@ mod tests {
             SyncOutput::Complete { height, .. } => Some(height.inner()),
             SyncOutput::Fetch { .. } => None,
         })
+    }
+
+    /// The window anchors at the frontier: once the applied run outgrows
+    /// the window, the height above the run is still fetched.
+    #[test]
+    fn an_applied_run_longer_than_the_window_does_not_starve_the_fetch() {
+        let mut s: Sync<UnitBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 2,
+            max_concurrent_per_scope: 4,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(10),
+        });
+        let mut fetched = Vec::new();
+        for h in 1..=3 {
+            let outputs = s.handle(SyncInput::Applied {
+                scope: (),
+                height: BlockHeight::new(h),
+            });
+            fetched.extend(fetched_from(&outputs));
+        }
+        let outputs = s.handle(SyncInput::Tick {
+            now: LocalTimestamp::from_millis(1),
+        });
+        let on_tick = fetched_from(&outputs);
+        fetched.extend(on_tick.iter().copied());
+        assert!(
+            fetched.contains(&4),
+            "the height above the applied run must be fetched; got {fetched:?}"
+        );
+        assert!(
+            !on_tick.iter().any(|h| *h <= 3),
+            "an applied height is never re-fetched; got {on_tick:?}"
+        );
+    }
+
+    /// A reopened height sits below the frontier, outside the window: it
+    /// is fetched on the reopen and again after a failed attempt.
+    #[test]
+    fn a_reopened_height_below_the_frontier_is_still_fetched() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(5),
+        });
+        for h in 1..=3 {
+            let _ = s.handle(SyncInput::FetchSucceeded {
+                scope: (),
+                from: BlockHeight::new(h),
+                count: 1,
+                delivered_heights: vec![BlockHeight::new(h)],
+                now: LocalTimestamp::ZERO,
+            });
+            let _ = s.handle(SyncInput::Applied {
+                scope: (),
+                height: BlockHeight::new(h),
+            });
+        }
+        let outputs = s.handle(SyncInput::Reopen {
+            scope: (),
+            height: BlockHeight::new(2),
+        });
+        assert!(
+            fetched_from(&outputs).contains(&2),
+            "got {:?}",
+            fetched_from(&outputs)
+        );
+
+        let _ = s.handle(SyncInput::FetchFailed {
+            scope: (),
+            from: BlockHeight::new(2),
+            count: 1,
+            kind: FetchFailureKind::Transport,
+            now: LocalTimestamp::ZERO,
+        });
+        let outputs = s.handle(SyncInput::Tick {
+            now: LocalTimestamp::from_millis(DEFERRAL_MAX_MS * 2),
+        });
+        assert!(
+            fetched_from(&outputs).contains(&2),
+            "got {:?}",
+            fetched_from(&outputs)
+        );
+    }
+
+    /// The unfounded verdict counts not-founds at the height above the
+    /// applied frontier, not above `committed`: a run applied but not
+    /// yet committed moves the question up with it.
+    #[test]
+    fn not_found_above_the_applied_frontier_counts_toward_unfounded() {
+        let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 1,
+            max_concurrent_per_scope: 1,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(9_000),
+        });
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: 1,
+            from: BlockHeight::new(1),
+            count: 1,
+            delivered_heights: vec![BlockHeight::new(1)],
+            now: LocalTimestamp::ZERO,
+        });
+        let _ = s.handle(SyncInput::Applied {
+            scope: 1,
+            height: BlockHeight::new(1),
+        });
+        let mut now = 0u64;
+        let mut outputs = Vec::new();
+        for _ in 0..NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED {
+            outputs = s.handle(SyncInput::FetchFailed {
+                scope: 1,
+                from: BlockHeight::new(2),
+                count: 1,
+                kind: FetchFailureKind::NotFound,
+                now: LocalTimestamp::from_millis(now),
+            });
+            now += DEFERRAL_MAX_MS * 2;
+            let _ = s.handle(SyncInput::Tick {
+                now: LocalTimestamp::from_millis(now),
+            });
+        }
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::Complete { scope: 1, .. })),
+            "the scope must complete as unfounded"
+        );
+        let st = s.scopes.get(&1).unwrap();
+        assert_eq!(
+            st.target,
+            BlockHeight::new(1),
+            "the target settles at the frontier"
+        );
+    }
+
+    /// A window fetches many heights at once; a peer serving the ones
+    /// above the gap says nothing about the gap, so those deliveries do
+    /// not reset the streak.
+    #[test]
+    fn deliveries_above_the_missing_height_do_not_reset_the_streak() {
+        let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 3,
+            max_concurrent_per_scope: 3,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(9_000),
+        });
+        let mut now = 0u64;
+        let mut outputs = Vec::new();
+        for _ in 0..NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED {
+            let _ = s.handle(SyncInput::FetchSucceeded {
+                scope: 1,
+                from: BlockHeight::new(3),
+                count: 1,
+                delivered_heights: vec![BlockHeight::new(3)],
+                now: LocalTimestamp::from_millis(now),
+            });
+            outputs = s.handle(SyncInput::FetchFailed {
+                scope: 1,
+                from: BlockHeight::new(1),
+                count: 1,
+                kind: FetchFailureKind::NotFound,
+                now: LocalTimestamp::from_millis(now),
+            });
+            now += DEFERRAL_MAX_MS * 2;
+            let _ = s.handle(SyncInput::Tick {
+                now: LocalTimestamp::from_millis(now),
+            });
+        }
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::Complete { scope: 1, .. })),
+            "the scope must complete as unfounded"
+        );
     }
 
     #[test]
