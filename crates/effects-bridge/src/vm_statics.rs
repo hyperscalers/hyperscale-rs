@@ -1224,8 +1224,8 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg, GraphNode, Hash32,
-        Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash, ManifestGraph, Member,
+        Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg, GraphNode,
+        Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash, ManifestGraph, Member,
         MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket, StoredRule, ValueRef,
         child_key, never, nullifier_expiry_ms, nullifier_key, package_slot,
     };
@@ -1975,9 +1975,10 @@ mod tests {
     fn the_stored_rule_governs_the_payer_binding() {
         let statics = statics();
         let stored = |rule: &StoredRule| {
-            RuleBytes::try_from(rule)
-                .expect("a rule within the vocabulary caps")
-                .in_cell()
+            Authority::primary_only(
+                RuleBytes::try_from(rule).expect("a rule within the vocabulary caps"),
+            )
+            .in_cell()
         };
 
         let admits = |cell: Option<&[u8]>, key: PrincipalAddr| {
