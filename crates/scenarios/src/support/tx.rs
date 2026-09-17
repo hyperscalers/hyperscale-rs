@@ -1302,10 +1302,9 @@ pub(crate) fn build_instantiate_tx(
     for address in addresses {
         instantiate(&mut root, address, ()).expect("a derivable lottery answers its seal");
     }
-    for meta in lotteries {
-        root.register_instance(meta.clone());
-    }
-    let tree = root.build().expect("the intent declares no hole");
+    let tree = root
+        .build_presenting(lotteries.to_vec(), Vec::new())
+        .expect("the intent declares no hole");
 
     Transaction::new(client.sign_tree(
         &tree,

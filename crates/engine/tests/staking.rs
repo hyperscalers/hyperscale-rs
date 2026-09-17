@@ -485,8 +485,9 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     // which of those nodes exist are the package's own declaration to
     // say.
     instantiate(&mut root, pool, ()).expect("a derivable pool answers its seal");
-    root.register_instance(meta);
-    let tree = root.build().expect("the intent declares no hole");
+    let tree = root
+        .build_presenting(vec![meta], Vec::new())
+        .expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, &[&key], terms(1_000)))
 }
 
