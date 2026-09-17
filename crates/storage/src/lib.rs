@@ -53,7 +53,7 @@ pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
     BaseReadCache, ChainEntry, PendingChain, SubstateView, TerminalWindow,
 };
-pub use shard::recovered_state::RecoveredState;
+pub use shard::recovered_state::{RECENT_HEADER_REPLAY, RecoveredState, recent_headers};
 pub use shard::retention::{Retired, retire_dated};
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{

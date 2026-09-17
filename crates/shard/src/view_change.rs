@@ -95,20 +95,32 @@ impl ViewChangeController {
         }
     }
 
+    /// Start the round clock as [`Self::new`] does, with the delay estimate
+    /// seeded from `recent_headers`: the committed headers just below the
+    /// tip, ascending, that the store kept across the restart.
+    pub(crate) fn recovered(initial_view: Round, recent_headers: &[BlockHeader]) -> Self {
+        let mut controller = Self::new(initial_view);
+        for header in recent_headers {
+            controller.delay.replay(Self::sample(header));
+        }
+        controller
+    }
+
     /// Feed a committed header, in chain order, to the delay estimate.
     /// `committee_len` is the size of the committee that certified it.
     pub(crate) fn observe_commit(&mut self, header: &BlockHeader, committee_len: usize) {
+        self.delay.observe(Self::sample(header), committee_len);
+    }
+
+    fn sample(header: &BlockHeader) -> CommittedSample {
         let parent_qc = header.parent_qc();
-        self.delay.observe(
-            CommittedSample {
-                round: header.round(),
-                timestamp: header.timestamp(),
-                is_fallback: header.is_fallback(),
-                parent_qc_round: parent_qc.round(),
-                parent_qc_weighted_timestamp: parent_qc.weighted_timestamp(),
-            },
-            committee_len,
-        );
+        CommittedSample {
+            round: header.round(),
+            timestamp: header.timestamp(),
+            is_fallback: header.is_fallback(),
+            parent_qc_round: parent_qc.round(),
+            parent_qc_weighted_timestamp: parent_qc.weighted_timestamp(),
+        }
     }
 
     /// The chain-derived delay estimate, once a full rotation has committed.

@@ -16,7 +16,7 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
     BoundaryStore, DedupWindow, GenesisCommit, ImportProgress, RecoveredState,
-    SafeVoteRegisterStore, SubstateStore, Substates, replay_window,
+    SafeVoteRegisterStore, SubstateStore, Substates, recent_headers, replay_window,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, ShardId,
@@ -212,6 +212,7 @@ impl SimShardStorage {
             latest_qc,
             anchor_qc: None,
             committed_tip,
+            recent_headers: recent_headers(self, committed_height),
             committed_block_anchor_wt,
             committed_committee_anchor_wt,
             jmt_root: Some(self.state_root()),

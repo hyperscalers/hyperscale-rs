@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{
-    BoundaryStore, DedupWindow, RecoveredState, SafeVoteRegisterStore, SubstateStore, replay_window,
+    BoundaryStore, DedupWindow, RecoveredState, SafeVoteRegisterStore, SubstateStore,
+    recent_headers, replay_window,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, CommittedTip, Hash,
@@ -101,6 +102,7 @@ impl RocksDbShardStorage {
             latest_qc,
             anchor_qc: None,
             committed_tip: self.committed_tip(committed_height),
+            recent_headers: recent_headers(self, committed_height),
             committed_block_anchor_wt,
             committed_committee_anchor_wt: committed_height
                 .prev()

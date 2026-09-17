@@ -10,8 +10,34 @@ use hyperscale_types::{
     StateRoot, SubstateKey, ValidatorId, Verified, WeightedTimestamp,
 };
 
+use super::chain_reader::ShardChainReader;
 use super::dedup_window::DedupWindow;
 use super::unresolved::ReplayWindow;
+
+/// How many committed headers a restart replays into the delay estimate.
+///
+/// Covers one rotation of any committee up to this size; a larger
+/// committee fills the remainder from live commits.
+pub const RECENT_HEADER_REPLAY: usize = 256;
+
+/// The committed headers from up to [`RECENT_HEADER_REPLAY`] below
+/// `committed_height` through it, ascending and contiguous: the walk stops
+/// at the first height the store no longer holds.
+pub fn recent_headers<R: ShardChainReader + ?Sized>(
+    reader: &R,
+    committed_height: BlockHeight,
+) -> Vec<BlockHeader> {
+    let floor = committed_height
+        .inner()
+        .saturating_sub(RECENT_HEADER_REPLAY as u64);
+    let mut headers: Vec<BlockHeader> = (floor..=committed_height.inner())
+        .rev()
+        .map_while(|height| reader.get_certified_header(BlockHeight::new(height)))
+        .map(|certified| certified.header().clone())
+        .collect();
+    headers.reverse();
+    headers
+}
 
 /// State recovered from storage on startup.
 ///
@@ -190,6 +216,12 @@ pub struct RecoveredState {
     /// Empty on a fresh start and after snap-sync, where the store
     /// carries no signing history.
     pub voted_blocks: Vec<Arc<Block>>,
+
+    /// The committed headers just below the tip, ascending, that seed the
+    /// round timer's delay estimate so a restart does not spend a rotation
+    /// on the default timeout. Empty when the store holds no history below
+    /// the tip, as after a snap-sync.
+    pub recent_headers: Vec<BlockHeader>,
 }
 
 impl RecoveredState {
@@ -259,6 +291,7 @@ impl RecoveredState {
             safe_vote_registers: BTreeMap::new(),
             escrow_records: Vec::new(),
             voted_blocks: Vec::new(),
+            recent_headers: Vec::new(),
         }
     }
 
