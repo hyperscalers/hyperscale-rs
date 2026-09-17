@@ -180,8 +180,8 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
 ///
 /// Panics if the shard fails to halt, the beacon or the sibling shard
 /// stops committing through the halt, the recovery never fires, the shard
-/// fails to resume under its fresh committee, or the recovery record
-/// never clears.
+/// fails to resume under its fresh committee, the recovery record never
+/// clears, or a redrawn committee rather than the first one clears it.
 pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) {
     let (left, right) = ShardId::ROOT.children();
     split_lifecycle(c);
@@ -218,8 +218,9 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 ///
 /// # Panics
 ///
-/// Panics if the halt or recovery misses a lifecycle budget, an in-flight
-/// tick hangs, the chains disagree on any probe's fate, or the
+/// Panics if the halt or recovery misses a lifecycle budget, a redrawn
+/// committee rather than the first one completes the recovery, an
+/// in-flight tick hangs, the chains disagree on any probe's fate, or the
 /// post-recovery transfers fail to settle.
 pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     let (halted, survivor) = ShardId::ROOT.children();
@@ -871,6 +872,10 @@ fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
         recovered,
         "the beacon must flag the halted shard and seat a fresh committee",
     );
+    let seated_at = c
+        .beacon_state()
+        .and_then(|state| state.pending_recoveries.get(&shard).map(|r| r.rotated_at))
+        .expect("the pending recovery names its seating epoch");
     // Only the shard halted: the beacon and the sibling kept committing.
     let epoch_now = beacon_epoch(c).expect("a committed beacon epoch").inner();
     assert!(
@@ -911,6 +916,19 @@ fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
     assert!(
         cleared,
         "the shard's next boundary crossing must clear the recovery record",
+    );
+    // The committee the flag seated is the one that recovered the shard.
+    // A recovery that stalls re-flags and redraws after another full
+    // threshold, and can still clear inside the budgets above; the
+    // completed record's seating epoch tells the two apart.
+    let completed_at = c
+        .beacon_state()
+        .and_then(|state| state.completed_recoveries.get(&shard).map(|r| r.rotated_at))
+        .expect("a cleared recovery leaves its completed record");
+    assert_eq!(
+        completed_at, seated_at,
+        "the first fresh committee must complete the recovery; a later seating \
+         epoch means it stalled and the beacon redrew",
     );
 }
 
