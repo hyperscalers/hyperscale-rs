@@ -10,11 +10,13 @@ mod support;
 
 use std::time::Duration;
 
+use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::tx::{
-    CROSS_FRACTION_SENDERS, cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
-    cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
-    livelock_genesis_accounts, merge_straddler_setup, participant_sweep_genesis_accounts,
-    remote_delegator, reshape_lifecycle_accounts, split_straddler_setup,
+    CROSS_FRACTION_SENDERS, armed_split_bytes, cross_fraction_genesis_accounts,
+    cross_shard_fault_genesis_accounts, cross_shard_genesis_accounts, genesis_accounts,
+    halt_recovery_split_bytes, halt_straddler_setup, livelock_genesis_accounts, merge_split_bytes,
+    merge_straddler_setup, participant_sweep_genesis_accounts, remote_delegator,
+    reshape_lifecycle_accounts, split_straddler_setup,
 };
 use hyperscale_scenarios::{
     ScenarioConfig, a_delivery_cut_off_past_its_window_is_reclaimed,
@@ -416,22 +418,22 @@ fn merge_lifecycle_prod() {
 }
 
 /// Two cohorts of pool surplus plus the shuffle's headroom, and a grow
-/// trigger above each child of the ballasted root (~29.2 KB and ~8.1 KB)
-/// but below the root itself (~37.2 KB): one cohort grows ROOT to the two
-/// siblings, the other splits the heavier one after the vote. One
-/// validator per host (each reshape seat its own store).
+/// trigger above each child of the ballasted root but below the root
+/// itself: one cohort grows ROOT to the two siblings, the other splits
+/// the heavier one after the vote. One validator per host (each reshape
+/// seat its own store).
 ///
 /// The headroom is what makes the second split reachable at all. A split
 /// is admitted only while the pool holds a whole committee, and the
 /// shuffle draws its entrants from that same pool with no such gate —
 /// one per live shard, so two here.
-const fn straddler_config() -> ScenarioConfig {
+fn straddler_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 10,
         num_shards: 1,
-        split_bytes: 33_000,
+        split_bytes: armed_split_bytes(&GenesisPackages::protocol()),
         latency: Duration::from_millis(60),
     }
 }
@@ -467,19 +469,20 @@ fn split_straddler_ec_partition_atomic_prod() {
 }
 
 /// Four-shard topology whose `split_bytes` derives a `merge_bytes` bracketing
-/// the genesis byte skew: the survivor pair (`leaf(2,0)`/`leaf(2,1)`, the latter
-/// bulk-funded) over it, the light merging pair (`leaf(2,2)`/`leaf(2,3)`) under
-/// it, so only the merging pair auto-merges into `leaf(1,1)`. One validator per
-/// host (each reshape seat its own store), three cohorts of pool surplus to
-/// staff the two split generations the grow walks through, a paced inter-host
-/// latency so the loadless committees track wall-clock through the merge.
-const fn merge_straddler_config() -> ScenarioConfig {
+/// the genesis byte skew: the surviving pair (`leaf(2,2)`/`leaf(2,3)`, ballasted
+/// clear of the floor) over it, the light merging pair (`leaf(2,0)`/`leaf(2,1)`)
+/// under it, so only the merging pair auto-merges into `leaf(1,0)`. One
+/// validator per host (each reshape seat its own store), three cohorts of pool
+/// surplus to staff the two split generations the grow walks through, a paced
+/// inter-host latency so the loadless committees track wall-clock through the
+/// merge.
+fn merge_straddler_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 12,
         num_shards: 4,
-        split_bytes: 40_000,
+        split_bytes: merge_split_bytes(&GenesisPackages::protocol()),
         latency: Duration::from_millis(60),
     }
 }
@@ -506,13 +509,13 @@ fn merge_straddler_atomic_prod() {
 /// the simulation's `halt_recovery_config`. The halt takes `HALT_THRESHOLD`
 /// epochs to detect, so these run tens of epochs — hours at the ci epoch
 /// length, the slowest scenarios in this suite.
-const fn halt_recovery_config() -> ScenarioConfig {
+fn halt_recovery_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 10,
         num_shards: 1,
-        split_bytes: 36_000,
+        split_bytes: halt_recovery_split_bytes(),
         latency: Duration::from_millis(150),
     }
 }

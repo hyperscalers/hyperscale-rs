@@ -16,6 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId,
@@ -27,7 +28,7 @@ use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
 use crate::straddler::{
     STRADDLER_PAYMENT, cast_splitter_vote, cast_threshold_vote, isolate_ec_intake,
-    split_bytes_over, straddler_split_bytes, vote_splitter_down_to,
+    straddler_split_bytes, vote_splitter_down_to,
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
@@ -36,10 +37,10 @@ use crate::support::query::{
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_SURVIVOR, ParamBallot, STRADDLER_SPLITTER,
-    STRADDLER_SURVIVOR, ballast_to, build_param_vote_tx, build_route_tx, build_swap_tx,
-    build_transfer_tx, fixture_flash_bytes, fixture_merge_survivor_ballast, merge_train_setup,
-    pool_operator, quarter_ballast_over, split_ballast_accounts_over, split_train_setup,
-    validity_around,
+    STRADDLER_SURVIVOR, armed_split_bytes, ballast_to, build_param_vote_tx, build_route_tx,
+    build_swap_tx, build_transfer_tx, departing_target, merge_survivor_ballast_accounts,
+    merge_train_setup, pool_operator, split_ballast_accounts_for, split_train_setup,
+    validity_around, voted_split_bytes,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_merge_keeper_count, await_serves, await_split_admitted,
@@ -95,12 +96,11 @@ enum Phase {
     Draining,
 }
 
-/// The byte skew for [`a_departing_venue_clears_swaps_and_carries_on`]:
-/// the survivor holds the fixture flash, so the splitter's ballast leads
-/// that rather than the protocol's alone.
+/// The byte skew for [`a_departing_venue_clears_swaps_and_carries_on`],
+/// on a network born running the fixtures beside the protocol's own.
 #[must_use]
 pub fn departing_venue_ballast() -> Vec<(PrincipalAddr, u128)> {
-    split_ballast_accounts_over(fixture_flash_bytes())
+    split_ballast_accounts_for(&GenesisPackages::with_fixtures())
 }
 
 /// The reshape trigger [`a_departing_venue_clears_swaps_and_carries_on`]
@@ -108,7 +108,7 @@ pub fn departing_venue_ballast() -> Vec<(PrincipalAddr, u128)> {
 /// root itself, on the fixture flash's scale.
 #[must_use]
 pub fn departing_venue_split_bytes() -> u64 {
-    fixture_flash_bytes() + 30_000
+    armed_split_bytes(&GenesisPackages::with_fixtures())
 }
 
 /// Genesis funding for the departing-route scenarios.
@@ -117,9 +117,15 @@ pub fn departing_venue_split_bytes() -> u64 {
 /// quarter alone over the threshold the scenarios vote in, a provider on
 /// each venue's shard, and the trader on its own, ground in the order
 /// [`departing_route`] stands them up.
+///
+/// Only that quarter is ballasted: no quarter can draw enough of the
+/// flash to reach the armed threshold on its own, and one drawing too
+/// little to clear the derived floor has a sibling well over it, so its
+/// merge half never pairs.
 #[must_use]
 pub fn departing_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
-    let mut accounts = quarter_ballast_over(FIRST_VENUE_SHARD, fixture_flash_bytes());
+    let packages = GenesisPackages::with_fixtures();
+    let mut accounts = ballast_to(FIRST_VENUE_SHARD, 4, departing_target(&packages), &packages);
     let mut taken = Vec::new();
     accounts.push((
         grind_onto(FIRST_VENUE_SHARD, &mut taken).1,
@@ -194,7 +200,7 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
     let mut charges = Charges::default();
 
     // The venue's shard is leaving from here to the cut.
-    vote_splitter_down_to(c, split_bytes_over(fixture_flash_bytes()));
+    vote_splitter_down_to(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
 
     let (leaving, later) = swappers.split_at(swappers.len() - 1);
     let mut submitted: Vec<TxHash> = Vec::new();
@@ -262,11 +268,11 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
 /// The ballast [`a_leg_issued_on_a_departing_shard_reaches_its_venue`]
 /// arms its trigger over.
 ///
-/// The callers' shard carries the lead, so the flash-holding venue shard
-/// stays under the threshold the scenario votes in.
+/// The callers' shard carries the ballast, so the venue's shard stays
+/// under the threshold the scenario votes in.
 #[must_use]
 pub fn departing_caller_ballast() -> Vec<(PrincipalAddr, u128)> {
-    split_ballast_accounts_over(fixture_flash_bytes())
+    split_ballast_accounts_for(&GenesisPackages::with_fixtures())
 }
 
 /// A venue that stays, callers on the shard that is leaving, and the
@@ -302,7 +308,7 @@ fn departing_callers<C: Cluster>(
     let set = stock_callers_against(c, venue_shard, caller_shard);
     // The splitter is leaving from here to the cut; the survivor stays
     // under the threshold with the flash on it.
-    vote_splitter_down_to(c, split_bytes_over(fixture_flash_bytes()));
+    vote_splitter_down_to(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
     assert!(
         await_split_admitted(c, STRADDLER_SPLITTER, epochs(20)),
         "the splitter must admit the split",
@@ -866,7 +872,7 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
 /// merges is the callers', and the venue's shard never reshapes.
 #[must_use]
 pub fn merging_caller_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
-    let mut accounts = fixture_merge_survivor_ballast();
+    let mut accounts = merge_survivor_ballast_accounts(&GenesisPackages::with_fixtures());
     accounts.extend(venue_genesis_accounts_on(
         MERGE_STRADDLER_SURVIVOR,
         &[MERGE_STRADDLER_LEFT],
@@ -954,7 +960,7 @@ fn departing_route<C: Cluster>(c: &mut C) -> DepartingRoute {
     // The departing venue's shard is leaving from here to the cut: its
     // ballast alone crosses the voted threshold. The vote settles before
     // any certificate channel is cut, since it crosses the same shards.
-    cast_threshold_vote(c, split_bytes_over(fixture_flash_bytes()));
+    cast_threshold_vote(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
     assert!(
         await_split_admitted(c, departing, epochs(20)),
         "only the over-threshold venue shard must admit a split",
@@ -1105,9 +1111,15 @@ const LATE_MERGING_PARENT_BYTES: u64 = (LATE_MERGE_FLOOR - LATE_FLOOR_MARGIN) * 
 /// a figure any of them controls.
 #[must_use]
 pub fn late_departing_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
-    let mut accounts = ballast_to(LATE_MERGED_PARENT, 4, LATE_MERGING_PARENT_BYTES);
+    let packages = GenesisPackages::with_fixtures();
+    let mut accounts = ballast_to(LATE_MERGED_PARENT, 4, LATE_MERGING_PARENT_BYTES, &packages);
     for surviving in [LATE_SURVIVOR_VENUE, LATE_TRADER_SHARD] {
-        accounts.extend(ballast_to(surviving, 4, LATE_SURVIVING_QUARTER_BYTES));
+        accounts.extend(ballast_to(
+            surviving,
+            4,
+            LATE_SURVIVING_QUARTER_BYTES,
+            &packages,
+        ));
     }
     let mut taken = Vec::new();
     accounts.push((

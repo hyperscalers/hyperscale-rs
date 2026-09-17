@@ -34,7 +34,7 @@ use hyperscale_vm_manifest_builder::{
     GraphBuilder, IntentBuilder, TypedBuilder, TypedError, signing,
 };
 use hyperscale_vm_sdk::client::VaultField;
-use hyperscale_vm_stdlib::{STAKING_MODULE, account, account_artifact, instantiate, staking};
+use hyperscale_vm_stdlib::{STAKING_MODULE, account, instantiate, staking};
 use hyperscale_vm_types::Address;
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
@@ -64,17 +64,15 @@ pub const STRADDLER_SPLITTER: ShardId = ShardId::leaf(1, 0);
 /// terminating splitter.
 pub const STRADDLER_SURVIVOR: ShardId = ShardId::leaf(1, 1);
 
-/// The genesis package flash's byte total: every stdlib artifact, written
-/// whole under the publisher's single prefix.
+/// The genesis package flash's byte total on a network born running the
+/// protocol's own packages.
 ///
-/// The flash lands on whichever shard that prefix routes to — nothing a
-/// scenario controls — so every byte band calibrated around a shard that
-/// may hold it offsets by this total. Expressed as an offset, a band's
-/// margin holds as the stdlib grows; expressed as a literal, it silently
-/// erodes with every regenerated guest blob.
+/// Expressed as an offset, a band's margin holds as the stdlib grows;
+/// expressed as a literal, it silently erodes with every regenerated
+/// guest blob.
 #[must_use]
 pub fn stdlib_flash_bytes() -> u64 {
-    (account_artifact().len() + staking_artifact().len()) as u64
+    flash_bytes(&GenesisPackages::protocol())
 }
 
 /// What one ballast account's vault cell stores: its `u128` balance.
@@ -82,16 +80,53 @@ pub fn stdlib_flash_bytes() -> u64 {
 /// into a ballast account count.
 const BALLAST_CELL_BYTES: u64 = 16;
 
-/// Bytes of ballast lead the splitter carries over the flash total, so a
-/// vote threshold fits between the flash-holding survivor and the
-/// splitter with fixed margins on both sides.
-const SPLITTER_BALLAST_LEAD: u64 = 24_000;
+/// Bytes over the flash at which the reshape scenarios arm `split_bytes`
+/// from genesis: every leaf of a grown pair sits under it, so nothing
+/// departs until a vote lowers the threshold.
+const SPLIT_BAND_CEILING: u64 = 30_000;
 
-/// Ballast accounts funded into the survivor: enough to clear the derived
-/// merge floor with margin, and short of the splitter's by enough that
-/// only the splitter crosses the voted-down split threshold even when the
-/// package lump is on this side.
-const STRADDLER_SURVIVOR_BULK: usize = 300;
+/// Bytes over the flash the reshape scenarios vote `split_bytes` down
+/// to: the ballasted shard is over this and its sibling under it, so the
+/// vote picks which one leaves.
+const SPLIT_BAND_FLOOR: u64 = 12_000;
+
+/// The `split_bytes` a reshape scenario arms from genesis on a network
+/// born running `packages` — the band's ceiling.
+#[must_use]
+pub fn armed_split_bytes(packages: &GenesisPackages) -> u64 {
+    flash_bytes(packages) + SPLIT_BAND_CEILING
+}
+
+/// The `split_bytes` a reshape scenario votes in — the band's floor,
+/// which the ballasted shard crosses and its sibling does not.
+#[must_use]
+pub fn voted_split_bytes(packages: &GenesisPackages) -> u64 {
+    flash_bytes(packages) + SPLIT_BAND_FLOOR
+}
+
+/// Committed bytes the ballast puts a departing shard at: the middle of
+/// the band, so the shard is a live leaf under the armed `split_bytes`
+/// and over the threshold the vote installs, with the same margin either
+/// way whatever share of the flash its own prefix drew.
+#[must_use]
+pub(crate) fn departing_target(packages: &GenesisPackages) -> u64 {
+    flash_bytes(packages) + u64::midpoint(SPLIT_BAND_FLOOR, SPLIT_BAND_CEILING)
+}
+
+/// Committed bytes the ballast puts a shard that must stay a live leaf
+/// at: clear of the merge floor the voted threshold derives, by the
+/// margin a merging pair is bracketed with, and under the voted
+/// threshold itself — so it neither departs beside its sibling nor
+/// asserts a merge of its own.
+///
+/// A target rather than a lead over the flash, because a shard holding
+/// the whole flash is already under the voted threshold: what the
+/// ballast has to cover is the floor, and topping up to it can only ever
+/// add what the flash left.
+#[must_use]
+fn staying_target(packages: &GenesisPackages) -> u64 {
+    voted_split_bytes(packages) / 8 + MERGE_FLOOR_MARGIN
+}
 
 /// Straddler pairs submitted across the splitter's grow — enough to span its
 /// terminal cut: the earliest settle on it before it crosses, the latest name a
@@ -101,15 +136,14 @@ pub(crate) const STRADDLER_COUNT: usize = 8;
 /// The surviving shard of the depth-2 merge-straddler topology —
 /// `leaf(2, 2)`.
 ///
-/// The heaviest engine-bootstrap quarter, bulk-funded over `merge_bytes` so its
-/// sibling pair never merges. Straddler payers live here; their cross-shard
-/// ticks name the terminating merge-left child.
+/// Ballasted clear of `merge_bytes` so its sibling pair never merges.
+/// Straddler payers live here; their cross-shard ticks name the
+/// terminating merge-left child.
 ///
-/// The protocol's own artifacts land here, so a network seeded with
-/// those alone finds the flash reinforcing the ordering it needs. One
-/// seeded with the fixtures beside them does not — those spread across
-/// every quarter — and brackets its floor through
-/// [`fixture_merge_floor`] instead.
+/// Which quarter draws which artifact is a hash's answer, so the floor
+/// is bracketed through [`merge_floor`] rather than assumed: the merging
+/// pair may hold a share of the flash, and the ballast here is whatever
+/// clears the floor that share sets.
 pub(crate) const MERGE_STRADDLER_SURVIVOR: ShardId = ShardId::leaf(2, 2);
 
 /// The merge-left child — `leaf(2, 0)`.
@@ -131,37 +165,22 @@ pub(crate) const MERGE_STRADDLER_RIGHT: ShardId = ShardId::leaf(2, 1);
 /// the surviving quarters this far above it.
 const MERGE_FLOOR_MARGIN: u64 = 18_000;
 
-/// The merge floor a fixture-seeded four-quarter topology brackets its
-/// pairs against: clear of the heavier merging quarter's flash.
+/// The merge floor a four-quarter topology brackets its pairs against:
+/// clear of whichever merging quarter drew the heavier share of the
+/// flash, so the pair's totals sit under the floor however the artifacts
+/// fell.
 #[must_use]
-pub(crate) fn fixture_merge_floor() -> u64 {
-    flash_bytes_on(MERGE_STRADDLER_LEFT, 4)
-        .max(flash_bytes_on(MERGE_STRADDLER_RIGHT, 4))
+fn merge_floor(packages: &GenesisPackages) -> u64 {
+    flash_bytes_on(MERGE_STRADDLER_LEFT, 4, packages)
+        .max(flash_bytes_on(MERGE_STRADDLER_RIGHT, 4, packages))
         .saturating_add(MERGE_FLOOR_MARGIN)
 }
 
-/// The split threshold whose derived eighth is [`fixture_merge_floor`].
+/// The `split_bytes` whose derived eighth is [`merge_floor`].
 #[must_use]
-pub fn fixture_merge_split_bytes() -> u64 {
-    fixture_merge_floor().saturating_mul(8)
+pub fn merge_split_bytes(packages: &GenesisPackages) -> u64 {
+    merge_floor(packages).saturating_mul(8)
 }
-
-/// Ballast lifting both surviving quarters clear of
-/// [`fixture_merge_floor`], so neither asserts a merge of its own while
-/// the lighter pair collapses.
-#[must_use]
-pub(crate) fn fixture_merge_survivor_ballast() -> Vec<(PrincipalAddr, u128)> {
-    let target = fixture_merge_floor().saturating_add(MERGE_FLOOR_MARGIN);
-    let mut accounts = ballast_to(MERGE_STRADDLER_SURVIVOR, 4, target);
-    accounts.extend(ballast_to(ShardId::leaf(2, 3), 4, target));
-    accounts
-}
-
-/// Ballast accounts funded into each surviving quarter (`leaf(2, 2)` and
-/// `leaf(2, 3)`), lifting the pair above `merge_bytes` so neither emits an
-/// unpairable merge against the other while the lighter merging pair stays
-/// under it.
-const MERGE_SURVIVOR_BULK: usize = 500;
 
 /// Merge-straddler pairs submitted across the merge.
 ///
@@ -233,10 +252,25 @@ pub struct HaltStraddlerSetup {
 /// summing over it, so the root splits exactly once and the grown pair
 /// holds while the halt and its recovery play out.
 ///
-/// The child that receives the genesis package flash starts
-/// [`stdlib_flash_bytes`] ahead, so the armed band offsets by the flash —
-/// see [`straddler_bulk`] for why the flash sets the scale.
+/// A fixed count on both children rather than a target either side of
+/// the flash, because what the band needs is a *sum* over the threshold
+/// and two totals under it: the flash lands whole on one child or the
+/// other, and a count this side of the band's width leaves either
+/// placement inside it.
 const HALT_RECOVERY_BULK: usize = 900;
+
+/// Bytes over the flash at which the halt-recovery harnesses arm
+/// `split_bytes`: above either child's ballast-plus-flash total and
+/// below the root's sum.
+const HALT_RECOVERY_BAND: u64 = 20_000;
+
+/// The `split_bytes` the halt-recovery harnesses arm from genesis, so
+/// the root splits exactly once and the grown pair holds through the
+/// halt.
+#[must_use]
+pub fn halt_recovery_split_bytes() -> u64 {
+    stdlib_flash_bytes() + HALT_RECOVERY_BAND
+}
 
 /// Build the halted-shard straddler genesis funding and probe transfers.
 ///
@@ -276,7 +310,7 @@ pub fn halt_straddler_setup() -> HaltStraddlerSetup {
 /// The genesis funding and straddler transfers for the merge-straddler scenario.
 ///
 /// Mirrors [`SplitStraddlerSetup`] but for a four-shard topology: the surviving
-/// quarter pair (`leaf(2, 2)`/`leaf(2, 3)`) is bulk-funded over `merge_bytes`,
+/// quarter pair (`leaf(2, 2)`/`leaf(2, 3)`) is ballasted over `merge_bytes`,
 /// the merging pair (`leaf(2, 0)`/`leaf(2, 1)`) is left under it, and the
 /// straddlers run from the survivor into the merging left child. The funding is
 /// installed at the single-shard genesis and partitions across the quarters as
@@ -378,78 +412,51 @@ const CONTENTION_SENDER_BASE: u8 = 120;
 /// sender seed.
 const CONTENTION_RECIPIENT_BASE: u8 = 200;
 
-/// The byte skew alone: the splitter ballasted over the voted-down
-/// threshold and the survivor under it, for a scenario that brings its
-/// own cast to the pair.
+/// The byte skew alone, on the protocol's own packages: the splitter
+/// ballasted into the band's middle and the survivor clear of the floor
+/// the vote derives, for a scenario that brings its own cast to the pair.
 #[must_use]
 pub(crate) fn split_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
-    split_ballast_accounts_over(stdlib_flash_bytes())
+    split_ballast_accounts_for(&GenesisPackages::protocol())
 }
 
-/// Ballast on one quarter of a four-shard partition, leading a genesis
-/// flash of `flash` bytes by the splitter's margin: what puts that
-/// quarter alone over a threshold voted to [`split_bytes_over`].
-///
-/// # Panics
-///
-/// Panics if the ballast count does not fit `usize`.
-///
-/// [`split_bytes_over`]: crate::straddler::split_bytes_over
+/// [`split_ballast_accounts`] on a network born running `packages`.
 #[must_use]
-pub(crate) fn quarter_ballast_over(shard: ShardId, flash: u64) -> Vec<(PrincipalAddr, u128)> {
-    let mut accounts = Vec::new();
-    let bulk = usize::try_from((flash + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
-        .expect("ballast count fits usize");
-    ballast(shard, 4, bulk, &mut accounts);
-    accounts
-}
-
-/// [`split_ballast_accounts`] for a network whose genesis flash is
-/// `flash` bytes — the fixture packages beside the protocol's, on a
-/// network born running them.
-///
-/// # Panics
-///
-/// Panics if the ballast count does not fit `usize`.
-#[must_use]
-pub(crate) fn split_ballast_accounts_over(flash: u64) -> Vec<(PrincipalAddr, u128)> {
-    let mut accounts = Vec::new();
-    let bulk = usize::try_from((flash + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
-        .expect("ballast count fits usize");
-    ballast(STRADDLER_SPLITTER, 2, bulk, &mut accounts);
-    ballast(
+pub(crate) fn split_ballast_accounts_for(packages: &GenesisPackages) -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = ballast_to(STRADDLER_SPLITTER, 2, departing_target(packages), packages);
+    accounts.extend(ballast_to(
         STRADDLER_SURVIVOR,
         2,
-        STRADDLER_SURVIVOR_BULK,
-        &mut accounts,
-    );
+        staying_target(packages),
+        packages,
+    ));
     accounts
 }
 
-/// The genesis flash of a network born running the fixture packages
-/// beside the protocol's: every artifact, summed.
+/// The genesis flash a network born running `packages` lands: every
+/// artifact, summed.
 #[must_use]
-pub(crate) fn fixture_flash_bytes() -> u64 {
-    GenesisPackages::with_fixtures()
+fn flash_bytes(packages: &GenesisPackages) -> u64 {
+    packages
         .artifacts()
         .iter()
         .map(|artifact| artifact.len() as u64)
         .sum()
 }
 
-/// The genesis flash landing on `shard` under a `num_shards`-wide
+/// The share of that flash landing on `shard` under a `num_shards`-wide
 /// uniform partition.
 ///
 /// A package cell sits under its own content address, so the flash is
 /// spread across the trie rather than pooled under whoever published it.
-/// A scenario bracketing a reshape floor reads what each shard actually
-/// drew: which shard carries which artifact is a hash's answer, and one
-/// that assumes a single prefix holds the lot is calibrated against an
-/// accident.
+/// A scenario bracketing a reshape threshold reads what each shard
+/// actually drew: which shard carries which artifact is a hash's answer,
+/// and one that assumes a single prefix holds the lot is calibrated
+/// against an accident.
 #[must_use]
-pub(crate) fn flash_bytes_on(shard: ShardId, num_shards: u64) -> u64 {
+fn flash_bytes_on(shard: ShardId, num_shards: u64, packages: &GenesisPackages) -> u64 {
     let trie = ShardTrie::uniform_from_count(num_shards);
-    GenesisPackages::with_fixtures()
+    packages
         .artifacts()
         .iter()
         .filter(|artifact| {
@@ -475,9 +482,10 @@ pub(crate) fn ballast_to(
     shard: ShardId,
     num_shards: u64,
     target: u64,
+    packages: &GenesisPackages,
 ) -> Vec<(PrincipalAddr, u128)> {
     let mut accounts = Vec::new();
-    let owed = target.saturating_sub(flash_bytes_on(shard, num_shards));
+    let owed = target.saturating_sub(flash_bytes_on(shard, num_shards, packages));
     let bulk = usize::try_from(owed.div_ceil(BALLAST_CELL_BYTES)).expect("ballast fits usize");
     ballast(shard, num_shards, bulk, &mut accounts);
     accounts
@@ -519,7 +527,7 @@ pub(crate) fn split_train_setup(count: usize) -> TrainSetup {
 #[must_use]
 pub(crate) fn merge_train_setup(count: usize) -> TrainSetup {
     let mut accounts = Vec::new();
-    merge_survivor_ballast(&mut accounts);
+    merge_survivor_ballast(&GenesisPackages::protocol(), &mut accounts);
     let mut taken = Vec::new();
     let legs = (0..count)
         .map(|_| {
@@ -596,35 +604,26 @@ pub fn split_issuer_straddler_setup() -> SplitStraddlerSetup {
 /// [`merge_survivor_ballast`] on its own, for a scenario composing the
 /// merge topology's byte skew with funding of its own.
 #[must_use]
-pub fn merge_survivor_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
+pub fn merge_survivor_ballast_accounts(packages: &GenesisPackages) -> Vec<(PrincipalAddr, u128)> {
     let mut accounts = Vec::new();
-    merge_survivor_ballast(&mut accounts);
+    merge_survivor_ballast(packages, &mut accounts);
     accounts
 }
 
-/// Lift the surviving quarters (`leaf(2, 2)` and `leaf(2, 3)`) above
-/// `merge_bytes`, so neither emits an unpairable merge against the other
-/// and churns the schedule, while the lighter pair stays under it.
-fn merge_survivor_ballast(accounts: &mut Vec<(PrincipalAddr, u128)>) {
-    let num_shards = 4;
-    ballast(
-        MERGE_STRADDLER_SURVIVOR,
-        num_shards,
-        MERGE_SURVIVOR_BULK,
-        accounts,
-    );
-    ballast(
-        ShardId::leaf(2, 3),
-        num_shards,
-        MERGE_SURVIVOR_BULK,
-        accounts,
-    );
+/// Lift the surviving quarters (`leaf(2, 2)` and `leaf(2, 3)`) clear of
+/// [`merge_floor`], so neither emits an unpairable merge against the
+/// other and churns the schedule, while the lighter pair stays under it.
+fn merge_survivor_ballast(packages: &GenesisPackages, accounts: &mut Vec<(PrincipalAddr, u128)>) {
+    let target = merge_floor(packages).saturating_add(MERGE_FLOOR_MARGIN);
+    for quarter in [MERGE_STRADDLER_SURVIVOR, ShardId::leaf(2, 3)] {
+        accounts.extend(ballast_to(quarter, 4, target, packages));
+    }
 }
 
 /// Build the merge-straddler genesis funding and straddler transfers.
 ///
 /// Across the four-shard topology the surviving quarters (`leaf(2, 2)`/`leaf(2,
-/// 3)`) are bulk-funded over the derived `merge_bytes` so neither auto-merges,
+/// 3)`) are ballasted clear of the derived `merge_bytes` so neither auto-merges,
 /// while the lighter merging pair (`leaf(2, 0)`/`leaf(2, 1)`) stays under it and
 /// collapses into `leaf(1, 0)`. Straddler payers sit in the survivor
 /// `leaf(2, 2)` and recipients in the merging `leaf(2, 0)`, so each cross-shard
@@ -633,7 +632,7 @@ fn merge_survivor_ballast(accounts: &mut Vec<(PrincipalAddr, u128)>) {
 pub fn merge_straddler_setup() -> MergeStraddlerSetup {
     let num_shards = 4;
     let mut accounts = Vec::new();
-    merge_survivor_ballast(&mut accounts);
+    merge_survivor_ballast(&GenesisPackages::protocol(), &mut accounts);
 
     let mut taken = Vec::new();
     let straddlers = (0..MERGE_STRADDLER_COUNT)

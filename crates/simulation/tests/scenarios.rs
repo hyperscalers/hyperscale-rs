@@ -12,10 +12,10 @@ use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
-    CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, badge_buyer,
+    CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
-    cross_shard_genesis_accounts, fixture_merge_split_bytes, genesis_accounts,
-    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
+    cross_shard_genesis_accounts, genesis_accounts, halt_recovery_split_bytes,
+    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts, merge_split_bytes,
     merge_straddler_setup, native_pq_genesis_accounts, nullifier_race_genesis_accounts,
     overdraw_genesis_accounts, participant_sweep_genesis_accounts, probe_train_genesis_accounts,
     remote_delegator, reshape_lifecycle_accounts, securify_genesis_accounts,
@@ -840,10 +840,7 @@ fn halt_recovery_config() -> ScenarioConfig {
         vnodes_per_host: 1,
         pool_surplus: 14,
         num_shards: 1,
-        // Above the flash-holding child's ballast-plus-flash total and
-        // below the root's sum, so the root splits exactly once and the
-        // grown pair holds through the halt.
-        split_bytes: stdlib_flash_bytes() + 20_000,
+        split_bytes: halt_recovery_split_bytes(),
         latency: Duration::from_millis(150),
     }
 }
@@ -1261,7 +1258,7 @@ fn straddler_config() -> ScenarioConfig {
         vnodes_per_host: 1,
         pool_surplus: 10,
         num_shards: 1,
-        split_bytes: stdlib_flash_bytes() + 30_000,
+        split_bytes: armed_split_bytes(&GenesisPackages::protocol()),
         latency: Duration::from_millis(150),
     }
 }
@@ -1518,21 +1515,22 @@ fn split_straddler_ec_partition_atomic_seed_2026_sim() {
 }
 
 /// Four-shard topology whose `split_bytes` derives a `merge_bytes` bracketing
-/// the genesis byte skew: the survivor pair (`leaf(2,0)`/`leaf(2,1)`, the latter
-/// bulk-funded) sits above it, the light merging pair (`leaf(2,2)`/`leaf(2,3)`)
-/// below it, so only the merging pair auto-merges into `leaf(1,1)`. Three cohorts
-/// of pool surplus staff the two split generations the grow walks through; the
-/// merge keepers then come from the merging children's own committees.
+/// the genesis byte skew: the surviving pair (`leaf(2,2)`/`leaf(2,3)`, ballasted
+/// clear of the floor) sits above it, the light merging pair
+/// (`leaf(2,0)`/`leaf(2,1)`) below it, so only the merging pair auto-merges into
+/// `leaf(1,0)`. Three cohorts of pool surplus staff the two split generations the
+/// grow walks through; the merge keepers then come from the merging children's
+/// own committees.
 fn merge_straddler_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 12,
         num_shards: 4,
-        // Above the flash-holding survivor quarter, with the derived
-        // merge floor (an eighth) between the merging pair's totals and
-        // the surviving pair's bulk funding.
-        split_bytes: stdlib_flash_bytes() + 18_000,
+        // The derived merge floor (an eighth) sits between the merging
+        // pair's totals and the surviving pair's, clear of whichever
+        // quarter drew the heavier share of the flash.
+        split_bytes: merge_split_bytes(&GenesisPackages::protocol()),
         latency: Duration::from_millis(150),
     }
 }
@@ -1551,7 +1549,7 @@ fn merge_straddler_atomic_sim() {
 /// of the two drew the heavier share of the artifacts.
 fn merging_caller_config() -> ScenarioConfig {
     ScenarioConfig {
-        split_bytes: fixture_merge_split_bytes(),
+        split_bytes: merge_split_bytes(&GenesisPackages::with_fixtures()),
         ..merge_straddler_config()
     }
 }

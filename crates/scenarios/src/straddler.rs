@@ -9,6 +9,7 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
+use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
@@ -25,8 +26,8 @@ use crate::support::query::{
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
     STRADDLER_SURVIVOR, build_reshape_threshold_vote_tx, build_transfer_tx, merge_straddler_setup,
-    pool_operator, split_issuer_straddler_setup, split_straddler_setup, stdlib_flash_bytes,
-    validity_around,
+    pool_operator, split_issuer_straddler_setup, split_straddler_setup, validity_around,
+    voted_split_bytes,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor,
@@ -82,21 +83,12 @@ const fn vote_activate_lead(fold_budget_ms: u64, epoch_ms: u64) -> u64 {
 /// survivor's byte total and the splitter's, so only the heavier splitter
 /// crosses and terminates while the survivor stays a live leaf.
 ///
-/// Offset by the genesis package flash, which the survivor's half holds
-/// beside its own ballast, while the splitter's ballast carries a fixed
-/// lead over the flash — so the threshold sits between the two with
-/// margins that hold as the stdlib grows, and the derived merge floor (an
-/// eighth of it) stays below every live leaf, including the splitter's
-/// own children once it splits.
+/// The band's floor on the protocol's own packages — the splitter's
+/// ballast puts it over this and the survivor's leaves it under, and the
+/// derived merge floor (an eighth) stays below every live leaf,
+/// including the splitter's own children once it splits.
 pub fn straddler_split_bytes() -> u64 {
-    split_bytes_over(stdlib_flash_bytes())
-}
-
-/// The voted-down threshold for a pair whose survivor holds a genesis
-/// flash of `flash` bytes beside its ballast, and whose splitter's
-/// ballast leads the flash by a fixed margin.
-pub const fn split_bytes_over(flash: u64) -> u64 {
-    flash + 12_000
+    voted_split_bytes(&GenesisPackages::protocol())
 }
 
 /// Verify a split straddler settles atomically across the reshape boundary.
