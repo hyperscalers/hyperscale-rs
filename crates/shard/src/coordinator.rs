@@ -949,8 +949,74 @@ impl ShardCoordinator {
     /// committed tip, whose anchor a split child's genesis carries from the
     /// parent chain's terminal canonical timestamp — resolving its first
     /// proposal in the window it inherited rather than epoch 0.
-    fn next_proposal_committee_anchor_wt(&self) -> Option<WeightedTimestamp> {
-        self.block_anchor(self.chain_view().proposal_parent().0)
+    fn next_proposal_committee_anchor_wt(
+        &self,
+        topology_schedule: &TopologySchedule,
+    ) -> Option<WeightedTimestamp> {
+        self.block_anchor(self.proposal_parent(topology_schedule).0)
+    }
+
+    /// The block the next proposal extends, and the QC over it.
+    ///
+    /// The high QC's block, as ever — except under a halt recovery whose
+    /// harvest has gone `HALT_HARVEST_WAIT` without applying anything
+    /// while that block still has no state tree. A sync-admitted suffix
+    /// block is QC-attested and, when its window fell below the schedule
+    /// floor or its verification chain broke, never executed here; a
+    /// proposal on it would park in `dispatch_or_defer` for good. So the
+    /// parent steps down the ancestry, over sync-admitted blocks without
+    /// a tree, to the first that has one. The committed tip is persisted,
+    /// so the walk ends; a live block stops it too, since its
+    /// verification is in flight and the deferral covers it. What the
+    /// walk steps over is the halted chain's uncommitted tail, abandoned
+    /// the way any uncommitted block is once the pacemaker has moved past
+    /// it. Voters accept the lower parent: the safe-vote lock rises only
+    /// with a commit or a vote, both on blocks with trees, so the chosen
+    /// parent's QC round is never below it.
+    fn proposal_parent(
+        &self,
+        topology_schedule: &TopologySchedule,
+    ) -> (BlockHash, Verified<QuorumCertificate>) {
+        let (mut hash, mut qc) = self.chain_view().proposal_parent();
+        if !self.harvest_tail_abandonable(topology_schedule) {
+            return (hash, qc);
+        }
+        loop {
+            if hash == self.committed_hash
+                || self.pending_blocks.contains_key(hash)
+                || self.verification.parent_tree_available(qc.height(), hash)
+            {
+                return (hash, qc);
+            }
+            let Some(certified) = self.verification.cached_verified_certified_block(hash) else {
+                return (hash, qc);
+            };
+            hash = certified.block().header().parent_block_hash();
+            qc = certified.parent_qc_attested();
+        }
+    }
+
+    /// Height of the next proposal: one above the block it extends.
+    fn next_proposal_height(&self, topology_schedule: &TopologySchedule) -> BlockHeight {
+        if self.latest_qc.is_none() {
+            return self.committed_height.next();
+        }
+        self.proposal_parent(topology_schedule).1.height().next()
+    }
+
+    /// Whether the harvested suffix's unbuildable tail may be abandoned:
+    /// a halt recovery is pending, the harvest is not still syncing, and
+    /// `HALT_HARVEST_WAIT` has passed since it last applied a block.
+    fn harvest_tail_abandonable(&self, topology_schedule: &TopologySchedule) -> bool {
+        topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+            .is_some_and(|recovery| recovery.cause == RecoveryCause::Halt)
+            && !self.recovery_behind_retained_tip()
+            && self
+                .halt_harvest_progress
+                .is_some_and(|since| self.now.saturating_sub(since) >= HALT_HARVEST_WAIT)
     }
 
     /// Committee that signed/produced `block_hash`. `None` to stall: the block
@@ -1001,7 +1067,7 @@ impl ShardCoordinator {
         &self,
         topology_schedule: &'t TopologySchedule,
     ) -> Option<&'t TopologySnapshot> {
-        let anchor = self.next_proposal_committee_anchor_wt()?;
+        let anchor = self.next_proposal_committee_anchor_wt(topology_schedule)?;
         if self.recovery_quiesced(topology_schedule, anchor) {
             return None;
         }
@@ -2022,10 +2088,7 @@ impl ShardCoordinator {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
         // two-chain commit rule is being satisfied.
-        let next_height = self
-            .latest_qc
-            .as_ref()
-            .map_or_else(|| self.committed_height.next(), |qc| qc.height().next());
+        let next_height = self.next_proposal_height(topology_schedule);
         let round = self.view_change.view;
 
         if !self.can_propose(topology_schedule, next_height, round) {
@@ -2043,7 +2106,7 @@ impl ShardCoordinator {
             );
         }
 
-        let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
+        let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
 
         // Post-fallback recovery: if the parent is a fallback, propose an
         // empty block too. The QC on this block is what commits the parent
@@ -2483,7 +2546,7 @@ impl ShardCoordinator {
             );
             return vec![];
         }
-        let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
+        let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
         // The block we build belongs to its parent's window — the same
         // committee `can_propose` drew our slot from and the same one every
         // verifier resolves for it. Its proposer schedule (missed-proposal
@@ -5801,12 +5864,7 @@ impl ShardCoordinator {
     /// quorum-max the timeout quorum just adopted). Reached via the
     /// timeout-quorum advance ([`Self::advance_on_timeout_quorum`]).
     fn enter_round(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        // The next height to propose is one above the highest certified block,
-        // NOT one above the committed block. This matches try_propose behavior.
-        let height = self
-            .latest_qc
-            .as_ref()
-            .map_or_else(|| self.committed_height.next(), |qc| qc.height().next());
+        let height = self.next_proposal_height(topology_schedule);
 
         // Clear any in-flight proposal — a stale build from the previous
         // round should not block the new round's proposer. If the old build
@@ -9965,6 +10023,94 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000 + wait / 2 + wait));
         let _ = state.check_sync_health(&schedule);
         assert!(!state.recovery_behind_retained_tip());
+    }
+
+    /// A fresh member under a halt recovery whose harvest applied blocks 4
+    /// and 5 above a persisted committed tip at 3 and adopted the QC over
+    /// 5, with neither synced block executed. Returns the two blocks.
+    fn harvested_unexecuted_suffix() -> (ShardCoordinator, TopologySchedule, Block, Block) {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"committed_3"));
+        state.verification.on_block_persisted(BlockHeight::new(3));
+        state.set_block_syncing(true);
+
+        let four = block_chained_on(BlockHeight::new(4), state.committed_hash, 100);
+        let (four_hash, _) = deliver_synced(&mut state, &schedule, four.clone());
+        let _ = state.on_qc_signature_verified(
+            &schedule,
+            four_hash,
+            Ok(make_test_qc(four_hash, BlockHeight::new(4))),
+        );
+        let five = block_chained_on(BlockHeight::new(5), four_hash, 110);
+        let (five_hash, _) = deliver_synced(&mut state, &schedule, five.clone());
+        let _ = state.on_qc_signature_verified(
+            &schedule,
+            five_hash,
+            Ok(make_test_qc(five_hash, BlockHeight::new(5))),
+        );
+        assert_eq!(state.committed_height, BlockHeight::new(3));
+
+        state.latest_qc = Some(make_test_qc(five_hash, BlockHeight::new(5)));
+        state.retained_tip_offered = Some(BlockHeight::new(5));
+        state.set_block_syncing(false);
+        (state, schedule, four, five)
+    }
+
+    /// Once the harvest has sat `HALT_HARVEST_WAIT` without applying
+    /// anything, a proposal steps down over sync-admitted blocks that
+    /// have no state tree to the nearest that does, and never below the
+    /// committed tip.
+    #[test]
+    fn proposal_parent_steps_down_over_an_unbuildable_synced_tip() {
+        let (mut state, schedule, four, five) = harvested_unexecuted_suffix();
+        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
+        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
+
+        let (parent, qc) = state.proposal_parent(&schedule);
+        assert_eq!(parent, state.committed_hash);
+        assert_eq!(qc.height(), BlockHeight::new(3));
+        assert_eq!(state.next_proposal_height(&schedule), BlockHeight::new(4));
+
+        state.verification.mark_proposal_fully_verified(&four);
+        let (parent, qc) = state.proposal_parent(&schedule);
+        assert_eq!(parent, four.hash());
+        assert_eq!(qc.height(), BlockHeight::new(4));
+
+        state.verification.mark_proposal_fully_verified(&five);
+        assert_eq!(state.proposal_parent(&schedule).0, five.hash());
+        assert_eq!(state.next_proposal_height(&schedule), BlockHeight::new(6));
+    }
+
+    /// Inside the wait the tip stays the parent: its verification may
+    /// still be in flight, and stepping down would abandon a suffix that
+    /// was about to become buildable.
+    #[test]
+    fn the_walk_waits_out_the_harvest_wait() {
+        let (mut state, schedule, _, five) = harvested_unexecuted_suffix();
+        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000));
+
+        assert_eq!(state.proposal_parent(&schedule).0, five.hash());
+        assert_eq!(state.next_proposal_height(&schedule), BlockHeight::new(6));
+    }
+
+    /// A live block at the tip keeps today's deferral: it stops the walk
+    /// even without a tree, because its verification is what the build
+    /// is parked on.
+    #[test]
+    fn a_live_parent_still_defers_the_build() {
+        let (mut state, schedule, _, five) = harvested_unexecuted_suffix();
+        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
+        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
+        install_complete_block(&mut state, &five);
+
+        assert_eq!(state.proposal_parent(&schedule).0, five.hash());
     }
 
     /// A sync-delivered certified block above the fork recovery's attested
