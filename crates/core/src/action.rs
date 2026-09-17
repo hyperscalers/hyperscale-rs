@@ -1325,6 +1325,11 @@ pub enum Action {
         height: BlockHeight,
     },
 
+    /// Tell block sync to stop at what it holds: the target it was raised
+    /// to is served by nobody reachable, and the scope completes at its
+    /// frontier. A later `StartBlockSync` raises the target again.
+    SettleBlockSync,
+
     /// Request the runner to start (or raise the target of) beacon-chain
     /// gap-fill sync.
     ///
@@ -1814,6 +1819,7 @@ impl Action {
             | Self::StartBlockSync { .. }
             | Self::SyncBlockApplied { .. }
             | Self::ReopenSyncHeight { .. }
+            | Self::SettleBlockSync
             | Self::StartBeaconBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
             | Self::FetchCommitProof { .. }
@@ -1952,6 +1958,7 @@ impl Action {
             | Self::ResolveTicks { .. }
             | Self::RestoreCommittedState
             | Self::SetTimer { .. }
+            | Self::SettleBlockSync
             | Self::StartBeaconBlockSync { .. }
             | Self::StartBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }

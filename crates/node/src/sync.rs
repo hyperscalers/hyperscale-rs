@@ -56,7 +56,7 @@ const DEFERRAL_MULTIPLIER: f64 = 2.0;
 /// Backoff cap; subsequent rounds plateau here rather than growing unbounded.
 const DEFERRAL_MAX_MS: u64 = 30_000;
 
-/// Rounds of sustained not-found at the height just above `committed`
+/// Rounds of sustained not-found at the height just above the frontier
 /// before the target is read as unfounded rather than merely unreached.
 ///
 /// A target is a claim by whoever raised it, and some of those claims
@@ -394,6 +394,10 @@ pub enum SyncInput<B: SyncBinding> {
     /// the block it applied there exists. Re-queues the height if it is
     /// still open. Idempotent while a fetch for it is in flight.
     Reopen { scope: B::Scope, height: B::Key },
+    /// The consumer gave up on the target: nobody reachable serves the
+    /// height above the frontier. The scope settles there and completes;
+    /// a later `StartSync` raises the target again.
+    Settle { scope: B::Scope },
     /// Periodic tick: promotes deferred heights past their backoff and
     /// emits any newly-ready fetches.
     Tick { now: LocalTimestamp },
@@ -513,6 +517,7 @@ impl<B: SyncBinding> Sync<B> {
             SyncInput::Admitted { scope, height } => self.handle_admitted(&scope, height),
             SyncInput::Applied { scope, height } => self.handle_applied(&scope, height),
             SyncInput::Reopen { scope, height } => self.handle_reopen(&scope, height),
+            SyncInput::Settle { scope } => self.handle_settle(&scope),
             SyncInput::Tick { now } => self.handle_tick(now),
         }
     }
@@ -698,6 +703,7 @@ impl<B: SyncBinding> Sync<B> {
                 }
             }
         }
+        let mut outputs = Vec::new();
         if unfounded {
             info!(
                 binding = B::NAME,
@@ -706,17 +712,7 @@ impl<B: SyncBinding> Sync<B> {
                 committed = state.committed.as_u64(),
                 "sync: target unfounded — the committee does not hold the height above ours"
             );
-            state.target = state.frontier();
-            state.heights_to_fetch.clear();
-            state.heights_queued.clear();
-            state.deferred.clear();
-            state.not_found_streak = 0;
-        }
-        // The scope stopped syncing; the consumer hears it the same way a
-        // reached target tells it.
-        let mut outputs = Vec::new();
-        if unfounded {
-            outputs.push(self.complete(scope));
+            outputs.extend(self.settle_at_frontier(scope));
         }
         // The freed slot can carry other ready work immediately — heights
         // past the failed range, ready-deferred entries from earlier
@@ -814,6 +810,35 @@ impl<B: SyncBinding> Sync<B> {
             state.queue_height(height);
         }
         self.emit_fetches()
+    }
+
+    fn handle_settle(&mut self, scope: &B::Scope) -> Vec<SyncOutput<B>> {
+        let Some(state) = self.scopes.get(scope) else {
+            return vec![];
+        };
+        info!(
+            binding = B::NAME,
+            ?scope,
+            target = state.target.as_u64(),
+            frontier = state.frontier().as_u64(),
+            "sync: settling at the frontier"
+        );
+        self.settle_at_frontier(scope).into_iter().collect()
+    }
+
+    /// Stop the scope at what it holds: the target drops to the frontier,
+    /// every queued and deferred height goes, and the consumer hears the
+    /// scope stop syncing the same way a reached target tells it. `None`
+    /// when the scope was not syncing, so a settled scope stays quiet.
+    fn settle_at_frontier(&mut self, scope: &B::Scope) -> Option<SyncOutput<B>> {
+        let state = self.scopes.get_mut(scope)?;
+        let was_syncing = state.is_syncing();
+        state.target = state.frontier();
+        state.heights_to_fetch.clear();
+        state.heights_queued.clear();
+        state.deferred.clear();
+        state.not_found_streak = 0;
+        was_syncing.then(|| self.complete(scope))
     }
 
     /// The scope's frontier just reached its target: fire the binding
@@ -2100,6 +2125,53 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, SyncOutput::Complete { scope: 1, .. })),
             "the scope must complete as unfounded"
+        );
+    }
+
+    /// A settle stops the scope at its frontier: the target drops to it,
+    /// the consumer hears the completion, and nothing is fetched until a
+    /// later target is raised.
+    #[test]
+    fn a_settle_stops_the_sync_at_the_frontier() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(10),
+        });
+        for h in 1..=3 {
+            let _ = s.handle(SyncInput::FetchSucceeded {
+                scope: (),
+                from: BlockHeight::new(h),
+                count: 1,
+                delivered_heights: vec![BlockHeight::new(h)],
+                now: LocalTimestamp::ZERO,
+            });
+            let _ = s.handle(SyncInput::Applied {
+                scope: (),
+                height: BlockHeight::new(h),
+            });
+        }
+        assert!(s.is_syncing());
+
+        let outputs = s.handle(SyncInput::Settle { scope: () });
+        assert_eq!(completed_at(&outputs), Some(3));
+        assert!(!s.is_syncing());
+        let st = s.scopes.get(&()).unwrap();
+        assert_eq!(st.target, BlockHeight::new(3));
+        assert!(st.heights_queued.is_empty() && st.deferred.is_empty());
+
+        let outputs = s.handle(SyncInput::Tick {
+            now: LocalTimestamp::from_millis(DEFERRAL_MAX_MS * 2),
+        });
+        assert!(
+            fetched_from(&outputs).is_empty(),
+            "a settled scope asks for nothing"
+        );
+
+        let again = s.handle(SyncInput::Settle { scope: () });
+        assert!(
+            completed_at(&again).is_none(),
+            "settling a settled scope is silent"
         );
     }
 

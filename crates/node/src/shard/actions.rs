@@ -131,6 +131,9 @@ where
             Action::ReopenSyncHeight { height } => {
                 self.process_reopen_sync_height(height);
             }
+            Action::SettleBlockSync => {
+                self.process_settle_block_sync();
+            }
             Action::StartBeaconBlockSync { target } => {
                 self.process_start_beacon_block_sync(target);
             }

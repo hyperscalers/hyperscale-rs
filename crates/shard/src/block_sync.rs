@@ -604,35 +604,80 @@ impl BlockSyncManager {
     pub(crate) fn take_next_verified(
         &mut self,
         committed_height: BlockHeight,
+        committed_hash: BlockHash,
     ) -> Option<(Block, Verified<QuorumCertificate>)> {
         let frontier = committed_height.max(self.sync_applied_height) + 1u64;
         self.log_verification_state(committed_height, frontier);
-        let (height, block_hash) = self
-            .pending_synced_block_verifications
-            .iter()
-            .filter_map(|(hash, p)| match p {
-                PendingSyncedBlockVerification::QcVerified { block, .. }
-                    if block.height() > committed_height
-                        && block.height() <= frontier
-                        && !self.is_applied(block.height(), hash) =>
-                {
-                    Some((block.height(), *hash))
-                }
-                _ => None,
-            })
-            .min_by_key(|(height, _)| *height)?;
-        if height < frontier {
-            warn!(
-                height = height.inner(),
-                ?block_hash,
-                applied = ?self.applied_uncommitted.get(&height),
-                "Taking certified sibling at an already-applied height — a served sibling is not committing"
-            );
+        loop {
+            let (height, block_hash) = self
+                .pending_synced_block_verifications
+                .iter()
+                .filter_map(|(hash, p)| match p {
+                    PendingSyncedBlockVerification::QcVerified { block, .. }
+                        if block.height() > committed_height
+                            && block.height() <= frontier
+                            && !self.is_applied(block.height(), hash) =>
+                    {
+                        Some((block.height(), *hash))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|(height, _)| *height)?;
+            let Some(PendingSyncedBlockVerification::QcVerified { block, qc }) =
+                self.pending_synced_block_verifications.remove(&block_hash)
+            else {
+                unreachable!("selection above matched a QcVerified entry")
+            };
+            if !Self::extends_committed_tip(&block, committed_height, committed_hash) {
+                warn!(
+                    height = height.inner(),
+                    ?block_hash,
+                    parent = ?block.header().parent_block_hash(),
+                    "Dropping a synced block off this node's chain — it sits above the committed tip but does not extend it"
+                );
+                record_sync_block_filtered("block", "branch_mismatch");
+                continue;
+            }
+            if height < frontier {
+                warn!(
+                    height = height.inner(),
+                    ?block_hash,
+                    applied = ?self.applied_uncommitted.get(&height),
+                    "Taking certified sibling at an already-applied height — a served sibling is not committing"
+                );
+            }
+            return Some((block, qc));
         }
-        match self.pending_synced_block_verifications.remove(&block_hash) {
-            Some(PendingSyncedBlockVerification::QcVerified { block, qc }) => Some((block, qc)),
-            _ => unreachable!("selection above matched a QcVerified entry"),
-        }
+    }
+
+    /// Whether `block`, if it sits at the height above the committed tip,
+    /// extends that tip. Sync delivers by height, and a peer on another
+    /// branch serves that height too — the retained cohort's tail above a
+    /// halt recovery's own chain. Such a block can never commit here,
+    /// since the commit prefix walks to the committed tip, and applying
+    /// it would make its QC `high_qc` over an ancestry this node does not
+    /// hold. Higher up, a parent that is not the block applied below it
+    /// is a sibling question the commit path settles by reopening the
+    /// applied height, so those blocks pass.
+    fn extends_committed_tip(
+        block: &Block,
+        committed_height: BlockHeight,
+        committed_hash: BlockHash,
+    ) -> bool {
+        block.height().prev() != Some(committed_height)
+            || block.header().parent_block_hash() == committed_hash
+    }
+
+    /// Drop every buffered and verification-pending synced block above
+    /// `frontier`. A sync that settles below its target leaves the blocks
+    /// it fetched past the frontier behind, and the halted chain's tail
+    /// they belong to would otherwise drain onto whatever this node
+    /// builds there next.
+    pub(crate) fn discard_above(&mut self, frontier: BlockHeight) {
+        self.buffered_synced_blocks
+            .retain(|height, _| *height <= frontier);
+        self.pending_synced_block_verifications
+            .retain(|_, pending| pending.block().height() <= frontier);
     }
 
     /// Log the current state of pending verifications (for debugging).
@@ -881,19 +926,29 @@ mod tests {
 
     use super::*;
 
-    fn header(height: BlockHeight, tag: &[u8]) -> BlockHeader {
-        BlockHeader::new(BlockHeaderParts {
-            height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(tag)),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
-            timestamp: ProposerTimestamp::from_millis(0),
-            ..Default::default()
-        })
+    /// A certified block at `height` whose parent is the hash derived
+    /// from `tag`, so blocks built with distinct tags are on distinct
+    /// branches.
+    fn certified(height: BlockHeight, tag: &[u8]) -> CertifiedBlock {
+        certified_on(height, parent_of(tag), tag)
     }
 
-    fn certified(height: BlockHeight, tag: &[u8]) -> CertifiedBlock {
+    /// The parent hash a block tagged `tag` carries.
+    fn parent_of(tag: &[u8]) -> BlockHash {
+        BlockHash::from_raw(Hash::from_bytes(tag))
+    }
+
+    /// A certified block at `height` extending `parent`; `tag` keeps two
+    /// blocks with the same parent distinct.
+    fn certified_on(height: BlockHeight, parent: BlockHash, tag: &[u8]) -> CertifiedBlock {
         let block = Block::Live {
-            header: header(height, tag),
+            header: BlockHeader::new(BlockHeaderParts {
+                height,
+                parent_block_hash: parent,
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                timestamp: ProposerTimestamp::from_millis(u64::from(tag[0])),
+                ..Default::default()
+            }),
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
@@ -1123,7 +1178,10 @@ mod tests {
             sm.on_qc_verified(hash, None),
             Some(BlockSyncVerificationResult::Verified)
         ));
-        assert!(sm.take_next_verified(BlockHeight::new(5)).is_some());
+        assert!(
+            sm.take_next_verified(BlockHeight::new(5), parent_of(b"v"))
+                .is_some()
+        );
     }
 
     // ─── certified sibling recovery ─────────────────────────────────────
@@ -1145,7 +1203,7 @@ mod tests {
         sm.track_verified_for_test(winner);
 
         let (block, _) = sm
-            .take_next_verified(BlockHeight::new(5))
+            .take_next_verified(BlockHeight::new(5), parent_of(b"winner"))
             .expect("certified sibling at an applied height is takeable");
         assert_eq!(block.hash(), winner_hash);
     }
@@ -1175,7 +1233,10 @@ mod tests {
         sm.mark_applied(BlockHeight::new(6), applied.block().hash());
         sm.track_verified_for_test(applied);
 
-        assert!(sm.take_next_verified(BlockHeight::new(5)).is_none());
+        assert!(
+            sm.take_next_verified(BlockHeight::new(5), parent_of(b"applied"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1183,17 +1244,93 @@ mod tests {
         // A sibling at an applied height applies before the frontier
         // entry so parents precede children.
         let mut sm = BlockSyncManager::new();
-        sm.mark_applied(
-            BlockHeight::new(6),
-            certified(BlockHeight::new(6), b"applied6").block().hash(),
-        );
-        sm.track_verified_for_test(certified(BlockHeight::new(7), b"frontier"));
-        sm.track_verified_for_test(certified(BlockHeight::new(6), b"sibling"));
+        let committed = parent_of(b"committed5");
+        let applied6_hash = certified_on(BlockHeight::new(6), committed, b"applied")
+            .block()
+            .hash();
+        sm.mark_applied(BlockHeight::new(6), applied6_hash);
+        sm.track_verified_for_test(certified_on(BlockHeight::new(7), applied6_hash, b"seven"));
+        sm.track_verified_for_test(certified_on(BlockHeight::new(6), committed, b"sibling"));
 
-        let (block, _) = sm.take_next_verified(BlockHeight::new(5)).unwrap();
+        let (block, _) = sm
+            .take_next_verified(BlockHeight::new(5), committed)
+            .unwrap();
         assert_eq!(block.height(), BlockHeight::new(6));
-        let (block, _) = sm.take_next_verified(BlockHeight::new(5)).unwrap();
+        let (block, _) = sm
+            .take_next_verified(BlockHeight::new(5), committed)
+            .unwrap();
         assert_eq!(block.height(), BlockHeight::new(7));
+    }
+
+    /// A verified block at the height above the committed tip whose parent
+    /// is not that tip belongs to another branch: it is dropped rather
+    /// than applied, and a block that does extend the tip at the same
+    /// height is taken instead.
+    #[test]
+    fn take_next_verified_drops_a_block_off_the_committed_tip() {
+        let mut sm = BlockSyncManager::new();
+        let committed = parent_of(b"committed5");
+        sm.track_verified_for_test(certified_on(
+            BlockHeight::new(6),
+            parent_of(b"elsewhere"),
+            b"foreign",
+        ));
+        assert!(
+            sm.take_next_verified(BlockHeight::new(5), committed)
+                .is_none(),
+            "a foreign branch is never applied"
+        );
+        assert_eq!(
+            sm.pending_verification_count(),
+            0,
+            "and is not kept waiting"
+        );
+
+        let ours = certified_on(BlockHeight::new(6), committed, b"ours");
+        let ours_hash = ours.block().hash();
+        sm.track_verified_for_test(certified_on(
+            BlockHeight::new(6),
+            parent_of(b"elsewhere"),
+            b"foreign again",
+        ));
+        sm.track_verified_for_test(ours);
+        let (block, _) = sm
+            .take_next_verified(BlockHeight::new(5), committed)
+            .unwrap();
+        assert_eq!(block.hash(), ours_hash);
+
+        sm.mark_applied(BlockHeight::new(6), ours_hash);
+        sm.track_verified_for_test(certified_on(
+            BlockHeight::new(7),
+            parent_of(b"elsewhere6"),
+            b"foreign seven",
+        ));
+        assert!(
+            sm.take_next_verified(BlockHeight::new(5), committed)
+                .is_some(),
+            "above the committed tip a mismatched parent is the reopen path's question"
+        );
+    }
+
+    /// Settling a sync below its target discards what was fetched past
+    /// the frontier, buffered and verification-pending alike.
+    #[test]
+    fn discard_above_drops_the_tail_past_the_frontier() {
+        let mut sm = BlockSyncManager::new();
+        assert!(sm.buffer_block(
+            BlockHeight::new(8),
+            certified(BlockHeight::new(8), b"eight")
+        ));
+        assert!(sm.buffer_block(BlockHeight::new(6), certified(BlockHeight::new(6), b"six")));
+        sm.track_verified_for_test(certified(BlockHeight::new(7), b"seven"));
+        sm.track_verified_for_test(certified(BlockHeight::new(5), b"five"));
+
+        sm.discard_above(BlockHeight::new(6));
+
+        assert_eq!(sm.buffered_synced_blocks_len(), 1);
+        assert!(sm.has_any_buffered_at_height(BlockHeight::new(6)));
+        assert_eq!(sm.pending_verification_count(), 1);
+        assert!(sm.has_pending_at_height(BlockHeight::new(5)));
     }
 
     #[test]
