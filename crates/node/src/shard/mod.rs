@@ -56,7 +56,7 @@ use hyperscale_engine::{Executor, LocalCells};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain};
 use hyperscale_types::{
-    Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, SubstateKey, TopologySnapshot,
+    Address, Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, SubstateKey, TopologySnapshot,
     TransactionStatus, TxHash, Verified,
 };
 pub use io::ShardIo;
@@ -564,15 +564,28 @@ where
         // run — a node holding the metadata but not the compiled code,
         // and a node that synced past the admission that would have
         // asked, both reach a committed member the same way.
+        //
+        // A transaction that routes nowhere here names no code to ask
+        // for: what it runs is behind the records it names, so those are
+        // what this asks the shards holding them for, and the code
+        // follows once they seat a derivation.
         if let ProtocolEvent::BlockCommitted { certified } = &event {
-            let wanted: Vec<Hash> = certified
-                .block()
-                .transactions()
-                .iter()
-                .flat_map(|tx| tx.packages().iter().copied())
-                .collect();
-            if !wanted.is_empty() {
-                self.fetch_wanted_packages(wanted);
+            let mut packages: Vec<Hash> = Vec::new();
+            let mut records: Vec<Address> = Vec::new();
+            for tx in certified.block().transactions().iter() {
+                let tx = tx.as_unverified();
+                if tx.is_routed() {
+                    packages.extend(tx.packages().iter().copied());
+                } else if let Some(wanted) = self.unrouted_wants(tx) {
+                    records.extend(wanted.instances);
+                    packages.extend(wanted.packages);
+                }
+            }
+            if !records.is_empty() {
+                self.fetch_instance_records(records);
+            }
+            if !packages.is_empty() {
+                self.fetch_wanted_packages(packages);
             }
         }
         let count = self.vnodes.len();

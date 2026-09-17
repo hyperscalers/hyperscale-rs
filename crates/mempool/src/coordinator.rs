@@ -772,6 +772,19 @@ impl MempoolCoordinator {
         let mut abandoned_tx_fetches: Vec<TxHash> = Vec::new();
         for tx in block.transactions().iter() {
             let hash = tx.hash();
+            // A transaction this node could not route takes no part
+            // here. What an entry holds it under — the shards it
+            // touches, the window its retention keys on — is read off a
+            // derivation only the nodes holding its records reach, and a
+            // certified block is committed by every replica alike. The
+            // commit asks for those records; until they land there is
+            // nothing to track it by.
+            if !tx.as_unverified().is_routed() {
+                if self.expected_txs.forget(&hash) {
+                    abandoned_tx_fetches.push(hash);
+                }
+                continue;
+            }
             // Prefer the marker the wrapper already carries; fall back to
             // the BFT-transitive `from_persisted` gate for sync-loaded
             // blocks whose `Verifiable` entries decoded as Unverified.
