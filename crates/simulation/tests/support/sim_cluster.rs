@@ -27,13 +27,14 @@ use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, submission_shards,
     vote_reshape_threshold,
 };
+use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeight, CertifiedBlock, ConsensusReceipt,
-    Derivation, Event, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot,
-    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    ValidatorId, Verified, WeightedTimestamp,
+    Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock,
+    ConsensusReceipt, Derivation, Event, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId,
+    Signer, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
 };
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
@@ -467,6 +468,27 @@ impl SimCluster {
     /// Panics if `host` does not serve `shard`, or if the rejoin does not
     /// take the retained-storage path — a snap-sync there would be a
     /// different test entirely.
+    /// Shard consensus statistics of `host`'s vnodes in `shard`, in vnode
+    /// order; empty when the host doesn't carry it.
+    #[must_use]
+    pub fn shard_stats(&self, host: usize, shard: ShardId) -> Vec<ShardStats> {
+        self.runner.shard_stats(host_index(host), shard)
+    }
+
+    /// The header `host`'s copy of `shard` holds certified at `height`.
+    #[must_use]
+    pub fn certified_header(
+        &self,
+        host: usize,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Option<BlockHeader> {
+        self.runner
+            .hosts_shard(host_index(host), shard)?
+            .get_certified_header(height)
+            .map(|certified| certified.header().clone())
+    }
+
     pub fn restart_host(&mut self, host: usize, shard: ShardId) {
         let kind = self.runner.restart_shard(host_index(host), shard);
         assert!(

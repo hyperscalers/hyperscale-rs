@@ -12,7 +12,7 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BlockHeight, LocalTimestamp, Round, SafeVoteRegisters, ShardId, TopologySchedule,
-    VIEW_CHANGE_TIMEOUT, ValidatorId,
+    VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId,
 };
 
 fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
@@ -46,12 +46,12 @@ fn fresh_coordinator_reports_genesis_chain_state() {
 }
 
 #[test]
-fn current_view_change_timeout_at_initial_round_is_protocol_base() {
+fn current_view_change_timeout_at_initial_round_is_the_default() {
     let coordinator = fresh_coordinator(ShardConsensusConfig::default());
 
     assert_eq!(
         coordinator.current_view_change_timeout(),
-        VIEW_CHANGE_TIMEOUT
+        VIEW_CHANGE_TIMEOUT_DEFAULT
     );
 }
 
@@ -105,6 +105,7 @@ fn stats_reports_initial_defaults() {
         current_round,
         committed_height,
         delay_estimate,
+        base_timeout,
     } = coordinator.stats();
 
     assert_eq!(view_changes, 0);
@@ -112,6 +113,7 @@ fn stats_reports_initial_defaults() {
     assert_eq!(current_round, Round::new(1).inner());
     assert_eq!(committed_height, BlockHeight::GENESIS);
     assert_eq!(delay_estimate, None);
+    assert_eq!(base_timeout, VIEW_CHANGE_TIMEOUT_DEFAULT);
 }
 
 #[test]

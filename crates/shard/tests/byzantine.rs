@@ -5,7 +5,10 @@ mod common;
 use std::time::Duration;
 
 use common::{ByzantineBehaviour, ShardCoordinatorSim};
-use hyperscale_types::{BlockHeight, Round, VIEW_CHANGE_TIMEOUT, ValidatorId, WeightedTimestamp};
+use hyperscale_types::{
+    BlockHeight, Round, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
+    WeightedTimestamp,
+};
 
 const MAX_STEPS: usize = 5_000;
 
@@ -67,7 +70,7 @@ fn sub_timeout_slow_proposer_commits_without_view_change() {
     sim.with_byzantine(
         slow,
         ByzantineBehaviour::DelayProposal {
-            delay: VIEW_CHANGE_TIMEOUT / 3,
+            delay: VIEW_CHANGE_TIMEOUT_MIN / 3,
         },
     );
     sim.kick_off();
@@ -114,7 +117,7 @@ fn super_timeout_slow_proposer_is_rotated_past() {
     sim.with_byzantine(
         slow,
         ByzantineBehaviour::DelayProposal {
-            delay: VIEW_CHANGE_TIMEOUT * 2,
+            delay: VIEW_CHANGE_TIMEOUT_DEFAULT * 2,
         },
     );
     sim.kick_off();

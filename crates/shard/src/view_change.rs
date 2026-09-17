@@ -1,5 +1,5 @@
-//! View change liveness state: current round, linear-backoff tracking, and
-//! leader-activity timestamps.
+//! View change liveness state: current round, the round timer and its
+//! backoff, and leader-activity timestamps.
 //!
 //! When its round timer fires a validator broadcasts a `Timeout` (the
 //! coordinator's pacemaker); the round advances only on a 2f+1 timeout quorum,
@@ -8,7 +8,7 @@
 //!
 //! - `view` — current round.
 //! - `view_at_height_start` — round when the current height began; drives
-//!   linear backoff (timeout grows with rounds attempted at the height).
+//!   the backoff (the timeout doubles per round abandoned at the height).
 //! - `last_leader_activity` — any signal from the leader (proposal, header,
 //!   QC, commit) resets the timeout.
 //! - `last_header_reset` — rate-limits `record_header_activity` to once per
@@ -18,8 +18,9 @@
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeader, BlockHeight, LocalTimestamp, Round, VIEW_CHANGE_TIMEOUT,
-    VIEW_CHANGE_TIMEOUT_INCREMENT, VIEW_CHANGE_TIMEOUT_MAX,
+    BlockHeader, BlockHeight, LocalTimestamp, PROGRESS_WAIT_MULTIPLIER, Round,
+    VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX,
+    VIEW_CHANGE_TIMEOUT_MIN,
 };
 
 use crate::coordinator::SPECULATIVE_VERIFY_GAP;
@@ -44,9 +45,9 @@ pub struct ViewChangeController {
     /// Current round.
     pub(crate) view: Round,
 
-    /// Round at the start of the current height. Used by the linear-backoff
-    /// timeout formula: `rounds_at_height = view - view_at_height_start`.
-    /// Reset to `view` when `committed_height` advances.
+    /// Round at the start of the current height. Drives the backoff:
+    /// `rounds_at_height = view - view_at_height_start`. Reset to `view`
+    /// when `committed_height` advances.
     pub(crate) view_at_height_start: Round,
 
     /// Time of last leader activity (proposal, header receipt, QC, commit).
@@ -135,20 +136,39 @@ impl ViewChangeController {
         }
     }
 
-    /// Linear-backoff view change timeout for the current round.
-    ///
-    /// `timeout = min(VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT *
-    /// rounds_at_height, VIEW_CHANGE_TIMEOUT_MAX)`. All validators compute
-    /// the same timeout because round numbers are QC- and header-attested,
-    /// so the formula is deterministic network-wide.
+    /// The round timer's base: `VIEW_CHANGE_DELAY_MULTIPLIER` network delays
+    /// as the committed chain measures them, bounded, or the default while
+    /// the chain has yet to measure a full rotation.
+    pub(crate) fn base_timeout(&self) -> Duration {
+        self.delay
+            .delay()
+            .map_or(VIEW_CHANGE_TIMEOUT_DEFAULT, |delay| {
+                (delay * VIEW_CHANGE_DELAY_MULTIPLIER)
+                    .clamp(VIEW_CHANGE_TIMEOUT_MIN, VIEW_CHANGE_TIMEOUT_MAX)
+            })
+    }
+
+    /// View change timeout for the current round: the base doubled per
+    /// round already abandoned at this height, capped at
+    /// `VIEW_CHANGE_TIMEOUT_MAX`. All validators compute the same timeout:
+    /// the base is a function of the committed chain and round numbers are
+    /// QC- and header-attested.
     pub(crate) fn current_timeout(&self) -> Duration {
         let rounds_at_height = self
             .view
             .inner()
             .saturating_sub(self.view_at_height_start.inner());
-        let rounds_factor = u32::try_from(rounds_at_height).unwrap_or(u32::MAX);
-        let timeout = VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT * rounds_factor;
-        timeout.min(VIEW_CHANGE_TIMEOUT_MAX)
+        // Five doublings of the floor already clear the cap.
+        let doublings = u32::try_from(rounds_at_height.min(5)).expect("at most five");
+        self.base_timeout()
+            .saturating_mul(1 << doublings)
+            .min(VIEW_CHANGE_TIMEOUT_MAX)
+    }
+
+    /// Ceiling on view-change suppression while a proposal is in flight:
+    /// `PROGRESS_WAIT_MULTIPLIER` round timer bases.
+    pub(crate) fn progress_wait(&self) -> Duration {
+        self.base_timeout() * PROGRESS_WAIT_MULTIPLIER
     }
 
     /// Time remaining until the view change timer should fire.
@@ -241,25 +261,70 @@ impl ViewChangeController {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::{ProposerTimestamp, WeightedTimestamp};
+
     use super::*;
 
-    #[test]
-    fn current_timeout_grows_linearly_with_rounds_at_height() {
+    /// A controller whose chain has committed a full rotation of `n`
+    /// blocks, each measuring `delay_ms` from proposer stamp to quorum vote.
+    fn with_delay(delay_ms: u64, n: usize) -> ViewChangeController {
         let mut vc = ViewChangeController::new(Round::INITIAL);
+        for i in 1..=u64::try_from(n).unwrap() + 1 {
+            vc.delay.observe(
+                CommittedSample {
+                    round: Round::new(i),
+                    timestamp: ProposerTimestamp::from_millis(i * 1_000),
+                    is_fallback: false,
+                    parent_qc_round: Round::new(i - 1),
+                    parent_qc_weighted_timestamp: WeightedTimestamp::from_millis(
+                        (i - 1) * 1_000 + delay_ms,
+                    ),
+                },
+                n,
+            );
+        }
+        vc
+    }
 
-        assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT);
+    #[test]
+    fn base_is_the_default_until_a_rotation_has_committed() {
+        let vc = ViewChangeController::new(Round::INITIAL);
+        assert_eq!(vc.delay(), None);
+        assert_eq!(vc.base_timeout(), VIEW_CHANGE_TIMEOUT_DEFAULT);
+        assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT_DEFAULT);
+        assert_eq!(
+            vc.progress_wait(),
+            VIEW_CHANGE_TIMEOUT_DEFAULT * PROGRESS_WAIT_MULTIPLIER
+        );
+    }
+
+    #[test]
+    fn base_is_six_delays_bounded_both_ways() {
+        let vc = with_delay(300, 4);
+        assert_eq!(vc.delay(), Some(Duration::from_millis(300)));
+        assert_eq!(vc.base_timeout(), Duration::from_millis(1_800));
+        assert_eq!(vc.progress_wait(), Duration::from_millis(5_400));
+
+        // Faster than the floor allows.
+        assert_eq!(with_delay(20, 4).base_timeout(), VIEW_CHANGE_TIMEOUT_MIN);
+        // Slower than the cap allows.
+        assert_eq!(
+            with_delay(60_000, 4).base_timeout(),
+            VIEW_CHANGE_TIMEOUT_MAX
+        );
+    }
+
+    #[test]
+    fn current_timeout_doubles_per_round_at_height() {
+        let mut vc = with_delay(300, 4);
+        let base = Duration::from_millis(1_800);
+        assert_eq!(vc.current_timeout(), base);
 
         vc.view = Round::new(1);
-        assert_eq!(
-            vc.current_timeout(),
-            VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT
-        );
+        assert_eq!(vc.current_timeout(), base * 2);
 
-        vc.view = Round::new(4);
-        assert_eq!(
-            vc.current_timeout(),
-            VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT * 4
-        );
+        vc.view = Round::new(3);
+        assert_eq!(vc.current_timeout(), base * 8);
     }
 
     #[test]
@@ -267,20 +332,21 @@ mod tests {
         let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(10_000);
         assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT_MAX);
+
+        let mut floored = with_delay(20, 4);
+        floored.view = Round::new(10_000);
+        assert_eq!(floored.current_timeout(), VIEW_CHANGE_TIMEOUT_MAX);
     }
 
     #[test]
     fn reset_for_height_advance_rebases_round_counter() {
         let mut vc = ViewChangeController::new(Round::INITIAL);
 
-        vc.view = Round::new(5);
-        assert_eq!(
-            vc.current_timeout(),
-            VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT * 5
-        );
+        vc.view = Round::new(2);
+        assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT_DEFAULT * 4);
 
         vc.reset_for_height_advance();
-        assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT);
+        assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT_DEFAULT);
     }
 
     #[test]
@@ -385,11 +451,11 @@ mod tests {
         vc.record_leader_activity(activity);
 
         let before = activity.plus(
-            VIEW_CHANGE_TIMEOUT
+            VIEW_CHANGE_TIMEOUT_DEFAULT
                 .checked_sub(Duration::from_millis(1))
                 .unwrap(),
         );
-        let after = activity.plus(VIEW_CHANGE_TIMEOUT);
+        let after = activity.plus(VIEW_CHANGE_TIMEOUT_DEFAULT);
 
         assert!(!vc.timeout_elapsed(before));
         assert!(vc.timeout_elapsed(after));

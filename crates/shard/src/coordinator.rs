@@ -19,11 +19,11 @@ use hyperscale_core::{
 };
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
-    FinalizationHash, Hash, LocalTimestamp, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
-    PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvenCells, ProvisionHash, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
-    StoredReceipt, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
-    derive_reshape_trigger, ready_signal_window,
+    FinalizationHash, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr,
+    ProposerTimestamp, ProvenAnchors, ProvenCells, ProvisionHash, ReadySignal, ReshapeThresholds,
+    ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
+    SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, derive_reshape_trigger,
+    ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -46,6 +46,9 @@ pub struct ShardStats {
     /// committee rotation has committed. Identical across replicas at the
     /// same committed height.
     pub delay_estimate: Option<Duration>,
+    /// The round timer's base: derived from `delay_estimate`, or the
+    /// default while that is unmeasured.
+    pub base_timeout: Duration,
 }
 
 /// Shard consensus memory statistics for monitoring collection sizes.
@@ -1694,10 +1697,16 @@ impl ShardCoordinator {
             .record_header_activity(height, round, self.now);
     }
 
-    /// Linear-backoff view change timeout for the current round.
+    /// View change timeout for the current round.
     #[must_use]
     pub fn current_view_change_timeout(&self) -> Duration {
         self.view_change.current_timeout()
+    }
+
+    /// Ceiling on view-change suppression while a proposal is in flight.
+    #[must_use]
+    pub fn progress_wait(&self) -> Duration {
+        self.view_change.progress_wait()
     }
 
     /// Time remaining until the view change timer should fire.
@@ -1723,7 +1732,7 @@ impl ShardCoordinator {
         // the leader's block. The timeout should detect leader *failure*,
         // not slow vote/QC propagation around a healthy proposal.
         //
-        // Three suppression sources, all bounded by `MAX_PROGRESS_WAIT`
+        // Three suppression sources, all bounded by the progress wait
         // measured from the last leader-activity reset so a Byzantine
         // proposer who only sends a header (and never advances the chain)
         // can't pin us at a stale round forever:
@@ -1738,7 +1747,7 @@ impl ShardCoordinator {
         // *other* replicas: a proposal we have already voted on, and a block
         // left over from a round the pacemaker abandoned, both need a quorum
         // we cannot supply, and the round timer is what bounds that wait.
-        // Suppressing on either prices it at `MAX_PROGRESS_WAIT` — three
+        // Suppressing on either prices it at the progress wait — three
         // times the nominal timeout — while the pacemaker sits on its hands.
         //
         // A block the vote fence withheld is excluded on the same
@@ -1762,7 +1771,7 @@ impl ShardCoordinator {
             let within_progress_window = self
                 .view_change
                 .last_leader_activity
-                .is_some_and(|t| self.now.saturating_sub(t) < MAX_PROGRESS_WAIT);
+                .is_some_and(|t| self.now.saturating_sub(t) < self.view_change.progress_wait());
             if within_progress_window {
                 return false;
             }
@@ -2873,7 +2882,7 @@ impl ShardCoordinator {
     /// QC ahead of it would let the fresh committee certify a sibling of
     /// real committed history above the anchor and break commit linkage
     /// when the suffix then syncs in. So under a halt the anchor is taken
-    /// only once the cohort has had [`MAX_PROGRESS_WAIT`] — several of
+    /// only once the cohort has had the progress wait — several of
     /// the timeout retransmissions that carry an offer — to name a tip
     /// above it and named none. A cohort that answers with nothing above
     /// the anchor is one of importers, or one whose suffix left with the
@@ -2898,7 +2907,7 @@ impl ShardCoordinator {
                     return Vec::new();
                 }
                 let started = *self.halt_harvest_started.get_or_insert(self.now);
-                if self.now.saturating_sub(started) < MAX_PROGRESS_WAIT {
+                if self.now.saturating_sub(started) < self.view_change.progress_wait() {
                     return Vec::new();
                 }
                 self.adopt_anchor_qc(topology_schedule)
@@ -6737,6 +6746,7 @@ impl ShardCoordinator {
             current_round: self.view_change.view.inner(),
             committed_height: self.committed_height,
             delay_estimate: self.view_change.delay(),
+            base_timeout: self.view_change.base_timeout(),
         }
     }
 
@@ -6966,8 +6976,9 @@ mod tests {
         NetworkDefinition, NetworkParams, RoutePrefix, SettledSetVerdict, SettledTxSet,
         SettledTxsRoot, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
         TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
-        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet,
-        VoteCount, WeightedTimestamp, WitnessSources, settled_set_verdict, test_utils,
+        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
+        ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources, settled_set_verdict,
+        test_utils,
     };
 
     use super::*;
@@ -10875,7 +10886,9 @@ mod tests {
 
         // Past the round timeout, inside the progress window.
         state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
-        state.set_time(LocalTimestamp::ZERO.plus(VIEW_CHANGE_TIMEOUT + Duration::from_millis(1)));
+        state.set_time(
+            LocalTimestamp::ZERO.plus(VIEW_CHANGE_TIMEOUT_DEFAULT + Duration::from_millis(1)),
+        );
         assert!(
             !state.should_advance_round(),
             "content still landing here is worth the window",
