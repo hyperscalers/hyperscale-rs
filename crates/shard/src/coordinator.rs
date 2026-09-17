@@ -6602,7 +6602,7 @@ impl ShardCoordinator {
         // peer signal ever supplies a higher one.
         self.release_stalled_harvest();
         let mut actions = self.try_adopt_anchor_qc(topology_schedule);
-        actions.extend(self.re_offer_retained_tip(topology_schedule));
+        actions.extend(self.reoffer_retained_tip(topology_schedule));
         actions.extend(self.resume_recovered_blocks(topology_schedule));
 
         let next_needed_height = self.committed_height.next();
@@ -6669,7 +6669,7 @@ impl ShardCoordinator {
     /// harvested there, never tallied, so re-sending it changes no quorum
     /// arithmetic; on this side it re-asserts a vote and a lock the timed
     /// out round already holds.
-    fn re_offer_retained_tip(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+    fn reoffer_retained_tip(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let view = self.view_change.view;
         if self.last_timed_out_round != Some(view) {
             return Vec::new();
@@ -9504,7 +9504,7 @@ mod tests {
     /// too — but only once the timer has fired for the current round, so
     /// the tick never manufactures a timeout the pacemaker did not.
     #[test]
-    fn a_retained_member_re_offers_its_tip_on_every_tick() {
+    fn a_retained_member_reoffers_its_tip_on_every_tick() {
         let (mut state, schedule) = make_test_state();
         let schedule = TopologySchedule::single(with_pending_halt_recovery(
             &schedule,
@@ -9531,7 +9531,7 @@ mod tests {
     /// The re-offer is a retained member's duty: a member the recovery
     /// seated fresh times out its rounds through the pacemaker alone.
     #[test]
-    fn a_fresh_member_does_not_re_offer() {
+    fn a_fresh_member_does_not_reoffer() {
         let (mut state, schedule) = make_test_state();
         let schedule = TopologySchedule::single(with_pending_halt_recovery(
             &schedule,
