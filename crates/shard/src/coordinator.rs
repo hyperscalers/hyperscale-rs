@@ -267,6 +267,20 @@ struct WitnessCommitmentPreview {
     base: BeaconWitnessLeafCount,
 }
 
+/// What a halt recovery's retained cohort has offered this member as the
+/// halted chain's certified tip, and whether the harvest can reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedTip {
+    /// A certified height a retained ex-member offered. The harvest syncs
+    /// to it, and proposals wait until its QC is `high_qc`.
+    Offered(BlockHeight),
+    /// An offered height the harvest could not reach: the sync settled
+    /// below it, or applied nothing for `HALT_HARVEST_WAIT`. Offers at
+    /// or below it name the same unreachable tail and are ignored; a
+    /// higher offer reopens the harvest.
+    Unreachable(BlockHeight),
+}
+
 /// One transaction's contribution to its payer's fee demand.
 struct PayerFee {
     /// The payer's fee vault.
@@ -423,10 +437,12 @@ pub struct ShardCoordinator {
     /// across a halt recovery — read off the timeouts
     /// [`Self::harvest_retained_tip`] harvests, which is the only signal
     /// carrying the halted tip to an incomer seated at the beacon's
-    /// frontier. Gates this member's proposals until the harvest sync
-    /// delivers that tip and its QC becomes `high_qc`; see
+    /// frontier — and whether the harvest reached it. An offered tip
+    /// gates this member's proposals until the harvest sync delivers it
+    /// and its QC becomes `high_qc`; an unreachable one gates nothing and
+    /// keeps the same offer from re-arming the gate. See
     /// [`Self::recovery_behind_retained_tip`].
-    retained_tip_offered: Option<BlockHeight>,
+    retained_tip: Option<RetainedTip>,
 
     /// The last instant the halt harvest advanced: the seating window
     /// opened with nothing offered, a retained member offered a higher
@@ -731,7 +747,7 @@ impl ShardCoordinator {
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
-            retained_tip_offered: None,
+            retained_tip: None,
             halt_harvest_progress: None,
             // Recover the registers from the durable record (which holds
             // every position this validator signed — persisted before each
@@ -1689,6 +1705,7 @@ impl ShardCoordinator {
             "Sync complete, resuming normal consensus"
         );
         self.set_block_syncing(false);
+        self.settle_short_harvest();
 
         // Resume fetching for any pending blocks that still need data.
         // During sync, check_pending_block_fetches() returns empty because we
@@ -2245,15 +2262,19 @@ impl ShardCoordinator {
     /// the tip arrives with the QC over it, which its apply adopts. A shard
     /// whose retained cohort offers nothing — no suffix above the
     /// frontier, or no ex-member left to answer — is never held, which is
-    /// the case where extending the frontier is the only move there is.
+    /// the case where extending the frontier is the only move there is;
+    /// nor is one whose offered tip proved unreachable, which is the same
+    /// case reached the slow way.
     fn recovery_behind_retained_tip(&self) -> bool {
-        self.retained_tip_offered.is_some_and(|offered| {
-            offered
-                > self
-                    .latest_qc
-                    .as_ref()
-                    .map_or(BlockHeight::GENESIS, |qc| qc.height())
-        })
+        matches!(
+            self.retained_tip,
+            Some(RetainedTip::Offered(offered))
+                if offered
+                    > self
+                        .latest_qc
+                        .as_ref()
+                        .map_or(BlockHeight::GENESIS, |qc| qc.height())
+        )
     }
 
     /// Pre-build gate: we must be the proposer for this round, must not have
@@ -2538,12 +2559,6 @@ impl ShardCoordinator {
         // after a timeout quorum and a sync block from a syncing proposer
         // would otherwise build siblings of the suffix being harvested.
         if self.recovery_behind_retained_tip() {
-            trace!(
-                validator = ?self.me,
-                height = height.inner(),
-                round = round.inner(),
-                "Proposal held behind the retained tip"
-            );
             return vec![];
         }
         let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
@@ -2975,7 +2990,7 @@ impl ShardCoordinator {
         match recovery.cause {
             RecoveryCause::Fork => self.adopt_anchor_qc(topology_schedule),
             RecoveryCause::Halt => {
-                if self.retained_tip_offered.is_some()
+                if matches!(self.retained_tip, Some(RetainedTip::Offered(_)))
                     || self.tip_committee(topology_schedule).is_none()
                 {
                     return Vec::new();
@@ -5779,7 +5794,7 @@ impl ShardCoordinator {
             .insert_verified_certified_block(block_hash, Arc::clone(&certified));
         self.block_sync.mark_applied(height, block_hash);
         self.initiate_synced_state_root_verification(topology_schedule, certified.block());
-        if self.retained_tip_offered.is_some() {
+        if matches!(self.retained_tip, Some(RetainedTip::Offered(_))) {
             self.halt_harvest_progress = Some(self.now);
         }
 
@@ -5843,8 +5858,9 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
-        while let Some((block, verified_qc)) =
-            self.block_sync.take_next_verified(self.committed_height)
+        while let Some((block, verified_qc)) = self
+            .block_sync
+            .take_next_verified(self.committed_height, self.committed_hash)
         {
             actions.extend(self.apply_synced_block(topology_schedule, block, verified_qc));
         }
@@ -6227,13 +6243,18 @@ impl ShardCoordinator {
         );
         // Remember what was offered: until the tip's own QC becomes this
         // member's `high_qc`, proposing would build over heights the
-        // halted chain already holds.
-        if self
-            .retained_tip_offered
-            .is_none_or(|seen| carried.height() > seen)
-        {
-            self.retained_tip_offered = Some(carried.height());
-            self.halt_harvest_progress = Some(self.now);
+        // halted chain already holds. An offer at or below a tip the
+        // harvest already found unreachable is the same tail, re-sent on
+        // the retained member's tick, and changes nothing.
+        match self.retained_tip {
+            Some(RetainedTip::Unreachable(unreachable)) if carried.height() <= unreachable => {
+                return Some(Vec::new());
+            }
+            Some(RetainedTip::Offered(offered)) if carried.height() <= offered => {}
+            _ => {
+                self.retained_tip = Some(RetainedTip::Offered(carried.height()));
+                self.halt_harvest_progress = Some(self.now);
+            }
         }
         Some(self.start_block_sync(carried.height()))
     }
@@ -6658,8 +6679,8 @@ impl ShardCoordinator {
         // entry that always has the schedule in hand — so the fresh
         // committee holds the parent QC for its first block even when no
         // peer signal ever supplies a higher one.
-        self.release_stalled_harvest();
-        let mut actions = self.try_adopt_anchor_qc(topology_schedule);
+        let mut actions = self.release_stalled_harvest();
+        actions.extend(self.try_adopt_anchor_qc(topology_schedule));
         actions.extend(self.reoffer_retained_tip(topology_schedule));
         actions.extend(self.resume_recovered_blocks(topology_schedule));
 
@@ -6686,28 +6707,67 @@ impl ShardCoordinator {
 
     /// Lift the proposal hold when the harvest it waits on has stalled:
     /// `HALT_HARVEST_WAIT` with no synced block applied since the tip was
-    /// offered. A cohort that offers a tip and then serves none of it is
-    /// unreachable, and is treated as the cohort that offered nothing —
-    /// the anchor is adopted on this same tick and the committee builds
-    /// on what it holds. A re-offer arriving afterwards is harvested
-    /// afresh; once the committee has certified a block of its own, the
-    /// harvest refuses it instead.
-    fn release_stalled_harvest(&mut self) {
+    /// offered. A cohort that offers a tip and then serves none of it
+    /// past this point holds a tail nobody can serve — a block the halted
+    /// chain certified without any member keeping its body. The tip goes
+    /// unreachable, the sync settles at what it reached, the anchor is
+    /// adopted on this same tick if nothing applied, and the committee
+    /// builds on what it holds. Re-offers of the same tip change nothing;
+    /// a higher offer reopens the harvest, and once the committee has
+    /// certified a block of its own the harvest refuses offers instead.
+    fn release_stalled_harvest(&mut self) -> Vec<Action> {
         if !self.recovery_behind_retained_tip() {
-            return;
+            return Vec::new();
         }
         let stalled = self
             .halt_harvest_progress
             .is_some_and(|since| self.now.saturating_sub(since) >= HALT_HARVEST_WAIT);
         if !stalled {
+            return Vec::new();
+        }
+        let Some(RetainedTip::Offered(offered)) = self.retained_tip else {
+            return Vec::new();
+        };
+        warn!(
+            validator = ?self.me,
+            offered = offered.inner(),
+            "Retained tip harvest stalled; releasing the proposal hold"
+        );
+        self.retained_tip = Some(RetainedTip::Unreachable(offered));
+        self.block_sync.discard_above(self.sync_frontier());
+        self.queue_ready_proposal();
+        vec![Action::SettleBlockSync]
+    }
+
+    /// A harvest sync that completed below the offered tip found the tip
+    /// unfounded: no retained member serves the height above what
+    /// applied. The tail above the frontier is the halted chain's, held
+    /// by nobody who can serve it, and the committee builds on what it
+    /// holds instead of waiting for it.
+    fn settle_short_harvest(&mut self) {
+        let Some(RetainedTip::Offered(offered)) = self.retained_tip else {
+            return;
+        };
+        let frontier = self.sync_frontier();
+        if offered <= frontier {
             return;
         }
         warn!(
             validator = ?self.me,
-            offered = ?self.retained_tip_offered.map(BlockHeight::inner),
-            "Retained tip harvest stalled; releasing the proposal hold"
+            offered = offered.inner(),
+            frontier = frontier.inner(),
+            "Retained tip harvest ended short of the offer; building on what was reached"
         );
-        self.retained_tip_offered = None;
+        self.retained_tip = Some(RetainedTip::Unreachable(offered));
+        self.block_sync.discard_above(frontier);
+        self.queue_ready_proposal();
+    }
+
+    /// The highest height this node holds in chain state: the committed
+    /// tip, or the top synced block applied above it.
+    fn sync_frontier(&self) -> BlockHeight {
+        self.committed_height
+            .max(self.block_sync.sync_applied_height())
     }
 
     /// Re-broadcast this member's current-round timeout on the periodic
@@ -9784,7 +9844,10 @@ mod tests {
             a,
             Action::StartBlockSync { target } if *target == BlockHeight::new(5)
         )));
-        assert_eq!(state.retained_tip_offered, Some(BlockHeight::new(5)));
+        assert_eq!(
+            state.retained_tip,
+            Some(RetainedTip::Offered(BlockHeight::new(5)))
+        );
         assert!(state.recovery_behind_retained_tip());
     }
 
@@ -9801,6 +9864,7 @@ mod tests {
         ));
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(4);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
 
         let _ = state.on_unverified_timeout(&schedule, &retained_offer_of(BlockHeight::new(5)));
         assert!(state.recovery_behind_retained_tip());
@@ -9852,7 +9916,7 @@ mod tests {
             .harvest_retained_tip(&schedule, &retained_offer_of(BlockHeight::new(5)))
             .expect("a retained voter is harvested, not dropped as an outsider");
         assert!(refused.is_empty(), "got {refused:?}");
-        assert_eq!(state.retained_tip_offered, None);
+        assert_eq!(state.retained_tip, None);
 
         state.latest_qc = Some(high_qc_stamped_at(0));
         let harvested = state
@@ -9862,7 +9926,10 @@ mod tests {
             a,
             Action::StartBlockSync { target } if *target == BlockHeight::new(5)
         )));
-        assert_eq!(state.retained_tip_offered, Some(BlockHeight::new(5)));
+        assert_eq!(
+            state.retained_tip,
+            Some(RetainedTip::Offered(BlockHeight::new(5)))
+        );
     }
 
     /// A state that builds a proposal at height 4 on a persisted tip at 3,
@@ -9917,7 +9984,7 @@ mod tests {
             state.build_and_broadcast_fallback_block(&schedule, BlockHeight::new(4), Round::new(1));
         assert!(!builds_a_proposal(&held), "got {held:?}");
 
-        state.retained_tip_offered = None;
+        state.retained_tip = None;
         let built =
             state.build_and_broadcast_fallback_block(&schedule, BlockHeight::new(4), Round::new(1));
         assert!(builds_a_proposal(&built), "got {built:?}");
@@ -9939,7 +10006,7 @@ mod tests {
         );
         assert!(!builds_a_proposal(&held), "got {held:?}");
 
-        state.retained_tip_offered = None;
+        state.retained_tip = None;
         let built = state.build_and_dispatch_proposal(
             &schedule,
             BlockHeight::new(4),
@@ -9976,11 +10043,19 @@ mod tests {
         assert!(state.anchor_qc.is_some());
 
         state.set_time(LocalTimestamp::from_millis(100_000 + wait));
-        let _ = state.check_sync_health(&schedule);
+        let actions = state.check_sync_health(&schedule);
         assert!(!state.recovery_behind_retained_tip());
         assert!(
             state.anchor_qc.is_none(),
             "the anchor is taken once the hold lifts"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::SettleBlockSync)),
+            "the sync settles at what it reached; got {actions:?}"
+        );
+        assert_eq!(
+            state.retained_tip,
+            Some(RetainedTip::Unreachable(BlockHeight::new(5)))
         );
     }
 
@@ -9995,6 +10070,7 @@ mod tests {
             Epoch::new(2),
         ));
         state.committed_height = BlockHeight::new(4);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
         let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
 
         state.set_time(LocalTimestamp::from_millis(100_000));
@@ -10058,7 +10134,7 @@ mod tests {
         assert_eq!(state.committed_height, BlockHeight::new(3));
 
         state.latest_qc = Some(make_test_qc(five_hash, BlockHeight::new(5)));
-        state.retained_tip_offered = Some(BlockHeight::new(5));
+        state.retained_tip = Some(RetainedTip::Offered(BlockHeight::new(5)));
         state.set_block_syncing(false);
         (state, schedule, four, five)
     }
@@ -10111,6 +10187,120 @@ mod tests {
         install_complete_block(&mut state, &five);
 
         assert_eq!(state.proposal_parent(&schedule).0, five.hash());
+    }
+
+    /// A tip the harvest gave up on is not re-armed by the retained
+    /// member's next re-offer of it: the same height is the same
+    /// unreachable tail. A higher offer is new information and reopens
+    /// the harvest.
+    #[test]
+    fn an_unreachable_tip_is_not_reoffered_into_a_hold() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
+
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let _ = state.on_unverified_timeout(&schedule, &retained_offer_of(BlockHeight::new(5)));
+        state.set_time(LocalTimestamp::from_millis(100_000 + wait));
+        let _ = state.check_sync_health(&schedule);
+        assert_eq!(
+            state.retained_tip,
+            Some(RetainedTip::Unreachable(BlockHeight::new(5)))
+        );
+        assert!(!state.recovery_behind_retained_tip());
+
+        let again = state
+            .harvest_retained_tip(&schedule, &retained_offer_of(BlockHeight::new(5)))
+            .expect("retained voter");
+        assert!(again.is_empty(), "got {again:?}");
+        assert!(!state.recovery_behind_retained_tip());
+
+        let higher = state
+            .harvest_retained_tip(&schedule, &retained_offer_of(BlockHeight::new(6)))
+            .expect("retained voter");
+        assert!(higher.iter().any(|a| matches!(
+            a,
+            Action::StartBlockSync { target } if *target == BlockHeight::new(6)
+        )));
+        assert!(state.recovery_behind_retained_tip());
+    }
+
+    /// A harvest sync that completes below the offered tip found the tip
+    /// unfounded: the hold lifts and the committee builds on what it
+    /// reached.
+    #[test]
+    fn a_sync_that_ends_short_of_the_offer_marks_it_unreachable() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(4);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+
+        let _ = state.on_unverified_timeout(&schedule, &retained_offer_of(BlockHeight::new(6)));
+        let (five, _) = deliver_synced(
+            &mut state,
+            &schedule,
+            block_with_parent_qc_ts(BlockHeight::new(5), 100),
+        );
+        let _ = state.on_qc_signature_verified(
+            &schedule,
+            five,
+            Ok(make_test_qc(five, BlockHeight::new(5))),
+        );
+        assert!(state.recovery_behind_retained_tip());
+
+        let _ = state.on_block_sync_complete(&schedule);
+        assert_eq!(
+            state.retained_tip,
+            Some(RetainedTip::Unreachable(BlockHeight::new(6)))
+        );
+        assert!(!state.recovery_behind_retained_tip());
+        assert!(
+            state.take_ready_proposal(),
+            "the release kicks a proposal attempt"
+        );
+    }
+
+    /// A harvest sync that reaches the offered tip leaves the offer
+    /// standing: the tip's QC is `high_qc` and nothing is unreachable.
+    #[test]
+    fn a_sync_that_reaches_the_offer_settles_nothing() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(4);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+
+        let _ = state.on_unverified_timeout(&schedule, &retained_offer_of(BlockHeight::new(5)));
+        let (five, _) = deliver_synced(
+            &mut state,
+            &schedule,
+            block_with_parent_qc_ts(BlockHeight::new(5), 100),
+        );
+        let _ = state.on_qc_signature_verified(
+            &schedule,
+            five,
+            Ok(make_test_qc(five, BlockHeight::new(5))),
+        );
+        let _ = state.on_block_sync_complete(&schedule);
+
+        assert_eq!(
+            state.retained_tip,
+            Some(RetainedTip::Offered(BlockHeight::new(5)))
+        );
+        assert!(!state.recovery_behind_retained_tip());
     }
 
     /// A sync-delivered certified block above the fork recovery's attested
@@ -11409,6 +11599,7 @@ mod tests {
         let (mut state, topology_schedule) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
         state.set_block_syncing(true);
 
         let block = block_with_parent_qc_ts(BlockHeight::new(4), 100);
@@ -11569,6 +11760,7 @@ mod tests {
         let (mut state, topology_schedule) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
         state.set_block_syncing(true);
 
         let deliver = |state: &mut ShardCoordinator, height: u64, ts: u64| {
@@ -11695,6 +11887,7 @@ mod tests {
         let (mut state, topology_schedule) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
         state.set_block_syncing(true);
 
         let (orphan, _) = deliver_synced(
