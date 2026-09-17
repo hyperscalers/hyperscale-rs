@@ -334,6 +334,39 @@ fn isolated_validator_still_settles_sim() {
     cluster.run_faultable(isolated_validator_still_settles);
 }
 
+/// A restarted replica replays its stored headers into the delay estimate,
+/// so it reads the same round timer as its peers from its first live commit
+/// rather than after a full rotation on the default.
+#[test]
+fn round_timer_survives_a_restart_sim() {
+    for seed in ROUND_TIMER_SEEDS {
+        let mut cluster = SimCluster::new(&liveness_config(), seed);
+        assert!(
+            commit_blocks(&mut cluster, 9, epochs(1)),
+            "seed {seed}: the shard must commit two rotations before the restart",
+        );
+        let restarted = 2;
+        cluster.restart_host(restarted, ShardId::ROOT);
+        assert!(
+            commit_blocks(&mut cluster, 2, epochs(1)),
+            "seed {seed}: the shard must commit past the restart",
+        );
+        let readings = round_timer_readings(&cluster);
+        assert_round_timer_agreement(&readings);
+        let stats = cluster.shard_stats(restarted, ShardId::ROOT);
+        assert!(
+            stats.iter().all(|s| s.delay_estimate.is_some()),
+            "seed {seed}: the restarted replica has no estimate after committing live: {readings:?}",
+        );
+        assert!(
+            stats
+                .iter()
+                .all(|s| s.base_timeout == VIEW_CHANGE_TIMEOUT_MIN),
+            "seed {seed}: the restarted replica is not on the adapted timer: {readings:?}",
+        );
+    }
+}
+
 /// Everything `livelock_resolves_promptly` needs funded: it composes
 /// `split_lifecycle`, so the probe transfer's accounts come along with
 /// the conflicting pair's.

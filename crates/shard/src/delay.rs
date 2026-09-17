@@ -62,6 +62,25 @@ impl DelayEstimator {
     /// committee that certified the block and sizes the window.
     pub fn observe(&mut self, committed: CommittedSample, committee_len: usize) {
         self.rotation = committee_len;
+        self.close(&committed);
+        while self.samples.len() > self.rotation {
+            self.samples.pop_front();
+        }
+        self.open(committed);
+    }
+
+    /// Feed a header committed before this replica started, in chain
+    /// order, ahead of any live commit. The rotation is unknown until a
+    /// live commit names its committee, so nothing is trimmed or reported
+    /// yet; the first live commit sizes the window and the newest rotation
+    /// of what was replayed is trusted at once. The caller bounds how much
+    /// it replays.
+    pub fn replay(&mut self, committed: CommittedSample) {
+        self.close(&committed);
+        self.open(committed);
+    }
+
+    fn close(&mut self, committed: &CommittedSample) {
         if let Some((round, stamped)) = self.open.take()
             && committed.parent_qc_round == round
         {
@@ -69,9 +88,9 @@ impl DelayEstimator {
             let sample = Duration::from_millis(voted.saturating_sub(stamped.as_millis()));
             self.samples.push_back(sample);
         }
-        while self.samples.len() > self.rotation {
-            self.samples.pop_front();
-        }
+    }
+
+    const fn open(&mut self, committed: CommittedSample) {
         if !committed.is_fallback {
             self.open = Some((committed.round, committed.timestamp));
         }
@@ -229,6 +248,33 @@ mod tests {
                 "offset {byzantine_stamp_offset}",
             );
         }
+    }
+
+    #[test]
+    fn a_replayed_rotation_is_trusted_at_the_first_live_commit() {
+        let mut est = DelayEstimator::new();
+        for i in 1..=9 {
+            est.replay(healthy(i, 1_000, 100));
+        }
+        assert_eq!(
+            est.delay(),
+            None,
+            "no rotation is known before a live commit"
+        );
+        est.observe(healthy(10, 1_000, 100), 4);
+        assert_eq!(est.delay(), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn a_replay_keeps_only_the_newest_rotation() {
+        let mut est = DelayEstimator::new();
+        for i in 1..=9 {
+            // Old samples are slow; the newest rotation is fast.
+            let delay = if i <= 5 { 900 } else { 100 };
+            est.replay(healthy(i, 1_000, delay));
+        }
+        est.observe(healthy(10, 1_000, 100), 4);
+        assert_eq!(est.delay(), Some(Duration::from_millis(100)));
     }
 
     #[test]

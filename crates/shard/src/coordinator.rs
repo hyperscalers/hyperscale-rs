@@ -677,7 +677,7 @@ impl ShardCoordinator {
         }
         Self {
             verifier,
-            view_change: ViewChangeController::new(initial_view),
+            view_change: ViewChangeController::recovered(initial_view, &recovered.recent_headers),
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
             committed_ts: committed_block_anchor_wt,
