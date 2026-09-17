@@ -41,8 +41,12 @@ pub type SharedTransactions = Arc<Vec<Arc<Verifiable<Transaction>>>>;
 /// nothing derived it on the way in, and deriving is the node's own
 /// answer rather than something the block could carry.
 ///
-/// A refusal is logged and left: the accessors panic where the fact is
-/// actually wanted, naming the transaction that was never derived.
+/// A gap is logged and left. The commit itself is not a choice — the
+/// block is certified, and a replica that holds no record the
+/// transaction names commits it alongside every other — so what the
+/// commit books comes from what the envelope declares of itself, which
+/// the attempt seats whatever it could not route. The routed accessors
+/// panic where such a fact is actually wanted, naming the transaction.
 pub fn derive_block_transactions(block: &Block, derivation: &dyn Derivation) {
     for tx in block.transactions().iter() {
         if let Err(error) = tx.as_unverified().try_derived(derivation) {

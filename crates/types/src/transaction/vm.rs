@@ -230,6 +230,38 @@ impl Routing {
     }
 }
 
+/// What an envelope declares of itself: the facts a node answers from
+/// the envelope alone, with no record resolved and no cache read.
+///
+/// Every consumer that books a committed transaction reads these — the
+/// window its retention is keyed by, the terms its fee hold carries —
+/// and a node that holds none of the records the transaction names
+/// answers them identically to one that holds them all. That is what
+/// lets a replica commit a certified block whose routing it cannot
+/// derive without booking it on different figures than its peers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    /// The window the transaction is admissible in: the root's,
+    /// narrowed by every member beneath it.
+    pub effective_window: TimestampRange,
+    /// The network the root names, which every intent beneath it names
+    /// too.
+    pub network: NetworkId,
+    /// The envelope's signing-time terms: the payer, the fee ceiling,
+    /// the compute ceilings, the priority and the message.
+    pub terms: Terms,
+}
+
+impl From<&Derived> for Declared {
+    fn from(derived: &Derived) -> Self {
+        Self {
+            effective_window: derived.effective_window,
+            network: derived.network,
+            terms: derived.terms.clone(),
+        }
+    }
+}
+
 /// Everything the bridge derives from an envelope.
 ///
 /// The routing identity, the terms and the network, and every
@@ -497,6 +529,25 @@ pub trait Derivation: Send + Sync {
     /// principals it declares, or an attesting key that does not derive
     /// the principal declared at its position.
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError>;
+
+    /// What the envelope declares of itself, answered without resolving
+    /// a record.
+    ///
+    /// The half of [`Self::derive`] that reads nothing a node
+    /// accumulates, so it answers where the full derivation reports a
+    /// gap. A commit is not a choice — a certified block is committed by
+    /// every replica, including one holding none of the records its
+    /// transactions name — and what the commit books comes from here.
+    ///
+    /// # Errors
+    ///
+    /// [`DerivationError::Refused`] on an undecodable or inadmissible
+    /// envelope. Never [`DerivationError::Unresolved`]: an
+    /// implementation that reads a record to answer this has put a
+    /// node's own history into a figure its peers book too.
+    fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+        Ok(Declared::from(&self.derive(vm)?))
+    }
 
     /// Offer one committed cell to the published-package cache.
     ///

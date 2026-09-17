@@ -18,7 +18,9 @@ use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec
 use hyperscale_vm_types::{DeclaredWork, LegShape, PriceTable, Terms};
 use thiserror::Error;
 
-use crate::transaction::vm::{ArtifactTerm, Derivation, ProtocolVerifier, SchemeVerifier};
+use crate::transaction::vm::{
+    ArtifactTerm, Declared, Derivation, ProtocolVerifier, SchemeVerifier,
+};
 use crate::{
     Address, DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey,
     MAX_ENVELOPE_BYTES, NetworkId, OwnerShare, PrincipalAddr, Routing, ShardId, ShardTrie,
@@ -64,6 +66,13 @@ pub struct Transaction {
     #[hbor(skip)]
     derived: OnceLock<Derived>,
 
+    /// What the envelope declares of itself, filled by any derivation
+    /// attempt — including one that found no record to route by, which
+    /// is what lets a commit book a transaction it cannot derive. Not
+    /// on the wire, for the same reason as `derived`.
+    #[hbor(skip)]
+    declared: OnceLock<Declared>,
+
     /// The envelope's signing hash, populated on first call to `hash()`.
     /// `::new` pre-populates. Not on the wire — recomputed at each end so
     /// a peer can't ship `(hash=X, tx_bytes=Y)` and have us key the bogus
@@ -102,6 +111,10 @@ impl Clone for Transaction {
         if let Some(r) = self.derived.get() {
             let _ = derived.set(r.clone());
         }
+        let declared = OnceLock::new();
+        if let Some(d) = self.declared.get() {
+            let _ = declared.set(d.clone());
+        }
         let hash = OnceLock::new();
         if let Some(h) = self.hash.get() {
             let _ = hash.set(*h);
@@ -114,6 +127,7 @@ impl Clone for Transaction {
             serialized_bytes: self.serialized_bytes.clone(),
             body,
             derived,
+            declared,
             hash,
             cached_bytes,
         }
@@ -277,10 +291,11 @@ impl Transaction {
     ///
     /// # Panics
     ///
-    /// As [`Self::work`], on a transaction that was never derived.
+    /// Panics on a transaction no derivation has ever been attempted
+    /// on. An attempt that resolved no record still seats this.
     #[must_use]
     pub fn terms(&self) -> &Terms {
-        &self.derived().terms
+        &self.declared_facts().terms
     }
 
     /// The cells the kernel writes of its own accord.
@@ -356,10 +371,11 @@ impl Transaction {
     ///
     /// # Panics
     ///
-    /// As [`Self::work`], on a transaction that was never derived.
+    /// Panics on a transaction no derivation has ever been attempted
+    /// on. An attempt that resolved no record still seats this.
     #[must_use]
     pub fn validity_range(&self) -> TimestampRange {
-        self.derived().effective_window
+        self.declared_facts().effective_window
     }
 
     /// Create a transaction from a signed envelope.
@@ -382,6 +398,7 @@ impl Transaction {
             serialized_bytes: payload,
             body: body_lock,
             derived: OnceLock::new(),
+            declared: OnceLock::new(),
             hash: hash_lock,
             cached_bytes: OnceLock::new(),
         }
@@ -540,6 +557,31 @@ impl Transaction {
         protocol_statics().rule_admits(auth_cell, self.terms().fee_payer, self.attested_by())
     }
 
+    /// Whether this node could route this transaction: false where the
+    /// records it names are seated somewhere this node has not been, so
+    /// nothing it declares about where it runs is readable here.
+    ///
+    /// What the commit path asks before it books a transaction into
+    /// anything keyed on routing — the ledger entry a shard owes an
+    /// outcome for, the code a member runs — since a certified block is
+    /// committed by every replica and a derivation is only reached by
+    /// the ones holding the records.
+    #[must_use]
+    pub fn is_routed(&self) -> bool {
+        self.derived.get().is_some()
+    }
+
+    /// The cached declaration, or a panic saying nothing ever derived
+    /// this envelope. Filled by every derivation attempt that decoded
+    /// the tree, a gap included, so only a transaction no path has
+    /// touched reaches the panic.
+    fn declared_facts(&self) -> &Declared {
+        self.declared.get().expect(
+            "declared facts read from a transaction no derivation was attempted on; \
+             every consensus path derives before it books",
+        )
+    }
+
     /// The cached derivation, or a panic saying it was never derived.
     fn derived(&self) -> &Derived {
         self.derived.get().expect(
@@ -563,7 +605,9 @@ impl Transaction {
             .expect("a stub transaction derives")
             .clone();
         let tx = Self::new(self.body().clone());
-        let _ = tx.derived.set(Derived { legs, ..base });
+        let derived = Derived { legs, ..base };
+        let _ = tx.declared.set(Declared::from(&derived));
+        let _ = tx.derived.set(derived);
         tx
     }
 
@@ -580,8 +624,38 @@ impl Transaction {
         if let Some(derived) = self.derived.get() {
             return Ok(derived);
         }
-        let derived = derivation.derive(self.body())?;
+        let derived = match derivation.derive(self.body()) {
+            Ok(derived) => derived,
+            Err(error) => {
+                // A gap is not a verdict on the envelope: the records it
+                // names are elsewhere, and what it declares of itself
+                // stands whatever this node holds. Keeping that much is
+                // what lets a certified block this node cannot route be
+                // committed and booked on the same figures as its peers.
+                if error.unresolved().is_some()
+                    && let Ok(declared) = derivation.declared(self.body())
+                {
+                    let _ = self.declared.set(declared);
+                }
+                return Err(error);
+            }
+        };
+        let _ = self.declared.set(Declared::from(&derived));
         Ok(self.derived.get_or_init(|| derived))
+    }
+
+    /// The facts the envelope declares of itself, deriving them through
+    /// `derivation` where nothing has yet.
+    ///
+    /// # Errors
+    ///
+    /// [`DerivationError::Refused`] on an envelope no node admits.
+    pub fn try_declared(&self, derivation: &dyn Derivation) -> Result<&Declared, DerivationError> {
+        if let Some(declared) = self.declared.get() {
+            return Ok(declared);
+        }
+        let declared = derivation.declared(self.body())?;
+        Ok(self.declared.get_or_init(|| declared))
     }
 
     /// Get the cached serialized envelope bytes.
@@ -742,8 +816,8 @@ mod tests {
     use super::*;
     use crate::test_utils::{StubTree, envelope_attestations, test_prefix, test_validity_range};
     use crate::{
-        Derivation, Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId,
-        Secp256k1PrivateKey,
+        Declared, Derivation, Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId,
+        Secp256k1PrivateKey, Unresolved,
     };
 
     struct StubStatics;
@@ -836,6 +910,49 @@ mod tests {
             network,
             derivation: &StubStatics,
         }
+    }
+
+    /// A derivation that resolves no record: the shape a node has
+    /// whenever the components a transaction names were seated
+    /// somewhere it has not been.
+    struct RecordlessStatics;
+
+    impl Derivation for RecordlessStatics {
+        fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            StubTree::decode(vm)?;
+            Err(DerivationError::Unresolved(Unresolved {
+                instances: vec![Address::new([0x77; 31], AddressClass::Component)],
+                packages: Vec::new(),
+            }))
+        }
+
+        fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+            let stub = StubTree::decode(vm)?;
+            Ok(Declared {
+                effective_window: stub.window(),
+                network: stub.network,
+                terms: stub.terms,
+            })
+        }
+    }
+
+    /// A certified block is committed by every replica, including one
+    /// that can route none of it — so the figures a commit books, the
+    /// retention window and the fee hold, come from what the envelope
+    /// declares of itself and read the same on both.
+    #[test]
+    fn a_transaction_whose_records_are_missing_still_declares_its_window_and_terms() {
+        let stranded = fixture(b"tree");
+        let error = stranded
+            .try_derived(&RecordlessStatics)
+            .expect_err("no record this envelope names is seated here");
+        assert!(error.unresolved().is_some(), "a gap, not a verdict");
+
+        let routed = fixture(b"tree");
+        routed.try_derived(&StubStatics).expect("the stub derives");
+
+        assert_eq!(stranded.validity_range(), routed.validity_range());
+        assert_eq!(stranded.terms(), routed.terms());
     }
 
     /// A transaction's share of the sweep budget is read at a placement:
@@ -983,6 +1100,7 @@ mod tests {
             serialized_bytes: bytes,
             body: OnceLock::new(),
             derived: OnceLock::new(),
+            declared: OnceLock::new(),
             hash: OnceLock::new(),
             cached_bytes: OnceLock::new(),
         };

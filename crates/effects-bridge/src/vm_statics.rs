@@ -18,10 +18,10 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
-    ArtifactTerm, Attestation, Attested, DeclaredKey, DeclaredRange, Derivation, DerivationError,
-    Derived, EnvelopeExt, Hash, MAX_INTENT_VALIDITY_RANGE, MAX_STATE_ENTRIES_PER_TX,
-    MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing, TimestampRange,
-    TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
+    ArtifactTerm, Attestation, Attested, Declared, DeclaredKey, DeclaredRange, Derivation,
+    DerivationError, Derived, EnvelopeExt, Hash, MAX_INTENT_VALIDITY_RANGE,
+    MAX_STATE_ENTRIES_PER_TX, MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing,
+    TimestampRange, TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
@@ -1074,6 +1074,20 @@ impl Derivation for BridgeStatics {
             sink(value);
         }
         self.instances.absorb_cell(owner, local, value);
+    }
+
+    /// The tree's own headers and the terms it states, which the
+    /// envelope carries whole — nothing here reads the record or
+    /// package caches, so a node that has seen no seal commit answers
+    /// exactly what one that has seen every seal answers.
+    fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+        let tree = decode_tree(&vm.tree)?;
+        let (effective_window, network) = effective_window(&tree)?;
+        Ok(Declared {
+            effective_window,
+            network,
+            terms: vm.terms.clone(),
+        })
     }
 
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {

@@ -115,7 +115,18 @@ fn committed_members(
     transactions: &[Arc<Verifiable<Transaction>>],
 ) -> Vec<CommittedMember> {
     let trie = classification.shard_trie();
-    assign_participants(classification, transactions)
+    // A transaction this node could not route takes no part here. Where
+    // it runs, what it holds and what this shard owes of it are all read
+    // off a derivation only the nodes holding its records reach, and a
+    // certified block is committed by every replica alike — including
+    // one that has never been where those records are seated. The commit
+    // asks for them; nothing is booked on a shape nobody derived.
+    let routed: Vec<Arc<Verifiable<Transaction>>> = transactions
+        .iter()
+        .filter(|tx| tx.as_unverified().is_routed())
+        .map(Arc::clone)
+        .collect();
+    assign_participants(classification, &routed)
         .into_iter()
         .map(|(tx, participating)| {
             let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);

@@ -26,7 +26,10 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetInstanceRecordsRequest, MAX_INSTANCE_RECORDS_PER_REQUEST,
 };
-use hyperscale_types::{Address, Hash, LocalTimestamp, MessageClass, ShardId, TxHash, ValidatorId};
+use hyperscale_types::{
+    Address, Hash, LocalTimestamp, MessageClass, ShardId, Transaction, TxHash, Unresolved,
+    ValidatorId,
+};
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
@@ -196,12 +199,22 @@ where
         self.fetch_wanted_packages(packages);
     }
 
+    /// What a transaction this node could not route is waiting on, or
+    /// `None` where nothing it waits on can be fetched — a refusal names
+    /// no gap, and a transaction that routes fine has none.
+    pub(crate) fn unrouted_wants(&self, tx: &Transaction) -> Option<Unresolved> {
+        let derivation = self.process.dispatch_handles.executor.derivation();
+        tx.try_derived(derivation.as_ref())
+            .err()
+            .and_then(|error| error.unresolved().cloned())
+    }
+
     /// Ask the shard owning each component's prefix for its record.
     ///
     /// Idempotent: a record is immutable once sealed and self-verifying
     /// on arrival, so asking twice costs a round trip and settles the
     /// same way.
-    fn fetch_instance_records(&mut self, instances: Vec<Address>) {
+    pub(crate) fn fetch_instance_records(&mut self, instances: Vec<Address>) {
         let executor = Arc::clone(&self.process.dispatch_handles.executor);
         let snapshot = self.process.topology_snapshot.load();
         let mut by_shard: BTreeMap<ShardId, Vec<Address>> = BTreeMap::new();
