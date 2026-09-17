@@ -104,12 +104,14 @@ fn stats_reports_initial_defaults() {
         view_syncs,
         current_round,
         committed_height,
+        delay_estimate,
     } = coordinator.stats();
 
     assert_eq!(view_changes, 0);
     assert_eq!(view_syncs, 0);
     assert_eq!(current_round, Round::new(1).inner());
     assert_eq!(committed_height, BlockHeight::GENESIS);
+    assert_eq!(delay_estimate, None);
 }
 
 #[test]
