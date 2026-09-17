@@ -4607,8 +4607,7 @@ impl ShardCoordinator {
     /// A block has been persisted to disk — advances the persisted tip and
     /// unblocks any deferred verifications still waiting on persistence
     /// (boot-time catch-up or fallback if the consensus-commit hook was
-    /// missed). Also auto-resumes from sync when persistence reaches the
-    /// sync target.
+    /// missed).
     pub fn on_block_persisted(
         &mut self,
         topology_schedule: &TopologySchedule,

@@ -180,7 +180,7 @@ impl ShardParticipation {
             // unblocking happens on `BlockCommitted`; this still matters for
             // boot-time catch-up (freshly-booted node has persisted state
             // but an empty in-memory set, so child verifications of just-
-            // persisted parents unblock here) and for auto-resume-from-sync.
+            // persisted parents unblock here).
             ProtocolEvent::BlockPersisted {
                 height,
                 substate_bytes,
