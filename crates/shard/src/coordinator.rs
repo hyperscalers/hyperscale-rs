@@ -377,6 +377,11 @@ pub struct ShardCoordinator {
     /// [`Self::resume_recovered_blocks`] on the first periodic entry that
     /// carries one.
     recovered_blocks: Vec<BlockHash>,
+    /// Headers the store kept below the tip, ascending, awaiting the first
+    /// commit since startup: attributing each to a committee needs the
+    /// topology schedule, which construction has no access to. Drained by
+    /// [`Self::replay_recent_headers`].
+    recent_headers: Vec<BlockHeader>,
     /// In-flight fee reservations at this (payer) shard — committed VM
     /// transactions whose ticks have not yet finalized.
     fee_ledger: FeeReservationLedger,
@@ -578,6 +583,31 @@ impl std::fmt::Debug for ShardCoordinator {
     }
 }
 
+/// The QC a restarted validator resumes on: the higher of the committed
+/// tip's and the one its safe-vote registers justify.
+///
+/// The chain metadata only keeps the QC of a committed block, and a lock
+/// rises on QCs that certify blocks well above the commit tip. Restoring the
+/// higher of the two is what lets a validator satisfy its own lock again: a
+/// committee that restarts together holds no certificate above the lock
+/// anywhere else, and every proposal it can build extends whatever it
+/// recovers here.
+fn restored_high_qc(
+    committed: Option<Verified<QuorumCertificate>>,
+    justification: Option<QuorumCertificate>,
+) -> Option<Verified<QuorumCertificate>> {
+    match (committed, justification) {
+        (Some(committed), Some(justification)) if justification.round() > committed.round() => {
+            Some(Verified::<QuorumCertificate>::from_persisted(justification))
+        }
+        (Some(committed), _) => Some(committed),
+        (None, Some(justification)) => {
+            Some(Verified::<QuorumCertificate>::from_persisted(justification))
+        }
+        (None, None) => None,
+    }
+}
+
 impl ShardCoordinator {
     /// Create a new shard consensus state machine.
     ///
@@ -625,22 +655,7 @@ impl ShardCoordinator {
             .get(&me)
             .cloned()
             .unwrap_or_default();
-        // The chain metadata only keeps the QC of a committed block, and a
-        // lock rises on QCs that certify blocks well above the commit tip.
-        // Restoring the higher of the two is what lets a validator satisfy
-        // its own lock again: a committee that restarts together holds no
-        // certificate above the lock anywhere else, and every proposal it
-        // can build extends whatever it recovers here.
-        let high_qc = match (recovered.latest_qc, recovered_registers.high_qc.clone()) {
-            (Some(committed), Some(justification)) if justification.round() > committed.round() => {
-                Some(Verified::<QuorumCertificate>::from_persisted(justification))
-            }
-            (Some(committed), _) => Some(committed),
-            (None, Some(justification)) => {
-                Some(Verified::<QuorumCertificate>::from_persisted(justification))
-            }
-            (None, None) => None,
-        };
+        let high_qc = restored_high_qc(recovered.latest_qc, recovered_registers.high_qc.clone());
         // Seeded from the chain the store kept, not constructed empty: an
         // empty index refuses no duplicate, so a coordinator resuming a
         // chain without it re-admits everything the window still covers.
@@ -677,7 +692,8 @@ impl ShardCoordinator {
         }
         Self {
             verifier,
-            view_change: ViewChangeController::recovered(initial_view, &recovered.recent_headers),
+            view_change: ViewChangeController::new(initial_view),
+            recent_headers: recovered.recent_headers,
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
             committed_ts: committed_block_anchor_wt,
@@ -5145,18 +5161,45 @@ impl ShardCoordinator {
         };
         self.ready_signal_pool.evict_expired(commit_ts);
 
-        self.view_change.observe_commit(
-            block.header(),
-            committee
-                .consensus_committee_for_shard(self.local_shard)
-                .len(),
-        );
+        let members = committee.consensus_committee_for_shard(self.local_shard);
+        self.replay_recent_headers(topology_schedule, block.header(), members);
+        self.view_change.observe_commit(block.header(), members);
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
 
         let mut actions = self.cleanup_old_state(height);
         self.drain_deferred_reservation_checks(height, &mut actions);
         (actions, witness)
+    }
+
+    /// Feed the headers the store kept below the tip into the delay
+    /// estimate, once, ahead of the first commit since this replica
+    /// started. Only headers the live committee certified count: a member
+    /// the committee change seated holds none of the others, and the
+    /// estimate has to be built from what every member holds. A block's
+    /// committee anchors at its parent's parent QC and is certified at its
+    /// own QC, pinned in its child, so each header is attributed from its
+    /// neighbours; the tip's child is the block committing now.
+    fn replay_recent_headers(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        live: &BlockHeader,
+        members: &[ValidatorId],
+    ) {
+        let headers = std::mem::take(&mut self.recent_headers);
+        let chain: Vec<&BlockHeader> = headers.iter().chain(std::iter::once(live)).collect();
+        for i in 1..chain.len().saturating_sub(1) {
+            let anchor = chain[i - 1].parent_qc().weighted_timestamp();
+            let certified = chain[i + 1].parent_qc().weighted_timestamp();
+            let by_live_committee = topology_schedule
+                .at_for_shard_certified(self.local_shard, anchor, certified)
+                .is_some_and(|(snapshot, _)| {
+                    snapshot.consensus_committee_for_shard(self.local_shard) == members
+                });
+            if by_live_committee {
+                self.view_change.observe_commit(chain[i], members);
+            }
+        }
     }
 
     /// Fold a committed block into the dedup index: what it committed, what

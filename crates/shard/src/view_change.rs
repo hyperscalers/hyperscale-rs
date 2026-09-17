@@ -20,7 +20,7 @@ use std::time::Duration;
 use hyperscale_types::{
     BlockHeader, BlockHeight, LocalTimestamp, PROGRESS_WAIT_MULTIPLIER, Round,
     VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX,
-    VIEW_CHANGE_TIMEOUT_MIN,
+    VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
 };
 
 use crate::coordinator::SPECULATIVE_VERIFY_GAP;
@@ -98,21 +98,10 @@ impl ViewChangeController {
         }
     }
 
-    /// Start the round clock as [`Self::new`] does, with the delay estimate
-    /// seeded from `recent_headers`: the committed headers just below the
-    /// tip, ascending, that the store kept across the restart.
-    pub(crate) fn recovered(initial_view: Round, recent_headers: &[BlockHeader]) -> Self {
-        let mut controller = Self::new(initial_view);
-        for header in recent_headers {
-            controller.delay.replay(Self::sample(header));
-        }
-        controller
-    }
-
     /// Feed a committed header, in chain order, to the delay estimate.
-    /// `committee_len` is the size of the committee that certified it.
-    pub(crate) fn observe_commit(&mut self, header: &BlockHeader, committee_len: usize) {
-        self.delay.observe(Self::sample(header), committee_len);
+    /// `committee` is the one that certified it.
+    pub(crate) fn observe_commit(&mut self, header: &BlockHeader, committee: &[ValidatorId]) {
+        self.delay.observe(Self::sample(header), committee);
     }
 
     fn sample(header: &BlockHeader) -> CommittedSample {
@@ -292,9 +281,10 @@ mod tests {
 
     /// A controller whose chain has committed a full rotation of `n`
     /// blocks, each measuring `delay_ms` from proposer stamp to quorum vote.
-    fn with_delay(delay_ms: u64, n: usize) -> ViewChangeController {
+    fn with_delay(delay_ms: u64, n: u64) -> ViewChangeController {
+        let committee: Vec<ValidatorId> = (0..n).map(ValidatorId::new).collect();
         let mut vc = ViewChangeController::new(Round::INITIAL);
-        for i in 1..=u64::try_from(n).unwrap() + 1 {
+        for i in 1..=n + 1 {
             vc.delay.observe(
                 CommittedSample {
                     round: Round::new(i),
@@ -305,7 +295,7 @@ mod tests {
                         (i - 1) * 1_000 + delay_ms,
                     ),
                 },
-                n,
+                &committee,
             );
         }
         vc
