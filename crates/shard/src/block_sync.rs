@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_core::Action;
+use hyperscale_metrics::record_sync_block_filtered;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ConsensusPublicKey,
     QuorumCertificate, ValidatorId, Verified, VoteCount,
@@ -78,10 +79,6 @@ pub struct BlockSyncManager {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
 
-    /// The sync target height — set at sync start, cleared on resume.
-    /// Used by `on_block_persisted` to auto-resume when persistence catches up.
-    sync_target_height: Option<BlockHeight>,
-
     /// Highest height handed to `apply_synced_block`, advancing together
     /// with `committed_height` inside that call. The sync apply loop keys
     /// off this marker rather than `committed_height` so it can pick the
@@ -130,7 +127,6 @@ impl BlockSyncManager {
     pub(crate) fn new() -> Self {
         Self {
             syncing: false,
-            sync_target_height: None,
             sync_applied_height: BlockHeight::GENESIS,
             applied_uncommitted: BTreeMap::new(),
             last_qc_height_seen: BlockHeight::GENESIS,
@@ -152,19 +148,6 @@ impl BlockSyncManager {
     /// Set the syncing flag.
     pub(crate) const fn set_syncing(&mut self, syncing: bool) {
         self.syncing = syncing;
-        if !syncing {
-            self.sync_target_height = None;
-        }
-    }
-
-    /// Set the sync target height (called when sync starts).
-    pub(crate) const fn set_sync_target(&mut self, height: BlockHeight) {
-        self.sync_target_height = Some(height);
-    }
-
-    /// Get the sync target height, if syncing.
-    pub(crate) const fn sync_target_height(&self) -> Option<BlockHeight> {
-        self.sync_target_height
     }
 
     /// Record that a synced block has been admitted to the chain state
@@ -189,7 +172,9 @@ impl BlockSyncManager {
 
     /// Highest synced height admitted to the chain state. Its round-contiguous
     /// commit may still be pending, so this can sit a block above
-    /// `committed_height`; sync completion tracks it rather than the commit.
+    /// `committed_height`. The node's sync FSM mirrors it through
+    /// `Action::SyncBlockApplied` and reads completion off its copy; a
+    /// target at or below it is met before any fetch goes out.
     pub(crate) const fn sync_applied_height(&self) -> BlockHeight {
         self.sync_applied_height
     }
@@ -400,11 +385,15 @@ impl BlockSyncManager {
         }
 
         if self.is_applied(height, &block_hash) {
+            // A refetch that overlapped the `SyncBlockApplied` for this
+            // height. The FSM holds an applied height out of its window,
+            // so this stays rare; a rising count says it is not.
             info!(
                 height = height.inner(),
                 ?block_hash,
                 "Synced block already applied - filtering"
             );
+            record_sync_block_filtered("block", "already_applied");
             return IngestOutcome::Drop;
         }
 

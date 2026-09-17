@@ -1538,41 +1538,44 @@ impl ShardCoordinator {
         self.block_sync.is_syncing()
     }
 
-    /// Start syncing to catch up to the network.
+    /// Start syncing to catch up to the network, or raise the target of a
+    /// sync in progress. The single entry point for both.
     ///
-    /// This is the single entry point for initiating sync. It:
-    /// 1. Sets the syncing flag immediately (enables sync block proposals, suppresses fetches)
-    /// 2. Returns the `StartBlockSync` action for the runner to begin fetching blocks
+    /// A target within the applied frontier is already met: every block up
+    /// to it is in chain state and the trailing one commits live, so the
+    /// FSM has nothing to fetch and never reports it complete. Such a
+    /// target is dropped here rather than parking the shard in sync mode
+    /// waiting on a signal that cannot come — on a halted chain the
+    /// successor QC that commits the trailing block is the one this
+    /// committee has to produce, and a committee parked in sync mode never
+    /// drives the view changes that produce it.
     ///
-    /// Setting the syncing flag immediately (rather than waiting for the first synced block)
-    /// ensures that:
-    /// - `check_pending_block_fetches()` stops emitting fetch requests that would compete with sync
-    /// - Proposers create empty sync blocks instead of full blocks
-    /// - The state machine accurately reflects that we're waiting for sync data
+    /// Every other target is forwarded. The FSM ignores one that has not
+    /// moved and raises its own otherwise, so a header arriving above a
+    /// sync already under way extends that sync instead of waiting for it
+    /// to finish and start over.
     ///
-    /// The syncing flag will be cleared when `Event::SyncComplete` arrives.
+    /// The syncing flag is set here, ahead of the first synced block, so
+    /// `check_pending_block_fetches()` stops competing with sync and a
+    /// proposer builds empty sync blocks at once. `BlockSyncComplete`
+    /// clears it.
     fn start_block_sync(&mut self, target_height: BlockHeight) -> Vec<Action> {
-        // Don't raise the target while already syncing. The io_loop's
-        // BlockSync manages its own target internally. Once the current
-        // sync completes and we resume consensus, a new start_sync will
-        // fire naturally if we're still behind.
-        if self.block_sync.is_syncing() {
+        let frontier = self
+            .committed_height
+            .max(self.block_sync.sync_applied_height());
+        if target_height <= frontier {
             return vec![];
         }
 
-        info!(
-            validator = ?self.me,
-            target_height = target_height.inner(),
-            committed_height = self.committed_height.inner(),
-            "Starting sync - setting syncing flag and requesting blocks"
-        );
-
-        // Set syncing flag immediately - this:
-        // - Enables sync block proposals if we're the proposer
-        // - Suppresses fetch requests (check_pending_block_fetches returns empty)
-        // - Signals to other code that we're catching up
-        self.set_block_syncing(true);
-        self.block_sync.set_sync_target(target_height);
+        if !self.block_sync.is_syncing() {
+            info!(
+                validator = ?self.me,
+                target_height = target_height.inner(),
+                committed_height = self.committed_height.inner(),
+                "Starting sync - setting syncing flag and requesting blocks"
+            );
+            self.set_block_syncing(true);
+        }
 
         vec![Action::StartBlockSync {
             target: target_height,
@@ -1582,18 +1585,16 @@ impl ShardCoordinator {
     /// Handle a synced block ready to apply (from runner via
     /// `Event::BlockSyncReadyToApply`). Delegates the dedup/routing
     /// decision to [`BlockSyncManager::ingest`] and translates the outcome into
-    /// a submit dispatch or a buffer drain.
+    /// a submit dispatch or a buffer drain. A dropped delivery is nothing
+    /// to act on: whether the sync is complete is the FSM's call, made on
+    /// the `SyncBlockApplied` each applied block emits.
     pub fn on_sync_block_ready_to_apply(
         &mut self,
         topology_schedule: &TopologySchedule,
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         match self.block_sync.ingest(certified, self.committed_height) {
-            // A delivery the applied-dedup discards still answers the
-            // target it was fetched for, and it is the only signal that
-            // will: nothing further applies, so the drain never runs and
-            // its completion check never fires.
-            IngestOutcome::Drop => self.complete_sync_if_frontier_reached(topology_schedule),
+            IngestOutcome::Drop => vec![],
             IngestOutcome::Submit(certified) => {
                 self.submit_synced_block_for_verification(topology_schedule, *certified)
             }
@@ -1601,31 +1602,8 @@ impl ShardCoordinator {
         }
     }
 
-    /// Resume consensus once the applied frontier reaches the sync target.
-    ///
-    /// Completion tracks the applied frontier rather than the committed
-    /// height, which lags it by a block: under the round-contiguous commit
-    /// rule the trailing synced block finalizes through live consensus.
-    ///
-    /// Evaluated wherever the frontier can meet the target, which includes
-    /// the arrival that dedups away. A target at or below the frontier is
-    /// met the moment it is set — every delivery for it is a duplicate —
-    /// and a sync that cannot report that latches `is_syncing`, which pins
-    /// the target below the heights that would carry the commit forward.
-    fn complete_sync_if_frontier_reached(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-    ) -> Vec<Action> {
-        if self.block_sync.is_syncing()
-            && let Some(target) = self.block_sync.sync_target_height()
-            && self.block_sync.sync_applied_height() >= target
-        {
-            return self.on_block_sync_complete(topology_schedule);
-        }
-        vec![]
-    }
-
-    /// Handle sync complete (from runner via `Event::SyncComplete`).
+    /// Handle sync complete (from runner via `Event::BlockSyncComplete`),
+    /// the FSM's report that its applied frontier reached the target.
     ///
     /// Re-enables normal block proposals and view changes.
     /// Also triggers fetch requests for any pending blocks that still need data,
@@ -4653,16 +4631,6 @@ impl ShardCoordinator {
                 }
             }
         }
-
-        // Auto-resume from sync the moment persistence catches up to the
-        // sync target: a single event carries the signal, so there's no
-        // room for ordering races between sync completion and persistence.
-        if self.block_sync.is_syncing()
-            && let Some(target) = self.block_sync.sync_target_height()
-            && block_height >= target
-        {
-            actions.extend(self.on_block_sync_complete(topology_schedule));
-        }
         actions
     }
 
@@ -5721,7 +5689,8 @@ impl ShardCoordinator {
         self.block_sync.mark_applied(height, block_hash);
         self.initiate_synced_state_root_verification(topology_schedule, certified.block());
 
-        let mut actions = self.try_two_chain_commit(certified.qc_verified(), CommitSource::Sync);
+        let mut actions = vec![Action::SyncBlockApplied { height }];
+        actions.extend(self.try_two_chain_commit(certified.qc_verified(), CommitSource::Sync));
 
         if !synced_finalizations.is_empty() {
             actions.push(Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
@@ -5786,7 +5755,6 @@ impl ShardCoordinator {
             actions.extend(self.apply_synced_block(topology_schedule, block, verified_qc));
         }
         actions.extend(self.try_drain_buffered_synced_blocks(topology_schedule));
-        actions.extend(self.complete_sync_if_frontier_reached(topology_schedule));
         actions
     }
 
@@ -6160,14 +6128,8 @@ impl ShardCoordinator {
         // block commits only under a successor QC, and on a halted chain
         // none exists yet — a sync targeted at it never completes, and a
         // committee parked in sync mode never drives the view changes
-        // that would produce that successor. A prefix within the applied
-        // frontier is already fetched and processed; its trailing block
-        // commits under the successor this committee must produce live,
-        // so re-syncing toward it would only park the pacemaker again.
+        // that would produce that successor.
         let prefix = BlockHeight::new(carried.height().inner().saturating_sub(1));
-        if prefix <= self.committed_height || self.block_sync.sync_applied_height() >= prefix {
-            return Some(Vec::new());
-        }
         Some(self.start_block_sync(prefix))
     }
 
@@ -6608,22 +6570,7 @@ impl ShardCoordinator {
         ) {
             BlockSyncHealthDecision::Idle => vec![],
             BlockSyncHealthDecision::TriggerSync { target_height } => {
-                // While a halt recovery pends, a certified tip within the
-                // applied frontier commits only under the successor QC this
-                // committee must produce live — a sync toward it waits on
-                // deliveries that never come, with view changes suppressed
-                // the whole while. On a live chain the same re-entry stays
-                // legitimate: it re-fetches a certified sibling a peer
-                // served that never committed.
-                if topology_schedule
-                    .recovery_bridge(self.local_shard)
-                    .is_some()
-                    && self.block_sync.sync_applied_height() >= target_height
-                {
-                    vec![]
-                } else {
-                    self.start_block_sync(target_height)
-                }
+                self.start_block_sync(target_height)
             }
         };
         actions.extend(sync_actions);
@@ -10647,14 +10594,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_completes_on_a_delivery_the_applied_dedup_discards() {
-        // A target at a height already applied is met the moment it is
-        // set: the block is in chain state, so every delivery for it
-        // dedups away, nothing reaches the drain, and the drain's
-        // completion check never runs. The arrival itself has to answer
-        // the target — otherwise `is_syncing` latches, and while it is
-        // set `start_block_sync` refuses to raise the target, pinning it
-        // below the heights whose QCs would carry the commit forward.
+    fn already_applied_delivery_emits_nothing() {
+        // A refetch that overlapped the height's `SyncBlockApplied` dedups
+        // away. Completion is the FSM's call, so the shard neither resumes
+        // nor re-dispatches on the duplicate.
         let (mut state, topology_schedule) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
@@ -10668,7 +10611,6 @@ mod tests {
             .mark_applied(BlockHeight::new(4), block_hash);
 
         state.set_block_syncing(true);
-        state.block_sync.set_sync_target(BlockHeight::new(4));
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -10684,14 +10626,97 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100),
         );
-        let _ = state.on_sync_block_ready_to_apply(
+        let actions = state.on_sync_block_ready_to_apply(
             &topology_schedule,
             CertifiedBlock::new_unchecked(block, qc),
         );
 
+        assert!(actions.is_empty(), "got {actions:?}");
         assert!(
-            !state.is_block_syncing(),
-            "a target the applied frontier already covers must resume consensus"
+            state.is_block_syncing(),
+            "the shard leaves sync mode on BlockSyncComplete, not on a duplicate"
+        );
+    }
+
+    #[test]
+    fn apply_synced_block_emits_sync_block_applied() {
+        // Every applied block tells the FSM, which holds the height out of
+        // its window and reads completion off it.
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.set_block_syncing(true);
+
+        let block = block_with_parent_qc_ts(BlockHeight::new(4), 100);
+        let block_hash = block.hash();
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let qc = QuorumCertificate::new(
+            block_hash,
+            ShardId::ROOT,
+            BlockHeight::new(4),
+            block.header().parent_block_hash(),
+            block.header().round(),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100),
+        );
+        let actions = state.on_sync_block_ready_to_apply(
+            &topology_schedule,
+            CertifiedBlock::new_unchecked(block, qc),
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
+        );
+        let qc = make_test_qc(block_hash, BlockHeight::new(4));
+        let actions = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(qc));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SyncBlockApplied { height } if *height == BlockHeight::new(4)
+            )),
+            "got {actions:?}"
+        );
+        assert!(
+            state.is_block_syncing(),
+            "the shard does not decide completion on its own"
+        );
+    }
+
+    #[test]
+    fn start_block_sync_forwards_a_raised_target_while_syncing() {
+        // The FSM owns the target: a higher one arriving mid-sync extends
+        // the sync, and one the applied frontier already covers is met
+        // before any fetch and does not enter sync mode.
+        let (mut state, _topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.block_sync.mark_applied(
+            BlockHeight::new(4),
+            BlockHash::from_raw(Hash::from_bytes(b"h4")),
+        );
+
+        assert!(state.start_block_sync(BlockHeight::new(4)).is_empty());
+        assert!(!state.is_block_syncing());
+
+        let first = state.start_block_sync(BlockHeight::new(10));
+        assert!(state.is_block_syncing());
+        assert!(first.iter().any(|a| matches!(
+            a,
+            Action::StartBlockSync { target } if *target == BlockHeight::new(10)
+        )));
+
+        let raised = state.start_block_sync(BlockHeight::new(12));
+        assert!(
+            raised.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == BlockHeight::new(12)
+            )),
+            "got {raised:?}"
         );
     }
 
