@@ -205,6 +205,20 @@ pub const VIEW_CHANGE_DELAY_MULTIPLIER: u32 = 6;
 /// reset, the timer fires regardless of pending work.
 pub const PROGRESS_WAIT_MULTIPLIER: u32 = 3;
 
+/// How long a committee seated for a halt recovery waits for a retained
+/// ex-member to offer a tip above the snap-synced anchor before it adopts
+/// the anchor as the chain's frontier.
+///
+/// The offer rides the retained member's timeout, re-sent on its cleanup
+/// tick for as long as the recovery names it retained, so the wait covers
+/// several ticks at the default interval with margin. It is measured from
+/// the first tick on which the seating window is open: before that neither
+/// side can send or receive an offer, and a wait counted from the seating
+/// fold would elapse with nothing measured. It is not derived from the
+/// cleanup interval, which is the retained member's local knob and not
+/// something the waiting member can read.
+pub const HALT_HARVEST_WAIT: Duration = Duration::from_secs(10);
+
 /// How long past a counterpart's claiming vote its claim cell becomes
 /// readable in that counterpart's committed state.
 ///

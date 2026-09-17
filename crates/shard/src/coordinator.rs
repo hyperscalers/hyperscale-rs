@@ -153,11 +153,11 @@ use hyperscale_storage::{CommittedProvisions, RecoveredState};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
-    MAX_ROUND_GAP, MAX_VALIDITY_RANGE, PredecessorTerminal, Provisions, QcContext, QcVerifyError,
-    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, Timeout,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
-    Verifier, Verify, VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload,
+    HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, PredecessorTerminal, Provisions,
+    QcContext, QcVerifyError, QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters,
+    StateRoot, Timeout, TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId,
+    Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
+    missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -427,9 +427,10 @@ pub struct ShardCoordinator {
     retained_tip_offered: Option<BlockHeight>,
 
     /// When this member first stood seated under a pending halt recovery
-    /// with nothing offered — the start of the window it gives the
-    /// retained cohort to carry a tip above the anchor before it takes
-    /// the anchor itself; see [`Self::try_adopt_anchor_qc`].
+    /// with nothing offered and the seating window open — the start of
+    /// the window it gives the retained cohort to carry a tip above the
+    /// anchor before it takes the anchor itself; see
+    /// [`Self::try_adopt_anchor_qc`].
     halt_harvest_started: Option<LocalTimestamp>,
 
     /// HotStuff-2 safe-vote lock: the highest `parent_qc` round we have ever
@@ -2876,9 +2877,12 @@ impl ShardCoordinator {
     /// QC ahead of it would let the fresh committee certify a sibling of
     /// real committed history above the anchor and break commit linkage
     /// when the suffix then syncs in. So under a halt the anchor is taken
-    /// only once the cohort has had the progress wait — several of
-    /// the timeout retransmissions that carry an offer — to name a tip
-    /// above it and named none. A cohort that answers with nothing above
+    /// only once the cohort has had `HALT_HARVEST_WAIT` — several of the
+    /// re-offer ticks a retained member sends while the recovery names it
+    /// — to name a tip above it and named none. The wait counts from the
+    /// first tick on which the seating window is open: while it is closed
+    /// no committee resolves for the tip on either side, so nothing can
+    /// be sent or received. A cohort that answers with nothing above
     /// the anchor is one of importers, or one whose suffix left with the
     /// members that held it; either way the anchor is the frontier, and
     /// the QC the bootstrap bound to it is the parent the first block
@@ -2897,11 +2901,13 @@ impl ShardCoordinator {
         match recovery.cause {
             RecoveryCause::Fork => self.adopt_anchor_qc(topology_schedule),
             RecoveryCause::Halt => {
-                if self.retained_tip_offered.is_some() {
+                if self.retained_tip_offered.is_some()
+                    || self.tip_committee(topology_schedule).is_none()
+                {
                     return Vec::new();
                 }
                 let started = *self.halt_harvest_started.get_or_insert(self.now);
-                if self.now.saturating_sub(started) < self.view_change.progress_wait() {
+                if self.now.saturating_sub(started) < HALT_HARVEST_WAIT {
                     return Vec::new();
                 }
                 self.adopt_anchor_qc(topology_schedule)
@@ -6565,6 +6571,7 @@ impl ShardCoordinator {
         // committee holds the parent QC for its first block even when no
         // peer signal ever supplies a higher one.
         let mut actions = self.try_adopt_anchor_qc(topology_schedule);
+        actions.extend(self.re_offer_retained_tip(topology_schedule));
         actions.extend(self.resume_recovered_blocks(topology_schedule));
 
         let next_needed_height = self.committed_height.next();
@@ -6586,6 +6593,41 @@ impl ShardCoordinator {
         };
         actions.extend(sync_actions);
         actions
+    }
+
+    /// Re-broadcast this member's current-round timeout on the periodic
+    /// tick while a pending halt recovery names it retained.
+    ///
+    /// The timeout carries `high_qc`, and it is the only signal that
+    /// carries the halted tip to the fresh committee, which
+    /// [`Self::harvest_retained_tip`] reads off it. The round timer
+    /// retransmits it too, but at its own cadence: the base while the
+    /// halted height is still on its first round, and up to the backoff
+    /// cap when rounds were abandoned before quorum was lost. The fresh
+    /// committee's `HALT_HARVEST_WAIT` is sized against this tick, not
+    /// against that timer. Guarded on the timer having fired for the
+    /// current round, so a member that has not timed out its round does
+    /// not manufacture a timeout the pacemaker never produced. The share
+    /// reaches the fresh committee through the recovery bridge and is
+    /// harvested there, never tallied, so re-sending it changes no quorum
+    /// arithmetic; on this side it re-asserts a vote and a lock the timed
+    /// out round already holds.
+    fn re_offer_retained_tip(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        let view = self.view_change.view;
+        if self.last_timed_out_round != Some(view) {
+            return Vec::new();
+        }
+        let retained = topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+            .is_some_and(|recovery| {
+                recovery.cause == RecoveryCause::Halt && recovery.retained.contains(&self.me)
+            });
+        if !retained {
+            return Vec::new();
+        }
+        self.broadcast_timeout(topology_schedule, view)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -9357,6 +9399,231 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::StartBlockSync { .. })),
             "a co-hosted retained ex-member's timeout must harvest, not drop",
+        );
+    }
+
+    /// A snapshot carrying a pending halt recovery on the root shard that
+    /// names `retained`, seated at `rotated_at`.
+    fn with_pending_halt_recovery(
+        schedule: &TopologySchedule,
+        retained: Vec<ValidatorId>,
+        rotated_at: Epoch,
+    ) -> Arc<TopologySnapshot> {
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
+
+        Arc::new(
+            schedule.head().as_ref().clone().with_pending_recoveries(
+                std::iter::once((
+                    ShardId::ROOT,
+                    ShardRecovery {
+                        cause: RecoveryCause::Halt,
+                        rotated_at,
+                        retained,
+                        attested_frontier: BlockHeight::GENESIS,
+                    },
+                ))
+                .collect(),
+            ),
+        )
+    }
+
+    /// Fire the round timer once, so the member has timed out its current
+    /// round the way a halted chain's members have.
+    fn time_out_current_round(state: &mut ShardCoordinator, schedule: &TopologySchedule) {
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
+        assert!(state.check_round_timeout(schedule).is_some());
+    }
+
+    fn offers_timeout_at(actions: &[Action], round: Round) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SignAndBroadcastTimeout { round: r, .. } if *r == round))
+    }
+
+    /// A retained ex-member's timeout is the only carrier of the halted
+    /// tip, and its round timer re-sends it at its own cadence. While the
+    /// recovery names the member retained, every cleanup tick re-sends it
+    /// too — but only once the timer has fired for the current round, so
+    /// the tick never manufactures a timeout the pacemaker did not.
+    #[test]
+    fn a_retained_member_re_offers_its_tip_on_every_tick() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(0)],
+            Epoch::new(2),
+        ));
+        let view = state.view_change.view;
+
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        assert!(
+            !offers_timeout_at(&state.check_sync_health(&schedule), view),
+            "no re-offer before the round timer has fired",
+        );
+
+        time_out_current_round(&mut state, &schedule);
+        for _ in 0..2 {
+            assert!(
+                offers_timeout_at(&state.check_sync_health(&schedule), view),
+                "every tick re-offers the current round's timeout",
+            );
+        }
+    }
+
+    /// The re-offer is a retained member's duty: a member the recovery
+    /// seated fresh times out its rounds through the pacemaker alone.
+    #[test]
+    fn a_fresh_member_does_not_re_offer() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        let view = state.view_change.view;
+
+        time_out_current_round(&mut state, &schedule);
+        assert!(!offers_timeout_at(
+            &state.check_sync_health(&schedule),
+            view
+        ));
+    }
+
+    /// While the seating window is closed no committee resolves for the
+    /// tip on either side, so no offer can be sent or received. The wait
+    /// before the anchor is adopted counts from the first tick on which
+    /// the window is open, not from the fold that seated the committee.
+    #[test]
+    fn the_harvest_wait_does_not_start_while_the_seating_window_is_closed() {
+        let (mut state, schedule) = make_test_state();
+        // Seated at epoch 2 with one-second windows: the bridge window
+        // opens at 3000ms.
+        let head = with_pending_halt_recovery(&schedule, vec![ValidatorId::new(9)], Epoch::new(2));
+        let schedule = TopologySchedule::new(1_000, Epoch::new(3), head);
+        state.anchor_qc = Some(QuorumCertificate::genesis(
+            ShardId::ROOT,
+            state.chain_origin,
+        ));
+
+        for closed in [2_500, 2_999] {
+            state.set_time(LocalTimestamp::from_millis(closed));
+            let _ = state.check_sync_health(&schedule);
+            assert_eq!(
+                state.halt_harvest_started, None,
+                "closed window at {closed}ms"
+            );
+            assert!(state.anchor_qc.is_some());
+        }
+
+        state.set_time(LocalTimestamp::from_millis(3_000));
+        let _ = state.check_sync_health(&schedule);
+        assert_eq!(
+            state.halt_harvest_started,
+            Some(LocalTimestamp::from_millis(3_000))
+        );
+        assert!(state.anchor_qc.is_some());
+
+        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
+        state.set_time(LocalTimestamp::from_millis(3_000 + wait - 1));
+        let _ = state.check_sync_health(&schedule);
+        assert!(
+            state.anchor_qc.is_some(),
+            "the wait counts from the open window"
+        );
+
+        state.set_time(LocalTimestamp::from_millis(3_000 + wait));
+        let _ = state.check_sync_health(&schedule);
+        assert!(
+            state.anchor_qc.is_none(),
+            "the anchor is taken once the wait elapses"
+        );
+    }
+
+    /// The anchor is held for the whole of `HALT_HARVEST_WAIT` and taken
+    /// on the first tick at or past it.
+    #[test]
+    fn the_anchor_is_not_adopted_inside_the_harvest_wait() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        state.anchor_qc = Some(QuorumCertificate::genesis(
+            ShardId::ROOT,
+            state.chain_origin,
+        ));
+        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
+
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let _ = state.check_sync_health(&schedule);
+        assert_eq!(
+            state.halt_harvest_started,
+            Some(LocalTimestamp::from_millis(100_000))
+        );
+
+        state.set_time(LocalTimestamp::from_millis(100_000 + wait - 1));
+        let _ = state.check_sync_health(&schedule);
+        assert!(state.anchor_qc.is_some());
+
+        state.set_time(LocalTimestamp::from_millis(100_000 + wait));
+        let _ = state.check_sync_health(&schedule);
+        assert!(state.anchor_qc.is_none());
+    }
+
+    /// An offer inside the wait holds the anchor for good: the harvest is
+    /// what seeds the committee, and the anchor QC is never the parent of
+    /// a block above a tip a retained member named.
+    #[test]
+    fn a_retained_offer_inside_the_wait_forestalls_the_anchor() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        state.anchor_qc = Some(QuorumCertificate::genesis(
+            ShardId::ROOT,
+            state.chain_origin,
+        ));
+        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
+
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let _ = state.check_sync_health(&schedule);
+
+        state.set_time(LocalTimestamp::from_millis(100_500));
+        let carried = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"retained-tip")),
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
+            Round::new(1),
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        let timeout = Timeout::new(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            Round::new(2),
+            carried,
+            ValidatorId::new(9),
+            &BlsSigner::generate(),
+        )
+        .expect("sign");
+        assert!(
+            state
+                .on_unverified_timeout(&schedule, &timeout)
+                .iter()
+                .any(|a| matches!(a, Action::StartBlockSync { .. }))
+        );
+
+        state.set_time(LocalTimestamp::from_millis(100_000 + wait + 1));
+        let _ = state.check_sync_health(&schedule);
+        assert!(
+            state.anchor_qc.is_some(),
+            "an offered tip keeps the anchor buffered"
         );
     }
 

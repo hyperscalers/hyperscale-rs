@@ -12,6 +12,10 @@ pub struct ShardConsensusConfig {
     /// Interval between cleanup timer fires.
     /// The cleanup timer performs periodic housekeeping tasks:
     /// - Checks sync health and triggers catch-up sync if needed
+    /// - Re-offers the halted tip while a halt recovery names this
+    ///   member retained, so it must stay well under
+    ///   `hyperscale_types::HALT_HARVEST_WAIT` for the fresh committee
+    ///   to see the offer inside its wait
     pub cleanup_interval: Duration,
 
     /// Maximum number of synced blocks to submit for parallel QC verification
