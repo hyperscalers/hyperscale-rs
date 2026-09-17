@@ -26,6 +26,23 @@ use std::time::Duration;
 
 use hyperscale_types::{ProposerTimestamp, Round, WeightedTimestamp};
 
+/// How long a pending block waits for its transactions to arrive by gossip
+/// before they are fetched from the proposer, while the chain has yet to
+/// measure a full rotation.
+pub const FETCH_TIMEOUT_DEFAULT: Duration = Duration::from_millis(150);
+
+/// Floor on the fetch wait once the delay is measured.
+pub const FETCH_TIMEOUT_MIN: Duration = Duration::from_millis(100);
+
+/// Cap on the fetch wait once the delay is measured.
+pub const FETCH_TIMEOUT_MAX: Duration = Duration::from_secs(2);
+
+/// Network delays per fetch wait: the gossip that carries a block's
+/// transactions is one hop behind the header, and the fetch that replaces
+/// it is a round trip, so waiting two delays before fetching costs at most
+/// one wasted request against a slow hop.
+pub const FETCH_DELAY_MULTIPLIER: u32 = 2;
+
 /// The chain-derived delay estimate.
 pub struct DelayEstimator {
     /// Oldest first, at most one rotation.

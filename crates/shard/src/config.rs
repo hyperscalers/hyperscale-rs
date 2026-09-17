@@ -9,11 +9,6 @@ use std::time::Duration;
 /// Local-only operational tuning for the shard consensus runtime.
 #[derive(Debug, Clone)]
 pub struct ShardConsensusConfig {
-    /// Timeout before fetching missing transactions from peers.
-    /// If a pending block is still incomplete after this duration, request
-    /// the missing transactions directly from the proposer or a peer.
-    pub(crate) transaction_fetch_timeout: Duration,
-
     /// Interval between cleanup timer fires.
     /// The cleanup timer performs periodic housekeeping tasks:
     /// - Checks sync health and triggers catch-up sync if needed
@@ -28,7 +23,6 @@ pub struct ShardConsensusConfig {
 impl Default for ShardConsensusConfig {
     fn default() -> Self {
         Self {
-            transaction_fetch_timeout: Duration::from_millis(150),
             cleanup_interval: Duration::from_secs(1),
             max_parallel_sync_verifications: 16,
         }

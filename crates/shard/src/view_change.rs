@@ -24,7 +24,10 @@ use hyperscale_types::{
 };
 
 use crate::coordinator::SPECULATIVE_VERIFY_GAP;
-use crate::delay::{CommittedSample, DelayEstimator};
+use crate::delay::{
+    CommittedSample, DelayEstimator, FETCH_DELAY_MULTIPLIER, FETCH_TIMEOUT_DEFAULT,
+    FETCH_TIMEOUT_MAX, FETCH_TIMEOUT_MIN,
+};
 
 /// How far past the verified `high_qc` round a single validator's unverified
 /// header or vote may nudge the local view. Anchored to verified progress so a
@@ -183,6 +186,16 @@ impl ViewChangeController {
         self.base_timeout() * PROGRESS_WAIT_MULTIPLIER
     }
 
+    /// How long a pending block waits for its transactions to arrive by
+    /// gossip before they are fetched from the proposer:
+    /// `FETCH_DELAY_MULTIPLIER` network delays, bounded, or the default
+    /// while the chain has yet to measure a full rotation.
+    pub(crate) fn fetch_timeout(&self) -> Duration {
+        self.delay.delay().map_or(FETCH_TIMEOUT_DEFAULT, |delay| {
+            (delay * FETCH_DELAY_MULTIPLIER).clamp(FETCH_TIMEOUT_MIN, FETCH_TIMEOUT_MAX)
+        })
+    }
+
     /// Time remaining until the view change timer should fire.
     pub(crate) fn remaining_timeout(&self, now: LocalTimestamp) -> Duration {
         let timeout = self.current_timeout();
@@ -324,6 +337,20 @@ mod tests {
             with_delay(60_000, 4).base_timeout(),
             VIEW_CHANGE_TIMEOUT_MAX
         );
+    }
+
+    #[test]
+    fn fetch_timeout_is_two_delays_bounded_both_ways() {
+        assert_eq!(
+            ViewChangeController::new(Round::INITIAL).fetch_timeout(),
+            FETCH_TIMEOUT_DEFAULT
+        );
+        assert_eq!(
+            with_delay(300, 4).fetch_timeout(),
+            Duration::from_millis(600)
+        );
+        assert_eq!(with_delay(20, 4).fetch_timeout(), FETCH_TIMEOUT_MIN);
+        assert_eq!(with_delay(60_000, 4).fetch_timeout(), FETCH_TIMEOUT_MAX);
     }
 
     #[test]
