@@ -617,17 +617,6 @@ impl ShardCoordinatorSim {
         self.absorb(idx, actions);
     }
 
-    /// Fire `on_block_persisted` on `replica`. In production this
-    /// arrives via `ProtocolEvent::BlockPersisted` after storage's
-    /// write batch flushes; once the persisted height reaches the
-    /// sync target, `on_block_sync_complete` fires and flips out
-    /// of sync mode.
-    pub fn deliver_block_persisted(&mut self, replica: ValidatorId, height: BlockHeight) {
-        let idx = self.idx_of(replica);
-        let actions = self.coordinators[idx].on_block_persisted(&self.topology_schedule, height, 0);
-        self.absorb(idx, actions);
-    }
-
     /// Hand `header` to `replica`'s `on_block_header` inline (bypassing the
     /// delivery queue) so the header is in its `pending_blocks` before the
     /// next test statement runs. Adversarial tests use this to seat a sibling
@@ -1999,9 +1988,22 @@ impl ShardCoordinatorSim {
             }
             Action::StartBlockSync { target } => {
                 // Tests inspect the captured target and drive
-                // recovery via `deliver_synced_block` +
-                // `deliver_block_persisted`.
+                // recovery via `deliver_synced_block`.
                 self.sync_targets[emitter_idx].push(target);
+            }
+            Action::SyncBlockApplied { height } => {
+                // The node's sync FSM holds the height out of its window
+                // and reports the sync complete once the applied frontier
+                // reaches the target it was given. Play that rule here
+                // against the highest captured target.
+                let target = self.sync_targets[emitter_idx].iter().max().copied();
+                if self.coordinators[emitter_idx].is_block_syncing()
+                    && target.is_some_and(|target| height >= target)
+                {
+                    let actions = self.coordinators[emitter_idx]
+                        .on_block_sync_complete(&self.topology_schedule);
+                    self.absorb(emitter_idx, actions);
+                }
             }
             Action::AttachCertifiedUncommitted { certified } => {
                 // Mirror the production handler: the certified tip

@@ -703,17 +703,24 @@ impl<B: SyncBinding> Sync<B> {
                 committed = state.committed.as_u64(),
                 "sync: target unfounded — the committee does not hold the height above ours"
             );
-            state.target = state.committed;
+            state.target = state.frontier();
             state.heights_to_fetch.clear();
             state.heights_queued.clear();
             state.deferred.clear();
             state.not_found_streak = 0;
         }
+        // The scope stopped syncing; the consumer hears it the same way a
+        // reached target tells it.
+        let mut outputs = Vec::new();
+        if unfounded {
+            outputs.push(self.complete(scope));
+        }
         // The freed slot can carry other ready work immediately — heights
         // past the failed range, ready-deferred entries from earlier
         // failures, or other scopes' queues. Without this, the slot sits
         // idle until the next Tick.
-        self.emit_fetches()
+        outputs.extend(self.emit_fetches());
+        outputs
     }
 
     fn handle_admitted(&mut self, scope: &B::Scope, height: B::Key) -> Vec<SyncOutput<B>> {
@@ -1356,13 +1363,19 @@ mod tests {
                 now: LocalTimestamp::from_millis(now),
             });
         }
-        let _ = s.handle(SyncInput::FetchFailed {
+        let outputs = s.handle(SyncInput::FetchFailed {
             scope: 1,
             from: BlockHeight::new(1),
             count: 1,
             kind: FetchFailureKind::NotFound,
             now: LocalTimestamp::from_millis(now),
         });
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::Complete { scope: 1, .. })),
+            "the consumer is told the scope stopped syncing"
+        );
 
         let st = s.scopes.get(&1).unwrap();
         assert_eq!(st.target, st.committed, "the target is read as unfounded");
