@@ -412,7 +412,7 @@ jobs:
       - name: Resolve wasm-bindgen Version
         id: wasm_bindgen
         run: |
-          version=$(sed -n 's/^wasm-bindgen = "\(.*\)"$/\1/p' Cargo.toml)
+          version=$(sed -n 's/^wasm-bindgen = "=\{0,1\}\(.*\)"$/\1/p' Cargo.toml)
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -10,7 +10,7 @@ root="$(cd "$here/.." && pwd)"
 
 # Must match the wasm-bindgen crate version, or the generated glue and the
 # module disagree about their ABI.
-want="$(sed -n 's/^wasm-bindgen = "\(.*\)"$/\1/p' "$root/Cargo.toml")"
+want="$(sed -n 's/^wasm-bindgen = "=\{0,1\}\(.*\)"$/\1/p' "$root/Cargo.toml")"
 have="$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)"
 if [ "$have" != "$want" ]; then
   echo "wasm-bindgen CLI is ${have:-missing}, need $want" >&2
