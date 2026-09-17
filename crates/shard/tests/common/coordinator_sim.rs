@@ -2015,10 +2015,11 @@ impl ShardCoordinatorSim {
             | Action::SetTimer { .. }
             | Action::CancelTimer { .. }
             | Action::TopologyChanged { .. }
-            | Action::AbandonFetch(_) => {
-                // Timers, topology changes, fetch abandons, and
-                // cross-shard light-client gossip have no in-sim
-                // delivery target.
+            | Action::AbandonFetch(_)
+            | Action::ReopenSyncHeight { .. } => {
+                // Timers, topology changes, fetch abandons, sync reopens
+                // (tests feed synced blocks by hand), and cross-shard
+                // light-client gossip have no in-sim delivery target.
             }
             other => panic!(
                 "ShardCoordinatorSim: unmodelled action variant: {}",
