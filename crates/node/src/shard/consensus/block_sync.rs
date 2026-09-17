@@ -94,10 +94,12 @@ where
         block: Option<Box<ElidedCertifiedBlock>>,
     ) {
         let Some(elided) = block else {
-            // Peer didn't have the block — re-queue via fetch-failed.
-            // Treat as exhausted so the FSM doesn't pile its own backoff on
-            // top of the request manager's; we just want another attempt.
-            self.feed_block_sync_fetch_failed(height, FetchFailureKind::Exhausted);
+            // A peer that answered and does not hold the block. The FSM
+            // backs the height off and counts the answer toward its
+            // unfounded verdict: a height nobody serves, asked about
+            // round after round just above the frontier, was never there
+            // to reach, and the sync settles at what it holds.
+            self.feed_block_sync_fetch_failed(height, FetchFailureKind::NotFound);
             return;
         };
         let cert = match self.rehydrate_elided_block(&elided) {
