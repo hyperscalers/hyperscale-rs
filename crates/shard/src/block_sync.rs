@@ -94,7 +94,10 @@ pub struct BlockSyncManager {
     /// certified-block cache is hash-keyed and synced blocks adopt
     /// without committing, so holding both siblings is coherent and the
     /// round-contiguous two-chain rule commits whichever one the chain
-    /// extends. Pruned at or below `committed_height` by [`Self::cleanup`].
+    /// extends. A child whose parent QC names a hash not applied here
+    /// reopens the height through `Action::ReopenSyncHeight`, which is
+    /// how the winner gets fetched. Pruned at or below `committed_height`
+    /// by [`Self::cleanup`].
     applied_uncommitted: BTreeMap<BlockHeight, Vec<BlockHash>>,
 
     /// Highest `latest_qc.height()` `health_check` has observed. Together with
