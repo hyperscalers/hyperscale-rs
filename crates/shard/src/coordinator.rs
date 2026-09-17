@@ -42,6 +42,10 @@ pub struct ShardStats {
     pub current_round: u64,
     /// Highest height committed to local storage.
     pub committed_height: BlockHeight,
+    /// Network delay as the committed chain measures it, once a full
+    /// committee rotation has committed. Identical across replicas at the
+    /// same committed height.
+    pub delay_estimate: Option<Duration>,
 }
 
 /// Shard consensus memory statistics for monitoring collection sizes.
@@ -5132,6 +5136,12 @@ impl ShardCoordinator {
         };
         self.ready_signal_pool.evict_expired(commit_ts);
 
+        self.view_change.observe_commit(
+            block.header(),
+            committee
+                .consensus_committee_for_shard(self.local_shard)
+                .len(),
+        );
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
 
@@ -6720,12 +6730,13 @@ impl ShardCoordinator {
 
     /// Get shard consensus statistics for monitoring.
     #[must_use]
-    pub const fn stats(&self) -> ShardStats {
+    pub fn stats(&self) -> ShardStats {
         ShardStats {
             view_changes: self.view_change.view_changes,
             view_syncs: self.view_change.view_syncs,
             current_round: self.view_change.view.inner(),
             committed_height: self.committed_height,
+            delay_estimate: self.view_change.delay(),
         }
     }
 

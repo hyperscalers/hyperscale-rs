@@ -18,11 +18,12 @@
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, Round, VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT,
-    VIEW_CHANGE_TIMEOUT_MAX,
+    BlockHeader, BlockHeight, LocalTimestamp, Round, VIEW_CHANGE_TIMEOUT,
+    VIEW_CHANGE_TIMEOUT_INCREMENT, VIEW_CHANGE_TIMEOUT_MAX,
 };
 
 use crate::coordinator::SPECULATIVE_VERIFY_GAP;
+use crate::delay::{CommittedSample, DelayEstimator};
 
 /// How far past the verified `high_qc` round a single validator's unverified
 /// header or vote may nudge the local view. Anchored to verified progress so a
@@ -71,6 +72,9 @@ pub struct ViewChangeController {
     /// out and it perpetually catches up. Watching only `view_changes`
     /// hides cluster-wide view-change activity at the slowest validator.
     pub(crate) view_syncs: u64,
+
+    /// Network delay as the committed chain measures it.
+    delay: DelayEstimator,
 }
 
 impl ViewChangeController {
@@ -86,7 +90,29 @@ impl ViewChangeController {
             last_header_reset: None,
             view_changes: 0,
             view_syncs: 0,
+            delay: DelayEstimator::new(),
         }
+    }
+
+    /// Feed a committed header, in chain order, to the delay estimate.
+    /// `committee_len` is the size of the committee that certified it.
+    pub(crate) fn observe_commit(&mut self, header: &BlockHeader, committee_len: usize) {
+        let parent_qc = header.parent_qc();
+        self.delay.observe(
+            CommittedSample {
+                round: header.round(),
+                timestamp: header.timestamp(),
+                is_fallback: header.is_fallback(),
+                parent_qc_round: parent_qc.round(),
+                parent_qc_weighted_timestamp: parent_qc.weighted_timestamp(),
+            },
+            committee_len,
+        );
+    }
+
+    /// The chain-derived delay estimate, once a full rotation has committed.
+    pub(crate) fn delay(&self) -> Option<Duration> {
+        self.delay.delay()
     }
 
     /// Record a direct signal of leader progress (proposal, QC, commit).

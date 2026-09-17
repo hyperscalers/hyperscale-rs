@@ -77,6 +77,7 @@ mod commit_pipeline;
 mod config;
 mod coordinator;
 mod deferred_qc;
+mod delay;
 mod fee_ledger;
 mod fence;
 mod lookups;
