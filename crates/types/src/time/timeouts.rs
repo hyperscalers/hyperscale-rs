@@ -7,11 +7,12 @@
 //!   `RETENTION_HORIZON`) — durations after which a tick aborts or a piece
 //!   of derived state becomes safe to drop on every node simultaneously.
 //!   Most downstream invariants derive from `MAX_FINALIZATION_DELAY`.
-//! - **shard consensus liveness timers** (`VIEW_CHANGE_TIMEOUT*`, `MAX_PROGRESS_WAIT`) —
-//!   round-timer cadences and the absolute ceiling on view-change
-//!   suppression while a proposal is in flight. Validators that disagree on
-//!   these values either time out asymmetrically (degraded liveness) or
-//!   weaken the stall-attack bound that `MAX_PROGRESS_WAIT` enforces.
+//! - **shard consensus liveness bounds** (`VIEW_CHANGE_TIMEOUT_*`,
+//!   `VIEW_CHANGE_DELAY_MULTIPLIER`, `PROGRESS_WAIT_MULTIPLIER`) — the round
+//!   timer's base is derived from the committed chain, so replicas agree on
+//!   it by construction; these bound it and size the ceiling on view-change
+//!   suppression while a proposal is in flight, the stall-attack bound every
+//!   validator must enforce alike.
 //!
 //! Sub-state-machine-local timeouts (fallback fetch, IO retry backoff, etc.)
 //! stay in their owning crate.
@@ -161,38 +162,48 @@ const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
 /// cleared mempool.
 const _: () = assert!(MAX_VALIDITY_RANGE.as_secs() >= 2 * SKIP_TIMEOUT.as_secs());
 
-/// Base view-change timeout for the first round at any height.
+/// The round timer's base while the committed chain has yet to measure a
+/// full committee rotation: a fresh chain, a restarted replica with no
+/// stored history, or a committee that just grew.
 ///
-/// Combined with `VIEW_CHANGE_TIMEOUT_INCREMENT` and capped by
-/// `VIEW_CHANGE_TIMEOUT_MAX` to produce the per-round timeout:
-/// `min(base + increment * rounds_at_height, max)`. Round numbers are
-/// QC- and header-attested, so every validator computes the same
-/// effective timeout for any `(height, round)`.
-pub const VIEW_CHANGE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Once a rotation has committed, the base is
+/// `VIEW_CHANGE_DELAY_MULTIPLIER` times the chain-derived network delay,
+/// bounded by `VIEW_CHANGE_TIMEOUT_MIN` and `VIEW_CHANGE_TIMEOUT_MAX`, and
+/// doubles per round abandoned at a height. The delay is a function of
+/// committed chain data and round numbers are QC- and header-attested, so
+/// every validator computes the same timeout for any `(height, round)`.
+pub const VIEW_CHANGE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(3);
 
-/// Linear backoff increment per failed round at the same height.
+/// Floor on the round timer's base.
 ///
-/// Prevents thundering-herd view changes when the network is briefly
-/// stressed: each successive round at the same height extends the
-/// timeout by this much before the cap kicks in.
-pub const VIEW_CHANGE_TIMEOUT_INCREMENT: Duration = Duration::from_secs(1);
+/// Absorbs proposer-to-voter clock skew, which the chain's delay sample
+/// cannot tell from delay, and keeps a fast committee's timer above the
+/// cadence of the duties that retry once per round.
+pub const VIEW_CHANGE_TIMEOUT_MIN: Duration = Duration::from_secs(1);
 
-/// Cap on the effective view-change timeout after linear backoff.
+/// Cap on the round timer after backoff.
 ///
 /// Bounds round latency in extreme network conditions so a stuck height
 /// can't ratchet timeouts upward indefinitely.
 pub const VIEW_CHANGE_TIMEOUT_MAX: Duration = Duration::from_secs(30);
 
-/// Absolute ceiling on view-change suppression while a block is in
-/// progress at the proposal tip.
+/// Network delays per round timer base.
+///
+/// After a QC forms the next leader needs up to one delay to receive it
+/// and one to land its header on a follower, so a healthy round's silence
+/// is at most two delays; six is a threefold margin over that.
+pub const VIEW_CHANGE_DELAY_MULTIPLIER: u32 = 6;
+
+/// Round timer bases per progress wait: the ceiling on view-change
+/// suppression while a block is in progress at the proposal tip.
 ///
 /// View changes are normally suppressed while we're fetching block
 /// content, awaiting our own QC, or processing the leader's pending
-/// block. This cap bounds how long a Byzantine proposer can stall the
-/// round timer purely by keeping a header alive without ever advancing
-/// the chain. Once this elapses since the last leader-activity reset,
-/// the timer fires regardless of pending work.
-pub const MAX_PROGRESS_WAIT: Duration = Duration::from_secs(9);
+/// block. The progress wait bounds how long a Byzantine proposer can
+/// stall the round timer purely by keeping a header alive without ever
+/// advancing the chain. Once it elapses since the last leader-activity
+/// reset, the timer fires regardless of pending work.
+pub const PROGRESS_WAIT_MULTIPLIER: u32 = 3;
 
 /// How long past a counterpart's claiming vote its claim cell becomes
 /// readable in that counterpart's committed state.

@@ -816,7 +816,7 @@ impl ShardCoordinatorSim {
     /// Fire `check_round_timeout` on `replica` and absorb any
     /// returned view-change actions. No-op when
     /// `should_advance_round` declines (verification in flight, this
-    /// round's unvoted proposal at the tip within `MAX_PROGRESS_WAIT`,
+    /// round's unvoted proposal at the tip within the progress wait,
     /// or timeout not yet elapsed).
     pub fn fire_view_change_timer(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);

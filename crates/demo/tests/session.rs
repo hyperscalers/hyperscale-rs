@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_demo::{HostRole, Session, SessionConfig, ShardPath, TraceEvent, TraceKind};
-use hyperscale_types::{ShardId, VIEW_CHANGE_TIMEOUT};
+use hyperscale_types::{ShardId, VIEW_CHANGE_TIMEOUT_DEFAULT};
 
 fn config() -> SessionConfig {
     SessionConfig::default()
@@ -889,7 +889,8 @@ fn a_rotation_never_stalls_a_lane_for_a_view_change() {
     }
     assert!(rotation_at.is_some(), "the run must cover a rotation");
     assert_eq!(worst.len(), 3, "root then both children, saw {worst:?}");
-    let ceiling = u64::try_from(VIEW_CHANGE_TIMEOUT.as_millis()).expect("timeout fits a u64");
+    let ceiling =
+        u64::try_from(VIEW_CHANGE_TIMEOUT_DEFAULT.as_millis()).expect("timeout fits a u64");
     for (lane, (gap, at)) in &worst {
         assert!(
             *gap < ceiling,

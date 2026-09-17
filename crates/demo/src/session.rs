@@ -80,7 +80,7 @@ const EPOCH_MS: u64 = 30_000;
 /// same run. Pacing on the span instead would make the run a function of how
 /// often the caller happens to paint.
 ///
-/// The value has to be well inside `VIEW_CHANGE_TIMEOUT`. A duty gated on
+/// The value has to be well inside `VIEW_CHANGE_TIMEOUT_MIN`. A duty gated on
 /// chain progress — recognising a terminal, proving its commit, seeding a
 /// half from its parent — retries once per poll, so the poll interval is
 /// what a child's committee seats staggered across. Seat it slower than the

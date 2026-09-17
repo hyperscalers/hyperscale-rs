@@ -6,15 +6,12 @@ mod common;
 use std::time::Duration;
 
 use common::{HoldFilter, ShardCoordinatorSim};
-use hyperscale_types::{
-    BlockHeight, MAX_PROGRESS_WAIT, Round, VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT,
-    ValidatorId,
-};
+use hyperscale_types::{BlockHeight, Round, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId};
 
 const MAX_STEPS: usize = 5_000;
 
 /// A silent round-1 leader stalls the chain: while its headers are
-/// withheld no replica commits, and past `MAX_PROGRESS_WAIT` every
+/// withheld no replica commits, and past the progress wait every
 /// replica self-times-out and advances its round.
 ///
 /// Rounds increase per block, so `proposer_for(shard=0, r=1) =
@@ -46,13 +43,14 @@ fn silent_leader_triggers_view_change() {
         );
     }
 
-    // Past `MAX_PROGRESS_WAIT`, the `has_pending_at_tip`
+    // Past the progress wait, the `has_pending_at_tip`
     // suppression in `should_advance_round` lifts and the timer
     // fires even though the silent leader's own pending block is
     // sitting on its local tip. Each replica broadcasts a timeout
     // instead of advancing locally; delivering them forms the 2f+1
     // quorum that advances every replica together.
-    sim.advance_clock(MAX_PROGRESS_WAIT + Duration::from_millis(100));
+    let progress_wait = sim.coordinators[0].progress_wait();
+    sim.advance_clock(progress_wait + Duration::from_millis(100));
     sim.fire_view_change_timer_all();
     sim.run_for_at_most(MAX_STEPS);
 
@@ -106,7 +104,8 @@ fn view_sync_via_higher_round_header_does_not_increment_view_changes() {
 
     sim.kick_off();
     sim.run_for_at_most(100);
-    sim.advance_clock(MAX_PROGRESS_WAIT + Duration::from_millis(100));
+    let progress_wait = sim.coordinators[0].progress_wait();
+    sim.advance_clock(progress_wait + Duration::from_millis(100));
 
     // idx 1, 2, 3 time out, form a 2f+1 quorum at round 1, and advance to
     // round 2; idx 2 then proposes and its header reaches idx 0.
@@ -134,7 +133,7 @@ fn view_sync_via_higher_round_header_does_not_increment_view_changes() {
 
 /// Linear backoff: after `K` consecutive view changes at the
 /// same height, `current_view_change_timeout` is
-/// `VIEW_CHANGE_TIMEOUT + K * VIEW_CHANGE_TIMEOUT_INCREMENT`.
+/// `VIEW_CHANGE_TIMEOUT_DEFAULT × 2^K`.
 ///
 /// Hold every proposer's header so no block ever certifies — the chain
 /// stays at height 0 and consecutive timeout quorums accrue at one
@@ -142,7 +141,7 @@ fn view_sync_via_higher_round_header_does_not_increment_view_changes() {
 /// clock past both the progress-wait suppression and the current timeout,
 /// fires every timer, and delivers the timeouts so the 2f+1 quorum forms.
 #[test]
-fn linear_backoff_grows_timeout_per_consecutive_view_change() {
+fn backoff_doubles_timeout_per_consecutive_view_change() {
     let mut sim = ShardCoordinatorSim::new(4, 0xBA_C0);
     for idx in 0..sim.n() {
         sim.hold_matching(ValidatorId::new(idx as u64), HoldFilter::AnyHeader);
@@ -151,12 +150,13 @@ fn linear_backoff_grows_timeout_per_consecutive_view_change() {
     // r=1 (genesis QC round 0 + 1), no commits.
     assert_eq!(
         sim.coordinators[0].current_view_change_timeout(),
-        VIEW_CHANGE_TIMEOUT
+        VIEW_CHANGE_TIMEOUT_DEFAULT
     );
 
     for k in 1u32..=3 {
         let prev_timeout = sim.coordinators[0].current_view_change_timeout();
-        sim.advance_clock(MAX_PROGRESS_WAIT + prev_timeout + Duration::from_millis(100));
+        let progress_wait = sim.coordinators[0].progress_wait();
+        sim.advance_clock(progress_wait + prev_timeout + Duration::from_millis(100));
         sim.fire_view_change_timer_all();
         sim.run_for_at_most(MAX_STEPS);
         // No block certifies (headers held), so every replica advances on
@@ -168,7 +168,7 @@ fn linear_backoff_grows_timeout_per_consecutive_view_change() {
                 "replica {idx} view_changes count after iteration {k}",
             );
         }
-        let expected = VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT * k;
+        let expected = VIEW_CHANGE_TIMEOUT_DEFAULT * (1 << k);
         let actual = sim.coordinators[0].current_view_change_timeout();
         assert_eq!(
             actual, expected,
@@ -213,7 +213,8 @@ fn timeout_view_change_preserves_safe_vote_lock() {
 
     // A 2f+1 timeout quorum advances idx 0 (the deafened idx 2 / idx 3 still
     // broadcast their own timeouts — only their inbound is dropped).
-    sim.advance_clock(MAX_PROGRESS_WAIT + Duration::from_millis(100));
+    let progress_wait = sim.coordinators[0].progress_wait();
+    sim.advance_clock(progress_wait + Duration::from_millis(100));
     sim.fire_view_change_timer_all();
     sim.run_for_at_most(MAX_STEPS);
 
@@ -241,7 +242,8 @@ fn bracha_amplification_completes_quorum_from_f_plus_one() {
         sim.hold_matching(ValidatorId::new(idx as u64), HoldFilter::AnyHeader);
     }
 
-    sim.advance_clock(MAX_PROGRESS_WAIT + VIEW_CHANGE_TIMEOUT + Duration::from_millis(100));
+    let progress_wait = sim.coordinators[0].progress_wait();
+    sim.advance_clock(progress_wait + VIEW_CHANGE_TIMEOUT_DEFAULT + Duration::from_millis(100));
     // Only f+1 = 2 replicas fire their own timer.
     sim.fire_view_change_timer(ValidatorId::new(0));
     sim.fire_view_change_timer(ValidatorId::new(1));
@@ -270,7 +272,8 @@ fn lone_timeout_does_not_advance() {
         sim.hold_matching(ValidatorId::new(idx as u64), HoldFilter::AnyHeader);
     }
 
-    sim.advance_clock(MAX_PROGRESS_WAIT + VIEW_CHANGE_TIMEOUT + Duration::from_millis(100));
+    let progress_wait = sim.coordinators[0].progress_wait();
+    sim.advance_clock(progress_wait + VIEW_CHANGE_TIMEOUT_DEFAULT + Duration::from_millis(100));
     sim.fire_view_change_timer(ValidatorId::new(0));
     sim.run_for_at_most(MAX_STEPS);
 
@@ -295,10 +298,10 @@ fn lone_timeout_does_not_advance() {
 /// are withheld from each other, so no QC forms and each replica keeps a
 /// complete, verified block pending at its tip. Once a replica has voted it
 /// owes that block nothing, so the nominal timeout governs: the clock advances
-/// past `VIEW_CHANGE_TIMEOUT` and stops well short of `MAX_PROGRESS_WAIT`,
-/// and the timers still fire and carry a 2f+1 quorum. Charging the pending
-/// block against the progress window instead would hold every replica for the
-/// full `MAX_PROGRESS_WAIT` — three times the timeout the round is sized for.
+/// past the nominal timeout and stops well short of the progress wait, and
+/// the timers still fire and carry a 2f+1 quorum. Charging the pending block
+/// against the progress window instead would hold every replica for the full
+/// progress wait — three times the timeout the round is sized for.
 #[test]
 fn a_voted_tip_proposal_leaves_the_round_timer_to_the_nominal_timeout() {
     let mut sim = ShardCoordinatorSim::new(4, 0x_0A_11);
@@ -324,11 +327,11 @@ fn a_voted_tip_proposal_leaves_the_round_timer_to_the_nominal_timeout() {
         );
     }
 
-    // Short of `MAX_PROGRESS_WAIT`, so a pending tip block that still counted
+    // Short of the progress wait, so a pending tip block that still counted
     // as progress would keep every timer suppressed here.
     let nominal = sim.coordinators[0].current_view_change_timeout();
     assert!(
-        nominal + Duration::from_millis(100) < MAX_PROGRESS_WAIT,
+        nominal + Duration::from_millis(100) < sim.coordinators[0].progress_wait(),
         "the test only says something while the nominal timeout is the shorter of the two",
     );
     sim.advance_clock(nominal + Duration::from_millis(100));

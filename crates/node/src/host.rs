@@ -26,6 +26,7 @@ use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{CodeAvailability, Executor};
 use hyperscale_network::Network;
+use hyperscale_shard::ShardStats;
 use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage, TickChain};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, Derivation, LocalTimestamp, NetworkDefinition, ShardId,
@@ -386,6 +387,18 @@ where
     #[must_use]
     pub fn vnodes_len(&self, shard: ShardId) -> usize {
         self.shards.get(&shard).map_or(0, |g| g.vnodes.len())
+    }
+
+    /// Shard consensus statistics of every vnode hosted in `shard`, in
+    /// vnode order; empty if `shard` isn't hosted.
+    #[must_use]
+    pub fn shard_stats(&self, shard: ShardId) -> Vec<ShardStats> {
+        self.shards.get(&shard).map_or_else(Vec::new, |g| {
+            g.vnodes
+                .iter()
+                .map(|v| v.state.shard_coordinator().stats())
+                .collect()
+        })
     }
 
     /// Number of shard-less, beacon-following vnodes in the host's pool.

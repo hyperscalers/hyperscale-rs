@@ -61,6 +61,12 @@
 //!   timeout quorum advances the round and adopts the quorum-max `high_qc`, which
 //!   the new round's leader extends.
 //!
+//! - **Adaptive round timer**: the timer's base is six network delays as the
+//!   committed chain measures them (proposer stamp to quorum vote stamp, the
+//!   median over one committee rotation), bounded, and it doubles per round
+//!   abandoned at a height. Every replica derives it from the same committed
+//!   data, so the cluster times out together.
+//!
 //! - **View synchronization**: adopting a verified QC for round R advances the
 //!   local view to R+1, so rounds track the chain; a lagging validator also
 //!   nudges its view toward a higher round observed on a header or vote.

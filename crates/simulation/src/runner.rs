@@ -30,7 +30,7 @@ use hyperscale_node::{
     VnodeInit, seat_follower, seat_vnode_group, timer_event,
 };
 use hyperscale_provisions::ProvisionConfig;
-use hyperscale_shard::ShardConsensusConfig;
+use hyperscale_shard::{ShardConsensusConfig, ShardStats};
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
@@ -717,6 +717,15 @@ impl SimulationRunner {
             .get(host as usize)
             .map(|h| h.hosted_shards().collect())
             .unwrap_or_default()
+    }
+
+    /// Shard consensus statistics of `host`'s vnodes in `shard`, in vnode
+    /// order; empty when the host doesn't carry it.
+    #[must_use]
+    pub fn shard_stats(&self, host: NodeIndex, shard: ShardId) -> Vec<ShardStats> {
+        self.hosts
+            .get(host as usize)
+            .map_or_else(Vec::new, |h| h.shard_stats(shard))
     }
 
     /// Get the last emitted transaction status for a host.

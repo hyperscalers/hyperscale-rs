@@ -24,7 +24,7 @@ use hyperscale_scenarios::tx::{
     unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
-    Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
+    Budget, Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
     a_delivery_cut_off_past_its_window_is_reclaimed,
     a_delivery_is_reclaimed_when_its_deliverer_splits,
     a_departing_venue_clears_swaps_and_carries_on,
@@ -92,7 +92,7 @@ use hyperscale_storage::ShardChainReader;
 use hyperscale_types::test_utils::shard_fork_proof_signed_by;
 use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, PrincipalAddr, RecoveryCause, Round, ShardForkProof,
-    ShardId, Timeout,
+    ShardId, Timeout, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN,
 };
 use support::SimCluster;
 
@@ -112,6 +112,208 @@ const fn liveness_config() -> ScenarioConfig {
 fn liveness_baseline_sim() {
     let mut cluster = SimCluster::new(&liveness_config(), 11);
     liveness_baseline(&mut cluster);
+}
+
+/// Every committee member's `(committed height, delay estimate, round timer
+/// base)` for the root shard.
+fn round_timer_readings(cluster: &SimCluster) -> Vec<(u64, Option<Duration>, Duration)> {
+    cluster
+        .committee_hosts(ShardId::ROOT)
+        .into_iter()
+        .flat_map(|host| {
+            let height = cluster
+                .host_committed_height(host, ShardId::ROOT)
+                .map_or(0, BlockHeight::inner);
+            cluster
+                .shard_stats(host, ShardId::ROOT)
+                .into_iter()
+                .map(move |s| (height, s.delay_estimate, s.base_timeout))
+        })
+        .collect()
+}
+
+/// Replicas at the same committed height hold the same estimate and base:
+/// both are functions of the committed chain. Requires at least two members
+/// to share a height, so the agreement is not vacuous.
+fn assert_round_timer_agreement(readings: &[(u64, Option<Duration>, Duration)]) {
+    let mut shared = false;
+    for (i, a) in readings.iter().enumerate() {
+        for b in &readings[i + 1..] {
+            if a.0 == b.0 {
+                shared = true;
+                assert_eq!(
+                    (a.1, a.2),
+                    (b.1, b.2),
+                    "replicas at height {} disagree on the round timer: {readings:?}",
+                    a.0,
+                );
+            }
+        }
+    }
+    assert!(
+        shared,
+        "no two replicas share a committed height: {readings:?}"
+    );
+}
+
+/// Run until the root shard has committed `blocks` blocks past its height now.
+fn commit_blocks(cluster: &mut SimCluster, blocks: u64, budget: Budget) -> bool {
+    let from = cluster
+        .committed_height(ShardId::ROOT)
+        .map_or(0, BlockHeight::inner);
+    cluster.run_until(budget, |c| {
+        c.committed_height(ShardId::ROOT)
+            .is_some_and(|h| h.inner() >= from + blocks)
+    })
+}
+
+/// Seeds each round-timer scenario runs under: the sims are cheap, and one
+/// seed's schedule proves little about a timer.
+const ROUND_TIMER_SEEDS: [u64; 5] = [7, 11, 42, 1337, 2026];
+
+/// On a fast shard the chain-derived delay puts the round timer on its
+/// floor, well under the default, and every replica reads the same value.
+#[test]
+fn round_timer_tracks_a_fast_shard_sim() {
+    for seed in ROUND_TIMER_SEEDS {
+        let mut cluster = SimCluster::new(&liveness_config(), seed);
+        // Two rotations of a four-member committee, plus the block that
+        // closes the last sample.
+        assert!(
+            commit_blocks(&mut cluster, 9, epochs(1)),
+            "seed {seed}: the shard must commit two rotations",
+        );
+        let readings = round_timer_readings(&cluster);
+        assert_round_timer_agreement(&readings);
+        for (height, delay, base) in &readings {
+            let delay = delay.expect("a full rotation has committed");
+            assert!(
+                delay < Duration::from_millis(500),
+                "seed {seed}: at height {height} a 150ms hop measured {delay:?}",
+            );
+            assert_eq!(
+                *base, VIEW_CHANGE_TIMEOUT_MIN,
+                "seed {seed}: at height {height}"
+            );
+            assert!(*base < VIEW_CHANGE_TIMEOUT_DEFAULT);
+        }
+    }
+}
+
+/// Single-shard, four-member config with a slow interconnect.
+const fn slow_config() -> ScenarioConfig {
+    ScenarioConfig {
+        latency: Duration::from_millis(700),
+        ..liveness_config()
+    }
+}
+
+/// Every committee member's self-originated view change count.
+fn view_changes(cluster: &SimCluster) -> Vec<u64> {
+    cluster
+        .committee_hosts(ShardId::ROOT)
+        .into_iter()
+        .flat_map(|host| cluster.shard_stats(host, ShardId::ROOT))
+        .map(|s| s.view_changes)
+        .collect()
+}
+
+/// On a slow shard the round timer climbs past the default instead of
+/// firing on healthy rounds: no replica view-changes once the window is
+/// full, and all agree on the base.
+#[test]
+fn round_timer_tracks_a_slow_shard_sim() {
+    for seed in ROUND_TIMER_SEEDS {
+        let mut cluster = SimCluster::new(&slow_config(), seed);
+        assert!(
+            commit_blocks(&mut cluster, 9, epochs(2)),
+            "seed {seed}: the shard must commit two rotations",
+        );
+        let readings = round_timer_readings(&cluster);
+        assert_round_timer_agreement(&readings);
+        for (height, delay, base) in &readings {
+            let delay = delay.expect("a full rotation has committed");
+            // The hop jitters around 700ms; the median lands near it.
+            assert!(
+                delay >= Duration::from_millis(500),
+                "seed {seed}: at height {height} a 700ms hop measured {delay:?}",
+            );
+            assert!(
+                *base > VIEW_CHANGE_TIMEOUT_DEFAULT,
+                "seed {seed}: at height {height} the base {base:?} did not climb past the default",
+            );
+        }
+
+        let before = view_changes(&cluster);
+        assert!(
+            commit_blocks(&mut cluster, 8, epochs(2)),
+            "seed {seed}: the shard must keep committing on the adapted timer",
+        );
+        assert_eq!(
+            before,
+            view_changes(&cluster),
+            "seed {seed}: a healthy slow shard view-changed on its own timer",
+        );
+    }
+}
+
+/// A crashed leader costs one adapted timeout per turn, not the default: the
+/// longest gap between consecutive QCs after the isolation stays under the
+/// old constant, while at least one gap shows the view change happened.
+#[test]
+fn a_crashed_leader_costs_one_adaptive_timeout_sim() {
+    for seed in ROUND_TIMER_SEEDS {
+        let mut cluster = SimCluster::new(&liveness_config(), seed);
+        assert!(
+            commit_blocks(&mut cluster, 9, epochs(1)),
+            "seed {seed}: the shard must commit two rotations before the crash",
+        );
+        let base = round_timer_readings(&cluster)[0].2;
+        assert_eq!(base, VIEW_CHANGE_TIMEOUT_MIN, "seed {seed}");
+
+        // Host 1 leads every fourth round; isolating it models a crash.
+        let crashed = 1;
+        cluster.isolate(crashed);
+        let from = cluster
+            .committed_height(ShardId::ROOT)
+            .expect("committed before the crash")
+            .inner();
+        assert!(
+            commit_blocks(&mut cluster, 12, epochs(1)),
+            "seed {seed}: three rotations must commit around the crashed leader",
+        );
+        let to = cluster
+            .committed_height(ShardId::ROOT)
+            .expect("committed after the crash")
+            .inner();
+
+        // QC-to-QC intervals over the crashed stretch, read from the chain
+        // (host 0 is not the crashed one).
+        let mut gaps = Vec::new();
+        for height in (from + 2)..=to {
+            let child = cluster
+                .certified_header(0, ShardId::ROOT, BlockHeight::new(height))
+                .expect("a committed header");
+            let parent = cluster
+                .certified_header(0, ShardId::ROOT, BlockHeight::new(height - 1))
+                .expect("a committed header");
+            let gap = child
+                .parent_qc()
+                .weighted_timestamp()
+                .as_millis()
+                .saturating_sub(parent.parent_qc().weighted_timestamp().as_millis());
+            gaps.push(Duration::from_millis(gap));
+        }
+        let longest = gaps.iter().copied().max().expect("at least one gap");
+        assert!(
+            longest >= base,
+            "seed {seed}: no gap reached the base timeout, so no round was abandoned: {gaps:?}",
+        );
+        assert!(
+            longest < VIEW_CHANGE_TIMEOUT_DEFAULT,
+            "seed {seed}: a crashed leader cost {longest:?}, no better than the old constant: {gaps:?}",
+        );
+    }
 }
 
 #[test]
