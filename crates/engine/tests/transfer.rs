@@ -393,8 +393,9 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         let mut root =
             IntentBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED), HEADER);
         instantiate(&mut root, round, ()).expect("a derivable round answers its seal");
-        root.register_instance(lottery_meta(*salt));
-        let tree = root.build().expect("the intent declares no hole");
+        let tree = root
+            .build_presenting(vec![lottery_meta(*salt)], Vec::new())
+            .expect("the intent declares no hole");
         let seal = Transaction::new(client().sign_tree(&tree, &[&key], terms(1_000_000)));
         let executed = execute_batch_on(
             &store,
