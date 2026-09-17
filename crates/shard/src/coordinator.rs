@@ -4845,6 +4845,18 @@ impl ShardCoordinator {
                 committable_hash = ?committable_hash,
                 "Cannot extract assembled Verified<CertifiedBlock> for committable block — deferring commit"
             );
+            // A synced block was applied at this height and the chain
+            // certified its sibling instead: the applied one is an orphan
+            // and the winner has to be fetched. The FSM holds an applied
+            // height out of its window, so nothing else asks for it.
+            if self
+                .block_sync
+                .has_applied_sibling(committable_height, &committable_hash)
+            {
+                return vec![Action::ReopenSyncHeight {
+                    height: committable_height,
+                }];
+            }
             return vec![];
         };
 
@@ -10868,6 +10880,142 @@ mod tests {
                 .cached_verified_certified_block(winner)
                 .is_some(),
             "the committing sibling's handle must be available to the commit walk"
+        );
+    }
+
+    /// Deliver `block` to the sync apply path under a synthetic 3-of-4 QC,
+    /// returning its hash and the dispatched actions.
+    fn deliver_synced(
+        state: &mut ShardCoordinator,
+        topology_schedule: &TopologySchedule,
+        block: Block,
+    ) -> (BlockHash, Vec<Action>) {
+        let block_hash = block.hash();
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let qc = QuorumCertificate::new(
+            block_hash,
+            ShardId::ROOT,
+            block.height(),
+            block.header().parent_block_hash(),
+            block.header().round(),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100),
+        );
+        let actions = state.on_sync_block_ready_to_apply(
+            topology_schedule,
+            CertifiedBlock::new_unchecked(block, qc),
+        );
+        (block_hash, actions)
+    }
+
+    /// A QC certifying `block` whose committable block is the header's
+    /// parent, as a live QC on the block would carry.
+    fn qc_on(block: &Block) -> Verified<QuorumCertificate> {
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        // SAFETY: synthetic test fixture, no real signature.
+        Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            block.height(),
+            block.header().parent_block_hash(),
+            block.header().round(),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(110),
+        ))
+    }
+
+    #[test]
+    fn orphan_sibling_at_applied_height_reopens_the_height() {
+        // A peer served the sibling at height 4 that never commits. The
+        // child at 5 arrives with a parent QC naming the other sibling,
+        // whose handle this node does not hold: the commit defers, and the
+        // height goes back to the FSM to be fetched again. The FSM holds
+        // an applied height out of its window, so this is the only path by
+        // which the winner arrives.
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.set_block_syncing(true);
+
+        let (orphan, _) = deliver_synced(
+            &mut state,
+            &topology_schedule,
+            block_with_parent_qc_ts(BlockHeight::new(4), 100),
+        );
+        let qc = make_test_qc(orphan, BlockHeight::new(4));
+        let _ = state.on_qc_signature_verified(&topology_schedule, orphan, Ok(qc));
+        assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
+
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner_at_4"));
+        let child = block_chained_on(BlockHeight::new(5), winner, 110);
+        let child_qc = qc_on(&child);
+        let (child_hash, actions) = deliver_synced(&mut state, &topology_schedule, child);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "the child drains past the applied height; got {actions:?}"
+        );
+        let actions = state.on_qc_signature_verified(&topology_schedule, child_hash, Ok(child_qc));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ReopenSyncHeight { height } if *height == BlockHeight::new(4)
+            )),
+            "got {actions:?}"
+        );
+        assert_eq!(
+            state.committed_height,
+            BlockHeight::new(3),
+            "nothing commits over a missing parent"
+        );
+    }
+
+    #[test]
+    fn child_of_the_applied_block_does_not_reopen_its_height() {
+        // The companion: the child's parent QC names the block this node
+        // applied, so the commit walks through and no refetch is asked for.
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        // The commit prefix walks from the applied block down to the
+        // committed tip, so the tip has to be the parent it extends.
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+        state.set_block_syncing(true);
+
+        let (parent, _) = deliver_synced(
+            &mut state,
+            &topology_schedule,
+            block_with_parent_qc_ts(BlockHeight::new(4), 100),
+        );
+        let qc = make_test_qc(parent, BlockHeight::new(4));
+        let _ = state.on_qc_signature_verified(&topology_schedule, parent, Ok(qc));
+
+        let child = block_chained_on(BlockHeight::new(5), parent, 110);
+        let child_qc = qc_on(&child);
+        let (child_hash, _) = deliver_synced(&mut state, &topology_schedule, child);
+        let actions = state.on_qc_signature_verified(&topology_schedule, child_hash, Ok(child_qc));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ReopenSyncHeight { .. })),
+            "got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Continuation(ProtocolEvent::BlockReadyToCommit { certified, .. })
+                    if certified.block().hash() == parent
+            )),
+            "the applied parent commits under its round-contiguous child; got {actions:?}"
         );
     }
 

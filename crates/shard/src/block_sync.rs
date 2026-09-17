@@ -170,6 +170,16 @@ impl BlockSyncManager {
             .is_some_and(|hashes| hashes.contains(block_hash))
     }
 
+    /// Whether a block other than `block_hash` was applied at `height`.
+    /// A child's parent QC naming `block_hash` there makes the applied
+    /// block an orphan: the winner has to be fetched, and the FSM holds
+    /// an applied height out of its window until told.
+    pub(crate) fn has_applied_sibling(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
+        self.applied_uncommitted
+            .get(&height)
+            .is_some_and(|hashes| !hashes.contains(block_hash))
+    }
+
     /// Highest synced height admitted to the chain state. Its round-contiguous
     /// commit may still be pending, so this can sit a block above
     /// `committed_height`. The node's sync FSM mirrors it through
@@ -1135,6 +1145,24 @@ mod tests {
             .take_next_verified(BlockHeight::new(5))
             .expect("certified sibling at an applied height is takeable");
         assert_eq!(block.hash(), winner_hash);
+    }
+
+    #[test]
+    fn applied_sibling_is_detected_per_hash() {
+        let mut sm = BlockSyncManager::new();
+        let loser_hash = certified(BlockHeight::new(6), b"loser").block().hash();
+        sm.mark_applied(BlockHeight::new(6), loser_hash);
+        let winner_hash = certified(BlockHeight::new(6), b"winner").block().hash();
+
+        assert!(sm.has_applied_sibling(BlockHeight::new(6), &winner_hash));
+        assert!(
+            !sm.has_applied_sibling(BlockHeight::new(6), &loser_hash),
+            "the applied block is not its own sibling"
+        );
+        assert!(
+            !sm.has_applied_sibling(BlockHeight::new(7), &winner_hash),
+            "nothing applied at the height"
+        );
     }
 
     #[test]
