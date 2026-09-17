@@ -62,7 +62,7 @@ impl VerdictGuard {
 
     fn report(&mut self, acceptance: MessageAcceptance) {
         if let Some((message_id, propagation_source)) = self.pending.take() {
-            record_gossipsub_validation(acceptance_label(&acceptance));
+            record_gossipsub_validation(acceptance_label(acceptance));
             let _ = self.tx.send(ValidationReport {
                 message_id,
                 propagation_source,
@@ -79,7 +79,7 @@ impl Drop for VerdictGuard {
                 peer = %propagation_source,
                 "Gossip handler task ended without reporting a verdict; sending Ignore"
             );
-            record_gossipsub_validation(acceptance_label(&MessageAcceptance::Ignore));
+            record_gossipsub_validation(acceptance_label(MessageAcceptance::Ignore));
             let _ = self.tx.send(ValidationReport {
                 message_id,
                 propagation_source,
@@ -90,7 +90,7 @@ impl Drop for VerdictGuard {
 }
 
 /// Stable string label for the gossipsub validation outcome metric.
-const fn acceptance_label(acceptance: &MessageAcceptance) -> &'static str {
+const fn acceptance_label(acceptance: MessageAcceptance) -> &'static str {
     match acceptance {
         MessageAcceptance::Accept => "accept",
         MessageAcceptance::Reject => "reject",
@@ -128,7 +128,7 @@ pub(super) fn handle_gossipsub_event(
                     "Received message with invalid topic format"
                 );
                 record_invalid_message();
-                record_gossipsub_validation(acceptance_label(&MessageAcceptance::Reject));
+                record_gossipsub_validation(acceptance_label(MessageAcceptance::Reject));
                 let _ = validation_tx.send(ValidationReport {
                     message_id,
                     propagation_source,
@@ -172,7 +172,7 @@ pub(super) fn handle_gossipsub_event(
                     "Dropping shard-local message from non-hosted shard (cross-shard contamination attempt)"
                 );
                 record_invalid_message();
-                record_gossipsub_validation(acceptance_label(&MessageAcceptance::Reject));
+                record_gossipsub_validation(acceptance_label(MessageAcceptance::Reject));
                 let _ = validation_tx.send(ValidationReport {
                     message_id,
                     propagation_source,
@@ -188,7 +188,7 @@ pub(super) fn handle_gossipsub_event(
                     "No gossip handler registered for message type, dropping"
                 );
                 // No handler is not the sender's fault — ignore rather than reject.
-                record_gossipsub_validation(acceptance_label(&MessageAcceptance::Ignore));
+                record_gossipsub_validation(acceptance_label(MessageAcceptance::Ignore));
                 let _ = validation_tx.send(ValidationReport {
                     message_id,
                     propagation_source,

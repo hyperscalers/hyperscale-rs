@@ -82,48 +82,46 @@ arc-swap = "1.9.2"
 blake3 = "1.8.6"
 blst = "0.3.17"
 bytes = "1.12.1"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 core_affinity = "0.8.3"
-crossbeam = "0.8.4"
+crossbeam = "0.8.5"
 dashmap = "6.2.1"
 ed25519-dalek = "3.0.0"
 k256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
-futures = "0.3.33"
+futures = "0.3.34"
 hdrhistogram = "7.6.0"
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 im = "15.1.0"
-indexmap = "2.14.0"
-libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tokio", "macros", "identify"] }
+indexmap = "2.14.2"
+libp2p = { version = "0.57.0", features = ["gossipsub", "kad", "quic", "tokio", "macros", "identify"] }
+libp2p-stream = "0.5.0-alpha"
 ml-dsa = "0.1.1"
-libp2p-stream = "0.4.0-alpha"
 opentelemetry = "0.32.0"
 opentelemetry_sdk = "0.32.1"
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.32.1"
-papaya = "0.2.4"
+papaya = "0.2.5"
 parking_lot = "0.12.5"
 proptest = "1.11.0"
 quick_cache = "0.7.0"
 rand = "0.10.2"
 rand_chacha = "0.10.0"
 rayon = "1.12.0"
-rocksdb = "0.24.0"
+rocksdb = "0.25.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde-wasm-bindgen = "0.6.5"
 serde_json = "1.0.151"
 strum = { version = "0.28.0", features = ["derive"] }
 tempfile = "3.27.0"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
-toml = "1.1.4"
+toml = "1.1.6"
 tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
 tracing-subscriber = "0.3.23"
 tracing-test = "0.2.6"
-wasm-bindgen = "0.2.127"
-wasmtime = { version = "=48.0.0", features = ["component-model", "winch", "pulley"] }
-# Exact: `wat` versions as 1.x, so a caret would admit the whole major and
-# drag a second wasm-encoder and wasmparser in behind the engine's own.
+wasm-bindgen = "=0.2.108"
+wasmtime = { version = "=48.0.2", features = ["component-model", "winch", "pulley"] }
 wat = "=1.254.0"
 zeroize = "1.9.0"
 
