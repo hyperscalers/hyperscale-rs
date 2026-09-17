@@ -3,7 +3,7 @@
 //! [`ProtocolHasher`] puts the protocol hash — blake3 — behind the
 //! `vm_effects` hashing seam: domain-separated and length-framed, so a
 //! part boundary is always semantic. [`BridgeStatics`] derives a signed
-//! envelope's admission keys, participant prefixes and subintent claims
+//! envelope's admission keys, participant prefixes and nullifiers
 //! through it; [`admit_package`] judges a publish; [`PoolRegistry`] reads
 //! a recognised pool's events as beacon facts.
 

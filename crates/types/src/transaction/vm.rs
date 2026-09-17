@@ -6,8 +6,8 @@
 //! there through the derived preimage. What binds here is what the leaf
 //! crate deliberately does not know: the protocol hash and the signature
 //! arithmetic behind [`EnvelopeExt`], and the workspace's admission
-//! vocabulary behind [`Derivation`], which reads the terms and the window
-//! off the tree's root.
+//! vocabulary behind [`Derivation`], which reads the window off the
+//! tree's root and the terms beside the tree on the envelope.
 
 use std::sync::OnceLock;
 
@@ -146,8 +146,10 @@ pub struct Attested {
 /// Admission conflict keys and the owner prefixes that place it on
 /// shards. A pure function of the envelope and genesis-static metadata —
 /// derived locally at every node, never carried on the wire, so a
-/// sender cannot claim a placement its content does not earn. Nullifier creation writes are in the write keys: committing a
-/// subintent is an exclusive write at its canonical nullifier address.
+/// sender cannot claim a placement its content does not earn. Nullifier
+/// creation writes are in the write keys: committing an intent, the
+/// root included, is an exclusive write at its canonical nullifier
+/// address under each account the intent acts as.
 /// Snapshot reads appear nowhere here: they are lock-free and
 /// client-proven, so a snapshot-only shard is not a participant at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,12 +240,12 @@ impl Routing {
 pub struct Derived {
     /// The routing identity.
     pub routing: Routing,
-    /// The signing-time terms the root states: the payer, the fee
-    /// ceiling, the compute ceilings, the priority and the message.
+    /// The envelope's signing-time terms: the payer, the fee ceiling,
+    /// the compute ceilings, the priority and the message.
     ///
-    /// Read off the tree at derivation, since the envelope carries the
-    /// tree as bytes; every consumer reads these rather than decoding
-    /// the tree again.
+    /// Copied from the envelope at derivation, so every consumer reads
+    /// one derived record rather than the envelope's fields and the
+    /// derivation's side by side.
     pub terms: Terms,
     /// The network the root names, which every intent beneath it names
     /// too. What verification holds a transaction to a session by.

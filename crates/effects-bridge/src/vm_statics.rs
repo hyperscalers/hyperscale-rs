@@ -938,8 +938,8 @@ impl BridgeStatics {
         artifact: &[u8],
     ) -> Result<Derived, DerivationError> {
         // A publish's tree is one root that calls nothing: the intent
-        // that states the terms and the window, composing nobody and
-        // presenting no interface.
+        // that states the window, composing nobody and presenting no
+        // interface.
         let tree = decode_tree(&vm.tree)?;
         let root = &tree.root;
         let calls_nothing = root.graph.nodes.is_empty()
