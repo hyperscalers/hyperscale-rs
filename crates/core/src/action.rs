@@ -1309,6 +1309,22 @@ pub enum Action {
         target: BlockHeight,
     },
 
+    /// Tell block sync that `height` is in chain state with its commit
+    /// pending: the FSM holds it out of the fetch window and counts it
+    /// toward completion.
+    SyncBlockApplied {
+        /// The height `apply_synced_block` admitted.
+        height: BlockHeight,
+    },
+
+    /// Tell block sync to fetch `height` again: a certified sibling of
+    /// the block applied there exists, and the applied one is not
+    /// committing.
+    ReopenSyncHeight {
+        /// The height whose applied block a child's parent QC bypasses.
+        height: BlockHeight,
+    },
+
     /// Request the runner to start (or raise the target of) beacon-chain
     /// gap-fill sync.
     ///
@@ -1796,6 +1812,8 @@ impl Action {
             | Self::TopologyChanged { .. }
             | Self::ReconfigureParticipation(_)
             | Self::StartBlockSync { .. }
+            | Self::SyncBlockApplied { .. }
+            | Self::ReopenSyncHeight { .. }
             | Self::StartBeaconBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
             | Self::FetchCommitProof { .. }
@@ -1930,12 +1948,14 @@ impl Action {
             | Self::ReconfigureParticipation(..)
             | Self::RecordTxEcCreated { .. }
             | Self::ReofferTransactions { .. }
+            | Self::ReopenSyncHeight { .. }
             | Self::ResolveTicks { .. }
             | Self::RestoreCommittedState
             | Self::SetTimer { .. }
             | Self::StartBeaconBlockSync { .. }
             | Self::StartBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
+            | Self::SyncBlockApplied { .. }
             | Self::TopologyChanged { .. } => ActionOwner::Local,
         }
     }

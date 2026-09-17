@@ -6,6 +6,9 @@
 //!
 //! - `target` — the highest known height to chase
 //! - `committed` — the highest height admitted via [`SyncInput::Admitted`]
+//! - `applied` — heights above `committed` the consumer holds with their
+//!   commit pending ([`SyncInput::Applied`]); held out of the fetch window
+//!   and counted toward completion, put back by [`SyncInput::Reopen`]
 //! - a [`BlockHeight`] queue of heights waiting to be fetched
 //! - which heights are in-flight to the network
 //! - which heights are deferred behind an exponential backoff after a
@@ -37,7 +40,7 @@
 //! [`SyncInput::Admitted`].
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::Duration;
@@ -234,8 +237,17 @@ struct ScopeState<K: SyncKey> {
     /// implicitly when a delivered height exceeds the current target
     /// (the responder's possession of a height is proof of existence).
     target: K,
-    /// Highest admitted height.
+    /// Highest admitted height. This is the commit frontier: nothing
+    /// advances it but [`SyncInput::Admitted`], and `applied` sits above
+    /// it so a fork can reopen a height.
     committed: K,
+    /// Heights above `committed` the consumer holds in chain state with
+    /// their commit pending. Held out of the fetch window and counted
+    /// toward completion through `frontier`; a [`SyncInput::Reopen`] puts
+    /// one back when the consumer learns a certified sibling exists at
+    /// it. The consumer applies contiguously, so the highest entry is the
+    /// frontier; the set is not checked for gaps.
+    applied: BTreeSet<K>,
     /// Heights ready to fetch (lowest-first).
     heights_to_fetch: BinaryHeap<Reverse<K>>,
     /// Membership for `heights_to_fetch` to dedupe pushes.
@@ -248,8 +260,9 @@ struct ScopeState<K: SyncKey> {
     /// Heights delivered by the network but not yet admitted by the
     /// consumer (admission is async — e.g. cross-shard QC verification
     /// on a thread pool). Held out of `heights_to_fetch` until either
-    /// admission lands (drop on `handle_admitted`) or the deadline
-    /// elapses (demoted to `deferred` on `handle_tick`). Without this,
+    /// admission lands (drop on `handle_admitted`), the consumer reports
+    /// the height applied (moved to `applied`), or the deadline elapses
+    /// (re-queued on `handle_tick`, with no backoff). Without this,
     /// `queue_window` would re-queue every just-delivered range and
     /// `emit_fetches` would dispatch a duplicate fetch for the bytes
     /// we just received.
@@ -269,6 +282,7 @@ impl<K: SyncKey> ScopeState<K> {
         Self {
             target,
             committed: K::GENESIS,
+            applied: BTreeSet::new(),
             heights_to_fetch: BinaryHeap::new(),
             heights_queued: HashSet::new(),
             in_flight: HashSet::new(),
@@ -279,10 +293,30 @@ impl<K: SyncKey> ScopeState<K> {
         }
     }
 
+    /// The highest height the consumer holds: `committed`, or the top
+    /// applied height above it. Completion and the syncing predicate read
+    /// this rather than `committed`.
+    fn frontier(&self) -> K {
+        self.applied
+            .last()
+            .map_or(self.committed, |&top| top.max(self.committed))
+    }
+
+    fn is_syncing(&self) -> bool {
+        self.frontier() < self.target
+    }
+
+    fn blocks_behind(&self) -> u64 {
+        self.target
+            .as_u64()
+            .saturating_sub(self.frontier().as_u64())
+    }
+
     fn queue_height(&mut self, height: K) {
         if self.in_flight.contains(&height)
             || self.deferred.contains_key(&height)
             || self.pending_admission.contains_key(&height)
+            || self.applied.contains(&height)
         {
             return;
         }
@@ -349,6 +383,15 @@ pub enum SyncInput<B: SyncBinding> {
     /// The consumer admitted a height for `scope` (e.g. via QC verification).
     /// Advances per-scope `committed`; may emit `Complete`.
     Admitted { scope: B::Scope, height: B::Key },
+    /// The consumer holds `height` in chain state with its commit pending.
+    /// Holds the height out of the fetch window and counts it toward
+    /// completion; may emit `Complete`. A height above `target` raises
+    /// `target`, as a delivery would.
+    Applied { scope: B::Scope, height: B::Key },
+    /// The consumer wants `height` fetched again: a certified sibling of
+    /// the block it applied there exists. Re-queues the height if it is
+    /// still open. Idempotent while a fetch for it is in flight.
+    Reopen { scope: B::Scope, height: B::Key },
     /// Periodic tick: promotes deferred heights past their backoff and
     /// emits any newly-ready fetches.
     Tick { now: LocalTimestamp },
@@ -404,21 +447,18 @@ impl<B: SyncBinding> Sync<B> {
         self.scopes.values().any(|s| !s.deferred.is_empty())
     }
 
-    /// True if any scope is actively syncing (committed < target).
+    /// True if any scope is actively syncing (frontier < target).
     #[must_use]
     pub(crate) fn is_syncing(&self) -> bool {
-        self.scopes.values().any(|s| s.committed < s.target)
+        self.scopes.values().any(ScopeState::is_syncing)
     }
 
     /// Total blocks behind across all scopes — sum of each scope's
-    /// `target - committed`. Use for an aggregate gauge across a
+    /// `target - frontier`. Use for an aggregate gauge across a
     /// multi-scope binding.
     #[must_use]
     pub(crate) fn total_blocks_behind(&self) -> u64 {
-        self.scopes
-            .values()
-            .map(|s| s.target.as_u64().saturating_sub(s.committed.as_u64()))
-            .sum()
+        self.scopes.values().map(ScopeState::blocks_behind).sum()
     }
 
     /// Total in-flight fetch ranges across all scopes.
@@ -441,7 +481,7 @@ impl<B: SyncBinding> Sync<B> {
             .map(|s| ScopeStatus {
                 target_height: s.target.as_u64(),
                 current_height: s.committed.as_u64(),
-                blocks_behind: s.target.as_u64().saturating_sub(s.committed.as_u64()),
+                blocks_behind: s.blocks_behind(),
                 pending_fetches: s.in_flight_ranges,
                 queued_heights: s.heights_queued.len()
                     + s.deferred.len()
@@ -469,6 +509,8 @@ impl<B: SyncBinding> Sync<B> {
                 now,
             } => self.handle_fetch_failed(&scope, from, count, kind, now),
             SyncInput::Admitted { scope, height } => self.handle_admitted(&scope, height),
+            SyncInput::Applied { scope, height } => self.handle_applied(&scope, height),
+            SyncInput::Reopen { scope, height } => self.handle_reopen(&scope, height),
             SyncInput::Tick { now } => self.handle_tick(now),
         }
     }
@@ -570,11 +612,13 @@ impl<B: SyncBinding> Sync<B> {
             let h = from.offset(offset);
             state.in_flight.remove(&h);
             if delivered.contains(&h) {
-                if h > state.committed {
-                    // Park until the consumer admits this height (async —
-                    // e.g. QC verification on the consensus-crypto pool).
-                    // `handle_tick` demotes back to `deferred` if admission
-                    // never arrives within `PENDING_ADMISSION_TIMEOUT`.
+                // Park until the consumer admits this height (async —
+                // e.g. QC verification on the consensus-crypto pool).
+                // `handle_tick` re-queues it if admission never arrives
+                // within `PENDING_ADMISSION_TIMEOUT`. A height the
+                // consumer already reported applied has nothing to wait
+                // for.
+                if h > state.committed && !state.applied.contains(&h) {
                     state.pending_admission.insert(h, pending_deadline);
                 }
             } else if h <= state.target && h > state.committed {
@@ -684,10 +728,10 @@ impl<B: SyncBinding> Sync<B> {
 
         // `Complete` should only fire on the transition from "syncing" to
         // "caught up" — i.e. the consumer admitted the height that closes
-        // the last gap. Capture whether we were below target *before*
-        // advancing committed so a steady-stream of admissions outside an
-        // active sync (target == committed) doesn't re-fire Complete.
-        let was_syncing = state.committed < state.target;
+        // the last gap. Capture whether the frontier was below target
+        // *before* advancing so a steady stream of admissions outside an
+        // active sync doesn't re-fire Complete.
+        let was_syncing = state.is_syncing();
 
         if height > state.committed {
             state.committed = height;
@@ -696,34 +740,87 @@ impl<B: SyncBinding> Sync<B> {
         // Drop tracking state for heights at or below the new committed
         // level.
         let committed = state.committed;
-        let reached_target = was_syncing && committed >= state.target;
         state.heights_queued.retain(|&h| h > committed);
         state.in_flight.retain(|&h| h > committed);
         state.deferred.retain(|&h, _| h > committed);
         state.pending_admission.retain(|&h, _| h > committed);
+        state.applied.retain(|&h| h > committed);
 
         // Binding hook: clean up per-id auxiliary state.
         B::on_admitted(&mut self.binding_state, scope, committed);
 
-        let mut outputs = Vec::new();
-        if reached_target {
-            info!(
-                binding = B::NAME,
-                ?scope,
-                height = committed.as_u64(),
-                "sync: caught up"
-            );
-            B::on_complete(&mut self.binding_state, scope, committed);
-            outputs.push(SyncOutput::Complete {
-                scope: scope.clone(),
-                height: committed,
-            });
-            return outputs;
+        if was_syncing && !state.is_syncing() {
+            return vec![self.complete(scope)];
+        }
+
+        let state = self
+            .scopes
+            .get_mut(scope)
+            .expect("scope entry inserted above");
+        Self::queue_window(state, &self.config);
+        self.emit_fetches()
+    }
+
+    fn handle_applied(&mut self, scope: &B::Scope, height: B::Key) -> Vec<SyncOutput<B>> {
+        let state = self
+            .scopes
+            .entry(scope.clone())
+            .or_insert_with(|| ScopeState::new(B::Key::GENESIS));
+        if height <= state.committed {
+            return vec![];
+        }
+        let was_syncing = state.is_syncing();
+
+        state.applied.insert(height);
+        state.heights_queued.remove(&height);
+        state.deferred.remove(&height);
+        state.pending_admission.remove(&height);
+        // The height above `committed` exists after all.
+        state.not_found_streak = 0;
+        if height > state.target {
+            state.target = height;
+        }
+
+        if was_syncing && !state.is_syncing() {
+            return vec![self.complete(scope)];
         }
 
         Self::queue_window(state, &self.config);
-        outputs.extend(self.emit_fetches());
-        outputs
+        self.emit_fetches()
+    }
+
+    fn handle_reopen(&mut self, scope: &B::Scope, height: B::Key) -> Vec<SyncOutput<B>> {
+        let Some(state) = self.scopes.get_mut(scope) else {
+            return vec![];
+        };
+        state.applied.remove(&height);
+        if height > state.committed && height <= state.target {
+            info!(
+                binding = B::NAME,
+                ?scope,
+                height = height.as_u64(),
+                "sync: height reopened"
+            );
+            state.queue_height(height);
+        }
+        self.emit_fetches()
+    }
+
+    /// The scope's frontier just reached its target: fire the binding
+    /// hook and produce the `Complete` output.
+    fn complete(&mut self, scope: &B::Scope) -> SyncOutput<B> {
+        let frontier = self.scopes[scope].frontier();
+        info!(
+            binding = B::NAME,
+            ?scope,
+            height = frontier.as_u64(),
+            "sync: caught up"
+        );
+        B::on_complete(&mut self.binding_state, scope, frontier);
+        SyncOutput::Complete {
+            scope: scope.clone(),
+            height: frontier,
+        }
     }
 
     fn handle_tick(&mut self, now: LocalTimestamp) -> Vec<SyncOutput<B>> {
@@ -1783,5 +1880,189 @@ mod tests {
             delivered_heights: vec![BlockHeight::new(1)],
             now: LocalTimestamp::from_millis(0),
         });
+    }
+
+    fn fetched_from(outputs: &[SyncOutput<UnitBinding>]) -> Vec<u64> {
+        outputs
+            .iter()
+            .filter_map(|o| match o {
+                SyncOutput::Fetch { from, .. } => Some(from.inner()),
+                SyncOutput::Complete { .. } => None,
+            })
+            .collect()
+    }
+
+    fn completed_at(outputs: &[SyncOutput<UnitBinding>]) -> Option<u64> {
+        outputs.iter().find_map(|o| match o {
+            SyncOutput::Complete { height, .. } => Some(height.inner()),
+            SyncOutput::Fetch { .. } => None,
+        })
+    }
+
+    #[test]
+    fn applied_without_admitted_completes() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(2),
+        });
+        let _ = s.handle(SyncInput::Admitted {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        let outputs = s.handle(SyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(2),
+        });
+        assert_eq!(completed_at(&outputs), Some(2));
+        assert!(!s.is_syncing());
+        let st = s.scopes.get(&()).unwrap();
+        assert_eq!(
+            st.committed,
+            BlockHeight::new(1),
+            "applied is not committed"
+        );
+        assert_eq!(st.frontier(), BlockHeight::new(2));
+        assert_eq!(s.total_blocks_behind(), 0);
+    }
+
+    #[test]
+    fn applied_height_is_not_requeued_when_pending_admission_expires() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(2),
+        });
+        for h in 1..=2 {
+            let _ = s.handle(SyncInput::FetchSucceeded {
+                scope: (),
+                from: BlockHeight::new(h),
+                count: 1,
+                delivered_heights: vec![BlockHeight::new(h)],
+                now: LocalTimestamp::ZERO,
+            });
+        }
+        let _ = s.handle(SyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        // Both heights' admission deadlines have passed. Height 2 is still
+        // open and goes back out; height 1 is held.
+        let outputs = s.handle(SyncInput::Tick {
+            now: LocalTimestamp::ZERO.plus(PENDING_ADMISSION_TIMEOUT + Duration::from_secs(1)),
+        });
+        assert_eq!(fetched_from(&outputs), vec![2]);
+    }
+
+    #[test]
+    fn applied_above_target_raises_target() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(2),
+        });
+        let _ = s.handle(SyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(5),
+        });
+        assert_eq!(s.target(&()), Some(BlockHeight::new(5)));
+    }
+
+    #[test]
+    fn admitted_prunes_applied_at_or_below_it() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(5),
+        });
+        for h in 1..=3 {
+            let _ = s.handle(SyncInput::Applied {
+                scope: (),
+                height: BlockHeight::new(h),
+            });
+        }
+        let _ = s.handle(SyncInput::Admitted {
+            scope: (),
+            height: BlockHeight::new(2),
+        });
+        let st = s.scopes.get(&()).unwrap();
+        assert_eq!(st.committed, BlockHeight::new(2));
+        assert_eq!(
+            st.applied.iter().copied().collect::<Vec<_>>(),
+            vec![BlockHeight::new(3)]
+        );
+        assert_eq!(st.frontier(), BlockHeight::new(3));
+        assert_eq!(s.total_blocks_behind(), 2);
+    }
+
+    #[test]
+    fn reopen_requeues_an_applied_height() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(1),
+        });
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: (),
+            from: BlockHeight::new(1),
+            count: 1,
+            delivered_heights: vec![BlockHeight::new(1)],
+            now: LocalTimestamp::ZERO,
+        });
+        let outputs = s.handle(SyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        assert_eq!(completed_at(&outputs), Some(1));
+
+        // The applied block turns out to have a certified sibling: the
+        // height goes back out and the scope is syncing again.
+        let outputs = s.handle(SyncInput::Reopen {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        assert_eq!(fetched_from(&outputs), vec![1]);
+        assert!(s.is_syncing());
+
+        // The sibling applies and the scope completes a second time.
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: (),
+            from: BlockHeight::new(1),
+            count: 1,
+            delivered_heights: vec![BlockHeight::new(1)],
+            now: LocalTimestamp::ZERO,
+        });
+        let outputs = s.handle(SyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        assert_eq!(completed_at(&outputs), Some(1));
+        assert!(!s.is_syncing());
+    }
+
+    #[test]
+    fn reopen_is_idempotent_while_the_height_is_in_flight() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let outputs = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(1),
+        });
+        assert_eq!(fetched_from(&outputs), vec![1]);
+        // Applied while the fetch is still out.
+        let _ = s.handle(SyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        for _ in 0..2 {
+            let outputs = s.handle(SyncInput::Reopen {
+                scope: (),
+                height: BlockHeight::new(1),
+            });
+            assert!(
+                fetched_from(&outputs).is_empty(),
+                "in-flight height is not fetched twice"
+            );
+        }
+        assert!(s.is_syncing());
     }
 }
