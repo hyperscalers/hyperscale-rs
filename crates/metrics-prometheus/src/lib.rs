@@ -100,6 +100,7 @@ pub struct Metrics {
     pub sync_blocks_filtered: CounterVec,
     pub sync_response_errors: CounterVec,
     pub sync_round_started: CounterVec,
+    pub halt_recovery_offers_refused: Counter,
     pub sync_round_completed: CounterVec,
     pub sync_round_retried: CounterVec,
     pub sync_round_in_flight: GaugeVec,
@@ -500,6 +501,11 @@ impl Metrics {
                 "hyperscale_sync_round_started_total",
                 "Sync range round-trips started (one per network request emitted by a sync FSM)",
                 &["kind"]
+            )
+            .unwrap(),
+            halt_recovery_offers_refused: register_counter!(
+                "hyperscale_halt_recovery_offers_refused_total",
+                "Retained tip offers refused by a halt recovery's fresh committee after its chain certified past the anchor"
             )
             .unwrap(),
 
@@ -1172,6 +1178,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .sync_round_started
             .with_label_values(&[kind])
             .inc();
+    }
+
+    fn record_halt_recovery_offer_refused(&self) {
+        self.metrics.halt_recovery_offers_refused.inc();
     }
 
     fn record_sync_round_completed(&self, kind: &str) {
