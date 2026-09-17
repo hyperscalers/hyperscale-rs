@@ -6534,7 +6534,7 @@ impl ShardCoordinator {
             self.me,
             self.local_shard,
             self.now,
-            self.config.transaction_fetch_timeout,
+            self.view_change.fetch_timeout(),
             force_immediate,
         )
     }
