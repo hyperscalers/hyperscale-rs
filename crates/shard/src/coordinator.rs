@@ -1312,13 +1312,34 @@ impl ShardCoordinator {
         advanced
     }
 
-    /// Re-drive the vote path for every pending complete block, for the
-    /// votes the fence deferred on evidence that has since arrived.
+    /// Re-drive the vote path for every pending complete block the
+    /// evidence can still move, for the votes and verifications the fence
+    /// deferred on evidence that has since arrived.
     /// `trigger_qc_verification_or_vote` is idempotent (already-verified
-    /// / already-voted short-circuit), so re-driving every pending block
-    /// is safe.
+    /// / already-voted short-circuit), so re-driving every such block is
+    /// safe. A verified block from a round the view has passed is left
+    /// alone: the safe-vote rule wants the current round, so no evidence
+    /// can make it votable, and with its verification done there is
+    /// nothing else the re-drive could start. The fence advances on every
+    /// commit, so without this a stale block is re-evaluated at the
+    /// chain's block rate for as long as it stays pending. An unverified
+    /// block is re-driven whatever its round: its verification is what
+    /// lets it commit once a quorum forms it elsewhere.
     pub fn redrive_pending_votes(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        let pending = self.assembled_in_chain_order();
+        let view = self.view_change.view;
+        let pending: Vec<BlockHash> = self
+            .assembled_in_chain_order()
+            .into_iter()
+            .filter(|hash| {
+                let Some(pending) = self.pending_blocks.get(*hash) else {
+                    return true;
+                };
+                pending.header().round() >= view
+                    || !pending
+                        .block()
+                        .is_some_and(|block| self.verification.is_block_verified(block))
+            })
+            .collect();
         let mut actions = Vec::new();
         for block_hash in pending {
             actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, block_hash));
@@ -10301,6 +10322,39 @@ mod tests {
             Some(RetainedTip::Offered(BlockHeight::new(5)))
         );
         assert!(!state.recovery_behind_retained_tip());
+    }
+
+    /// The fence re-drive visits only blocks the evidence can still move:
+    /// once the view has passed a verified block's round, no evidence
+    /// makes it votable, and re-evaluating it on every commit is waste.
+    #[test]
+    fn a_verified_block_from_a_passed_round_is_not_redriven() {
+        use hyperscale_types::test_utils::make_live_block;
+
+        let (mut state, schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(1),
+            vec![],
+            vec![],
+        );
+        let round = block.header().round();
+        install_complete_block(&mut state, &block);
+
+        state.view_change.view = round.next();
+        assert!(
+            !state.redrive_pending_votes(&schedule).is_empty(),
+            "an unverified block is re-driven whatever its round: its verification is what lets it commit"
+        );
+
+        state.verification.mark_proposal_fully_verified(&block);
+        assert!(
+            state.redrive_pending_votes(&schedule).is_empty(),
+            "a verified block from a passed round is left alone"
+        );
     }
 
     /// A sync-delivered certified block above the fork recovery's attested
