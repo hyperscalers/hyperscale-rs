@@ -58,7 +58,7 @@ pub struct Transaction {
     #[hbor(skip)]
     body: OnceLock<TransactionEnvelope>,
 
-    /// Derived routing identity and subintent claims, populated at
+    /// Derived routing identity and intent records, populated at
     /// verification (or lazily for committed transactions). Not on the
     /// wire — derivation is local by construction.
     #[hbor(skip)]
@@ -349,10 +349,10 @@ impl Transaction {
     /// included in a block. Anchored on the parent QC's `weighted_timestamp`
     /// at every check site. Signer-chosen, chain-enforced.
     ///
-    /// The *effective* window: the envelope's, narrowed by every
-    /// subintent it binds. Read from the derivation rather than from the
-    /// envelope, because the envelope's own fields are the composer's
-    /// claim and a bound signer's window may be tighter.
+    /// The *effective* window: the root's, narrowed by every member
+    /// intent nested beneath it. Read from the derivation rather than
+    /// from the envelope, because the root's own header is the
+    /// composer's claim and a member's window may be tighter.
     ///
     /// # Panics
     ///
@@ -922,10 +922,10 @@ mod tests {
 
     #[test]
     fn the_validity_window_is_the_derived_one() {
-        // The envelope's window is the composer's claim; the window the
-        // transaction actually has is the derivation's, because a bound
-        // subintent may have offered a tighter one. With nothing bound
-        // they agree, and that agreement is what this pins.
+        // The root's window is the composer's claim; the window the
+        // transaction actually has is the derivation's, because a nested
+        // member may have offered a tighter one. With no member they
+        // agree, and that agreement is what this pins.
         let tx = fixture(b"graph bytes");
         tx.try_derived(&StubStatics).expect("the stub derives");
         assert_eq!(tx.validity_range(), test_validity_range());

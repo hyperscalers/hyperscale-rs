@@ -103,13 +103,16 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// for every transaction it commits. Sized at five times
 /// [`MAX_TXS_PER_BLOCK`] so a full block of any shape the corpus
 /// produces stays admissible on its busiest shard — every transaction
-/// carries its committed cell and its own intent's nullifier, so a
+/// carries its committed cell and one nullifier per account its root
+/// intent acts as, one for every shape the corpus produces, so a
 /// transfer's payer writes those and the record, three; a swap's caller
 /// adds the claim of what the venue issued, four; a liquidity provider
 /// paying two resources writes two records and one claim beside them,
-/// five. A bound subintent adds its own nullifier on its signer's shard,
-/// so a subintent-heavy block packs fewer transactions, which is the
-/// trade the figure made when nullifiers were the only family. Nothing
+/// five. A member intent adds a nullifier under each of its accounts on
+/// that account's shard, and a root acting as several accounts adds one
+/// per account the same way, so a block heavy with either packs fewer
+/// transactions, which is the trade the figure made when nullifiers
+/// were the only family. Nothing
 /// else in the block budget reaches this: a nullifier costs its
 /// transaction a footprint unit and a signature, so the work budget
 /// admits thirty-two of them per transaction and the creation ceiling
