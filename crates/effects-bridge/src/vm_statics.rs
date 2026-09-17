@@ -2179,6 +2179,7 @@ mod tests {
                 GraphArg::Literal(Value::Bytes(bob_rule())),
                 GraphArg::Literal(Value::Bytes(bob_rule())),
                 GraphArg::Literal(Value::Bytes(bob_rule())),
+                GraphArg::Literal(Value::Bytes(bob_rule())),
                 GraphArg::Literal(Value::U64(86_400_000)),
             ],
             evidence,
