@@ -20,7 +20,7 @@ use hyperscale_engine::{
     PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
     TickEnvironment, TickTxInput, genesis_writes,
 };
-use hyperscale_hbor::{Bytes, Capped, TypeShape};
+use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
     Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
 };
@@ -2406,7 +2406,7 @@ fn naming(metadata: &mut PackageMetadata, event: &str) {
     metadata
         .types
         .push(TypeShape::Named {
-            name: event.to_owned(),
+            name: Name::try_from(event).expect("a name the protocol spells"),
             shape: unit,
         })
         .expect("a name the package does not already hold");
@@ -2495,7 +2495,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     // the index still reaches the compile worker. A restart replays
     // whatever the store holds, so one unreadable entry must not be the
     // end of the reseed.
-    naming(&mut metadata, "after the refusal");
+    naming(&mut metadata, "after_the_refusal");
     let next = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     executor.install_artifact(&next);
     await_code_runnable(&executor, package_hash(&ProtocolHasher, &next));
