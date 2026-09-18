@@ -85,8 +85,7 @@ pub fn qc1_certify(votes: &[PcVector], f: usize) -> Option<PcVector> {
         .iter()
         .filter(|(_, c)| **c >= threshold)
         .max_by_key(|(p, _)| p.len())
-        .map(|(p, _)| p.clone())
-        .unwrap_or_default();
+        .map_or_default(|(p, _)| p.clone());
     Some(PcVector::new(best))
 }
 

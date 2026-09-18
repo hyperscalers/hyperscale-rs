@@ -129,11 +129,7 @@ impl ShardSupervisor {
     /// off its last shard and would otherwise go dark, never raising its own
     /// re-seat trigger. No-op if it is already a follower.
     pub(super) fn follow_in_pool(&mut self, validator: ValidatorId) {
-        let mut validators = self
-            .pool
-            .as_ref()
-            .map(|p| p.validators.clone())
-            .unwrap_or_default();
+        let mut validators = self.pool.as_ref().map_or_default(|p| p.validators.clone());
         if validators.contains(&validator) {
             return;
         }

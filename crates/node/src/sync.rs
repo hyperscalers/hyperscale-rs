@@ -482,18 +482,13 @@ impl<B: SyncBinding> Sync<B> {
     /// Per-scope status snapshot.
     #[must_use]
     pub(crate) fn status(&self, scope: &B::Scope) -> ScopeStatus {
-        self.scopes
-            .get(scope)
-            .map(|s| ScopeStatus {
-                target_height: s.target.as_u64(),
-                current_height: s.committed.as_u64(),
-                blocks_behind: s.blocks_behind(),
-                pending_fetches: s.in_flight_ranges,
-                queued_heights: s.heights_queued.len()
-                    + s.deferred.len()
-                    + s.pending_admission.len(),
-            })
-            .unwrap_or_default()
+        self.scopes.get(scope).map_or_default(|s| ScopeStatus {
+            target_height: s.target.as_u64(),
+            current_height: s.committed.as_u64(),
+            blocks_behind: s.blocks_behind(),
+            pending_fetches: s.in_flight_ranges,
+            queued_heights: s.heights_queued.len() + s.deferred.len() + s.pending_admission.len(),
+        })
     }
 
     /// Process an input, returning outputs.

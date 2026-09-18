@@ -2170,8 +2170,7 @@ impl ExecutionCoordinator {
         let ec_tx_hashes = self
             .ticks
             .get_tick(&tick_id)
-            .map(|w| w.tx_hashes().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|w| w.tx_hashes().to_vec());
 
         // tx_outcomes are extracted from votes by the aggregation handler
         // (all quorum votes carry identical outcomes).
@@ -2219,16 +2218,13 @@ impl ExecutionCoordinator {
         // is what its copy carries — the certificate a remote shard gets
         // is sized by its own stake in the batch rather than by the
         // batch.
-        let per_target: Vec<(ShardId, HashSet<TxHash>)> = self
-            .ticks
-            .get_tick(tick_id)
-            .map(|tick| {
+        let per_target: Vec<(ShardId, HashSet<TxHash>)> =
+            self.ticks.get_tick(tick_id).map_or_default(|tick| {
                 tick.counterpart_shards()
                     .into_iter()
                     .map(|shard| (shard, tick.txs_reaching(shard).collect()))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
 
         // Make the cert available to the io_loop's inbound EC fetch handler
         // for fallback serving until the containing block commits.
@@ -7394,8 +7390,7 @@ mod tests {
         state
             .ticks
             .get_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(height)))
-            .map(|tick| tick.tx_hashes().to_vec())
-            .unwrap_or_default()
+            .map_or_default(|tick| tick.tx_hashes().to_vec())
     }
 
     /// A replay releases the ticks the blocks it re-drives finalized,

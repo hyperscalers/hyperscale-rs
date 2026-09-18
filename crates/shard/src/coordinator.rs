@@ -6923,8 +6923,7 @@ impl ShardCoordinator {
         let mut actions = self
             .pending_blocks
             .remove_orphaning(block_hash)
-            .map(OrphanedFetches::into_abandon_actions)
-            .unwrap_or_default();
+            .map_or_default(OrphanedFetches::into_abandon_actions);
         actions.extend(self.abandon_orphaned_relays(&relays));
         actions
     }
@@ -7113,9 +7112,7 @@ impl ShardCoordinator {
         let tip = voted.or_else(|| self.latest_qc.as_deref().map(QuorumCertificate::block_hash));
         VotePosition {
             registers: self.safe_vote_registers(),
-            justification: tip
-                .map(|tip| self.uncommitted_suffix(tip))
-                .unwrap_or_default(),
+            justification: tip.map_or_default(|tip| self.uncommitted_suffix(tip)),
         }
     }
 

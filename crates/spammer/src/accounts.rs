@@ -264,15 +264,12 @@ impl AccountPool {
         shard: ShardId,
         balance: u128,
     ) -> Vec<(PrincipalAddr, u128)> {
-        self.by_shard
-            .get(&shard)
-            .map(|accounts| {
-                accounts
-                    .iter()
-                    .map(|account| (account.address, balance))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.by_shard.get(&shard).map_or_default(|accounts| {
+            accounts
+                .iter()
+                .map(|account| (account.address, balance))
+                .collect()
+        })
     }
 
     /// Get all genesis balances across all shards.

@@ -159,15 +159,12 @@ impl ProvisionPipeline {
     /// calls this when the matching header arrives; each drained entry is
     /// then run through merkle proof verification.
     pub(crate) fn drain_pending_for_key(&mut self, key: Key) -> Vec<Provisions> {
-        self.pending
-            .remove(&key)
-            .map(|entries| {
-                for p in &entries {
-                    self.pending_entries -= p.provisions.transactions().len();
-                }
-                entries.into_iter().map(|p| p.provisions).collect()
-            })
-            .unwrap_or_default()
+        self.pending.remove(&key).map_or_default(|entries| {
+            for p in &entries {
+                self.pending_entries -= p.provisions.transactions().len();
+            }
+            entries.into_iter().map(|p| p.provisions).collect()
+        })
     }
 
     /// Drop parked bundles keyed to `shard` strictly above a pending

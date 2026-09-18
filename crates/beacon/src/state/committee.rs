@@ -352,8 +352,7 @@ fn recover_committee(
                 members: fresh.clone(),
             },
         )
-        .map(|committee| committee.members)
-        .unwrap_or_default();
+        .map_or_default(|committee| committee.members);
     for id in &fresh {
         state
             .validators
@@ -570,8 +569,7 @@ pub(super) fn diff_shard_committees(
         let current = state
             .next_shard_committees
             .get(&shard)
-            .map(|c| c.members.clone())
-            .unwrap_or_default();
+            .map_or_default(|c| c.members.clone());
         let prior_set: BTreeSet<ValidatorId> = prior.iter().copied().collect();
         let current_set: BTreeSet<ValidatorId> = current.iter().copied().collect();
         if prior_set != current_set {

@@ -318,7 +318,7 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
     let mut parent_members: Vec<ValidatorId> = state
         .next_shard_committees
         .get(&target)
-        .map(|committee| {
+        .map_or_default(|committee| {
             committee
                 .members
                 .iter()
@@ -330,8 +330,7 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
                     )
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     parent_members.sort_unstable();
     let mut prng = reshape_prng(DOMAIN_RESHAPE_PARENT_HALF, state, target);
     shuffle(&mut parent_members, &mut prng);

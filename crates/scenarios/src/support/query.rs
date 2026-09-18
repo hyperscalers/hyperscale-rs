@@ -453,8 +453,7 @@ pub fn committee_size<C: Cluster>(c: &C, shard: ShardId) -> Option<usize> {
 #[must_use]
 pub(crate) fn live_shards<C: Cluster + ?Sized>(c: &C) -> BTreeSet<ShardId> {
     c.beacon_state()
-        .map(|state| state.shard_committees.keys().copied().collect())
-        .unwrap_or_default()
+        .map_or_default(|state| state.shard_committees.keys().copied().collect())
 }
 
 /// The total stake folded into `pool`, or `None` if the beacon holds no record

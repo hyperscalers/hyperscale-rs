@@ -263,35 +263,32 @@ fn roster(runner: &SimulationRunner) -> Vec<HostRole> {
             // are drawn from the free pool, keyed by the shard splitting;
             // parent halves are the splitting committee's own members, keyed
             // by the child each will seat on.
-            let observing = topology
-                .as_ref()
-                .map(|t| {
-                    let observers =
-                        t.reshape_observer_cohorts()
-                            .iter()
-                            .filter_map(|(&shard, cohort)| {
-                                let seat = cohort.get(&me)?;
-                                Some(ObserverSeat {
-                                    shard: ShardPath::from(shard),
-                                    child: ShardPath::from(seat.shard),
-                                    ready: seat.ready,
-                                })
-                            });
-                    let halves =
-                        t.reshape_parent_half_cohorts()
-                            .iter()
-                            .filter_map(|(&child, cohort)| {
-                                Some(ObserverSeat {
-                                    shard: ShardPath::from(*cohort.get(&me)?),
-                                    child: ShardPath::from(child),
-                                    // A member already holds the state its
-                                    // half re-roots from; nothing to sync.
-                                    ready: true,
-                                })
-                            });
-                    observers.chain(halves).collect()
-                })
-                .unwrap_or_default();
+            let observing = topology.as_ref().map_or_default(|t| {
+                let observers =
+                    t.reshape_observer_cohorts()
+                        .iter()
+                        .filter_map(|(&shard, cohort)| {
+                            let seat = cohort.get(&me)?;
+                            Some(ObserverSeat {
+                                shard: ShardPath::from(shard),
+                                child: ShardPath::from(seat.shard),
+                                ready: seat.ready,
+                            })
+                        });
+                let halves =
+                    t.reshape_parent_half_cohorts()
+                        .iter()
+                        .filter_map(|(&child, cohort)| {
+                            Some(ObserverSeat {
+                                shard: ShardPath::from(*cohort.get(&me)?),
+                                child: ShardPath::from(child),
+                                // A member already holds the state its
+                                // half re-roots from; nothing to sync.
+                                ready: true,
+                            })
+                        });
+                observers.chain(halves).collect()
+            });
             HostRole {
                 host,
                 shards: shards.iter().copied().map(ShardPath::from).collect(),
@@ -426,8 +423,7 @@ impl Session {
         // announcing the shard it opened on.
         let opening = (0..runner.num_hosts())
             .find_map(|host| runner.host_topology(host))
-            .map(|topology| topology.shard_trie().leaves().collect())
-            .unwrap_or_default();
+            .map_or_default(|topology| topology.shard_trie().leaves().collect());
         let opening_hosts = roster(&runner);
         Self {
             runner,
@@ -722,8 +718,7 @@ impl Session {
     pub fn live_shards(&self) -> Vec<ShardId> {
         (0..self.runner.num_hosts())
             .find_map(|host| self.runner.host_topology(host))
-            .map(|topology| topology.shard_trie().leaves().collect())
-            .unwrap_or_default()
+            .map_or_default(|topology| topology.shard_trie().leaves().collect())
     }
 
     /// Walk each shard's newly committed blocks and emit one event apiece.

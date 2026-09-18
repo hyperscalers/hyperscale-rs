@@ -715,8 +715,7 @@ impl SimulationRunner {
     pub fn hosted_shards_of(&self, host: NodeIndex) -> Vec<ShardId> {
         self.hosts
             .get(host as usize)
-            .map(|h| h.hosted_shards().collect())
-            .unwrap_or_default()
+            .map_or_default(|h| h.hosted_shards().collect())
     }
 
     /// Shard consensus statistics of `host`'s vnodes in `shard`, in vnode

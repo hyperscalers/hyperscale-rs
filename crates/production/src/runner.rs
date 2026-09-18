@@ -383,8 +383,7 @@ impl ProductionRunnerBuilder {
         let seat_list: Vec<StakePoolSeat> = self
             .genesis_config
             .as_ref()
-            .map(|config| config.pools.clone())
-            .unwrap_or_default();
+            .map_or_default(|config| config.pools.clone());
         let boot = build_genesis(&genesis_validators, chain_config, &seat_list);
         // Warm-restart: resume the beacon coordinator from the latest
         // committed (block, state) in storage. On an empty store, commit the
