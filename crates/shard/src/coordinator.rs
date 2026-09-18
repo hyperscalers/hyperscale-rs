@@ -5820,7 +5820,22 @@ impl ShardCoordinator {
         }
 
         let mut actions = vec![Action::SyncBlockApplied { height }];
-        actions.extend(self.try_two_chain_commit(certified.qc_verified(), CommitSource::Sync));
+        let own = certified.qc_verified();
+        let mut commits = self.try_two_chain_commit(own, CommitSource::Sync);
+        // A QC held above this block's own is a child's, adopted when the
+        // child applied over a sibling at this height that never
+        // committed. Its commit deferred on the handle this block now
+        // supplies, and once the sync has delivered everything it will,
+        // no later arrival re-enters it: re-drive it here. Only when the
+        // block's own QC committed nothing, since both prefixes start at
+        // the committed tip and would name the same blocks twice.
+        if commits.is_empty()
+            && let Some(high) = self.latest_qc.clone()
+            && high.round() > own.round()
+        {
+            commits = self.try_two_chain_commit(&high, CommitSource::Sync);
+        }
+        actions.extend(commits);
 
         if !synced_finalizations.is_empty() {
             actions.push(Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
@@ -11950,8 +11965,11 @@ mod tests {
         let _ = state.on_qc_signature_verified(&topology_schedule, orphan, Ok(qc));
         assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
 
-        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner_at_4"));
-        let child = block_chained_on(BlockHeight::new(5), winner, 110);
+        // The winner extends the same committed tip; a different parent
+        // stamp keeps it a distinct block from the orphan.
+        let winner = block_with_parent_qc_ts(BlockHeight::new(4), 105);
+        let winner_hash = winner.hash();
+        let child = block_chained_on(BlockHeight::new(5), winner_hash, 110);
         let child_qc = qc_on(&child);
         let (child_hash, actions) = deliver_synced(&mut state, &topology_schedule, child);
         assert!(
@@ -11972,6 +11990,25 @@ mod tests {
             state.committed_height,
             BlockHeight::new(3),
             "nothing commits over a missing parent"
+        );
+
+        // The winner arrives on the reopened height. Its own QC commits
+        // nothing new, so the child's QC, adopted when the child applied,
+        // is re-driven and commits the winner under it.
+        let (delivered, _) = deliver_synced(&mut state, &topology_schedule, winner);
+        assert_eq!(delivered, winner_hash);
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            winner_hash,
+            Ok(make_test_qc(winner_hash, BlockHeight::new(4))),
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Continuation(ProtocolEvent::BlockReadyToCommit { certified, .. })
+                    if certified.block().hash() == winner_hash
+            )),
+            "the winner commits under the child's QC; got {actions:?}"
         );
     }
 
