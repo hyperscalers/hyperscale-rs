@@ -33,22 +33,24 @@ fn a_maximal_envelope_encodes_under_the_bound_it_is_budgeted_at() {
 
     let widest = SchemeId::ML_DSA_65;
     let vm = TransactionEnvelope {
-        tree: vec![0xAB; MAX_TREE_BYTES],
+        tree: vec![0xAB; MAX_TREE_BYTES].try_into().unwrap(),
         terms: Terms {
             fee_payer: PrincipalAddr::new([0xAA; 31]),
             max_fee: u128::MAX,
-            gas_limits: vec![u64::MAX; MAX_MANIFEST_NODES],
+            gas_limits: vec![u64::MAX; MAX_MANIFEST_NODES].try_into().unwrap(),
             priority_bp: u32::MAX,
-            message: vec![0xAB; MAX_MESSAGE_LEN],
+            message: vec![0xAB; MAX_MESSAGE_LEN].try_into().unwrap(),
         },
-        artifact: Some(vec![0xAB; MAX_ARTIFACT_BYTES]),
+        artifact: Some(vec![0xAB; MAX_ARTIFACT_BYTES].try_into().unwrap()),
         signatures: (0..MAX_ATTESTATIONS)
             .map(|_| Attestation {
                 scheme: widest,
-                public_key: vec![0x11; MAX_KEY_BYTES],
-                signature: vec![0x22; MAX_SIG_BYTES],
+                public_key: vec![0x11; MAX_KEY_BYTES].try_into().unwrap(),
+                signature: vec![0x22; MAX_SIG_BYTES].try_into().unwrap(),
             })
-            .collect(),
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap(),
     };
     let encoded = hbor_to_vec(&vm).expect("a maximal envelope encodes").len();
     println!("widest envelope: {encoded} bytes against a {MAX_ENVELOPE_BYTES} budget");

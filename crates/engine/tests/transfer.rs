@@ -20,7 +20,7 @@ use hyperscale_engine::{
     PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
     TickEnvironment, TickTxInput, genesis_writes,
 };
-use hyperscale_hbor::TypeShape;
+use hyperscale_hbor::{Bytes, Capped, TypeShape};
 use hyperscale_storage::{
     Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
 };
@@ -2058,15 +2058,15 @@ fn signed_publish_under(seed: u8, artifact: Vec<u8>, max_fee: u128) -> Transacti
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let publisher = account_address(&key.public_key().0);
     let vm = signing::wrap_publish(
-        artifact,
+        artifact.try_into().expect("an artifact under the wire cap"),
         publisher,
         HEADER,
         signing::Terms {
             fee_payer: publisher,
             max_fee,
-            gas_limits: vec![1_000_000],
+            gas_limits: Capped::from_array([1_000_000]),
             priority_bp: 0,
-            message: Vec::new(),
+            message: Bytes::empty(),
         },
     )
     .sign(&key);

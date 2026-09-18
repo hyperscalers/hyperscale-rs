@@ -17,6 +17,7 @@ use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::ExecutedTx;
 use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_execution::action_handlers::accumulate_tick_output;
+use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_storage::TickOutput;
 use hyperscale_types::test_utils::StubTree;
 use hyperscale_types::{
@@ -123,9 +124,9 @@ fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
         terms: Terms {
             fee_payer: PrincipalAddr::new([0xAA; 31]),
             max_fee: 1_000,
-            gas_limits: vec![1_000_000],
+            gas_limits: Capped::from_array([1_000_000]),
             priority_bp: 0,
-            message: Vec::new(),
+            message: Bytes::empty(),
         },
         network: NetworkId(242),
         members: 0,

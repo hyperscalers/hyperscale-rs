@@ -235,7 +235,7 @@ mod tests {
             events: vec![Event {
                 emitter: Address::new([7; 31], AddressClass::Component),
                 event_type: 1,
-                payload: vec![4, 5, 6],
+                payload: vec![4, 5, 6].try_into().unwrap(),
             }],
         }
     }

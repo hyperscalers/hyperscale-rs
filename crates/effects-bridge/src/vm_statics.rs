@@ -1233,6 +1233,7 @@ impl ProtocolStatics for BridgeStatics {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::{
         AccountSigner, CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey,
     };
@@ -1400,9 +1401,9 @@ mod tests {
         Terms {
             fee_payer: composer_addr(),
             max_fee: 1_000,
-            gas_limits: vec![250_000; tree.node_count()],
+            gas_limits: vec![250_000; tree.node_count()].try_into().unwrap(),
             priority_bp: 0,
-            message: Vec::new(),
+            message: Bytes::empty(),
         }
     }
 
@@ -1417,10 +1418,10 @@ mod tests {
             }
         });
         TransactionEnvelope {
-            tree: encode_tree(&tree),
+            tree: encode_tree(&tree).try_into().unwrap(),
             terms: terms(&tree),
             artifact: None,
-            signatures: Vec::new(),
+            signatures: Capped::empty(),
         }
         .sign(&key(7))
     }
@@ -1433,7 +1434,7 @@ mod tests {
     ) -> TransactionEnvelope {
         let mut edited = vm.clone();
         edit(&mut edited.terms);
-        edited.signatures.clear();
+        edited.signatures = Capped::empty();
         edited.sign(signer)
     }
 
@@ -1546,7 +1547,9 @@ mod tests {
             .expect_err("one ceiling for two nodes");
         assert!(short.to_string().contains("2 manifest nodes"), "{short}");
 
-        let extra = reterm(&vm, &key(7), |terms| terms.gas_limits = vec![250_000; 3]);
+        let extra = reterm(&vm, &key(7), |terms| {
+            terms.gas_limits = vec![250_000; 3].try_into().unwrap();
+        });
         assert!(
             statics().derive(&extra).is_err(),
             "three ceilings for two nodes"
@@ -1565,7 +1568,9 @@ mod tests {
         );
         let vm = envelope(&tree, &[]);
         let past = reterm(&vm, &key(7), |terms| {
-            terms.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2 + 1];
+            terms.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2 + 1]
+                .try_into()
+                .unwrap();
         });
         let heavy = statics()
             .derive(&past)
@@ -1573,7 +1578,9 @@ mod tests {
         assert!(heavy.to_string().contains("sum"), "{heavy}");
 
         let at = reterm(&vm, &key(7), |terms| {
-            terms.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2];
+            terms.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2]
+                .try_into()
+                .unwrap();
         });
         statics().derive(&at).expect("at the bound derives");
     }
@@ -1583,15 +1590,15 @@ mod tests {
     fn a_publish_carries_one_ceiling() {
         let key = key(7);
         let vm = wrap_publish(
-            vec![0xAB; 64],
+            vec![0xAB; 64].try_into().unwrap(),
             composer_addr(),
             HEADER,
             Terms {
                 fee_payer: composer_addr(),
                 max_fee: 1_000,
-                gas_limits: vec![1, 2],
+                gas_limits: Capped::from_array([1, 2]),
                 priority_bp: 0,
-                message: Vec::new(),
+                message: Bytes::empty(),
             },
         )
         .sign(&key);
@@ -1601,7 +1608,9 @@ mod tests {
         assert!(two.to_string().contains("1 manifest node"), "{two}");
         // One ceiling passes the terms; what refuses the envelope then
         // is the artifact, which is not a package.
-        let one = reterm(&vm, &key, |terms| terms.gas_limits = vec![1]);
+        let one = reterm(&vm, &key, |terms| {
+            terms.gas_limits = Capped::from_array([1]);
+        });
         let refused = statics()
             .derive(&one)
             .expect_err("the artifact is not a package");
@@ -2144,7 +2153,7 @@ mod tests {
         );
         let mut secp_signed = envelope(&tree, &[]);
         secp_signed.terms.fee_payer = payer;
-        secp_signed.signatures.clear();
+        secp_signed.signatures = Capped::empty();
         let signed = secp_signed.sign(&secp);
 
         let derived = statics().derive(&signed).expect("derives");
@@ -2284,7 +2293,7 @@ mod tests {
         let mut unsigned = envelope(&tree, &[&key(9)]);
         let mut stripped = decode_tree(&unsigned.tree).expect("the tree decodes");
         stripped.root.members[0].signed.signatures.clear();
-        unsigned.tree = encode_tree(&stripped);
+        unsigned.tree = encode_tree(&stripped).try_into().unwrap();
         assert!(statics().derive(&unsigned).is_err());
     }
 
