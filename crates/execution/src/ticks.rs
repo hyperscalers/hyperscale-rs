@@ -190,6 +190,10 @@ impl TickRegistry {
         self.trackers.get_mut(tick_id)
     }
 
+    pub(crate) fn get_tracker(&self, tick_id: &TickId) -> Option<&VoteTracker> {
+        self.trackers.get(tick_id)
+    }
+
     // ─── EC dispatch gate ───────────────────────────────────────────────
 
     pub(crate) fn mark_ec_dispatched(&mut self, tick_id: TickId) {

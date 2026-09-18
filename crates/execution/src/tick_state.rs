@@ -40,9 +40,9 @@ use std::time::Duration;
 use hyperscale_engine::legs::Member;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Role, Settles, ShardId, StoredReceipt, SubstateKey,
-    TickHalf, TickId, TxHash, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
-    refused_transactions, settles,
+    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, Role, Settles, ShardId,
+    StoredReceipt, SubstateKey, TickHalf, TickId, TxHash, TxOutcome, Verified, WeightedTimestamp,
+    compute_global_receipt_root, refused_transactions, settles,
 };
 
 /// A tick whose local execution disagreed with the quorum's.
@@ -241,6 +241,21 @@ impl Admission {
 /// guarantee has failed, so the dump is invariant-violation diagnostics
 /// rather than routine load noise.
 pub const TICK_OVERDUE_WARN: Duration = Duration::from_secs(MAX_FINALIZATION_DELAY.as_secs() * 2);
+
+/// How long past its own anchor a tick can still hold a member something
+/// could settle.
+///
+/// The widest close a tick holds is a delivery's, and it is two windows
+/// wide rather than one: a delivery is admissible from its transaction's
+/// validity end for a further [`MAX_VALIDITY_RANGE`], and that validity
+/// end is itself at most one `MAX_VALIDITY_RANGE` past the anchor — the
+/// transaction had to be admissible in the block that committed it. A
+/// core member closes far earlier, at `MAX_FINALIZATION_DELAY` past its
+/// validity end, so the delivery bound covers both, and the finalization
+/// delay is carried on top so the span clears the close rather than
+/// landing on it.
+pub const TICK_SETTLEABLE_SPAN: Duration =
+    Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2 + MAX_FINALIZATION_DELAY.as_secs());
 
 /// One member's seat in its tick: the terms it joined on, and everything
 /// the tick has learned about it since — from the engine, from the
@@ -1058,6 +1073,40 @@ impl TickState {
         self.determined_members()
             .iter()
             .any(|tx_hash| self.seats.get(tx_hash).is_some_and(|seat| !seat.settled))
+    }
+
+    /// Whether the chain owes this tick a determined half it can no
+    /// longer deliver.
+    ///
+    /// A determined half the chain still owes is one every later half
+    /// must settle behind, so a tick that never reaches its own
+    /// certificate holds the settlement frontier against its whole
+    /// shard — blocks still commit and nothing behind it ever finalizes.
+    /// [`determined_ready`](Self::determined_ready) reasons only about
+    /// coverage, where a leg waiting on a counterpart cannot hold
+    /// determined members; it does not cover
+    /// [`attestable`](Self::attestable), and a certificate that never
+    /// forms holds them just as hard.
+    ///
+    /// [`TICK_SETTLEABLE_SPAN`] past the tick's own anchor is where no
+    /// member it holds can still be settleable, so a half emitted after
+    /// it would settle a transaction already past every deadline that
+    /// could decide it. Only then is the tick released — inside the span
+    /// a member is merely slow, and the abandonment path is what speaks
+    /// for one whose own close has passed.
+    ///
+    /// Read off committed content alone — seats settle on committed
+    /// finalizations and both timestamps are BFT-authenticated — so every
+    /// replica releases the same ticks at the same frontier. Whether
+    /// *this* validator happened to hand its own half off
+    /// ([`determined_pending`](Self::determined_pending)) is local state
+    /// and deliberately not asked: releasing lets go of the chain holds
+    /// later ticks read, and replicas letting go at different frontiers
+    /// would read different overlays from the same chain.
+    #[must_use]
+    pub fn owes_undeliverable_determined(&self, committed_ts: WeightedTimestamp) -> bool {
+        self.determined_unsettled()
+            && committed_ts.elapsed_since(self.tick_ts) >= TICK_SETTLEABLE_SPAN
     }
 
     /// Whether the determined half is out of the way — emitted, or never

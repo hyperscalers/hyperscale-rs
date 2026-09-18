@@ -1134,6 +1134,11 @@ fn halted_shard_straddler_atomic_seed_2027_sim() {
     halted_shard_straddler_atomic_at_seed(2027);
 }
 
+#[test]
+fn halted_shard_straddler_atomic_seed_45_sim() {
+    halted_shard_straddler_atomic_at_seed(45);
+}
+
 /// A provable committee-level fork drives the same full re-draw a halt does,
 /// and the fresh committee seeds from the beacon-attested frontier while both
 /// branches' retained signals stay live.

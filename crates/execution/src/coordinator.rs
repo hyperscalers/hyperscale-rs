@@ -2856,6 +2856,7 @@ impl ExecutionCoordinator {
         // carry txs.
         actions.extend(self.check_exec_cert_timeouts());
         actions.extend(self.check_vote_retry_timeouts(topology_schedule));
+        self.release_wedged_ticks();
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         // Re-check gate-held finalizations against the advanced schedule:
@@ -3131,6 +3132,54 @@ impl ExecutionCoordinator {
             .into_iter()
             .filter(|entry| self.beyond_every_shard(composing, entry.tx_hash))
             .collect()
+    }
+
+    /// Release every tick still owing a determined half it can no longer
+    /// deliver.
+    ///
+    /// Admission refuses a determined half that settles past a tick whose
+    /// own half the chain still owes, so a tick that never reaches its
+    /// certificate stops the shard settling anything at all: later halves
+    /// are built and offered and refused for good, and the members they
+    /// name stay committed and never finalized until their deadlines
+    /// abandon them. [`admit_abandoned`](Self::admit_abandoned) already
+    /// discards a tick holding an abandoned member, but a tick whose
+    /// members are not yet abandonable is not reached that way, and
+    /// nothing else releases it.
+    ///
+    /// Discarding is what the tick's own state has already established:
+    /// past [`TICK_SETTLEABLE_SPAN`] it can settle nothing, so the
+    /// members go to the deadline path, which is where a transaction
+    /// nothing can settle belongs. The order rule is untouched — a
+    /// discarded tick produces no half to invert against.
+    ///
+    /// [`TICK_SETTLEABLE_SPAN`]: crate::tick_state::TICK_SETTLEABLE_SPAN
+    fn release_wedged_ticks(&mut self) {
+        let committed_ts = self.committed_ts;
+        let wedged: Vec<TickId> = self
+            .ticks
+            .ticks_iter()
+            .filter(|(_, tick)| tick.owes_undeliverable_determined(committed_ts))
+            .map(|(tick_id, _)| *tick_id)
+            .collect();
+        for tick_id in wedged {
+            // What the tally saw is the whole diagnosis: split roots are
+            // replicas that executed the tick differently, and power under
+            // quorum on one root is votes that never arrived. Reported
+            // here because this is the only place that knows a tick has
+            // run out of time to certify.
+            let tally = self.ticks.get_tracker(&tick_id);
+            tracing::warn!(
+                tick = %tick_id,
+                tallied_here = tally.is_some(),
+                distinct_receipt_roots =
+                    tally.map_or(0, VoteTracker::distinct_global_receipt_root_count),
+                verified_power = tally
+                    .map_or(0, |tracker| tracker.total_verified_power().inner()),
+                "Releasing a tick that never certified — it was holding the settlement frontier"
+            );
+            self.discard_tick(tick_id);
+        }
     }
 
     /// Drop a tick that can no longer speak for a member being abandoned,
