@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, CommitProof, Epoch, EpochWindows,
     Hash, LeafIndex, QuorumCertificate, ShardId, ShardWitnessPayload, Verified,
@@ -194,6 +195,10 @@ impl ShardSourceTracker {
     /// signatures were verified on arrival. A bare 2f+1 QC proves
     /// availability, not commitment, so this is what separates a crossing
     /// the shard's chain durably reached from one it merely certified.
+    ///
+    /// # Panics
+    ///
+    /// If a list written out here is past the cap its type states.
     #[must_use]
     pub fn commit_established(&self, shard: ShardId, boundary: &BlockHeader) -> bool {
         let boundary_hash = boundary.hash();
@@ -230,7 +235,12 @@ impl ShardSourceTracker {
                 ancestry.push(link.header().clone());
                 link_height = h.prev();
             }
-            let proof = CommitProof::new((***x).clone(), (***y).clone(), None, ancestry);
+            let proof = CommitProof::new(
+                (***x).clone(),
+                (***y).clone(),
+                None,
+                Capped::new(ancestry).expect("an ancestry written out in a test"),
+            );
             proof.verify_structure().is_ok() && proof.proven_block_hash() == boundary_hash
         })
     }

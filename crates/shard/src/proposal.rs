@@ -546,6 +546,7 @@ pub fn dispatch_or_defer(
 mod tests {
     use std::time::Duration;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_finalization, make_undecided_finalization,
         stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
@@ -612,10 +613,10 @@ mod tests {
                 anchor: WeightedTimestamp::ZERO,
                 committee_anchor: WeightedTimestamp::ZERO,
             },
-            reach: vec![RoutePrefix::of(Address::new(
+            reach: Capped::from_array([RoutePrefix::of(Address::new(
                 [0x00; 31],
                 AddressClass::Principal,
-            ))],
+            ))]),
         }
     }
 

@@ -8,6 +8,7 @@ description = "Shard consensus state machine (HotStuff-2)"
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-engine.workspace = true
+hyperscale-hbor.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-network.workspace = true
 hyperscale-storage.workspace = true

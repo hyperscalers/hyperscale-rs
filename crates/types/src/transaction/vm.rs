@@ -11,6 +11,7 @@
 
 use std::sync::OnceLock;
 
+use hyperscale_hbor::Capped;
 pub use hyperscale_vm_types::{
     AccountSigner, Attestation, MAX_ATTESTATIONS, MAX_INTENTS, MAX_MESSAGE_LEN,
     MAX_TX_ATTESTATIONS, Mode, SchemeId, SchemeVerifier, Terms, TransactionEnvelope,
@@ -23,7 +24,8 @@ use crate::crypto::{
     verify_ml_dsa_65, verify_secp256k1,
 };
 use crate::{
-    Address, DeclaredKey, Hash, PrincipalAddr, ProtocolHasher, RoutePrefix, TimestampRange,
+    Address, DeclaredKey, Hash, MAX_PREFIXES_PER_TX, PrincipalAddr, ProtocolHasher, RoutePrefix,
+    TimestampRange,
 };
 
 /// The arithmetic behind the VM's scheme registry.
@@ -198,8 +200,14 @@ impl Routing {
     /// Deduplicated on the route and not on the address, so two prefixes
     /// that place together are one entry: what reads this asks only
     /// where a prefix sits.
+    ///
+    /// # Panics
+    ///
+    /// Never for a decoded transaction: a prefix enters routing through
+    /// a declared key, whose owner and local half the call budget pays
+    /// for, which is where [`MAX_PREFIXES_PER_TX`] comes from.
     #[must_use]
-    pub fn all_routes(&self) -> Vec<RoutePrefix> {
+    pub fn all_routes(&self) -> Capped<Vec<RoutePrefix>, MAX_PREFIXES_PER_TX> {
         let mut routes: Vec<RoutePrefix> = self
             .read_prefixes
             .iter()
@@ -208,7 +216,7 @@ impl Routing {
             .collect();
         routes.sort_unstable();
         routes.dedup();
-        routes
+        Capped::new(routes).expect("a transaction's reach divides its call budget")
     }
 
     /// Every owner prefix the transaction touches, ascending, deduplicated.

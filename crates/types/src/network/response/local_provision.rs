@@ -134,7 +134,7 @@ mod tests {
             parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(source_shard, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             ..Default::default()
         });
         let header_hash = header.hash();

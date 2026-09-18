@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_hbor::Capped;
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
@@ -1549,19 +1550,19 @@ impl ShardCoordinatorSim {
                     is_fallback,
                     parent_state_root,
                     parent_block_height,
-                    transactions,
-                    finalizations.clone(),
+                    &Capped::new(transactions).expect("a selection written out in a test"),
+                    Capped::new(finalizations.clone()).expect("a list written out in a test"),
                     shard_id,
                     &classification_topology,
-                    provisions.clone(),
-                    abandonment_records,
-                    state_claims,
+                    Capped::new(provisions.clone()).expect("a list written out in a test"),
+                    Capped::new(abandonment_records).expect("a list written out in a test"),
+                    Capped::new(state_claims).expect("a list written out in a test"),
                     parent_in_flight,
                     parent_settled_frontier,
                     parent_sweep_frontier,
                     parent_load,
                     substate_bytes,
-                    ready_signals,
+                    Capped::new(ready_signals).expect("a list written out in a test"),
                     reshape_trigger,
                     // Sign a genuine reveal with the proposer's key so the
                     // block's reveal passes the signature gate `verify` now runs;

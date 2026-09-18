@@ -581,6 +581,7 @@ mod tests {
 
     use hyperscale_crypto::Signer;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_hbor::Capped;
 
     use super::*;
     use crate::{
@@ -688,7 +689,7 @@ mod tests {
     /// Witness sources with a valid reveal for `shard` and nothing else —
     /// the baseline every `context_with` test customizes from.
     fn empty_sources(shard: ShardId) -> WitnessSources {
-        WitnessSources::new(Vec::new(), None, signed_reveal(shard))
+        WitnessSources::new(Capped::empty(), None, signed_reveal(shard))
     }
 
     fn context_with<'a>(
@@ -884,7 +885,7 @@ mod tests {
         let shard = ShardId::ROOT;
         let topology_snapshot = snapshot_with_base(shard, 0);
         let ws = WitnessSources::new(
-            Vec::new(),
+            Capped::empty(),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS,
             }),
@@ -937,7 +938,7 @@ mod tests {
         let shard = ShardId::ROOT;
         let topology_snapshot = snapshot_with_base(shard, 0);
         let ws = WitnessSources::new(
-            Vec::new(),
+            Capped::empty(),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS,
             }),
@@ -976,7 +977,7 @@ mod tests {
         let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&[trigger_leaf]));
 
         let ws = WitnessSources::new(
-            Vec::new(),
+            Capped::empty(),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS,
             }),
@@ -1056,7 +1057,11 @@ mod tests {
         .leaf_hash();
         let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&[leaf]));
 
-        let ws = WitnessSources::new(signals, None, signed_reveal(shard));
+        let ws = WitnessSources::new(
+            Capped::new(signals).expect("a list written out in a test"),
+            None,
+            signed_reveal(shard),
+        );
         let seated = snapshot_with_observers(shard, 0, BTreeMap::from([(observer, child)]));
         let ctx = context_with(&seated, &ws, shard, 0, Vec::new(), 1);
         assert!(expected_root.verify(&ctx).is_ok());
@@ -1095,7 +1100,11 @@ mod tests {
         .leaf_hash();
         let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&[leaf]));
 
-        let ws = WitnessSources::new(signals, None, signed_reveal(child));
+        let ws = WitnessSources::new(
+            Capped::new(signals).expect("a list written out in a test"),
+            None,
+            signed_reveal(child),
+        );
         let seated = snapshot_with_keepers(child, 0, BTreeMap::from([(keeper, parent)]));
         let ctx = context_with(&seated, &ws, child, 0, Vec::new(), 1);
         assert!(expected_root.verify(&ctx).is_ok());
@@ -1158,7 +1167,7 @@ mod tests {
         let shard = ShardId::ROOT;
         let topology_snapshot = snapshot_with_base(shard, 0);
 
-        let zero_ws = WitnessSources::new(Vec::new(), None, VrfProof::ZERO);
+        let zero_ws = WitnessSources::new(Capped::empty(), None, VrfProof::ZERO);
         let zero = context_with(&topology_snapshot, &zero_ws, shard, 0, Vec::new(), 0);
         assert_eq!(
             BeaconWitnessRoot::ZERO.verify(&zero).unwrap_err(),
@@ -1178,7 +1187,7 @@ mod tests {
             BlockHeight::new(5),
         )
         .expect("sign");
-        let wrong_ws = WitnessSources::new(Vec::new(), None, impostor_reveal);
+        let wrong_ws = WitnessSources::new(Capped::empty(), None, impostor_reveal);
         let wrong_key = context_with(&topology_snapshot, &wrong_ws, shard, 0, Vec::new(), 0);
         assert_eq!(
             BeaconWitnessRoot::ZERO.verify(&wrong_key).unwrap_err(),

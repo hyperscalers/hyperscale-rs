@@ -18,7 +18,7 @@
 //! [`ShardForkProof`]: super::evidence::ShardForkProof
 
 use hyperscale_crypto::Verifier;
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use crate::{
@@ -108,8 +108,7 @@ pub struct CommitProof {
     /// block. `ancestry[0]` is `certified`'s parent; `ancestry[i].hash()
     /// == ancestry[i-1].parent_block_hash()`; the last element is the
     /// proven block.
-    #[hbor(max = MAX_COMMIT_PROOF_ANCESTRY)]
-    ancestry: Vec<BlockHeader>,
+    ancestry: Capped<Vec<BlockHeader>, MAX_COMMIT_PROOF_ANCESTRY>,
 }
 
 /// Failure modes of [`CommitProof`] verification.
@@ -151,7 +150,7 @@ impl CommitProof {
         certified: CertifiedBlockHeader,
         child: CertifiedBlockHeader,
         certified_parent: Option<BlockHeader>,
-        ancestry: Vec<BlockHeader>,
+        ancestry: Capped<Vec<BlockHeader>, MAX_COMMIT_PROOF_ANCESTRY>,
     ) -> Self {
         Self {
             certified,
@@ -169,7 +168,7 @@ impl CommitProof {
         child: CertifiedBlockHeader,
         certified_parent: Option<BlockHeader>,
     ) -> Self {
-        Self::new(certified, child, certified_parent, Vec::new())
+        Self::new(certified, child, certified_parent, Capped::empty())
     }
 
     /// Anchor selecting the committee that signed [`Self::certified`]'s QC —
@@ -419,7 +418,7 @@ mod tests {
             certified_header(500, 500),
             certified_header(501, 501),
             None,
-            ancestry,
+            Capped::new(ancestry).expect("an ancestry written out in a test"),
         );
 
         let bytes = hbor_to_vec(&proof).unwrap();

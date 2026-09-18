@@ -473,6 +473,7 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_undecided_finalization, stub_abort_charge,
         test_principal,
@@ -555,7 +556,7 @@ mod tests {
             proposer: ValidatorId::new(height.inner() % 4),
             timestamp: ProposerTimestamp::from_millis(timestamp_ms),
             round: Round::new(0),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             // A chain contiguous from genesis: one committed block per
             // height, none of which carried anything.
             load: ShardLoad {
@@ -753,7 +754,7 @@ mod tests {
             proposer,
             timestamp: ProposerTimestamp::from_millis(now.as_millis()),
             round,
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             ..Default::default()
         })
     }
@@ -885,7 +886,7 @@ mod tests {
             proposer,
             timestamp: ProposerTimestamp::from_millis(now.as_millis()),
             round: Round::new(1),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             ..Default::default()
         })
     }
@@ -991,16 +992,16 @@ mod tests {
                 proposer: ValidatorId::new(height.inner() % 4),
                 timestamp: ProposerTimestamp::from_millis(100_000),
                 round: Round::new(0),
-                provision_tx_roots: std::collections::BTreeMap::new(),
+                provision_tx_roots: Capped::default(),
                 load,
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -1010,12 +1011,14 @@ mod tests {
     ) -> Block {
         Block::Live {
             header: header_at_height(height, 100_000),
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(
+                Capped::new(transactions).expect("a list written out in a test"),
+            ),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -1094,15 +1097,17 @@ mod tests {
                 proposer: base.proposer(),
                 timestamp: base.timestamp(),
                 round: base.round(),
-                provision_tx_roots: std::collections::BTreeMap::new(),
+                provision_tx_roots: Capped::default(),
                 abandonment_root: root,
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(verdicts),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(
+                Capped::new(verdicts).expect("a list written out in a test"),
+            ),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1118,15 +1123,15 @@ mod tests {
                 proposer: base.proposer(),
                 timestamp: base.timestamp(),
                 round: base.round(),
-                provision_tx_roots: std::collections::BTreeMap::new(),
+                provision_tx_roots: Capped::default(),
                 state_claims_root: root,
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(bundles),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1179,7 +1184,7 @@ mod tests {
         assert!(err.contains("repeats or precedes"), "{err}");
 
         let empty = vec![StateClaim {
-            cells: Vec::new(),
+            cells: Capped::empty(),
             ..bundle_at(3, &[1])
         }];
         let err = held(empty.clone(), StateClaimsRoot::over(&empty))
@@ -1201,7 +1206,7 @@ mod tests {
                 anchor: WeightedTimestamp::ZERO,
                 committee_anchor: WeightedTimestamp::ZERO,
             },
-            reach: vec![route(0x00), route(0xC0)],
+            reach: Capped::from_array([route(0x00), route(0xC0)]),
         }
     }
 
@@ -1288,9 +1293,14 @@ mod tests {
         // them between two records to clear the byte budget while
         // staying well under the drain's count.
         let wide = |seed: usize| UnsettledTx {
-            reach: (0..6u8)
-                .map(|at| RoutePrefix::from(Address::new([at * 0x30; 31], AddressClass::Component)))
-                .collect(),
+            reach: Capped::new(
+                (0..6u8)
+                    .map(|at| {
+                        RoutePrefix::from(Address::new([at * 0x30; 31], AddressClass::Component))
+                    })
+                    .collect(),
+            )
+            .expect("a reach written out in a test"),
             ..named(TxHash::from(Hash::from_bytes(&seed.to_le_bytes())))
         };
         let per_record = MAX_PROPOSAL_EVIDENCE_BYTES / wide(0).wire_weight() / 2 + 1;
@@ -1516,12 +1526,12 @@ mod tests {
             .collect();
         Block::Live {
             header: header_at_height(height, 100_000),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(wrapped),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::new(wrapped).expect("a list written out in a test")),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -1667,16 +1677,16 @@ mod tests {
             .expect("a tick names its members");
         let block = Block::Live {
             header: header_at_height(BlockHeight::new(6), 100_000),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(vec![Arc::new((*settled).clone().into())]),
-            provisions: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::from_array([Arc::new((*settled).clone().into())])),
+            provisions: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(vec![AbandonmentRecord::new(
+            abandonment_records: Arc::new(Capped::from_array([AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
                 WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
                 [named(tx_hash)],
-            )]),
+            )])),
         };
         let err = no_resolutions(&block, CommitDedupIndex::new()).unwrap_err();
         assert!(err.contains("which the same block resolves"), "{err}");
@@ -1753,12 +1763,14 @@ mod tests {
             .collect();
         Block::Live {
             header: header_at_height(BlockHeight::new(100), 100_000),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(certificates),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(
+                Capped::new(certificates).expect("a list written out in a test"),
+            ),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -1869,12 +1881,12 @@ mod tests {
             .collect();
         Block::Live {
             header: header_at_height(height, 100_000),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(wrapped),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::new(wrapped).expect("a list written out in a test")),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -2123,12 +2135,12 @@ mod tests {
     ) -> Block {
         Block::Live {
             header: header_at_height(BlockHeight::new(1), 100_000),
-            transactions: Arc::new(vec![Arc::clone(tx)]),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(provisions),
+            transactions: Arc::new(Capped::from_array([Arc::clone(tx)])),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::new(provisions).expect("a list written out in a test")),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 

@@ -413,9 +413,10 @@ impl VoteFence<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+
     use std::sync::Arc;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         Anchor, BlockHeader, BlockHeaderParts, BlockHeight, Hash, Inclusion, LeafRoot, StateClaim,
@@ -447,14 +448,14 @@ mod tests {
                 shard_id: LOCAL,
                 height: BlockHeight::new(6),
                 state_claims_root: StateClaimsRoot::over(&claims),
-                provision_tx_roots: BTreeMap::new(),
+                provision_tx_roots: Capped::default(),
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(claims),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }

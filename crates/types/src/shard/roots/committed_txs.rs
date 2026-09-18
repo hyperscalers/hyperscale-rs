@@ -16,7 +16,7 @@
 //!
 //! [`CommittedTxsRoot`]: crate::CommittedTxsRoot
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::shard::roots::SetRoot;
 use crate::{
@@ -94,8 +94,7 @@ pub struct CommittedTxAbsence {
     /// Total leaves in the committed set.
     pub(crate) leaf_count: u32,
     /// Range proof lifting the bracket to the root.
-    #[hbor(max = MAX_ABSENCE_PROOF_NODES)]
-    pub(crate) proof: Vec<Hash>,
+    pub(crate) proof: Capped<Vec<Hash>, MAX_ABSENCE_PROOF_NODES>,
 }
 
 impl CommittedTxAbsence {
@@ -182,7 +181,7 @@ pub fn prove_committed_tx_absent(
             right: None,
             lo: 0,
             leaf_count: 0,
-            proof: Vec::new(),
+            proof: Capped::empty(),
         });
     }
     // `Err` is the insertion point: the count of members below `tx_hash`.
@@ -201,7 +200,8 @@ pub fn prove_committed_tx_absent(
         right,
         lo: u32::try_from(lo).unwrap_or(u32::MAX),
         leaf_count: u32::try_from(leaf_count).unwrap_or(u32::MAX),
-        proof: compute_range_proof(&leaves, lo, lo + span),
+        proof: Capped::new(compute_range_proof(&leaves, lo, lo + span))
+            .expect("a range proof carries one flank per side per level"),
     })
 }
 
@@ -327,7 +327,8 @@ mod tests {
                 right: Some(set[lo + 1]),
                 lo: u32::try_from(lo).unwrap(),
                 leaf_count: count,
-                proof: compute_range_proof(&leaves, lo, lo + 2),
+                proof: Capped::new(compute_range_proof(&leaves, lo, lo + 2))
+                    .expect("a proof written out in a test"),
             })
             .collect();
         brackets.push(CommittedTxAbsence {
@@ -335,14 +336,16 @@ mod tests {
             right: Some(set[0]),
             lo: 0,
             leaf_count: count,
-            proof: compute_range_proof(&leaves, 0, 1),
+            proof: Capped::new(compute_range_proof(&leaves, 0, 1))
+                .expect("a proof written out in a test"),
         });
         brackets.push(CommittedTxAbsence {
             left: Some(set[n - 1]),
             right: None,
             lo: count - 1,
             leaf_count: count,
-            proof: compute_range_proof(&leaves, n - 1, n),
+            proof: Capped::new(compute_range_proof(&leaves, n - 1, n))
+                .expect("a proof written out in a test"),
         });
 
         for member in &set {
@@ -370,7 +373,8 @@ mod tests {
             right: Some(set[5]),
             lo: 2,
             leaf_count: u32::try_from(set.len()).unwrap(),
-            proof: compute_range_proof(&leaves, 2, 4),
+            proof: Capped::new(compute_range_proof(&leaves, 2, 4))
+                .expect("a proof written out in a test"),
         };
         assert!(!forged.proves_absent(&hidden, root));
     }
@@ -426,7 +430,8 @@ mod tests {
             right: Some(set[4]),
             lo: 4,
             leaf_count: u32::try_from(set.len()).unwrap(),
-            proof: compute_range_proof(&leaves, 4, 5),
+            proof: Capped::new(compute_range_proof(&leaves, 4, 5))
+                .expect("a proof written out in a test"),
         };
         assert!(!not_first.proves_absent(&set[0], root));
 
@@ -436,7 +441,8 @@ mod tests {
             right: None,
             lo: 4,
             leaf_count: u32::try_from(set.len()).unwrap(),
-            proof: compute_range_proof(&leaves, 4, 5),
+            proof: Capped::new(compute_range_proof(&leaves, 4, 5))
+                .expect("a proof written out in a test"),
         };
         assert!(!not_last.proves_absent(&probe, root));
     }
@@ -451,7 +457,10 @@ mod tests {
         assert!(good.proves_absent(&probe, root));
 
         let mut padded = good.clone();
-        padded.proof.push(Hash::ZERO);
+        padded
+            .proof
+            .push(Hash::ZERO)
+            .expect("a proof written out in a test");
         assert!(!padded.proves_absent(&probe, root));
 
         let mut truncated = good.clone();

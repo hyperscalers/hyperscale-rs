@@ -232,6 +232,7 @@ impl HistoryBackfill {
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts,
         ChainOrigin, ElidedCertifiedBlock, Inventory, ProposerTimestamp, QuorumCertificate, Round,
@@ -284,11 +285,11 @@ mod tests {
             });
             let block = Block::Live {
                 header,
-                transactions: Arc::new(Vec::new()),
-                certificates: Arc::new(Vec::new()),
-                provisions: Arc::new(Vec::new()),
-                abandonment_records: Arc::new(Vec::new()),
-                state_claims: Arc::new(Vec::new()),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
             let qc = real_qc(block.hash(), height * 1000);

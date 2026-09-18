@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_storage::test_helpers::{
     commit_settled_at, commit_writes, make_settled_writes, make_test_block,
     make_test_block_with_anchor_wt, make_test_certified, make_test_qc, push_certificate, state_key,
@@ -213,11 +214,11 @@ fn test_transactions_batch_with_indexed_block() {
             ..
         } => Block::Live {
             header,
-            transactions: Arc::new(vec![tx]),
+            transactions: Arc::new(Capped::from_array([tx])),
             certificates,
             provisions,
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -227,11 +228,11 @@ fn test_transactions_batch_with_indexed_block() {
             ..
         } => Block::Sealed {
             header,
-            transactions: Arc::new(vec![tx]),
+            transactions: Arc::new(Capped::from_array([tx])),
             certificates,
             provision_hashes,
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -579,7 +580,7 @@ fn block_with_txs(
             ..
         } => Block::Live {
             header,
-            transactions: Arc::new(txs),
+            transactions: Arc::new(Capped::new(txs).expect("a list written out in a test")),
             certificates,
             provisions,
             abandonment_records,

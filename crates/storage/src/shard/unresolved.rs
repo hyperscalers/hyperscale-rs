@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, ChainOrigin, EPOCH_DURATION, Provisions, TERMINAL_EVIDENCE_EPOCHS,
     TRANSACTION_EVIDENCE_HORIZON, TxHash, Verifiable, Verified, WeightedTimestamp,
@@ -268,6 +269,8 @@ fn rehydrate(
     let (block, qc) = certified.into_inner().into_parts();
     // Sealing keeps the header, and the header is what the hash and the
     // QC pairing are over, so reattaching the bodies cannot break it.
-    let live = block.into_live(Arc::new(provisions));
+    let live = block.into_live(Arc::new(
+        Capped::new(provisions).expect("a rebuilt block keeps the caps its source met"),
+    ));
     Verified::<CertifiedBlock>::from_persisted(CertifiedBlock::new_unchecked(live, qc))
 }

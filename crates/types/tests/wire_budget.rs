@@ -8,7 +8,7 @@
 //! maximal value of its type, and a widened field fails this before it
 //! can quietly overrun the frame.
 
-use hyperscale_hbor::to_vec as hbor_to_vec;
+use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass, Anchor,
     BlockHeight, CommittedAt, Deadline, Hash, Inclusion, LocalKey, MAX_ARTIFACT_BYTES,
@@ -93,14 +93,17 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
             anchor: WeightedTimestamp::from_millis(u64::MAX / 2),
             committee_anchor: WeightedTimestamp::from_millis(u64::MAX / 2),
         },
-        reach: (0..routes)
-            .map(|at| {
-                RoutePrefix::from(Address::new(
-                    [u8::try_from(at % 256).expect("masked"); 31],
-                    AddressClass::Component,
-                ))
-            })
-            .collect(),
+        reach: Capped::new(
+            (0..routes)
+                .map(|at| {
+                    RoutePrefix::from(Address::new(
+                        [u8::try_from(at % 256).expect("masked"); 31],
+                        AddressClass::Component,
+                    ))
+                })
+                .collect(),
+        )
+        .expect("a reach written out in a test"),
     }
 }
 

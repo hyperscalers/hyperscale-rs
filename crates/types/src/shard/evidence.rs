@@ -549,7 +549,7 @@ mod tests {
         use std::sync::Arc;
 
         use hyperscale_crypto_bls::BlsVerifier;
-        use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+        use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
         use super::super::*;
         use crate::test_utils::{
@@ -787,7 +787,7 @@ mod tests {
                 &committee,
                 header(BlockHeight::new(10), Round::new(21), d.block_hash(), 3),
             );
-            let a = CommitProof::new(d, child, Some(b.clone()), vec![b.clone()]);
+            let a = CommitProof::new(d, child, Some(b.clone()), Capped::from_array([b.clone()]));
             assert_eq!(a.proven_height(), BlockHeight::new(8));
             assert_eq!(a.proven_block_hash(), b.hash());
 

@@ -7,6 +7,7 @@
 //! are asserted here rather than beside the derivation, because the
 //! second needs a store to follow a block into.
 
+use hyperscale_hbor::Capped;
 use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{AddressClass, ShardId};
 use hyperscale_vm_effects::Hash32;
@@ -129,7 +130,7 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
     };
     let block = Block::Live {
         header,
-        transactions: Arc::new(vec![Arc::new(Verifiable::from(tx))]),
+        transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx))])),
         certificates,
         provisions,
         abandonment_records,

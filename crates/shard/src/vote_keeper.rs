@@ -564,6 +564,7 @@ pub enum RecordResult {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         BlockHeaderParts, ChainOrigin, Hash, NetworkDefinition, ProposerTimestamp,
         QuorumCertificate, ShardId, Signer, ValidatorId, ValidatorInfo, ValidatorSet,
@@ -591,7 +592,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             round,
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             ..Default::default()
         })
     }

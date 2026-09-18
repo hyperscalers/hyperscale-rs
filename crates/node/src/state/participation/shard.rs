@@ -457,6 +457,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         TestCommittee, certify, make_live_block, shard_fork_proof, test_transaction,
     };
@@ -501,10 +502,11 @@ mod tests {
                 certificate_root: header.certificate_root(),
                 local_receipt_root: header.local_receipt_root(),
                 provision_root: header.provision_root(),
-                provision_tx_roots: std::collections::BTreeMap::from([(
+                provision_tx_roots: Capped::new(std::collections::BTreeMap::from([(
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
-                )]),
+                )]))
+                .expect("a map written out in a test"),
                 txs_in_flight: header.txs_in_flight(),
                 ..Default::default()
             });
@@ -799,11 +801,11 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
 
         let manifest = BlockManifest::new(
-            vec![TxHash::ZERO],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
+            Capped::from_array([TxHash::ZERO]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
             WitnessSources::empty(),
         );
 

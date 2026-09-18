@@ -95,6 +95,7 @@ const EXPECTED_PC_QC1: &str = "0255555555555555555555555555555555555555555555555
 /// vocabulary enum renumbered re-reads every record ever written as a
 /// different answer.
 mod records {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline,
         LocalKey, RoutePrefix, SubstateKey, TxHash, UnsettledTx,
@@ -119,10 +120,10 @@ mod records {
                 anchor: WeightedTimestamp::from_millis(1_700_000_000_321),
                 committee_anchor: WeightedTimestamp::from_millis(1_699_999_999_100),
             },
-            reach: vec![
+            reach: Capped::from_array([
                 RoutePrefix::of(Address::new([0x33; 31], AddressClass::Principal)),
                 RoutePrefix::of(Address::new([0x44; 31], AddressClass::Resource)),
-            ],
+            ]),
         }
     }
 

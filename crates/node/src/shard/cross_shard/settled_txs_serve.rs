@@ -289,7 +289,7 @@ mod tests {
             parent_qc: parent_qc.into(),
             timestamp: ProposerTimestamp::from_millis(1_000 * height),
             certificate_root: *Verified::<CertificateRoot>::compute(certs).as_ref(),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             // Every block of a terminating window carries the roots; a
             // block without them is not one this handler answers for.
             terminal_roots: Some(TerminalRoots {
@@ -300,11 +300,13 @@ mod tests {
         });
         let block = Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(certs.to_vec()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(
+                Capped::new(certs.to_vec()).expect("a list written out in a test"),
+            ),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();
@@ -420,14 +422,16 @@ mod tests {
                 parent_qc: parent_qc.into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
                 certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
-                provision_tx_roots: std::collections::BTreeMap::new(),
+                provision_tx_roots: Capped::default(),
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(certs.to_vec()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(
+                Capped::new(certs.to_vec()).expect("a list written out in a test"),
+            ),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();

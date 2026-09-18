@@ -306,6 +306,7 @@ impl BoundaryStore for SimShardStorage {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
@@ -561,14 +562,17 @@ mod tests {
                 ..Default::default()
             }),
             transactions: Arc::new(
-                txs.into_iter()
-                    .map(|tx| Arc::new(Verifiable::from(tx)))
-                    .collect(),
+                Capped::new(
+                    txs.into_iter()
+                        .map(|tx| Arc::new(Verifiable::from(tx)))
+                        .collect(),
+                )
+                .expect("a block written out in a test"),
             ),
             certificates,
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }

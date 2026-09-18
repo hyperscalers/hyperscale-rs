@@ -7219,6 +7219,7 @@ mod tests {
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
@@ -7722,11 +7723,11 @@ mod tests {
         });
         Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8216,11 +8217,11 @@ mod tests {
         state.pending_blocks.assemble(
             child.header().clone(),
             BlockManifest::new(
-                vec![TxHash::from(Hash::from_bytes(b"absent-tx"))],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
+                Capped::from_array([TxHash::from(Hash::from_bytes(b"absent-tx"))]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -8298,11 +8299,11 @@ mod tests {
             });
             Block::Live {
                 header,
-                transactions: Arc::new(Vec::new()),
-                certificates: Arc::new(Vec::new()),
-                provisions: Arc::new(Vec::new()),
-                abandonment_records: Arc::new(Vec::new()),
-                state_claims: Arc::new(Vec::new()),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -8513,11 +8514,11 @@ mod tests {
         });
         Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8957,11 +8958,11 @@ mod tests {
 
         let parent_block = Block::Live {
             header: make_header_at_height(BlockHeight::new(1), 99_000),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -12220,12 +12221,12 @@ mod tests {
                     ..Default::default()
                 })
             },
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -12290,12 +12291,12 @@ mod tests {
                     ..Default::default()
                 })
             },
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -12339,12 +12340,12 @@ mod tests {
                     ..Default::default()
                 })
             },
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -12546,12 +12547,12 @@ mod tests {
                     ..Default::default()
                 })
             },
-            transactions: Arc::new(vec![tx1.clone()]),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::from_array([tx1.clone()])),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -12581,12 +12582,12 @@ mod tests {
                     ..Default::default()
                 })
             },
-            transactions: Arc::new(txs),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::new(txs).expect("a list written out in a test")),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
 
         let result = state.admit_transactions(&topology, &block);
@@ -12686,12 +12687,12 @@ mod tests {
                     ..Default::default()
                 })
             },
-            transactions: Arc::new(vec![tx1.clone()]),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::from_array([tx1.clone()])),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -12719,12 +12720,12 @@ mod tests {
                     ..Default::default()
                 })
             },
-            transactions: Arc::new(vec![tx1]),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::from_array([tx1])),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -13006,11 +13007,13 @@ mod tests {
                 abandonment_root: AbandonmentRoot::over(&records),
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(records),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(
+                Capped::new(records).expect("a list written out in a test"),
+            ),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -13023,11 +13026,11 @@ mod tests {
                 state_claims_root: StateClaimsRoot::over(&bundles),
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(bundles),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -13257,7 +13260,7 @@ mod tests {
                 anchor: WeightedTimestamp::ZERO,
                 committee_anchor: WeightedTimestamp::ZERO,
             },
-            reach: vec![route(0xAA)],
+            reach: Capped::from_array([route(0xAA)]),
         }
     }
 
@@ -13398,7 +13401,7 @@ mod tests {
         let sched = make_terminating_schedule(4);
         let naming = |reach: Vec<RoutePrefix>| {
             let mut figures = figures_of(b"tx");
-            figures.reach = reach;
+            figures.reach = Capped::new(reach).expect("a list written out in a test");
             vec![AbandonmentRecord::new(
                 ShardId::ROOT,
                 WeightedTimestamp::from_millis(ROOT_CUT_MS),
@@ -13638,12 +13641,12 @@ mod tests {
     fn block_with_certs(certs: Vec<Arc<Verifiable<Finalization>>>) -> Block {
         Block::Live {
             header: make_header_at_height(BlockHeight::new(1), 1500),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(certs),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::new(certs).expect("a list written out in a test")),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -13996,16 +13999,16 @@ mod tests {
         });
         Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(vec![cross_shard_tick(
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::from_array([cross_shard_tick(
                 ShardId::leaf(1, 0),
                 ShardId::ROOT,
                 1,
-            )]),
-            provisions: Arc::new(Vec::new()),
+            )])),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -14094,12 +14097,12 @@ mod tests {
         });
         Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -14116,12 +14119,12 @@ mod tests {
         });
         Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 

@@ -8,6 +8,7 @@ description = "Mempool state machine"
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-engine.workspace = true
+hyperscale-hbor.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
 papaya.workspace = true

@@ -957,6 +957,7 @@ mod tests {
 
     use crossbeam::channel::{Receiver, unbounded};
     use hyperscale_dispatch_sync::SyncDispatch;
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{TestCommittee, make_live_block};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId,
@@ -1751,16 +1752,16 @@ mod tests {
             parent_block_hash: parent_hash,
             parent_qc: linked_qc(parent_hash, parent_qc_wt_ms).into(),
             timestamp: ProposerTimestamp::from_millis(1_000 + height),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             ..Default::default()
         });
         let block = Block::Live {
             header,
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::from_array([])),
+            certificates: Arc::new(Capped::from_array([])),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();

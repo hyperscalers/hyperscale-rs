@@ -918,6 +918,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, Block, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
         ProposerTimestamp, Round, ShardId, SignerBitfield, ValidatorId, WeightedTimestamp,
@@ -949,11 +950,11 @@ mod tests {
                 timestamp: ProposerTimestamp::from_millis(u64::from(tag[0])),
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(

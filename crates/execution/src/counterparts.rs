@@ -1078,6 +1078,7 @@ impl Counterparts {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Hash, LocalKey, RoutePrefix,
         evidence_admits_block,
@@ -1104,14 +1105,17 @@ mod tests {
                 anchor: WeightedTimestamp::ZERO,
                 committee_anchor: WeightedTimestamp::ZERO,
             },
-            reach: (0..routes)
-                .map(|at| {
-                    RoutePrefix::from(Address::new(
-                        [u8::try_from(at % 256).expect("masked"); 31],
-                        AddressClass::Component,
-                    ))
-                })
-                .collect(),
+            reach: Capped::new(
+                (0..routes)
+                    .map(|at| {
+                        RoutePrefix::from(Address::new(
+                            [u8::try_from(at % 256).expect("masked"); 31],
+                            AddressClass::Component,
+                        ))
+                    })
+                    .collect(),
+            )
+            .expect("a reach written out in a test"),
         }
     }
 

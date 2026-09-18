@@ -9,7 +9,7 @@ use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_hbor::{Bytes, from_slice};
+use hyperscale_hbor::{Bytes, Capped, from_slice};
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
@@ -274,11 +274,11 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
             timestamp: ProposerTimestamp::from_millis(height.inner() * 1000),
             ..Default::default()
         }),
-        transactions: Arc::new(Vec::new()),
-        certificates: Arc::new(Vec::new()),
-        provisions: Arc::new(Vec::new()),
-        abandonment_records: Arc::new(Vec::new()),
-        state_claims: Arc::new(Vec::new()),
+        transactions: Arc::new(Capped::empty()),
+        certificates: Arc::new(Capped::empty()),
+        provisions: Arc::new(Capped::empty()),
+        abandonment_records: Arc::new(Capped::empty()),
+        state_claims: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -499,6 +499,10 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
 
 /// Append a finalization to `block`'s certificate list, preserving
 /// the block variant.
+///
+/// # Panics
+///
+/// If `fw` is past the certificate cap the block's field states.
 #[must_use]
 pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
     match block {
@@ -512,7 +516,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
-            certificates.push(fw);
+            certificates.push(fw).expect("a list written out in a test");
             Block::Live {
                 header,
                 transactions,
@@ -533,7 +537,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
-            certificates.push(fw);
+            certificates.push(fw).expect("a list written out in a test");
             Block::Sealed {
                 header,
                 transactions,
@@ -563,7 +567,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             transactions,
             certificates,
             provisions,
-            abandonment_records: Arc::new(vec![record]),
+            abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
             witness_sources,
         },
@@ -580,7 +584,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             transactions,
             certificates,
             provision_hashes,
-            abandonment_records: Arc::new(vec![record]),
+            abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
             witness_sources,
         },
@@ -786,11 +790,11 @@ pub fn commit_block_with_witnesses(
             beacon_witness_leaf_count: count,
             ..Default::default()
         }),
-        transactions: Arc::new(Vec::new()),
-        certificates: Arc::new(Vec::new()),
-        provisions: Arc::new(Vec::new()),
-        abandonment_records: Arc::new(Vec::new()),
-        state_claims: Arc::new(Vec::new()),
+        transactions: Arc::new(Capped::empty()),
+        certificates: Arc::new(Capped::empty()),
+        provisions: Arc::new(Capped::empty()),
+        abandonment_records: Arc::new(Capped::empty()),
+        state_claims: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -842,11 +846,11 @@ pub fn commit_block_with_witness_window(
             beacon_witness_base: BeaconWitnessLeafCount::new(base),
             ..Default::default()
         }),
-        transactions: Arc::new(Vec::new()),
-        certificates: Arc::new(Vec::new()),
-        provisions: Arc::new(Vec::new()),
-        abandonment_records: Arc::new(Vec::new()),
-        state_claims: Arc::new(Vec::new()),
+        transactions: Arc::new(Capped::empty()),
+        certificates: Arc::new(Capped::empty()),
+        provisions: Arc::new(Capped::empty()),
+        abandonment_records: Arc::new(Capped::empty()),
+        state_claims: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -1905,7 +1909,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             header,
             transactions,
             certificates,
-            provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
+            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
             abandonment_records,
             state_claims,
             witness_sources,
@@ -1927,7 +1931,7 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             ..
         } => Block::Live {
             header,
-            transactions: Arc::new(txs),
+            transactions: Arc::new(Capped::new(txs).expect("a list written out in a test")),
             certificates,
             provisions,
             abandonment_records,

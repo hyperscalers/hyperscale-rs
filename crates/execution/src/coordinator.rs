@@ -4231,6 +4231,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_hbor::Capped;
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
@@ -8621,7 +8622,7 @@ mod tests {
             certificates,
             provisions,
             abandonment_records,
-            state_claims: Arc::new(bundles),
+            state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -8657,7 +8658,9 @@ mod tests {
         let block = Block::Live {
             header,
             transactions,
-            certificates: Arc::new(vec![Arc::new(Verifiable::from(finalization))]),
+            certificates: Arc::new(Capped::from_array([Arc::new(Verifiable::from(
+                finalization,
+            ))])),
             provisions,
             abandonment_records,
             state_claims,
@@ -8738,7 +8741,9 @@ mod tests {
             transactions,
             certificates,
             provisions,
-            abandonment_records: Arc::new(records),
+            abandonment_records: Arc::new(
+                Capped::new(records).expect("a list written out in a test"),
+            ),
             state_claims,
             witness_sources,
         };
@@ -10574,7 +10579,7 @@ mod tests {
                         amount: 5,
                     },
                     committed: test_committed(),
-                    reach: Vec::new(),
+                    reach: Capped::empty(),
                 }],
             )]);
     }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest};
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, FinalizationHash,
     LocalTimestamp, ProvisionHash, Provisions, Round, ShardId, Transaction, TxHash, ValidatorId,
@@ -606,11 +607,11 @@ impl PendingBlock {
             .map(|c| c.receipt_hash())
             .collect();
         let manifest = BlockManifest::new(
-            tx_hashes,
-            cert_ids,
-            provision_hashes,
-            block.abandonment_records().to_vec(),
-            block.state_claims().to_vec(),
+            Capped::new(tx_hashes).expect("a rebuilt block keeps the caps its source met"),
+            Capped::new(cert_ids).expect("a rebuilt block keeps the caps its source met"),
+            Capped::new(provision_hashes).expect("a rebuilt block keeps the caps its source met"),
+            block.abandonment_records().clone(),
+            block.state_claims().clone(),
             block.witness_sources().as_ref().clone(),
         );
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
@@ -803,9 +804,15 @@ impl PendingBlock {
 
         let block = Arc::new(Block::Live {
             header: self.header.clone(),
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(certificates),
-            provisions: Arc::new(provisions),
+            transactions: Arc::new(
+                Capped::new(transactions).expect("a rebuilt block keeps the caps its source met"),
+            ),
+            certificates: Arc::new(
+                Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
+            ),
+            provisions: Arc::new(
+                Capped::new(provisions).expect("a rebuilt block keeps the caps its source met"),
+            ),
             abandonment_records: Arc::new(self.manifest.abandonment_records().clone()),
             state_claims: Arc::new(self.manifest.state_claims().clone()),
             witness_sources: Arc::new(self.manifest.witness_sources().clone()),
@@ -836,12 +843,12 @@ impl PendingBlock {
     }
 
     /// Get total transaction count across all sections.
-    pub const fn transaction_count(&self) -> usize {
+    pub fn transaction_count(&self) -> usize {
         self.manifest.transaction_count()
     }
 
     /// Get certificate count.
-    pub const fn certificate_count(&self) -> usize {
+    pub fn certificate_count(&self) -> usize {
         self.manifest.cert_ids().len()
     }
 }
@@ -857,6 +864,7 @@ impl PendingBlock {
 #[cfg(test)]
 mod tests {
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         Block, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, ProposerTimestamp,
@@ -976,11 +984,11 @@ mod tests {
         let pb = PendingBlock::from_manifest(
             header,
             BlockManifest::new(
-                vec![tx1, tx2],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
+                Capped::from_array([tx1, tx2]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1012,11 +1020,11 @@ mod tests {
         let pb = PendingBlock::from_manifest(
             header,
             BlockManifest::new(
-                vec![tx1],
-                vec![one, two],
-                vec![],
-                vec![],
-                vec![],
+                Capped::from_array([tx1]),
+                Capped::from_array([one, two]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1046,11 +1054,11 @@ mod tests {
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest::new(
-                vec![],
-                vec![fw.receipt_hash()],
-                vec![],
-                vec![],
-                vec![],
+                Capped::from_array([]),
+                Capped::from_array([fw.receipt_hash()]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1084,11 +1092,11 @@ mod tests {
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest::new(
-                vec![tx_hash],
-                vec![fw.receipt_hash()],
-                vec![],
-                vec![],
-                vec![],
+                Capped::from_array([tx_hash]),
+                Capped::from_array([fw.receipt_hash()]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1119,12 +1127,12 @@ mod tests {
 
         let block = Block::Live {
             header: make_header(BlockHeight::new(1)),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(vec![wire_fw]),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::from_array([wire_fw])),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
 
         let pending = PendingBlock::from_complete_block(
@@ -1149,11 +1157,11 @@ mod tests {
         let stale = PendingBlock::from_manifest(
             make_header(BlockHeight::new(5)),
             BlockManifest::new(
-                vec![],
-                vec![],
-                vec![prov_a, prov_b],
-                vec![],
-                vec![],
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([prov_a, prov_b]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1199,11 +1207,11 @@ mod tests {
         let stale = PendingBlock::from_manifest(
             make_header(BlockHeight::new(5)),
             BlockManifest::new(
-                vec![],
-                vec![],
-                vec![shared, only_stale],
-                vec![],
-                vec![],
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([shared, only_stale]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1211,11 +1219,11 @@ mod tests {
         let live = PendingBlock::from_manifest(
             make_header(BlockHeight::new(10)),
             BlockManifest::new(
-                vec![],
-                vec![],
-                vec![shared],
-                vec![],
-                vec![],
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([shared]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1240,11 +1248,11 @@ mod tests {
         let dropped = PendingBlock::from_manifest(
             make_header(BlockHeight::new(7)),
             BlockManifest::new(
-                vec![shared, only_dropped],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
+                Capped::from_array([shared, only_dropped]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1253,11 +1261,11 @@ mod tests {
         let other = PendingBlock::from_manifest(
             make_header(BlockHeight::new(8)),
             BlockManifest::new(
-                vec![shared],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
+                Capped::from_array([shared]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
