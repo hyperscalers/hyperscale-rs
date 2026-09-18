@@ -1,6 +1,6 @@
 //! Instance record fetch response (cross-shard component resolution).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Bytes, Capped, Hbor};
 use hyperscale_vm_types::MAX_CELL_VALUE_LEN;
 
 use crate::network::request::MAX_INSTANCE_RECORDS_PER_REQUEST;
@@ -13,35 +13,19 @@ use crate::{MessageClass, NetworkMessage};
 /// record by re-deriving the address its contents commit — the request's
 /// own ids are the only trust anchor, so no addresses ride back.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-#[hbor(validate = records_fit)]
 pub struct GetInstanceRecordsResponse {
-    /// The found records, as their configuration leaves store them.
-    #[hbor(max = MAX_INSTANCE_RECORDS_PER_REQUEST)]
-    pub records: Vec<Vec<u8>>,
-}
-
-/// No record is larger than the cell that held it.
-///
-/// A protocol bound rather than a guard on what decoding allocates: a
-/// claimed length the remaining input cannot satisfy is refused before
-/// any collection is built. What this adds is that a well-formed frame
-/// still cannot name a record no configuration leaf could have stored.
-fn records_fit(response: &GetInstanceRecordsResponse) -> Result<(), &'static str> {
-    if response
-        .records
-        .iter()
-        .all(|record| record.len() <= MAX_CELL_VALUE_LEN)
-    {
-        Ok(())
-    } else {
-        Err("a record exceeds the substate value cap")
-    }
+    /// The found records, as their configuration leaves store them, each
+    /// no larger than the cell that held it — so a well-formed frame
+    /// cannot name a record no configuration leaf could have stored.
+    pub records: Capped<Vec<Bytes<MAX_CELL_VALUE_LEN>>, MAX_INSTANCE_RECORDS_PER_REQUEST>,
 }
 
 impl GetInstanceRecordsResponse {
     /// Build a response carrying the supplied records.
     #[must_use]
-    pub const fn new(records: Vec<Vec<u8>>) -> Self {
+    pub const fn new(
+        records: Capped<Vec<Bytes<MAX_CELL_VALUE_LEN>>, MAX_INSTANCE_RECORDS_PER_REQUEST>,
+    ) -> Self {
         Self { records }
     }
 }

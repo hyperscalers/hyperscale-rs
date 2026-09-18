@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
+use hyperscale_hbor::Capped;
 use hyperscale_network::Network;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
@@ -382,7 +383,7 @@ impl SimulationRunner {
             .map(|storage| serve_local_certified_headers(storage, request))
             .find(|r| !r.headers.is_empty())
             .unwrap_or(GetRemoteHeadersResponse {
-                headers: Vec::new(),
+                headers: Capped::empty(),
             })
     }
 

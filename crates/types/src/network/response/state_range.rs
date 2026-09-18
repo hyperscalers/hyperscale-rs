@@ -1,6 +1,6 @@
 //! Snap-sync state range response.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{MerkleInclusionProof, MessageClass, NetworkMessage, SubstateLeaf};
 
@@ -17,8 +17,7 @@ pub const MAX_LEAVES_PER_STATE_RANGE: usize = 1_024;
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct StateRangeChunk {
     /// Substate entries, strictly ascending by key.
-    #[hbor(max = MAX_LEAVES_PER_STATE_RANGE)]
-    pub leaves: Vec<SubstateLeaf>,
+    pub leaves: Capped<Vec<SubstateLeaf>, MAX_LEAVES_PER_STATE_RANGE>,
     /// Whether leaves beyond the last returned remain in the requested
     /// range — the chunk is complete only through its last leaf, and the
     /// joiner resumes immediately after it.
@@ -73,7 +72,7 @@ mod tests {
         };
         let response = GetStateRangeResponse {
             chunk: Some(StateRangeChunk {
-                leaves: vec![leaf],
+                leaves: Capped::from_array([leaf]),
                 more: true,
                 proof: MerkleInclusionProof::new(vec![1, 2, 3]),
             }),

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crossbeam::channel::Sender;
 use hyperscale_core::{FetchIds, ProtocolEvent};
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_refused;
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
@@ -90,12 +91,15 @@ impl FetchBinding for LocalProvisionBinding {
         network.request(
             shard,
             preferred,
-            GetLocalProvisionsRequest::new(ids),
+            GetLocalProvisionsRequest::new(
+                Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
+            ),
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split =
-                        partition_solicited(resp.entries, &hs, |entry| [entry.provisions.hash()]);
+                    let split = partition_solicited(resp.entries.into_inner(), &hs, |entry| {
+                        [entry.provisions.hash()]
+                    });
                     // Push the bundled source header BEFORE the provisions
                     // so the verification pipeline has a chance to admit it
                     // first. The header is QC-self-authenticating; sender is
@@ -177,13 +181,16 @@ impl FetchBinding for FinalizationBinding {
         network.request(
             shard,
             preferred,
-            GetFinalizationsRequest::new(ids),
+            GetFinalizationsRequest::new(
+                Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
+            ),
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split = partition_solicited(resp.finalizations, &requested_ids, |w| {
-                        [w.receipt_hash()]
-                    });
+                    let split =
+                        partition_solicited(resp.finalizations.into_inner(), &requested_ids, |w| {
+                            [w.receipt_hash()]
+                        });
                     if !split.kept.is_empty() {
                         // Refcount is 1 right after decode, so each unwrap moves.
                         let finalizations: Vec<Arc<Verifiable<Finalization>>> = split
@@ -261,7 +268,8 @@ impl FetchBinding for ExecCertBinding {
             shard,
             preferred,
             GetExecutionCertsRequest {
-                tx_hashes: ids.into_iter().map(|(_, tx_hash)| tx_hash).collect(),
+                tx_hashes: Capped::new(ids.into_iter().map(|(_, tx_hash)| tx_hash).collect())
+                    .expect("no more hashes than one block carries"),
             },
             class,
             Box::new(move |result| {
@@ -400,7 +408,11 @@ impl ScopedAnswer for CommittedTxBinding {
     }
 
     fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
-        GetCommittedTxsRequest::new(scope.height, scope.block_hash, keys.to_vec())
+        GetCommittedTxsRequest::new(
+            scope.height,
+            scope.block_hash,
+            Capped::new(keys.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
+        )
     }
 
     /// Absence is the answer that relaxes the successor's standing
@@ -470,7 +482,10 @@ impl ScopedAnswer for StateProofBinding {
     }
 
     fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
-        GetStateProofRequest::new(scope.height, keys.to_vec())
+        GetStateProofRequest::new(
+            scope.height,
+            Capped::new(keys.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
+        )
     }
 
     /// Checked here so an unusable proof rotates the peer rather than
@@ -547,7 +562,11 @@ impl ScopedAnswer for StateProofRelayBinding {
     /// shard's committee, and what it asks about is another shard's
     /// state.
     fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
-        GetRelayedStateProofRequest::new(scope.shard, scope.height, keys.to_vec())
+        GetRelayedStateProofRequest::new(
+            scope.shard,
+            scope.height,
+            Capped::new(keys.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
+        )
     }
 
     /// Checked here, against the anchor the requester commit-proved, so

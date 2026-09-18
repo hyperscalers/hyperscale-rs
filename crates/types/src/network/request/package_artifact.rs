@@ -1,6 +1,6 @@
 //! Package artifact fetch request (cross-shard code availability).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::response::GetPackageArtifactsResponse;
 use crate::{Hash, MessageClass, NetworkMessage, Request};
@@ -21,14 +21,13 @@ pub const MAX_PACKAGE_ARTIFACTS_PER_REQUEST: usize = 4;
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetPackageArtifactsRequest {
     /// The requested content addresses.
-    #[hbor(max = MAX_PACKAGE_ARTIFACTS_PER_REQUEST)]
-    pub packages: Vec<Hash>,
+    pub packages: Capped<Vec<Hash>, MAX_PACKAGE_ARTIFACTS_PER_REQUEST>,
 }
 
 impl GetPackageArtifactsRequest {
     /// Build a request for the listed `packages`.
     #[must_use]
-    pub const fn new(packages: Vec<Hash>) -> Self {
+    pub const fn new(packages: Capped<Vec<Hash>, MAX_PACKAGE_ARTIFACTS_PER_REQUEST>) -> Self {
         Self { packages }
     }
 }

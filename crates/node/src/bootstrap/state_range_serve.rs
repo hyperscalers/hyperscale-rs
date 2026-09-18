@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_jmt::{Blake3Hasher, Tree, TreeReader};
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{ShardStorage, Substates};
@@ -88,10 +89,15 @@ pub fn serve_state_range_request<S: ShardStorage>(
         return unavailable;
     };
 
-    record_fetch_response_sent("state_range", wire_leaves.len());
+    // A chunk past the cap is one this answer cannot express, and the
+    // proof beside it covers the whole run.
+    let Ok(leaves) = Capped::new(wire_leaves) else {
+        return unavailable;
+    };
+    record_fetch_response_sent("state_range", leaves.len());
     GetStateRangeResponse {
         chunk: Some(StateRangeChunk {
-            leaves: wire_leaves,
+            leaves,
             more: range.more,
             proof: MerkleInclusionProof::new(proof.encode()),
         }),

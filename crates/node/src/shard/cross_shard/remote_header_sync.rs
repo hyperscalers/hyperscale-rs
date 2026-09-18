@@ -180,7 +180,7 @@ where
                                 source_shard,
                                 from_height,
                                 count,
-                                headers: resp.headers,
+                                headers: resp.headers.into_inner(),
                             },
                         );
                     }
@@ -275,7 +275,7 @@ where
                                             source_shard,
                                             from_height,
                                             count: typed_count,
-                                            headers: resp.headers,
+                                            headers: resp.headers.into_inner(),
                                         },
                                     );
                                 }

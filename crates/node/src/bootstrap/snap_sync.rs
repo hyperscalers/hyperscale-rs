@@ -275,7 +275,7 @@ impl SnapSync {
             .map(|l| l.value.len() as u64)
             .sum::<u64>();
         StateRangeOutcome::Staged {
-            leaves: chunk.leaves.clone(),
+            leaves: chunk.leaves.clone().into_inner(),
             progress: self.progress(),
         }
     }

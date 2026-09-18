@@ -16,6 +16,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{AllCodeRuns, ExecutionMode, Executor};
 use hyperscale_execution::{ExecCertStore, FinalizationStore};
+use hyperscale_hbor::Capped;
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
@@ -209,7 +210,7 @@ fn add_and_remove_shard_at_runtime() {
             .local_dispatch_request(SHARD_B, block_request())
             .is_none()
     );
-    let gossip = TransactionGossip::new(vec![Arc::new(test_transaction(1))]);
+    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(1))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     assert!(
         event_rx.try_recv().is_err(),
@@ -230,7 +231,7 @@ fn add_and_remove_shard_at_runtime() {
             .is_some(),
         "request handlers for the added shard serve"
     );
-    let gossip = TransactionGossip::new(vec![Arc::new(test_transaction(2))]);
+    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(2))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     let event = event_rx
         .try_recv()
@@ -250,7 +251,7 @@ fn add_and_remove_shard_at_runtime() {
             .is_none(),
         "request handlers for the dropped shard are gone"
     );
-    let gossip = TransactionGossip::new(vec![Arc::new(test_transaction(3))]);
+    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(3))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     assert!(
         event_rx.try_recv().is_err(),

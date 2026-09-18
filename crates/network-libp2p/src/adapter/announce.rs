@@ -8,10 +8,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hyperscale_hbor::to_vec as hbor_to_vec;
+use hyperscale_hbor::{Bytes, to_vec as hbor_to_vec};
 use hyperscale_network::Topic;
 use hyperscale_network::compression::compress;
-use hyperscale_types::network::gossip::{MAX_ANNOUNCED_ADDRESSES, ValidatorAddressGossip};
+use hyperscale_types::network::gossip::{AnnouncedAddresses, ValidatorAddressGossip};
 use hyperscale_types::{NetworkDefinition, NetworkMessage, ValidatorAddressMessage, signed_bytes};
 use libp2p::gossipsub::{IdentTopic, PublishError};
 use libp2p::{Multiaddr, Swarm};
@@ -38,13 +38,25 @@ pub(super) fn announce_validator_addresses(
             addresses.push(addr.clone());
         }
     }
-    addresses.truncate(MAX_ANNOUNCED_ADDRESSES);
-    if addresses.is_empty() {
+    let Ok(peer_bytes) = Bytes::new(swarm.local_peer_id().to_bytes()) else {
+        warn!("local peer id is past the announced cap");
+        return;
+    };
+    // An address past either cap is one no receiver would admit, so it is
+    // left out of the announcement rather than announced and dropped at
+    // the far end.
+    let mut address_bytes = AnnouncedAddresses::empty();
+    for addr in &addresses {
+        let Ok(bytes) = Bytes::new(addr.to_vec()) else {
+            continue;
+        };
+        if address_bytes.push(bytes).is_err() {
+            break;
+        }
+    }
+    if address_bytes.is_empty() {
         return;
     }
-
-    let peer_bytes = swarm.local_peer_id().to_bytes();
-    let address_bytes: Vec<Vec<u8>> = addresses.iter().map(Multiaddr::to_vec).collect();
     // Wall-clock milliseconds: orders re-announcements across process
     // restarts, which a per-process counter cannot.
     let sequence = u64::try_from(

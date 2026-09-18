@@ -1,6 +1,6 @@
 //! Committed-transaction membership answers for a reshape successor.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{CommittedTxAbsence, MAX_PROOFS_PER_QUERY, MessageClass, NetworkMessage};
 
@@ -34,14 +34,13 @@ pub struct GetCommittedTxsResponse {
     /// A requester must check the length against what it asked before
     /// pairing them up; a short list is a malformed answer, not a
     /// partial one.
-    #[hbor(max = MAX_PROOFS_PER_QUERY)]
-    pub verdicts: Option<Vec<CommittedTxVerdict>>,
+    pub verdicts: Option<Capped<Vec<CommittedTxVerdict>, MAX_PROOFS_PER_QUERY>>,
 }
 
 impl GetCommittedTxsResponse {
     /// Verdicts for every queried transaction.
     #[must_use]
-    pub const fn found(verdicts: Vec<CommittedTxVerdict>) -> Self {
+    pub const fn found(verdicts: Capped<Vec<CommittedTxVerdict>, MAX_PROOFS_PER_QUERY>) -> Self {
         Self {
             verdicts: Some(verdicts),
         }
@@ -95,10 +94,10 @@ mod tests {
         let probe = TxHash::from(Hash::from_bytes(b"absent probe"));
         let absence = prove_committed_tx_absent(&members, &probe).expect("probe is not a member");
 
-        let response = GetCommittedTxsResponse::found(vec![
+        let response = GetCommittedTxsResponse::found(Capped::from_array([
             CommittedTxVerdict::Committed,
             CommittedTxVerdict::Absent(absence),
-        ]);
+        ]));
         let encoded = hbor_to_vec(&response).unwrap();
         let decoded: GetCommittedTxsResponse = hbor_from_slice(&encoded).unwrap();
         assert_eq!(response, decoded);

@@ -24,11 +24,12 @@ pub struct ValidatorAddressMessage {
 impl ValidatorAddressMessage {
     /// Assemble the message an address announcement signs.
     #[must_use]
-    pub fn new(peer_id_bytes: &[u8], addresses: &[Vec<u8>], sequence: u64) -> Self {
+    pub fn new(peer_id_bytes: &[u8], addresses: &[impl AsRef<[u8]>], sequence: u64) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(&frame_len(peer_id_bytes.len()));
         hasher.update(peer_id_bytes);
         for addr in addresses {
+            let addr = addr.as_ref();
             hasher.update(&frame_len(addr.len()));
             hasher.update(addr);
         }

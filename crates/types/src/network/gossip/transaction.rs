@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::{GossipMessage, TopicScope};
 use crate::{MessageClass, NetworkMessage, Transaction};
@@ -21,7 +21,7 @@ use crate::{MessageClass, NetworkMessage, Transaction};
 /// can't pack a 28-bit LEB128 count into a few bytes and force a multi-GB
 /// `Vec::with_capacity` pre-allocation per delivered gossip message.
 /// Production batches sit in the low hundreds; 1000 leaves headroom.
-const MAX_GOSSIP_TX_BATCH: usize = 1_000;
+pub const MAX_GOSSIP_TX_BATCH: usize = 1_000;
 
 /// Gossips a batch of transactions to a single destination shard.
 ///
@@ -30,27 +30,26 @@ const MAX_GOSSIP_TX_BATCH: usize = 1_000;
 #[derive(Debug, Clone, Hbor)]
 pub struct TransactionGossip {
     /// The transactions in this batch.
-    #[hbor(max = MAX_GOSSIP_TX_BATCH)]
-    pub transactions: Vec<Arc<Transaction>>,
+    pub transactions: Capped<Vec<Arc<Transaction>>, MAX_GOSSIP_TX_BATCH>,
 }
 
 impl TransactionGossip {
     /// Build a gossip batch from a vector of `Arc`-wrapped transactions.
     /// The batch cap is enforced at encode and decode, not here.
     #[must_use]
-    pub const fn new(transactions: Vec<Arc<Transaction>>) -> Self {
+    pub const fn new(transactions: Capped<Vec<Arc<Transaction>>, MAX_GOSSIP_TX_BATCH>) -> Self {
         Self { transactions }
     }
 
     /// Number of transactions in the batch.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.transactions.len()
     }
 
     /// Whether the batch is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
 }
@@ -110,7 +109,8 @@ mod tests {
             &[test_prefix(4)],
         ));
 
-        let gossip = TransactionGossip::new(vec![Arc::clone(&tx1), Arc::clone(&tx2)]);
+        let gossip =
+            TransactionGossip::new(Capped::from_array([Arc::clone(&tx1), Arc::clone(&tx2)]));
         assert_eq!(gossip.len(), 2);
         assert!(!gossip.is_empty());
         assert_eq!(gossip.transactions[0].hash(), tx1.hash());
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn empty_batch() {
-        let gossip = TransactionGossip::new(vec![]);
+        let gossip = TransactionGossip::new(Capped::empty());
         assert!(gossip.is_empty());
         assert_eq!(gossip.len(), 0);
     }
@@ -135,7 +135,8 @@ mod tests {
                 ))
             })
             .collect();
-        let original = TransactionGossip::new(txs);
+        let original =
+            TransactionGossip::new(Capped::new(txs).expect("a batch written out in a test"));
 
         let bytes = hbor_to_vec(&original).expect("encode");
         let decoded: TransactionGossip = hbor_from_slice(&bytes).expect("decode");
@@ -146,7 +147,7 @@ mod tests {
 
     #[test]
     fn hbor_roundtrip_empty() {
-        let original = TransactionGossip::new(vec![]);
+        let original = TransactionGossip::new(Capped::empty());
         let bytes = hbor_to_vec(&original).expect("encode");
         let decoded: TransactionGossip = hbor_from_slice(&bytes).expect("decode");
         assert_eq!(original, decoded);

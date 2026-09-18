@@ -21,10 +21,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use hyperscale_crypto::Verifier;
 use hyperscale_network::ValidatorKeyMap;
-use hyperscale_types::network::gossip::{
-    MAX_ANNOUNCED_ADDRESS_BYTES, MAX_ANNOUNCED_ADDRESSES, MAX_ANNOUNCED_PEER_ID_BYTES,
-    ValidatorAddressGossip,
-};
+use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{NetworkDefinition, Signed, SignedContext, ValidatorId};
 use libp2p::{Multiaddr, PeerId as Libp2pPeerId};
 
@@ -72,14 +69,9 @@ impl AddressBook {
         keys: &ValidatorKeyMap,
         gossip: &ValidatorAddressGossip,
     ) -> IngestOutcome {
-        if gossip.peer_id.len() > MAX_ANNOUNCED_PEER_ID_BYTES
-            || gossip.addresses.is_empty()
-            || gossip.addresses.len() > MAX_ANNOUNCED_ADDRESSES
-            || gossip
-                .addresses
-                .iter()
-                .any(|a| a.len() > MAX_ANNOUNCED_ADDRESS_BYTES)
-        {
+        // The caps are the record's own types, so what is left to ask is
+        // whether the record names anything at all.
+        if gossip.addresses.is_empty() {
             return IngestOutcome::Invalid;
         }
 
@@ -101,7 +93,7 @@ impl AddressBook {
         let addresses: Vec<Multiaddr> = gossip
             .addresses
             .iter()
-            .filter_map(|bytes| Multiaddr::try_from(bytes.clone()).ok())
+            .filter_map(|bytes| Multiaddr::try_from(bytes.to_vec()).ok())
             .collect();
         if addresses.is_empty() {
             return IngestOutcome::Invalid;
@@ -176,6 +168,8 @@ impl AddressBook {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_hbor::Bytes;
+    use hyperscale_types::network::gossip::AnnouncedAddresses;
     use hyperscale_types::{Signer, ValidatorAddressMessage, signed_bytes};
 
     use super::*;
@@ -189,13 +183,8 @@ mod tests {
     }
 
     fn announce(vid: ValidatorId, peer_id: &Libp2pPeerId, sequence: u64) -> ValidatorAddressGossip {
-        let peer_bytes = peer_id.to_bytes();
-        let addresses = vec![
-            "/ip4/127.0.0.1/udp/4001/quic-v1"
-                .parse::<Multiaddr>()
-                .unwrap()
-                .to_vec(),
-        ];
+        let peer_bytes = Bytes::new(peer_id.to_bytes()).expect("a peer id under the cap");
+        let addresses = dialable();
         let signature = keypair()
             .sign(&signed_bytes(
                 &ValidatorAddressMessage::new(&peer_bytes, &addresses, sequence),
@@ -209,6 +198,15 @@ mod tests {
             sequence,
             signature,
         }
+    }
+
+    /// One dialable address, under both announced caps.
+    fn dialable() -> AnnouncedAddresses {
+        let addr = "/ip4/127.0.0.1/udp/4001/quic-v1"
+            .parse::<Multiaddr>()
+            .expect("a multiaddr")
+            .to_vec();
+        AnnouncedAddresses::from_array([Bytes::new(addr).expect("an address under the cap")])
     }
 
     fn keys_for(vid: ValidatorId) -> ValidatorKeyMap {
@@ -311,29 +309,18 @@ mod tests {
         assert_eq!(candidates[0].peer_id, cohost_peer);
     }
 
+    /// The announced caps are the record's own types, so what ingest is
+    /// left to refuse is content that fits them and still means nothing.
     #[test]
-    fn rejects_over_cap_and_malformed_content() {
+    fn rejects_malformed_content() {
         let book = AddressBook::default();
         let vid = ValidatorId::new(4);
         let keys = keys_for(vid);
-        let peer = Libp2pPeerId::random();
-
-        let mut oversized = announce(vid, &peer, 1);
-        oversized.addresses = vec![vec![0u8; MAX_ANNOUNCED_ADDRESS_BYTES + 1]];
-        assert_eq!(
-            book.ingest(&BlsVerifier, &net(), &keys, &oversized),
-            IngestOutcome::Invalid
-        );
 
         // A signed record whose peer id bytes don't parse is invalid even
         // though the signature verifies.
-        let bogus_peer_bytes = vec![1u8, 2, 3];
-        let addresses = vec![
-            "/ip4/127.0.0.1/udp/4001/quic-v1"
-                .parse::<Multiaddr>()
-                .unwrap()
-                .to_vec(),
-        ];
+        let bogus_peer_bytes = Bytes::from_array([1u8, 2, 3]);
+        let addresses = dialable();
         let signature = keypair()
             .sign(&signed_bytes(
                 &ValidatorAddressMessage::new(&bogus_peer_bytes, &addresses, 3),

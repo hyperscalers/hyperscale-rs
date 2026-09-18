@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_mempool::TxStore;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
@@ -83,15 +84,23 @@ pub fn serve_transaction_request<S: ShardStorage>(
         );
     }
 
-    let found = within_byte_budget(found);
-    let found_count = found.len();
+    // The wire's own cap, met where the byte budget is: an answer is a
+    // prefix of what was asked, so trimming it is what a partial answer
+    // already means here.
+    let mut kept = Capped::empty();
+    for tx in within_byte_budget(found) {
+        if kept.push(tx).is_err() {
+            break;
+        }
+    }
+    let found_count = kept.len();
     debug!(
         requested = requested_count,
         found = found_count,
         "Responding to transaction fetch request"
     );
     record_fetch_response_sent("transaction", found_count);
-    GetTransactionsResponse::new(found)
+    GetTransactionsResponse::new(kept)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! `ExecutionCertificatesNotification` message.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     ConsensusSignature, ExecutionCertificate, ExecutionCertificatesSenderMessage,
@@ -22,8 +22,7 @@ pub struct ExecutionCertificatesNotification {
     /// the same ceiling [`GetExecutionCertsRequest`] asks under.
     ///
     /// [`GetExecutionCertsRequest`]: crate::network::request::GetExecutionCertsRequest
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    pub certificates: Vec<ExecutionCertificate>,
+    pub certificates: Capped<Vec<ExecutionCertificate>, MAX_TXS_PER_BLOCK>,
     /// The validator who sent this batch.
     pub sender: ValidatorId,
     /// Signature over the domain-separated signing message, by the sender.
@@ -34,7 +33,7 @@ impl ExecutionCertificatesNotification {
     /// Create a new signed execution certificate batch.
     #[must_use]
     pub const fn new(
-        certificates: Vec<ExecutionCertificate>,
+        certificates: Capped<Vec<ExecutionCertificate>, MAX_TXS_PER_BLOCK>,
         sender: ValidatorId,
         sender_signature: ConsensusSignature,
     ) -> Self {
@@ -54,18 +53,18 @@ impl ExecutionCertificatesNotification {
     /// Consume and return the certificates.
     #[must_use]
     pub fn into_certificates(self) -> Vec<ExecutionCertificate> {
-        self.certificates
+        self.certificates.into_inner()
     }
 
     /// Check if the batch is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.certificates.is_empty()
     }
 
     /// Get the number of certificates in the batch.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.certificates.len()
     }
 }

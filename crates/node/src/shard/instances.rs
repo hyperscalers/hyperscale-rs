@@ -21,6 +21,7 @@ use crossbeam::channel::Sender;
 use hyperscale_core::FetchIds;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::instance_of_record;
+use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
@@ -93,7 +94,9 @@ impl FetchBinding for InstanceRecordBinding {
         network.request(
             shard,
             preferred,
-            GetInstanceRecordsRequest::new(ids),
+            GetInstanceRecordsRequest::new(
+                Capped::new(ids).expect("the fetch config clamps a chunk to the record cap"),
+            ),
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
@@ -106,6 +109,7 @@ impl FetchBinding for InstanceRecordBinding {
                     let addressed: Vec<(Address, Vec<u8>)> = resp
                         .records
                         .into_iter()
+                        .map(Bytes::into_inner)
                         .filter_map(|record| {
                             instance_of_record(&record).map(|address| (address, record))
                         })

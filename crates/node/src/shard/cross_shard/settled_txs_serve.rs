@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetSettledTxsRequest;
@@ -181,7 +182,7 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
     // rather than letting the requester read the overflow `not_found` as a
     // plain "block not held" and rotate peers forever.
     let window = set.len();
-    if window > MAX_FINALIZED_TX_PER_BLOCK {
+    let Ok(txs) = Capped::new(set.as_ref().clone()) else {
         tracing::warn!(
             shard = ?shard,
             terminal_height = req.terminal_height.inner(),
@@ -192,9 +193,9 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
         );
         record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
-    }
+    };
     record_fetch_response_sent("settled_txs", 1);
-    GetSettledTxsResponse::found(set.as_ref().clone())
+    GetSettledTxsResponse::found(txs)
 }
 
 #[cfg(test)]

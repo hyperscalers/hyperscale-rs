@@ -1,6 +1,6 @@
 //! Range response for remote committed block headers.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use crate::{CertifiedBlockHeader, MessageClass, NetworkMessage};
@@ -30,8 +30,7 @@ pub struct GetRemoteHeadersResponse {
     ///
     /// Capped at what one request may ask for, which is the most a
     /// responder can honestly have been asked to serve.
-    #[hbor(max = MAX_REMOTE_HEADERS_PER_REQUEST_LEN)]
-    pub headers: Vec<CertifiedBlockHeader>,
+    pub headers: Capped<Vec<CertifiedBlockHeader>, MAX_REMOTE_HEADERS_PER_REQUEST_LEN>,
 }
 
 impl NetworkMessage for GetRemoteHeadersResponse {
@@ -52,7 +51,9 @@ mod tests {
 
     #[test]
     fn test_hbor_roundtrip_empty() {
-        let response = GetRemoteHeadersResponse { headers: vec![] };
+        let response = GetRemoteHeadersResponse {
+            headers: Capped::empty(),
+        };
 
         let encoded = hbor_to_vec(&response).unwrap();
         let decoded: GetRemoteHeadersResponse = hbor_from_slice(&encoded).unwrap();

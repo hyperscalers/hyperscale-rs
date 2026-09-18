@@ -1,6 +1,6 @@
 //! Validator address announcement for by-identity dialing.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Bytes, Capped, Hbor};
 
 use crate::network::{GossipMessage, TopicScope};
 use crate::{
@@ -19,6 +19,12 @@ pub const MAX_ANNOUNCED_ADDRESS_BYTES: usize = 256;
 /// Maximum encoded length of the announced libp2p peer id.
 pub const MAX_ANNOUNCED_PEER_ID_BYTES: usize = 64;
 
+/// The addresses one announcement carries: each a dialable multiaddr no
+/// longer than a receiver admits, and no more of them than one record
+/// names.
+pub type AnnouncedAddresses =
+    Capped<Vec<Bytes<MAX_ANNOUNCED_ADDRESS_BYTES>>, MAX_ANNOUNCED_ADDRESSES>;
+
 /// Gossips a validator's own libp2p peer id and network addresses globally.
 ///
 /// Every node caches these records in a `ValidatorId → (PeerId, addresses)`
@@ -30,19 +36,18 @@ pub const MAX_ANNOUNCED_PEER_ID_BYTES: usize = 64;
 /// address for a never-connected peer.
 ///
 /// The peer id and addresses travel as raw bytes: this crate carries no
-/// libp2p types, and the network adapter parses and validates them at
-/// ingest against the `MAX_ANNOUNCED_*` caps.
+/// libp2p types, and the network adapter parses them at ingest. Their
+/// caps are the types', so a record past one is a record that does not
+/// decode.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ValidatorAddressGossip {
     /// The validator this record names — also its signer: address records
     /// are only ever self-announced.
     pub validator: ValidatorId,
     /// libp2p peer id bytes the validator currently binds as.
-    #[hbor(max = MAX_ANNOUNCED_PEER_ID_BYTES)]
-    pub peer_id: Vec<u8>,
+    pub peer_id: Bytes<MAX_ANNOUNCED_PEER_ID_BYTES>,
     /// Encoded multiaddrs the peer can be dialed at.
-    #[hbor(max = MAX_ANNOUNCED_ADDRESSES)]
-    pub addresses: Vec<Vec<u8>>,
+    pub addresses: AnnouncedAddresses,
     /// Announce ordering: consumers keep the record with the highest
     /// sequence per validator, so a re-announce after a peer-id or address
     /// change supersedes older records everywhere.
@@ -113,8 +118,8 @@ mod tests {
 
     fn signed_record(sequence: u64) -> (ValidatorAddressGossip, ConsensusPublicKey) {
         let key = BlsSigner::from_seed(&[7u8; 32]);
-        let peer_id = b"peer-id".to_vec();
-        let addresses = vec![b"addr".to_vec()];
+        let peer_id = Bytes::new(b"peer-id".to_vec()).expect("under the peer id cap");
+        let addresses = Capped::from_array([Bytes::from_array(*b"addr")]);
         let message = signed_bytes(
             &ValidatorAddressMessage::new(&peer_id, &addresses, sequence),
             &net(),
@@ -144,7 +149,10 @@ mod tests {
     #[test]
     fn tampered_addresses_fail_verification() {
         let (mut gossip, public_key) = signed_record(9);
-        gossip.addresses.push(b"injected".to_vec());
+        gossip
+            .addresses
+            .push(Bytes::from_array(*b"injected"))
+            .expect("under the address cap");
         let network = net();
         let ctx = SignedContext {
             verifier: &BlsVerifier,

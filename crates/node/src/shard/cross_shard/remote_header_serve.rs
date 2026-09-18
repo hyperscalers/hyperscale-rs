@@ -6,6 +6,7 @@
 //! [`MAX_REMOTE_HEADERS_PER_REQUEST`] and the local tip. The response
 //! short-caps on the first missing height rather than failing.
 
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardChainReader, ShardStorage};
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
@@ -37,12 +38,12 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
 ) -> GetRemoteHeadersResponse {
     if req.source_shard != local_shard {
         return GetRemoteHeadersResponse {
-            headers: Vec::new(),
+            headers: Capped::empty(),
         };
     }
 
     let bounded_count = req.count.min(MAX_REMOTE_HEADERS_PER_REQUEST);
-    let mut headers = Vec::with_capacity(usize::try_from(bounded_count.inner()).unwrap_or(0));
+    let mut headers = Capped::empty();
 
     for offset in 0..bounded_count.inner() {
         let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
@@ -56,7 +57,9 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
         else {
             break;
         };
-        headers.push((**header).clone());
+        if headers.push((**header).clone()).is_err() {
+            break;
+        }
     }
 
     if !headers.is_empty() {
@@ -84,13 +87,15 @@ pub fn serve_local_certified_headers<S: ShardChainReader>(
     req: &GetRemoteHeadersRequest,
 ) -> GetRemoteHeadersResponse {
     let bounded_count = req.count.min(MAX_REMOTE_HEADERS_PER_REQUEST);
-    let mut headers = Vec::with_capacity(usize::try_from(bounded_count.inner()).unwrap_or(0));
+    let mut headers = Capped::empty();
     for offset in 0..bounded_count.inner() {
         let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
         let Some(certified) = storage.get_certified_header(height) else {
             break;
         };
-        headers.push(certified.as_ref().clone());
+        if headers.push(certified.as_ref().clone()).is_err() {
+            break;
+        }
     }
     GetRemoteHeadersResponse { headers }
 }

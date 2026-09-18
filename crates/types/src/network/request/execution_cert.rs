@@ -1,6 +1,6 @@
 //! Execution certificate fetch request for fallback recovery.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::response::GetExecutionCertsResponse;
 use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Request, TxHash};
@@ -19,8 +19,7 @@ use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Request, TxHash};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetExecutionCertsRequest {
     /// Transactions whose outcome from this shard is missing.
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    pub tx_hashes: Vec<TxHash>,
+    pub tx_hashes: Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK>,
 }
 
 impl NetworkMessage for GetExecutionCertsRequest {
@@ -51,10 +50,10 @@ mod tests {
     #[test]
     fn test_hbor_roundtrip() {
         let request = GetExecutionCertsRequest {
-            tx_hashes: vec![
+            tx_hashes: Capped::from_array([
                 TxHash::from(Hash::from_bytes(b"tx one")),
                 TxHash::from(Hash::from_bytes(b"tx two")),
-            ],
+            ]),
         };
 
         let encoded = hbor_to_vec(&request).unwrap();

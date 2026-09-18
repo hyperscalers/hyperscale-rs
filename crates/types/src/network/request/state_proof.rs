@@ -8,7 +8,7 @@
 //! inclusion and non-inclusion alike — see
 //! [`GetStateProofResponse`](crate::network::response::GetStateProofResponse).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::response::GetStateProofResponse;
 use crate::{
@@ -21,14 +21,16 @@ pub struct GetStateProofRequest {
     /// The committed height whose state root the proof reconstructs.
     pub height: BlockHeight,
     /// The keys to prove, present or absent.
-    #[hbor(max = MAX_PROOFS_PER_QUERY)]
-    pub keys: Vec<SubstateKey>,
+    pub keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
 }
 
 impl GetStateProofRequest {
     /// A request for `keys` at `height`.
     #[must_use]
-    pub const fn new(height: BlockHeight, keys: Vec<SubstateKey>) -> Self {
+    pub const fn new(
+        height: BlockHeight,
+        keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
+    ) -> Self {
         Self { height, keys }
     }
 }
@@ -73,14 +75,17 @@ pub struct GetRelayedStateProofRequest {
     /// The committed height whose state root the proof reconstructs.
     pub height: BlockHeight,
     /// The keys to prove, present or absent.
-    #[hbor(max = MAX_PROOFS_PER_QUERY)]
-    pub keys: Vec<SubstateKey>,
+    pub keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
 }
 
 impl GetRelayedStateProofRequest {
     /// A request for `keys` at `shard`'s `height`.
     #[must_use]
-    pub const fn new(shard: ShardId, height: BlockHeight, keys: Vec<SubstateKey>) -> Self {
+    pub const fn new(
+        shard: ShardId,
+        height: BlockHeight,
+        keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
+    ) -> Self {
         Self {
             shard,
             height,
@@ -116,7 +121,8 @@ mod tests {
 
     #[test]
     fn test_hbor_roundtrip() {
-        let request = GetStateProofRequest::new(BlockHeight::new(42), vec![test_key(7)]);
+        let request =
+            GetStateProofRequest::new(BlockHeight::new(42), Capped::from_array([test_key(7)]));
         let encoded = hbor_to_vec(&request).unwrap();
         let decoded: GetStateProofRequest = hbor_from_slice(&encoded).unwrap();
         assert_eq!(request, decoded);

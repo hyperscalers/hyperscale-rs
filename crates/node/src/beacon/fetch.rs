@@ -137,8 +137,8 @@ impl ScopedAnswer for ShardWitnessBinding {
             shard_id: source_shard,
             committed_block_hash,
             lo,
-            payloads: response.payloads,
-            range_proof: response.range_proof,
+            payloads: response.payloads.into_inner(),
+            range_proof: response.range_proof.into_inner(),
         })
     }
 }

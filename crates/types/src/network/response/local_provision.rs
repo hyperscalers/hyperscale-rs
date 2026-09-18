@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     CertifiedBlockHeader, MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage, Provisions,
@@ -48,8 +48,7 @@ pub struct GetLocalProvisionsResponse {
     /// Capped at [`MAX_PROVISIONS_PER_BLOCK`] — the natural ceiling since a
     /// single block can't reference more provisions than this, and the fetch
     /// dispatcher chunks at 16 ids per call.
-    #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-    pub entries: Vec<LocalProvisionEntry>,
+    pub entries: Capped<Vec<LocalProvisionEntry>, MAX_PROVISIONS_PER_BLOCK>,
 }
 
 impl GetLocalProvisionsResponse {
@@ -61,7 +60,7 @@ impl GetLocalProvisionsResponse {
     /// dispatcher chunks at 16 ids per call, so well-behaved callers sit
     /// far below the cap.
     #[must_use]
-    pub const fn new(entries: Vec<LocalProvisionEntry>) -> Self {
+    pub const fn new(entries: Capped<Vec<LocalProvisionEntry>, MAX_PROVISIONS_PER_BLOCK>) -> Self {
         Self { entries }
     }
 
@@ -69,7 +68,7 @@ impl GetLocalProvisionsResponse {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: Capped::empty(),
         }
     }
 }
@@ -151,10 +150,10 @@ mod tests {
         );
         let source_header = Arc::new(CertifiedBlockHeader::new(header, qc));
 
-        let original = GetLocalProvisionsResponse::new(vec![LocalProvisionEntry {
+        let original = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
             provisions: Arc::clone(&provisions),
             source_header: Some(Arc::clone(&source_header)),
-        }]);
+        }]));
         let bytes = hbor_to_vec(&original).unwrap();
         let decoded: GetLocalProvisionsResponse = hbor_from_slice(&bytes).unwrap();
         assert_eq!(decoded.entries.len(), 1);
@@ -169,10 +168,10 @@ mod tests {
         );
 
         // Same shape with `None` header — the responder GC'd it after admit.
-        let stripped = GetLocalProvisionsResponse::new(vec![LocalProvisionEntry {
+        let stripped = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
             provisions: Arc::clone(&provisions),
             source_header: None,
-        }]);
+        }]));
         let bytes = hbor_to_vec(&stripped).unwrap();
         let decoded: GetLocalProvisionsResponse = hbor_from_slice(&bytes).unwrap();
         assert!(decoded.entries[0].source_header.is_none());

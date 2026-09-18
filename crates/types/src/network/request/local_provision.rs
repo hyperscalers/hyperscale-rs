@@ -1,6 +1,6 @@
 //! Local provisions fetch request (intra-shard DA).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::response::GetLocalProvisionsResponse;
 use crate::{MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage, ProvisionHash, Request};
@@ -16,14 +16,13 @@ pub struct GetLocalProvisionsRequest {
     ///
     /// Capped as the response is: a request asks for the batches a block
     /// names, and a block carries at most this many.
-    #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-    pub batch_hashes: Vec<ProvisionHash>,
+    pub batch_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
 }
 
 impl GetLocalProvisionsRequest {
     /// Build a request for the listed `batch_hashes`.
     #[must_use]
-    pub const fn new(batch_hashes: Vec<ProvisionHash>) -> Self {
+    pub const fn new(batch_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>) -> Self {
         Self { batch_hashes }
     }
 }
@@ -56,10 +55,10 @@ mod tests {
     #[test]
     fn test_hbor_roundtrip() {
         let request = GetLocalProvisionsRequest {
-            batch_hashes: vec![
+            batch_hashes: Capped::from_array([
                 ProvisionHash::from_raw(Hash::from_bytes(b"batch1")),
                 ProvisionHash::from_raw(Hash::from_bytes(b"batch2")),
-            ],
+            ]),
         };
         let encoded = hbor_to_vec(&request).unwrap();
         let decoded: GetLocalProvisionsRequest = hbor_from_slice(&encoded).unwrap();

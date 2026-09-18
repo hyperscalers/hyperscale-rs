@@ -12,7 +12,7 @@
 //! Answers come back per transaction, in the order asked. Only absence
 //! carries a proof; see [`GetCommittedTxsResponse`].
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::response::GetCommittedTxsResponse;
 use crate::{
@@ -29,8 +29,7 @@ pub struct GetCommittedTxsRequest {
     /// answers `not_found` on a hash mismatch.
     pub terminal_block_hash: BlockHash,
     /// The transactions to resolve, in the order the answers come back.
-    #[hbor(max = MAX_PROOFS_PER_QUERY)]
-    pub tx_hashes: Vec<TxHash>,
+    pub tx_hashes: Capped<Vec<TxHash>, MAX_PROOFS_PER_QUERY>,
 }
 
 impl GetCommittedTxsRequest {
@@ -40,7 +39,7 @@ impl GetCommittedTxsRequest {
     pub const fn new(
         terminal_height: BlockHeight,
         terminal_block_hash: BlockHash,
-        tx_hashes: Vec<TxHash>,
+        tx_hashes: Capped<Vec<TxHash>, MAX_PROOFS_PER_QUERY>,
     ) -> Self {
         Self {
             terminal_height,
@@ -80,7 +79,7 @@ mod tests {
         let request = GetCommittedTxsRequest::new(
             BlockHeight::new(98),
             BlockHash::from_raw(Hash::from_bytes(b"terminal")),
-            vec![TxHash::from(Hash::from_bytes(b"probe"))],
+            Capped::from_array([TxHash::from(Hash::from_bytes(b"probe"))]),
         );
         let encoded = hbor_to_vec(&request).unwrap();
         let decoded: GetCommittedTxsRequest = hbor_from_slice(&encoded).unwrap();

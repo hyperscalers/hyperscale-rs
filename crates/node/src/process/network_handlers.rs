@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
+use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
@@ -906,13 +907,19 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetPackageArtifactsRequest>(
             shard,
             move |req: GetPackageArtifactsRequest| {
-                let artifacts: Vec<Vec<u8>> = req
+                // An artifact the publish gate would have refused for
+                // width is one no asker would admit either, so it is
+                // absent from the answer rather than sent to be dropped.
+                let artifacts: Vec<_> = req
                     .packages
                     .iter()
                     .filter_map(|package| storage.package_artifact(*package))
+                    .filter_map(|artifact| Bytes::new(artifact).ok())
                     .collect();
                 record_fetch_response_sent("package_artifact", artifacts.len());
-                GetPackageArtifactsResponse::new(artifacts)
+                GetPackageArtifactsResponse::new(
+                    Capped::new(artifacts).expect("no more answers than the request named"),
+                )
             },
         );
 
@@ -931,7 +938,7 @@ pub fn register_shard_request_handlers<S, N, D>(
             shard,
             move |req: GetInstanceRecordsRequest| {
                 let height = storage.jmt_height();
-                let records: Vec<Vec<u8>> = req
+                let records: Vec<_> = req
                     .instances
                     .iter()
                     .filter_map(|instance| {
@@ -942,9 +949,12 @@ pub fn register_shard_request_handlers<S, N, D>(
                             )
                             .flatten()
                     })
+                    .filter_map(|record| Bytes::new(record).ok())
                     .collect();
                 record_fetch_response_sent("instance_record", records.len());
-                GetInstanceRecordsResponse::new(records)
+                GetInstanceRecordsResponse::new(
+                    Capped::new(records).expect("no more answers than the request named"),
+                )
             },
         );
 

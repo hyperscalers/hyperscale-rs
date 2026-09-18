@@ -22,6 +22,7 @@ use std::sync::Arc;
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool, Parallelism};
+use hyperscale_hbor::Capped;
 use hyperscale_network::Network;
 use hyperscale_storage::{ShardStorage, SubstateStore};
 use hyperscale_types::network::gossip::TransactionGossip;
@@ -331,7 +332,9 @@ where
         if txs.is_empty() {
             return;
         }
-        let gossip = TransactionGossip::new(txs);
+        let gossip = TransactionGossip::new(
+            Capped::new(txs).expect("the flush point is clamped to the gossip batch cap"),
+        );
         self.process.network.broadcast_to_shard(dst, &gossip);
     }
 
