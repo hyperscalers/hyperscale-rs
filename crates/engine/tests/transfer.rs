@@ -2398,7 +2398,7 @@ fn published_account_artifact() -> Vec<u8> {
 /// it. An event is a name *and* a shape, so the name arrives with the
 /// empty one — what an event carrying nothing declares.
 fn naming(metadata: &mut PackageMetadata, event: &str) {
-    metadata.events.push(event.to_owned());
+    let named = Name::declared(event);
     let unit = metadata
         .types
         .push(TypeShape::Tuple(Vec::new()))
@@ -2406,10 +2406,11 @@ fn naming(metadata: &mut PackageMetadata, event: &str) {
     metadata
         .types
         .push(TypeShape::Named {
-            name: Name::try_from(event).expect("a name the protocol spells"),
+            name: named.clone(),
             shape: unit,
         })
         .expect("a name the package does not already hold");
+    metadata.events.push(named);
 }
 
 fn published_metadata() -> PackageMetadata {
