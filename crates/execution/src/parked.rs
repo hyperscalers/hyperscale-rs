@@ -134,6 +134,7 @@ impl ParkedArtifacts {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionOutcome, GlobalReceiptRoot, Hash, SignerBitfield,
         TickId, TxHash, TxOutcome, WeightedTimestamp,
@@ -147,10 +148,10 @@ mod tests {
                 TickId::new(shard, BlockHeight::new(u64::from(seed))),
                 WeightedTimestamp::ZERO,
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(
+                Capped::from_array([TxOutcome::new(
                     TxHash::from(Hash::from_bytes(&[seed])),
                     ExecutionOutcome::Aborted,
-                )],
+                )]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )

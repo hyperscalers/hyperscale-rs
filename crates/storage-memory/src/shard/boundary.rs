@@ -467,8 +467,8 @@ mod tests {
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes,
-                beacon_witness_events: Vec::new(),
-                events: Vec::new(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
             }),
         );
         (make_settled_writes(seed, seed, vec![seed; 4]), receipt)
@@ -643,8 +643,8 @@ mod tests {
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes,
-                beacon_witness_events: Vec::new(),
-                events: Vec::new(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
             }),
         );
         store

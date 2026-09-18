@@ -424,6 +424,7 @@ impl TickRegistry {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash,
@@ -475,7 +476,8 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            tx_hashes.iter().map(|h| make_outcome(*h)).collect(),
+            Capped::new(tx_hashes.iter().map(|h| make_outcome(*h)).collect())
+                .expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )

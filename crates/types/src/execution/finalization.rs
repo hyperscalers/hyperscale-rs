@@ -1002,7 +1002,7 @@ mod tests {
             local_wid,
             WeightedTimestamp::from_millis(1),
             compute_global_receipt_root(&[make_outcome(1)]),
-            vec![make_outcome(1)],
+            Capped::from_array([make_outcome(1)]),
             AggregateSignature::ZERO,
             SignerBitfield::new(2),
         ));
@@ -1135,7 +1135,7 @@ mod tests {
             *remote_ec.tick_id(),
             remote_ec.vote_anchor_ts(),
             remote_ec.global_receipt_root(),
-            remote_ec.tx_outcomes().clone(),
+            Capped::new(remote_ec.tx_outcomes().clone()).expect("a list written out in a test"),
             AggregateSignature::new([0xFF; 96]),
             remote_ec.signers().clone(),
         );

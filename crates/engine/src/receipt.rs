@@ -11,6 +11,7 @@
 //!   events, and the beacon facts are shard-specific — a no-op on
 //!   writes the executor already projected.
 
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     Address, BeaconWitnessEvent, ConsensusReceipt, EscrowedValue, Event, ExecutionMetadata,
     GlobalReceiptHash, ShardId, ShardTrie, StateWrites, TxHash,
@@ -104,6 +105,10 @@ impl CachedOutput {
 /// canonically ordered by construction, so
 /// `ConsensusReceipt::local_receipt_hash` is order-stable with no sort
 /// step.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
 #[must_use]
 pub fn project_to_shard(
     cached: &CachedOutput,
@@ -147,8 +152,9 @@ pub fn project_to_shard(
             let consensus = ConsensusReceipt::Succeeded {
                 receipt_hash: *receipt_hash,
                 writes,
-                beacon_witness_events,
-                events,
+                beacon_witness_events: Capped::new(beacon_witness_events)
+                    .expect("a list under the cap its source already met"),
+                events: Capped::new(events).expect("a list under the cap its source already met"),
             };
             let mut executed = ExecutedTx::new(tx_hash, consensus, cached.metadata.clone());
             executed.escrowed.clone_from(escrowed);

@@ -14,8 +14,8 @@ use std::sync::LazyLock;
 
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
-    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth, Sink,
-    bounded as hbor_bounded, to_vec as hbor_to_vec,
+    Capped, Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth,
+    Sink, to_vec as hbor_to_vec,
 };
 
 use crate::receipt::event::EventExt;
@@ -70,13 +70,13 @@ pub enum ConsensusReceipt {
         /// into the shard's beacon-witness accumulator at block-assembly
         /// time; the root of those events is bound into `receipt_hash`
         /// via [`GlobalReceipt::beacon_witness_root`].
-        beacon_witness_events: Vec<BeaconWitnessEvent>,
+        beacon_witness_events: Capped<Vec<BeaconWitnessEvent>, MAX_BEACON_WITNESS_EVENTS_PER_TX>,
         /// Events whose emitting instance lives on this shard — and
         /// exactly what `receipt_hash` commits to through
         /// [`GlobalReceipt::event_root`]. These differ per shard by
         /// design: an event is stored where its emitter lives, and each
         /// shard attests its own.
-        events: Vec<Event>,
+        events: Capped<Vec<Event>, MAX_EVENTS_PER_TX>,
     },
     /// All failures collapse to one variant — the canonical
     /// [`FAILED_RECEIPT_HASH`] is derived at hash time, no payload needed.
@@ -123,13 +123,7 @@ impl HborEncode for ConsensusReceipt {
                 encoder.write_u8(RECEIPT_VARIANT_SUCCEEDED);
                 encoder.nested(receipt_hash)?;
                 encoder.nested(writes)?;
-                hbor_bounded::check_encoded_len(
-                    "beacon_witness_events",
-                    beacon_witness_events.len(),
-                    MAX_BEACON_WITNESS_EVENTS_PER_TX,
-                )?;
                 encoder.nested(beacon_witness_events)?;
-                hbor_bounded::check_encoded_len("events", events.len(), MAX_EVENTS_PER_TX)?;
                 encoder.nested(events)
             }
             Self::Failed => {
@@ -146,13 +140,11 @@ impl HborDecode for ConsensusReceipt {
             RECEIPT_VARIANT_SUCCEEDED => {
                 let receipt_hash: GlobalReceiptHash = decoder.nested()?;
                 let writes: StateWrites = decoder.nested()?;
-                let beacon_witness_events: Vec<BeaconWitnessEvent> =
-                    decoder.descend(|decoder| {
-                        hbor_bounded::decode_bounded_vec(decoder, MAX_BEACON_WITNESS_EVENTS_PER_TX)
-                    })?;
-                let events: Vec<Event> = decoder.descend(|decoder| {
-                    hbor_bounded::decode_bounded_vec(decoder, MAX_EVENTS_PER_TX)
-                })?;
+                let beacon_witness_events: Capped<
+                    Vec<BeaconWitnessEvent>,
+                    MAX_BEACON_WITNESS_EVENTS_PER_TX,
+                > = decoder.nested()?;
+                let events: Capped<Vec<Event>, MAX_EVENTS_PER_TX> = decoder.nested()?;
                 Ok(Self::Succeeded {
                     receipt_hash,
                     writes,
@@ -231,12 +223,12 @@ mod tests {
         ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
             writes: StateWrites::default(),
-            beacon_witness_events: Vec::new(),
-            events: vec![Event {
+            beacon_witness_events: Capped::empty(),
+            events: Capped::from_array([Event {
                 emitter: Address::new([7; 31], AddressClass::Component),
                 event_type: 1,
                 payload: vec![4, 5, 6].try_into().unwrap(),
-            }],
+            }]),
         }
     }
 

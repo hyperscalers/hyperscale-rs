@@ -28,6 +28,7 @@ pub mod stored;
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_vm_types::{Address, AddressClass};
 
     use crate::receipt::event::EventExt;
@@ -48,8 +49,8 @@ mod tests {
         ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
-            beacon_witness_events: Vec::new(),
-            events,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::new(events).expect("a list written out in a test"),
         }
     }
 

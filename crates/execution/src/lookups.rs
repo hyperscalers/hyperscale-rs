@@ -395,7 +395,7 @@ mod tests {
             tick,
             WeightedTimestamp::from_millis(3),
             GlobalReceiptRoot::ZERO,
-            vec![
+            Capped::from_array([
                 TxOutcome::new(
                     accepted,
                     ExecutionOutcome::Succeeded {
@@ -407,7 +407,7 @@ mod tests {
                 TxOutcome::new(refused, ExecutionOutcome::Failed)
                     .escrowing([record])
                     .crossing_to([target]),
-            ],
+            ]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );

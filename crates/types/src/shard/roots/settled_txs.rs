@@ -160,7 +160,7 @@ mod tests {
             TickId::new(shard, BlockHeight::new(1)),
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )

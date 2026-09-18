@@ -112,8 +112,8 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: make_state_writes(0xA0, 1, vec![1; 4]),
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
         }),
     );
     let Block::Live {

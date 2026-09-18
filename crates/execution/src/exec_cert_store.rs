@@ -161,6 +161,7 @@ impl Default for ExecCertStore {
 #[cfg(test)]
 mod tests {
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionOutcome, GlobalReceiptRoot, Hash, Role, ShardId,
         SignerBitfield, WeightedTimestamp,
@@ -182,7 +183,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )))

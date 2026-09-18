@@ -44,6 +44,7 @@ impl StoredReceipt {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_vm_types::Address;
 
     use super::*;
@@ -64,8 +65,8 @@ mod tests {
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: StateWrites::default(),
-                events: vec![make_event(1)],
-                beacon_witness_events: Vec::new(),
+                events: Capped::from_array([make_event(1)]),
+                beacon_witness_events: Capped::empty(),
             }),
         );
         assert!(synced.metadata.is_none());
