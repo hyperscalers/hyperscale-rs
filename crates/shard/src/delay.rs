@@ -54,8 +54,8 @@ pub struct DelayEstimator {
     /// Round and proposer stamp of the newest committed non-fallback block
     /// whose sample the next commit closes.
     open: Option<(Round, ProposerTimestamp)>,
-    /// The committee whose blocks the window measures; its size is the
-    /// window's. Empty until the first observation.
+    /// The membership whose blocks the window measures, sorted; its size
+    /// is the window's. Empty until the first observation.
     committee: Vec<ValidatorId>,
 }
 
@@ -80,11 +80,16 @@ impl DelayEstimator {
 
     /// Feed a committed header in chain order. `committee` is the one that
     /// certified the block; a membership change empties the window first.
-    /// Closes the open sample when this header's parent QC certifies it,
-    /// then opens one for this header unless it is a fallback block.
+    /// Membership is the set of members, not the order the committee
+    /// lists them in: a sample is one leader's, and which leader it was
+    /// does not move with the rotation order. Closes the open sample when
+    /// this header's parent QC certifies it, then opens one for this
+    /// header unless it is a fallback block.
     pub fn observe(&mut self, sample: CommittedSample, committee: &[ValidatorId]) {
-        if self.committee != committee {
-            self.committee = committee.to_vec();
+        let mut membership = committee.to_vec();
+        membership.sort_unstable();
+        if self.committee != membership {
+            self.committee = membership;
             self.samples.clear();
             self.open = None;
         }
@@ -237,6 +242,25 @@ mod tests {
         }
         est.observe(healthy(10, 1_000, 100), &swapped);
         assert_eq!(est.delay(), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn a_reordered_committee_is_the_same_membership() {
+        let four = committee(4);
+        let mut est = DelayEstimator::new();
+        for i in 1..=5 {
+            est.observe(healthy(i, 1_000, 100), &four);
+        }
+        assert_eq!(est.delay(), Some(Duration::from_millis(100)));
+
+        let mut reordered = committee(4);
+        reordered.reverse();
+        est.observe(healthy(6, 1_000, 100), &reordered);
+        assert_eq!(
+            est.delay(),
+            Some(Duration::from_millis(100)),
+            "the members are the same, so the window is"
+        );
     }
 
     #[test]
