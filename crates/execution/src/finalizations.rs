@@ -302,7 +302,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            tx_outcomes,
+            Capped::new(tx_outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );

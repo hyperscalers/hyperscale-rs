@@ -162,6 +162,7 @@ pub fn gate_certificate(
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, CompletedRecovery, Epoch, GlobalReceiptRoot,
         NetworkDefinition, ShardId, Signer, SignerBitfield, TopologySnapshot, ValidatorId,
@@ -227,7 +228,7 @@ mod tests {
                 TickId::new(shard, height),
                 WeightedTimestamp::from_millis(2_500),
                 GlobalReceiptRoot::ZERO,
-                vec![],
+                Capped::from_array([]),
                 AggregateSignature::ZERO,
                 signers.clone(),
             )

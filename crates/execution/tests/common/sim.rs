@@ -723,8 +723,8 @@ fn stub_execute(
         ConsensusReceipt::Succeeded {
             receipt_hash,
             writes,
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
         },
         ExecutionMetadata::empty(),
     );
@@ -760,8 +760,8 @@ fn stub_charge(owner: Address) -> ConsensusReceipt {
     ConsensusReceipt::Succeeded {
         receipt_hash,
         writes,
-        beacon_witness_events: Vec::new(),
-        events: Vec::new(),
+        beacon_witness_events: Capped::empty(),
+        events: Capped::empty(),
     }
 }
 
@@ -786,7 +786,7 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
         *tick_id,
         WeightedTimestamp::from_millis(tick_id.block_height().inner() * BLOCK_INTERVAL_MS),
         compute_global_receipt_root(&outcomes),
-        outcomes,
+        Capped::new(outcomes).expect("a list written out in a test"),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
@@ -833,7 +833,7 @@ pub fn settle_refused_by_counterpart(
         *tick_id,
         WeightedTimestamp::from_millis(tick_id.block_height().inner() * BLOCK_INTERVAL_MS),
         compute_global_receipt_root(&outcomes),
-        outcomes,
+        Capped::new(outcomes).expect("a list written out in a test"),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
@@ -846,7 +846,7 @@ pub fn settle_refused_by_counterpart(
         remote_id,
         WeightedTimestamp::from_millis(tick_id.block_height().inner() * BLOCK_INTERVAL_MS),
         compute_global_receipt_root(&refused),
-        refused,
+        Capped::new(refused).expect("a list written out in a test"),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );

@@ -74,15 +74,17 @@ impl ExecutionCertificatesSenderMessage {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
+
     use super::*;
-    use crate::{AggregateSignature, BlockHeight, SignerBitfield, TxOutcome};
+    use crate::{AggregateSignature, BlockHeight, SignerBitfield};
 
     fn certificate(anchor_ms: u64, tick_height: u64, sig: u8) -> ExecutionCertificate {
         ExecutionCertificate::new(
             TickId::new(ShardId::ROOT, BlockHeight::new(tick_height)),
             WeightedTimestamp::from_millis(anchor_ms),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
-            Vec::<TxOutcome>::new(),
+            Capped::empty(),
             AggregateSignature::new([sig; 96]),
             SignerBitfield::new(4),
         )

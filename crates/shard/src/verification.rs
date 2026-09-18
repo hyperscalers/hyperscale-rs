@@ -2316,7 +2316,7 @@ mod tests {
                 tick_id,
                 WeightedTimestamp::from_millis(height),
                 GlobalReceiptRoot::ZERO,
-                Vec::new(),
+                Capped::empty(),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             );

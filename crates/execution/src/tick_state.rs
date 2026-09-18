@@ -1404,8 +1404,8 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 #[allow(clippy::default_trait_access)]
                 writes: Default::default(),
-                beacon_witness_events: Vec::new(),
-                events: Vec::new(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
             }),
             metadata: None,
         }
@@ -1503,7 +1503,7 @@ mod tests {
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
                 root,
-                outcomes,
+                Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -1535,15 +1535,13 @@ mod tests {
                 TickId::new(peer, BlockHeight::new(7)),
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
-                vec![
-                    TxOutcome::new(
-                        member,
-                        ExecutionOutcome::Succeeded {
-                            receipt_hash: GlobalReceiptHash::ZERO,
-                        },
-                    )
-                    .awaiting(counterparts),
-                ],
+                Capped::from_array([TxOutcome::new(
+                    member,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .awaiting(counterparts)]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )))
@@ -1606,7 +1604,7 @@ mod tests {
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
                 root,
-                outcomes,
+                Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -1616,15 +1614,13 @@ mod tests {
                 TickId::new(shard(1), BlockHeight::new(4)),
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
-                vec![
-                    TxOutcome::new(
-                        leg,
-                        ExecutionOutcome::Succeeded {
-                            receipt_hash: GlobalReceiptHash::ZERO,
-                        },
-                    )
-                    .awaiting([local]),
-                ],
+                Capped::from_array([TxOutcome::new(
+                    leg,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .awaiting([local])]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -1687,15 +1683,13 @@ mod tests {
                 TickId::new(shard(1), BlockHeight::new(4)),
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
-                vec![
-                    TxOutcome::new(
-                        leg,
-                        ExecutionOutcome::Succeeded {
-                            receipt_hash: GlobalReceiptHash::ZERO,
-                        },
-                    )
-                    .awaiting([shard(0)]),
-                ],
+                Capped::from_array([TxOutcome::new(
+                    leg,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .awaiting([shard(0)])]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -1737,7 +1731,7 @@ mod tests {
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
                 root,
-                outcomes,
+                Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -1955,7 +1949,7 @@ mod tests {
                 TickId::new(venue, BlockHeight::new(1)),
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(leg, ExecutionOutcome::Aborted)],
+                Capped::from_array([TxOutcome::new(leg, ExecutionOutcome::Aborted)]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -1974,7 +1968,7 @@ mod tests {
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
                 root,
-                outcomes,
+                Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),

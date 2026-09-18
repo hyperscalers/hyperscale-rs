@@ -283,7 +283,7 @@ impl TreeReader for PreRootStore<'_> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Bytes;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES, Key, NibblePath};
     use hyperscale_storage::test_helpers::import_boundary_state;
     use hyperscale_storage::{AdoptSource, BoundaryStore, SweepIndex, WitnessSeed};
@@ -723,8 +723,8 @@ mod tests {
                 Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     writes,
-                    beacon_witness_events: Vec::new(),
-                    events: Vec::new(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
                 }),
             )];
             let block = block_settling(BlockHeight::new(u64::from(seed)), receipts.to_vec());

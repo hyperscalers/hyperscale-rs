@@ -126,15 +126,13 @@ mod tests {
             TickId::new(ShardId::ROOT, BlockHeight::new(height)),
             WeightedTimestamp::from_millis(height + 1),
             GlobalReceiptRoot::ZERO,
-            vec![
-                TxOutcome::new(
-                    tx_hash,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .as_role(role),
-            ],
+            Capped::from_array([TxOutcome::new(
+                tx_hash,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )
+            .as_role(role)]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )

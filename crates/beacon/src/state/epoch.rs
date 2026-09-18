@@ -1673,8 +1673,9 @@ mod tests {
                     shard,
                     ShardEpochContribution {
                         boundary_header: header,
-                        payloads: Capped::new(payloads).expect("under the cap"),
-                        range_proof: Capped::new(range_proof).expect("under the cap"),
+                        payloads: Capped::new(payloads).expect("a list written out in a test"),
+                        range_proof: Capped::new(range_proof)
+                            .expect("a list written out in a test"),
                     },
                 ))
                 .collect();
@@ -1754,8 +1755,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads: Capped::new(payloads).expect("under the cap"),
-                range_proof: Capped::new(range_proof).expect("under the cap"),
+                payloads: Capped::new(payloads).expect("a list written out in a test"),
+                range_proof: Capped::new(range_proof).expect("a list written out in a test"),
             },
         ))
         .collect();
@@ -2043,8 +2044,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads: Capped::new(payloads).expect("under the cap"),
-                range_proof: Capped::new(range_proof).expect("under the cap"),
+                payloads: Capped::new(payloads).expect("a list written out in a test"),
+                range_proof: Capped::new(range_proof).expect("a list written out in a test"),
             },
         ))
         .collect();
@@ -2281,8 +2282,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads: Capped::new(payloads).expect("under the cap"),
-                range_proof: Capped::new(range_proof).expect("under the cap"),
+                payloads: Capped::new(payloads).expect("a list written out in a test"),
+                range_proof: Capped::new(range_proof).expect("a list written out in a test"),
             },
         ))
         .collect();
@@ -2329,8 +2330,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b.clone(),
-                payloads: Capped::new(payloads).expect("under the cap"),
-                range_proof: Capped::new(range_proof).expect("under the cap"),
+                payloads: Capped::new(payloads).expect("a list written out in a test"),
+                range_proof: Capped::new(range_proof).expect("a list written out in a test"),
             },
         ))
         .collect();
@@ -2439,8 +2440,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: header,
-                payloads: Capped::new(payloads).expect("under the cap"),
-                range_proof: Capped::new(range_proof).expect("under the cap"),
+                payloads: Capped::new(payloads).expect("a list written out in a test"),
+                range_proof: Capped::new(range_proof).expect("a list written out in a test"),
             },
         ))
         .collect();
@@ -2802,8 +2803,8 @@ mod tests {
             shard,
             b,
             (
-                Capped::new(payloads).expect("under the cap"),
-                Capped::new(range_proof).expect("under the cap"),
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
             ),
             1_500,
         );
@@ -2831,8 +2832,8 @@ mod tests {
             shard,
             b2,
             (
-                Capped::new(payloads2).expect("under the cap"),
-                Capped::new(proof2).expect("under the cap"),
+                Capped::new(payloads2).expect("a list written out in a test"),
+                Capped::new(proof2).expect("a list written out in a test"),
             ),
             2_500,
         );
@@ -2864,8 +2865,8 @@ mod tests {
             shard,
             b,
             (
-                Capped::new(payloads).expect("under the cap"),
-                Capped::new(range_proof).expect("under the cap"),
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
             ),
             1_500,
         );
@@ -2973,8 +2974,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads: Capped::new(payloads).expect("under the cap"),
-                range_proof: Capped::new(range_proof).expect("under the cap"),
+                payloads: Capped::new(payloads).expect("a list written out in a test"),
+                range_proof: Capped::new(range_proof).expect("a list written out in a test"),
             },
         ))
         .collect();
@@ -3303,8 +3304,8 @@ mod tests {
             parent,
             header.clone(),
             (
-                Capped::new(payloads).expect("under the cap"),
-                Capped::new(range_proof).expect("under the cap"),
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
             ),
             2_500,
         );
@@ -3357,8 +3358,8 @@ mod tests {
             parent,
             header,
             (
-                Capped::new(payloads).expect("under the cap"),
-                Capped::new(range_proof).expect("under the cap"),
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
             ),
             2_500,
         );
@@ -3396,8 +3397,8 @@ mod tests {
             parent,
             header,
             (
-                Capped::new(payloads).expect("under the cap"),
-                Capped::new(range_proof).expect("under the cap"),
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
             ),
             1_500,
         );
@@ -3517,8 +3518,8 @@ mod tests {
             parent,
             header,
             (
-                Capped::new(payloads).expect("under the cap"),
-                Capped::new(range_proof).expect("under the cap"),
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
             ),
             2_500,
         );
@@ -3608,8 +3609,8 @@ mod tests {
             parent,
             header,
             (
-                Capped::new(payloads).expect("under the cap"),
-                Capped::new(range_proof).expect("under the cap"),
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
             ),
             601_000,
         );
@@ -3699,8 +3700,8 @@ mod tests {
             parent,
             header,
             (
-                Capped::new(payloads).expect("under the cap"),
-                Capped::new(range_proof).expect("under the cap"),
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
             ),
             2_500,
         );
@@ -4079,16 +4080,16 @@ mod tests {
                 left,
                 ShardEpochContribution {
                     boundary_header: lh.clone(),
-                    payloads: Capped::new(lw).expect("under the cap"),
-                    range_proof: Capped::new(lw_proof).expect("under the cap"),
+                    payloads: Capped::new(lw).expect("a list written out in a test"),
+                    range_proof: Capped::new(lw_proof).expect("a list written out in a test"),
                 },
             ),
             (
                 right,
                 ShardEpochContribution {
                     boundary_header: rh.clone(),
-                    payloads: Capped::new(rw).expect("under the cap"),
-                    range_proof: Capped::new(rw_proof).expect("under the cap"),
+                    payloads: Capped::new(rw).expect("a list written out in a test"),
+                    range_proof: Capped::new(rw_proof).expect("a list written out in a test"),
                 },
             ),
         ]
@@ -4155,16 +4156,17 @@ mod tests {
                 left,
                 ShardEpochContribution {
                     boundary_header: span_header,
-                    payloads: Capped::new(span_witnesses).expect("under the cap"),
-                    range_proof: Capped::new(span_witnesses_proof).expect("under the cap"),
+                    payloads: Capped::new(span_witnesses).expect("a list written out in a test"),
+                    range_proof: Capped::new(span_witnesses_proof)
+                        .expect("a list written out in a test"),
                 },
             ),
             (
                 right,
                 ShardEpochContribution {
                     boundary_header: rh.clone(),
-                    payloads: Capped::new(rw).expect("under the cap"),
-                    range_proof: Capped::new(rw_proof).expect("under the cap"),
+                    payloads: Capped::new(rw).expect("a list written out in a test"),
+                    range_proof: Capped::new(rw_proof).expect("a list written out in a test"),
                 },
             ),
         ]
@@ -4209,8 +4211,9 @@ mod tests {
             left,
             ShardEpochContribution {
                 boundary_header: coast_header.clone(),
-                payloads: Capped::new(coast_witnesses).expect("under the cap"),
-                range_proof: Capped::new(coast_witnesses_proof).expect("under the cap"),
+                payloads: Capped::new(coast_witnesses).expect("a list written out in a test"),
+                range_proof: Capped::new(coast_witnesses_proof)
+                    .expect("a list written out in a test"),
             },
         ))
         .collect();

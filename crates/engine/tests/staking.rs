@@ -254,7 +254,7 @@ fn witnesses(executed: &ExecutedTx) -> Vec<BeaconWitnessEvent> {
         ConsensusReceipt::Succeeded {
             beacon_witness_events,
             ..
-        } => beacon_witness_events.clone(),
+        } => beacon_witness_events.clone().into_inner(),
         other @ ConsensusReceipt::Failed => {
             panic!("the delegation must succeed; receipt = {other:?}")
         }

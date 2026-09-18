@@ -286,11 +286,11 @@ mod tests {
             tick,
             WeightedTimestamp::from_millis(3),
             GlobalReceiptRoot::ZERO,
-            vec![
+            Capped::from_array([
                 outcome(1, succeeded.clone()),
                 outcome(2, ExecutionOutcome::Failed),
                 outcome(3, succeeded),
-            ],
+            ]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );

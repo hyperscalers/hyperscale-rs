@@ -11,8 +11,8 @@ use std::fmt::{self, Debug, Formatter};
 use hyperscale_crypto::{ConsensusSignature, Verifier};
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
-    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth, Sink,
-    bounded as hbor_bounded, to_vec as hbor_to_vec, varint,
+    Capped, Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth,
+    Sink, to_vec as hbor_to_vec, varint,
 };
 use thiserror::Error;
 
@@ -80,10 +80,10 @@ pub struct ExecutionCertificate {
     /// Receipt-tree leaf index of each carried outcome, ascending and
     /// distinct. Parallel to `tx_outcomes`.
     leaf_indices: Vec<u32>,
-    tx_outcomes: Vec<TxOutcome>,
+    tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK>,
     /// Sibling nodes covering the leaves this copy does not carry. Empty
     /// on a complete copy.
-    proof: Vec<Hash>,
+    proof: Capped<Vec<Hash>, MAX_TXS_PER_BLOCK>,
     aggregated_signature: AggregateSignature,
     signers: SignerBitfield,
     /// Cached HBOR-encoded bytes. Populated at construction or after
@@ -210,14 +210,12 @@ impl HborEncode for ExecutionCertificate {
         encoder.nested(&self.vote_anchor_ts)?;
         encoder.nested(&self.global_receipt_root)?;
         encoder.nested(&self.tx_count)?;
-        hbor_bounded::check_encoded_len("tx_outcomes", self.tx_outcomes.len(), MAX_TXS_PER_BLOCK)?;
         encoder.nested(&self.tx_outcomes)?;
         if self.is_complete() {
             encoder.write_sized(&[])?;
         } else {
             encoder.write_sized(&encode_leaf_indices(&self.leaf_indices)?)?;
         }
-        hbor_bounded::check_encoded_len("proof", self.proof.len(), MAX_TXS_PER_BLOCK)?;
         encoder.nested(&self.proof)?;
         encoder.nested(&self.aggregated_signature)?;
         encoder.nested(&self.signers)
@@ -230,12 +228,10 @@ impl HborDecode for ExecutionCertificate {
         let vote_anchor_ts: WeightedTimestamp = decoder.nested()?;
         let global_receipt_root: GlobalReceiptRoot = decoder.nested()?;
         let tx_count: u32 = decoder.nested()?;
-        let tx_outcomes: Vec<TxOutcome> = decoder
-            .descend(|decoder| hbor_bounded::decode_bounded_vec(decoder, MAX_TXS_PER_BLOCK))?;
+        let tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK> = decoder.nested()?;
         let index_len = decoder.read_len(1)?;
         let index_bytes = decoder.read_slice(index_len)?;
-        let proof: Vec<Hash> = decoder
-            .descend(|decoder| hbor_bounded::decode_bounded_vec(decoder, MAX_TXS_PER_BLOCK))?;
+        let proof: Capped<Vec<Hash>, MAX_TXS_PER_BLOCK> = decoder.nested()?;
         let aggregated_signature: AggregateSignature = decoder.nested()?;
         let signers: SignerBitfield = decoder.nested()?;
 
@@ -296,7 +292,7 @@ impl ExecutionCertificate {
         tick_id: TickId,
         vote_anchor_ts: WeightedTimestamp,
         global_receipt_root: GlobalReceiptRoot,
-        tx_outcomes: Vec<TxOutcome>,
+        tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK>,
         aggregated_signature: AggregateSignature,
         signers: SignerBitfield,
     ) -> Self {
@@ -308,7 +304,7 @@ impl ExecutionCertificate {
             tx_count,
             leaf_indices: (0..tx_count).collect(),
             tx_outcomes,
-            proof: Vec::new(),
+            proof: Capped::empty(),
             aggregated_signature,
             signers,
             cached_bytes: None,
@@ -361,8 +357,9 @@ impl ExecutionCertificate {
             global_receipt_root: self.global_receipt_root,
             tx_count: self.tx_count,
             leaf_indices,
-            tx_outcomes,
-            proof,
+            tx_outcomes: Capped::new(tx_outcomes)
+                .expect("a list under the cap its source already met"),
+            proof: Capped::new(proof).expect("a list under the cap its source already met"),
             aggregated_signature: self.aggregated_signature,
             signers: self.signers.clone(),
             cached_bytes: None,
@@ -380,7 +377,7 @@ impl ExecutionCertificate {
 
     /// Whether this copy carries every outcome of its tick.
     #[must_use]
-    pub const fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         self.tx_outcomes.len() == self.tx_count as usize
     }
 
@@ -424,7 +421,7 @@ impl ExecutionCertificate {
 
     /// Per-transaction outcomes (in tick order = block order).
     #[must_use]
-    pub const fn tx_outcomes(&self) -> &Vec<TxOutcome> {
+    pub fn tx_outcomes(&self) -> &Vec<TxOutcome> {
         &self.tx_outcomes
     }
 
@@ -726,7 +723,7 @@ impl Verified<ExecutionCertificate> {
             *tick_id,
             vote_anchor_ts,
             global_receipt_root,
-            tx_outcomes,
+            Capped::new(tx_outcomes).expect("a list under the cap its source already met"),
             aggregated_signature,
             signers,
         ))
@@ -873,7 +870,7 @@ mod tests {
             *cert.tick_id(),
             cert.vote_anchor_ts(),
             cert.global_receipt_root(),
-            cert.tx_outcomes().clone(),
+            Capped::new(cert.tx_outcomes().clone()).expect("a list written out in a test"),
             AggregateSignature::new([0xFF; 96]),
             cert.signers().clone(),
         );
@@ -903,7 +900,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             root,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0xAA; 96]),
             SignerBitfield::new(4),
         );
@@ -934,7 +931,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             root,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1028,7 +1025,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             root,
-            forged,
+            Capped::new(forged).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1087,7 +1084,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             root,
-            outcomes.clone(),
+            Capped::new(outcomes.clone()).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1111,7 +1108,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             root,
-            outcomes.clone(),
+            Capped::new(outcomes.clone()).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1144,7 +1141,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
-            outcomes.clone(),
+            Capped::new(outcomes.clone()).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1173,7 +1170,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
-            outcomes.clone(),
+            Capped::new(outcomes.clone()).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )
@@ -1209,7 +1206,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1226,7 +1223,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
-            outcomes.clone(),
+            Capped::new(outcomes.clone()).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1251,7 +1248,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
-            outcomes.clone(),
+            Capped::new(outcomes.clone()).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1276,7 +1273,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
-            outcomes.clone(),
+            Capped::new(outcomes.clone()).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1301,7 +1298,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
-            outcomes.clone(),
+            Capped::new(outcomes.clone()).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -1325,7 +1322,7 @@ mod tests {
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             // Distinctive so the encoded signature can be located below.
             AggregateSignature::new([0xAB; 96]),
             SignerBitfield::new(4),

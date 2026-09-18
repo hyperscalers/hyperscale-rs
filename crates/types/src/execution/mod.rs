@@ -279,7 +279,7 @@ mod tests {
             make_tick_id(shard, BlockHeight::new(42)),
             WeightedTimestamp::from_millis(43),
             global_receipt_root,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ))
@@ -332,7 +332,7 @@ mod tests {
             make_tick_id(1, BlockHeight::new(42)),
             WeightedTimestamp::from_millis(43),
             compute_global_receipt_root(&remote_outcomes),
-            remote_outcomes,
+            Capped::new(remote_outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ));
@@ -600,7 +600,7 @@ mod tests {
             *tick_id,
             WeightedTimestamp::from_millis(tick_id.block_height().inner() + 1),
             compute_global_receipt_root(&outcomes),
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ))
@@ -610,8 +610,8 @@ mod tests {
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
         })
     }
 
@@ -949,8 +949,8 @@ mod tests {
                     consensus: Arc::new(ConsensusReceipt::Succeeded {
                         receipt_hash: GlobalReceiptHash::ZERO,
                         writes: StateWrites::default(),
-                        beacon_witness_events: Vec::new(),
-                        events: Vec::new(),
+                        beacon_witness_events: Capped::empty(),
+                        events: Capped::empty(),
                     }),
                     metadata: None,
                 },
@@ -1006,8 +1006,8 @@ mod tests {
                 consensus: Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     writes: StateWrites::default(),
-                    beacon_witness_events: Vec::new(),
-                    events: Vec::new(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
                 }),
                 metadata: None,
             }]),
@@ -1040,8 +1040,8 @@ mod tests {
                 consensus: Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash,
                     writes: StateWrites::default(),
-                    beacon_witness_events: Vec::new(),
-                    events: Vec::new(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
                 }),
                 metadata: None,
             }]),
@@ -1089,8 +1089,8 @@ mod tests {
                 consensus: Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     writes: StateWrites::default(),
-                    beacon_witness_events: Vec::new(),
-                    events: Vec::new(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
                 }),
                 metadata: None,
             }]),
@@ -1121,8 +1121,8 @@ mod tests {
                 consensus: Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     writes: StateWrites::default(),
-                    beacon_witness_events: Vec::new(),
-                    events: Vec::new(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
                 }),
                 metadata: None,
             }]),

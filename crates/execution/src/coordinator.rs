@@ -5042,7 +5042,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         );
@@ -5079,12 +5079,12 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome::new(
+            Capped::from_array([TxOutcome::new(
                 covered_tx,
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            )],
+            )]),
             AggregateSignature::ZERO,
             signers,
         ));
@@ -5129,12 +5129,12 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome::new(
+            Capped::from_array([TxOutcome::new(
                 covered_tx,
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            )],
+            )]),
             AggregateSignature::ZERO,
             signers,
         ));
@@ -5203,7 +5203,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             compute_global_receipt_root(&outcomes),
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -5281,7 +5281,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             compute_global_receipt_root(&outcomes),
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -5345,7 +5345,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         ));
@@ -5385,7 +5385,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         ));
@@ -5437,7 +5437,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         ));
@@ -5492,7 +5492,7 @@ mod tests {
             TickId::new(ShardId::leaf(8, 99), BlockHeight::new(1)),
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         ));
@@ -5536,7 +5536,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         ));
@@ -5571,7 +5571,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         );
@@ -5608,7 +5608,7 @@ mod tests {
                 TickId::new(recovering, BlockHeight::new(height)),
                 WeightedTimestamp::ZERO,
                 GlobalReceiptRoot::ZERO,
-                vec![],
+                Capped::from_array([]),
                 AggregateSignature::ZERO,
                 signers.clone(),
             )
@@ -5651,10 +5651,10 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome::new(
+            Capped::from_array([TxOutcome::new(
                 TxHash::from(Hash::from_bytes(b"deferred_tx")),
                 ExecutionOutcome::Aborted,
-            )],
+            )]),
             AggregateSignature::ZERO,
             quorum_signers(),
         );
@@ -5698,7 +5698,7 @@ mod tests {
                 TickId::new(remote_shard, BlockHeight::new(5)),
                 WeightedTimestamp::ZERO,
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+                Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
                 AggregateSignature::ZERO,
                 quorum_signers(),
             )
@@ -5743,7 +5743,7 @@ mod tests {
             TickId::new(remote_shard, BlockHeight::new(5)),
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+            Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
             AggregateSignature::ZERO,
             quorum_signers(),
         );
@@ -5787,10 +5787,10 @@ mod tests {
                 TickId::new(remote_shard, BlockHeight::new(height)),
                 WeightedTimestamp::ZERO,
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(
+                Capped::from_array([TxOutcome::new(
                     TxHash::from(Hash::from_bytes(&height.to_le_bytes())),
                     ExecutionOutcome::Aborted,
-                )],
+                )]),
                 AggregateSignature::ZERO,
                 quorum_signers(),
             )
@@ -5832,7 +5832,7 @@ mod tests {
             TickId::new(ShardId::ROOT, BlockHeight::new(99)),
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         );
@@ -5860,7 +5860,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         );
@@ -5900,7 +5900,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         );
@@ -5938,7 +5938,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers_a,
         );
@@ -5946,7 +5946,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers_b,
         );
@@ -5979,7 +5979,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         ));
@@ -6018,7 +6018,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         ));
@@ -6054,7 +6054,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::from_millis(1_000_000),
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
@@ -6113,12 +6113,12 @@ mod tests {
             tick_id,
             WeightedTimestamp::from_millis(1_000_000),
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome::new(
+            Capped::from_array([TxOutcome::new(
                 cross_shard_tx,
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            )],
+            )]),
             AggregateSignature::ZERO,
             quorum_signers(),
         );
@@ -6164,10 +6164,10 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome::new(
+            Capped::from_array([TxOutcome::new(
                 TxHash::from(Hash::from_bytes(b"untracked_tx")),
                 ExecutionOutcome::Aborted,
-            )],
+            )]),
             AggregateSignature::ZERO,
             quorum_signers(),
         );
@@ -6313,7 +6313,7 @@ mod tests {
             TickId::new(shard, BlockHeight::new(1)),
             WeightedTimestamp::from_millis(ED), // epoch 1
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             quorum_signers(),
         );
@@ -6416,7 +6416,7 @@ mod tests {
             TickId::new(shard, BlockHeight::new(1)),
             WeightedTimestamp::from_millis(5 * ED), // epoch 5, past the head
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             quorum_signers(),
         );
@@ -6460,7 +6460,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::from_millis(5 * ED), // epoch 5, past the head
             GlobalReceiptRoot::ZERO,
-            vec![],
+            Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
         ));
@@ -6674,8 +6674,8 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     #[allow(clippy::default_trait_access)]
                     writes: Default::default(),
-                    beacon_witness_events: Vec::new(),
-                    events: Vec::new(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
                 }),
                 metadata: None,
             });
@@ -6686,7 +6686,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
-            tx_outcomes,
+            Capped::new(tx_outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )));
@@ -7305,12 +7305,12 @@ mod tests {
                 tick,
                 WeightedTimestamp::from_millis(height),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(
+                Capped::from_array([TxOutcome::new(
                     tx_hash,
                     ExecutionOutcome::Succeeded {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
-                )],
+                )]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )
@@ -8191,12 +8191,12 @@ mod tests {
                     tick_id,
                     WeightedTimestamp::from_millis(1_000),
                     GlobalReceiptRoot::from_raw(Hash::from_bytes(b"quorum")),
-                    vec![TxOutcome::new(
+                    Capped::from_array([TxOutcome::new(
                         tx_hash,
                         ExecutionOutcome::Succeeded {
                             receipt_hash: GlobalReceiptHash::ZERO,
                         },
-                    )],
+                    )]),
                     AggregateSignature::ZERO,
                     SignerBitfield::new(4),
                 ),
@@ -8466,7 +8466,7 @@ mod tests {
                 TickId::new(PEER, BlockHeight::new(3)),
                 WeightedTimestamp::from_millis(7_000),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(tx_hash, outcome)],
+                Capped::from_array([TxOutcome::new(tx_hash, outcome)]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )))
@@ -8502,7 +8502,7 @@ mod tests {
                 TickId::new(PEER, BlockHeight::new(3)),
                 WeightedTimestamp::from_millis(7_000),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(tx_hash, outcome)],
+                Capped::from_array([TxOutcome::new(tx_hash, outcome)]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )))
@@ -10126,12 +10126,12 @@ mod tests {
             TickId::new(PEER, BlockHeight::new(5)),
             probed_wt,
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome::new(
+            Capped::from_array([TxOutcome::new(
                 tx_hash,
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            )],
+            )]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )));
@@ -10656,7 +10656,7 @@ mod tests {
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
-                vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+                Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -10749,7 +10749,7 @@ mod tests {
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
-                vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+                Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -11007,7 +11007,7 @@ mod tests {
                     tick_id,
                     WeightedTimestamp::ZERO,
                     GlobalReceiptRoot::ZERO,
-                    vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+                    Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
                     AggregateSignature::ZERO,
                     quorum_signers(),
                 ),
@@ -11195,7 +11195,7 @@ mod tests {
                 tick_id,
                 WeightedTimestamp::from_millis(1),
                 GlobalReceiptRoot::ZERO,
-                vec![outcome],
+                Capped::from_array([outcome]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ))]),

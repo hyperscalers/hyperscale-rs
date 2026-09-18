@@ -211,6 +211,7 @@ impl OutboundExecutionCertificateTracker {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, GlobalReceiptRoot, Hash, RETENTION_HORIZON, SignerBitfield,
     };
@@ -237,7 +238,7 @@ mod tests {
             tick_id,
             vote_anchor_ts,
             GlobalReceiptRoot::from_raw(Hash::ZERO),
-            Vec::new(),
+            Capped::empty(),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )))

@@ -170,8 +170,8 @@ fn succeeded(tx_hash: TxHash) -> ExecutedTx {
         ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
             writes: StateWrites::default(),
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
         },
         ExecutionMetadata::empty(),
     )

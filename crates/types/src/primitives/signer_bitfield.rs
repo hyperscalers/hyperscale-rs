@@ -1,9 +1,7 @@
 //! Bitfield for tracking which validators have signed.
 
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
-use hyperscale_hbor::{
-    Decoder, Encoder, HborDecode, HborEncode, HborWidth, Sink, bounded as hbor_bounded,
-};
+use hyperscale_hbor::{Bytes, Decoder, Encoder, HborDecode, HborEncode, HborWidth, Sink};
 
 /// Hard cap on signers a single bitfield may describe.
 ///
@@ -23,7 +21,7 @@ const MAX_BITS_BYTES_LEN: usize = MAX_SIGNERS.div_ceil(8);
 /// which validators contributed to the aggregated signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerBitfield {
-    bits: Vec<u8>,
+    bits: Bytes<MAX_BITS_BYTES_LEN>,
     num_validators: usize,
 }
 
@@ -40,7 +38,7 @@ impl SignerBitfield {
         );
         let num_bytes = num_validators.div_ceil(8);
         Self {
-            bits: vec![0u8; num_bytes],
+            bits: Bytes::new(vec![0u8; num_bytes]).expect("a bitfield under the signer cap"),
             num_validators,
         }
     }
@@ -49,7 +47,7 @@ impl SignerBitfield {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            bits: Vec::new(),
+            bits: Bytes::empty(),
             num_validators: 0,
         }
     }
@@ -136,8 +134,7 @@ impl HborWidth for SignerBitfield {
 
 impl HborEncode for SignerBitfield {
     fn encode<S: Sink>(&self, encoder: &mut Encoder<S>) -> Result<(), HborEncodeError> {
-        hbor_bounded::check_encoded_len("bits", self.bits.len(), MAX_BITS_BYTES_LEN)?;
-        encoder.descend(|encoder| hbor_bounded::encode_bytes(encoder, &self.bits))?;
+        encoder.nested(&self.bits)?;
         let count =
             u16::try_from(self.num_validators).map_err(|_| HborEncodeError::BoundExceeded {
                 field: "num_validators",
@@ -150,8 +147,7 @@ impl HborEncode for SignerBitfield {
 
 impl HborDecode for SignerBitfield {
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, HborDecodeError> {
-        let bits = decoder
-            .descend(|decoder| hbor_bounded::decode_bounded_bytes(decoder, MAX_BITS_BYTES_LEN))?;
+        let bits: Bytes<MAX_BITS_BYTES_LEN> = decoder.nested()?;
         let num_validators = usize::from(decoder.nested::<u16>()?);
         if num_validators > MAX_SIGNERS {
             return Err(HborDecodeError::FailedValidation(
@@ -319,8 +315,10 @@ mod tests {
     }
 
     /// Mirror of the `SignerBitfield` wire layout, used in tests to forge
-    /// payloads that the production decoder must reject. The count is a
-    /// `u16` on the wire, as the codec writes it.
+    /// payloads that the production decoder must reject. The bits are
+    /// uncapped here — a twin wide enough to write what the real type
+    /// cannot hold is the whole point — and the count is a `u16` on the
+    /// wire, as the codec writes it.
     #[derive(Hbor)]
     struct ManualBitfield {
         bits: Vec<u8>,

@@ -896,6 +896,10 @@ const fn outcome_of(decision: TransactionDecision) -> ExecutionOutcome {
 /// What the commit path applies to the base, and what a replay reads a
 /// settled tick's contribution off where it re-ran no tick to produce
 /// one.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
 #[must_use]
 pub fn make_finalization_leaving(
     block_height: BlockHeight,
@@ -907,8 +911,8 @@ pub fn make_finalization_leaving(
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
         }),
     );
     let outcomes = vec![TxOutcome::new(
@@ -920,7 +924,7 @@ pub fn make_finalization_leaving(
         tick_id,
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         compute_global_receipt_root(&outcomes),
-        outcomes,
+        Capped::new(outcomes).expect("a list written out in a test"),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
@@ -933,6 +937,10 @@ pub fn make_finalization_leaving(
 }
 
 /// A single-certificate finalization at `block_height` over `outcomes`.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
 #[must_use]
 pub fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> Finalization {
     let tick_id = TickId::new(ShardId::ROOT, block_height);
@@ -943,7 +951,7 @@ pub fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> F
         // rebuild every decode runs, so the fixture would not survive a
         // round trip through storage.
         compute_global_receipt_root(&outcomes),
-        outcomes,
+        Capped::new(outcomes).expect("a list written out in a test"),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );

@@ -501,7 +501,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );

@@ -12964,12 +12964,12 @@ mod tests {
                 tick,
                 WeightedTimestamp::from_millis(height),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(
+                Capped::from_array([TxOutcome::new(
                     TxHash::from(Hash::from_bytes(b"tx")),
                     ExecutionOutcome::Succeeded {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
-                )],
+                )]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )
@@ -13693,7 +13693,7 @@ mod tests {
                 tick,
                 WeightedTimestamp::from_millis(height),
                 GlobalReceiptRoot::ZERO,
-                vec![outcome],
+                Capped::from_array([outcome]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ))]),

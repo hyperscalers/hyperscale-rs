@@ -126,6 +126,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
         LocalTimestamp, ShardId, SignerBitfield, TickId, TxHash, TxOutcome, Verified,
@@ -145,7 +146,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::from_millis(0),
             GlobalReceiptRoot::ZERO,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )))

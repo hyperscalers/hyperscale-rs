@@ -376,7 +376,7 @@ mod tests {
             tick_id,
             vote_anchor_ts,
             GlobalReceiptRoot::ZERO,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )))

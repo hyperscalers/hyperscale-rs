@@ -577,7 +577,7 @@ mod tests {
             tick_id,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
-            vec![outcome],
+            Capped::from_array([outcome]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         );
@@ -588,8 +588,8 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     #[allow(clippy::default_trait_access)]
                     writes: Default::default(),
-                    beacon_witness_events: Vec::new(),
-                    events: Vec::new(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
                 }
             } else {
                 ConsensusReceipt::Failed
@@ -1024,12 +1024,12 @@ mod tests {
             tick_id,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome::new(
+            Capped::from_array([TxOutcome::new(
                 tx_hash,
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            )],
+            )]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         );

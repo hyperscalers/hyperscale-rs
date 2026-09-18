@@ -206,7 +206,7 @@ pub fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<Executio
         TickId::new(shard, height),
         WeightedTimestamp::from_millis(0),
         GlobalReceiptRoot::ZERO,
-        Vec::new(),
+        Capped::empty(),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
     ))
@@ -428,12 +428,12 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
     let consensus = ConsensusReceipt::Succeeded {
         receipt_hash: GlobalReceiptHash::ZERO,
         writes: StateWrites::default(),
-        beacon_witness_events: Vec::new(),
-        events: vec![Event {
+        beacon_witness_events: Capped::empty(),
+        events: Capped::from_array([Event {
             emitter: Address::new([seed; 31], AddressClass::Component),
             event_type: u32::from(seed),
             payload: Bytes::from_array([seed, seed + 1]),
-        }],
+        }]),
     };
     let metadata = Some(ExecutionMetadata::new(
         FeeSummary {
@@ -462,6 +462,10 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
 /// `seed` also disambiguates the `TickId` (via `remote_shards`), so two ECs
 /// at the same `block_height` with different seeds have distinct identities
 /// — matching the protocol invariant that one tick produces one EC.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
 #[must_use]
 pub fn make_test_execution_certificate(
     seed: u8,
@@ -478,7 +482,7 @@ pub fn make_test_execution_certificate(
         TickId::new(ShardId::ROOT, block_height),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         global_receipt_root,
-        outcomes,
+        Capped::new(outcomes).expect("a list written out in a test"),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     )
@@ -652,8 +656,8 @@ fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finaliza
         consensus: Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
         }),
         metadata: None,
     };
@@ -1682,7 +1686,7 @@ fn execution_certificate_over(
         TickId::new(ShardId::ROOT, block_height),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         compute_global_receipt_root(&outcomes),
-        outcomes,
+        Capped::new(outcomes).expect("a list written out in a test"),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     )
@@ -1791,7 +1795,7 @@ pub fn test_tx_index_answers_with_the_local_shards_certificate(
         TickId::new(ShardId::leaf(1, 1), BlockHeight::new(4)),
         WeightedTimestamp::from_millis(5),
         compute_global_receipt_root(&remote_outcomes),
-        remote_outcomes,
+        Capped::new(remote_outcomes).expect("a list written out in a test"),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );

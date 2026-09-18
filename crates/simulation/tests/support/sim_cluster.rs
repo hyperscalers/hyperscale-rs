@@ -670,7 +670,7 @@ impl Cluster for SimCluster {
         let store =
             (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))?;
         match store.get_consensus_receipt(&tx)?.as_ref() {
-            ConsensusReceipt::Succeeded { events, .. } => Some(events.clone()),
+            ConsensusReceipt::Succeeded { events, .. } => Some(events.clone().into_inner()),
             ConsensusReceipt::Failed => Some(Vec::new()),
         }
     }
