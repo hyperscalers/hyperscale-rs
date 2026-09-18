@@ -2399,9 +2399,17 @@ fn published_account_artifact() -> Vec<u8> {
 /// empty one — what an event carrying nothing declares.
 fn naming(metadata: &mut PackageMetadata, event: &str) {
     metadata.events.push(event.to_owned());
+    let unit = metadata
+        .types
+        .push(TypeShape::Tuple(Vec::new()))
+        .expect("the empty shape joins any table");
     metadata
         .types
-        .insert(event.to_owned(), TypeShape::Tuple(Vec::new()));
+        .push(TypeShape::Named {
+            name: event.to_owned(),
+            shape: unit,
+        })
+        .expect("a name the package does not already hold");
 }
 
 fn published_metadata() -> PackageMetadata {
