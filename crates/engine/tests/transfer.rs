@@ -3269,7 +3269,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         ResourceKind::NonFungible,
         staking::OWNER_BADGE,
     );
-    let [] = b.call(payer, "deposit-nf", (badge.resource_is(owner_badge),));
+    let [] = b.call(payer, "deposit_nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
     let tree = IntentTree {
         root: Intent::leaf(HEADER, account_address(&key.public_key().0), graph),

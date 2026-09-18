@@ -2137,7 +2137,7 @@ pub(crate) fn build_instance_instantiate_tx(
         ResourceKind::NonFungible,
         staking::OWNER_BADGE,
     );
-    let [] = b.call(founder, "deposit-nf", (badge.resource_is(owner_badge),));
+    let [] = b.call(founder, "deposit_nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
 
     let mut tree = IntentTree::of_one(Intent::leaf(
