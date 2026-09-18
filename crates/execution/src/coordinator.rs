@@ -77,8 +77,8 @@ use crate::finalizations::FinalizationStore;
 use crate::gate::{Attested, Gate, gate_certificate};
 use crate::ledger::{Ledger, Settleable, Unanswerable};
 use crate::lookups::{
-    assign_participants, build_provision_requests, ec_has_shard_quorum_power, fetch_keys_covered,
-    peers_excluding_self,
+    assign_participants, attesting_committee, build_provision_requests, ec_has_shard_quorum_power,
+    fetch_keys_covered, peers_excluding_self,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
@@ -1554,13 +1554,14 @@ impl ExecutionCoordinator {
         }
 
         // Only the tick leader creates a `VoteTracker` for aggregation.
-        // Resolved under the committee seated at the tick's own block,
-        // which is the one that will verify the certificate. A window this
-        // shard has already left seats nobody, and there is no leader to
-        // be: the tick composes, but no vote it could carry would reach a
+        // Resolved under the committee that attests the tick, which is
+        // the one that will verify the certificate. A window this shard
+        // has already left seats nobody, and there is no leader to be:
+        // the tick composes, but no vote it could carry would reach a
         // quorum.
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
-        if let Some(committee) = topology_schedule.at(block.ts)
+        if let Some(committee) =
+            attesting_committee(topology_schedule, local_shard, block.ts, block.height)
             && let seated = committee.consensus_committee_for_shard(local_shard)
             && !seated.is_empty()
             && self.me == tick_leader(&tick_id, seated)
@@ -1625,13 +1626,17 @@ impl ExecutionCoordinator {
     ) -> Vec<CompletionData> {
         let local_shard = self.local_shard;
         let routable = |tick: &TickState| {
-            topology_schedule
-                .at(tick.vote_anchor_ts())
-                .is_some_and(|snapshot| {
-                    !snapshot
-                        .consensus_committee_for_shard(local_shard)
-                        .is_empty()
-                })
+            attesting_committee(
+                topology_schedule,
+                local_shard,
+                tick.vote_anchor_ts(),
+                tick.block_height(),
+            )
+            .is_some_and(|snapshot| {
+                !snapshot
+                    .consensus_committee_for_shard(local_shard)
+                    .is_empty()
+            })
         };
 
         let votable: Vec<TickId> = self
@@ -1786,16 +1791,19 @@ impl ExecutionCoordinator {
         let completions = self.scan_votable_ticks(topology_schedule);
         let mut actions = Vec::with_capacity(completions.len());
         for completion in completions {
-            // The tick's committee is the one seated at its vote anchor — the
-            // same committee that will verify the EC. The scan admits only
+            // The tick's committee is the one that attests it — the same
+            // committee that will verify the EC. The scan admits only
             // ticks this resolves for, so a miss here is not reachable; a
             // tick dropped after the scan would have spent its one-shot vote
             // without casting it.
-            let Some(committee) = topology_schedule
-                .at(completion.vote_anchor_ts)
-                .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
-                .filter(|committee| !committee.is_empty())
-            else {
+            let Some(committee) = attesting_committee(
+                topology_schedule,
+                self.local_shard,
+                completion.vote_anchor_ts,
+                completion.tick_id.block_height(),
+            )
+            .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
+            .filter(|committee| !committee.is_empty()) else {
                 debug_assert!(false, "scan_votable_ticks admitted an unroutable tick");
                 continue;
             };
@@ -1909,11 +1917,16 @@ impl ExecutionCoordinator {
         let tick_id = *vote.tick_id();
         let validator_id = vote.validator();
 
-        // The committee seated at the vote's anchor — the same one whose
+        // The committee that attests the vote's tick — the same one whose
         // positional bitfield the EC will carry. `None` means our beacon
         // hasn't reached that epoch; drop and let the sender's retry re-deliver
         // once we catch up.
-        let Some(committee) = topology_schedule.at(vote.vote_anchor_ts()) else {
+        let Some(committee) = attesting_committee(
+            topology_schedule,
+            self.local_shard,
+            vote.vote_anchor_ts(),
+            tick_id.block_height(),
+        ) else {
             return vec![];
         };
 
@@ -2048,10 +2061,17 @@ impl ExecutionCoordinator {
         vote: Verified<ExecutionVote>,
     ) -> Vec<Action> {
         let tick_id = *vote.tick_id();
-        // The vote anchors to a committee the beacon has reached: `at` returning
-        // `None` means the beacon hasn't committed that epoch yet (drop and let
+        // The vote anchors to a committee the beacon has reached: `None`
+        // means the beacon hasn't committed that epoch yet (drop and let
         // the sender retry). Membership was confirmed before delegating here.
-        if topology_schedule.at(vote.vote_anchor_ts()).is_none() {
+        if attesting_committee(
+            topology_schedule,
+            self.local_shard,
+            vote.vote_anchor_ts(),
+            tick_id.block_height(),
+        )
+        .is_none()
+        {
             return vec![];
         }
 
@@ -2078,7 +2098,14 @@ impl ExecutionCoordinator {
         // on the votes' anchor before they're consumed into the tracker.
         let warn_quorum = verified_votes
             .first()
-            .and_then(|v| topology_schedule.at(v.vote_anchor_ts()))
+            .and_then(|v| {
+                attesting_committee(
+                    topology_schedule,
+                    self.local_shard,
+                    v.vote_anchor_ts(),
+                    tick_id.block_height(),
+                )
+            })
             .map(|s| s.quorum_threshold_for_shard(self.local_shard));
 
         let Some(tracker) = self.ticks.get_tracker_mut(&tick_id) else {
@@ -2130,15 +2157,18 @@ impl ExecutionCoordinator {
             return vec![];
         };
 
-        // The EC's signer bitfield is positional against the committee seated
-        // at `vote_anchor_ts` — the committee every verifier resolves from the
-        // EC's own anchor. Resolve it before consuming the votes; `None`
-        // (beacon behind this epoch) leaves the tracker intact to re-check on a
-        // later commit.
-        let Some(committee) = topology_schedule
-            .at(vote_anchor_ts)
-            .map(|s| s.committee_for_shard(local_shard).to_vec())
-        else {
+        // The EC's signer bitfield is positional against the committee that
+        // attests the tick — the committee every verifier resolves from the
+        // EC's own anchor and height. Resolve it before consuming the votes;
+        // `None` (beacon behind this epoch) leaves the tracker intact to
+        // re-check on a later commit.
+        let Some(committee) = attesting_committee(
+            topology_schedule,
+            local_shard,
+            vote_anchor_ts,
+            tick_id.block_height(),
+        )
+        .map(|s| s.committee_for_shard(local_shard).to_vec()) else {
             return vec![];
         };
 
@@ -2453,12 +2483,17 @@ impl ExecutionCoordinator {
 
         // A single Byzantine signer can produce a cryptographically valid
         // EC; require 2f+1 voting power on the EC's own shard before any
-        // state mutation downstream. The committee is the one seated at the
-        // EC's anchor. `on_execution_certificate` already resolved it to dispatch
-        // this verification, so `None` here means that epoch aged out of the
-        // schedule in the interim (the beacon advanced past retention) — the
-        // EC is stale, so abandon it.
-        let Some(committee) = topology_schedule.at(ec_arc.vote_anchor_ts()) else {
+        // state mutation downstream. The committee is the one that attests
+        // the EC's tick. `on_execution_certificate` already resolved it to
+        // dispatch this verification, so `None` here means that epoch aged
+        // out of the schedule in the interim (the beacon advanced past
+        // retention) — the EC is stale, so abandon it.
+        let Some(committee) = attesting_committee(
+            topology_schedule,
+            ec_arc.shard_id(),
+            ec_arc.vote_anchor_ts(),
+            ec_arc.block_height(),
+        ) else {
             tracing::warn!(
                 shard = ec_arc.shard_id().inner(),
                 tick = %ec_arc.tick_id(),
@@ -2730,18 +2765,21 @@ impl ExecutionCoordinator {
             tx_outcomes,
         } in effects
         {
-            // The rotated leader is drawn from the committee seated at the
-            // tick's anchor — the one that will verify the EC. Two ways
-            // there is nobody to rotate to, and both defer the retry to a
-            // later commit rather than resolving a leader: the beacon is
-            // behind the anchor, or the anchor resolves a window this
-            // shard has already left, where its committee is empty and no
-            // vote can reach a quorum anyway.
-            let Some(committee) = topology_schedule
-                .at(vote_anchor_ts)
-                .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
-                .filter(|committee| !committee.is_empty())
-            else {
+            // The rotated leader is drawn from the committee that attests
+            // the tick — the one that will verify the EC. Two ways there
+            // is nobody to rotate to, and both defer the retry to a later
+            // commit rather than resolving a leader: the beacon is behind
+            // the anchor, or the anchor resolves a window this shard has
+            // already left, where nobody is seated and no vote can reach
+            // a quorum anyway.
+            let Some(committee) = attesting_committee(
+                topology_schedule,
+                self.local_shard,
+                vote_anchor_ts,
+                tick_id.block_height(),
+            )
+            .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
+            .filter(|committee| !committee.is_empty()) else {
                 continue;
             };
             let new_leader = tick_leader_at(&tick_id, attempt, &committee);
@@ -3159,7 +3197,10 @@ impl ExecutionCoordinator {
     /// certified: that is committed content, and no replica commits such
     /// a block before folding the record that resolves its committee.
     /// Every replica then releases at the first fresh block, and none on
-    /// the tail.
+    /// the tail. Released is only what no fresh quorum can hold — a tick
+    /// at or below the recovery's attested frontier. A tail tick above
+    /// it is the fresh committee's to attest and waits on its
+    /// certificate like any live tick, with the span as its backstop.
     ///
     /// [`TICK_SETTLEABLE_SPAN`]: crate::tick_state::TICK_SETTLEABLE_SPAN
     fn release_wedged_ticks(
@@ -3177,9 +3218,13 @@ impl ExecutionCoordinator {
         let wedged: Vec<TickId> = self
             .ticks
             .ticks_iter()
-            .filter(|(_, tick)| {
+            .filter(|(tick_id, tick)| {
                 let replaced = fresh_certified
-                    && topology_schedule.committee_replaced_at(local_shard, tick.anchor());
+                    && topology_schedule.committee_replaced_for_anchored(
+                        local_shard,
+                        tick.anchor(),
+                        tick_id.block_height(),
+                    );
                 tick.owes_undeliverable_determined(committed_ts, replaced)
             })
             .map(|(tick_id, _)| *tick_id)
@@ -4267,10 +4312,11 @@ mod tests {
     }
 
     /// A schedule whose root shard is under a halt recovery seated at
-    /// epoch 20, with one-second windows: the bridge is epoch 21, so an
-    /// anchor under 21s is the replaced committee's and a QC stamped from
-    /// 20s on is the fresh committee's.
-    fn make_test_topology_bridged_at_20() -> TopologySchedule {
+    /// epoch 20 and frozen at `frontier`, with one-second windows: the
+    /// bridge is epoch 21, so an anchor under 21s is the replaced
+    /// committee's at or below the frontier and the fresh committee's
+    /// above it, and a QC stamped from 20s on is the fresh committee's.
+    fn make_test_topology_bridged_at_20(frontier: BlockHeight) -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -4287,7 +4333,7 @@ mod tests {
                 cause: RecoveryCause::Halt,
                 rotated_at: Epoch::new(20),
                 retained: vec![ValidatorId::new(0)],
-                attested_frontier: BlockHeight::GENESIS,
+                attested_frontier: frontier,
             },
         );
         TopologySchedule::new(
@@ -6637,11 +6683,14 @@ mod tests {
     /// committee certified and on no other: a fresh member replaying the
     /// harvested tail commits the replaced committee's blocks with the
     /// record already folded, and must let go of nothing the retained
-    /// members, who committed those blocks live, did not.
+    /// members, who committed those blocks live, did not. And it
+    /// releases only what no fresh quorum can hold — a tick at or below
+    /// the attested frontier — while a tail tick above it, the fresh
+    /// committee's to attest, waits on its certificate.
     #[test]
     fn a_replaced_tick_is_released_on_the_first_fresh_certified_commit() {
         let mut state = make_test_state();
-        let schedule = make_test_topology_bridged_at_20();
+        let schedule = make_test_topology_bridged_at_20(BlockHeight::new(1));
         let hold = |height: u64, anchor_ms: u64| {
             let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
             let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(
@@ -6656,14 +6705,19 @@ mod tests {
                 ),
             )
         };
-        // Executed under the replaced committee, its certificate owed.
-        let (old_id, old_tick) = hold(1, 2_500);
-        state.ticks.insert_tick(old_id, old_tick);
+        // At the frontier: executed under the replaced committee, whose
+        // certificate no fresh member can ever hold.
+        let (frontier_id, frontier_tick) = hold(1, 2_500);
+        state.ticks.insert_tick(frontier_id, frontier_tick);
+        // The harvested tail: anchored below the bridge, above the
+        // frontier, re-executed by the fresh committee.
+        let (tail_id, tail_tick) = hold(2, 2_600);
+        state.ticks.insert_tick(tail_id, tail_tick);
         // Executed under the fresh committee, its certificate merely
         // pending.
-        let (fresh_id, fresh_tick) = hold(2, 21_050);
+        let (fresh_id, fresh_tick) = hold(3, 21_050);
         state.ticks.insert_tick(fresh_id, fresh_tick);
-        let block = make_live_block(BlockHeight::new(3), 0, ValidatorId::new(0), vec![]);
+        let block = make_live_block(BlockHeight::new(4), 0, ValidatorId::new(0), vec![]);
 
         // A suffix block: anchored and certified below the bridge. Inside
         // the span, so nothing is released.
@@ -6671,7 +6725,7 @@ mod tests {
         state.committed_ts = WeightedTimestamp::from_millis(2_900);
         state.release_wedged_ticks(&schedule, &test_certify(block.clone(), 2_900));
         assert!(
-            state.ticks.get_tick(&old_id).is_some(),
+            state.ticks.get_tick(&frontier_id).is_some(),
             "a commit the replaced committee certified releases nothing"
         );
 
@@ -6680,12 +6734,161 @@ mod tests {
         state.committed_ts = WeightedTimestamp::from_millis(20_900);
         state.release_wedged_ticks(&schedule, &test_certify(block, 20_900));
         assert!(
-            state.ticks.get_tick(&old_id).is_none(),
-            "the first fresh-certified commit releases the replaced tick"
+            state.ticks.get_tick(&frontier_id).is_none(),
+            "the first fresh-certified commit releases the frontier tick"
+        );
+        assert!(
+            state.ticks.get_tick(&tail_id).is_some(),
+            "a tail tick above the frontier waits on the fresh committee's certificate"
         );
         assert!(
             state.ticks.get_tick(&fresh_id).is_some(),
             "a tick anchored past the bridge waits on its certificate"
+        );
+    }
+
+    /// A two-committee schedule for one shard under a halt recovery: the
+    /// replaced committee (validators 0 to 3) seated from epoch 2, the
+    /// fresh one (4 to 7) seated at epoch 20 with the bridge at 21 and
+    /// one-second windows, frozen at `frontier`. Returns the schedule
+    /// with the two committees.
+    fn make_test_topology_redrawn(
+        frontier: BlockHeight,
+    ) -> (TopologySchedule, Vec<ValidatorId>, Vec<ValidatorId>) {
+        let validators: Vec<ValidatorInfo> = (0..8)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let set = ValidatorSet::new(validators);
+        let old: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let fresh: Vec<ValidatorId> = (4..8).map(ValidatorId::new).collect();
+        let snap = |committee: &[ValidatorId]| {
+            Arc::new(TopologySnapshot::with_shard_committees(
+                NetworkDefinition::simulator(),
+                1,
+                &set,
+                std::iter::once((ShardId::ROOT, committee.to_vec())).collect(),
+            ))
+        };
+        let mut recoveries = BTreeMap::new();
+        recoveries.insert(
+            ShardId::ROOT,
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
+                rotated_at: Epoch::new(20),
+                retained: old.clone(),
+                attested_frontier: frontier,
+            },
+        );
+        let fresh_snap = Arc::new(
+            snap(&fresh)
+                .as_ref()
+                .clone()
+                .with_pending_recoveries(recoveries),
+        );
+        let mut schedule = TopologySchedule::new(1_000, Epoch::new(2), snap(&old));
+        schedule.insert(Epoch::new(21), Arc::clone(&fresh_snap));
+        schedule.set_head(fresh_snap);
+        (schedule, old, fresh)
+    }
+
+    /// Commit a one-transaction block at `height` anchored at `anchor_ms`
+    /// on `state` and land its execution, so its tick is ready to vote.
+    fn ready_tick_at(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        height: BlockHeight,
+        anchor_ms: u64,
+    ) -> TickId {
+        let tx = test_transaction(u8::try_from(height.inner()).unwrap());
+        let tx_hash = tx.hash();
+        let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![Arc::new(tx)]);
+        state.on_block_committed(schedule, &test_certify(block, anchor_ms));
+        let tick_id = state
+            .ticks
+            .tick_assignment(tx_hash)
+            .expect("the committed tx is assigned to a tick");
+        state.on_execution_batch_completed(
+            schedule,
+            height,
+            TickBatchOutcome {
+                tick_id,
+                results: vec![],
+                tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
+                fee_receipts: vec![],
+            },
+        );
+        tick_id
+    }
+
+    /// A fresh member replaying the harvested tail carries a tick anchored
+    /// below the bridge and above the frontier toward its own committee's
+    /// certificate: its vote goes to a fresh leader, a fresh member's vote
+    /// is accepted, and a replaced member's is not. A tick at the
+    /// frontier stays the replaced committee's.
+    #[test]
+    fn a_fresh_member_attests_a_tail_tick_under_its_own_committee() {
+        let frontier = BlockHeight::new(5);
+        let (schedule, old, fresh) = make_test_topology_redrawn(frontier);
+        let tail = TickId::new(ShardId::ROOT, frontier.next());
+        let leader = tick_leader(&tail, &fresh);
+        let me = *fresh.iter().find(|&&v| v != leader).unwrap();
+        let other = *fresh.iter().find(|&&v| v != leader && v != me).unwrap();
+
+        let mut state = make_test_state_for(me);
+        let tick_id = ready_tick_at(&mut state, &schedule, tail.block_height(), 2_500);
+        assert_eq!(tick_id, tail);
+
+        let actions = state.emit_vote_actions(&schedule);
+        let sent_to = actions.iter().find_map(|a| match a {
+            Action::SignAndSendExecutionVote { leader, .. } => Some(*leader),
+            _ => None,
+        });
+        assert_eq!(
+            sent_to,
+            Some(leader),
+            "the vote is addressed to the fresh committee's leader, got {actions:?}",
+        );
+
+        let vote_from = |voter: ValidatorId| {
+            ExecutionVote::new(
+                WeightedTimestamp::from_millis(2_500),
+                tail,
+                ShardId::ROOT,
+                GlobalReceiptRoot::ZERO,
+                1,
+                vec![],
+                voter,
+                ConsensusSignature::ZERO,
+            )
+        };
+        state.on_execution_vote(&schedule, vote_from(old[0]).into());
+        assert!(
+            !state.ticks.contains_tracker(&tail),
+            "a replaced member holds no seat in the committee attesting the tail",
+        );
+        state.on_execution_vote(&schedule, vote_from(other).into());
+        assert!(
+            state.ticks.contains_tracker(&tail),
+            "a fresh member's vote on the tail is tallied",
+        );
+
+        // At the frontier the replaced committee still attests.
+        let at_frontier = TickId::new(ShardId::ROOT, frontier);
+        let mut state = make_test_state_for(me);
+        let tick_id = ready_tick_at(&mut state, &schedule, frontier, 2_400);
+        assert_eq!(tick_id, at_frontier);
+        let actions = state.emit_vote_actions(&schedule);
+        let sent_to = actions.iter().find_map(|a| match a {
+            Action::SignAndSendExecutionVote { leader, .. } => Some(*leader),
+            _ => None,
+        });
+        assert_eq!(
+            sent_to,
+            Some(tick_leader(&at_frontier, &old)),
+            "a frontier tick is still addressed to the replaced committee, got {actions:?}",
         );
     }
 

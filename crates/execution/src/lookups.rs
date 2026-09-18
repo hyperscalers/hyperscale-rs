@@ -10,13 +10,34 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
-    ConsensusPublicKey, DeclaredKey, DeclaredRange, ExecutionCertificate, Finalization, ShardId,
-    ShardTrie, SubstateKey, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable,
-    VoteCount, committed_crossings,
+    BlockHeight, ConsensusPublicKey, DeclaredKey, DeclaredRange, ExecutionCertificate,
+    Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, ValidatorId, Verifiable, VoteCount, WeightedTimestamp, committed_crossings,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
 pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
+
+/// The committee that attests a tick of `shard` anchored at `anchor_wt`
+/// at `height` — the one its votes address, its certificate's bitfield
+/// indexes, and every verifier resolves from the certificate alone.
+///
+/// `None` when this replica cannot resolve it yet, or when the anchor
+/// falls in a window the shard had already left: nobody was seated
+/// there to attest, so a tick anchored past its shard's terminal gets no
+/// leader, no tracker and no vote, and a certificate claiming one is
+/// refused.
+pub fn attesting_committee(
+    schedule: &TopologySchedule,
+    shard: ShardId,
+    anchor_wt: WeightedTimestamp,
+    height: BlockHeight,
+) -> Option<&Arc<TopologySnapshot>> {
+    schedule
+        .at_for_shard_anchored(shard, anchor_wt, height)
+        .filter(|(_, past_terminal)| !past_terminal)
+        .map(|(snapshot, _)| snapshot)
+}
 
 /// Committee members of `shard` with the local validator filtered out.
 ///

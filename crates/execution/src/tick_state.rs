@@ -1089,14 +1089,18 @@ impl TickState {
     /// forms holds them just as hard.
     ///
     /// Two ways a half becomes undeliverable. `committee_replaced` is the
-    /// immediate one: a halt recovery has replaced the committee seated
-    /// at this tick's anchor, so the signatures its certificate needs are
-    /// from members no longer serving the shard and no quorum can ever
-    /// form — waiting changes nothing, and a fresh member that executed
-    /// the block while catching up would otherwise hold the frontier
-    /// against its own committee's work. The caller answers it from the
-    /// committing block: true only on a block the fresh committee
-    /// certified, which no replica commits before folding the record.
+    /// immediate one: no fresh quorum can ever hold this tick. A halt
+    /// recovery replaced the committee its anchor names and the tick
+    /// sits at or below the recovery's attested frontier, so the
+    /// replaced members no longer serve the shard and the fresh members
+    /// snap-synced past its block without executing it — waiting changes
+    /// nothing, and a fresh member that did execute it while catching up
+    /// would otherwise hold the frontier against its own committee's
+    /// work. A tick above the frontier is not this: the fresh committee
+    /// re-executes it from the harvested tail and attests it like any
+    /// live tick. The caller answers it from the committing block: true
+    /// only on a block the fresh committee certified, which no replica
+    /// commits before folding the record.
     ///
     /// [`TICK_SETTLEABLE_SPAN`] past the tick's own anchor is the other:
     /// no member it holds can still be settleable, so a half emitted
