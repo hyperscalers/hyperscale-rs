@@ -1,6 +1,6 @@
 //! Per-transaction state entries within a provision.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{MAX_STATE_ENTRIES_PER_TX, SubstateEntry, TxHash};
 
@@ -17,8 +17,7 @@ pub struct ProvisionEntry {
     /// The state entries this transaction touched on the source shard.
     /// Empty for an engagement echo — a counterpart with nothing to serve
     /// still owes the payer its commitment of the transaction.
-    #[hbor(max = MAX_STATE_ENTRIES_PER_TX)]
-    pub entries: Vec<SubstateEntry>,
+    pub entries: Capped<Vec<SubstateEntry>, MAX_STATE_ENTRIES_PER_TX>,
 }
 
 impl ProvisionEntry {
@@ -29,7 +28,10 @@ impl ProvisionEntry {
     /// paths; canonicalising here rather than at each call site means a
     /// future ordering leak can't slip past one caller.
     #[must_use]
-    pub fn new(tx_hash: TxHash, mut entries: Vec<SubstateEntry>) -> Self {
+    pub fn new(
+        tx_hash: TxHash,
+        mut entries: Capped<Vec<SubstateEntry>, MAX_STATE_ENTRIES_PER_TX>,
+    ) -> Self {
         entries.sort_by_key(|entry| entry.key);
         Self { tx_hash, entries }
     }
@@ -38,7 +40,7 @@ impl ProvisionEntry {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::{
-        DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
+        Bytes, DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
 
     use super::*;
@@ -46,14 +48,14 @@ mod tests {
     use crate::{Hash, LEAF_KEY_BYTES};
 
     fn sample_entry(seed: u8) -> SubstateEntry {
-        SubstateEntry::test_entry(test_prefix(seed), b"sort", Some(vec![seed]))
+        SubstateEntry::test_entry(test_prefix(seed), b"sort", Some(Bytes::from_array([seed])))
     }
 
     #[test]
     fn hbor_roundtrip() {
         let entry = ProvisionEntry::new(
             TxHash::from(Hash::from_bytes(b"tx")),
-            vec![sample_entry(1), sample_entry(2)],
+            Capped::from_array([sample_entry(1), sample_entry(2)]),
         );
         let bytes = hbor_to_vec(&entry).unwrap();
         let decoded: ProvisionEntry = hbor_from_slice(&bytes).unwrap();
@@ -66,8 +68,14 @@ mod tests {
     #[test]
     fn construction_canonicalises_entry_order() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"tx"));
-        let forward = ProvisionEntry::new(tx_hash, vec![sample_entry(1), sample_entry(2)]);
-        let reverse = ProvisionEntry::new(tx_hash, vec![sample_entry(2), sample_entry(1)]);
+        let forward = ProvisionEntry::new(
+            tx_hash,
+            Capped::from_array([sample_entry(1), sample_entry(2)]),
+        );
+        let reverse = ProvisionEntry::new(
+            tx_hash,
+            Capped::from_array([sample_entry(2), sample_entry(1)]),
+        );
         assert_eq!(forward, reverse);
         assert_eq!(
             hbor_to_vec(&forward).unwrap(),
@@ -99,7 +107,10 @@ mod tests {
         // Hand-roll a wire layout carrying entries plus target and owned
         // node lists, to confirm a peer can't ship node sets the receiver
         // derives for itself.
-        let entry = ProvisionEntry::new(TxHash::from(Hash::from_bytes(b"tx")), vec![]);
+        let entry = ProvisionEntry::new(
+            TxHash::from(Hash::from_bytes(b"tx")),
+            Capped::from_array([]),
+        );
         let mut buf = hbor_to_vec(&entry).unwrap();
         buf.extend_from_slice(&hbor_to_vec(&Vec::<[u8; 16]>::new()).unwrap());
         buf.extend_from_slice(&hbor_to_vec(&Vec::<[u8; 16]>::new()).unwrap());

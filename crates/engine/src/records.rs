@@ -134,7 +134,7 @@ impl ChainRecords for BatchRecords<'_> {
 #[cfg(test)]
 mod tests {
     use hyperscale_effects_bridge::ProtocolHasher;
-    use hyperscale_hbor::Capped;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_vm_effects::{Hash32, Hasher, Value};
     use hyperscale_vm_types::{Address, CollectionId};
 
@@ -218,7 +218,10 @@ mod tests {
         let address = meta.address(&ProtocolHasher);
         let entries = vec![SubstateEntry::new(
             config_key(address),
-            Some(meta.leaf_bytes().expect("a record encodes")),
+            Some(
+                Bytes::new(meta.leaf_bytes().expect("a record encodes"))
+                    .expect("a record fits its leaf"),
+            ),
         )];
         let provisions = provisioned(entries);
         let chain = records(&provisions, &Barren);
@@ -254,7 +257,10 @@ mod tests {
         let address = meta.address(&ProtocolHasher);
         let entries = vec![SubstateEntry::new(
             config_key(address),
-            Some(elsewhere.leaf_bytes().expect("a record encodes")),
+            Some(
+                Bytes::new(elsewhere.leaf_bytes().expect("a record encodes"))
+                    .expect("a record fits its leaf"),
+            ),
         )];
         let provisions = provisioned(entries);
         let chain = records(&provisions, &Barren);
@@ -279,7 +285,10 @@ mod tests {
         let meta = record(6);
         let address = meta.address(&ProtocolHasher);
         let leaf = meta.leaf_bytes().expect("a record encodes");
-        let entries = vec![SubstateEntry::new(config_key(address), Some(vec![0xFF; 8]))];
+        let entries = vec![SubstateEntry::new(
+            config_key(address),
+            Some(Bytes::from_array([0xFF; 8])),
+        )];
         let provisions = provisioned(entries);
         let store = OneCell(config_key(address), leaf);
         let chain = records(&provisions, &store);

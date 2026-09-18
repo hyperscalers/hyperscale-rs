@@ -296,6 +296,7 @@ impl ProvisionPipeline {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{Hash, MerkleInclusionProof, ProvisionEntry, TxHash};
 
     use super::*;
@@ -311,10 +312,10 @@ mod tests {
             height,
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(
+            Capped::from_array([ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(&[seed])),
-                vec![],
-            )],
+                Capped::empty(),
+            )]),
         )
     }
 

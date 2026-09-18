@@ -1532,10 +1532,13 @@ mod tests {
         target_shard: ShardId,
         height: BlockHeight,
     ) -> Provisions {
-        let transactions = tx_hashes
-            .into_iter()
-            .map(|tx_hash| ProvisionEntry::new(tx_hash, vec![]))
-            .collect();
+        let transactions = Capped::new(
+            tx_hashes
+                .into_iter()
+                .map(|tx_hash| ProvisionEntry::new(tx_hash, Capped::from_array([])))
+                .collect(),
+        )
+        .expect("a list written out in a test");
         Provisions::new(
             source_shard,
             target_shard,

@@ -936,8 +936,8 @@ mod settled_txs_tests {
         Arc::new(Verifiable::from(Finalization::new(
             tick,
             TickHalf::Determined,
-            vec![certificate(tick, height), certificate(remote, height)],
-            vec![],
+            &Capped::from_array([certificate(tick, height), certificate(remote, height)]),
+            Capped::from_array([]),
         )))
     }
 

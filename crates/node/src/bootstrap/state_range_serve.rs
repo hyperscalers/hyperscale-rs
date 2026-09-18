@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::Capped;
+use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_jmt::{Blake3Hasher, Tree, TreeReader};
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{ShardStorage, Substates};
@@ -75,7 +75,10 @@ pub fn serve_state_range_request<S: ShardStorage>(
             warn!(height = version, "state range: oversized substate value");
             return unavailable;
         }
-        wire_leaves.push(SubstateLeaf { key, value });
+        wire_leaves.push(SubstateLeaf {
+            key,
+            value: Bytes::new(value).expect("a list under the cap its source already met"),
+        });
         if budget == 0 {
             break;
         }

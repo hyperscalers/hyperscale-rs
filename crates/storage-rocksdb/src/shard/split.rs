@@ -283,6 +283,7 @@ impl TreeReader for PreRootStore<'_> {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Bytes;
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES, Key, NibblePath};
     use hyperscale_storage::test_helpers::import_boundary_state;
     use hyperscale_storage::{AdoptSource, BoundaryStore, SweepIndex, WitnessSeed};
@@ -307,7 +308,7 @@ mod tests {
     fn leaf(b: u8) -> SubstateLeaf {
         SubstateLeaf {
             key: SubstateKey::from_bytes(k(b)).expect("a stored leaf key names an address"),
-            value: vec![b],
+            value: Bytes::from_array([b]),
         }
     }
 
@@ -400,7 +401,7 @@ mod tests {
                 key
             })
             .expect("a stored leaf key names an address"),
-            value: value.clone(),
+            value: Bytes::new(value.clone()).expect("a list written out in a test"),
         };
 
         let parent_dir = TempDir::new().unwrap();

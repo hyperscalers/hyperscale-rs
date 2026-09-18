@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
@@ -63,7 +64,7 @@ fn index_imported_leaves(
     let artifacts_cf = PackageArtifactsCf::handle(cf);
     let mut sweep_rows = SweepRows::default();
     for leaf in leaves {
-        batch_put::<StateCf>(batch, state_cf, &leaf.key, &leaf.value);
+        batch_put::<StateCf>(batch, state_cf, &leaf.key, &leaf.value.to_vec());
         let LeafRows {
             entry,
             package,
@@ -76,7 +77,7 @@ fn index_imported_leaves(
         // imported store whose committee turns over is the only place a
         // foreign shard can still fetch this artifact from.
         if let Some(package) = package {
-            batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, &leaf.value);
+            batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, &leaf.value.to_vec());
         }
         sweep_rows.delta(leaf.key.owner, None, sweep);
     }
@@ -259,7 +260,10 @@ impl RocksDbShardStorage {
             let leaf = pending.next();
             if let Some((key, value)) = leaf {
                 batch_weight += leaf_weight(&value);
-                batch_leaves.push(SubstateLeaf { key, value });
+                batch_leaves.push(SubstateLeaf {
+                    key,
+                    value: Bytes::new(value).expect("a list under the cap its source already met"),
+                });
                 if batch_weight < limit && pending.peek().is_some() {
                     continue;
                 }
@@ -550,7 +554,7 @@ impl BoundaryStore for RocksDbShardStorage {
         let staging_cf = ImportStagingCf::handle(&cf);
         let mut batch = WriteBatch::default();
         for leaf in leaves {
-            batch_put::<ImportStagingCf>(&mut batch, staging_cf, &leaf.key, &leaf.value);
+            batch_put::<ImportStagingCf>(&mut batch, staging_cf, &leaf.key, &leaf.value.to_vec());
         }
         meta_write::<ImportProgressEntry>(&mut batch, progress);
         self.db
@@ -710,6 +714,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use blake3::hash as blake3_hash;
+    use hyperscale_hbor::Bytes;
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
@@ -914,7 +919,7 @@ mod tests {
         key[31] = AddressClass::Component.tag();
         SubstateLeaf {
             key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
-            value: vec![top; 3],
+            value: Bytes::from_array([top; 3]),
         }
     }
 
@@ -1059,7 +1064,7 @@ mod tests {
                 key,
                 SubstateLeaf {
                     key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
-                    value,
+                    value: Bytes::new(value).expect("a list written out in a test"),
                 },
             );
         }
@@ -1316,7 +1321,8 @@ mod tests {
                     key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
                     // Sized off the value width, not the key width: the
                     // declared byte total is what this test checks.
-                    value: digest.repeat(VALUE_BYTES / digest.len()),
+                    value: Bytes::new(digest.repeat(VALUE_BYTES / digest.len()))
+                        .expect("a value written out in a test"),
                 });
                 if chunk.len() == STAGE_CHUNK {
                     storage.stage_import_chunk(&progress, &chunk).unwrap();

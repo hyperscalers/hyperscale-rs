@@ -110,6 +110,8 @@ pub fn settled_txs_root_from_hashes<'a>(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
+
     use super::*;
     use crate::{
         AggregateSignature, BlockHeight, ExecutionCertificate, GlobalReceiptHash,
@@ -147,8 +149,9 @@ mod tests {
         Arc::new(Verifiable::from(Finalization::new(
             TickId::new(local, BlockHeight::new(1)),
             TickHalf::Determined,
-            ecs.into_iter().map(Arc::new).collect(),
-            vec![],
+            &Capped::new(ecs.into_iter().map(Arc::new).collect())
+                .expect("a list written out in a test"),
+            Capped::from_array([]),
         )))
     }
 

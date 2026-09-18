@@ -41,7 +41,7 @@ mod tests {
     use hyperscale_crypto::Signer;
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::{
-        DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
+        Capped, DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
 
     use crate::test_utils::{test_prefix, test_transaction_with_prefixes};
@@ -290,8 +290,8 @@ mod tests {
         let fw = Finalization::new(
             make_tick_id(0, BlockHeight::new(42)),
             TickHalf::Determined,
-            vec![make_test_ec(0, 1), make_test_ec(1, 2)],
-            vec![],
+            &Capped::from_array([make_test_ec(0, 1), make_test_ec(1, 2)]),
+            Capped::from_array([]),
         );
         assert_eq!(fw.receipt_hash(), fw.receipt_hash());
         assert_ne!(fw.receipt_hash(), FinalizationHash::ZERO);
@@ -303,14 +303,14 @@ mod tests {
         let fw1 = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_test_ec(0, 1)],
-            vec![],
+            &Capped::from_array([make_test_ec(0, 1)]),
+            Capped::from_array([]),
         );
         let fw2 = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_test_ec(1, 2)],
-            vec![],
+            &Capped::from_array([make_test_ec(1, 2)]),
+            Capped::from_array([]),
         );
         assert_ne!(fw1.receipt_hash(), fw2.receipt_hash());
     }
@@ -351,11 +351,15 @@ mod tests {
         let whole = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![Arc::clone(&local), remote],
-            vec![],
+            &Capped::from_array([Arc::clone(&local), remote]),
+            Capped::from_array([]),
         );
-        let partial =
-            Finalization::new(tick_id, TickHalf::Determined, vec![local, narrowed], vec![]);
+        let partial = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            &Capped::from_array([local, narrowed]),
+            Capped::from_array([]),
+        );
         assert_ne!(
             whole.receipt_hash(),
             partial.receipt_hash(),
@@ -368,8 +372,8 @@ mod tests {
         let fw = Finalization::new(
             make_tick_id(0, BlockHeight::new(42)),
             TickHalf::Determined,
-            vec![make_test_ec(0, 1), make_test_ec(1, 2)],
-            vec![],
+            &Capped::from_array([make_test_ec(0, 1), make_test_ec(1, 2)]),
+            Capped::from_array([]),
         );
         let encoded = hbor_to_vec(&fw).unwrap();
         let decoded: Finalization = hbor_from_slice(&encoded).unwrap();
@@ -384,8 +388,8 @@ mod tests {
         let fw = Finalization::new(
             make_tick_id(0, BlockHeight::new(42)),
             TickHalf::Determined,
-            vec![make_test_ec(1, 1)],
-            vec![],
+            &Capped::from_array([make_test_ec(1, 1)]),
+            Capped::from_array([]),
         );
         let bytes = hbor_to_vec(&fw).unwrap();
         let err = hbor_from_slice::<Finalization>(&bytes).unwrap_err();
@@ -405,7 +409,12 @@ mod tests {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let ec_a = make_local_ec(&tick_id, vec![make_outcome(1)]);
         let ec_b = make_local_ec(&tick_id, vec![make_outcome(2)]);
-        let fw = Finalization::new(tick_id, TickHalf::Determined, vec![ec_a, ec_b], vec![]);
+        let fw = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            &Capped::from_array([ec_a, ec_b]),
+            Capped::from_array([]),
+        );
         let bytes = hbor_to_vec(&fw).unwrap();
         let err = hbor_from_slice::<Finalization>(&bytes).unwrap_err();
         assert!(matches!(err, DecodeError::FailedValidation(_)));
@@ -507,8 +516,8 @@ mod tests {
         let attestation = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, vec![])],
-            vec![],
+            &Capped::from_array([make_local_ec(&tick_id, vec![])]),
+            Capped::from_array([]),
         );
 
         // Everything up to the receipt count, then a forged count.
@@ -629,8 +638,8 @@ mod tests {
         let attestation = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![],
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([]),
         );
 
         let fw = Finalization::reconstruct(attestation, |_| Some(make_success_receipt()))
@@ -661,8 +670,8 @@ mod tests {
         let attestation = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![],
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([]),
         );
 
         // Lookup returns Some for tx_a, None for tx_b (never persisted — pure abort).
@@ -694,8 +703,8 @@ mod tests {
         let attestation = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![],
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([]),
         );
 
         let fw = Finalization::reconstruct(attestation, |_| None);
@@ -742,8 +751,8 @@ mod tests {
         let attestation = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![local_ec, remote_ec],
-            vec![],
+            &Capped::from_array([local_ec, remote_ec]),
+            Capped::from_array([]),
         );
 
         let fw = Finalization::reconstruct(attestation, |tx_hash| {
@@ -765,7 +774,12 @@ mod tests {
                 ExecutionOutcome::Aborted,
             )],
         );
-        let attestation = Finalization::new(tick_id, TickHalf::Determined, vec![remote_ec], vec![]);
+        let attestation = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            &Capped::from_array([remote_ec]),
+            Capped::from_array([]),
+        );
 
         let fw = Finalization::reconstruct(attestation, |_| Some(make_success_receipt()));
         assert!(fw.is_none(), "reconstruction requires the local EC");
@@ -813,8 +827,8 @@ mod tests {
         let thinned = Finalization::new(
             tick_id,
             TickHalf::Legs,
-            vec![Arc::clone(&local_ec)],
-            vec![effects],
+            &Capped::from_array([Arc::clone(&local_ec)]),
+            Capped::from_array([effects]),
         );
         assert_eq!(
             thinned.validate_against_certificates(),
@@ -831,7 +845,12 @@ mod tests {
 
         // The same tick with the refusal present settles the charge its
         // outcome named — here, none — and never the effects.
-        let whole = Finalization::new(tick_id, TickHalf::Legs, vec![local_ec, refusal], vec![]);
+        let whole = Finalization::new(
+            tick_id,
+            TickHalf::Legs,
+            &Capped::from_array([local_ec, refusal]),
+            Capped::from_array([]),
+        );
         assert_eq!(whole.validate_against_certificates(), Ok(()));
         assert!(whole.settling_receipts().is_empty());
     }
@@ -845,7 +864,7 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(
+            &Capped::from_array([make_local_ec(
                 &tick_id,
                 vec![TxOutcome::new(
                     tx,
@@ -853,12 +872,12 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )],
-            )],
-            vec![StoredReceipt {
+            )]),
+            Capped::from_array([StoredReceipt {
                 tx_hash: tx,
                 consensus: make_success_receipt(),
                 metadata: None,
-            }],
+            }]),
         );
         assert_eq!(fw.validate_against_certificates(), Ok(()));
         assert_eq!(fw.settling_receipts().len(), 1);
@@ -874,11 +893,11 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Legs,
-            vec![make_local_ec(
+            &Capped::from_array([make_local_ec(
                 &tick_id,
                 vec![TxOutcome::new(leg, ExecutionOutcome::Aborted).awaiting([absent.shard_id()])],
-            )],
-            vec![],
+            )]),
+            Capped::from_array([]),
         );
         assert_eq!(fw.validate_against_certificates(), Ok(()));
     }
@@ -923,8 +942,8 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([
                 StoredReceipt {
                     tx_hash: tx_a,
                     consensus: Arc::new(ConsensusReceipt::Succeeded {
@@ -940,7 +959,7 @@ mod tests {
                     consensus: Arc::new(ConsensusReceipt::Failed),
                     metadata: None,
                 },
-            ],
+            ]),
         );
         assert_eq!(fw.validate_against_certificates(), Ok(()));
     }
@@ -959,12 +978,12 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![StoredReceipt {
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([StoredReceipt {
                 tx_hash: tx_a,
                 consensus: Arc::new(ConsensusReceipt::Failed),
                 metadata: None,
-            }],
+            }]),
         );
         assert!(matches!(
             fw.validate_against_certificates(),
@@ -981,8 +1000,8 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![StoredReceipt {
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([StoredReceipt {
                 tx_hash: tx_a,
                 consensus: Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
@@ -991,7 +1010,7 @@ mod tests {
                     events: Vec::new(),
                 }),
                 metadata: None,
-            }],
+            }]),
         );
         assert!(matches!(
             fw.validate_against_certificates(),
@@ -1015,8 +1034,8 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![StoredReceipt {
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([StoredReceipt {
                 tx_hash: tx_a,
                 consensus: Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash,
@@ -1025,7 +1044,7 @@ mod tests {
                     events: Vec::new(),
                 }),
                 metadata: None,
-            }],
+            }]),
         );
         assert!(matches!(
             fw.validate_against_certificates(),
@@ -1047,8 +1066,8 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![],
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([]),
         );
         assert!(matches!(
             fw.validate_against_certificates(),
@@ -1064,8 +1083,8 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![StoredReceipt {
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([StoredReceipt {
                 tx_hash: tx_a,
                 consensus: Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
@@ -1074,7 +1093,7 @@ mod tests {
                     events: Vec::new(),
                 }),
                 metadata: None,
-            }],
+            }]),
         );
         assert!(matches!(
             fw.validate_against_certificates(),
@@ -1096,8 +1115,8 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![StoredReceipt {
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([StoredReceipt {
                 tx_hash: tx_b,
                 consensus: Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
@@ -1106,7 +1125,7 @@ mod tests {
                     events: Vec::new(),
                 }),
                 metadata: None,
-            }],
+            }]),
         );
         assert!(matches!(
             fw.validate_against_certificates(),
@@ -1119,7 +1138,12 @@ mod tests {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let remote_tick_id = make_tick_id(1, BlockHeight::new(42));
         let remote_ec = make_local_ec(&remote_tick_id, vec![]);
-        let fw = Finalization::new(tick_id, TickHalf::Determined, vec![remote_ec], vec![]);
+        let fw = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            &Capped::from_array([remote_ec]),
+            Capped::from_array([]),
+        );
         assert_eq!(
             fw.validate_against_certificates(),
             Err(ReceiptValidationError::MissingLocalEc)
@@ -1136,8 +1160,8 @@ mod tests {
         let fw = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![make_local_ec(&tick_id, outcomes)],
-            vec![],
+            &Capped::from_array([make_local_ec(&tick_id, outcomes)]),
+            Capped::from_array([]),
         );
         assert_eq!(fw.validate_against_certificates(), Ok(()));
     }

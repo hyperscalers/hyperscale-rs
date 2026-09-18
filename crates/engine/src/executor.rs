@@ -1520,7 +1520,7 @@ impl Executor {
                         if let Some((entry_key, entry_value)) = entry_from_leaf(entry.key, value) {
                             base.entries.insert(entry_key, entry_value);
                         } else {
-                            base.cells.insert(entry.key, value.clone());
+                            base.cells.insert(entry.key, value.clone().into_inner());
                         }
                     }
                 }

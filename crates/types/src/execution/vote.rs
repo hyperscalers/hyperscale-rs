@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use hyperscale_crypto::{SignError, Signer, Verifier};
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use crate::{
@@ -31,8 +31,7 @@ pub struct ExecutionVote {
     shard_id: ShardId,
     global_receipt_root: GlobalReceiptRoot,
     tx_count: u32,
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    tx_outcomes: Vec<TxOutcome>,
+    tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK>,
     validator: ValidatorId,
     signature: ConsensusSignature,
 }
@@ -51,7 +50,7 @@ impl ExecutionVote {
         shard_id: ShardId,
         global_receipt_root: GlobalReceiptRoot,
         tx_count: u32,
-        tx_outcomes: Vec<TxOutcome>,
+        tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK>,
         validator: ValidatorId,
         signature: ConsensusSignature,
     ) -> Self {
@@ -147,7 +146,7 @@ impl ExecutionVote {
             self.shard_id,
             self.global_receipt_root,
             self.tx_count,
-            self.tx_outcomes,
+            self.tx_outcomes.into_inner(),
             self.validator,
             self.signature,
         )
@@ -264,7 +263,7 @@ impl Verified<ExecutionVote> {
         vote_anchor_ts: WeightedTimestamp,
         tick_id: TickId,
         shard_id: ShardId,
-        tx_outcomes: Vec<TxOutcome>,
+        tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK>,
         validator: ValidatorId,
         signer: &dyn Signer,
     ) -> Result<Self, SignError> {
@@ -393,7 +392,7 @@ mod tests {
             ShardId::leaf(1, 0),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
             u32::try_from(outcomes.len()).unwrap(),
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             ValidatorId::new(3),
             ConsensusSignature::new([0u8; 96]),
         )
@@ -435,7 +434,7 @@ mod tests {
             shard_id,
             global_receipt_root,
             tx_count,
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             ValidatorId::new(validator),
             signature,
         )
@@ -478,7 +477,7 @@ mod tests {
             shard_id,
             bogus_root,
             tx_count,
-            tx_outcomes,
+            Capped::new(tx_outcomes).expect("a list written out in a test"),
             validator,
             signature,
         );
@@ -575,7 +574,7 @@ mod tests {
             shard_id,
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"bogus")),
             tx_count,
-            tx_outcomes,
+            Capped::new(tx_outcomes).expect("a list written out in a test"),
             validator,
             signature,
         );
@@ -609,7 +608,7 @@ mod tests {
             WeightedTimestamp::from_millis(11),
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(7)),
             ShardId::leaf(1, 0),
-            vec![sample_outcome(1)],
+            Capped::from_array([sample_outcome(1)]),
             ValidatorId::new(3),
             &signer,
         )

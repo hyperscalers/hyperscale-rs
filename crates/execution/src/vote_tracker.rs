@@ -288,6 +288,7 @@ impl VoteTracker {
 mod tests {
 
     use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{BlockHeight, ConsensusSignature, Hash, ShardId, Signer};
 
     use super::*;
@@ -303,7 +304,7 @@ mod tests {
             ShardId::ROOT,
             global_receipt_root,
             5,
-            vec![],
+            Capped::from_array([]),
             ValidatorId::new(validator),
             ConsensusSignature::ZERO,
         )

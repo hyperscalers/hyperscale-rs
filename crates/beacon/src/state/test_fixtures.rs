@@ -12,6 +12,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 pub use hyperscale_crypto_bls::{
     public_key_from_u64_seed as pubkey, signer_from_u64_seed as keypair,
 };
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusSignature,
@@ -289,8 +290,9 @@ pub fn apply_witness_chunk(
         shard,
         ShardEpochContribution {
             boundary_header: header,
-            payloads,
-            range_proof,
+            payloads: Capped::new(payloads).expect("a list under the cap its source already met"),
+            range_proof: Capped::new(range_proof)
+                .expect("a list under the cap its source already met"),
         },
     ))
     .collect();

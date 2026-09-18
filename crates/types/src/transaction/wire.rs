@@ -14,7 +14,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::OnceLock;
 
 use blake3::Hasher;
-use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Bytes, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_vm_types::{DeclaredWork, LegShape, PriceTable, Terms};
 use thiserror::Error;
 
@@ -52,8 +52,7 @@ pub struct TransactionContext<'a> {
 #[derive(Hbor)]
 pub struct Transaction {
     /// HBOR-encoded [`TransactionEnvelope`] bytes — the canonical wire form.
-    #[hbor(max = MAX_ENVELOPE_BYTES)]
-    serialized_bytes: Vec<u8>,
+    serialized_bytes: Bytes<MAX_ENVELOPE_BYTES>,
 
     /// Decoded envelope, populated by `body()` on first access from
     /// `serialized_bytes`. Constructors pre-populate. Not on the wire.
@@ -395,7 +394,8 @@ impl Transaction {
         let _ = hash_lock.set(hash);
 
         Self {
-            serialized_bytes: payload,
+            serialized_bytes: Bytes::new(payload)
+                .expect("a list under the cap its source already met"),
             body: body_lock,
             derived: OnceLock::new(),
             declared: OnceLock::new(),
@@ -1098,7 +1098,7 @@ mod tests {
         let mut bytes = fixture(b"graph bytes").serialized_bytes().to_vec();
         bytes.truncate(3);
         let garbage = Transaction {
-            serialized_bytes: bytes,
+            serialized_bytes: Bytes::new(bytes).expect("a list written out in a test"),
             body: OnceLock::new(),
             derived: OnceLock::new(),
             declared: OnceLock::new(),

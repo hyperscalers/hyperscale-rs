@@ -34,7 +34,7 @@
 
 use blake3::Hasher;
 use hyperscale_crypto::{SignError, Signer, Verifier};
-use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::{
@@ -674,6 +674,10 @@ pub fn sign_empty_view_msg(
 /// Doesn't enforce `f + 1` threshold here — the verifier rejects
 /// short sets, but callers typically pool until they have `f + 1`
 /// before invoking this.
+///
+/// # Panics
+///
+/// If a list runs past the cap its type states, which a committee's own vote cannot.
 #[must_use]
 pub fn build_indirect_cert(
     verifier: &dyn Verifier,
@@ -722,7 +726,10 @@ pub fn build_indirect_cert(
         target_view,
         target_value,
         target_proof,
-        skip_reports: PositionalBundle::new(signers_bf, reports),
+        skip_reports: PositionalBundle::new(
+            signers_bf,
+            Capped::new(reports).expect("one report per signer of the committee"),
+        ),
         skip_aggregate_sig,
     })
 }
@@ -1166,7 +1173,7 @@ impl Verified<SpcNewCommitMsg> {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
     use crate::{PcQc2, PcSignerLengths, PcValueElement, PcXpProof, SignerBitfield};
@@ -1257,7 +1264,10 @@ mod tests {
             target_view: SpcView::new(4),
             target_value: sample_pc_vector(2),
             target_proof: sample_pc_qc3().into(),
-            skip_reports: PositionalBundle::new(signers, reports),
+            skip_reports: PositionalBundle::new(
+                signers,
+                Capped::new(reports).expect("one report per signer of the committee"),
+            ),
             skip_aggregate_sig: AggregateSignature::new([0xCC; 96]),
         };
         let bytes = hbor_to_vec(&c).unwrap();
@@ -1364,7 +1374,10 @@ mod tests {
             target_view: SpcView::new(1),
             target_value: PcVector::empty(),
             target_proof: sample_pc_qc3().into(),
-            skip_reports: PositionalBundle::new(signers, reports),
+            skip_reports: PositionalBundle::new(
+                signers,
+                Capped::new(reports).expect("one report per signer of the committee"),
+            ),
             skip_aggregate_sig: AggregateSignature::new(
                 *BlsSigner::generate()
                     .sign(b"unused")

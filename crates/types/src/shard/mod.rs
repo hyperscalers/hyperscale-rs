@@ -171,8 +171,8 @@ mod tests {
                 Finalization::new(
                     TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
                     TickHalf::Determined,
-                    vec![ec],
-                    vec![],
+                    &Capped::from_array([ec]),
+                    Capped::from_array([]),
                 )
                 .into(),
             )
@@ -203,8 +203,8 @@ mod tests {
         let cert = Finalization::new(
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             TickHalf::Determined,
-            vec![ec],
-            vec![],
+            &Capped::from_array([ec]),
+            Capped::from_array([]),
         );
         let expected_receipt_hash = cert.receipt_hash();
         let fw: Arc<Verifiable<Finalization>> = Arc::new(cert.into());

@@ -148,6 +148,7 @@ impl Default for ProvisionStore {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{Hash, MerkleInclusionProof, ProvisionEntry, TxHash, WeightedTimestamp};
 
     use super::*;
@@ -159,10 +160,10 @@ mod tests {
             BlockHeight::new(height),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(
+            Capped::from_array([ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(&[tx_seed])),
-                vec![],
-            )],
+                Capped::empty(),
+            )]),
         ))
     }
 

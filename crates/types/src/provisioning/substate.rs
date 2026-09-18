@@ -1,7 +1,7 @@
 //! Substate pairs shipped between shards: provision entries and
 //! snap-sync leaves, both keyed for direct lookup at the receiver.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Bytes, Hbor};
 use hyperscale_vm_types::MAX_CELL_VALUE_LEN;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -20,8 +20,7 @@ pub struct SubstateLeaf {
     /// The substate's key — its JMT leaf key by identity.
     pub key: SubstateKey,
     /// The raw substate value, bounded like a provisioned entry's.
-    #[hbor(max = MAX_CELL_VALUE_LEN)]
-    pub value: Vec<u8>,
+    pub value: Bytes<MAX_CELL_VALUE_LEN>,
 }
 
 /// A state entry shipped by key for direct lookup at the receiving shard.
@@ -31,14 +30,13 @@ pub struct SubstateEntry {
     pub key: SubstateKey,
 
     /// The raw substate value (`None` if deleted/doesn't exist).
-    #[hbor(max = MAX_CELL_VALUE_LEN)]
-    pub value: Option<Vec<u8>>,
+    pub value: Option<Bytes<MAX_CELL_VALUE_LEN>>,
 }
 
 impl SubstateEntry {
     /// Create a new substate entry.
     #[must_use]
-    pub const fn new(key: SubstateKey, value: Option<Vec<u8>>) -> Self {
+    pub const fn new(key: SubstateKey, value: Option<Bytes<MAX_CELL_VALUE_LEN>>) -> Self {
         Self { key, value }
     }
 
@@ -66,7 +64,11 @@ impl SubstateEntry {
     /// seed.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
-    pub fn test_entry(owner: Address, local: &[u8], value: Option<Vec<u8>>) -> Self {
+    pub fn test_entry(
+        owner: Address,
+        local: &[u8],
+        value: Option<Bytes<MAX_CELL_VALUE_LEN>>,
+    ) -> Self {
         use hyperscale_vm_types::LocalKey;
         let mut half = [0u8; 16];
         let n = local.len().min(16);
@@ -92,7 +94,11 @@ mod tests {
 
     #[test]
     fn test_substate_entry_hash() {
-        let entry = SubstateEntry::test_entry(test_prefix(1), b"key", Some(b"value".to_vec()));
+        let entry = SubstateEntry::test_entry(
+            test_prefix(1),
+            b"key",
+            Some(Bytes::new(b"value".to_vec()).expect("a list written out in a test")),
+        );
 
         let hash1 = entry.hash();
         let hash2 = entry.hash();
@@ -101,7 +107,8 @@ mod tests {
 
     #[test]
     fn hbor_roundtrip_some_value() {
-        let entry = SubstateEntry::test_entry(test_prefix(7), b"sort", Some(vec![9u8; 128]));
+        let entry =
+            SubstateEntry::test_entry(test_prefix(7), b"sort", Some(Bytes::from_array([9u8; 128])));
         let bytes = hbor_to_vec(&entry).unwrap();
         let decoded: SubstateEntry = hbor_from_slice(&bytes).unwrap();
         assert_eq!(decoded, entry);

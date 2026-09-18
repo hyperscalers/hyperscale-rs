@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, btree_map};
 
 use hyperscale_crypto::{SignError, Signer, Verifier};
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use super::certified::verify_committed_proposal_binding;
@@ -840,8 +840,8 @@ impl Verified<CandidateBeaconBlock> {
         let block = BeaconBlock::new_with_contributions(
             epoch,
             prev_block_hash,
-            proposals,
-            shard_contributions,
+            Capped::new(proposals).expect("a list written out in a test"),
+            Capped::new(shard_contributions).expect("a map written out in a test"),
         );
         Self::new_unchecked(CandidateBeaconBlock::new(
             block,
@@ -853,7 +853,7 @@ impl Verified<CandidateBeaconBlock> {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, signer_from_u64_seed};
-    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
     use crate::Hash;
@@ -1221,7 +1221,7 @@ mod tests {
     #[test]
     fn candidate_hbor_round_trip() {
         let original = CandidateBeaconBlock::new(
-            BeaconBlock::new(Epoch::new(3), anchor(), Vec::new()),
+            BeaconBlock::new(Epoch::new(3), anchor(), Capped::empty()),
             dummy_spc_cert(),
         );
         let bytes = hbor_to_vec(&original).unwrap();
@@ -1233,7 +1233,7 @@ mod tests {
     /// cert is side-data, exactly like the certified wrapper.
     #[test]
     fn candidate_identity_delegates_to_block() {
-        let block = BeaconBlock::new(Epoch::new(3), anchor(), Vec::new());
+        let block = BeaconBlock::new(Epoch::new(3), anchor(), Capped::empty());
         let expected_hash = block.block_hash();
         let candidate = CandidateBeaconBlock::new(block, dummy_spc_cert());
         assert_eq!(candidate.block_hash(), expected_hash);
@@ -1261,7 +1261,7 @@ mod tests {
     fn candidate_with_garbage_cert_rejects() {
         let (active, _) = pool(4);
         let candidate = CandidateBeaconBlock::new(
-            BeaconBlock::new(Epoch::new(3), anchor(), Vec::new()),
+            BeaconBlock::new(Epoch::new(3), anchor(), Capped::empty()),
             dummy_spc_cert(),
         );
         let ctx = CandidateVerifyContext {

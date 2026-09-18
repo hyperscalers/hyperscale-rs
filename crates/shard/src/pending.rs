@@ -1045,8 +1045,8 @@ mod tests {
             Verified::new_unchecked_for_test(Finalization::new(
                 tick_id,
                 TickHalf::Determined,
-                vec![],
-                vec![],
+                &Capped::from_array([]),
+                Capped::from_array([]),
             ))
             .into(),
         );
@@ -1083,8 +1083,8 @@ mod tests {
             Verified::new_unchecked_for_test(Finalization::new(
                 tick_id,
                 TickHalf::Determined,
-                vec![],
-                vec![],
+                &Capped::from_array([]),
+                Capped::from_array([]),
             ))
             .into(),
         );
@@ -1119,8 +1119,8 @@ mod tests {
         let fw = Arc::new(Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![],
-            vec![],
+            &Capped::from_array([]),
+            Capped::from_array([]),
         ));
         let verified_fw = Arc::new(Verified::new_unchecked_for_test((*fw).clone()).into());
         let wire_fw = Arc::new((*fw).clone().into());

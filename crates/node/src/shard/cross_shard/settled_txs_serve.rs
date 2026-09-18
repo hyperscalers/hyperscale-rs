@@ -260,8 +260,8 @@ mod tests {
         Arc::new(Verifiable::from(Finalization::new(
             tick,
             TickHalf::Determined,
-            vec![Arc::new(ec), Arc::new(remote)],
-            vec![],
+            &Capped::from_array([Arc::new(ec), Arc::new(remote)]),
+            Capped::from_array([]),
         )))
     }
 

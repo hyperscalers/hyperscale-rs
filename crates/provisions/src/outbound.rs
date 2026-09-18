@@ -228,6 +228,7 @@ impl OutboundProvisionTracker {
 mod tests {
     use std::time::Duration;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         ExecutionOutcome, GlobalReceiptHash, Hash, MerkleInclusionProof, ProvisionEntry,
         RETENTION_HORIZON,
@@ -252,10 +253,12 @@ mod tests {
         source_block_ts: WeightedTimestamp,
         txs: &[TxHash],
     ) -> Arc<Verified<Provisions>> {
-        let transactions = txs
-            .iter()
-            .map(|h| ProvisionEntry::new(*h, vec![]))
-            .collect();
+        let transactions = Capped::new(
+            txs.iter()
+                .map(|h| ProvisionEntry::new(*h, Capped::from_array([])))
+                .collect(),
+        )
+        .expect("a list written out in a test");
         Arc::new(Verified::new_unchecked_for_test(Provisions::new(
             ShardId::leaf(2, 0),
             ShardId::leaf(2, 1),

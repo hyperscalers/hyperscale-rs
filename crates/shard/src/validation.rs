@@ -1752,8 +1752,8 @@ mod tests {
             Arc::new(Verifiable::from(Finalization::new(
                 tick_id,
                 half,
-                vec![Arc::new(ec)],
-                Vec::new(),
+                &Capped::from_array([Arc::new(ec)]),
+                Capped::empty(),
             )))
         };
         let certificates: Vec<_> = determined
@@ -1898,7 +1898,7 @@ mod tests {
             BlockHeight::new(u64::from(seed)),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(tx_hash, vec![])],
+            Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
         ))
     }
 
@@ -2168,7 +2168,7 @@ mod tests {
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 MerkleInclusionProof::dummy(),
-                vec![ProvisionEntry::new(tx_hash, vec![])],
+                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
             .into(),
         );
@@ -2191,7 +2191,7 @@ mod tests {
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 MerkleInclusionProof::dummy(),
-                vec![ProvisionEntry::new(tx_hash, vec![])],
+                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
             .into(),
         );
@@ -2245,7 +2245,7 @@ mod tests {
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 MerkleInclusionProof::dummy(),
-                vec![ProvisionEntry::new(tx_hash, vec![])],
+                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
             .into(),
         );

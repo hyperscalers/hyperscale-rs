@@ -60,7 +60,7 @@ impl NetworkMessage for PcVote2Notification {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
     use crate::{
@@ -73,7 +73,7 @@ mod tests {
         signers.set(0);
         PcQc1::new(
             PcVector::empty(),
-            PositionalBundle::new(signers, vec![PcCompactVote::new(0, None)]),
+            PositionalBundle::new(signers, Capped::from_array([PcCompactVote::new(0, None)])),
             AggregateSignature::new([0xAA; 96]),
         )
     }
@@ -82,7 +82,7 @@ mod tests {
         PcVote2::new(
             ValidatorId::new(2),
             PcVector::empty(),
-            vec![ConsensusSignature::new([0x11; 96])],
+            Capped::from_array([ConsensusSignature::new([0x11; 96])]),
             sample_qc1(),
             ConsensusSignature::new([0x22; 96]),
         )

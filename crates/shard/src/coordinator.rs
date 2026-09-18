@@ -12980,8 +12980,8 @@ mod tests {
         Arc::new(Verifiable::from(Finalization::new(
             local_tick,
             TickHalf::Legs,
-            vec![Arc::new(ec(local)), Arc::new(ec(remote))],
-            vec![],
+            &Capped::from_array([Arc::new(ec(local)), Arc::new(ec(remote))]),
+            Capped::from_array([]),
         )))
     }
 
@@ -13689,15 +13689,15 @@ mod tests {
         Arc::new(Verifiable::from(Finalization::new(
             tick,
             TickHalf::Determined,
-            vec![Arc::new(ExecutionCertificate::new(
+            &Capped::from_array([Arc::new(ExecutionCertificate::new(
                 tick,
                 WeightedTimestamp::from_millis(height),
                 GlobalReceiptRoot::ZERO,
                 vec![outcome],
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
-            ))],
-            vec![],
+            ))]),
+            Capped::from_array([]),
         )))
     }
 

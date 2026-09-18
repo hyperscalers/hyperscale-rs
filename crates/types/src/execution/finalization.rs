@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use blake3::Hasher;
 use hyperscale_crypto::Verifier;
-use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::{
@@ -91,10 +91,9 @@ pub struct Finalization {
     /// Which half of `tick_id` this settles. Ordering is per half, so
     /// the identity that orders is too.
     half: TickHalf,
-    #[hbor(max = MAX_EXECUTION_CERTIFICATES_PER_TICK)]
-    execution_certificates: Vec<Arc<Verifiable<ExecutionCertificate>>>,
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    receipts: Vec<StoredReceipt>,
+    execution_certificates:
+        Capped<Vec<Arc<Verifiable<ExecutionCertificate>>>, MAX_EXECUTION_CERTIFICATES_PER_TICK>,
+    receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
 }
 
 /// The exactly-one-local-EC invariant, enforced at the wire boundary. Zero
@@ -238,7 +237,7 @@ impl Finalization {
     /// `receipts.len() <= tx_count()`. Preserves canonical block order.
     /// Held in-memory until block commit, then written atomically with block metadata.
     #[must_use]
-    pub const fn receipts(&self) -> &Vec<StoredReceipt> {
+    pub fn receipts(&self) -> &Vec<StoredReceipt> {
         &self.receipts
     }
 
@@ -460,7 +459,7 @@ impl Finalization {
             tick_id: self.tick_id,
             half: self.half,
             execution_certificates: self.execution_certificates.clone(),
-            receipts: Vec::new(),
+            receipts: Capped::empty(),
         }
     }
 
@@ -477,6 +476,10 @@ impl Finalization {
     /// - A receipt the tick settled is missing from the lookup
     ///   (peer/storage has incomplete state — a syncing peer should try a
     ///   different source).
+    ///
+    /// # Panics
+    ///
+    /// If a list runs past the cap its type states, which a committee's own vote cannot.
     pub fn reconstruct<F>(attestation: Self, mut lookup: F) -> Option<Self>
     where
         F: FnMut(&TxHash) -> Option<Arc<ConsensusReceipt>>,
@@ -502,7 +505,9 @@ impl Finalization {
             receipts.push(StoredReceipt::synced(outcome.tx_hash(), receipt));
         }
 
-        Some(attestation.with_receipts(receipts))
+        Some(attestation.with_receipts(
+            Capped::new(receipts).expect("a list under the cap its source already met"),
+        ))
     }
 
     /// Build a `Finalization` from raw inputs. Each EC lands
@@ -520,16 +525,17 @@ impl Finalization {
     pub fn new(
         tick_id: TickId,
         half: TickHalf,
-        execution_certificates: Vec<Arc<ExecutionCertificate>>,
-        receipts: Vec<StoredReceipt>,
+        execution_certificates: &Capped<
+            Vec<Arc<ExecutionCertificate>>,
+            MAX_EXECUTION_CERTIFICATES_PER_TICK,
+        >,
+        receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
     ) -> Self {
         Self {
             tick_id,
             half,
             execution_certificates: execution_certificates
-                .into_iter()
-                .map(|ec| Arc::new(Verifiable::from(Arc::unwrap_or_clone(ec))))
-                .collect(),
+                .map(|ec| Arc::new(Verifiable::from((**ec).clone()))),
             receipts,
         }
     }
@@ -550,23 +556,27 @@ impl Finalization {
     pub fn from_verified_ecs(
         tick_id: TickId,
         half: TickHalf,
-        execution_certificates: Vec<Verified<ExecutionCertificate>>,
+        execution_certificates: &Capped<
+            Vec<Verified<ExecutionCertificate>>,
+            MAX_EXECUTION_CERTIFICATES_PER_TICK,
+        >,
     ) -> Self {
         Self {
             tick_id,
             half,
             execution_certificates: execution_certificates
-                .into_iter()
-                .map(|ec| Arc::new(Verifiable::from(ec)))
-                .collect(),
-            receipts: Vec::new(),
+                .map(|ec| Arc::new(Verifiable::from(ec.clone()))),
+            receipts: Capped::empty(),
         }
     }
 
     /// The same tick carrying `receipts`. The receipt-count cap is
     /// enforced at encode and decode, not here.
     #[must_use]
-    pub fn with_receipts(mut self, receipts: Vec<StoredReceipt>) -> Self {
+    pub fn with_receipts(
+        mut self,
+        receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
+    ) -> Self {
         self.receipts = receipts;
         self
     }
@@ -999,10 +1009,15 @@ mod tests {
         let determined = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            vec![Arc::clone(&ec)],
-            vec![],
+            &Capped::from_array([Arc::clone(&ec)]),
+            Capped::from_array([]),
         );
-        let legs = Finalization::new(local_wid, TickHalf::Legs, vec![ec], vec![]);
+        let legs = Finalization::new(
+            local_wid,
+            TickHalf::Legs,
+            &Capped::from_array([ec]),
+            Capped::from_array([]),
+        );
 
         assert_ne!(
             determined.receipt_hash(),
@@ -1045,7 +1060,7 @@ mod tests {
                     WeightedTimestamp::from_millis(tick_id.block_height().inner() + 1),
                     *tick_id,
                     tick_id.shard_id(),
-                    outcomes.to_vec(),
+                    Capped::new(outcomes.to_vec()).expect("a list written out in a test"),
                     ValidatorId::new(u64::try_from(i).unwrap()),
                     sk,
                 )
@@ -1080,8 +1095,8 @@ mod tests {
         let tick = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            vec![Arc::new(local_ec), Arc::new(remote_ec)],
-            vec![],
+            &Capped::from_array([Arc::new(local_ec), Arc::new(remote_ec)]),
+            Capped::from_array([]),
         );
 
         let ec_pks = vec![shard0_pks, shard1_pks];
@@ -1128,8 +1143,8 @@ mod tests {
         let tick = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            vec![Arc::new(local_ec), Arc::new(tampered_remote)],
-            vec![],
+            &Capped::from_array([Arc::new(local_ec), Arc::new(tampered_remote)]),
+            Capped::from_array([]),
         );
 
         let ec_pks = vec![shard0_pks, shard1_pks];
@@ -1159,7 +1174,12 @@ mod tests {
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
 
-        let tick = Finalization::new(local_wid, TickHalf::Determined, vec![Arc::new(ec)], vec![]);
+        let tick = Finalization::new(
+            local_wid,
+            TickHalf::Determined,
+            &Capped::from_array([Arc::new(ec)]),
+            Capped::from_array([]),
+        );
 
         let verified = Verified::<Finalization>::from_committed_block(tick.clone());
         assert_eq!(verified.into_inner(), tick);
@@ -1175,7 +1195,12 @@ mod tests {
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
 
-        let tick = Finalization::new(local_wid, TickHalf::Determined, vec![Arc::new(ec)], vec![]);
+        let tick = Finalization::new(
+            local_wid,
+            TickHalf::Determined,
+            &Capped::from_array([Arc::new(ec)]),
+            Capped::from_array([]),
+        );
 
         // Supply two public-key vectors for a single-EC tick.
         let ec_pks: Vec<Vec<ConsensusPublicKey>> = vec![vec![], vec![]];

@@ -73,7 +73,7 @@ impl GossipMessage for BeaconCandidateGossip {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
     use crate::{
@@ -101,7 +101,7 @@ mod tests {
             BeaconBlock::new(
                 Epoch::new(3),
                 BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
-                Vec::new(),
+                Capped::empty(),
             ),
             Box::new(SpcCert::Direct {
                 prev_view: SpcView::INITIAL,

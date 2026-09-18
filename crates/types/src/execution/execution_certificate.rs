@@ -773,7 +773,7 @@ impl Verified<ExecutionCertificate> {
 mod tests {
     use hyperscale_crypto::Signer;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_hbor::from_slice as hbor_from_slice;
+    use hyperscale_hbor::{Capped, from_slice as hbor_from_slice};
 
     use super::*;
     use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, Role, TxHash};
@@ -805,7 +805,7 @@ mod tests {
             WeightedTimestamp::from_millis(11),
             tick_id(),
             ShardId::leaf(1, 0),
-            outcomes,
+            Capped::new(outcomes).expect("a list written out in a test"),
             ValidatorId::new(validator),
             sk,
         )

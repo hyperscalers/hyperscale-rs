@@ -286,6 +286,7 @@ pub fn build_provision_requests(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet};
 
@@ -413,8 +414,8 @@ mod tests {
         let finalization = Arc::new(Verifiable::from(Finalization::new(
             tick,
             TickHalf::Legs,
-            vec![Arc::new(ec)],
-            vec![],
+            &Capped::from_array([Arc::new(ec)]),
+            Capped::from_array([]),
         )));
 
         let requests = crossing_requests(std::slice::from_ref(&finalization), local);

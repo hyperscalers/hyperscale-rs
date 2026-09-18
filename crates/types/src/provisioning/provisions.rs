@@ -7,7 +7,7 @@
 use std::fmt::{self, Debug, Formatter};
 use std::sync::OnceLock;
 
-use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::state_key::jmt_value_hash;
@@ -44,8 +44,7 @@ pub struct Provisions {
     /// hold the header itself.
     source_block_ts: WeightedTimestamp,
     proof: MerkleInclusionProof,
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    transactions: Vec<ProvisionEntry>,
+    transactions: Capped<Vec<ProvisionEntry>, MAX_TXS_PER_BLOCK>,
 
     /// Lazily-computed content hash (blake3 over HBOR-encoded content fields).
     /// Populated on first [`Self::hash`] call; not on the wire.
@@ -102,7 +101,7 @@ impl Provisions {
         block_height: BlockHeight,
         source_block_ts: WeightedTimestamp,
         proof: MerkleInclusionProof,
-        transactions: Vec<ProvisionEntry>,
+        transactions: Capped<Vec<ProvisionEntry>, MAX_TXS_PER_BLOCK>,
     ) -> Self {
         Self {
             source_shard,
@@ -148,7 +147,7 @@ impl Provisions {
 
     /// Per-transaction entries.
     #[must_use]
-    pub const fn transactions(&self) -> &Vec<ProvisionEntry> {
+    pub fn transactions(&self) -> &Vec<ProvisionEntry> {
         &self.transactions
     }
 
@@ -247,7 +246,7 @@ impl Provisions {
             block_height,
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![],
+            Capped::empty(),
         )
     }
 }
@@ -405,7 +404,7 @@ impl Verified<Provisions> {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::{
-        DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
+        Bytes, DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
     use hyperscale_vm_types::{LocalKey, SubstateKey};
 
@@ -420,7 +419,7 @@ mod tests {
     }
 
     fn test_entry(seed: u8) -> SubstateEntry {
-        SubstateEntry::new(cell(seed, seed), Some(vec![seed, seed + 1]))
+        SubstateEntry::new(cell(seed, seed), Some(Bytes::from_array([seed, seed + 1])))
     }
 
     #[test]
@@ -431,7 +430,7 @@ mod tests {
             BlockHeight::new(100),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::new(vec![]),
-            vec![],
+            Capped::empty(),
         );
         let source_ts = WeightedTimestamp::from_millis(1_000_000);
         assert_eq!(
@@ -448,7 +447,7 @@ mod tests {
             BlockHeight::new(42),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::new(vec![1, 2, 3]),
-            vec![],
+            Capped::empty(),
         );
 
         let bytes = hbor_to_vec(&original).unwrap();
@@ -465,10 +464,10 @@ mod tests {
             BlockHeight::new(10),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(
+            Capped::from_array([ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(b"tx1")),
-                vec![test_entry(1)],
-            )],
+                Capped::from_array([test_entry(1)]),
+            )]),
         );
 
         let bytes = hbor_to_vec(&provisions).unwrap();
@@ -485,13 +484,16 @@ mod tests {
             BlockHeight::new(10),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![
-                ProvisionEntry::new(TxHash::from(Hash::from_bytes(b"tx1")), vec![entry.clone()]),
+            Capped::from_array([
+                ProvisionEntry::new(
+                    TxHash::from(Hash::from_bytes(b"tx1")),
+                    Capped::from_array([entry.clone()]),
+                ),
                 ProvisionEntry::new(
                     TxHash::from(Hash::from_bytes(b"tx2")),
-                    vec![entry, test_entry(2)],
+                    Capped::from_array([entry, test_entry(2)]),
                 ),
-            ],
+            ]),
         );
 
         let deduped = provisions.all_entries_deduped();
@@ -509,6 +511,7 @@ mod tests {
     mod verify {
         use std::collections::BTreeMap;
 
+        use hyperscale_hbor::Bytes;
         use hyperscale_jmt::{
             Blake3Hasher, ClaimTermination, Key as JmtKey, LeafValue, MemoryStore, NodeKey, Tree,
         };
@@ -566,14 +569,21 @@ mod tests {
             proof: MerkleInclusionProof,
             items: Vec<(SubstateKey, Vec<u8>)>,
         ) -> Provisions {
-            let tx_entries = items
+            let tx_entries: Vec<_> = items
                 .into_iter()
                 .enumerate()
                 .map(|(i, (key, value))| {
                     let tx_hash = TxHash::from(Hash::from_bytes(&[u8::try_from(i).unwrap(); 4]));
-                    ProvisionEntry::new(tx_hash, vec![SubstateEntry::new(key, Some(value))])
+                    ProvisionEntry::new(
+                        tx_hash,
+                        Capped::from_array([SubstateEntry::new(
+                            key,
+                            Some(Bytes::new(value).expect("a list written out in a test")),
+                        )]),
+                    )
                 })
                 .collect();
+            let tx_entries = Capped::new(tx_entries).expect("a list written out in a test");
             Provisions::new(
                 SOURCE,
                 ShardId::leaf(1, 1),
@@ -636,7 +646,7 @@ mod tests {
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 MerkleInclusionProof::new(vec![]),
-                vec![],
+                Capped::empty(),
             );
             let ctx = ProvisionsContext {
                 certified_header: &verified_header,
@@ -738,10 +748,10 @@ mod tests {
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 MerkleInclusionProof::new(forged.encode()),
-                vec![ProvisionEntry::new(
+                Capped::from_array([ProvisionEntry::new(
                     TxHash::from(Hash::from_bytes(b"tx")),
-                    vec![SubstateEntry::new(foreign, None)],
-                )],
+                    Capped::from_array([SubstateEntry::new(foreign, None)]),
+                )]),
             );
             let ctx = ProvisionsContext {
                 certified_header: &verified_header,
@@ -789,11 +799,14 @@ mod tests {
             let absent = vec![
                 ProvisionEntry::new(
                     TxHash::from(Hash::from_bytes(b"tx")),
-                    vec![SubstateEntry::new(key, None)],
+                    Capped::from_array([SubstateEntry::new(key, None)]),
                 ),
                 ProvisionEntry::new(
                     TxHash::from(Hash::from_bytes(b"ty")),
-                    vec![SubstateEntry::new(items[1].0, Some(items[1].1.clone()))],
+                    Capped::from_array([SubstateEntry::new(
+                        items[1].0,
+                        Some(Bytes::new(items[1].1.clone()).expect("a list written out in a test")),
+                    )]),
                 ),
             ];
             let bundle = Provisions::new(
@@ -802,7 +815,7 @@ mod tests {
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 proof,
-                absent,
+                Capped::new(absent).expect("a list written out in a test"),
             );
             assert_eq!(
                 bundle.verify(&ctx),
@@ -824,10 +837,13 @@ mod tests {
                 BlockHeight::new(1),
                 WeightedTimestamp::from_millis(1),
                 proof,
-                vec![ProvisionEntry::new(
+                Capped::from_array([ProvisionEntry::new(
                     TxHash::from(Hash::from_bytes(b"tx")),
-                    vec![SubstateEntry::new(items[0].0, Some(items[0].1.clone()))],
-                )],
+                    Capped::from_array([SubstateEntry::new(
+                        items[0].0,
+                        Some(Bytes::new(items[0].1.clone()).expect("a list written out in a test")),
+                    )]),
+                )]),
             );
             let ctx = ProvisionsContext {
                 certified_header: &verified_header,

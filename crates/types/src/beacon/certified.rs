@@ -94,7 +94,7 @@ impl CertifiedBeaconBlock {
 
     /// Genesis bootstrap pair.
     #[must_use]
-    pub const fn genesis(config_hash: GenesisConfigHash) -> Self {
+    pub fn genesis(config_hash: GenesisConfigHash) -> Self {
         Self {
             block: BeaconBlock::genesis(),
             cert: BeaconCert::Genesis(config_hash),
@@ -433,7 +433,7 @@ impl Verified<CertifiedBeaconBlock> {
     /// `config_hash` doesn't need a cryptographic check; identity is
     /// established by the operator config the node was launched with.
     #[must_use]
-    pub const fn genesis(config_hash: GenesisConfigHash) -> Self {
+    pub fn genesis(config_hash: GenesisConfigHash) -> Self {
         Self::new_unchecked(CertifiedBeaconBlock::genesis(config_hash))
     }
 
@@ -481,7 +481,7 @@ mod tests {
     use hyperscale_crypto::Signer;
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::{
-        DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
+        Capped, DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
     };
 
     use super::*;
@@ -609,7 +609,7 @@ mod tests {
         let block = BeaconBlock::new(
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            vec![(ValidatorId::new(0), proposal(0))],
+            Capped::from_array([(ValidatorId::new(0), proposal(0))]),
         );
         let cert = normal_cert_for(&block);
         let pair = CertifiedBeaconBlock::new_checked(block, cert).unwrap();
@@ -653,7 +653,11 @@ mod tests {
         ]);
 
         let bind = |proposals: Vec<(ValidatorId, BeaconProposal)>| {
-            let block = BeaconBlock::new(epoch, prev, proposals);
+            let block = BeaconBlock::new(
+                epoch,
+                prev,
+                Capped::new(proposals).expect("a list written out in a test"),
+            );
             let cert = normal_cert_with_value(value.clone(), &block);
             let certified = CertifiedBeaconBlock::new_checked(block, cert).unwrap();
             let BeaconCert::Normal { spc, .. } = certified.cert() else {
@@ -720,7 +724,7 @@ mod tests {
         let block = BeaconBlock::new(
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            Vec::new(),
+            Capped::empty(),
         );
         let err =
             CertifiedBeaconBlock::new_checked(block, BeaconCert::Genesis(GenesisConfigHash::ZERO))
@@ -744,7 +748,7 @@ mod tests {
         let block = BeaconBlock::new(
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            vec![(ValidatorId::new(0), proposal(0))],
+            Capped::from_array([(ValidatorId::new(0), proposal(0))]),
         );
         let cert = BeaconCert::Skip(ratify_cert_for(&block));
         let err = CertifiedBeaconBlock::new_checked(block, cert).unwrap_err();
@@ -811,7 +815,7 @@ mod tests {
         let block = BeaconBlock::new(
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            vec![(ValidatorId::new(0), proposal(0))],
+            Capped::from_array([(ValidatorId::new(0), proposal(0))]),
         );
         let cert = BeaconCert::Skip(ratify_cert_for(&block));
         let bytes = hbor_to_vec(&CertifiedBeaconBlockWire { block, cert }).unwrap();
@@ -824,7 +828,7 @@ mod tests {
         let block = BeaconBlock::new(
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            Vec::new(),
+            Capped::empty(),
         );
         let bytes = hbor_to_vec(&CertifiedBeaconBlockWire {
             block,

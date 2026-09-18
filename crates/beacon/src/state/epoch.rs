@@ -1440,17 +1440,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BASIS_POINTS, BeaconProposal, BeaconWitnessLeafCount,
         BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin,
         CommittedTxsRoot, DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash,
-        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable, QuorumCertificate,
-        ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee, ShardForkProof,
-        ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield, SplitChildRoots,
-        Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots,
-        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
-        compute_range_proof, derive_reshape_trigger,
+        MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable,
+        QuorumCertificate, ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
+        ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
+        SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS,
+        TerminalRoots, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
+        compute_merkle_root, compute_range_proof, derive_reshape_trigger,
     };
 
     use super::*;
@@ -1605,14 +1606,18 @@ mod tests {
         payloads: &[ShardWitnessPayload],
         lo: usize,
         hi: usize,
-    ) -> (Vec<ShardWitnessPayload>, Vec<Hash>) {
+    ) -> (
+        Capped<Vec<ShardWitnessPayload>, MAX_WITNESSES_PER_SHARD>,
+        Capped<Vec<Hash>, MAX_RANGE_PROOF_NODES>,
+    ) {
         let leaf_hashes: Vec<Hash> = payloads
             .iter()
             .map(ShardWitnessPayload::leaf_hash)
             .collect();
         (
-            payloads[lo..hi].to_vec(),
-            compute_range_proof(&leaf_hashes, lo, hi),
+            Capped::new(payloads[lo..hi].to_vec()).expect("a chunk written out in a test"),
+            Capped::new(compute_range_proof(&leaf_hashes, lo, hi))
+                .expect("a proof written out in a test"),
         )
     }
 
@@ -1668,8 +1673,8 @@ mod tests {
                     shard,
                     ShardEpochContribution {
                         boundary_header: header,
-                        payloads,
-                        range_proof,
+                        payloads: Capped::new(payloads).expect("under the cap"),
+                        range_proof: Capped::new(range_proof).expect("under the cap"),
                     },
                 ))
                 .collect();
@@ -1749,8 +1754,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads,
-                range_proof,
+                payloads: Capped::new(payloads).expect("under the cap"),
+                range_proof: Capped::new(range_proof).expect("under the cap"),
             },
         ))
         .collect();
@@ -2038,8 +2043,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads,
-                range_proof,
+                payloads: Capped::new(payloads).expect("under the cap"),
+                range_proof: Capped::new(range_proof).expect("under the cap"),
             },
         ))
         .collect();
@@ -2276,8 +2281,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads,
-                range_proof,
+                payloads: Capped::new(payloads).expect("under the cap"),
+                range_proof: Capped::new(range_proof).expect("under the cap"),
             },
         ))
         .collect();
@@ -2324,8 +2329,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b.clone(),
-                payloads,
-                range_proof,
+                payloads: Capped::new(payloads).expect("under the cap"),
+                range_proof: Capped::new(range_proof).expect("under the cap"),
             },
         ))
         .collect();
@@ -2356,8 +2361,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads: Vec::new(),
-                range_proof: Vec::new(),
+                payloads: Capped::empty(),
+                range_proof: Capped::empty(),
             },
         ))
         .collect();
@@ -2434,8 +2439,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: header,
-                payloads,
-                range_proof,
+                payloads: Capped::new(payloads).expect("under the cap"),
+                range_proof: Capped::new(range_proof).expect("under the cap"),
             },
         ))
         .collect();
@@ -2537,8 +2542,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads: Vec::new(),
-                range_proof: Vec::new(),
+                payloads: Capped::empty(),
+                range_proof: Capped::empty(),
             },
         ))
         .collect();
@@ -2608,8 +2613,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads: Vec::new(),
-                range_proof: Vec::new(),
+                payloads: Capped::empty(),
+                range_proof: Capped::empty(),
             },
         ))
         .collect();
@@ -2793,7 +2798,15 @@ mod tests {
 
         // The crossing (height 5 > frontier 3) folds and clears the
         // recovery, but contributes nothing to the seed.
-        let (committed, contributions) = contribution_for(shard, b, (payloads, range_proof), 1_500);
+        let (committed, contributions) = contribution_for(
+            shard,
+            b,
+            (
+                Capped::new(payloads).expect("under the cap"),
+                Capped::new(range_proof).expect("under the cap"),
+            ),
+            1_500,
+        );
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2814,7 +2827,15 @@ mod tests {
         let (b2, payloads2, proof2) =
             boundary_block_with_payloads(shard, 9, 1_900, StateRoot::ZERO, Vec::new());
         let expected = b2.reveal_chain();
-        let (committed, contributions) = contribution_for(shard, b2, (payloads2, proof2), 2_500);
+        let (committed, contributions) = contribution_for(
+            shard,
+            b2,
+            (
+                Capped::new(payloads2).expect("under the cap"),
+                Capped::new(proof2).expect("under the cap"),
+            ),
+            2_500,
+        );
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2839,7 +2860,15 @@ mod tests {
         let (b, payloads, range_proof) =
             boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, Vec::new());
         let expected = b.reveal_chain();
-        let (committed, contributions) = contribution_for(shard, b, (payloads, range_proof), 1_500);
+        let (committed, contributions) = contribution_for(
+            shard,
+            b,
+            (
+                Capped::new(payloads).expect("under the cap"),
+                Capped::new(range_proof).expect("under the cap"),
+            ),
+            1_500,
+        );
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2944,8 +2973,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                payloads,
-                range_proof,
+                payloads: Capped::new(payloads).expect("under the cap"),
+                range_proof: Capped::new(range_proof).expect("under the cap"),
             },
         ))
         .collect();
@@ -3227,7 +3256,10 @@ mod tests {
     fn contribution_for(
         shard: ShardId,
         header: BlockHeader,
-        chunk: (Vec<ShardWitnessPayload>, Vec<Hash>),
+        chunk: (
+            Capped<Vec<ShardWitnessPayload>, MAX_WITNESSES_PER_SHARD>,
+            Capped<Vec<Hash>, MAX_RANGE_PROOF_NODES>,
+        ),
         qc_wt: u64,
     ) -> (
         Vec<(ValidatorId, BeaconProposal)>,
@@ -3267,8 +3299,15 @@ mod tests {
 
         let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
-        let (committed, contributions) =
-            contribution_for(parent, header.clone(), (payloads, range_proof), 2_500);
+        let (committed, contributions) = contribution_for(
+            parent,
+            header.clone(),
+            (
+                Capped::new(payloads).expect("under the cap"),
+                Capped::new(range_proof).expect("under the cap"),
+            ),
+            2_500,
+        );
 
         record_boundaries(
             &BlsVerifier,
@@ -3314,8 +3353,15 @@ mod tests {
         };
         let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, forged, composed, 3, None);
-        let (committed, contributions) =
-            contribution_for(parent, header, (payloads, range_proof), 2_500);
+        let (committed, contributions) = contribution_for(
+            parent,
+            header,
+            (
+                Capped::new(payloads).expect("under the cap"),
+                Capped::new(range_proof).expect("under the cap"),
+            ),
+            2_500,
+        );
 
         record_boundaries(
             &BlsVerifier,
@@ -3346,8 +3392,15 @@ mod tests {
 
         let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 900, pair, composed, 3, None);
-        let (committed, contributions) =
-            contribution_for(parent, header, (payloads, range_proof), 1_500);
+        let (committed, contributions) = contribution_for(
+            parent,
+            header,
+            (
+                Capped::new(payloads).expect("under the cap"),
+                Capped::new(range_proof).expect("under the cap"),
+            ),
+            1_500,
+        );
 
         record_boundaries(
             &BlsVerifier,
@@ -3460,8 +3513,15 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
-        let (committed, contributions) =
-            contribution_for(parent, header, (payloads, range_proof), 2_500);
+        let (committed, contributions) = contribution_for(
+            parent,
+            header,
+            (
+                Capped::new(payloads).expect("under the cap"),
+                Capped::new(range_proof).expect("under the cap"),
+            ),
+            2_500,
+        );
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3544,8 +3604,15 @@ mod tests {
         };
         let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 599_000, pair, composed, 3, Some(roots));
-        let (committed, contributions) =
-            contribution_for(parent, header, (payloads, range_proof), 601_000);
+        let (committed, contributions) = contribution_for(
+            parent,
+            header,
+            (
+                Capped::new(payloads).expect("under the cap"),
+                Capped::new(range_proof).expect("under the cap"),
+            ),
+            601_000,
+        );
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3628,8 +3695,15 @@ mod tests {
         // The terminal contribution finally lands: it seeds both children.
         let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
-        let (committed, contributions) =
-            contribution_for(parent, header, (payloads, range_proof), 2_500);
+        let (committed, contributions) = contribution_for(
+            parent,
+            header,
+            (
+                Capped::new(payloads).expect("under the cap"),
+                Capped::new(range_proof).expect("under the cap"),
+            ),
+            2_500,
+        );
         let later = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 6);
         record_boundaries(
             &BlsVerifier,
@@ -4005,16 +4079,16 @@ mod tests {
                 left,
                 ShardEpochContribution {
                     boundary_header: lh.clone(),
-                    payloads: lw,
-                    range_proof: lw_proof,
+                    payloads: Capped::new(lw).expect("under the cap"),
+                    range_proof: Capped::new(lw_proof).expect("under the cap"),
                 },
             ),
             (
                 right,
                 ShardEpochContribution {
                     boundary_header: rh.clone(),
-                    payloads: rw,
-                    range_proof: rw_proof,
+                    payloads: Capped::new(rw).expect("under the cap"),
+                    range_proof: Capped::new(rw_proof).expect("under the cap"),
                 },
             ),
         ]
@@ -4081,16 +4155,16 @@ mod tests {
                 left,
                 ShardEpochContribution {
                     boundary_header: span_header,
-                    payloads: span_witnesses,
-                    range_proof: span_witnesses_proof,
+                    payloads: Capped::new(span_witnesses).expect("under the cap"),
+                    range_proof: Capped::new(span_witnesses_proof).expect("under the cap"),
                 },
             ),
             (
                 right,
                 ShardEpochContribution {
                     boundary_header: rh.clone(),
-                    payloads: rw,
-                    range_proof: rw_proof,
+                    payloads: Capped::new(rw).expect("under the cap"),
+                    range_proof: Capped::new(rw_proof).expect("under the cap"),
                 },
             ),
         ]
@@ -4135,8 +4209,8 @@ mod tests {
             left,
             ShardEpochContribution {
                 boundary_header: coast_header.clone(),
-                payloads: coast_witnesses,
-                range_proof: coast_witnesses_proof,
+                payloads: Capped::new(coast_witnesses).expect("under the cap"),
+                range_proof: Capped::new(coast_witnesses_proof).expect("under the cap"),
             },
         ))
         .collect();
@@ -4163,9 +4237,11 @@ mod tests {
     fn a_lone_terminal_child_holds_until_its_sibling_composes_the_parent() {
         let (mut state, parent, left_root, right_root) = merge_terminating_state();
         let (left, right) = parent.children();
-        let (lh, lw, lw_proof) =
+        // Neither child's boundary block carries a witness leaf, so
+        // every contribution below names the empty window.
+        let (lh, ..) =
             boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None, None);
-        let (rh, rw, rw_proof) =
+        let (rh, ..) =
             boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
 
         // Both children's terminal records, sourced together — the
@@ -4189,16 +4265,16 @@ mod tests {
                     left,
                     ShardEpochContribution {
                         boundary_header: lh.clone(),
-                        payloads: lw.clone(),
-                        range_proof: lw_proof.clone(),
+                        payloads: Capped::empty(),
+                        range_proof: Capped::empty(),
                     },
                 ),
                 (
                     right,
                     ShardEpochContribution {
                         boundary_header: rh.clone(),
-                        payloads: rw.clone(),
-                        range_proof: rw_proof.clone(),
+                        payloads: Capped::empty(),
+                        range_proof: Capped::empty(),
                     },
                 ),
             ]
@@ -4210,7 +4286,7 @@ mod tests {
         // Fold E: only the left child terminates. It is held (the parent
         // can't compose without the sibling) and the parent stays pending.
         let (committed, contributions) =
-            contribution_for(left, lh.clone(), (lw.clone(), lw_proof.clone()), 2_500);
+            contribution_for(left, lh.clone(), (Capped::empty(), Capped::empty()), 2_500);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -4232,7 +4308,7 @@ mod tests {
         // terminal record, so the compose no longer hinges on both terminals
         // landing in a single fold (the case staggered witness fetches miss).
         let (committed, contributions) =
-            contribution_for(right, rh.clone(), (rw.clone(), rw_proof.clone()), 2_500);
+            contribution_for(right, rh.clone(), (Capped::empty(), Capped::empty()), 2_500);
         record_boundaries(
             &BlsVerifier,
             &mut state,

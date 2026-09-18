@@ -50,7 +50,7 @@ impl NetworkMessage for GetStateRangeResponse {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_hbor::{Bytes, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
     use crate::test_utils::test_key;
@@ -68,7 +68,7 @@ mod tests {
     fn test_hbor_roundtrip_chunk() {
         let leaf = SubstateLeaf {
             key: test_key(7u8),
-            value: vec![9u8; 128],
+            value: Bytes::from_array([9u8; 128]),
         };
         let response = GetStateRangeResponse {
             chunk: Some(StateRangeChunk {

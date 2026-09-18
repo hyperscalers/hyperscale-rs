@@ -8,6 +8,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
@@ -139,7 +140,9 @@ impl BoundaryStore for SimShardStorage {
 
         let mut staging = write_or_recover(&self.import_staging);
         for leaf in leaves {
-            staging.leaves.insert(leaf.key, leaf.value.clone());
+            staging
+                .leaves
+                .insert(leaf.key, leaf.value.clone().into_inner());
         }
         staging.progress = Some(progress.clone());
         drop(staging);
@@ -187,7 +190,10 @@ impl BoundaryStore for SimShardStorage {
         drop(staging);
         let leaves: Vec<SubstateLeaf> = staged
             .into_iter()
-            .map(|(key, value)| SubstateLeaf { key, value })
+            .map(|(key, value)| SubstateLeaf {
+                key,
+                value: Bytes::new(value).expect("a list under the cap its source already met"),
+            })
             .collect();
 
         let root_path = state.tree_store.root_path();
@@ -214,10 +220,14 @@ impl BoundaryStore for SimShardStorage {
                 state.current_entries.insert(entry_key, Arc::from(value));
             }
             if let Some(package) = package {
-                state.package_artifacts.insert(package, leaf.value.clone());
+                state
+                    .package_artifacts
+                    .insert(package, leaf.value.clone().into_inner());
             }
             sweep_rows.delta(leaf.key.owner, None, sweep);
-            state.current_state.insert(leaf.key, Arc::from(leaf.value));
+            state
+                .current_state
+                .insert(leaf.key, Arc::from(leaf.value.into_inner()));
         }
         state.sweep_index.fold(&sweep_rows);
 
@@ -306,7 +316,7 @@ impl BoundaryStore for SimShardStorage {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Capped;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
@@ -338,7 +348,7 @@ mod tests {
         progress.cursors[0].done = false;
         let leaf = SubstateLeaf {
             key: test_key(0x42),
-            value: vec![1],
+            value: Bytes::from_array([1]),
         };
         storage.stage_import_chunk(&progress, &[leaf]).unwrap();
 

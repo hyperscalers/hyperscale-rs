@@ -717,10 +717,10 @@ mod tests {
             BlockHeight::new(1),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(
+            Capped::from_array([ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(b"outbound-tx")),
-                vec![],
-            )],
+                Capped::empty(),
+            )]),
         )));
         let _ = node.handle(
             LocalTimestamp::ZERO,

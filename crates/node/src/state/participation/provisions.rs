@@ -72,6 +72,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         BlockHeight, LocalTimestamp, MerkleInclusionProof, Provisions, ShardId, Verified,
         WeightedTimestamp,
@@ -97,7 +98,7 @@ mod tests {
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 MerkleInclusionProof::dummy(),
-                vec![],
+                Capped::from_array([]),
             ))
             .into(),
         );
