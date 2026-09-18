@@ -1,6 +1,6 @@
 //! Shard-witness fetch response.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     Hash, MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MessageClass, NetworkMessage,
@@ -31,12 +31,10 @@ use crate::{
 pub struct GetShardWitnessesResponse {
     /// Witness payloads in leaf-index order, starting at the request's
     /// `lo`.
-    #[hbor(max = MAX_WITNESSES_PER_SHARD)]
-    pub payloads: Vec<ShardWitnessPayload>,
+    pub payloads: Capped<Vec<ShardWitnessPayload>, MAX_WITNESSES_PER_SHARD>,
     /// Flanking merkle nodes lifting `payloads` to the anchor block's
     /// beacon-witness root.
-    #[hbor(max = MAX_RANGE_PROOF_NODES)]
-    pub range_proof: Vec<Hash>,
+    pub range_proof: Capped<Vec<Hash>, MAX_RANGE_PROOF_NODES>,
 }
 
 impl GetShardWitnessesResponse {
@@ -47,7 +45,10 @@ impl GetShardWitnessesResponse {
     /// Panics if `payloads.len() > MAX_WITNESSES_PER_SHARD` or
     /// `range_proof.len() > MAX_RANGE_PROOF_NODES`.
     #[must_use]
-    pub const fn new(payloads: Vec<ShardWitnessPayload>, range_proof: Vec<Hash>) -> Self {
+    pub const fn new(
+        payloads: Capped<Vec<ShardWitnessPayload>, MAX_WITNESSES_PER_SHARD>,
+        range_proof: Capped<Vec<Hash>, MAX_RANGE_PROOF_NODES>,
+    ) -> Self {
         Self {
             payloads,
             range_proof,
@@ -58,8 +59,8 @@ impl GetShardWitnessesResponse {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            payloads: Vec::new(),
-            range_proof: Vec::new(),
+            payloads: Capped::empty(),
+            range_proof: Capped::empty(),
         }
     }
 }
@@ -91,8 +92,8 @@ mod tests {
     #[test]
     fn hbor_round_trip_populated() {
         let resp = GetShardWitnessesResponse::new(
-            vec![sample_payload(1), sample_payload(2), sample_payload(42)],
-            vec![Hash::from_bytes(b"flank0"), Hash::from_bytes(b"flank1")],
+            Capped::from_array([sample_payload(1), sample_payload(2), sample_payload(42)]),
+            Capped::from_array([Hash::from_bytes(b"flank0"), Hash::from_bytes(b"flank1")]),
         );
         let bytes = hbor_to_vec(&resp).unwrap();
         let decoded: GetShardWitnessesResponse = hbor_from_slice(&bytes).unwrap();

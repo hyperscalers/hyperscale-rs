@@ -143,14 +143,12 @@ pub fn serve_committed_txs_request<S: ShardStorage>(
         return GetCommittedTxsResponse::not_found();
     };
 
-    let verdicts = req
-        .tx_hashes
-        .iter()
-        .map(|tx_hash| {
-            prove_committed_tx_absent(&members, tx_hash)
-                .map_or(CommittedTxVerdict::Committed, CommittedTxVerdict::Absent)
-        })
-        .collect();
+    // One verdict per hash asked, so the answer is under the cap the
+    // request already met.
+    let verdicts = req.tx_hashes.map(|tx_hash| {
+        prove_committed_tx_absent(&members, tx_hash)
+            .map_or(CommittedTxVerdict::Committed, CommittedTxVerdict::Absent)
+    });
     record_fetch_response_sent("committed_txs", 1);
     GetCommittedTxsResponse::found(verdicts)
 }
@@ -159,6 +157,7 @@ pub fn serve_committed_txs_request<S: ShardStorage>(
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_storage::test_helpers::{commit_settled_at, make_test_certified};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_transaction;
@@ -282,7 +281,7 @@ mod tests {
         let req = GetCommittedTxsRequest::new(
             BlockHeight::new(3),
             terminal,
-            vec![tx_hash(1), tx_hash(5), absent],
+            Capped::from_array([tx_hash(1), tx_hash(5), absent]),
         );
         let verdicts =
             serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
@@ -322,7 +321,11 @@ mod tests {
     fn no_committed_transaction_is_shown_absent() {
         let (pending_chain, terminal) = chain();
         let committed: Vec<TxHash> = (1..=6u8).map(tx_hash).collect();
-        let req = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, committed.clone());
+        let req = GetCommittedTxsRequest::new(
+            BlockHeight::new(3),
+            terminal,
+            Capped::new(committed.clone()).expect("a list written out in a test"),
+        );
         let verdicts =
             serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
                 .verdicts
@@ -350,7 +353,11 @@ mod tests {
         let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
 
         let below_floor = tx_hash(10);
-        let req = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, vec![below_floor]);
+        let req = GetCommittedTxsRequest::new(
+            BlockHeight::new(3),
+            terminal,
+            Capped::from_array([below_floor]),
+        );
         let verdicts =
             serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
                 .verdicts
@@ -369,11 +376,11 @@ mod tests {
     #[test]
     fn an_empty_query_answers_empty() {
         let (pending_chain, terminal) = chain();
-        let req = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, Vec::new());
+        let req = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, Capped::empty());
         assert_eq!(
             serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
                 .verdicts,
-            Some(Vec::new())
+            Some(Capped::empty())
         );
     }
 
@@ -384,7 +391,7 @@ mod tests {
         let req = GetCommittedTxsRequest::new(
             BlockHeight::new(3),
             BlockHash::from_raw(Hash::from_bytes(b"other-chain")),
-            vec![tx_hash(1)],
+            Capped::from_array([tx_hash(1)]),
         );
         assert!(
             serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
@@ -410,7 +417,11 @@ mod tests {
         let cache = CommittedTxsCache::default();
 
         let ask = |probe: TxHash| {
-            let req = GetCommittedTxsRequest::new(BlockHeight::new(3), parent, vec![probe]);
+            let req = GetCommittedTxsRequest::new(
+                BlockHeight::new(3),
+                parent,
+                Capped::from_array([probe]),
+            );
             serve_committed_txs_request(&pending_chain, &cache, &req)
                 .verdicts
                 .expect("terminal block is held")
@@ -442,10 +453,14 @@ mod tests {
         let (pending_chain, terminal) = chain();
         let cache = CommittedTxsCache::default();
 
-        let first = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, vec![tx_hash(1)]);
+        let first = GetCommittedTxsRequest::new(
+            BlockHeight::new(3),
+            terminal,
+            Capped::from_array([tx_hash(1)]),
+        );
         assert_eq!(
             serve_committed_txs_request(&pending_chain, &cache, &first).verdicts,
-            Some(vec![CommittedTxVerdict::Committed]),
+            Some(Capped::from_array([CommittedTxVerdict::Committed])),
         );
 
         // Same height, different terminal: the cache must miss and the
@@ -453,7 +468,7 @@ mod tests {
         let forged = GetCommittedTxsRequest::new(
             BlockHeight::new(3),
             BlockHash::from_raw(Hash::from_bytes(b"other-chain")),
-            vec![tx_hash(1)],
+            Capped::from_array([tx_hash(1)]),
         );
         assert!(
             serve_committed_txs_request(&pending_chain, &cache, &forged)
@@ -473,7 +488,11 @@ mod tests {
         let plain = commit_block_without_terminal_roots(&storage, 2, rooted, 2_000, &[2]);
         let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
 
-        let req = GetCommittedTxsRequest::new(BlockHeight::new(2), plain, vec![tx_hash(1)]);
+        let req = GetCommittedTxsRequest::new(
+            BlockHeight::new(2),
+            plain,
+            Capped::from_array([tx_hash(1)]),
+        );
         assert!(
             serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
                 .verdicts
@@ -481,7 +500,11 @@ mod tests {
             "the block is held and its hash matches; what it lacks is the root"
         );
 
-        let req = GetCommittedTxsRequest::new(BlockHeight::new(1), rooted, vec![tx_hash(1)]);
+        let req = GetCommittedTxsRequest::new(
+            BlockHeight::new(1),
+            rooted,
+            Capped::from_array([tx_hash(1)]),
+        );
         assert!(
             serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
                 .verdicts
@@ -495,8 +518,11 @@ mod tests {
     fn unheld_height_serves_not_found() {
         let pending_chain =
             PendingChain::new(Arc::new(SimShardStorage::default()), ChainOrigin::ROOT);
-        let req =
-            GetCommittedTxsRequest::new(BlockHeight::new(7), BlockHash::ZERO, vec![tx_hash(1)]);
+        let req = GetCommittedTxsRequest::new(
+            BlockHeight::new(7),
+            BlockHash::ZERO,
+            Capped::from_array([tx_hash(1)]),
+        );
         assert!(
             serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
                 .verdicts

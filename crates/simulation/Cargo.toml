@@ -22,6 +22,7 @@ hyperscale-core.workspace = true
 hyperscale-shard.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
+hyperscale-hbor.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-network.workspace = true
 hyperscale-network-memory.workspace = true
@@ -37,7 +38,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-effects-bridge.workspace = true
-hyperscale-hbor.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 hyperscale-metrics.workspace = true
 hyperscale-metrics-memory.workspace = true

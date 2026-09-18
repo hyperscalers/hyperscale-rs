@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Transaction};
 
@@ -14,8 +14,7 @@ use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Transaction};
 pub struct GetTransactionsResponse {
     /// The requested transactions that were found.
     /// Uses Arc to avoid copying transaction data.
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    pub(crate) transactions: Vec<Arc<Transaction>>,
+    pub(crate) transactions: Capped<Vec<Arc<Transaction>>, MAX_TXS_PER_BLOCK>,
 }
 
 impl GetTransactionsResponse {
@@ -25,7 +24,7 @@ impl GetTransactionsResponse {
     ///
     /// Panics if `transactions.len() > MAX_TXS_PER_BLOCK`.
     #[must_use]
-    pub const fn new(transactions: Vec<Arc<Transaction>>) -> Self {
+    pub const fn new(transactions: Capped<Vec<Arc<Transaction>>, MAX_TXS_PER_BLOCK>) -> Self {
         Self { transactions }
     }
 
@@ -33,26 +32,26 @@ impl GetTransactionsResponse {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            transactions: Vec::new(),
+            transactions: Capped::empty(),
         }
     }
 
     /// Get the number of transactions in the response.
     #[must_use]
-    pub const fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.transactions.len()
     }
 
     /// Check if the response is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
 
     /// Consume and return the transactions.
     #[must_use]
     pub fn into_transactions(self) -> Vec<Arc<Transaction>> {
-        self.transactions
+        self.transactions.into_inner()
     }
 }
 
@@ -94,7 +93,7 @@ mod tests {
         let tx1 = Arc::new(test_transaction(1));
         let tx2 = Arc::new(test_transaction(2));
 
-        let response = GetTransactionsResponse::new(vec![tx1, tx2]);
+        let response = GetTransactionsResponse::new(Capped::from_array([tx1, tx2]));
         assert_eq!(response.count(), 2);
         assert!(!response.is_empty());
     }
@@ -111,7 +110,7 @@ mod tests {
         let tx1 = Arc::new(test_transaction(1));
         let tx2 = Arc::new(test_transaction(2));
 
-        let response = GetTransactionsResponse::new(vec![tx1, tx2]);
+        let response = GetTransactionsResponse::new(Capped::from_array([tx1, tx2]));
 
         let encoded = hbor_to_vec(&response).expect("encode");
         let decoded: GetTransactionsResponse = hbor_from_slice(&encoded).expect("decode");

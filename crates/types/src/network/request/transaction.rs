@@ -1,6 +1,6 @@
 //! Transaction fetch request.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::response::GetTransactionsResponse;
 use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Request, TxHash};
@@ -17,20 +17,19 @@ pub struct GetTransactionsRequest {
     /// The response is capped the same way: a request asks for the
     /// transactions a block names, and a block carries at most this
     /// many.
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    pub tx_hashes: Vec<TxHash>,
+    pub tx_hashes: Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK>,
 }
 
 impl GetTransactionsRequest {
     /// Create a new transaction fetch request.
     #[must_use]
-    pub const fn new(tx_hashes: Vec<TxHash>) -> Self {
+    pub const fn new(tx_hashes: Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK>) -> Self {
         Self { tx_hashes }
     }
 
     /// Get the number of transactions being requested.
     #[must_use]
-    pub const fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.tx_hashes.len()
     }
 }
@@ -70,14 +69,18 @@ mod tests {
             TxHash::from(Hash::from_bytes(b"tx3")),
         ];
 
-        let request = GetTransactionsRequest::new(tx_hashes.clone());
+        let request = GetTransactionsRequest::new(
+            Capped::new(tx_hashes.clone()).expect("a list written out in a test"),
+        );
         assert_eq!(request.tx_hashes, tx_hashes);
         assert_eq!(request.count(), 3);
     }
 
     #[test]
     fn test_hbor_roundtrip() {
-        let request = GetTransactionsRequest::new(vec![TxHash::from(Hash::from_bytes(b"tx1"))]);
+        let request = GetTransactionsRequest::new(Capped::from_array([TxHash::from(
+            Hash::from_bytes(b"tx1"),
+        )]));
         let bytes = hbor_to_vec(&request).unwrap();
         let decoded: GetTransactionsRequest = hbor_from_slice(&bytes).unwrap();
         assert_eq!(request, decoded);

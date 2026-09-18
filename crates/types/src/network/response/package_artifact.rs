@@ -1,6 +1,6 @@
 //! Package artifact fetch response (cross-shard code availability).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Bytes, Capped, Hbor};
 
 use crate::network::request::MAX_PACKAGE_ARTIFACTS_PER_REQUEST;
 use crate::{MAX_ARTIFACT_BYTES, MessageClass, NetworkMessage};
@@ -12,36 +12,19 @@ use crate::{MAX_ARTIFACT_BYTES, MessageClass, NetworkMessage};
 /// artifact by hashing it — the request's own ids are the only trust
 /// anchor, so no ids ride back.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-#[hbor(validate = artifacts_fit)]
 pub struct GetPackageArtifactsResponse {
-    /// The found artifacts' bytes.
-    #[hbor(max = MAX_PACKAGE_ARTIFACTS_PER_REQUEST)]
-    pub artifacts: Vec<Vec<u8>>,
-}
-
-/// No artifact is larger than the publish that could have carried it.
-///
-/// A protocol bound, not a guard on what decoding allocates — a claimed
-/// length the remaining input cannot satisfy is refused before any
-/// collection is built, so oversized bytes are unreachable either way.
-/// What this adds is that a well-formed frame still cannot name an
-/// artifact no publish transaction could have put on the chain.
-fn artifacts_fit(response: &GetPackageArtifactsResponse) -> Result<(), &'static str> {
-    if response
-        .artifacts
-        .iter()
-        .all(|artifact| artifact.len() <= MAX_ARTIFACT_BYTES)
-    {
-        Ok(())
-    } else {
-        Err("an artifact exceeds the publish byte cap")
-    }
+    /// The found artifacts' bytes, each no larger than the publish that
+    /// could have carried it — so a well-formed frame cannot name an
+    /// artifact no publish transaction could have put on the chain.
+    pub artifacts: Capped<Vec<Bytes<MAX_ARTIFACT_BYTES>>, MAX_PACKAGE_ARTIFACTS_PER_REQUEST>,
 }
 
 impl GetPackageArtifactsResponse {
     /// Build a response carrying the supplied artifacts.
     #[must_use]
-    pub const fn new(artifacts: Vec<Vec<u8>>) -> Self {
+    pub const fn new(
+        artifacts: Capped<Vec<Bytes<MAX_ARTIFACT_BYTES>>, MAX_PACKAGE_ARTIFACTS_PER_REQUEST>,
+    ) -> Self {
         Self { artifacts }
     }
 }

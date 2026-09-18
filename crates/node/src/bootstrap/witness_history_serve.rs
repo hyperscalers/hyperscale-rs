@@ -1,5 +1,6 @@
 //! Inbound snap-sync witness-history serving.
 
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::MAX_WITNESSES_PER_FETCH;
@@ -61,6 +62,13 @@ pub fn serve_witness_history_request<S: ShardStorage>(
         );
         return unavailable;
     }
+
+    // The clamped limit already holds the window under the cap; a chunk
+    // past it is one this answer cannot express, and no answer is better
+    // than one the joiner would refuse.
+    let Ok(payloads) = Capped::new(payloads) else {
+        return unavailable;
+    };
 
     record_fetch_response_sent("witness_history", payloads.len());
     GetWitnessHistoryResponse {

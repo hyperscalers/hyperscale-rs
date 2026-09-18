@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{PendingChain, ShardStorage, Substates};
@@ -18,7 +19,7 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{GetCellsResponse, GetStateProofResponse, RangeAnswer};
 use hyperscale_types::{
     EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, ProvenCells,
-    SubstateKey, entry_leaf_key,
+    entry_leaf_key,
 };
 
 /// Serve an inbound state-proof query from the committed chain.
@@ -108,13 +109,20 @@ pub fn serve_cells_request<S: ShardStorage>(
     // built, since only the walk knows what the leaves hold.
     let mut carried = 0usize;
 
-    let cells: Vec<(SubstateKey, Vec<u8>)> = req
-        .keys
-        .iter()
-        .filter_map(|key| at.cell(*key).map(|value| (*key, value)))
-        .collect();
-    for (_, value) in &cells {
+    let mut cells = Vec::with_capacity(req.keys.len());
+    for key in req.keys.iter() {
+        let Some(value) = at.cell(*key) else {
+            continue;
+        };
+        // A stored value past what the wire carries is one this answer
+        // cannot express, and leaving it out would prove the key absent
+        // when it is not — so the whole answer is declined instead.
+        let Ok(value) = Bytes::new(value) else {
+            record_fetch_response_sent("cells", 0);
+            return GetCellsResponse::not_found();
+        };
         carried = carried.saturating_add(value.len());
+        cells.push((*key, value));
     }
     if carried > MAX_CELLS_RESPONSE_BYTES {
         record_fetch_response_sent("cells", 0);
@@ -124,18 +132,24 @@ pub fn serve_cells_request<S: ShardStorage>(
     // Every leaf the answer stands on, so one multiproof covers the
     // whole of it: the keys as asked — an absent one is proven absent —
     // and an entry leaf per entry a range returned.
-    let mut leaves = req.keys.clone();
+    let mut leaves = req.keys.to_vec();
     let mut ranges = Vec::with_capacity(req.ranges.len());
     for range in &req.ranges {
-        let entries = at.entries_in_range(
+        let found = at.entries_in_range(
             range.owner,
             range.collection,
             range.lo,
             range.hi,
             range.cap as usize,
         );
-        for (_, value) in &entries {
+        let mut entries = Vec::with_capacity(found.len());
+        for (order, value) in found {
+            let Ok(value) = Bytes::new(value) else {
+                record_fetch_response_sent("cells", 0);
+                return GetCellsResponse::not_found();
+            };
             carried = carried.saturating_add(value.len());
+            entries.push((order, value));
         }
         if carried > MAX_CELLS_RESPONSE_BYTES {
             record_fetch_response_sent("cells", 0);
@@ -151,7 +165,10 @@ pub fn serve_cells_request<S: ShardStorage>(
                 },
             )
         }));
-        ranges.push(RangeAnswer { entries });
+        ranges.push(RangeAnswer {
+            entries: Capped::new(entries)
+                .expect("no more entries than the interval's own cap admits"),
+        });
     }
 
     generate_proof(view.as_ref(), &leaves, height).map_or_else(
@@ -161,7 +178,12 @@ pub fn serve_cells_request<S: ShardStorage>(
         },
         |proof| {
             record_fetch_response_sent("cells", leaves.len());
-            GetCellsResponse::found(cells, ranges, proof, (*anchor).clone().into_inner())
+            GetCellsResponse::found(
+                Capped::new(cells).expect("no more cells than the request named"),
+                Capped::new(ranges).expect("no more intervals than the request named"),
+                proof,
+                (*anchor).clone().into_inner(),
+            )
         },
     )
 }
@@ -202,6 +224,7 @@ pub fn serve_relayed_state_proof_request(
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_storage::test_helpers::{
         commit_settled_at, commit_writes, entry_key, make_settled_entries, make_test_certified,
     };
@@ -215,7 +238,7 @@ mod tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, Inclusion, ProposerTimestamp,
         QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield, StateRoot,
-        Transaction, Verifiable, WeightedTimestamp, WitnessSources,
+        SubstateKey, Transaction, Verifiable, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -313,7 +336,7 @@ mod tests {
 
         let refused = serve_state_proof_request(
             &chain,
-            &GetStateProofRequest::new(BlockHeight::new(1), vec![key]),
+            &GetStateProofRequest::new(BlockHeight::new(1), Capped::from_array([key])),
         );
         assert!(
             refused.proof.is_none(),
@@ -321,7 +344,7 @@ mod tests {
         );
         let served = serve_state_proof_request(
             &chain,
-            &GetStateProofRequest::new(BlockHeight::new(2), vec![key]),
+            &GetStateProofRequest::new(BlockHeight::new(2), Capped::from_array([key])),
         );
         assert!(served.proof.is_some(), "and the tip is still answered");
     }
@@ -374,7 +397,7 @@ mod tests {
 
         let refused = serve_cells_request(
             &chain,
-            &GetCellsRequest::new(Vec::new(), vec![whole_space(u32::MAX)]),
+            &GetCellsRequest::new(Capped::empty(), Capped::from_array([whole_space(u32::MAX)])),
         );
         assert!(
             refused.proof.is_none(),
@@ -388,8 +411,8 @@ mod tests {
         let split = serve_cells_request(
             &chain,
             &GetCellsRequest::new(
-                Vec::new(),
-                vec![whole_space(cap / 2 + 1), whole_space(cap / 2 + 1)],
+                Capped::empty(),
+                Capped::from_array([whole_space(cap / 2 + 1), whole_space(cap / 2 + 1)]),
             ),
         );
         assert!(
@@ -400,7 +423,7 @@ mod tests {
         // And what a declaration could have bought is still served.
         let served = serve_cells_request(
             &chain,
-            &GetCellsRequest::new(Vec::new(), vec![whole_space(cap)]),
+            &GetCellsRequest::new(Capped::empty(), Capped::from_array([whole_space(cap)])),
         );
         assert!(
             served.proof.is_some(),
@@ -443,8 +466,8 @@ mod tests {
         let refused = serve_cells_request(
             &chain,
             &GetCellsRequest::new(
-                Vec::new(),
-                vec![whole(u32::try_from(count).expect("a small count"))],
+                Capped::empty(),
+                Capped::from_array([whole(u32::try_from(count).expect("a small count"))]),
             ),
         );
         assert!(
@@ -457,8 +480,8 @@ mod tests {
         let served = serve_cells_request(
             &chain,
             &GetCellsRequest::new(
-                Vec::new(),
-                vec![whole(u32::try_from(count - 1).expect("a small count"))],
+                Capped::empty(),
+                Capped::from_array([whole(u32::try_from(count - 1).expect("a small count"))]),
             ),
         );
         assert!(
@@ -490,14 +513,14 @@ mod tests {
         let response = serve_cells_request(
             &chain,
             &GetCellsRequest::new(
-                Vec::new(),
-                vec![CellRange {
+                Capped::empty(),
+                Capped::from_array([CellRange {
                     owner,
                     collection,
                     lo: 2,
                     hi: u128::MAX,
                     cap: 3,
-                }],
+                }]),
             ),
         );
         let proof = response.proof.expect("the tip is answerable");
@@ -558,7 +581,10 @@ mod tests {
 
         let response = serve_state_proof_request(
             &chain,
-            &GetStateProofRequest::new(BlockHeight::new(1), keys.clone()),
+            &GetStateProofRequest::new(
+                BlockHeight::new(1),
+                Capped::new(keys.clone()).expect("a list written out in a test"),
+            ),
         );
         let proof = response.proof.expect("the height is held");
         let attested = proof.inclusions(root, SHARD, &keys).unwrap();
@@ -568,7 +594,10 @@ mod tests {
 
         let unheld = serve_state_proof_request(
             &chain,
-            &GetStateProofRequest::new(BlockHeight::new(7), keys),
+            &GetStateProofRequest::new(
+                BlockHeight::new(7),
+                Capped::new(keys).expect("a list written out in a test"),
+            ),
         );
         assert!(
             unheld.proof.is_none(),

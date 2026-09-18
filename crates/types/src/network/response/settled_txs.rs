@@ -1,6 +1,6 @@
 //! Settled-transaction window response for the split-boundary fence.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{MAX_FINALIZED_TX_PER_BLOCK, MessageClass, NetworkMessage, TxHash};
 
@@ -26,15 +26,14 @@ pub struct GetSettledTxsResponse {
     /// The terminated shard's complete settled-transaction window list, or
     /// `None` when this peer doesn't hold the terminal block — the
     /// requester rotates to another terminal-committee member.
-    #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    pub txs: Option<Vec<TxHash>>,
+    pub txs: Option<Capped<Vec<TxHash>, MAX_FINALIZED_TX_PER_BLOCK>>,
 }
 
 /// The window-list cap, checked at the wire boundary.
 impl GetSettledTxsResponse {
     /// A complete window list for the terminated shard.
     #[must_use]
-    pub const fn found(txs: Vec<TxHash>) -> Self {
+    pub const fn found(txs: Capped<Vec<TxHash>, MAX_FINALIZED_TX_PER_BLOCK>) -> Self {
         Self { txs: Some(txs) }
     }
 
@@ -72,8 +71,9 @@ mod tests {
 
     #[test]
     fn test_hbor_roundtrip_found() {
-        let response =
-            GetSettledTxsResponse::found(vec![TxHash::from(Hash::from_bytes(b"settled tx"))]);
+        let response = GetSettledTxsResponse::found(Capped::from_array([TxHash::from(
+            Hash::from_bytes(b"settled tx"),
+        )]));
         let encoded = hbor_to_vec(&response).unwrap();
         let decoded: GetSettledTxsResponse = hbor_from_slice(&encoded).unwrap();
         assert_eq!(response, decoded);

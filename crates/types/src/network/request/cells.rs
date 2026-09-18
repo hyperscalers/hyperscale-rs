@@ -19,7 +19,7 @@
 //! [`GetCellsResponse`](crate::network::response::GetCellsResponse) for
 //! what a served answer does and does not attest.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::response::GetCellsResponse;
 use crate::{
@@ -67,17 +67,18 @@ pub struct CellRange {
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetCellsRequest {
     /// Point cells to answer, present or absent.
-    #[hbor(max = MAX_PROOFS_PER_QUERY)]
-    pub keys: Vec<SubstateKey>,
+    pub keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
     /// Collection intervals to answer.
-    #[hbor(max = MAX_RANGES_PER_QUERY)]
-    pub ranges: Vec<CellRange>,
+    pub ranges: Capped<Vec<CellRange>, MAX_RANGES_PER_QUERY>,
 }
 
 impl GetCellsRequest {
     /// A request for `keys` and `ranges`.
     #[must_use]
-    pub const fn new(keys: Vec<SubstateKey>, ranges: Vec<CellRange>) -> Self {
+    pub const fn new(
+        keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
+        ranges: Capped<Vec<CellRange>, MAX_RANGES_PER_QUERY>,
+    ) -> Self {
         Self { keys, ranges }
     }
 }
@@ -110,14 +111,14 @@ mod tests {
     #[test]
     fn test_hbor_roundtrip() {
         let request = GetCellsRequest::new(
-            vec![test_key(7)],
-            vec![CellRange {
+            Capped::from_array([test_key(7)]),
+            Capped::from_array([CellRange {
                 owner: test_prefix(3),
                 collection: CollectionId([0xEE; 16]),
                 lo: 0,
                 hi: u128::MAX,
                 cap: 64,
-            }],
+            }]),
         );
         let encoded = hbor_to_vec(&request).unwrap();
         let decoded: GetCellsRequest = hbor_from_slice(&encoded).unwrap();

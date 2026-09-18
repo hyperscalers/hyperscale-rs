@@ -13,6 +13,7 @@ hyperscale-metrics.workspace = true
 hyperscale-dispatch.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
+hyperscale-hbor.workspace = true
 hyperscale-jmt.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-network.workspace = true
@@ -30,7 +31,6 @@ serde.workspace = true
 [dev-dependencies]
 hyperscale-engine = { workspace = true, features = ["test-utils"] }
 hyperscale-crypto-bls.workspace = true
-hyperscale-hbor.workspace = true
 hyperscale-dispatch-sync.workspace = true
 hyperscale-network-memory.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }

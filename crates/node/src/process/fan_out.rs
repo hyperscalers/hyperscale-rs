@@ -113,10 +113,10 @@ fn fold_attested(
     // rebuilt from what the server returned — so the proof is checked
     // against keys this node derived and never against a list the
     // server chose.
-    let served: BTreeMap<SubstateKey, &Vec<u8>> = response
+    let served: BTreeMap<SubstateKey, &[u8]> = response
         .cells
         .iter()
-        .map(|(key, value)| (*key, value))
+        .map(|(key, value)| (*key, value.as_ref()))
         .collect();
     let mut leaves = Vec::with_capacity(ask.keys.len());
     // What the leaf holds, which for an entry is not the bare value: an
@@ -126,7 +126,7 @@ fn fold_attested(
     let mut claimed: Vec<Option<Vec<u8>>> = Vec::with_capacity(ask.keys.len());
     for key in &ask.keys {
         leaves.push(*key);
-        claimed.push(served.get(key).map(|value| (*value).clone()));
+        claimed.push(served.get(key).map(|value| (*value).to_vec()));
     }
     for (range, answer) in ask.ranges.iter().zip(&response.ranges) {
         for (order, value) in &answer.entries {
@@ -161,7 +161,10 @@ fn fold_attested(
         into.merge_entries(
             range.owner,
             range.collection,
-            answer.entries.iter().cloned(),
+            answer
+                .entries
+                .iter()
+                .map(|(order, value)| (*order, value.to_vec())),
         );
     }
     into.anchors.insert(shard, height);
@@ -318,7 +321,7 @@ fn absorb_own(
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
-    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
     use hyperscale_network::{GossipHandler, NotificationHandler, RequestError, RequestHandler};
     use hyperscale_storage::test_helpers::{
         commit_settled_at, commit_writes, entry_key, make_settled_entries, make_test_certified,
@@ -411,14 +414,14 @@ mod tests {
     fn one_range() -> DeclaredReads {
         let key = entry_key(OWNER_SEED, 0);
         DeclaredReads {
-            keys: Vec::new(),
-            ranges: vec![CellRange {
+            keys: Capped::empty(),
+            ranges: Capped::from_array([CellRange {
                 owner: key.owner,
                 collection: key.collection,
                 lo: 0,
                 hi: u128::MAX,
                 cap: 4,
-            }],
+            }]),
         }
     }
 
@@ -494,7 +497,7 @@ mod tests {
         let topology = Arc::new(committee.topology_snapshot(1));
         let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
 
-        tampered.ranges[0].entries[0].1 = vec![0xFF; 4];
+        tampered.ranges[0].entries[0].1 = Bytes::from_array([0xFF; 4]);
         let lying = Answering {
             response: tampered,
             verdict: std::sync::Mutex::new(None),
@@ -545,7 +548,7 @@ mod tests {
         assert_eq!(into.entries.len(), 1, "and the entries it carried are kept");
 
         let mut tampered = response.clone();
-        tampered.ranges[0].entries[0].1 = vec![0xFF; 4];
+        tampered.ranges[0].entries[0].1 = Bytes::from_array([0xFF; 4]);
         let mut nothing = FetchedCells::default();
         assert!(
             !fold_attested(
@@ -665,7 +668,10 @@ mod tests {
         let proof = response.proof.clone().expect("the tip is answerable");
 
         let mut volunteered = response;
-        volunteered.cells.push((test_key(0x5A), vec![0xAB; 8]));
+        volunteered
+            .cells
+            .push((test_key(0x5A), Bytes::from_array([0xAB; 8])))
+            .expect("under the cell cap");
 
         let mut into = FetchedCells::default();
         assert!(

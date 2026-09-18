@@ -17,6 +17,7 @@ use hyperscale_core::{
     Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput, fold_state_writes};
@@ -403,7 +404,8 @@ where
                 tracing::error!("cannot sign execution certificate batch; skipping broadcast");
                 return;
             };
-            let batch = ExecutionCertificatesNotification::new(vec![cert], ctx.me, sig);
+            let batch =
+                ExecutionCertificatesNotification::new(Capped::from_array([cert]), ctx.me, sig);
             ctx.network.notify(&recipients, &batch);
         }
 

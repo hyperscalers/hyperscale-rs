@@ -1,6 +1,6 @@
 //! Finalization fetch request (intra-shard DA).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::response::GetFinalizationsResponse;
 use crate::{FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MessageClass, NetworkMessage, Request};
@@ -18,14 +18,15 @@ pub struct GetFinalizationsRequest {
     ///
     /// A block names at most this many, and a request asks for the ones
     /// a block names.
-    #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    pub finalization_hashes: Vec<FinalizationHash>,
+    pub finalization_hashes: Capped<Vec<FinalizationHash>, MAX_FINALIZED_TX_PER_BLOCK>,
 }
 
 impl GetFinalizationsRequest {
     /// Build a request for the listed `finalization_hashes`.
     #[must_use]
-    pub const fn new(finalization_hashes: Vec<FinalizationHash>) -> Self {
+    pub const fn new(
+        finalization_hashes: Capped<Vec<FinalizationHash>, MAX_FINALIZED_TX_PER_BLOCK>,
+    ) -> Self {
         Self {
             finalization_hashes,
         }
@@ -61,10 +62,10 @@ mod tests {
     #[test]
     fn test_hbor_roundtrip() {
         let request = GetFinalizationsRequest {
-            finalization_hashes: vec![
+            finalization_hashes: Capped::from_array([
                 FinalizationHash::from_raw(Hash::from_bytes(b"one")),
                 FinalizationHash::from_raw(Hash::from_bytes(b"two")),
-            ],
+            ]),
         };
         let encoded = hbor_to_vec(&request).unwrap();
         let decoded: GetFinalizationsRequest = hbor_from_slice(&encoded).unwrap();

@@ -1,6 +1,6 @@
 //! Instance record fetch request (cross-shard component resolution).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 use hyperscale_vm_types::Address;
 
 use crate::network::response::GetInstanceRecordsResponse;
@@ -24,14 +24,13 @@ pub const MAX_INSTANCE_RECORDS_PER_REQUEST: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetInstanceRecordsRequest {
     /// The component addresses whose records are wanted.
-    #[hbor(max = MAX_INSTANCE_RECORDS_PER_REQUEST)]
-    pub instances: Vec<Address>,
+    pub instances: Capped<Vec<Address>, MAX_INSTANCE_RECORDS_PER_REQUEST>,
 }
 
 impl GetInstanceRecordsRequest {
     /// Build a request for the listed `instances`.
     #[must_use]
-    pub const fn new(instances: Vec<Address>) -> Self {
+    pub const fn new(instances: Capped<Vec<Address>, MAX_INSTANCE_RECORDS_PER_REQUEST>) -> Self {
         Self { instances }
     }
 }

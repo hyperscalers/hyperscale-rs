@@ -8,6 +8,7 @@
 //! the retained CF payloads, and answer with one contiguous run plus the
 //! range proof lifting it to the window's root.
 
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
@@ -48,6 +49,13 @@ pub fn serve_shard_witnesses_request<S: ShardStorage>(
     req: &GetShardWitnessesRequest,
 ) -> GetShardWitnessesResponse {
     let Some((payloads, range_proof)) = build_chunk(pending_chain, req) else {
+        record_fetch_response_sent("shard_witness", 0);
+        return GetShardWitnessesResponse::empty();
+    };
+    // A chunk past either cap is one this answer cannot express, and a
+    // proof covers the whole run — so a prefix would be a proof of
+    // something else.
+    let (Ok(payloads), Ok(range_proof)) = (Capped::new(payloads), Capped::new(range_proof)) else {
         record_fetch_response_sent("shard_witness", 0);
         return GetShardWitnessesResponse::empty();
     };

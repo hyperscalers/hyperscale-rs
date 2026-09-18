@@ -17,13 +17,13 @@
 //! against, the same way it can lose a race or miss a crossing. What it
 //! cannot be answered with is a value nobody wrote.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Bytes, Capped, Hbor};
 use hyperscale_jmt::MAX_PROOF_CLAIMS;
 
 use crate::network::request::MAX_RANGES_PER_QUERY;
 use crate::{
-    CertifiedBlockHeader, MAX_CELLS_PER_QUERY, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
-    MessageClass, NetworkMessage, SubstateKey,
+    CertifiedBlockHeader, MAX_CELL_VALUE_LEN, MAX_CELLS_PER_QUERY, MAX_PROOFS_PER_QUERY,
+    MerkleInclusionProof, MessageClass, NetworkMessage, SubstateKey,
 };
 
 /// The most entries one interval's answer may carry.
@@ -45,8 +45,7 @@ const _: () = assert!(MAX_CELLS_PER_QUERY <= MAX_ENTRIES_PER_ANSWER as u64);
 pub struct RangeAnswer {
     /// The entries found, `(order, value)`, ascending and no more than
     /// the interval's declared cap.
-    #[hbor(max = MAX_ENTRIES_PER_ANSWER)]
-    pub entries: Vec<(u128, Vec<u8>)>,
+    pub entries: Capped<Vec<(u128, Bytes<MAX_CELL_VALUE_LEN>)>, MAX_ENTRIES_PER_ANSWER>,
 }
 
 /// The values, and the proof they stand on, or nothing when the height
@@ -56,11 +55,9 @@ pub struct GetCellsResponse {
     /// The point cells that were present, in the request's own order of
     /// keys; a key the tree does not hold is absent from this and proven
     /// so by `proof`.
-    #[hbor(max = MAX_PROOFS_PER_QUERY)]
-    pub cells: Vec<(SubstateKey, Vec<u8>)>,
+    pub cells: Capped<Vec<(SubstateKey, Bytes<MAX_CELL_VALUE_LEN>)>, MAX_PROOFS_PER_QUERY>,
     /// One answer per requested interval, positionally.
-    #[hbor(max = MAX_RANGES_PER_QUERY)]
-    pub ranges: Vec<RangeAnswer>,
+    pub ranges: Capped<Vec<RangeAnswer>, MAX_RANGES_PER_QUERY>,
     /// A multiproof over every leaf above — the point keys asked, present
     /// or absent, and the entry leaves the intervals returned — against
     /// `anchor`'s state root. `None` when this peer cannot answer at all.
@@ -81,8 +78,8 @@ impl GetCellsResponse {
     /// A served answer.
     #[must_use]
     pub fn found(
-        cells: Vec<(SubstateKey, Vec<u8>)>,
-        ranges: Vec<RangeAnswer>,
+        cells: Capped<Vec<(SubstateKey, Bytes<MAX_CELL_VALUE_LEN>)>, MAX_PROOFS_PER_QUERY>,
+        ranges: Capped<Vec<RangeAnswer>, MAX_RANGES_PER_QUERY>,
         proof: MerkleInclusionProof,
         anchor: CertifiedBlockHeader,
     ) -> Self {
@@ -98,8 +95,8 @@ impl GetCellsResponse {
     #[must_use]
     pub const fn not_found() -> Self {
         Self {
-            cells: Vec::new(),
-            ranges: Vec::new(),
+            cells: Capped::empty(),
+            ranges: Capped::empty(),
             proof: None,
             anchor: None,
         }
@@ -129,10 +126,13 @@ mod tests {
         for response in [
             GetCellsResponse::not_found(),
             GetCellsResponse::found(
-                vec![(test_key(7), vec![1, 2, 3])],
-                vec![RangeAnswer {
-                    entries: vec![(0, vec![4, 5]), (9, vec![6])],
-                }],
+                Capped::from_array([(test_key(7), Bytes::from_array([1, 2, 3]))]),
+                Capped::from_array([RangeAnswer {
+                    entries: Capped::from_array([
+                        (0, Bytes::from_array([4, 5])),
+                        (9, Bytes::from_array([6])),
+                    ]),
+                }]),
                 MerkleInclusionProof::new(vec![1, 2, 3]),
                 CertifiedBlockHeader::new(
                     BlockHeader::new(BlockHeaderParts::default()),

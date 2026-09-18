@@ -22,6 +22,7 @@ use crossbeam::channel::Sender;
 use hyperscale_core::FetchIds;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::{Executor, artifact_package};
+use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
@@ -98,7 +99,9 @@ impl FetchBinding for PackageArtifactBinding {
         network.request(
             shard,
             preferred,
-            GetPackageArtifactsRequest::new(ids),
+            GetPackageArtifactsRequest::new(
+                Capped::new(ids).expect("the fetch config clamps a chunk to the artifact cap"),
+            ),
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
@@ -110,6 +113,7 @@ impl FetchBinding for PackageArtifactBinding {
                     let addressed: Vec<(Hash, Vec<u8>)> = resp
                         .artifacts
                         .into_iter()
+                        .map(Bytes::into_inner)
                         .map(|artifact| (artifact_package(&artifact), artifact))
                         .collect();
                     let split =

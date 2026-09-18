@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
 use hyperscale_types::network::request::GetLocalProvisionsRequest;
@@ -21,7 +22,10 @@ pub fn serve_local_provisions_request(
     verified_headers: &VerifiedHeaderBuffer,
     req: &GetLocalProvisionsRequest,
 ) -> GetLocalProvisionsResponse {
-    let mut entries = Vec::with_capacity(req.batch_hashes.len());
+    // One entry per hash asked, so the answer meets the cap the request
+    // already met; a hash past it is simply absent, which is what a
+    // partial answer already means here.
+    let mut entries = Capped::empty();
     for h in &req.batch_hashes {
         if let Some(provisions) = provision_store.get(*h) {
             // The buffer holds Verified handles; the wire form takes
@@ -30,10 +34,15 @@ pub fn serve_local_provisions_request(
             let source_header = verified_headers
                 .get((provisions.source_shard(), provisions.block_height()))
                 .map(|v| Arc::new(v.as_ref().clone().into_inner()));
-            entries.push(LocalProvisionEntry {
-                provisions,
-                source_header,
-            });
+            if entries
+                .push(LocalProvisionEntry {
+                    provisions,
+                    source_header,
+                })
+                .is_err()
+            {
+                break;
+            }
         }
     }
 

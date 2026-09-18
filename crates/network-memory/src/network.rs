@@ -1680,6 +1680,7 @@ fn gossip_message_id(entry: &OutboxEntry) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_network::{Network, RawRequestHandler};
     use rand::SeedableRng;
 
@@ -2839,11 +2840,9 @@ mod tests {
         let adapter0 = network.create_adapter(0);
 
         // Node 0 broadcasts a transaction via its adapter
-        let gossip = TransactionGossip::new(vec![Arc::new(test_transaction_with_prefixes(
-            &[1, 2, 3],
-            &[test_prefix(1)],
-            &[test_prefix(2)],
-        ))]);
+        let gossip = TransactionGossip::new(Capped::from_array([Arc::new(
+            test_transaction_with_prefixes(&[1, 2, 3], &[test_prefix(1)], &[test_prefix(2)]),
+        )]));
         Network::broadcast_to_shard(&adapter0, ShardId::leaf(1, 0), &gossip);
 
         // Drain and deliver via accept_gossip + flush_gossip

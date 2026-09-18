@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{Finalization, MessageClass, NetworkMessage};
 
@@ -24,8 +24,7 @@ pub struct GetFinalizationsResponse {
     ///
     /// `Arc`-wrapped because both the server-side cache and every
     /// downstream consumer hold `Finalization` behind `Arc` already.
-    #[hbor(max = MAX_FINALIZATIONS_PER_RESPONSE)]
-    pub finalizations: Vec<Arc<Finalization>>,
+    pub finalizations: Capped<Vec<Arc<Finalization>>, MAX_FINALIZATIONS_PER_RESPONSE>,
 }
 
 impl GetFinalizationsResponse {
@@ -35,7 +34,9 @@ impl GetFinalizationsResponse {
     ///
     /// Panics if `finalizations.len() > MAX_FINALIZATIONS_PER_RESPONSE`.
     #[must_use]
-    pub const fn new(finalizations: Vec<Arc<Finalization>>) -> Self {
+    pub const fn new(
+        finalizations: Capped<Vec<Arc<Finalization>>, MAX_FINALIZATIONS_PER_RESPONSE>,
+    ) -> Self {
         Self { finalizations }
     }
 
@@ -43,7 +44,7 @@ impl GetFinalizationsResponse {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            finalizations: Vec::new(),
+            finalizations: Capped::empty(),
         }
     }
 }

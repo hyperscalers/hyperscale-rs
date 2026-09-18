@@ -759,6 +759,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_hbor::Capped;
     use hyperscale_jmt::{Blake3Hasher, Hasher};
     use hyperscale_storage::test_helpers::pin_snap_sync_replica;
     use hyperscale_storage::{BoundaryStore, SubstateStore, WitnessSeed};
@@ -898,11 +899,12 @@ mod tests {
                 if let Some(chunk) = &mut response.chunk
                     && !chunk.leaves.is_empty()
                 {
-                    let mut leaves: Vec<_> = chunk.leaves.clone();
+                    let mut leaves: Vec<_> = chunk.leaves.clone().into_inner();
                     let mut value = leaves[0].value.clone();
                     value[0] ^= 1;
                     leaves[0].value = value;
-                    chunk.leaves = leaves;
+                    chunk.leaves =
+                        Capped::new(leaves).expect("the tampered chunk keeps its length");
                     rejected = matches!(
                         bootstrap.on_state_range(id, &response),
                         StateRangeOutcome::Rejected(_),

@@ -1,6 +1,6 @@
 //! Snap-sync beacon-witness history response.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     BlockHeader, MAX_WITNESSES_PER_FETCH, MessageClass, NetworkMessage, QuorumCertificate,
@@ -42,8 +42,7 @@ pub struct WitnessHistoryChunk {
     pub qc: QuorumCertificate,
     /// Leaf payloads from the requested `start_index`, in leaf-index
     /// order.
-    #[hbor(max = MAX_WITNESSES_PER_FETCH)]
-    pub payloads: Vec<ShardWitnessPayload>,
+    pub payloads: Capped<Vec<ShardWitnessPayload>, MAX_WITNESSES_PER_FETCH>,
     /// Whether leaves beyond the last returned remain below the
     /// header's leaf count — the joiner resumes at the next index.
     pub more: bool,
@@ -119,7 +118,7 @@ mod tests {
             history: Some(WitnessHistoryChunk {
                 header,
                 qc,
-                payloads: vec![
+                payloads: Capped::from_array([
                     ShardWitnessPayload::StakeDeposit {
                         pool_id: StakePoolId::new(1),
                         amount: Stake::from_whole_tokens(5),
@@ -128,7 +127,7 @@ mod tests {
                         pool_id: StakePoolId::new(2),
                         amount: Stake::from_whole_tokens(7),
                     },
-                ],
+                ]),
                 more: true,
             }),
         };

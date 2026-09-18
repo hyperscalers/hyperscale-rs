@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetFinalizationsRequest;
@@ -26,11 +27,19 @@ pub fn serve_finalizations_request<S: ShardStorage>(
     fw_cache: &QuickCache<FinalizationHash, Arc<Verifiable<Finalization>>>,
     req: &GetFinalizationsRequest,
 ) -> GetFinalizationsResponse {
-    let mut finalizations: Vec<Arc<Finalization>> = Vec::new();
+    // One finalization per hash asked, so the answer meets the cap the
+    // request already met; one past it is simply absent, which is what a
+    // partial answer already means here.
+    let mut finalizations = Capped::empty();
     let mut missing: Vec<FinalizationHash> = Vec::new();
     for id in &req.finalization_hashes {
         if let Some(fw) = fw_cache.get(id) {
-            finalizations.push(Arc::new(fw.as_unverified().clone()));
+            if finalizations
+                .push(Arc::new(fw.as_unverified().clone()))
+                .is_err()
+            {
+                break;
+            }
         } else {
             missing.push(*id);
         }
@@ -41,8 +50,9 @@ pub fn serve_finalizations_request<S: ShardStorage>(
         for cert in certs {
             if let Some(fw) =
                 Finalization::reconstruct(cert, |h| pending_chain.consensus_receipt(h))
+                && finalizations.push(Arc::new(fw)).is_err()
             {
-                finalizations.push(Arc::new(fw));
+                break;
             }
         }
     }

@@ -14,8 +14,8 @@ mod validator_address;
 pub use certified_block_header::CertifiedBlockHeaderGossip;
 pub use shard_fork_proof::ShardForkProofGossip;
 pub use shard_vote_equivocation::ShardVoteEquivocationGossip;
-pub use transaction::TransactionGossip;
+pub use transaction::{MAX_GOSSIP_TX_BATCH, TransactionGossip};
 pub use validator_address::{
-    MAX_ANNOUNCED_ADDRESS_BYTES, MAX_ANNOUNCED_ADDRESSES, MAX_ANNOUNCED_PEER_ID_BYTES,
-    ValidatorAddressGossip,
+    AnnouncedAddresses, MAX_ANNOUNCED_ADDRESS_BYTES, MAX_ANNOUNCED_ADDRESSES,
+    MAX_ANNOUNCED_PEER_ID_BYTES, ValidatorAddressGossip,
 };

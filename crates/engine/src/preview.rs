@@ -22,10 +22,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_effects_bridge::admit_package;
+use hyperscale_hbor::Capped;
 use hyperscale_storage::Substates;
-use hyperscale_types::network::request::CellRange;
+use hyperscale_types::network::request::{CellRange, MAX_RANGES_PER_QUERY};
 use hyperscale_types::{
-    Address, BlockHeight, CollectionId, Event, ShardId, ShardTrie, Transaction, WeightedTimestamp,
+    Address, BlockHeight, CollectionId, Event, MAX_PROOFS_PER_QUERY, ShardId, ShardTrie,
+    Transaction, WeightedTimestamp,
 };
 use hyperscale_vm_kernel::{EnvInputs, OwnerSet, Substates as KernelReads, decode_amount};
 use hyperscale_vm_preview::{Report as PreviewRun, Slack, preview as preview_run};
@@ -98,10 +100,13 @@ pub struct PreviewInputs {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeclaredReads {
     /// Point cells to answer, present or absent.
-    pub keys: Vec<SubstateKey>,
+    ///
+    /// Under the same cap the request that carries them is held to, so
+    /// a set this holds is one a fan-out can ask for.
+    pub keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
     /// Collection intervals to answer, each at the cap the declaration
     /// signed for.
-    pub ranges: Vec<CellRange>,
+    pub ranges: Capped<Vec<CellRange>, MAX_RANGES_PER_QUERY>,
 }
 
 impl Executor {
@@ -145,7 +150,9 @@ impl Executor {
         if !held.contains(&shard) {
             let asks = by_shard.entry(shard).or_default();
             if !asks.keys.contains(&vault) {
-                asks.keys.push(vault);
+                asks.keys
+                    .push(vault)
+                    .map_err(|_| "declared reads name more cells than one request carries")?;
             }
         }
         Ok(by_shard)
@@ -172,31 +179,40 @@ impl Executor {
             }
             let asks = by_shard.entry(shard).or_default();
             match target {
-                EffectTarget::Point(key) => asks.keys.push(key),
+                EffectTarget::Point(key) => asks
+                    .keys
+                    .push(key)
+                    .map_err(|_| "declared reads name more cells than one request carries")?,
                 EffectTarget::Entry {
                     owner,
                     collection,
                     order,
-                } => asks.ranges.push(CellRange {
-                    owner,
-                    collection,
-                    lo: order,
-                    hi: order,
-                    cap: 1,
-                }),
+                } => asks
+                    .ranges
+                    .push(CellRange {
+                        owner,
+                        collection,
+                        lo: order,
+                        hi: order,
+                        cap: 1,
+                    })
+                    .map_err(|_| "declared reads name more intervals than one request carries")?,
                 EffectTarget::Range {
                     owner,
                     collection,
                     lo,
                     hi,
                     cap,
-                } => asks.ranges.push(CellRange {
-                    owner,
-                    collection,
-                    lo,
-                    hi,
-                    cap,
-                }),
+                } => asks
+                    .ranges
+                    .push(CellRange {
+                        owner,
+                        collection,
+                        lo,
+                        hi,
+                        cap,
+                    })
+                    .map_err(|_| "declared reads name more intervals than one request carries")?,
             }
         }
         Ok(())

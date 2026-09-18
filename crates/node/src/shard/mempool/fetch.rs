@@ -8,6 +8,7 @@
 
 use crossbeam::channel::Sender;
 use hyperscale_core::FetchIds;
+use hyperscale_hbor::Capped;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetTransactionsRequest;
@@ -49,7 +50,9 @@ impl FetchBinding for TransactionBinding {
         network.request(
             shard,
             preferred,
-            GetTransactionsRequest::new(ids),
+            GetTransactionsRequest::new(
+                Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
+            ),
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {

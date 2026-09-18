@@ -22,6 +22,7 @@ use std::time::Duration;
 
 pub use deferred::{DeferredForRecords, DeferredOrigin, DeferredTransaction, Orphaned};
 pub use fetch::{TransactionBinding, TransactionFetch};
+use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::{ShardId, Transaction, TxHash};
 pub use serve::serve_transaction_request;
 
@@ -93,7 +94,10 @@ impl MempoolState {
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             deferred_records: DeferredForRecords::new(),
             outbound_gossip_batches: BTreeMap::new(),
-            tx_gossip_max: b.tx_gossip_max,
+            // The decode-side batch bound is the ceiling a configured
+            // flush point cannot pass: a batch past it is one the far
+            // end refuses whole.
+            tx_gossip_max: b.tx_gossip_max.min(MAX_GOSSIP_TX_BATCH),
             tx_gossip_window: b.tx_gossip_window,
         }
     }

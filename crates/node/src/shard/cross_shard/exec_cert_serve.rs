@@ -108,6 +108,7 @@ fn record(
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_storage::test_helpers::{
         commit_settled_at, make_test_block, make_test_certified, push_certificate,
     };
@@ -185,7 +186,7 @@ mod tests {
             &pending_chain,
             &store,
             &GetExecutionCertsRequest {
-                tx_hashes: vec![tx_hash],
+                tx_hashes: Capped::from_array([tx_hash]),
             },
         );
         let mut ticks: Vec<TickId> = answered

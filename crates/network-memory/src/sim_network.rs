@@ -322,6 +322,7 @@ impl Network for SimNetworkAdapter {
 mod tests {
     use std::sync::Mutex as StdMutex;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::network::gossip::TransactionGossip;
     use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
     use hyperscale_types::{BlockHeight, ShardId};
@@ -329,11 +330,9 @@ mod tests {
     use super::*;
 
     fn test_gossip() -> TransactionGossip {
-        TransactionGossip::new(vec![Arc::new(test_transaction_with_prefixes(
-            &[1, 2, 3],
-            &[test_prefix(1)],
-            &[test_prefix(2)],
-        ))])
+        TransactionGossip::new(Capped::from_array([Arc::new(
+            test_transaction_with_prefixes(&[1, 2, 3], &[test_prefix(1)], &[test_prefix(2)]),
+        )]))
     }
 
     #[test]
