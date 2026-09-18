@@ -7228,8 +7228,8 @@ mod tests {
         SettledTxsRoot, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
         TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
         TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
-        ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources, settled_set_verdict,
-        test_utils,
+        ValidatorSet, VoteCount, WeightedTimestamp, WindowLookup, WitnessSources,
+        settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -13494,7 +13494,7 @@ mod tests {
         );
         let stated = figures_of(b"tx").committed.committee_anchor;
         assert!(
-            matches!(sched.lookup(stated), ScheduleLookup::Evicted),
+            matches!(sched.lookup(stated), WindowLookup::Evicted),
             "and the name's own window must be gone",
         );
 

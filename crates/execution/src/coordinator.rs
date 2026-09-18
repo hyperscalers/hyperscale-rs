@@ -64,7 +64,8 @@ use hyperscale_types::{
     SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey,
     TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
     TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    Window, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    Window, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
+    tick_leader_at,
 };
 use tracing::instrument;
 
@@ -494,27 +495,24 @@ pub struct ExecutionCoordinator {
     local_shard: ShardId,
 }
 
-/// The window `wt` falls in, or the head where the schedule names none.
+/// The price table of the window `wt` falls in, or the head's where the
+/// schedule names none.
 ///
-/// What prices. A table is a property of the window and not of any
-/// shard's place in it, so this takes the plain lookup rather than the
-/// shard-clamped one a classification does. A split child replaying
-/// content its parent committed asks about an anchor before its own
-/// cut, where the clamp finds no committee for the child and answers
-/// the head — charging inherited content at a table it was never priced
-/// under, while the shard-side verifier resolves the window and
-/// refuses.
+/// A table is a property of the window and not of any shard's place in
+/// it, so this takes the plain lookup rather than the shard-clamped one
+/// a classification does. A split child replaying content its parent
+/// committed asks about an anchor before its own cut, where the clamp
+/// finds no committee for the child and answers the head — charging
+/// inherited content at a table it was never priced under, while the
+/// shard-side verifier resolves the window and refuses.
 ///
 /// The fallback is left for a window this node has not folded, which a
 /// committing block's own timestamp is not: its committee had to
 /// resolve for the block to be verified at all.
-fn pricing_window(
-    topology_schedule: &TopologySchedule,
-    wt: WeightedTimestamp,
-) -> &TopologySnapshot {
+fn prices_at(topology_schedule: &TopologySchedule, wt: WeightedTimestamp) -> PriceTable {
     topology_schedule
         .at(wt)
-        .map_or_else(|| topology_schedule.head().as_ref(), AsRef::as_ref)
+        .map_or_else(|| topology_schedule.head().prices(), WindowView::prices)
 }
 
 impl ExecutionCoordinator {
@@ -1204,10 +1202,10 @@ impl ExecutionCoordinator {
         if self.counterparts.held.is_empty() {
             return;
         }
-        let Some(committee) = topology_schedule.at(tick_ts) else {
+        let Some(window) = topology_schedule.at(tick_ts) else {
             return;
         };
-        let trie = committee.shard_trie();
+        let trie = window.shard_trie();
         let local_shard = self.local_shard;
         // One licence per issuing transaction, so records answered the
         // same way settle together and a record still waiting holds
@@ -1517,7 +1515,7 @@ impl ExecutionCoordinator {
         // The tick's own anchor prices what the tick itself composes:
         // a settlement is committed by the block being built, not by an
         // earlier one, so there is one table for all of them.
-        let tick_prices = pricing_window(topology_schedule, block.ts).prices();
+        let tick_prices = prices_at(topology_schedule, block.ts);
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_record_disposals(

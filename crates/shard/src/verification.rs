@@ -16,9 +16,9 @@ use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
-    ReshapeThresholds, RevealChain, ScheduleLookup, ShardId, SplitChildRoots, StateRoot,
-    SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TxHash,
-    TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
+    ReshapeThresholds, RevealChain, ShardId, SplitChildRoots, StateRoot, SubstateKey,
+    SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TxHash, TxsInFlight,
+    UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
     WeightedTimestamp,
 };
 use thiserror::Error;
@@ -28,26 +28,6 @@ use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witne
 use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
 use crate::proposal::late_deliveries;
-
-/// `anchor`'s window — the trie a delivered body is classified against
-/// and the table its price is weighed at — or `None` where no retained
-/// window carries the anchor.
-///
-/// A stand-in would not be a neutral answer. Under one shard every
-/// prefix resolves to it, so no body classifies as delivering here, no
-/// delivery is ever read as lapsed, and the block passes the arm the
-/// abandonment fence rests on — a permissive answer to the question that
-/// keeps a crossing from being claimed after its issuer may have taken it
-/// back. A window this cannot read is one to wait for.
-pub fn anchor_window(
-    schedule: &TopologySchedule,
-    anchor: WeightedTimestamp,
-) -> Option<&TopologySnapshot> {
-    match schedule.lookup(anchor) {
-        ScheduleLookup::Committee(snapshot) => Some(snapshot),
-        _ => None,
-    }
-}
 
 /// The committed cells `block` writes.
 ///
@@ -1014,8 +994,15 @@ impl VerificationPipeline {
         let anchor = block.header().parent_qc().weighted_timestamp();
         // No window, no check: the mark is not taken and no action goes
         // out, so the block stays pending and the next re-drive asks
-        // again — the same shape an unknown name takes.
-        let Some(window) = anchor_window(schedule, anchor) else {
+        // again — the same shape an unknown name takes. A stand-in would
+        // not be a neutral answer: under one shard every prefix resolves
+        // to it, so no body classifies as delivering here, no delivery
+        // is ever read as lapsed, and the block passes the arm the
+        // abandonment fence rests on — a permissive answer to the
+        // question that keeps a crossing from being claimed after its
+        // issuer may have taken it back. A window this cannot read is
+        // one to wait for.
+        let Some(window) = schedule.at(anchor) else {
             warn!(
                 ?block_hash,
                 ?anchor,

@@ -19,8 +19,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::hash::BuildHasher;
 
 use crate::{
-    BlockHash, BlockHeight, ScheduleLookup, SettledTxsRoot, ShardId, TopologySchedule, TxHash,
-    WeightedTimestamp,
+    BlockHash, BlockHeight, SettledTxsRoot, ShardId, TopologySchedule, TxHash, WeightedTimestamp,
+    WindowLookup,
 };
 
 /// What a survivor needs to acquire a departed shard's settled set: the
@@ -184,7 +184,7 @@ where
         // expiry the stamp fixes; one where the boundary record is gone
         // reads a window the beacon already closed and swept.
         match topology_schedule.lookup(anchored_wt) {
-            ScheduleLookup::Committee(snapshot) => match snapshot.boundary(shard) {
+            WindowLookup::Window(window) => match window.boundary(shard) {
                 None => return SettledSetVerdict::Reject,
                 Some(anchor)
                     if anchor.handoff_complete.is_some_and(|done| {
@@ -197,13 +197,13 @@ where
             },
             // The judging anchor's window hasn't folded yet — transient
             // lag, the same hold the missing set takes below.
-            ScheduleLookup::NotYetCommitted => {
+            WindowLookup::NotYetCommitted => {
                 defer = true;
                 continue;
             }
             // Below the schedule floor nothing about the window is
             // readable, which rejects for the same reason eviction does.
-            ScheduleLookup::Evicted => return SettledSetVerdict::Reject,
+            WindowLookup::Evicted => return SettledSetVerdict::Reject,
         }
         match settled_sets.get(&shard) {
             // The partner's verdict, read the way the claim needs it: a

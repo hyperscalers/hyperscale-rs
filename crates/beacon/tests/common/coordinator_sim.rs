@@ -522,8 +522,9 @@ impl CoordinatorSim {
         let pred_wt = header.parent_qc().weighted_timestamp();
         let snapshot = self.coordinators[0]
             .topology_schedule()
-            .at(pred_wt)
+            .at_for_shard(shard, pred_wt)
             .expect("committee resolvable at the boundary block's parent wt")
+            .0
             .clone();
         let votes: Vec<(usize, Verified<BlockVote>)> = snapshot
             .committee_for_shard(shard)

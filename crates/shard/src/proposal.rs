@@ -23,8 +23,8 @@ use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch,
     Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal, ReshapeTrigger,
-    RevealChain, Round, ScheduleLookup, ShardId, StateClaim, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
+    RevealChain, Round, ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
 };
 use tracing::debug;
 
@@ -258,10 +258,10 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
     anchor: WeightedTimestamp,
     local_shard: ShardId,
 ) -> HashSet<TxHash> {
-    let ScheduleLookup::Committee(snapshot) = topology_schedule.lookup(anchor) else {
+    let Some(window) = topology_schedule.at(anchor) else {
         return HashSet::new();
     };
-    let trie = snapshot.shard_trie();
+    let trie = window.shard_trie();
     txs.iter()
         .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
         .filter(|tx| {

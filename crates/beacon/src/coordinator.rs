@@ -5700,8 +5700,8 @@ mod tests {
         let len_at = |window: u64| {
             coord
                 .topology_schedule()
-                .at(WeightedTimestamp::from_millis(window * ed))
-                .map(|t| t.committee_for_shard(shard).len())
+                .at_for_shard(shard, WeightedTimestamp::from_millis(window * ed))
+                .map(|(t, _)| t.committee_for_shard(shard).len())
         };
         assert_eq!(len_at(1), Some(4)); // active for epoch 1
         assert_eq!(len_at(2), Some(3)); // epoch 2

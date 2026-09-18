@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    BlockHeight, Epoch, EpochWindows, PredecessorTerminal, ReshapeThresholds, ShardId,
-    TopologySnapshot, ValidatorId, WeightedTimestamp,
+    BlockHeight, Epoch, EpochWindows, PredecessorTerminal, PriceTable, ReshapeThresholds,
+    ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
 /// Per-shard committees for request **routing**, terminal-clamped.
@@ -83,7 +83,53 @@ pub enum SplitAtBoundary {
     Children(ShardId, ShardId),
 }
 
-/// Result of resolving a weighted timestamp against the retained window.
+/// What a window fixes network-wide, with no committee on it.
+///
+/// Read off the snapshot governing an anchor: the shard trie content is
+/// classified against, the price table it is weighed at, and the
+/// boundary records of departed shards. Which committee governs a shard
+/// at an anchor is a
+/// shard-scoped question — it needs the recovery bridge, the attested
+/// frontier and the terminal clamp — and only the shard-aware lookups
+/// answer it, so a committee read off a bare anchor does not compile.
+#[derive(Clone, Copy)]
+pub struct WindowView<'a> {
+    snapshot: &'a TopologySnapshot,
+}
+
+impl<'a> WindowView<'a> {
+    /// The trie in force in this window.
+    #[must_use]
+    pub const fn shard_trie(self) -> &'a ShardTrie {
+        self.snapshot.shard_trie()
+    }
+
+    /// The price table in force in this window.
+    #[must_use]
+    pub const fn prices(self) -> PriceTable {
+        self.snapshot.prices()
+    }
+
+    /// The boundary record of a departed `shard`, as this window carries
+    /// it.
+    #[must_use]
+    pub fn boundary(self, shard: ShardId) -> Option<ShardAnchor> {
+        self.snapshot.boundary(shard)
+    }
+}
+
+/// Result of resolving a weighted timestamp to its window.
+pub enum WindowLookup<'a> {
+    /// The window is retained.
+    Window(WindowView<'a>),
+    /// As [`ScheduleLookup::NotYetCommitted`].
+    NotYetCommitted,
+    /// As [`ScheduleLookup::Evicted`].
+    Evicted,
+}
+
+/// Result of resolving a shard's committee at a weighted timestamp
+/// against the retained window.
 pub enum ScheduleLookup<'a> {
     /// The epoch's committee is retained.
     Committee(&'a Arc<TopologySnapshot>),
@@ -170,26 +216,48 @@ impl TopologySchedule {
         self.windows().epoch_for(wt)
     }
 
-    /// Committee that signed an artifact attested at `wt` — exact, for
-    /// verification and quorum. `None` when that epoch is outside the retained
-    /// window; callers that handle the two miss reasons differently use
-    /// [`lookup`](Self::lookup). Hands out a shared handle: borrow it for
-    /// verification, or clone it to move into an off-thread closure.
+    /// The window `wt` falls in — its trie, prices and boundary records —
+    /// or `None` when that epoch is outside the retained window. Callers
+    /// that handle the two miss reasons differently use
+    /// [`lookup`](Self::lookup). Never a committee: see [`WindowView`].
     #[must_use]
-    pub fn at(&self, wt: WeightedTimestamp) -> Option<&Arc<TopologySnapshot>> {
+    pub fn at(&self, wt: WeightedTimestamp) -> Option<WindowView<'_>> {
         match self.lookup(wt) {
+            WindowLookup::Window(window) => Some(window),
+            WindowLookup::NotYetCommitted | WindowLookup::Evicted => None,
+        }
+    }
+
+    /// [`at`](Self::at) with the miss reason surfaced: an epoch above every
+    /// retained entry is [`NotYetCommitted`](WindowLookup::NotYetCommitted)
+    /// (defer and retry), anything else absent is
+    /// [`Evicted`](WindowLookup::Evicted) (reject — no honest artifact is
+    /// attested below the eviction floor).
+    #[must_use]
+    pub fn lookup(&self, wt: WeightedTimestamp) -> WindowLookup<'_> {
+        match self.lookup_snapshot(wt) {
+            ScheduleLookup::Committee(snapshot) => WindowLookup::Window(WindowView { snapshot }),
+            ScheduleLookup::NotYetCommitted => WindowLookup::NotYetCommitted,
+            ScheduleLookup::Evicted => WindowLookup::Evicted,
+        }
+    }
+
+    /// The snapshot governing `wt`'s epoch, or `None` outside the
+    /// retained window.
+    #[cfg(test)]
+    fn snapshot_at(&self, wt: WeightedTimestamp) -> Option<&Arc<TopologySnapshot>> {
+        match self.lookup_snapshot(wt) {
             ScheduleLookup::Committee(snapshot) => Some(snapshot),
             ScheduleLookup::NotYetCommitted | ScheduleLookup::Evicted => None,
         }
     }
 
-    /// [`at`](Self::at) with the miss reason surfaced: an epoch above every
-    /// retained entry is [`NotYetCommitted`](ScheduleLookup::NotYetCommitted)
-    /// (defer and retry), anything else absent is
-    /// [`Evicted`](ScheduleLookup::Evicted) (reject — no honest artifact is
-    /// attested below the eviction floor).
-    #[must_use]
-    pub fn lookup(&self, wt: WeightedTimestamp) -> ScheduleLookup<'_> {
+    /// The snapshot governing `wt`'s epoch with the miss reason: the one
+    /// resolution every lookup here derives from. Private, because a bare
+    /// anchor names a window and not a committee; the shard-aware lookups
+    /// add the bridge, the frontier and the clamp that make its committee
+    /// answerable.
+    fn lookup_snapshot(&self, wt: WeightedTimestamp) -> ScheduleLookup<'_> {
         let epoch = self.epoch_for(wt);
         if let Some(snapshot) = self.by_epoch.get(&epoch) {
             return ScheduleLookup::Committee(snapshot);
@@ -313,7 +381,7 @@ impl TopologySchedule {
         }
     }
 
-    /// [`lookup`](Self::lookup) with the terminal clamp of
+    /// The snapshot governing `wt` with the terminal clamp of
     /// [`at_for_shard`](Self::at_for_shard): a `wt` whose window no
     /// longer carries `shard` resolves the newest retained window that
     /// does, flagged `true`. A `wt` whose window carries no trace of the
@@ -325,7 +393,7 @@ impl TopologySchedule {
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> (ScheduleLookup<'_>, bool) {
-        match self.lookup(wt) {
+        match self.lookup_snapshot(wt) {
             ScheduleLookup::Committee(snapshot) if !snapshot.shard_trie().contains(shard) => self
                 .terminal_window(shard, wt)
                 .map_or((ScheduleLookup::Evicted, true), |(_, s)| {
@@ -384,7 +452,7 @@ impl TopologySchedule {
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> Option<WeightedTimestamp> {
-        match self.lookup(wt) {
+        match self.lookup_snapshot(wt) {
             ScheduleLookup::Committee(snapshot) if !snapshot.shard_trie().contains(shard) => self
                 .terminal_window(shard, wt)
                 .map(|(epoch, _)| self.windows().window_of(epoch).end),
@@ -416,7 +484,7 @@ impl TopologySchedule {
     /// none of them stops asking while the fence still expects an answer.
     #[must_use]
     pub fn terminal_evidence_readable(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
-        match self.lookup(wt) {
+        match self.lookup_snapshot(wt) {
             ScheduleLookup::Committee(snapshot) => snapshot.boundary(shard).is_some_and(|anchor| {
                 anchor
                     .handoff_complete
@@ -1488,7 +1556,9 @@ mod tests {
         // Head and `at` agree — one committee for all time.
         assert!(Arc::ptr_eq(
             sched.head(),
-            sched.at(WeightedTimestamp::from_millis(42)).unwrap()
+            sched
+                .snapshot_at(WeightedTimestamp::from_millis(42))
+                .unwrap()
         ));
     }
 
@@ -1511,15 +1581,15 @@ mod tests {
         sched.insert(Epoch::new(6), snapshot());
         assert!(matches!(
             sched.lookup(WeightedTimestamp::from_millis(5500)),
-            ScheduleLookup::Committee(_)
+            WindowLookup::Window(_)
         ));
         assert!(matches!(
             sched.lookup(WeightedTimestamp::from_millis(7500)),
-            ScheduleLookup::NotYetCommitted
+            WindowLookup::NotYetCommitted
         ));
         assert!(matches!(
             sched.lookup(WeightedTimestamp::from_millis(3500)),
-            ScheduleLookup::Evicted
+            WindowLookup::Evicted
         ));
     }
 
@@ -1754,7 +1824,9 @@ mod tests {
         assert!(!past);
         assert!(Arc::ptr_eq(
             in_window,
-            sched.at(WeightedTimestamp::from_millis(6500)).unwrap()
+            sched
+                .snapshot_at(WeightedTimestamp::from_millis(6500))
+                .unwrap()
         ));
 
         // Past the cut: clamps to the terminal window's snapshot and flags it.
@@ -1764,7 +1836,9 @@ mod tests {
         assert!(past);
         assert!(Arc::ptr_eq(
             clamped,
-            sched.at(WeightedTimestamp::from_millis(6500)).unwrap()
+            sched
+                .snapshot_at(WeightedTimestamp::from_millis(6500))
+                .unwrap()
         ));
 
         // A shard alive in the same window is untouched by the clamp.
@@ -1774,7 +1848,9 @@ mod tests {
         assert!(!past);
         assert!(Arc::ptr_eq(
             alive,
-            sched.at(WeightedTimestamp::from_millis(7500)).unwrap()
+            sched
+                .snapshot_at(WeightedTimestamp::from_millis(7500))
+                .unwrap()
         ));
 
         // Outside the retained window resolution still stalls.

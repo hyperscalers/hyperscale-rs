@@ -231,7 +231,7 @@ pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
-    RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule,
+    RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{
     SettledSetVerdict, SettledTxSet, TerminalEvidence, TxClaim, settled_set_verdict,
