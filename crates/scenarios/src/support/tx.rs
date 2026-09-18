@@ -1831,9 +1831,17 @@ pub(crate) fn storm_artifact(nonce: u16) -> Vec<u8> {
     // arrives with the empty one — what an event carrying nothing
     // declares.
     let named = format!("storm-{nonce}");
+    let unit = metadata
+        .types
+        .push(TypeShape::Tuple(Vec::new()))
+        .expect("the empty shape joins any table");
     metadata
         .types
-        .insert(named.clone(), TypeShape::Tuple(Vec::new()));
+        .push(TypeShape::Named {
+            name: named.clone(),
+            shape: unit,
+        })
+        .expect("a name the package does not already hold");
     metadata.events.push(named);
     // The mark is granted to protocol code seeded at genesis, and this
     // artifact publishes through the ordinary path.
