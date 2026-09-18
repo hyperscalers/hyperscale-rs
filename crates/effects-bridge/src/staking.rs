@@ -130,7 +130,7 @@ pub fn witness_from_event(
     // this reads is what that package says it wrote. A payload that does
     // not decode is a package whose code and metadata disagree — its
     // author's defect, and not a fact.
-    let payload = event.payload.as_slice();
+    let payload = &event.payload[..];
     match event.event_type {
         STAKED => {
             from_slice(payload)
@@ -245,6 +245,7 @@ const fn basis_points(stated: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Bytes;
     use hyperscale_types::CONSENSUS_PUBLIC_KEY_BYTES;
     use hyperscale_vm_effects::{Hash32, InstanceMeta, InstanceRegistry, Records};
     use hyperscale_vm_types::{Address, ComponentAddr};
@@ -282,7 +283,7 @@ mod tests {
         Event {
             emitter: emitter.into(),
             event_type,
-            payload: amount.to_le_bytes().to_vec(),
+            payload: Bytes::from_array(amount.to_le_bytes()),
         }
     }
 
@@ -350,7 +351,9 @@ mod tests {
         Event {
             emitter: emitter.into(),
             event_type,
-            payload,
+            payload: payload
+                .try_into()
+                .expect("a payload the kernel carried fits its cap"),
         }
     }
 
@@ -655,7 +658,7 @@ mod tests {
             let event = Event {
                 emitter: pool.into(),
                 event_type: STAKED,
-                payload,
+                payload: payload.try_into().unwrap(),
             };
             assert_eq!(
                 witness_from_event(&event, &pools, &instances, package(1)),

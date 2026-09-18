@@ -758,7 +758,7 @@ impl Executor {
                 },
                 declaration,
                 nullifiers: admitted.intents().to_vec(),
-                gas_limits: terms.gas_limits.clone(),
+                gas_limits: terms.gas_limits.to_vec(),
                 event_bytes,
                 work,
                 judges: OwnerSet::whole(),
@@ -1449,7 +1449,7 @@ impl Executor {
             .filter_map(|member| {
                 let tx = member.body.as_ref()?;
                 let artifact = tx.body().artifact.as_ref()?;
-                Some((member.tx_hash, (tx.terms().fee_payer, artifact.clone())))
+                Some((member.tx_hash, (tx.terms().fee_payer, artifact.to_vec())))
             })
             .collect();
 
@@ -1840,6 +1840,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{AddressClass, LocalKey, Presence};
     use hyperscale_vm_types::AbortReason;
 
@@ -1902,7 +1903,7 @@ mod tests {
             abortable,
         };
         let completed = Outcome::Completed {
-            answers: Vec::new(),
+            answers: Capped::empty(),
         };
         assert!(
             !settled_apart(&completed, payer(false)),

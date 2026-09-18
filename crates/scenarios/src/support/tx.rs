@@ -16,7 +16,7 @@ use hyperscale_engine::genesis::{
     OWNER_BADGE_ID, pool_address, pool_owner_badge, stake_unit, staking_artifact,
 };
 use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
-use hyperscale_hbor::TypeShape;
+use hyperscale_hbor::{Bytes, Capped, TypeShape};
 use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits, principal_of};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
@@ -1541,11 +1541,14 @@ pub(crate) fn build_transfer_paid_by<S: AccountSigner>(
         signing::Terms {
             fee_payer: payer,
             max_fee: MAX_FEE,
-            gas_limits,
+            gas_limits: gas_limits
+                .try_into()
+                .expect("one ceiling per node, under the node cap"),
             priority_bp: 0,
-            message: Vec::new(),
+            message: Bytes::empty(),
         },
-    );
+    )
+    .expect("a scenario tree fits the tree cap");
     Transaction::new(
         signing::sign(envelope, signer, &ProtocolHasher)
             .expect("a composed envelope stays within the wire caps"),
@@ -1853,15 +1856,15 @@ pub(crate) fn build_publish_tx(
     let publisher = account_address(&payer.public_key().0);
     Transaction::new(
         signing::wrap_publish(
-            artifact,
+            artifact.try_into().expect("an artifact under the wire cap"),
             publisher,
             scenario_header(validity),
             signing::Terms {
                 fee_payer: publisher,
                 max_fee: PUBLISH_MAX_FEE,
-                gas_limits: vec![1_000_000],
+                gas_limits: Capped::from_array([1_000_000]),
                 priority_bp: 0,
-                message: Vec::new(),
+                message: Bytes::empty(),
             },
         )
         .sign(payer),

@@ -327,11 +327,19 @@ impl Client {
             signing::Terms {
                 fee_payer: principal_of(*payer),
                 max_fee: terms.max_fee,
-                gas_limits: terms.ceilings.over(tree.node_count()),
+                gas_limits: terms
+                    .ceilings
+                    .over(tree.node_count())
+                    .try_into()
+                    .expect("one ceiling per node, under the node cap"),
                 priority_bp: terms.priority_bp,
-                message: terms.message,
+                message: terms
+                    .message
+                    .try_into()
+                    .expect("a composed message fits the message cap"),
             },
-        );
+        )
+        .expect("a composed tree fits the tree cap");
         signers
             .iter()
             .try_fold(envelope, |envelope, signer| {
@@ -505,7 +513,7 @@ mod tests {
                 terms(Ceilings::Measured(measured.clone())),
             )
             .expect("a measured transfer builds");
-        let ceilings = |tx: &Transaction| tx.body().terms.gas_limits.clone();
+        let ceilings = |tx: &Transaction| tx.body().terms.gas_limits.to_vec();
         assert_eq!(ceilings(&previewed), measured);
 
         let guessed = client

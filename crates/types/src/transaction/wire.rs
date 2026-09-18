@@ -809,7 +809,8 @@ impl Verified<Transaction> {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::{
-        DecodeError, Hash32, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
+        Bytes, Capped, DecodeError, Hash32, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
+        varint,
     };
     use hyperscale_vm_types::{Address, AddressClass, IntentHash, LegRole, Mode, Moves, ValueEdge};
 
@@ -884,9 +885,9 @@ mod tests {
             terms: Terms {
                 fee_payer: PrincipalAddr::new([0xAA; 31]),
                 max_fee: 1_000,
-                gas_limits: vec![1_000_000],
+                gas_limits: Capped::from_array([1_000_000]),
                 priority_bp: 0,
-                message: Vec::new(),
+                message: Bytes::empty(),
             },
             network: TEST_NETWORK,
             validity: test_validity_range(),
@@ -1068,7 +1069,7 @@ mod tests {
         // And the attestations are outside the identity: the same
         // content with any signature at all is the same one.
         let mut rerolled = one.body().clone();
-        rerolled.signatures[0].signature = vec![0xAA; 64];
+        rerolled.signatures[0].signature = vec![0xAA; 64].try_into().unwrap();
         assert_eq!(Transaction::new(rerolled).hash(), one.hash());
     }
 
@@ -1129,7 +1130,7 @@ mod tests {
         let mut retargeted = tx.body().clone();
         let mut stub = stub_tree(b"graph bytes");
         stub.network = NetworkId(7);
-        retargeted.tree = stub.encode();
+        retargeted.tree = stub.encode().try_into().unwrap();
         assert_eq!(
             Transaction::new(retargeted)
                 .verify(ctx(NetworkId(7)))
@@ -1233,7 +1234,7 @@ mod tests {
                 .plus(std::time::Duration::from_millis(1)),
             stub.validity.end_timestamp_exclusive,
         );
-        shifted.tree = stub.encode();
+        shifted.tree = stub.encode().try_into().unwrap();
         let shifted = shifted.sign(&key);
         assert_ne!(
             Transaction::new(base.clone()).hash(),

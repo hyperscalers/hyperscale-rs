@@ -97,6 +97,11 @@ pub trait EnvelopeExt: Sized {
     /// Attest the envelope's content with `key`, standing the attestation
     /// beside those already given. The caller signs in the order the
     /// root intent declares its attesting principals.
+    ///
+    /// # Panics
+    ///
+    /// On an envelope already carrying every attestation it may, which
+    /// no fixture builds.
     #[must_use]
     fn sign<S: AccountSigner>(self, key: &S) -> Self;
 }
@@ -120,7 +125,9 @@ impl EnvelopeExt for TransactionEnvelope {
         let digest = self
             .signing_digest(&ProtocolHasher)
             .expect("a fixture envelope stays within the wire caps");
-        self.signatures.push(attest(key, &digest));
+        self.signatures
+            .push(attest(key, &digest))
+            .expect("a fixture envelope has room for another attestation");
         self
     }
 }

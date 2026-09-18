@@ -9,7 +9,7 @@ use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_hbor::from_slice;
+use hyperscale_hbor::{Bytes, from_slice};
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
@@ -432,7 +432,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
         events: vec![Event {
             emitter: Address::new([seed; 31], AddressClass::Component),
             event_type: u32::from(seed),
-            payload: vec![seed, seed + 1],
+            payload: Bytes::from_array([seed, seed + 1]),
         }],
     };
     let metadata = Some(ExecutionMetadata::new(

@@ -96,6 +96,7 @@ pub fn serve_transaction_request<S: ShardStorage>(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::{
         MAX_ARTIFACT_BYTES, MAX_WIRE_MESSAGE_BYTES, PrincipalAddr, Terms, TransactionEnvelope,
     };
@@ -106,16 +107,16 @@ mod tests {
     /// the largest artifact an envelope admits.
     fn maximal(seed: u8) -> Arc<Transaction> {
         Arc::new(Transaction::new(TransactionEnvelope {
-            tree: vec![seed],
+            tree: Bytes::from_array([seed]),
             terms: Terms {
                 fee_payer: PrincipalAddr::new([seed; 31]),
                 max_fee: 0,
-                gas_limits: Vec::new(),
+                gas_limits: Capped::empty(),
                 priority_bp: 0,
-                message: Vec::new(),
+                message: Bytes::empty(),
             },
-            artifact: Some(vec![seed; MAX_ARTIFACT_BYTES]),
-            signatures: Vec::new(),
+            artifact: Some(vec![seed; MAX_ARTIFACT_BYTES].try_into().unwrap()),
+            signatures: Capped::empty(),
         }))
     }
 

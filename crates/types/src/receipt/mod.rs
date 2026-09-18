@@ -40,7 +40,7 @@ mod tests {
         Event {
             emitter: Address::new([seed; 31], AddressClass::Component),
             event_type: u32::from(seed),
-            payload: vec![seed, seed + 1],
+            payload: vec![seed, seed + 1].try_into().unwrap(),
         }
     }
 

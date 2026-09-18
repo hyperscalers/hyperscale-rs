@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-use hyperscale_hbor::{Hash32, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+use hyperscale_hbor::{
+    Bytes, Capped, Hash32, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
+};
 use hyperscale_vm_types::{
     Address, AddressClass, DeclaredWork, IntentHash, LegRole, LegShape, LocalKey, Mode, Moves,
     PrincipalAddr, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey, SweepBucket, Terms, ValueEdge,
@@ -112,7 +114,10 @@ pub fn test_transaction_at_priority(seed: u8, priority_bp: u32) -> Transaction {
     let mut vm = test_transaction(seed).body().clone();
     let mut stub = StubTree::decode(&vm).expect("a test transaction carries a stub tree");
     stub.terms.priority_bp = priority_bp;
-    vm.tree = stub.encode();
+    vm.tree = stub
+        .encode()
+        .try_into()
+        .expect("a stub tree fits the tree cap");
     let tx = Transaction::new(vm.sign(&key));
     tx.try_derived(&StubVmStatics)
         .expect("the fixture builds a tree the stub derivation routes");
@@ -1049,13 +1054,20 @@ impl StubTree {
     }
 
     /// An unsigned envelope around this stub.
+    /// # Panics
+    ///
+    /// On a stub tree past the envelope's tree cap, which no fixture
+    /// builds.
     #[must_use]
     pub fn envelope(&self) -> TransactionEnvelope {
         TransactionEnvelope {
-            tree: self.encode(),
+            tree: self
+                .encode()
+                .try_into()
+                .expect("a stub tree fits the tree cap"),
             terms: self.terms.clone(),
             artifact: None,
-            signatures: Vec::new(),
+            signatures: Capped::empty(),
         }
     }
 
@@ -1339,9 +1351,9 @@ pub fn stub_transaction_binding(seed: u32, bound: usize, validity: TimestampRang
         terms: Terms {
             fee_payer: PrincipalAddr::new(payer),
             max_fee: 1_000,
-            gas_limits: vec![1_000_000],
+            gas_limits: Capped::from_array([1_000_000]),
             priority_bp: 0,
-            message: Vec::new(),
+            message: Bytes::empty(),
         },
         network: NetworkId::from(&NetworkDefinition::simulator()),
         validity,
@@ -1461,9 +1473,13 @@ pub fn stub_transaction_declaring(
         terms: Terms {
             fee_payer,
             max_fee,
-            gas_limits,
+            gas_limits: gas_limits
+                .try_into()
+                .expect("a fixture's ceilings fit the node cap"),
             priority_bp: 0,
-            message,
+            message: message
+                .try_into()
+                .expect("a fixture's message fits the message cap"),
         },
         network: NetworkId::from(&NetworkDefinition::simulator()),
         members: 0,
