@@ -2852,7 +2852,7 @@ impl ExecutionCoordinator {
         // carry txs.
         actions.extend(self.check_exec_cert_timeouts());
         actions.extend(self.check_vote_retry_timeouts(topology_schedule));
-        self.release_wedged_ticks(topology_schedule);
+        self.release_wedged_ticks(topology_schedule, certified);
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         // Re-check gate-held finalizations against the advanced schedule:
@@ -3149,15 +3149,37 @@ impl ExecutionCoordinator {
     /// nothing can settle belongs. The order rule is untouched — a
     /// discarded tick produces no half to invert against.
     ///
+    /// Releasing lets go of holds the composition below reads, so it has
+    /// to fire on the same commit everywhere. The span reads committed
+    /// stamps alone. The replacement reads the recovery record, which
+    /// replicas fold at their own pace against their shard commits — a
+    /// fresh member replays the harvested tail with it folded, the
+    /// retained members committed those blocks live without it — so it
+    /// is gated on the committing block being one the fresh committee
+    /// certified: that is committed content, and no replica commits such
+    /// a block before folding the record that resolves its committee.
+    /// Every replica then releases at the first fresh block, and none on
+    /// the tail.
+    ///
     /// [`TICK_SETTLEABLE_SPAN`]: crate::tick_state::TICK_SETTLEABLE_SPAN
-    fn release_wedged_ticks(&mut self, topology_schedule: &TopologySchedule) {
+    fn release_wedged_ticks(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        certified: &CertifiedBlock,
+    ) {
         let committed_ts = self.committed_ts;
         let local_shard = self.local_shard;
+        let fresh_certified = !topology_schedule.committee_replaced_for_certified(
+            local_shard,
+            self.committed_committee_anchor_wt,
+            certified.qc().weighted_timestamp(),
+        );
         let wedged: Vec<TickId> = self
             .ticks
             .ticks_iter()
             .filter(|(_, tick)| {
-                let replaced = topology_schedule.committee_replaced_at(local_shard, tick.anchor());
+                let replaced = fresh_certified
+                    && topology_schedule.committee_replaced_at(local_shard, tick.anchor());
                 tick.owes_undeliverable_determined(committed_ts, replaced)
             })
             .map(|(tick_id, _)| *tick_id)
@@ -4242,6 +4264,44 @@ mod tests {
             )
             .with_pending_recoveries(recoveries),
         ))
+    }
+
+    /// A schedule whose root shard is under a halt recovery seated at
+    /// epoch 20, with one-second windows: the bridge is epoch 21, so an
+    /// anchor under 21s is the replaced committee's and a QC stamped from
+    /// 20s on is the fresh committee's.
+    fn make_test_topology_bridged_at_20() -> TopologySchedule {
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let mut recoveries = BTreeMap::new();
+        recoveries.insert(
+            ShardId::ROOT,
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
+                rotated_at: Epoch::new(20),
+                retained: vec![ValidatorId::new(0)],
+                attested_frontier: BlockHeight::GENESIS,
+            },
+        );
+        TopologySchedule::new(
+            1_000,
+            Epoch::GENESIS,
+            Arc::new(
+                TopologySnapshot::new(
+                    NetworkDefinition::simulator(),
+                    1,
+                    ValidatorSet::new(validators),
+                )
+                .with_pending_recoveries(recoveries),
+            ),
+        )
     }
 
     /// A tick holding `txs`, each admitted with its participating shards.
@@ -6570,6 +6630,62 @@ mod tests {
                 .get_tick(&tick_id)
                 .is_some_and(TickState::has_spoken),
             "a purely local tick has nothing left to say",
+        );
+    }
+
+    /// The replacement release fires on the commit of a block the fresh
+    /// committee certified and on no other: a fresh member replaying the
+    /// harvested tail commits the replaced committee's blocks with the
+    /// record already folded, and must let go of nothing the retained
+    /// members, who committed those blocks live, did not.
+    #[test]
+    fn a_replaced_tick_is_released_on_the_first_fresh_certified_commit() {
+        let mut state = make_test_state();
+        let schedule = make_test_topology_bridged_at_20();
+        let hold = |height: u64, anchor_ms: u64| {
+            let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
+            let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(
+                u8::try_from(height).unwrap(),
+            )));
+            (
+                tick_id,
+                tick_holding(
+                    tick_id,
+                    WeightedTimestamp::from_millis(anchor_ms),
+                    vec![(tx, BTreeSet::from([ShardId::ROOT]))],
+                ),
+            )
+        };
+        // Executed under the replaced committee, its certificate owed.
+        let (old_id, old_tick) = hold(1, 2_500);
+        state.ticks.insert_tick(old_id, old_tick);
+        // Executed under the fresh committee, its certificate merely
+        // pending.
+        let (fresh_id, fresh_tick) = hold(2, 21_050);
+        state.ticks.insert_tick(fresh_id, fresh_tick);
+        let block = make_live_block(BlockHeight::new(3), 0, ValidatorId::new(0), vec![]);
+
+        // A suffix block: anchored and certified below the bridge. Inside
+        // the span, so nothing is released.
+        state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(2_500);
+        state.committed_ts = WeightedTimestamp::from_millis(2_900);
+        state.release_wedged_ticks(&schedule, &test_certify(block.clone(), 2_900));
+        assert!(
+            state.ticks.get_tick(&old_id).is_some(),
+            "a commit the replaced committee certified releases nothing"
+        );
+
+        // A bridge block: anchored below the bridge, certified one skew
+        // window under it, which is the fresh committee's.
+        state.committed_ts = WeightedTimestamp::from_millis(20_900);
+        state.release_wedged_ticks(&schedule, &test_certify(block, 20_900));
+        assert!(
+            state.ticks.get_tick(&old_id).is_none(),
+            "the first fresh-certified commit releases the replaced tick"
+        );
+        assert!(
+            state.ticks.get_tick(&fresh_id).is_some(),
+            "a tick anchored past the bridge waits on its certificate"
         );
     }
 

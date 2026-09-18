@@ -1094,7 +1094,9 @@ impl TickState {
     /// from members no longer serving the shard and no quorum can ever
     /// form — waiting changes nothing, and a fresh member that executed
     /// the block while catching up would otherwise hold the frontier
-    /// against its own committee's work.
+    /// against its own committee's work. The caller answers it from the
+    /// committing block: true only on a block the fresh committee
+    /// certified, which no replica commits before folding the record.
     ///
     /// [`TICK_SETTLEABLE_SPAN`] past the tick's own anchor is the other:
     /// no member it holds can still be settleable, so a half emitted
@@ -1103,10 +1105,11 @@ impl TickState {
     /// the abandonment path is what speaks for one whose own close has
     /// passed.
     ///
-    /// Read off committed content alone — seats settle on committed
-    /// finalizations and both timestamps are BFT-authenticated — so every
-    /// replica releases the same ticks at the same frontier. Whether
-    /// *this* validator happened to hand its own half off
+    /// Both read as committed content — seats settle on committed
+    /// finalizations, the stamps are BFT-authenticated, and the
+    /// committing block's certifier is what its commit resolved — so
+    /// every replica releases the same ticks at the same frontier.
+    /// Whether *this* validator happened to hand its own half off
     /// ([`determined_pending`](Self::determined_pending)) is local state
     /// and deliberately not asked: releasing lets go of the chain holds
     /// later ticks read, and replicas letting go at different frontiers

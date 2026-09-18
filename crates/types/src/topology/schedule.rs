@@ -486,6 +486,35 @@ impl TopologySchedule {
             .is_some_and(|bridge| self.epoch_for(wt) < bridge)
     }
 
+    /// Whether the committee that certified a block of `shard` anchored
+    /// at `anchor_wt` under a QC stamped `qc_wt` is one a halt recovery
+    /// has replaced.
+    ///
+    /// Reads the band
+    /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified)
+    /// binds to the fresh committee, so the two never disagree about who
+    /// certified a block: a suffix block, anchored and certified below
+    /// the bridge, is the replaced committee's; a bridge block, anchored
+    /// below it but certified at or one skew window under it, is the
+    /// fresh committee's, as is everything anchored at the bridge or
+    /// past it.
+    ///
+    /// What makes this readable at a commit: a replica commits a block
+    /// only after resolving its certifying committee, and a fresh
+    /// committee resolves only through the bridge, so every replica that
+    /// commits a fresh-certified block holds the record this reads.
+    #[must_use]
+    pub fn committee_replaced_for_certified(
+        &self,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> bool {
+        self.certified_recovery_bridge(shard).is_some_and(|bridge| {
+            self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge
+        })
+    }
+
     /// Whether a cross-shard artifact from `shard` at `height` is fenced by
     /// an in-flight halt recovery: past the beacon-attested frontier the
     /// recovery froze, the retained (beyond-f) committee could only have
@@ -1895,6 +1924,70 @@ mod tests {
             old,
         );
         assert!(!plain.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
+    }
+
+    /// The replacement predicates read the certified band: an anchor
+    /// below the bridge is replaced, and a block is replaced-certified
+    /// only when its QC also sits in the suffix band — a bridge block,
+    /// certified at or one skew window under the bridge, is the fresh
+    /// committee's.
+    #[test]
+    fn committee_replacement_reads_the_certified_band() {
+        use crate::ValidatorInfo;
+
+        let validators: Vec<ValidatorInfo> = (0..8)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let set = ValidatorSet::new(validators);
+        let shard = ShardId::leaf(1, 0);
+        let old: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let fresh: Vec<ValidatorId> = (4..8).map(ValidatorId::new).collect();
+        let snap = |committee: &[ValidatorId]| {
+            Arc::new(TopologySnapshot::with_shard_committees(
+                NetworkDefinition::simulator(),
+                2,
+                &set,
+                std::iter::once((shard, committee.to_vec())).collect(),
+            ))
+        };
+        let old_snap = snap(&old);
+        let fresh_snap =
+            Arc::new(snap(&fresh).as_ref().clone().with_pending_recoveries(
+                std::iter::once((shard, halt_recovery(20, &old))).collect(),
+            ));
+        let mut sched = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
+        sched.insert(Epoch::new(21), Arc::clone(&fresh_snap));
+        sched.set_head(Arc::clone(&fresh_snap));
+
+        let stale_anchor = WeightedTimestamp::from_millis(2_500);
+        let suffix_qc = WeightedTimestamp::from_millis(2_900);
+        let edge_qc = WeightedTimestamp::from_millis(20_900);
+        let bridge_qc = WeightedTimestamp::from_millis(21_100);
+
+        assert!(sched.committee_replaced_at(shard, stale_anchor));
+        assert!(!sched.committee_replaced_at(shard, bridge_qc));
+
+        assert!(
+            sched.committee_replaced_for_certified(shard, stale_anchor, suffix_qc),
+            "a suffix block is the replaced committee's"
+        );
+        for qc_wt in [edge_qc, bridge_qc] {
+            assert!(
+                !sched.committee_replaced_for_certified(shard, stale_anchor, qc_wt),
+                "a bridge block certified at {} is the fresh committee's",
+                qc_wt.as_millis()
+            );
+        }
+        assert!(!sched.committee_replaced_for_certified(shard, bridge_qc, bridge_qc));
+
+        // Without a recovery nothing is replaced, whatever the anchor.
+        let mut plain = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
+        plain.insert(Epoch::new(21), snap(&fresh));
+        assert!(!plain.committee_replaced_at(shard, stale_anchor));
+        assert!(!plain.committee_replaced_for_certified(shard, stale_anchor, suffix_qc));
     }
 
     /// The bridge binding outlives the pending record: once the recovery
