@@ -69,7 +69,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_hbor::{
-        DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
+        Capped, DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
     };
 
     use super::*;
@@ -93,7 +93,7 @@ mod tests {
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             ..Default::default()
         });
 
@@ -239,7 +239,7 @@ mod tests {
             ChainOrigin::ROOT,
         )
         .into_sealed()
-        .into_live(Arc::new(Vec::new()));
+        .into_live(Arc::new(Capped::empty()));
         if let Block::Live { ref mut header, .. } = bad_block {
             *header = BlockHeader::new(BlockHeaderParts {
                 shard_id: header.shard_id(),

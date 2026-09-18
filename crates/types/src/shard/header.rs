@@ -4,18 +4,16 @@
 //! `Verified<BlockHeader>`; predicate at [`impl Verify<()>`](Verify::verify)
 //! below.
 
-use std::collections::BTreeMap;
-
-use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::{
     AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-    CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot,
-    MAX_PROVISION_TARGET_SHARDS, PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot,
-    ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad,
-    SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier, TerminalRoots, TransactionRoot,
-    TxsInFlight, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
+    CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, PredecessorTerminal,
+    ProposerTimestamp, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
+    SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier,
+    TerminalRoots, TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify,
+    WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -77,8 +75,7 @@ pub struct BlockHeader {
     certificate_root: CertificateRoot,
     local_receipt_root: LocalReceiptRoot,
     provision_root: ProvisionsRoot,
-    #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
-    provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
+    provision_tx_roots: ProvisionTxRootsMap,
     /// Commits the block's [`AbandonmentRecord`](crate::AbandonmentRecord)
     /// records — what departed shards left unresolved of this chain's
     /// business, written down while the evidence for it could still be
@@ -187,7 +184,7 @@ pub struct BlockHeaderParts {
     pub certificate_root: CertificateRoot,
     pub local_receipt_root: LocalReceiptRoot,
     pub provision_root: ProvisionsRoot,
-    pub provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
+    pub provision_tx_roots: ProvisionTxRootsMap,
     pub abandonment_root: AbandonmentRoot,
     pub state_claims_root: StateClaimsRoot,
     pub txs_in_flight: TxsInFlight,
@@ -219,7 +216,7 @@ impl Default for BlockHeaderParts {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            provision_tx_roots: BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             abandonment_root: AbandonmentRoot::ZERO,
             state_claims_root: StateClaimsRoot::ZERO,
             txs_in_flight: TxsInFlight::ZERO,
@@ -238,10 +235,6 @@ impl Default for BlockHeaderParts {
 
 impl BlockHeader {
     /// Build a `BlockHeader` from its parts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `provision_tx_roots.len() > MAX_PROVISION_TARGET_SHARDS`.
     #[allow(clippy::too_many_arguments)] // mirrors the stored fields one to one
     #[must_use]
     pub fn new(parts: BlockHeaderParts) -> Self {
@@ -563,7 +556,7 @@ impl BlockHeader {
     /// contains the full set it was meant to receive — catches silently
     /// dropped txs on the broadcast path.
     #[must_use]
-    pub const fn provision_tx_roots(&self) -> &BTreeMap<ShardId, ProvisionTxRoot> {
+    pub const fn provision_tx_roots(&self) -> &ProvisionTxRootsMap {
         &self.provision_tx_roots
     }
 
@@ -908,6 +901,7 @@ mod tests {
     use hyperscale_vm_types::SweepBucket;
 
     use super::*;
+    use crate::MAX_PROVISION_TARGET_SHARDS;
 
     fn sample_header() -> BlockHeader {
         BlockHeader::genesis(

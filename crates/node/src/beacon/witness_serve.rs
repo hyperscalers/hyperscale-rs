@@ -221,11 +221,11 @@ mod tests {
         let header = make_header(height, root, leaf_count_at_block_end);
         let block = Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = make_qc_for(&block);

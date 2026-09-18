@@ -269,7 +269,7 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 parent_qc: parent_qc.into(),
                 timestamp: ProposerTimestamp::from_millis(*ts_ms),
-                provision_tx_roots: std::collections::BTreeMap::new(),
+                provision_tx_roots: Capped::default(),
                 ..Default::default()
             });
             let txs: Vec<Arc<Verifiable<Transaction>>> = if height == 1 {
@@ -279,11 +279,11 @@ mod tests {
             };
             let block = Block::Live {
                 header,
-                transactions: Arc::new(txs),
-                certificates: Arc::new(Vec::new()),
-                provisions: Arc::new(Vec::new()),
-                abandonment_records: Arc::new(Vec::new()),
-                state_claims: Arc::new(Vec::new()),
+                transactions: Arc::new(Capped::new(txs).expect("a list written out in a test")),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
             let creations = committed_tx_cells(

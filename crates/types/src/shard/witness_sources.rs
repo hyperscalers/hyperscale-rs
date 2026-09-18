@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{MAX_READY_SIGNALS_PER_BLOCK, ReadySignal, ReshapeTrigger, VrfProof};
 
@@ -34,8 +34,7 @@ pub type SharedWitnessSources = Arc<WitnessSources>;
 pub struct WitnessSources {
     /// Validator-emitted ready signals the proposer drained from its
     /// pool — one readiness leaf each.
-    #[hbor(max = MAX_READY_SIGNALS_PER_BLOCK)]
-    ready_signals: Vec<ReadySignal>,
+    ready_signals: Capped<Vec<ReadySignal>, MAX_READY_SIGNALS_PER_BLOCK>,
     /// The proposer's reshape assertion, if any — validated against the
     /// locally recomputed load predicate.
     reshape_trigger: Option<ReshapeTrigger>,
@@ -54,7 +53,7 @@ impl WitnessSources {
     /// Panics if a list exceeds its per-block cap.
     #[must_use]
     pub const fn new(
-        ready_signals: Vec<ReadySignal>,
+        ready_signals: Capped<Vec<ReadySignal>, MAX_READY_SIGNALS_PER_BLOCK>,
         reshape_trigger: Option<ReshapeTrigger>,
         randomness_reveal: VrfProof,
     ) -> Self {
@@ -73,7 +72,7 @@ impl WitnessSources {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            ready_signals: Vec::new(),
+            ready_signals: Capped::empty(),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         }
@@ -82,7 +81,7 @@ impl WitnessSources {
     /// Validator-emitted ready signals the proposer included. The leaf
     /// derivation projects one readiness leaf per signal.
     #[must_use]
-    pub(crate) const fn ready_signals(&self) -> &Vec<ReadySignal> {
+    pub(crate) fn ready_signals(&self) -> &Vec<ReadySignal> {
         &self.ready_signals
     }
 

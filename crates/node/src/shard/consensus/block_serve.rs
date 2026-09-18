@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_sync_response_error;
 use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
@@ -43,6 +44,10 @@ use tracing::{trace, warn};
 /// response. The requester rotates to another peer who has the provisions
 /// cached. Pending-window blocks never hit this path because their
 /// provisions are inline.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
 pub fn serve_block_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     provision_store: &ProvisionStore,
@@ -117,7 +122,9 @@ pub fn serve_block_request<S: ShardStorage>(
         .collect();
 
     GetBlockResponse::found(ElidedCertifiedBlock::elide(
-        &block.into_live(Arc::new(provisions)),
+        &block.into_live(Arc::new(
+            Capped::new(provisions).expect("a rebuilt block keeps the caps its source met"),
+        )),
         qc,
         &req.inventory,
     ))

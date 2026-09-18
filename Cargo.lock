@@ -2035,6 +2035,7 @@ dependencies = [
  "blake3",
  "hyperscale-core",
  "hyperscale-crypto-bls",
+ "hyperscale-hbor",
  "hyperscale-network",
  "hyperscale-storage",
  "hyperscale-types",
@@ -2232,6 +2233,7 @@ version = "0.1.0"
 dependencies = [
  "hyperscale-core",
  "hyperscale-engine",
+ "hyperscale-hbor",
  "hyperscale-metrics",
  "hyperscale-metrics-memory",
  "hyperscale-types",
@@ -2412,6 +2414,7 @@ version = "0.1.0"
 dependencies = [
  "hyperscale-core",
  "hyperscale-engine",
+ "hyperscale-hbor",
  "hyperscale-jmt",
  "hyperscale-metrics",
  "hyperscale-network",
@@ -2460,6 +2463,7 @@ dependencies = [
  "hyperscale-core",
  "hyperscale-crypto-bls",
  "hyperscale-engine",
+ "hyperscale-hbor",
  "hyperscale-metrics",
  "hyperscale-network",
  "hyperscale-storage",

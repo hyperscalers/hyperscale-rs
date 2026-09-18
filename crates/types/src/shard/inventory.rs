@@ -21,7 +21,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
@@ -82,6 +82,21 @@ impl Inventory {
 /// and let the requester reconstruct a `Block` even when bodies are
 /// missing.
 ///
+/// One row per transaction the block carries: its hash, and its body
+/// where the serve kept one.
+type ElidedTransactions =
+    Capped<Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>, MAX_TXS_PER_BLOCK>;
+
+/// One row per finalization, on the same terms as [`ElidedTransactions`].
+type ElidedCertificates = Capped<
+    Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)>,
+    MAX_FINALIZED_TX_PER_BLOCK,
+>;
+
+/// One row per provision, on the same terms as [`ElidedTransactions`].
+pub type ElidedProvisionBodies =
+    Capped<Vec<(ProvisionHash, Option<Arc<Verifiable<Provisions>>>)>, MAX_PROVISIONS_PER_BLOCK>;
+
 /// Per-collection caps mirror [`Block`]'s caps one-to-one — the elided
 /// form is a structural transformation of `Block` and inherits its
 /// natural ceilings.
@@ -89,21 +104,17 @@ impl Inventory {
 pub struct ElidedCertifiedBlock {
     header: Verifiable<BlockHeader>,
     qc: Verifiable<QuorumCertificate>,
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    transactions: Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>,
-    #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    certificates: Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)>,
+    transactions: ElidedTransactions,
+    certificates: ElidedCertificates,
     provisions: ElidedProvisions,
     /// What departed shards left unresolved of the serving chain's
     /// business, always inline: the records are small, rare, and are what
     /// a verdict is composed on, so a hop that dropped them would hand
     /// back a block that cannot answer for itself.
-    #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
-    abandonment_records: Vec<AbandonmentRecord>,
+    abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
     /// The block's state claims, always inline: they are small, and the
     /// receiver folds them at commit.
-    #[hbor(max = MAX_STATE_CLAIMS_PER_BLOCK)]
-    state_claims: Vec<StateClaim>,
+    state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
@@ -122,12 +133,9 @@ pub struct ElidedCertifiedBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub enum ElidedProvisions {
     /// Block was `Live` at serve time.
-    Live(
-        #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-        Vec<(ProvisionHash, Option<Arc<Verifiable<Provisions>>>)>,
-    ),
+    Live(ElidedProvisionBodies),
     /// Block was `Sealed` at serve time; hashes only.
-    Sealed(#[hbor(max = MAX_PROVISIONS_PER_BLOCK)] Vec<ProvisionHash>),
+    Sealed(Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>),
 }
 
 impl ElidedCertifiedBlock {
@@ -157,15 +165,13 @@ impl ElidedCertifiedBlock {
     /// rehydration share the same allocations as the local mempool /
     /// pending-block stores rather than deep-cloning every body.
     #[must_use]
-    pub const fn transactions(&self) -> &Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)> {
+    pub fn transactions(&self) -> &Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)> {
         &self.transactions
     }
 
     /// Per-certificate `(tick id, optional body)` pairs; body is `None` when elided.
     #[must_use]
-    pub const fn certificates(
-        &self,
-    ) -> &Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)> {
+    pub fn certificates(&self) -> &Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)> {
         &self.certificates
     }
 
@@ -181,6 +187,10 @@ impl ElidedCertifiedBlock {
     /// replaced with `None`; hashes are always included so the requester
     /// can reconstruct the block.
     #[must_use]
+    /// # Panics
+    ///
+    /// Never: every elided list is one row per element of a block field
+    /// the block's own decode already held to the same cap.
     pub fn elide(
         block: &Block,
         qc: impl Into<Verifiable<QuorumCertificate>>,
@@ -190,37 +200,27 @@ impl ElidedCertifiedBlock {
         let header = block.header().clone();
         let is_live = block.is_live();
 
-        // The `block.transactions()/certificates()/provisions()` source
-        // collections are capped at the same limits as the elided fields
-        // by `Block`'s own decode validator, so the elided form cannot
-        // outgrow the caps its fields declare.
-        let transactions: Vec<_> = block
-            .transactions()
-            .iter()
-            .map(|tx| {
-                let hash = tx.hash();
-                let body = if matches_filter(inventory.tx_have.as_ref(), &hash) {
-                    None
-                } else {
-                    Some(Arc::clone(tx))
-                };
-                (hash, body)
-            })
-            .collect();
+        // One row per element, so every elided list keeps the cap the
+        // block's own field already met.
+        let transactions = block.transactions().map(|tx| {
+            let hash = tx.hash();
+            let body = if matches_filter(inventory.tx_have.as_ref(), &hash) {
+                None
+            } else {
+                Some(Arc::clone(tx))
+            };
+            (hash, body)
+        });
 
-        let certificates: Vec<_> = block
-            .certificates()
-            .iter()
-            .map(|fw| {
-                let id = fw.receipt_hash();
-                let body = if finalization_is_held(inventory.cert_have.as_ref(), fw) {
-                    None
-                } else {
-                    Some(Arc::clone(fw))
-                };
-                (id, body)
-            })
-            .collect();
+        let certificates = block.certificates().map(|fw| {
+            let id = fw.receipt_hash();
+            let body = if finalization_is_held(inventory.cert_have.as_ref(), fw) {
+                None
+            } else {
+                Some(Arc::clone(fw))
+            };
+            (id, body)
+        });
 
         let provisions = if is_live {
             let entries: Vec<_> = block
@@ -236,7 +236,9 @@ impl ElidedCertifiedBlock {
                     (hash, body)
                 })
                 .collect();
-            ElidedProvisions::Live(entries)
+            ElidedProvisions::Live(
+                Capped::new(entries).expect("one row per provision the block carries"),
+            )
         } else {
             ElidedProvisions::Sealed(block.provision_hashes())
         };
@@ -247,8 +249,8 @@ impl ElidedCertifiedBlock {
             transactions,
             certificates,
             provisions,
-            abandonment_records: block.abandonment_records().to_vec(),
-            state_claims: block.state_claims().to_vec(),
+            abandonment_records: block.abandonment_records().clone(),
+            state_claims: block.state_claims().clone(),
             witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
@@ -269,6 +271,10 @@ impl ElidedCertifiedBlock {
     /// could not be resolved by the supplied lookup closures, or
     /// [`RehydrateError::QcMismatch`] when the inline QC's `block_hash`
     /// does not match the inline header's hash.
+    /// # Panics
+    ///
+    /// Never: a body is unwrapped only after the miss list is empty,
+    /// which is what says every one resolved.
     pub fn try_rehydrate<FTx, FCert, FProv>(
         &self,
         mut tx_lookup: FTx,
@@ -291,45 +297,33 @@ impl ElidedCertifiedBlock {
             });
         }
         let mut miss = RehydrationMiss::default();
-        let mut txs = Vec::with_capacity(self.transactions.len());
-        for (hash, body) in &self.transactions {
-            if let Some(tx) = body {
-                txs.push(Some(Arc::clone(tx)));
-            } else if let Some(resolved) = tx_lookup(hash) {
-                txs.push(Some(resolved));
-            } else {
-                txs.push(None);
-                miss.missing_tx.push(*hash);
-            }
-        }
-
-        let mut certs = Vec::with_capacity(self.certificates.len());
-        for (id, body) in &self.certificates {
-            if let Some(fw) = body {
-                certs.push(Some(Arc::clone(fw)));
-            } else if let Some(resolved) = cert_lookup(id) {
-                certs.push(Some(resolved));
-            } else {
-                certs.push(None);
-                miss.missing_cert.push(*id);
-            }
-        }
-
+        // One body per entry, so each list keeps the cap its inventory
+        // field already met.
+        let txs = self.transactions.map(|(hash, body)| {
+            body.clone().or_else(|| {
+                tx_lookup(hash).or_else(|| {
+                    miss.missing_tx.push(*hash);
+                    None
+                })
+            })
+        });
+        let certs = self.certificates.map(|(id, body)| {
+            body.clone().or_else(|| {
+                cert_lookup(id).or_else(|| {
+                    miss.missing_cert.push(*id);
+                    None
+                })
+            })
+        });
         let live_provs = match &self.provisions {
-            ElidedProvisions::Live(entries) => {
-                let mut out = Vec::with_capacity(entries.len());
-                for (hash, body) in entries {
-                    if let Some(p) = body {
-                        out.push(Some(Arc::clone(p)));
-                    } else if let Some(resolved) = provision_lookup(hash) {
-                        out.push(Some(resolved));
-                    } else {
-                        out.push(None);
+            ElidedProvisions::Live(entries) => Some(entries.map(|(hash, body)| {
+                body.clone().or_else(|| {
+                    provision_lookup(hash).or_else(|| {
                         miss.missing_provision.push(*hash);
-                    }
-                }
-                Some(out)
-            }
+                        None
+                    })
+                })
+            })),
             ElidedProvisions::Sealed(_) => None,
         };
 
@@ -337,15 +331,11 @@ impl ElidedCertifiedBlock {
             return Err(RehydrateError::Missing(miss));
         }
 
-        let txs: Vec<Arc<Verifiable<Transaction>>> = txs.into_iter().map(Option::unwrap).collect();
-        let certs: Vec<Arc<Verifiable<Finalization>>> =
-            certs.into_iter().map(Option::unwrap).collect();
-        let txs = Arc::new(txs);
-        let certs = Arc::new(certs);
+        let txs = Arc::new(txs.map(|body| body.clone().expect("no body is missing")));
+        let certs = Arc::new(certs.map(|body| body.clone().expect("no body is missing")));
         let block = match (live_provs, &self.provisions) {
             (Some(entries), _) => {
-                let provisions: Vec<Arc<Verifiable<Provisions>>> =
-                    entries.into_iter().map(Option::unwrap).collect();
+                let provisions = entries.map(|body| body.clone().expect("no body is missing"));
                 Block::Live {
                     header: self.header.as_unverified().clone(),
                     transactions: txs,
@@ -483,11 +473,11 @@ mod tests {
                 timestamp: ProposerTimestamp::from_millis(1_234_567_890),
                 ..Default::default()
             }),
-            transactions: Arc::new(vec![Arc::new(Verifiable::from(tx))]),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx))])),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -537,7 +527,7 @@ mod tests {
         Block::Live {
             header,
             transactions,
-            certificates: Arc::new(vec![Arc::new(fw)]),
+            certificates: Arc::new(Capped::from_array([Arc::new(fw)])),
             provisions,
             abandonment_records,
             state_claims,

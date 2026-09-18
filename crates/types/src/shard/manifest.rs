@@ -1,7 +1,7 @@
 //! Hash-level block contents (`BlockManifest`) and denormalized storage form
 //! (`BlockMetadata`).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
@@ -20,23 +20,18 @@ use crate::{
 /// hash-only projection of a `Block` and inherits its natural ceilings.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct BlockManifest {
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    tx_hashes: Vec<TxHash>,
-    #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    cert_ids: Vec<FinalizationHash>,
-    #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-    provision_hashes: Vec<ProvisionHash>,
+    tx_hashes: Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK>,
+    cert_ids: Capped<Vec<FinalizationHash>, MAX_FINALIZED_TX_PER_BLOCK>,
+    provision_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
     /// What departed shards left unresolved of this chain's business,
     /// mirrored verbatim rather than by hash: a verdict is composed on
     /// the records themselves however long after the terminal they came
     /// from, and there is no later source to fetch them from.
-    #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
-    abandonment_records: Vec<AbandonmentRecord>,
+    abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
     /// The block's state claims, mirrored verbatim: they are small, and
     /// a voter checks each against a proof of its own rather than
     /// against anything it could fetch back from a later source.
-    #[hbor(max = MAX_STATE_CLAIMS_PER_BLOCK)]
-    state_claims: Vec<StateClaim>,
+    state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
@@ -49,11 +44,11 @@ impl Default for BlockManifest {
     /// the sentinel stays an explicit choice.
     fn default() -> Self {
         Self {
-            tx_hashes: Vec::new(),
-            cert_ids: Vec::new(),
-            provision_hashes: Vec::new(),
-            abandonment_records: Vec::new(),
-            state_claims: Vec::new(),
+            tx_hashes: Capped::empty(),
+            cert_ids: Capped::empty(),
+            provision_hashes: Capped::empty(),
+            abandonment_records: Capped::empty(),
+            state_claims: Capped::empty(),
             witness_sources: WitnessSources::empty(),
         }
     }
@@ -64,11 +59,11 @@ impl BlockManifest {
     /// encode and decode, not here.
     #[must_use]
     pub const fn new(
-        tx_hashes: Vec<TxHash>,
-        cert_ids: Vec<FinalizationHash>,
-        provision_hashes: Vec<ProvisionHash>,
-        abandonment_records: Vec<AbandonmentRecord>,
-        state_claims: Vec<StateClaim>,
+        tx_hashes: Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK>,
+        cert_ids: Capped<Vec<FinalizationHash>, MAX_FINALIZED_TX_PER_BLOCK>,
+        provision_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
+        abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
+        state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
         witness_sources: WitnessSources,
     ) -> Self {
         Self {
@@ -83,7 +78,7 @@ impl BlockManifest {
 
     /// Transaction hashes in block order.
     #[must_use]
-    pub const fn tx_hashes(&self) -> &Vec<TxHash> {
+    pub const fn tx_hashes(&self) -> &Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK> {
         &self.tx_hashes
     }
 
@@ -93,26 +88,28 @@ impl BlockManifest {
     /// missing body by. Identity is content rather than tick, so a tick
     /// settling in more than one part names each part separately.
     #[must_use]
-    pub const fn cert_ids(&self) -> &Vec<FinalizationHash> {
+    pub const fn cert_ids(&self) -> &Capped<Vec<FinalizationHash>, MAX_FINALIZED_TX_PER_BLOCK> {
         &self.cert_ids
     }
 
     /// Hashes of provisions included in this block.
     /// Used for provision data availability — validators fetch missing batches by hash.
     #[must_use]
-    pub const fn provision_hashes(&self) -> &Vec<ProvisionHash> {
+    pub const fn provision_hashes(&self) -> &Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK> {
         &self.provision_hashes
     }
 
     /// What departed shards left unresolved of this chain's business.
     #[must_use]
-    pub const fn abandonment_records(&self) -> &Vec<AbandonmentRecord> {
+    pub const fn abandonment_records(
+        &self,
+    ) -> &Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS> {
         &self.abandonment_records
     }
 
     /// The block's state claims.
     #[must_use]
-    pub const fn state_claims(&self) -> &Vec<StateClaim> {
+    pub const fn state_claims(&self) -> &Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK> {
         &self.state_claims
     }
 
@@ -124,7 +121,7 @@ impl BlockManifest {
 
     /// Get total transaction count.
     #[must_use]
-    pub const fn transaction_count(&self) -> usize {
+    pub fn transaction_count(&self) -> usize {
         self.tx_hashes.len()
     }
 
@@ -140,22 +137,17 @@ impl BlockManifest {
     /// derivation reads it and must match every node.
     #[must_use]
     pub fn from_block(block: &Block) -> Self {
-        // The source `Block` collections are capped at the same limits by
-        // `Block`'s own decode validator, so the manifest cannot outgrow
-        // the caps its fields declare.
-        let tx_hashes: Vec<_> = block.transactions().iter().map(|tx| tx.hash()).collect();
-        let cert_ids: Vec<_> = block
-            .certificates()
-            .iter()
-            .map(|c| c.receipt_hash())
-            .collect();
+        // One hash per element, so each list keeps the cap the block's
+        // own field already met.
+        let tx_hashes = block.transactions().map(|tx| tx.hash());
+        let cert_ids = block.certificates().map(|c| c.receipt_hash());
         let provision_hashes = block.provision_hashes();
         Self::new(
             tx_hashes,
             cert_ids,
             provision_hashes,
-            block.abandonment_records().to_vec(),
-            block.state_claims().to_vec(),
+            block.abandonment_records().clone(),
+            block.state_claims().clone(),
             block.witness_sources().as_ref().clone(),
         )
     }
@@ -268,7 +260,7 @@ impl BlockMetadata {
 
     /// Get total transaction count.
     #[must_use]
-    pub const fn transaction_count(&self) -> usize {
+    pub fn transaction_count(&self) -> usize {
         self.manifest.transaction_count()
     }
 }

@@ -96,6 +96,7 @@ impl VerifiedHeaderBuffer {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
         ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, WeightedTimestamp,
@@ -110,7 +111,7 @@ mod tests {
             parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             ..Default::default()
         });
         let header_hash = header.hash();

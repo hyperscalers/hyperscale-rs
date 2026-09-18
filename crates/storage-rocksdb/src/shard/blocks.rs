@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata,
@@ -388,8 +389,12 @@ impl RocksDbShardStorage {
             .collect();
         let block = Block::Sealed {
             header,
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(certificates),
+            transactions: Arc::new(
+                Capped::new(transactions).expect("a rebuilt block keeps the caps its source met"),
+            ),
+            certificates: Arc::new(
+                Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
+            ),
             provision_hashes: Arc::new(manifest.provision_hashes().clone()),
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
@@ -519,8 +524,12 @@ impl RocksDbShardStorage {
             .collect();
         let block = Block::Sealed {
             header,
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(certificates),
+            transactions: Arc::new(
+                Capped::new(transactions).expect("a rebuilt block keeps the caps its source met"),
+            ),
+            certificates: Arc::new(
+                Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
+            ),
             provision_hashes: Arc::new(provision_hashes_bounded.clone()),
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
@@ -532,7 +541,7 @@ impl RocksDbShardStorage {
         record_storage_read(elapsed);
         record_storage_operation("get_block_for_sync_complete", elapsed);
 
-        Some((block, qc, provision_hashes))
+        Some((block, qc, provision_hashes.into_inner()))
     }
 
     /// Get multiple transactions by hash, preserving order.

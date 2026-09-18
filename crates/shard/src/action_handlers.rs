@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
@@ -27,10 +28,12 @@ use hyperscale_types::{
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
     Deadline, DeferOn, Derivation, Epoch, EpochWindows, Finalization, Hash, LocalReceiptRoot,
-    NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round,
-    ShardId, ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition,
+    PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
+    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
+    ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
     Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
     UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
@@ -211,19 +214,19 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     is_fallback: bool,
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
-    transactions: Vec<Arc<Verified<Transaction>>>,
-    certificates: Vec<Arc<Verifiable<Finalization>>>,
+    transactions: &Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+    certificates: Capped<Vec<Arc<Verifiable<Finalization>>>, MAX_FINALIZED_TX_PER_BLOCK>,
     local_shard: ShardId,
     topology_snapshot: &TopologySnapshot,
-    provisions: Vec<Arc<Verifiable<Provisions>>>,
-    abandonment_records: Vec<AbandonmentRecord>,
-    state_claims: Vec<StateClaim>,
+    provisions: Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>,
+    abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
+    state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
     parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
     parent_load: Option<ShardLoad>,
     substate_bytes: Option<u64>,
-    ready_signals: Vec<ReadySignal>,
+    ready_signals: Capped<Vec<ReadySignal>, MAX_READY_SIGNALS_PER_BLOCK>,
     reshape_trigger: Option<ReshapeTrigger>,
     randomness_reveal: VrfProof,
     parent_witness_leaves: &[Hash],
@@ -281,10 +284,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Lift each `Verified<Transaction>` into `Verifiable` so block
     // construction and per-root compute calls see the form that
     // `Block.transactions` carries.
-    let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions
-        .into_iter()
-        .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
-        .collect();
+    let transactions = transactions.map(|tx| Arc::new(Verifiable::from((**tx).clone())));
 
     let receipts: Vec<StoredReceipt> = certificates
         .iter()
@@ -1361,6 +1361,35 @@ where
                     return;
                 }
             };
+            // A block carries no more than its fields state, so a
+            // selection past one of them is a block no peer could decode.
+            // Leaving the slot empty rotates it to another proposer,
+            // which is the response the round already has for one that
+            // cannot answer.
+            let (
+                Ok(transactions),
+                Ok(finalizations),
+                Ok(provisions),
+                Ok(abandonment_records),
+                Ok(state_claims),
+                Ok(ready_signals),
+            ) = (
+                Capped::new(transactions),
+                Capped::new(finalizations),
+                Capped::new(provisions),
+                Capped::new(abandonment_records),
+                Capped::new(state_claims),
+                Capped::new(ready_signals),
+            )
+            else {
+                tracing::warn!(
+                    shard = ?shard_id,
+                    height = height.inner(),
+                    round = round.inner(),
+                    "Skipping a proposal whose selection outgrew what a block carries"
+                );
+                return;
+            };
             let result = build_proposal(
                 &view,
                 proposer,
@@ -1372,7 +1401,7 @@ where
                 is_fallback,
                 parent_state_root,
                 parent_block_height,
-                transactions,
+                &transactions,
                 finalizations.clone(),
                 shard_id,
                 &classification_topology,
@@ -1412,8 +1441,8 @@ where
                 round,
                 block: Arc::new(result.block),
                 block_hash,
-                finalizations,
-                provisions,
+                finalizations: finalizations.into_inner(),
+                provisions: provisions.into_inner(),
                 bytes_delta,
             });
         }
@@ -1601,6 +1630,7 @@ mod tests {
     use std::collections::HashSet;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, stub_abort_charge, stub_transaction, test_prefix,
         test_principal,
@@ -1685,7 +1715,7 @@ mod tests {
                 anchor: WeightedTimestamp::from_millis(anchor),
                 committee_anchor: WeightedTimestamp::from_millis(committee_anchor),
             },
-            reach: Vec::new(),
+            reach: Capped::empty(),
         }
     }
 

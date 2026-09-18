@@ -1018,6 +1018,7 @@ impl ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use hyperscale_core::FetchRequest;
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
         MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
@@ -1079,7 +1080,9 @@ mod tests {
         let root = ProvisionTxRoot::from_raw(compute_merkle_root(&raw));
         let (header, qc) = Arc::unwrap_or_clone(header_arc).into_inner().into_parts();
         let mut roots = header.provision_tx_roots().clone();
-        roots.insert(local_shard, root);
+        roots
+            .insert(local_shard, root)
+            .expect("a list written out in a test");
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: header.shard_id(),
             height: header.height(),
@@ -2015,7 +2018,8 @@ mod tests {
             state_root: StateRoot::from_raw(Hash::from_bytes(
                 format!("root_{shard}_{height}").as_bytes(),
             )),
-            provision_tx_roots,
+            provision_tx_roots: Capped::new(provision_tx_roots)
+                .expect("a list written out in a test"),
             ..Default::default()
         });
         let header_hash = header.hash();
@@ -2069,11 +2073,11 @@ mod tests {
         });
         let block = Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = {
@@ -2447,11 +2451,11 @@ mod tests {
             Arc::new(Arc::unwrap_or_clone(provisions).into());
         let block = Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(vec![provisions_verifiable]),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::from_array([provisions_verifiable])),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(

@@ -396,7 +396,7 @@ where
             return Some(BlockForSync {
                 block,
                 qc,
-                provision_hashes,
+                provision_hashes: provision_hashes.into_inner(),
             });
         }
         self.base.get_block_for_sync(height)
@@ -430,7 +430,14 @@ where
             .pending_certified_at(height)
             .or_else(|| self.pending_certified_uncommitted_at(height))
         {
-            return Some(certified.block().certificates().as_ref().clone());
+            return Some(
+                certified
+                    .block()
+                    .certificates()
+                    .as_ref()
+                    .clone()
+                    .into_inner(),
+            );
         }
         let metadata = self.base.get_block_metadata(height)?;
         let ids = metadata.manifest().cert_ids();
@@ -1308,6 +1315,7 @@ mod tests {
     use std::sync::PoisonError;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{test_prefix, test_transaction};
     use hyperscale_types::{
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
@@ -2091,10 +2099,12 @@ mod tests {
         let block = Block::Live {
             header,
             transactions,
-            certificates: Arc::new(certs),
+            certificates: Arc::new(
+                Capped::new(certs).expect("a rebuilt block keeps the caps its source met"),
+            ),
             provisions,
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // The certifying QC carries a deliberately divergent timestamp (a
@@ -2232,11 +2242,13 @@ mod tests {
             .collect();
         let block = Block::Live {
             header,
-            transactions: Arc::new(txs),
+            transactions: Arc::new(
+                Capped::new(txs).expect("a rebuilt block keeps the caps its source met"),
+            ),
             certificates,
             provisions,
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // A deliberately divergent certifying timestamp, as in

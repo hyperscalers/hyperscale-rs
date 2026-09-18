@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
     PendingBaseline, commit_settled_at, commit_writes, commit_writes_at, entry_key,
@@ -407,11 +408,11 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
         block,
         Block::Sealed {
             header: block.header().clone(),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provision_hashes: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provision_hashes: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
@@ -426,7 +427,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
-            certificates.push(fw);
+            certificates.push(fw).expect("a list written out in a test");
             Block::Live {
                 header,
                 transactions,
@@ -447,7 +448,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
-            certificates.push(fw);
+            certificates.push(fw).expect("a list written out in a test");
             Block::Sealed {
                 header,
                 transactions,
@@ -638,7 +639,7 @@ fn test_commit_block_stores_certificates() {
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
-    let fw_certificates = Arc::new(vec![Arc::new(cert.into())]);
+    let fw_certificates = Arc::new(Capped::from_array([Arc::new(cert.into())]));
     let block = match block {
         Block::Live {
             header,
@@ -648,10 +649,10 @@ fn test_commit_block_stores_certificates() {
         } => Block::Live {
             header,
             transactions,
-            certificates: fw_certificates,
+            certificates: Arc::clone(&fw_certificates),
             provisions,
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -662,10 +663,10 @@ fn test_commit_block_stores_certificates() {
         } => Block::Sealed {
             header,
             transactions,
-            certificates: fw_certificates,
+            certificates: Arc::clone(&fw_certificates),
             provision_hashes,
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };

@@ -35,6 +35,8 @@ impl LeafRoot for AbandonmentRoot {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
+
     use super::*;
     use crate::{
         AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
@@ -59,10 +61,10 @@ mod tests {
                 anchor: WeightedTimestamp::from_millis(100),
                 committee_anchor: WeightedTimestamp::from_millis(100),
             },
-            reach: vec![RoutePrefix::of(Address::new(
+            reach: Capped::from_array([RoutePrefix::of(Address::new(
                 [seed; 31],
                 AddressClass::Component,
-            ))],
+            ))]),
         }
     }
 

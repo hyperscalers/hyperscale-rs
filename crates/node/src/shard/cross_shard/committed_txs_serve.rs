@@ -225,7 +225,7 @@ mod tests {
             parent_block_hash: parent,
             parent_qc: parent_qc.into(),
             timestamp: ProposerTimestamp::from_millis(1_000 * height),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             // Every block of a terminating window carries the roots; a
             // block without them is not one this handler answers for.
             terminal_roots: terminating.then_some(TerminalRoots {
@@ -240,11 +240,11 @@ mod tests {
             .collect();
         let block = Block::Live {
             header,
-            transactions: Arc::new(txs),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::new(txs).expect("a list written out in a test")),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();

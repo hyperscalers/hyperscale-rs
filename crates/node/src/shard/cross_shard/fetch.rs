@@ -886,7 +886,7 @@ mod committed_tx_tests {
 
 #[cfg(test)]
 mod settled_txs_tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hyperscale_storage::PendingChain;
@@ -966,7 +966,7 @@ mod settled_txs_tests {
                 parent_qc: parent_qc.into(),
                 timestamp: ProposerTimestamp::from_millis(1_000 * h),
                 certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
-                provision_tx_roots: BTreeMap::new(),
+                provision_tx_roots: Capped::default(),
                 terminal_roots: Some(TerminalRoots {
                     settled_txs: SettledTxsRoot::ZERO,
                     committed_txs: CommittedTxsRoot::ZERO,
@@ -975,11 +975,11 @@ mod settled_txs_tests {
             });
             let block = Block::Live {
                 header,
-                transactions: Arc::new(Vec::new()),
-                certificates: Arc::new(certs.to_vec()),
-                provisions: Arc::new(Vec::new()),
-                abandonment_records: Arc::new(Vec::new()),
-                state_claims: Arc::new(Vec::new()),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::from_array(certs)),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
             parent = block.hash();

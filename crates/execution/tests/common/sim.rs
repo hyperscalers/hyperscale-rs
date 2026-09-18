@@ -34,6 +34,7 @@ use hyperscale_execution::action_handlers::{
     ExecutionOutputs, accumulate_tick_output, split_execution_outputs,
 };
 use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
+use hyperscale_hbor::Capped;
 use hyperscale_storage::{
     Anchored, RecoveredState, ReplayWindow, SubstateStore, Substates, TickChain, TickOutput,
     VersionedStore, merge_writes_from_receipts,
@@ -364,7 +365,7 @@ impl ExecutionSim {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
+                provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
                 abandonment_records,
                 state_claims,
                 witness_sources,

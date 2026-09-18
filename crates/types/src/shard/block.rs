@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use crate::{
@@ -29,7 +29,7 @@ use crate::{
 /// construction; wire-decoded blocks land at `Verifiable::Unverified`
 /// because HBOR decode is a transparent passthrough into that variant.
 /// Same rationale as [`SharedCertificates`].
-pub type SharedTransactions = Arc<Vec<Arc<Verifiable<Transaction>>>>;
+pub type SharedTransactions = Arc<Capped<Vec<Arc<Verifiable<Transaction>>>, MAX_TXS_PER_BLOCK>>;
 
 /// Derive every transaction of a committed `block` through this node's
 /// `derivation`, so the routed facts its handlers read are there to
@@ -69,10 +69,11 @@ pub fn derive_block_transactions(block: &Block, derivation: &dyn Derivation) {
 /// passthrough into that variant. Same rationale as
 /// [`BlockHeader::parent_qc`](crate::BlockHeader) which carries
 /// `Verifiable<QuorumCertificate>` for the same reason.
-pub type SharedCertificates = Arc<Vec<Arc<Verifiable<Finalization>>>>;
+pub type SharedCertificates =
+    Arc<Capped<Vec<Arc<Verifiable<Finalization>>>, MAX_FINALIZED_TX_PER_BLOCK>>;
 
 /// Shared provision list — same rationale as [`SharedCertificates`].
-pub type SharedProvisions = Arc<Vec<Arc<Verifiable<Provisions>>>>;
+pub type SharedProvisions = Arc<Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>>;
 
 /// What a shard charged across the ticks `certificates` settle, in
 /// quanta.
@@ -116,27 +117,20 @@ pub enum Block {
     Live {
         /// Block header (contains all merkle roots).
         header: BlockHeader,
-        /// Transactions in this block, sorted by hash. Spelled out
-        /// rather than as [`SharedTransactions`] so the cap can see the
-        /// collection it bounds.
-        #[hbor(max = MAX_TXS_PER_BLOCK)]
-        transactions: Arc<Vec<Arc<Verifiable<Transaction>>>>,
+        /// Transactions in this block, sorted by hash.
+        transactions: SharedTransactions,
         /// Finalizations finalized in this block.
-        #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-        certificates: Arc<Vec<Arc<Verifiable<Finalization>>>>,
+        certificates: SharedCertificates,
         /// Provisions needed to execute cross-shard ticks locally.
-        #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-        provisions: Arc<Vec<Arc<Verifiable<Provisions>>>>,
+        provisions: SharedProvisions,
         /// What departed shards left unresolved of this chain's business.
         /// Committed via the header's `abandonment_root`.
-        #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
-        abandonment_records: Arc<Vec<AbandonmentRecord>>,
+        abandonment_records: Arc<Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>>,
         /// What this block commits about counterparts' chains: cells
         /// their commit-proven state holds, proved against their
         /// headers. Committed via the header's `state_claims_root` and
         /// folded by every replica at commit.
-        #[hbor(max = MAX_STATE_CLAIMS_PER_BLOCK)]
-        state_claims: Arc<Vec<StateClaim>>,
+        state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -151,30 +145,23 @@ pub enum Block {
     Sealed {
         /// Block header (contains all merkle roots).
         header: BlockHeader,
-        /// Transactions in this block, sorted by hash. Spelled out
-        /// rather than as [`SharedTransactions`] so the cap can see the
-        /// collection it bounds.
-        #[hbor(max = MAX_TXS_PER_BLOCK)]
-        transactions: Arc<Vec<Arc<Verifiable<Transaction>>>>,
+        /// Transactions in this block, sorted by hash.
+        transactions: SharedTransactions,
         /// Finalizations finalized in this block.
-        #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-        certificates: Arc<Vec<Arc<Verifiable<Finalization>>>>,
+        certificates: SharedCertificates,
         /// Content hashes of the provisions the block consumed while
         /// `Live`. Empty iff the block consumed no provisions.
-        #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-        provision_hashes: Arc<Vec<ProvisionHash>>,
+        provision_hashes: Arc<Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>>,
         /// What departed shards left unresolved of this chain's business.
         ///
         /// Retained through sealing, unlike provisions: a verdict is
         /// composed on this evidence however long after the terminal it
         /// came from, which is the whole reason it is written down.
-        #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
-        abandonment_records: Arc<Vec<AbandonmentRecord>>,
+        abandonment_records: Arc<Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>>,
         /// Proofs of counterparts' cells, retained through sealing like
         /// the records: a replay of any depth re-folds its answers off
         /// the block it reads, and the root binds at every stage.
-        #[hbor(max = MAX_STATE_CLAIMS_PER_BLOCK)]
-        state_claims: Arc<Vec<StateClaim>>,
+        state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -244,11 +231,11 @@ impl Block {
     ) -> Self {
         Self::Live {
             header: BlockHeader::genesis(shard_id, proposer, state_root, origin),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -271,11 +258,11 @@ impl Block {
                 parent_terminal,
                 parent_canonical_wt,
             ),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -301,11 +288,11 @@ impl Block {
                 right_terminal,
                 cut_wt,
             ),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -428,7 +415,9 @@ impl Block {
     /// regardless of variant — the evidence a verdict against a departed
     /// counterpart is composed on.
     #[must_use]
-    pub fn abandonment_records(&self) -> &[AbandonmentRecord] {
+    pub fn abandonment_records(
+        &self,
+    ) -> &Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS> {
         match self {
             Self::Live {
                 abandonment_records,
@@ -445,7 +434,7 @@ impl Block {
     /// variant — what every replica folds at commit to answer the
     /// ledger's probes.
     #[must_use]
-    pub fn state_claims(&self) -> &[StateClaim] {
+    pub fn state_claims(&self) -> &Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK> {
         match self {
             Self::Live { state_claims, .. } | Self::Sealed { state_claims, .. } => state_claims,
         }
@@ -541,12 +530,12 @@ impl Block {
     /// construction: `into_sealed` derives the `Sealed` list by hashing
     /// the `Live` provisions before dropping the bodies.
     #[must_use]
-    pub fn provision_hashes(&self) -> Vec<ProvisionHash> {
+    pub fn provision_hashes(&self) -> Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK> {
         match self {
-            Self::Live { provisions, .. } => provisions.iter().map(|p| p.hash()).collect(),
+            Self::Live { provisions, .. } => provisions.map(|p| p.hash()),
             Self::Sealed {
                 provision_hashes, ..
-            } => provision_hashes.iter().copied().collect(),
+            } => (**provision_hashes).clone(),
         }
     }
 
@@ -589,7 +578,9 @@ impl Block {
                 state_claims,
                 witness_sources,
             } => {
-                let hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
+                // One hash per body, so the list keeps the cap the
+                // provisions field already met.
+                let hashes = provisions.map(|p| p.hash());
                 Self::Sealed {
                     header,
                     transactions,

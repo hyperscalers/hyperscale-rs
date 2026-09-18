@@ -1447,6 +1447,7 @@ impl MempoolCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::{
@@ -1532,9 +1533,9 @@ mod tests {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(vec![Arc::new(provision.into())]),
-                abandonment_records: Arc::new(Vec::new()),
-                state_claims: Arc::new(Vec::new()),
+                provisions: Arc::new(Capped::from_array([Arc::new(provision.into())])),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             },
             sealed @ Block::Sealed { .. } => sealed,

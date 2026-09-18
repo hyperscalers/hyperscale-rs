@@ -14,7 +14,7 @@
 //! fetch lands. Carrying the bytes to a committee that mostly holds
 //! them already costs a block megabytes to save a fetch nobody makes.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{Anchor, Inclusion, MAX_PROOFS_PER_QUERY, SubstateKey};
 
@@ -31,8 +31,7 @@ pub struct StateClaim {
     /// The commit-proven state the readings were taken against.
     pub anchor: Anchor,
     /// Each cell asked about, with what the anchor's root says of it.
-    #[hbor(max = MAX_PROOFS_PER_QUERY)]
-    pub cells: Vec<(SubstateKey, Inclusion)>,
+    pub cells: Capped<Vec<(SubstateKey, Inclusion)>, MAX_PROOFS_PER_QUERY>,
 }
 
 impl StateClaim {
@@ -42,6 +41,11 @@ impl StateClaim {
         let mut cells: Vec<(SubstateKey, Inclusion)> = cells.into_iter().collect();
         cells.sort_unstable();
         cells.dedup_by_key(|(key, _)| *key);
+        // A reading list past the cap is one no claim may carry, and an
+        // empty claim is one `is_well_formed` refuses — so an over-cap
+        // input lands where it landed before, refused rather than
+        // trimmed into a different claim.
+        let cells = Capped::new(cells).unwrap_or_default();
         Self { anchor, cells }
     }
 
@@ -53,9 +57,7 @@ impl StateClaim {
     /// pointless.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        !self.cells.is_empty()
-            && self.cells.len() <= MAX_PROOFS_PER_QUERY
-            && self.cells.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        !self.cells.is_empty() && self.cells.windows(2).all(|pair| pair[0].0 < pair[1].0)
     }
 
     /// The cells this claim answers for.
@@ -132,7 +134,7 @@ mod tests {
     fn a_claim_out_of_its_form_is_refused() {
         let over = |cells: Vec<(SubstateKey, Inclusion)>| StateClaim {
             anchor: anchor(),
-            cells,
+            cells: Capped::new(cells).expect("a list written out in a test"),
         };
         assert!(!over(Vec::new()).is_well_formed());
         assert!(

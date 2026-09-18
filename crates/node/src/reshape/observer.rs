@@ -31,6 +31,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_types::network::request::{
     GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
 };
@@ -691,7 +692,7 @@ impl ObserverTail {
             CertifiedBlockHeader::new(prev.clone(), header.parent_qc().clone()),
             CertifiedBlockHeader::new(header.clone(), qc.clone()),
             certified_parent,
-            ancestry,
+            Capped::new(ancestry).expect("a rebuilt block keeps the caps its source met"),
         );
         if let Some(sighting) = &mut self.terminal {
             sighting.commit_proof = Some((proof, committee));
@@ -972,17 +973,17 @@ mod tests {
             parent_qc: parent_qc.into(),
             round: Round::new(round),
             state_root,
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             split_child_roots: pair,
             ..Default::default()
         });
         Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }

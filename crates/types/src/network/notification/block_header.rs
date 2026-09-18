@@ -87,6 +87,8 @@ impl NetworkMessage for BlockHeaderNotification {
 #[cfg(test)]
 mod tests {
 
+    use hyperscale_hbor::Capped;
+
     use super::*;
     use crate::{
         BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, ProposerTimestamp,
@@ -111,16 +113,16 @@ mod tests {
     fn test_block_header_gossip_creation() {
         let header = make_header(BlockHeight::new(1));
         let manifest = BlockManifest::new(
-            vec![
+            Capped::from_array([
                 TxHash::from(Hash::from_bytes(b"tx1")),
                 TxHash::from(Hash::from_bytes(b"tx2")),
                 TxHash::from(Hash::from_bytes(b"tx3")),
                 TxHash::from(Hash::from_bytes(b"tx4")),
-            ],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
+            ]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
             WitnessSources::empty(),
         );
 
@@ -134,11 +136,11 @@ mod tests {
     fn test_block_header_gossip_into_parts() {
         let header = make_header(BlockHeight::new(5));
         let manifest = BlockManifest::new(
-            vec![TxHash::from(Hash::from_bytes(b"tx1"))],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
+            Capped::from_array([TxHash::from(Hash::from_bytes(b"tx1"))]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
             WitnessSources::empty(),
         );
 
@@ -157,17 +159,17 @@ mod tests {
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight::new(1)),
             BlockManifest::new(
-                vec![tx1, tx2, tx3],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
+                Capped::from_array([tx1, tx2, tx3]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             zero_sig(),
         );
 
-        let all: Vec<TxHash> = gossip.manifest.tx_hashes().clone();
+        let all: Vec<TxHash> = gossip.manifest.tx_hashes().clone().into_inner();
         assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }

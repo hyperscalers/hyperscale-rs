@@ -201,6 +201,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
@@ -247,10 +248,11 @@ mod tests {
                 certificate_root: header.certificate_root(),
                 local_receipt_root: header.local_receipt_root(),
                 provision_root: header.provision_root(),
-                provision_tx_roots: std::collections::BTreeMap::from([(
+                provision_tx_roots: Capped::new(std::collections::BTreeMap::from([(
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
-                )]),
+                )]))
+                .expect("a map written out in a test"),
                 txs_in_flight: header.txs_in_flight(),
                 ..Default::default()
             });

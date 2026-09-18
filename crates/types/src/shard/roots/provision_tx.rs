@@ -3,11 +3,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use thiserror::Error;
 
 use crate::{
-    Finalization, Hash, ProvisionTxRoot, ShardId, TopologySnapshot, Transaction,
-    TransactionDecision, TxHash, Verifiable, Verified, Verify, compute_merkle_root,
+    Finalization, Hash, MAX_PROVISION_TARGET_SHARDS, ProvisionTxRoot, ShardId, TopologySnapshot,
+    Transaction, TransactionDecision, TxHash, Verifiable, Verified, Verify, compute_merkle_root,
 };
 
 /// Inputs the provision-tx-roots verifier reads against.
@@ -64,10 +65,11 @@ pub fn committed_crossings(
 }
 
 /// Provision-tx roots map type as carried by [`BlockHeader`](crate::BlockHeader),
-/// which caps it at [`MAX_PROVISION_TARGET_SHARDS`] entries on the wire.
+/// at the entry cap a block's provision targets are held to.
 ///
 /// [`MAX_PROVISION_TARGET_SHARDS`]: crate::MAX_PROVISION_TARGET_SHARDS
-pub type ProvisionTxRootsMap = BTreeMap<ShardId, ProvisionTxRoot>;
+pub type ProvisionTxRootsMap =
+    Capped<BTreeMap<ShardId, ProvisionTxRoot>, MAX_PROVISION_TARGET_SHARDS>;
 
 /// Failure modes of provision-tx-roots verification.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -77,9 +79,9 @@ pub enum ProvisionTxRootsVerifyError {
     #[error("computed provision_tx_roots {computed:?} ≠ claimed {expected:?}")]
     Mismatch {
         /// Header's claimed per-target-shard provision-tx roots.
-        expected: BTreeMap<ShardId, ProvisionTxRoot>,
+        expected: ProvisionTxRootsMap,
         /// Map computed from the supplied transactions.
-        computed: BTreeMap<ShardId, ProvisionTxRoot>,
+        computed: ProvisionTxRootsMap,
     },
 }
 
@@ -104,6 +106,13 @@ impl Verified<ProvisionTxRootsMap> {
     /// verify a received `Provisions` carries the full set it was meant
     /// to receive, and the bundle builder stages requests in the same
     /// order. Only emits an entry for targets with ≥1 tx.
+    ///
+    /// # Panics
+    ///
+    /// Never: a block exports to at most one entry per other shard,
+    /// which is what [`MAX_PROVISION_TARGET_SHARDS`] counts.
+    ///
+    /// [`MAX_PROVISION_TARGET_SHARDS`]: crate::MAX_PROVISION_TARGET_SHARDS
     #[must_use]
     pub fn compute(
         local_shard: ShardId,
@@ -160,15 +169,18 @@ impl Verified<ProvisionTxRootsMap> {
             }
         }
 
-        let map: BTreeMap<ShardId, ProvisionTxRoot> = per_target
-            .into_iter()
-            .map(|(shard, hashes)| {
-                (
-                    shard,
-                    ProvisionTxRoot::from_raw(compute_merkle_root(&hashes)),
-                )
-            })
-            .collect();
+        let map: ProvisionTxRootsMap = Capped::new(
+            per_target
+                .into_iter()
+                .map(|(shard, hashes)| {
+                    (
+                        shard,
+                        ProvisionTxRoot::from_raw(compute_merkle_root(&hashes)),
+                    )
+                })
+                .collect(),
+        )
+        .expect("a block exports one entry per other shard");
         Self::new_unchecked(map)
     }
 }

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
@@ -37,16 +38,16 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         height,
         parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
         parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
-        provision_tx_roots: std::collections::BTreeMap::new(),
+        provision_tx_roots: Capped::default(),
         ..Default::default()
     });
     let block = Block::Live {
         header,
-        transactions: Arc::new(Vec::new()),
-        certificates: Arc::new(Vec::new()),
-        provisions: Arc::new(Vec::new()),
-        abandonment_records: Arc::new(Vec::new()),
-        state_claims: Arc::new(Vec::new()),
+        transactions: Arc::new(Capped::empty()),
+        certificates: Arc::new(Capped::empty()),
+        provisions: Arc::new(Capped::empty()),
+        abandonment_records: Arc::new(Capped::empty()),
+        state_claims: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let qc = {
@@ -85,7 +86,7 @@ fn make_remote_header_targeting(
         parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
         parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
         timestamp: ProposerTimestamp::from_millis(1000 + height.inner()),
-        provision_tx_roots,
+        provision_tx_roots: Capped::new(provision_tx_roots).expect("a list written out in a test"),
         ..Default::default()
     });
     let header_hash = header.hash();

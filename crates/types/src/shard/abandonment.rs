@@ -35,7 +35,7 @@
 //! the transaction's own block still holds enough to compose the same
 //! verdict as its peers.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 use hyperscale_vm_types::Quanta;
 
 use crate::{
@@ -126,8 +126,7 @@ pub struct UnsettledTx {
     ///
     /// Routes rather than addresses, because placement is the only
     /// question asked of them and it reads no further than this.
-    #[hbor(max = MAX_PREFIXES_PER_TX)]
-    pub reach: Vec<RoutePrefix>,
+    pub reach: Capped<Vec<RoutePrefix>, MAX_PREFIXES_PER_TX>,
 }
 
 /// The window a name says committed it: what its figures were frozen
@@ -192,7 +191,7 @@ impl UnsettledTx {
     /// figure without re-encoding what it just decoded. Everything but
     /// the reach is fixed width, and the reach is a route each.
     #[must_use]
-    pub const fn wire_weight(&self) -> usize {
+    pub fn wire_weight(&self) -> usize {
         UNSETTLED_TX_BYTES + self.reach.len() * ROUTE_PREFIX_BYTES
     }
 
@@ -390,8 +389,7 @@ pub struct AbandonmentRecord {
     ///
     /// Sorted by hash and duplicate-free on it, so the record has one form
     /// and a validator checking it walks the same order it would build.
-    #[hbor(max = MAX_UNSETTLED_PER_BLOCK)]
-    unsettled: Vec<UnsettledTx>,
+    unsettled: Capped<Vec<UnsettledTx>, MAX_UNSETTLED_PER_BLOCK>,
 }
 
 impl AbandonmentRecord {
@@ -406,10 +404,14 @@ impl AbandonmentRecord {
         let mut unsettled: Vec<UnsettledTx> = unsettled.into_iter().collect();
         unsettled.sort_unstable_by_key(|entry| entry.tx_hash);
         unsettled.dedup_by_key(|entry| entry.tx_hash);
+        // A list past the cap is one no record may carry, and an empty
+        // record is one `is_well_formed` refuses — so an over-cap input
+        // lands where it landed before, refused rather than trimmed into
+        // a different record.
         Self {
             shard,
             terminal_wt,
-            unsettled,
+            unsettled: Capped::new(unsettled).unwrap_or_default(),
         }
     }
 
@@ -466,7 +468,6 @@ impl AbandonmentRecord {
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         !self.unsettled.is_empty()
-            && self.unsettled.len() <= MAX_UNSETTLED_PER_BLOCK
             && self
                 .unsettled
                 .windows(2)
@@ -498,10 +499,10 @@ mod tests {
                 anchor: WeightedTimestamp::from_millis(u64::from(seed) * 10),
                 committee_anchor: WeightedTimestamp::from_millis(u64::from(seed) * 10),
             },
-            reach: vec![RoutePrefix::of(Address::new(
+            reach: Capped::from_array([RoutePrefix::of(Address::new(
                 [seed; 31],
                 AddressClass::Component,
-            ))],
+            ))]),
         }
     }
 
@@ -593,10 +594,10 @@ mod tests {
         let departed = ShardId::leaf(1, 0);
         let successor = ShardId::leaf(2, 0);
         let name = UnsettledTx {
-            reach: vec![RoutePrefix::of(Address::new(
+            reach: Capped::from_array([RoutePrefix::of(Address::new(
                 [0x00; 31],
                 AddressClass::Component,
-            ))],
+            ))]),
             committed: CommittedAt {
                 height: BlockHeight::new(7),
                 anchor: WeightedTimestamp::from_millis(1_000),
@@ -746,14 +747,14 @@ mod tests {
         let reversed = AbandonmentRecord {
             shard: ShardId::ROOT,
             terminal_wt: wt(),
-            unsettled: vec![tx(2), tx(1)],
+            unsettled: Capped::from_array([tx(2), tx(1)]),
         };
         assert!(!reversed.is_well_formed());
 
         let repeating = AbandonmentRecord {
             shard: ShardId::ROOT,
             terminal_wt: wt(),
-            unsettled: vec![tx(1), tx(1)],
+            unsettled: Capped::from_array([tx(1), tx(1)]),
         };
         assert!(!repeating.is_well_formed());
     }

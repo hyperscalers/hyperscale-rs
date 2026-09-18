@@ -332,6 +332,10 @@ impl TestCommittee {
 /// on blocks with any un-`Verified` entry; tests targeting that path must
 /// construct `Block` directly with `Vec<Arc<Verifiable<Transaction>>>`
 /// holding `Verified` entries.
+///
+/// # Panics
+///
+/// If a list written out here is past a block's own cap.
 #[must_use]
 pub fn make_live_block(
     shard_id: ShardId,
@@ -348,7 +352,7 @@ pub fn make_live_block(
         parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
         proposer,
         timestamp: ProposerTimestamp::from_millis(timestamp_ms),
-        provision_tx_roots: std::collections::BTreeMap::new(),
+        provision_tx_roots: Capped::default(),
         // A chain contiguous from genesis: one committed block per
         // height, none of which carried anything.
         load: ShardLoad {
@@ -363,11 +367,11 @@ pub fn make_live_block(
         .collect();
     Block::Live {
         header,
-        transactions: Arc::new(transactions),
-        certificates: Arc::new(certificates),
-        provisions: Arc::new(Vec::new()),
-        abandonment_records: Arc::new(Vec::new()),
-        state_claims: Arc::new(Vec::new()),
+        transactions: Arc::new(Capped::new(transactions).expect("a list written out in a test")),
+        certificates: Arc::new(Capped::new(certificates).expect("a list written out in a test")),
+        provisions: Arc::new(Capped::empty()),
+        abandonment_records: Arc::new(Capped::empty()),
+        state_claims: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -532,7 +536,7 @@ pub(crate) fn fork_header(
         parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
         timestamp: ProposerTimestamp::from_millis(salt),
         round,
-        provision_tx_roots: std::collections::BTreeMap::new(),
+        provision_tx_roots: Capped::default(),
         ..Default::default()
     })
 }
@@ -696,7 +700,7 @@ pub(crate) fn live_fork_header(
         parent_qc: anchor_qc(shard, wt).into(),
         timestamp: ProposerTimestamp::from_millis(salt),
         round,
-        provision_tx_roots: std::collections::BTreeMap::new(),
+        provision_tx_roots: Capped::default(),
         ..Default::default()
     })
 }

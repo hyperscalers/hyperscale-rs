@@ -7,6 +7,7 @@ description = "Beacon-chain coordinator (PC/SPC/MSC consensus, validator-set + t
 
 [dependencies]
 hyperscale-core.workspace = true
+hyperscale-hbor.workspace = true
 hyperscale-network.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true

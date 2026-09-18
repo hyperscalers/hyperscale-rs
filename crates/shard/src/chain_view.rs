@@ -245,6 +245,7 @@ impl<'a> ChainView<'a> {
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, Block, BlockHeaderParts, BlockManifest, Hash, LocalTimestamp,
         ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield, Transaction,
@@ -261,7 +262,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(1000),
             state_root: StateRoot::from_raw(Hash::from_bytes(&[height; 32])),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             txs_in_flight: TxsInFlight::new(u64::from(height)),
             ..Default::default()
         })
@@ -270,11 +271,11 @@ mod tests {
     fn make_block(height: u8, parent_block_hash: BlockHash) -> Block {
         Block::Live {
             header: make_header(height, parent_block_hash),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -377,11 +378,11 @@ mod tests {
         let tx_hash = tx.hash();
         let low = Block::Live {
             header: make_header(1, BlockHash::ZERO),
-            transactions: Arc::new(vec![tx]),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::from_array([tx])),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let low_pending = pending_from_block(&low);
@@ -440,11 +441,11 @@ mod tests {
         let tx_hash = tx.hash();
         let low = Block::Live {
             header: make_header(1, BlockHash::ZERO),
-            transactions: Arc::new(vec![tx]),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::from_array([tx])),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let low_hash = low.hash();

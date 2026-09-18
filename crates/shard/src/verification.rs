@@ -924,7 +924,7 @@ impl VerificationPipeline {
         vec![Action::VerifyProvisionRoot {
             block_hash,
             expected_root: block.header().provision_root(),
-            batch_hashes: manifest.provision_hashes().clone(),
+            batch_hashes: manifest.provision_hashes().clone().into_inner(),
         }]
     }
 
@@ -2181,8 +2181,8 @@ impl VerificationPipeline {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_finalization_awaiting, make_leg_finalization,
         make_settling_finalization, test_transaction,
@@ -2237,11 +2237,13 @@ mod tests {
                 height,
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(certificates),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(
+                Capped::new(certificates).expect("a list written out in a test"),
+            ),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -2269,7 +2271,7 @@ mod tests {
             parent_block_hash,
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
-            provision_tx_roots: BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             txs_in_flight: TxsInFlight::new(u64::from(in_flight)),
             load: ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, substate_bytes),
             ..Default::default()
@@ -2294,12 +2296,14 @@ mod tests {
     ) -> Block {
         Block::Live {
             header: header_claiming(height, parent_block_hash, in_flight, substate_bytes),
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(
+                Capped::new(transactions).expect("a list written out in a test"),
+            ),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -2333,18 +2337,20 @@ mod tests {
             parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
-            provision_tx_roots: BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             settled_tick_frontier: BlockHeight::new(frontier),
             ..Default::default()
         });
         Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(certificates),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(
+                Capped::new(certificates).expect("a list written out in a test"),
+            ),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         }
     }
 
@@ -3047,17 +3053,17 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
             transaction_root: TransactionRoot::from_raw(Hash::from_bytes(b"forged-tx-root")),
-            provision_tx_roots: BTreeMap::new(),
+            provision_tx_roots: Capped::default(),
             ..Default::default()
         });
         let block = Block::Live {
             header: forged_header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
         };
         let demands = block.demands();
         assert!(demands.contains(VerificationKind::TransactionRoot));

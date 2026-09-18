@@ -80,7 +80,7 @@ impl ShardChainReader for SimShardStorage {
                 BlockForSync {
                     block,
                     qc: qc.into_unverified(),
-                    provision_hashes,
+                    provision_hashes: provision_hashes.into_inner(),
                 }
             })
     }

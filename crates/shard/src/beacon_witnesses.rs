@@ -264,6 +264,7 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
@@ -385,11 +386,11 @@ mod tests {
                 round: Round::new(parent_round.inner() + 1 + skipped),
                 ..Default::default()
             }),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            abandonment_records: Arc::new(Vec::new()),
-            state_claims: Arc::new(Vec::new()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -614,7 +615,7 @@ mod tests {
         // Validator 2 holds an observer seat: its signal classifies as
         // `ReshapeReady` in the same ascending-id position.
         let sources = WitnessSources::new(
-            ready,
+            Capped::new(ready).expect("a list written out in a test"),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS,
             }),
@@ -665,7 +666,11 @@ mod tests {
         let ready = ready_signals(&[7, 2]);
         let receipts: Vec<StoredReceipt> = Vec::new();
 
-        let sources = WitnessSources::new(ready, None, VrfProof::ZERO);
+        let sources = WitnessSources::new(
+            Capped::new(ready).expect("a list written out in a test"),
+            None,
+            VrfProof::ZERO,
+        );
         let a = derive_leaves(ShardId::ROOT, &topo, &receipts, &missed, &sources);
         let b = derive_leaves(ShardId::ROOT, &topo, &receipts, &missed, &sources);
         assert_eq!(a, b);
