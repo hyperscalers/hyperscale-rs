@@ -16,7 +16,7 @@ use hyperscale_engine::genesis::{
     OWNER_BADGE_ID, pool_address, pool_owner_badge, stake_unit, staking_artifact,
 };
 use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
-use hyperscale_hbor::{Bytes, Capped, TypeShape};
+use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits, principal_of};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
@@ -1830,7 +1830,7 @@ pub(crate) fn storm_artifact(nonce: u16) -> Vec<u8> {
     // An event is a name and a shape, so the name that varies the address
     // arrives with the empty one — what an event carrying nothing
     // declares.
-    let named = format!("storm-{nonce}");
+    let named = format!("Storm{nonce}");
     let unit = metadata
         .types
         .push(TypeShape::Tuple(Vec::new()))
@@ -1838,7 +1838,7 @@ pub(crate) fn storm_artifact(nonce: u16) -> Vec<u8> {
     metadata
         .types
         .push(TypeShape::Named {
-            name: named.clone(),
+            name: Name::try_from(named.as_str()).expect("a name the protocol spells"),
             shape: unit,
         })
         .expect("a name the package does not already hold");
