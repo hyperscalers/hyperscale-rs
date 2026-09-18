@@ -270,7 +270,7 @@ pub fn declared_vector(
         .map(|call| {
             metadata
                 .get(call.package)
-                .and_then(|package| package.methods.get(&call.export))
+                .and_then(|package| package.methods.get(call.export.as_str()))
                 .map_or(0, |method| method.event_bytes)
         })
         .collect();

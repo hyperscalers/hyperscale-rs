@@ -1830,7 +1830,7 @@ pub(crate) fn storm_artifact(nonce: u16) -> Vec<u8> {
     // An event is a name and a shape, so the name that varies the address
     // arrives with the empty one — what an event carrying nothing
     // declares.
-    let named = format!("Storm{nonce}");
+    let named = Name::declared(&format!("Storm{nonce}"));
     let unit = metadata
         .types
         .push(TypeShape::Tuple(Vec::new()))
@@ -1838,7 +1838,7 @@ pub(crate) fn storm_artifact(nonce: u16) -> Vec<u8> {
     metadata
         .types
         .push(TypeShape::Named {
-            name: Name::try_from(named.as_str()).expect("a name the protocol spells"),
+            name: named.clone(),
             shape: unit,
         })
         .expect("a name the package does not already hold");
