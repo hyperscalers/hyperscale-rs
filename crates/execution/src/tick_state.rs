@@ -1088,12 +1088,20 @@ impl TickState {
     /// [`attestable`](Self::attestable), and a certificate that never
     /// forms holds them just as hard.
     ///
-    /// [`TICK_SETTLEABLE_SPAN`] past the tick's own anchor is where no
-    /// member it holds can still be settleable, so a half emitted after
-    /// it would settle a transaction already past every deadline that
-    /// could decide it. Only then is the tick released — inside the span
-    /// a member is merely slow, and the abandonment path is what speaks
-    /// for one whose own close has passed.
+    /// Two ways a half becomes undeliverable. `committee_replaced` is the
+    /// immediate one: a halt recovery has replaced the committee seated
+    /// at this tick's anchor, so the signatures its certificate needs are
+    /// from members no longer serving the shard and no quorum can ever
+    /// form — waiting changes nothing, and a fresh member that executed
+    /// the block while catching up would otherwise hold the frontier
+    /// against its own committee's work.
+    ///
+    /// [`TICK_SETTLEABLE_SPAN`] past the tick's own anchor is the other:
+    /// no member it holds can still be settleable, so a half emitted
+    /// after it would settle a transaction already past every deadline
+    /// that could decide it. Inside the span a member is merely slow, and
+    /// the abandonment path is what speaks for one whose own close has
+    /// passed.
     ///
     /// Read off committed content alone — seats settle on committed
     /// finalizations and both timestamps are BFT-authenticated — so every
@@ -1104,9 +1112,20 @@ impl TickState {
     /// later ticks read, and replicas letting go at different frontiers
     /// would read different overlays from the same chain.
     #[must_use]
-    pub fn owes_undeliverable_determined(&self, committed_ts: WeightedTimestamp) -> bool {
+    pub fn owes_undeliverable_determined(
+        &self,
+        committed_ts: WeightedTimestamp,
+        committee_replaced: bool,
+    ) -> bool {
         self.determined_unsettled()
-            && committed_ts.elapsed_since(self.tick_ts) >= TICK_SETTLEABLE_SPAN
+            && (committee_replaced
+                || committed_ts.elapsed_since(self.tick_ts) >= TICK_SETTLEABLE_SPAN)
+    }
+
+    /// The anchor whose committee would have to attest this tick.
+    #[must_use]
+    pub const fn anchor(&self) -> WeightedTimestamp {
+        self.tick_ts
     }
 
     /// Whether the determined half is out of the way — emitted, or never

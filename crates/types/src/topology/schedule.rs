@@ -464,6 +464,28 @@ impl TopologySchedule {
         self.live_bridge(shard, wt).is_some()
     }
 
+    /// Whether a halt recovery has replaced the committee seated at `wt`
+    /// for `shard`, so nothing anchored there can still reach a quorum of
+    /// the committee that would have to attest it.
+    ///
+    /// A shuffle does not answer true here and must not: rotating a
+    /// validator into or out of a shard changes later windows and leaves
+    /// the one an old anchor names exactly as it was seated. Only a
+    /// recovery replaces a committee *retroactively*, and only then does
+    /// work anchored below it become unattestable — the members whose
+    /// signatures it would need are no longer serving the shard.
+    ///
+    /// Reads the certified bridge rather than the pending one, so the
+    /// answer does not flip when the recovery record clears on the
+    /// shard's first crossing: a tick unattestable during the recovery is
+    /// unattestable after it, and a replica that folded the clear must
+    /// not start believing otherwise.
+    #[must_use]
+    pub fn committee_replaced_at(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+        self.certified_recovery_bridge(shard)
+            .is_some_and(|bridge| self.epoch_for(wt) < bridge)
+    }
+
     /// Whether a cross-shard artifact from `shard` at `height` is fenced by
     /// an in-flight halt recovery: past the beacon-attested frontier the
     /// recovery froze, the retained (beyond-f) committee could only have

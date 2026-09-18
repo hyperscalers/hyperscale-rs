@@ -2856,7 +2856,7 @@ impl ExecutionCoordinator {
         // carry txs.
         actions.extend(self.check_exec_cert_timeouts());
         actions.extend(self.check_vote_retry_timeouts(topology_schedule));
-        self.release_wedged_ticks();
+        self.release_wedged_ticks(topology_schedule);
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         // Re-check gate-held finalizations against the advanced schedule:
@@ -3154,12 +3154,16 @@ impl ExecutionCoordinator {
     /// discarded tick produces no half to invert against.
     ///
     /// [`TICK_SETTLEABLE_SPAN`]: crate::tick_state::TICK_SETTLEABLE_SPAN
-    fn release_wedged_ticks(&mut self) {
+    fn release_wedged_ticks(&mut self, topology_schedule: &TopologySchedule) {
         let committed_ts = self.committed_ts;
+        let local_shard = self.local_shard;
         let wedged: Vec<TickId> = self
             .ticks
             .ticks_iter()
-            .filter(|(_, tick)| tick.owes_undeliverable_determined(committed_ts))
+            .filter(|(_, tick)| {
+                let replaced = topology_schedule.committee_replaced_at(local_shard, tick.anchor());
+                tick.owes_undeliverable_determined(committed_ts, replaced)
+            })
             .map(|(tick_id, _)| *tick_id)
             .collect();
         for tick_id in wedged {
