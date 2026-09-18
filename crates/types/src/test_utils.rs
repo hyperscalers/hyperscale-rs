@@ -927,8 +927,8 @@ pub fn make_finalization_leaving(
     Finalization::new(
         tick_id,
         TickHalf::Determined,
-        vec![Arc::new(ec)],
-        vec![receipt],
+        &Capped::from_array([Arc::new(ec)]),
+        Capped::from_array([receipt]),
     )
 }
 
@@ -947,7 +947,12 @@ pub fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> F
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![])
+    Finalization::new(
+        tick_id,
+        TickHalf::Determined,
+        &Capped::from_array([Arc::new(ec)]),
+        Capped::from_array([]),
+    )
 }
 
 /// A leg's finalization at `block_height`: `tx_hash` succeeded here and

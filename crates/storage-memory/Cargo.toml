@@ -6,6 +6,7 @@ license.workspace = true
 description = "In-memory storage implementation for simulation"
 
 [dependencies]
+hyperscale-hbor.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 hyperscale-jmt.workspace = true
@@ -14,7 +15,6 @@ hyperscale-vm-types.workspace = true
 im.workspace = true
 
 [dev-dependencies]
-hyperscale-hbor.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 indexmap.workspace = true

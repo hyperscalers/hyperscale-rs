@@ -358,7 +358,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use arc_swap::ArcSwap;
-    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_hbor::{Bytes, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
     use hyperscale_network::{GossipHandler, NotificationHandler, RequestHandler};
     use hyperscale_node::{
         serve_block_request, serve_state_range_request, serve_witness_history_request,
@@ -606,7 +606,7 @@ mod tests {
         // the fetch geometry.
         let poisoned = SubstateLeaf {
             key: test_key(0x42),
-            value: vec![0xEE; 8],
+            value: Bytes::from_array([0xEE; 8]),
         };
         fresh
             .stage_import_chunk(

@@ -407,8 +407,12 @@ impl ProvisioningTracker {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::test_utils::test_key;
-    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardTrie};
+    use hyperscale_types::{
+        BlockHeight, Hash, MAX_STATE_ENTRIES_PER_TX, MerkleInclusionProof, ProvisionEntry,
+        ShardTrie,
+    };
 
     use super::*;
     use crate::fixtures;
@@ -425,7 +429,7 @@ mod tests {
     ) -> Verified<Provisions> {
         let transactions: Vec<ProvisionEntry> = tx_hashes
             .into_iter()
-            .map(|tx_hash| ProvisionEntry::new(tx_hash, vec![]))
+            .map(|tx_hash| ProvisionEntry::new(tx_hash, Capped::from_array([])))
             .collect();
         Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
             source,
@@ -433,7 +437,7 @@ mod tests {
             block_height,
             anchor.clock,
             MerkleInclusionProof::dummy(),
-            transactions,
+            Capped::new(transactions).expect("a list written out in a test"),
         ))
     }
 
@@ -448,7 +452,7 @@ mod tests {
     fn bundle_for(
         source: ShardId,
         tx_hash: TxHash,
-        entries: Vec<SubstateEntry>,
+        entries: Capped<Vec<SubstateEntry>, MAX_STATE_ENTRIES_PER_TX>,
     ) -> Verified<Provisions> {
         Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
             source,
@@ -456,7 +460,7 @@ mod tests {
             BlockHeight::new(5),
             anchor(0).clock,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(tx_hash, entries)],
+            Capped::from_array([ProvisionEntry::new(tx_hash, entries)]),
         ))
     }
 
@@ -532,16 +536,17 @@ mod tests {
             local: LocalKey([2; 16]),
         };
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        let bundle = |source: ShardId, entries: Vec<SubstateEntry>| {
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                source,
-                ShardId::leaf(2, 0),
-                BlockHeight::new(5),
-                anchor(0).clock,
-                MerkleInclusionProof::dummy(),
-                vec![ProvisionEntry::new(tx, entries)],
-            ))
-        };
+        let bundle =
+            |source: ShardId, entries: Capped<Vec<SubstateEntry>, MAX_STATE_ENTRIES_PER_TX>| {
+                Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+                    source,
+                    ShardId::leaf(2, 0),
+                    BlockHeight::new(5),
+                    anchor(0).clock,
+                    MerkleInclusionProof::dummy(),
+                    Capped::from_array([ProvisionEntry::new(tx, entries)]),
+                ))
+            };
         let requirement = Requirement::Crossing {
             source: shard(1),
             key: record,
@@ -553,7 +558,7 @@ mod tests {
         planted.record_required(tx, BTreeSet::from([requirement]));
         planted.absorb_provisions(&bundle(
             shard(3),
-            vec![SubstateEntry::new(record, Some(vec![9]))],
+            Capped::from_array([SubstateEntry::new(record, Some(Bytes::from_array([9])))]),
         ));
         assert!(
             !planted.is_fully_provisioned(tx),
@@ -565,7 +570,7 @@ mod tests {
         let mut early = ProvisioningTracker::new();
         early.absorb_provisions(&bundle(
             shard(1),
-            vec![SubstateEntry::new(record, Some(vec![7]))],
+            Capped::from_array([SubstateEntry::new(record, Some(Bytes::from_array([7])))]),
         ));
         early.record_required(tx, BTreeSet::from([requirement]));
         assert!(early.is_fully_provisioned(tx));
@@ -580,14 +585,17 @@ mod tests {
         wrong.record_required(tx, BTreeSet::from([requirement]));
         wrong.absorb_provisions(&bundle(
             shard(1),
-            vec![SubstateEntry::new(other, Some(vec![7]))],
+            Capped::from_array([SubstateEntry::new(other, Some(Bytes::from_array([7])))]),
         ));
         assert!(!wrong.is_fully_provisioned(tx));
-        wrong.absorb_provisions(&bundle(shard(1), vec![SubstateEntry::new(record, None)]));
+        wrong.absorb_provisions(&bundle(
+            shard(1),
+            Capped::from_array([SubstateEntry::new(record, None)]),
+        ));
         assert!(!wrong.is_fully_provisioned(tx), "absent answers nothing");
         wrong.absorb_provisions(&bundle(
             shard(1),
-            vec![SubstateEntry::new(record, Some(vec![7]))],
+            Capped::from_array([SubstateEntry::new(record, Some(Bytes::from_array([7])))]),
         ));
         assert!(wrong.is_fully_provisioned(tx));
 
@@ -600,10 +608,10 @@ mod tests {
         );
         both.absorb_provisions(&bundle(
             shard(1),
-            vec![SubstateEntry::new(record, Some(vec![7]))],
+            Capped::from_array([SubstateEntry::new(record, Some(Bytes::from_array([7])))]),
         ));
         assert!(!both.is_fully_provisioned(tx));
-        both.absorb_provisions(&bundle(shard(2), Vec::new()));
+        both.absorb_provisions(&bundle(shard(2), Capped::empty()));
         assert!(both.is_fully_provisioned(tx));
     }
 
@@ -786,7 +794,13 @@ mod tests {
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         let a = test_key(1);
         let b = test_key(2);
-        let first = || bundle_for(shard(1), tx, vec![SubstateEntry::new(a, Some(vec![1]))]);
+        let first = || {
+            bundle_for(
+                shard(1),
+                tx,
+                Capped::from_array([SubstateEntry::new(a, Some(Bytes::from_array([1])))]),
+            )
+        };
         t.absorb_provisions(&first());
         t.absorb_provisions(&first());
         assert_eq!(
@@ -799,7 +813,7 @@ mod tests {
         t.absorb_provisions(&bundle_for(
             shard(1),
             tx,
-            vec![SubstateEntry::new(b, Some(vec![2]))],
+            Capped::from_array([SubstateEntry::new(b, Some(Bytes::from_array([2])))]),
         ));
         let carried = t.provisions_for(tx);
         assert_eq!(carried.len(), 1, "still one absorption for the shard");

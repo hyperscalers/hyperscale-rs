@@ -1,6 +1,6 @@
 //! Fee summary, log levels, and node-local execution metadata.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor, Text};
 
 /// Cap on `ExecutionMetadata.log_messages` count at decode time. Receipts
 /// emit a handful of log lines per tx; 1024 is far above any legitimate
@@ -49,7 +49,6 @@ pub enum LogLevel {
 /// Written atomically with block commit but on a separate pruning cycle
 /// (can be pruned earlier than the consensus receipt since not needed for state verification).
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-#[hbor(validate = check_diagnostic_lengths)]
 pub struct ExecutionMetadata {
     /// Fee breakdown reported by the engine.
     pub fee_summary: FeeSummary,
@@ -57,55 +56,40 @@ pub struct ExecutionMetadata {
     /// capped at [`MAX_DIAGNOSTIC_STRING_LEN`] by the type's validator —
     /// the cap sits inside a tuple element, out of a field attribute's
     /// reach.
-    #[hbor(max = MAX_LOG_MESSAGES_PER_TX)]
-    pub(crate) log_messages: Vec<(LogLevel, String)>,
+    pub(crate) log_messages:
+        Capped<Vec<(LogLevel, Text<MAX_DIAGNOSTIC_STRING_LEN>)>, MAX_LOG_MESSAGES_PER_TX>,
     /// Engine error message when `outcome == Failure`.
-    #[hbor(max = MAX_DIAGNOSTIC_STRING_LEN)]
-    pub(crate) error_message: Option<String>,
+    pub(crate) error_message: Option<Text<MAX_DIAGNOSTIC_STRING_LEN>>,
 }
 
 /// The per-log-string cap, checked at the wire boundary. It sits inside
 /// a tuple element, out of a field attribute's reach.
-fn check_diagnostic_lengths(meta: &ExecutionMetadata) -> Result<(), &'static str> {
-    if meta
-        .log_messages
-        .iter()
-        .all(|(_, msg)| msg.len() <= MAX_DIAGNOSTIC_STRING_LEN)
-    {
-        Ok(())
-    } else {
-        Err("diagnostic string exceeds the length cap")
-    }
-}
-
 impl ExecutionMetadata {
     /// Build from the engine's raw outputs.
     ///
-    /// # Panics
-    ///
-    /// Panics if `log_messages.len() > MAX_LOG_MESSAGES_PER_TX`, if any
-    /// `log_messages` entry's string exceeds `MAX_DIAGNOSTIC_STRING_LEN`,
-    /// or if `error_message` exceeds `MAX_DIAGNOSTIC_STRING_LEN`.
+    /// A diagnostic past one of the caps is left out rather than
+    /// refused: a message is a courtesy the receipt carries, and the
+    /// receipt has to exist either way.
     #[must_use]
     pub fn new(
         fee_summary: FeeSummary,
         log_messages: Vec<(LogLevel, String)>,
         error_message: Option<String>,
     ) -> Self {
-        assert!(
-            log_messages.len() <= MAX_LOG_MESSAGES_PER_TX,
-            "log messages past the per-transaction cap",
-        );
-        let out = Self {
+        let mut kept = Capped::empty();
+        for (level, message) in log_messages {
+            let Ok(message) = Text::new(message) else {
+                continue;
+            };
+            if kept.push((level, message)).is_err() {
+                break;
+            }
+        }
+        Self {
             fee_summary,
-            log_messages,
-            error_message,
-        };
-        assert!(
-            check_diagnostic_lengths(&out).is_ok(),
-            "diagnostic string exceeds the length cap",
-        );
-        out
+            log_messages: kept,
+            error_message: error_message.and_then(|message| Text::new(message).ok()),
+        }
     }
 
     /// All-zero metadata: empty fees, no logs, no error.
@@ -124,7 +108,7 @@ impl ExecutionMetadata {
                 total_storage_cost: None,
                 total_tipping_cost: None,
             },
-            log_messages: Vec::new(),
+            log_messages: Capped::empty(),
             error_message: None,
         }
     }
@@ -236,11 +220,19 @@ mod tests {
         buf.extend_from_slice(&hbor_to_vec(&LogLevel::Info).unwrap());
         varint::write(&mut buf, MAX_DIAGNOSTIC_STRING_LEN + 1).unwrap();
         buf.extend(std::iter::repeat_n(0u8, MAX_DIAGNOSTIC_STRING_LEN + 1));
-        // error_message: None, so the value decodes fully and the
-        // validator is what rejects it.
+        // error_message: None, so what refuses the value is the
+        // message's own type rather than anything read after it.
         buf.push(0);
         let err = hbor_from_slice::<ExecutionMetadata>(&buf).unwrap_err();
-        assert!(matches!(err, DecodeError::FailedValidation(_)));
+        assert!(
+            matches!(
+                err,
+                DecodeError::BoundExceeded { max, actual }
+                    if max == MAX_DIAGNOSTIC_STRING_LEN
+                        && actual == MAX_DIAGNOSTIC_STRING_LEN + 1
+            ),
+            "{err:?}"
+        );
     }
 
     /// Hand-roll metadata with an oversized `error_message` string and

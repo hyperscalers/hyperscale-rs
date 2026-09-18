@@ -2091,8 +2091,8 @@ mod tests {
                 // A counterpart's certificate for the same transaction:
                 // what makes it cross-shard, and so what puts it in the
                 // settled set.
-                vec![ec_for(settles), remote_ec_for(settles)],
-                vec![],
+                &Capped::from_array([ec_for(settles), remote_ec_for(settles)]),
+                Capped::from_array([]),
             )
             .into(),
         )];

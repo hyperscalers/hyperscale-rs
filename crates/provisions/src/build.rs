@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
+use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{SubstateStore, SubstateView, VersionedStore};
@@ -32,6 +33,10 @@ use tracing::warn;
 ///
 /// `requests` may name several target shards. Only those naming
 /// `target_shard` participate in this build.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
 pub fn build_provisions<S>(
     view: &SubstateView<S>,
     source_shard: ShardId,
@@ -71,7 +76,10 @@ where
             };
             if let Some(value) = value {
                 all_keys.push(*key);
-                entries.push(SubstateEntry::new(*key, Some(value)));
+                entries.push(SubstateEntry::new(
+                    *key,
+                    Some(Bytes::new(value).expect("a list under the cap its source already met")),
+                ));
             }
         }
         // A declared interval serves as the entry leaves it holds at the
@@ -126,7 +134,10 @@ where
                     return None;
                 };
                 all_keys.push(leaf_key);
-                entries.push(SubstateEntry::new(leaf_key, Some(value)));
+                entries.push(SubstateEntry::new(
+                    leaf_key,
+                    Some(Bytes::new(value).expect("a list under the cap its source already met")),
+                ));
             }
         }
         staged.push((req.tx_hash, entries));
@@ -143,10 +154,21 @@ where
         generate_proof(view, &all_keys, source_block_height)?
     };
 
-    let transactions = staged
-        .into_iter()
-        .map(|(tx_hash, entries)| ProvisionEntry::new(tx_hash, entries))
-        .collect();
+    // One entry per staged transaction, which the block's own cap
+    // already bounded; a bundle past it is one no peer would decode, so
+    // there is nothing to send.
+    let transactions = Capped::new(
+        staged
+            .into_iter()
+            .map(|(tx_hash, entries)| {
+                ProvisionEntry::new(
+                    tx_hash,
+                    Capped::new(entries).expect("a transaction's reads divide its call budget"),
+                )
+            })
+            .collect(),
+    )
+    .ok()?;
 
     Some(Arc::new(Provisions::new(
         source_shard,

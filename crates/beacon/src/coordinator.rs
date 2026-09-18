@@ -24,6 +24,7 @@ use std::time::Duration;
 use hyperscale_core::{
     Action, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, TimerId,
 };
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
     BeaconState, BlockHash, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
@@ -1109,7 +1110,9 @@ impl BeaconCoordinator {
         }
         proposal
             .clone()
-            .with_verified_equivocations(equivocations)
+            .with_verified_equivocations(
+                Capped::new(equivocations).expect("a list under the cap its source already met"),
+            )
             .ok()
     }
 
@@ -1136,7 +1139,10 @@ impl BeaconCoordinator {
         }
         proposal
             .clone()
-            .with_verified_vote_equivocations(vote_equivocations)
+            .with_verified_vote_equivocations(
+                Capped::new(vote_equivocations)
+                    .expect("a list under the cap its source already met"),
+            )
             .ok()
     }
 
@@ -2760,6 +2766,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
@@ -3190,15 +3197,15 @@ mod tests {
         let committed = vec![(ValidatorId::new(0), proposal_with_boundary(shard, qc))];
         let contribution = ShardEpochContribution {
             boundary_header: b.header().clone(),
-            payloads,
-            range_proof,
+            payloads: Capped::new(payloads).expect("a list written out in a test"),
+            range_proof: Capped::new(range_proof).expect("a list written out in a test"),
         };
         let block_with = |contribs: BTreeMap<ShardId, ShardEpochContribution>| {
             BeaconBlock::new_with_contributions(
                 Epoch::new(1),
                 BeaconBlockHash::ZERO,
-                committed.clone(),
-                contribs,
+                Capped::new(committed.clone()).expect("a list written out in a test"),
+                Capped::new(contribs).expect("a list written out in a test"),
             )
         };
 
@@ -3227,8 +3234,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: wrong.header().clone(),
-                payloads: Vec::new(),
-                range_proof: Vec::new(),
+                payloads: Capped::empty(),
+                range_proof: Capped::empty(),
             },
         ))
         .collect();
@@ -3244,8 +3251,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b.header().clone(),
-                payloads: Vec::new(),
-                range_proof: Vec::new(),
+                payloads: Capped::empty(),
+                range_proof: Capped::empty(),
             },
         ))
         .collect();
@@ -3271,8 +3278,8 @@ mod tests {
         let committed = vec![(ValidatorId::new(0), proposal_with_boundary(shard, qc))];
         let contribution = ShardEpochContribution {
             boundary_header: b.header().clone(),
-            payloads,
-            range_proof,
+            payloads: Capped::new(payloads).expect("a list written out in a test"),
+            range_proof: Capped::new(range_proof).expect("a list written out in a test"),
         };
         let epoch = coord.state.current_epoch.next();
         let prev = coord.latest_block.block_hash();
@@ -3300,7 +3307,12 @@ mod tests {
         );
         let candidate_with = |contribs: BTreeMap<ShardId, ShardEpochContribution>| {
             Arc::new(Verifiable::from(CandidateBeaconBlock::new(
-                BeaconBlock::new_with_contributions(epoch, prev, committed.clone(), contribs),
+                BeaconBlock::new_with_contributions(
+                    epoch,
+                    prev,
+                    Capped::new(committed.clone()).expect("a list written out in a test"),
+                    Capped::new(contribs).expect("a map written out in a test"),
+                ),
                 Box::new(cert.clone()),
             )))
         };
@@ -3598,7 +3610,7 @@ mod tests {
         let vote = PcVote1::new(
             ValidatorId::new(1),
             PcVector::empty(),
-            vec![ConsensusSignature::new([0u8; 96])],
+            Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
         assert!(actions.is_empty());
@@ -3615,7 +3627,7 @@ mod tests {
         let vote = PcVote1::new(
             ValidatorId::new(9),
             PcVector::empty(),
-            vec![ConsensusSignature::new([0u8; 96])],
+            Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
         assert!(actions.is_empty());
@@ -3633,7 +3645,7 @@ mod tests {
         let vote = PcVote1::new(
             ValidatorId::new(1),
             PcVector::empty(),
-            vec![ConsensusSignature::new([0u8; 96])],
+            Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(6), vote);
         assert!(actions.is_empty());
@@ -3650,7 +3662,7 @@ mod tests {
         let vote = PcVote1::new(
             ValidatorId::new(1),
             PcVector::empty(),
-            vec![ConsensusSignature::new([0u8; 96])],
+            Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
         assert_eq!(actions.len(), 1);
@@ -4280,7 +4292,7 @@ mod tests {
             &signer_positions,
             &PcVector::empty(),
         );
-        let block = BeaconBlock::new(epoch, prev_hash, Vec::new());
+        let block = BeaconBlock::new(epoch, prev_hash, Capped::empty());
         let ratify = ratify_cert_for_block(coord, &block);
         Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
@@ -4331,7 +4343,11 @@ mod tests {
             &signer_positions,
             &PcVector::new(elements),
         );
-        let block = BeaconBlock::new(epoch, prev_hash, vec![(committee[0].0, proposal)]);
+        let block = BeaconBlock::new(
+            epoch,
+            prev_hash,
+            Capped::from_array([(committee[0].0, proposal)]),
+        );
         let ratify = ratify_cert_for_block(coord, &block);
         Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,

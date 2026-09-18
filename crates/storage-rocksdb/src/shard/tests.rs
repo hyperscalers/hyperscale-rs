@@ -511,8 +511,8 @@ fn finalization_with_writes(
     Arc::new(Verifiable::from(Finalization::new(
         tick_id,
         TickHalf::Determined,
-        vec![placeholder_local_ec(ShardId::ROOT, height)],
-        vec![receipt],
+        &Capped::from_array([placeholder_local_ec(ShardId::ROOT, height)]),
+        Capped::from_array([receipt]),
     )))
 }
 
@@ -880,7 +880,13 @@ fn test_ec_survives_reopen() {
         push_finalization(
             &mut block,
             Arc::new(
-                Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![]).into(),
+                Finalization::new(
+                    tick_id,
+                    TickHalf::Determined,
+                    &Capped::from_array([Arc::new(ec)]),
+                    Capped::from_array([]),
+                )
+                .into(),
             ),
         );
         commit_settled_at(
@@ -912,7 +918,13 @@ fn test_ec_atomic_with_block_commit() {
     push_finalization(
         &mut block,
         Arc::new(
-            Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![]).into(),
+            Finalization::new(
+                tick_id,
+                TickHalf::Determined,
+                &Capped::from_array([Arc::new(ec)]),
+                Capped::from_array([]),
+            )
+            .into(),
         ),
     );
     // Commit block with EC atomically

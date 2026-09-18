@@ -15,7 +15,7 @@ mod support;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
     build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, validity_around,
@@ -432,7 +432,7 @@ fn a_bundle_whose_entries_its_proof_does_not_cover_is_refused() {
                             .iter_mut()
                             .flat_map(|entry| entry.entries.iter_mut())
                             .find_map(|entry| entry.value.as_mut())
-                            .and_then(|bytes| bytes.first_mut())
+                            .and_then(|bytes| bytes.iter_mut().next())
                         else {
                             return honest.to_vec();
                         };
@@ -446,7 +446,7 @@ fn a_bundle_whose_entries_its_proof_does_not_cover_is_refused() {
                             bundle.block_height(),
                             bundle.source_block_ts(),
                             bundle.proof().clone(),
-                            entries,
+                            Capped::new(entries).expect("a list written out in a test"),
                         );
                         hbor_to_vec(&GetProvisionResponse {
                             provisions: Some(Arc::new(forged)),

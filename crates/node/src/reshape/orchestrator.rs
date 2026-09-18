@@ -1887,6 +1887,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_hbor::Bytes;
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, LocalTimestamp,
@@ -2175,7 +2176,7 @@ mod tests {
         let progress = completed_import_progress(BlockHeight::new(1), 0);
         let leaves = vec![SubstateLeaf {
             key: test_key(7u8),
-            value: vec![7],
+            value: Bytes::from_array([7]),
         }];
         duty.pending_stage.push((progress.clone(), leaves.clone()));
         orch.observers.insert(child, duty);

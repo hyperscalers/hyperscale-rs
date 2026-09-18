@@ -330,6 +330,7 @@ impl EarlyArrivalBuffer {
 mod tests {
 
     use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ConsensusSignature, ExecutionOutcome,
         ExecutionVoteMessage, GlobalReceiptHash, GlobalReceiptRoot, Hash, NetworkDefinition,
@@ -402,7 +403,7 @@ mod tests {
             shard(),
             global_receipt_root,
             u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
-            tx_outcomes,
+            Capped::new(tx_outcomes).expect("a list written out in a test"),
             ValidatorId::new(voter),
             signature,
         )
@@ -419,7 +420,7 @@ mod tests {
             shard(),
             GlobalReceiptRoot::ZERO,
             0,
-            vec![],
+            Capped::from_array([]),
             ValidatorId::new(voter),
             ConsensusSignature::ZERO,
         )

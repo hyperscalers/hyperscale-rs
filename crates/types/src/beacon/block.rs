@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 
 use crate::{
     BeaconBlockHash, BeaconProposal, BlockHeader, Epoch, Hash, MAX_BEACON_COMMITTEE,
@@ -46,12 +46,10 @@ pub struct ShardEpochContribution {
     pub boundary_header: BlockHeader,
     /// The witness payloads the boundary block appended, in leaf-index
     /// order.
-    #[hbor(max = MAX_WITNESSES_PER_SHARD)]
-    pub payloads: Vec<ShardWitnessPayload>,
+    pub payloads: Capped<Vec<ShardWitnessPayload>, MAX_WITNESSES_PER_SHARD>,
     /// Flanking merkle nodes lifting `payloads` to the boundary header's
     /// beacon-witness root.
-    #[hbor(max = MAX_RANGE_PROOF_NODES)]
-    pub range_proof: Vec<Hash>,
+    pub range_proof: Capped<Vec<Hash>, MAX_RANGE_PROOF_NODES>,
 }
 
 /// One epoch's committed-proposal record.
@@ -74,26 +72,24 @@ pub struct ShardEpochContribution {
 pub struct BeaconBlock {
     epoch: Epoch,
     prev_block_hash: BeaconBlockHash,
-    #[hbor(max = MAX_BEACON_COMMITTEE)]
-    committed_proposals: Vec<(ValidatorId, BeaconProposal)>,
-    #[hbor(max = MAX_SHARDS)]
-    shard_contributions: BTreeMap<ShardId, ShardEpochContribution>,
+    committed_proposals: Capped<Vec<(ValidatorId, BeaconProposal)>, MAX_BEACON_COMMITTEE>,
+    shard_contributions: Capped<BTreeMap<ShardId, ShardEpochContribution>, MAX_SHARDS>,
 }
 
 impl BeaconBlock {
     /// Build a `BeaconBlock` from its parts. Per-field caps are enforced
     /// at encode and decode, not here.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         epoch: Epoch,
         prev_block_hash: BeaconBlockHash,
-        committed_proposals: Vec<(ValidatorId, BeaconProposal)>,
+        committed_proposals: Capped<Vec<(ValidatorId, BeaconProposal)>, MAX_BEACON_COMMITTEE>,
     ) -> Self {
         Self {
             epoch,
             prev_block_hash,
             committed_proposals,
-            shard_contributions: BTreeMap::new(),
+            shard_contributions: Capped::default(),
         }
     }
 
@@ -103,8 +99,8 @@ impl BeaconBlock {
     pub const fn new_with_contributions(
         epoch: Epoch,
         prev_block_hash: BeaconBlockHash,
-        committed_proposals: Vec<(ValidatorId, BeaconProposal)>,
-        shard_contributions: BTreeMap<ShardId, ShardEpochContribution>,
+        committed_proposals: Capped<Vec<(ValidatorId, BeaconProposal)>, MAX_BEACON_COMMITTEE>,
+        shard_contributions: Capped<BTreeMap<ShardId, ShardEpochContribution>, MAX_SHARDS>,
     ) -> Self {
         Self {
             epoch,
@@ -118,12 +114,12 @@ impl BeaconBlock {
     /// Pair with [`BeaconCert::Genesis`](crate::BeaconCert::Genesis) via
     /// [`CertifiedBeaconBlock::genesis`](crate::CertifiedBeaconBlock::genesis).
     #[must_use]
-    pub const fn genesis() -> Self {
+    pub fn genesis() -> Self {
         Self {
             epoch: Epoch::GENESIS,
             prev_block_hash: BeaconBlockHash::ZERO,
-            committed_proposals: Vec::new(),
-            shard_contributions: BTreeMap::new(),
+            committed_proposals: Capped::empty(),
+            shard_contributions: Capped::default(),
         }
     }
 
@@ -131,12 +127,12 @@ impl BeaconBlock {
     /// Pair with [`BeaconCert::Skip`](crate::BeaconCert::Skip) via
     /// [`CertifiedBeaconBlock::new_checked`](crate::CertifiedBeaconBlock::new_checked).
     #[must_use]
-    pub const fn skip(epoch: Epoch, prev_block_hash: BeaconBlockHash) -> Self {
+    pub fn skip(epoch: Epoch, prev_block_hash: BeaconBlockHash) -> Self {
         Self {
             epoch,
             prev_block_hash,
-            committed_proposals: Vec::new(),
-            shard_contributions: BTreeMap::new(),
+            committed_proposals: Capped::empty(),
+            shard_contributions: Capped::default(),
         }
     }
 
@@ -163,7 +159,7 @@ impl BeaconBlock {
     /// Per-shard canonical boundary contributions for this epoch — one
     /// header per live shard. Empty for Genesis and Skip blocks.
     #[must_use]
-    pub const fn shard_contributions(&self) -> &BTreeMap<ShardId, ShardEpochContribution> {
+    pub fn shard_contributions(&self) -> &BTreeMap<ShardId, ShardEpochContribution> {
         &self.shard_contributions
     }
 
@@ -209,7 +205,7 @@ mod tests {
         let original = BeaconBlock::new(
             Epoch::new(7),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            Vec::new(),
+            Capped::empty(),
         );
         let bytes = hbor_to_vec(&original).unwrap();
         let decoded: BeaconBlock = hbor_from_slice(&bytes).unwrap();
@@ -221,10 +217,10 @@ mod tests {
         let original = BeaconBlock::new(
             Epoch::new(7),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            vec![
+            Capped::from_array([
                 (ValidatorId::new(0), sample_proposal(0)),
                 (ValidatorId::new(1), sample_proposal(1)),
-            ],
+            ]),
         );
         let bytes = hbor_to_vec(&original).unwrap();
         let decoded: BeaconBlock = hbor_from_slice(&bytes).unwrap();
@@ -236,24 +232,24 @@ mod tests {
         let base = BeaconBlock::new(
             Epoch::new(7),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            Vec::new(),
+            Capped::empty(),
         );
         let h_base = base.block_hash();
 
-        let diff_epoch = BeaconBlock::new(Epoch::new(8), base.prev_block_hash(), Vec::new());
+        let diff_epoch = BeaconBlock::new(Epoch::new(8), base.prev_block_hash(), Capped::empty());
         assert_ne!(h_base, diff_epoch.block_hash());
 
         let diff_parent = BeaconBlock::new(
             base.epoch(),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"other-prev")),
-            Vec::new(),
+            Capped::empty(),
         );
         assert_ne!(h_base, diff_parent.block_hash());
 
         let diff_proposals = BeaconBlock::new(
             base.epoch(),
             base.prev_block_hash(),
-            vec![(ValidatorId::new(0), sample_proposal(0))],
+            Capped::from_array([(ValidatorId::new(0), sample_proposal(0))]),
         );
         assert_ne!(h_base, diff_proposals.block_hash());
     }
@@ -276,7 +272,7 @@ mod tests {
         let epoch = Epoch::new(5);
         let prev = BeaconBlockHash::from_raw(Hash::from_bytes(b"prev"));
         let skip = BeaconBlock::skip(epoch, prev);
-        let empty_normal = BeaconBlock::new(epoch, prev, Vec::new());
+        let empty_normal = BeaconBlock::new(epoch, prev, Capped::empty());
         assert_eq!(skip.block_hash(), empty_normal.block_hash());
     }
 }

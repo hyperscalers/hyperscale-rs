@@ -312,6 +312,7 @@ impl CommitDedupIndex {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_finalization, stub_transaction, test_prefix,
         test_principal,
@@ -400,7 +401,7 @@ mod tests {
             BlockHeight::new(u64::from(seed)),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(tx_hash, vec![])],
+            Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
         ))
     }
 

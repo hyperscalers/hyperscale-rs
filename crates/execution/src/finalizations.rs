@@ -269,6 +269,7 @@ impl FinalizationStore {
 #[cfg(test)]
 mod tests {
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, ShardId, SignerBitfield, TickHalf, TxHash, TxOutcome, Verified,
@@ -310,8 +311,8 @@ mod tests {
         let verified = Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![Arc::new(ec)],
-            vec![],
+            &Capped::from_array([Arc::new(ec)]),
+            Capped::from_array([]),
         ));
         let fw = Arc::new(verified.into());
         (tick_id, fw)

@@ -165,8 +165,8 @@ mod tests {
                 Finalization::new(
                     *verdict.tick_id(),
                     TickHalf::Legs,
-                    vec![Arc::new(verdict.clone())],
-                    vec![],
+                    &Capped::from_array([Arc::new(verdict.clone())]),
+                    Capped::from_array([]),
                 )
                 .into(),
             ),

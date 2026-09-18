@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::legs::Member;
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptRoot, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, Role, Settles, ShardId,
@@ -1301,7 +1302,11 @@ impl TickState {
             .collect();
         ecs.sort_by(|a, b| (&a.shard_id(), a.tick_id()).cmp(&(&b.shard_id(), b.tick_id())));
 
-        Some(Finalization::from_verified_ecs(self.tick_id, half, ecs))
+        Some(Finalization::from_verified_ecs(
+            self.tick_id,
+            half,
+            &Capped::new(ecs).expect("a list under the cap its source already met"),
+        ))
     }
 
     /// Drain one stored receipt per outcome of `attestation` that settles
@@ -1347,7 +1352,9 @@ impl TickState {
                 );
             }
         }
-        attestation.with_receipts(receipts)
+        attestation.with_receipts(
+            Capped::new(receipts).expect("a list under the cap its source already met"),
+        )
     }
 
     /// Take the determined half's finalization, if it is ready.

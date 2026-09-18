@@ -52,6 +52,8 @@ impl NetworkMessage for ExecutionVoteNotification {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
+
     use super::*;
     use crate::{
         BlockHeight, ConsensusSignature, GlobalReceiptRoot, ShardId, TickId, ValidatorId,
@@ -65,7 +67,7 @@ mod tests {
             ShardId::ROOT,
             GlobalReceiptRoot::ZERO,
             0,
-            Vec::new(),
+            Capped::empty(),
             ValidatorId::new(2),
             ConsensusSignature::ZERO,
         )

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconWitnessLeafCount, BlockHash,
     BlockHeight, CandidateBeaconBlock, ConsensusSignature, Epoch, Hash, PcQc2, PcQc3,
@@ -1001,7 +1002,7 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
             BeaconBlock::new(
                 Epoch::new(1),
                 genesis_tip,
-                vec![(ValidatorId::new(0), proposal)],
+                Capped::from_array([(ValidatorId::new(0), proposal)]),
             ),
             Box::new(SpcCert::Direct {
                 prev_view: SpcView::new(1),

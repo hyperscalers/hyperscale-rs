@@ -508,8 +508,8 @@ mod tests {
         let fw = Verifiable::from(Finalization::new(
             tick_id,
             TickHalf::Determined,
-            vec![Arc::new(ec)],
-            Vec::new(),
+            &Capped::from_array([Arc::new(ec)]),
+            Capped::empty(),
         ));
 
         let Block::Live {

@@ -123,10 +123,10 @@ mod tests {
             source_height,
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(
+            Capped::from_array([ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(b"tx")),
-                vec![],
-            )],
+                Capped::empty(),
+            )]),
         ));
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: source_shard,

@@ -3,7 +3,7 @@
 //! break — deliberate re-pins accompany deliberate encoding changes.
 
 use hex::encode as hex_encode;
-use hyperscale_hbor::{HborEncode, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Capped, HborEncode, to_vec as hbor_to_vec};
 use hyperscale_types::{
     AggregateSignature, BlockHash, BlockHeight, BlockVote, ConsensusPublicKey, ConsensusSignature,
     Hash, PcCompactVote, PcQc1, PcValueElement, PcVector, PositionalBundle, ProposerTimestamp,
@@ -72,10 +72,10 @@ fn pc_qc1_golden_bytes() {
     ]);
     let x_signers = PositionalBundle::new(
         golden_signers(),
-        vec![
+        Capped::from_array([
             PcCompactVote::new(2, None),
             PcCompactVote::new(1, Some(PcValueElement::from_digest([0x77; 32], b"golden"))),
-        ],
+        ]),
     );
     let qc1 = PcQc1::new(x, x_signers, AggregateSignature::new([0x88; 96]));
     assert_golden(&qc1, EXPECTED_PC_QC1, "PcQc1");

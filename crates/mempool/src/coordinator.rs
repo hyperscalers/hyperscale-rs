@@ -1504,10 +1504,13 @@ mod tests {
         source_shard: ShardId,
         tx_hashes: &[TxHash],
     ) -> CertifiedBlock {
-        let transactions = tx_hashes
-            .iter()
-            .map(|h| ProvisionEntry::new(*h, vec![]))
-            .collect();
+        let transactions = Capped::new(
+            tx_hashes
+                .iter()
+                .map(|h| ProvisionEntry::new(*h, Capped::from_array([])))
+                .collect(),
+        )
+        .expect("a list written out in a test");
         let provision = Provisions::new(
             source_shard,
             ShardId::ROOT,

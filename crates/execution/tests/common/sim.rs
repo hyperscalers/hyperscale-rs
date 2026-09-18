@@ -339,10 +339,13 @@ impl ExecutionSim {
             self.height,
             WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS),
             MerkleInclusionProof::dummy(),
-            tx_hashes
-                .iter()
-                .map(|h| ProvisionEntry::new(*h, vec![]))
-                .collect(),
+            Capped::new(
+                tx_hashes
+                    .iter()
+                    .map(|h| ProvisionEntry::new(*h, Capped::from_array([])))
+                    .collect(),
+            )
+            .expect("a list written out in a test"),
         );
         self.height = self.height.next();
         let block = match make_live_block(
@@ -790,8 +793,8 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
     Finalization::new(
         *tick_id,
         TickHalf::Determined,
-        vec![Arc::new(ec)],
-        receipts.to_vec(),
+        &Capped::from_array([Arc::new(ec)]),
+        Capped::new(receipts.to_vec()).expect("a list written out in a test"),
     )
 }
 
@@ -850,7 +853,7 @@ pub fn settle_refused_by_counterpart(
     Finalization::new(
         *tick_id,
         TickHalf::Legs,
-        vec![Arc::new(local), Arc::new(remote)],
-        charges.to_vec(),
+        &Capped::from_array([Arc::new(local), Arc::new(remote)]),
+        Capped::new(charges.to_vec()).expect("a list written out in a test"),
     )
 }

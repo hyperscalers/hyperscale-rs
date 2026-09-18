@@ -362,7 +362,7 @@ where
                 vote_anchor_ts,
                 tick_id,
                 local_shard,
-                tx_outcomes,
+                Capped::new(tx_outcomes).expect("a list under the cap its source already met"),
                 validator_id,
                 ctx.signer.as_ref(),
             ) else {

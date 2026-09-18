@@ -162,6 +162,7 @@ fn install_adoption(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Bytes;
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES};
     use hyperscale_storage::test_helpers::import_boundary_state;
     use hyperscale_storage::{AdoptSource, SweepIndex, WitnessSeed};
@@ -181,7 +182,7 @@ mod tests {
         key[31] = AddressClass::Component.tag();
         SubstateLeaf {
             key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
-            value: vec![top],
+            value: Bytes::from_array([top]),
         }
     }
 
@@ -360,7 +361,7 @@ mod tests {
                 ),
                 local,
             },
-            value: value.clone(),
+            value: Bytes::new(value.clone()).expect("a list written out in a test"),
         };
         let parent = SimShardStorage::default();
         import_boundary_state(

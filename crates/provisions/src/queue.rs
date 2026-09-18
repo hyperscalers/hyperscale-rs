@@ -109,6 +109,7 @@ impl QueuedProvisionBuffer {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardId, TxHash,
     };
@@ -134,10 +135,10 @@ mod tests {
             height,
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(
+            Capped::from_array([ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(&[seed])),
-                vec![],
-            )],
+                Capped::empty(),
+            )]),
         )))
     }
 

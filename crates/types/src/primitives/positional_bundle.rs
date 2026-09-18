@@ -1,6 +1,6 @@
 //! Positional `(SignerBitfield, parallel-item)` bundle.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::SignerBitfield;
 use crate::primitives::signer_bitfield::MAX_SIGNERS;
@@ -23,8 +23,7 @@ use crate::primitives::signer_bitfield::MAX_SIGNERS;
 #[hbor(validate = check_positional)]
 pub struct PositionalBundle<T> {
     signers: SignerBitfield,
-    #[hbor(max = MAX_SIGNERS)]
-    items: Vec<T>,
+    items: Capped<Vec<T>, MAX_SIGNERS>,
 }
 
 /// The cross-field invariant, run at the wire boundary: without it a peer
@@ -45,7 +44,7 @@ impl<T> PositionalBundle<T> {
     ///
     /// Panics if `items.len() != signers.count_ones()` or if `items.len() > MAX_SIGNERS`.
     #[must_use]
-    pub fn new(signers: SignerBitfield, items: Vec<T>) -> Self {
+    pub fn new(signers: SignerBitfield, items: Capped<Vec<T>, MAX_SIGNERS>) -> Self {
         assert_eq!(
             items.len(),
             signers.count_ones(),
@@ -63,7 +62,7 @@ impl<T> PositionalBundle<T> {
     pub const fn empty() -> Self {
         Self {
             signers: SignerBitfield::empty(),
-            items: Vec::new(),
+            items: Capped::empty(),
         }
     }
 
@@ -75,13 +74,13 @@ impl<T> PositionalBundle<T> {
 
     /// Number of `(index, item)` pairs.
     #[must_use]
-    pub(crate) const fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Whether the bundle is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
@@ -114,7 +113,7 @@ mod tests {
     #[test]
     fn new_pairs_items_with_set_bits_in_order() {
         let bf = bitfield(10, &[1, 4, 7]);
-        let bundle = PositionalBundle::new(bf, vec!["a", "b", "c"]);
+        let bundle = PositionalBundle::new(bf, Capped::from_array(["a", "b", "c"]));
         let pairs: Vec<_> = bundle.iter().collect();
         assert_eq!(pairs, vec![(1, &"a"), (4, &"b"), (7, &"c")]);
     }
@@ -123,7 +122,7 @@ mod tests {
     #[should_panic(expected = "items length must match signer count")]
     fn new_panics_on_length_mismatch() {
         let bf = bitfield(10, &[1, 4, 7]);
-        let _ = PositionalBundle::new(bf, vec!["a", "b"]);
+        let _ = PositionalBundle::new(bf, Capped::from_array(["a", "b"]));
     }
 
     #[test]
@@ -136,7 +135,7 @@ mod tests {
     #[test]
     fn hbor_round_trip() {
         let bf = bitfield(100, &[3, 50, 99]);
-        let bundle = PositionalBundle::new(bf, vec![10u32, 20, 30]);
+        let bundle = PositionalBundle::new(bf, Capped::from_array([10u32, 20, 30]));
         let bytes = hbor_to_vec(&bundle).unwrap();
         let decoded: PositionalBundle<u32> = hbor_from_slice(&bytes).unwrap();
         assert_eq!(bundle, decoded);

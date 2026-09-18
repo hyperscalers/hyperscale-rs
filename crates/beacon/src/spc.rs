@@ -1177,6 +1177,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, ConsensusSignature, Epoch, NetworkDefinition, PcQc2, PcQc3,
         PcSignerLengths, PcVote1, PcXpProof, Signer, SignerBitfield,
@@ -1344,7 +1345,7 @@ mod tests {
         let dummy = Verified::<PcVote1>::new_unchecked_for_test(PcVote1::new(
             members[1].0,
             PcVector::empty(),
-            vec![ConsensusSignature::new([0u8; 96])],
+            Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         ));
         let effects = fsm.on_pc_vote1_verified(SpcView::new(99), dummy);
         assert!(effects.is_empty());

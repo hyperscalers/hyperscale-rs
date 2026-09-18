@@ -219,8 +219,8 @@ pub fn make_test_finalization(height: BlockHeight, shard: ShardId) -> Finalizati
     Finalization::new(
         TickId::new(shard, height),
         TickHalf::Determined,
-        vec![placeholder_local_ec(shard, height)],
-        vec![],
+        &Capped::from_array([placeholder_local_ec(shard, height)]),
+        Capped::from_array([]),
     )
 }
 
@@ -364,7 +364,7 @@ pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<Verified<CertifiedB
     let block = BeaconBlock::new(
         Epoch::new(epoch),
         BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
-        Vec::new(),
+        Capped::empty(),
     );
     let ratify = RatifyCert::new(
         block.prev_block_hash(),
@@ -493,7 +493,12 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
     if ecs.is_empty() {
         return block;
     }
-    let certificate = Finalization::new(*ecs[0].tick_id(), TickHalf::Determined, ecs, vec![]);
+    let certificate = Finalization::new(
+        *ecs[0].tick_id(),
+        TickHalf::Determined,
+        &Capped::new(ecs).expect("a list written out in a test"),
+        Capped::empty(),
+    );
     push_certificate(block, Arc::new(certificate.into()))
 }
 
@@ -656,8 +661,8 @@ fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finaliza
         Finalization::new(
             TickId::new(ShardId::ROOT, height),
             TickHalf::Determined,
-            vec![placeholder_local_ec(ShardId::ROOT, height)],
-            vec![receipt],
+            &Capped::from_array([placeholder_local_ec(ShardId::ROOT, height)]),
+            Capped::from_array([receipt]),
         )
         .into(),
     )
@@ -746,14 +751,18 @@ pub fn paced(height: u64, blocks: u64) -> WeightedTimestamp {
 /// A block at `height` whose one tick settles `receipts` and which
 /// carries no transactions — what a follow applies when only receipts
 /// move state.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
 #[must_use]
 pub fn block_settling(height: BlockHeight, receipts: Vec<StoredReceipt>) -> Block {
     let finalized = Arc::new(
         Finalization::new(
             TickId::new(ShardId::ROOT, height),
             TickHalf::Determined,
-            vec![],
-            receipts,
+            &Capped::from_array([]),
+            Capped::new(receipts).expect("a list written out in a test"),
         )
         .into(),
     );
@@ -1462,7 +1471,7 @@ where
         BlockHeight::new(6),
         &[SubstateLeaf {
             key: state_key(3, 3),
-            value: vec![3, 3, 3],
+            value: Bytes::from_array([3, 3, 3]),
         }],
         WitnessSeed::default(),
     )
@@ -1610,7 +1619,7 @@ where
             SubstateLeaf {
                 key: SubstateKey::from_bytes(*leaf_key)
                     .expect("a stored leaf key names an address"),
-                value,
+                value: Bytes::new(value).expect("a list written out in a test"),
             }
         })
         .collect();
@@ -1791,8 +1800,8 @@ pub fn test_tx_index_answers_with_the_local_shards_certificate(
     let certificate = Finalization::new(
         *local.tick_id(),
         TickHalf::Legs,
-        vec![Arc::new(local.clone()), Arc::new(remote)],
-        vec![],
+        &Capped::from_array([Arc::new(local.clone()), Arc::new(remote)]),
+        Capped::from_array([]),
     );
     let block = push_certificate(
         make_test_block(BlockHeight::new(1)),
@@ -1848,8 +1857,8 @@ pub fn test_the_tx_index_answers_with_every_certificate_of_this_shards(
                 Finalization::new(
                     *verdict.tick_id(),
                     TickHalf::Legs,
-                    vec![Arc::new(verdict.clone())],
-                    vec![],
+                    &Capped::from_array([Arc::new(verdict.clone())]),
+                    Capped::from_array([]),
                 )
                 .into(),
             ),
@@ -1858,8 +1867,8 @@ pub fn test_the_tx_index_answers_with_every_certificate_of_this_shards(
             Finalization::new(
                 *settling.tick_id(),
                 TickHalf::Determined,
-                vec![Arc::new(settling.clone())],
-                vec![],
+                &Capped::from_array([Arc::new(settling.clone())]),
+                Capped::from_array([]),
             )
             .into(),
         ),
@@ -1894,7 +1903,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
         BlockHeight::new(1),
         WeightedTimestamp::ZERO,
         MerkleInclusionProof::dummy(),
-        vec![ProvisionEntry::new(tx_hash, vec![])],
+        Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
     );
     match block {
         Block::Live {

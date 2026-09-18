@@ -14,6 +14,7 @@ use std::hint::black_box;
 
 use blake3::hash as blake3_hash;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use hyperscale_hbor::Bytes;
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::completed_import_progress;
 use hyperscale_storage::{BoundaryStore, WitnessSeed};
@@ -48,7 +49,7 @@ fn leaf(index: u64) -> SubstateLeaf {
             owner: Address::new(body, AddressClass::Component),
             local: LocalKey(local),
         },
-        value: digest.repeat(VALUE_BYTES / 32),
+        value: Bytes::new(digest.repeat(VALUE_BYTES / 32)).expect("a value under the cell cap"),
     }
 }
 

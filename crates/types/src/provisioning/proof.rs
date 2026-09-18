@@ -1,6 +1,6 @@
 //! Merkle proofs over the JMT state tree, on the wire.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Bytes, Hbor};
 use hyperscale_jmt::{Blake3Hasher, ClaimTermination, MultiProof, Tree, ValueHash};
 use thiserror::Error;
 
@@ -19,7 +19,7 @@ use crate::{MAX_MERKLE_PROOF_LEN, ShardId, StateRoot, SubstateKey, shard_prefix_
 /// - Sibling hashes for bottom-up verification
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hbor)]
 #[hbor(transparent)]
-pub struct MerkleInclusionProof(#[hbor(max = MAX_MERKLE_PROOF_LEN)] pub Vec<u8>);
+pub struct MerkleInclusionProof(pub Bytes<MAX_MERKLE_PROOF_LEN>);
 
 /// What a proof says about one key under the root it reconstructs.
 ///
@@ -70,9 +70,14 @@ pub enum StateProofError {
 
 impl MerkleInclusionProof {
     /// Create a new proof from raw bytes.
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` runs past what a proof may occupy, which a proof
+    /// generated over a tree this codebase builds cannot.
     #[must_use]
-    pub const fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(Bytes::new(bytes).expect("a proof over one shard's tree fits its cap"))
     }
 
     /// Each of `keys` as this proof attests it under `shard`'s `root`, in
@@ -142,7 +147,7 @@ impl MerkleInclusionProof {
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub const fn dummy() -> Self {
-        Self(Vec::new())
+        Self(Bytes::empty())
     }
 }
 

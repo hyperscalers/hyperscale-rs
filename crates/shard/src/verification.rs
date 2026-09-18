@@ -2323,8 +2323,8 @@ mod tests {
             Arc::new(Verifiable::from(Finalization::new(
                 tick_id,
                 half,
-                vec![Arc::new(ec)],
-                Vec::new(),
+                &Capped::from_array([Arc::new(ec)]),
+                Capped::empty(),
             )))
         };
         let certificates: Vec<_> = determined

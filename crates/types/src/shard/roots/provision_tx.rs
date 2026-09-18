@@ -297,8 +297,8 @@ mod tests {
         let finalization = Arc::new(Verifiable::from(Finalization::new(
             tick,
             TickHalf::Legs,
-            vec![Arc::new(ec)],
-            vec![],
+            &Capped::from_array([Arc::new(ec)]),
+            Capped::from_array([]),
         )));
 
         let promised: Vec<(ShardId, TxHash)> =

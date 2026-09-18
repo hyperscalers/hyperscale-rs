@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHash, BlockHeader, NetworkDefinition, QcContext,
     QuorumCertificate, ScheduleLookup, ShardEpochContribution, ShardId, TopologySchedule,
@@ -197,8 +198,10 @@ pub(crate) fn build_shard_contributions(
             shard,
             ShardEpochContribution {
                 boundary_header,
-                payloads,
-                range_proof,
+                payloads: Capped::new(payloads)
+                    .expect("a list under the cap its source already met"),
+                range_proof: Capped::new(range_proof)
+                    .expect("a list under the cap its source already met"),
             },
         );
     }

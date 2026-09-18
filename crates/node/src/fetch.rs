@@ -1083,6 +1083,7 @@ mod tests {
 mod partition_tests {
     use std::sync::Arc;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{Transaction, TxHash};
 
@@ -1214,10 +1215,10 @@ mod partition_tests {
             BlockHeight::new(10),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(
+            Capped::from_array([ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(b"asked")),
-                vec![],
-            )],
+                Capped::empty(),
+            )]),
         ));
         let extra = Arc::new(Provisions::new(
             ShardId::leaf(2, 3),
@@ -1225,10 +1226,10 @@ mod partition_tests {
             BlockHeight::new(11),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(
+            Capped::from_array([ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(b"extra")),
-                vec![],
-            )],
+                Capped::empty(),
+            )]),
         ));
         let asked_hash = asked.hash();
         let split = partition_solicited(
