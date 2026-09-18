@@ -134,6 +134,7 @@ impl ChainRecords for BatchRecords<'_> {
 #[cfg(test)]
 mod tests {
     use hyperscale_effects_bridge::ProtocolHasher;
+    use hyperscale_hbor::Capped;
     use hyperscale_vm_effects::{Hash32, Hasher, Value};
     use hyperscale_vm_types::{Address, CollectionId};
 
@@ -183,7 +184,7 @@ mod tests {
     fn record(salt: u8) -> InstanceMeta {
         InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
-            config: vec![Value::U64(u64::from(salt))],
+            config: Capped::new(vec![Value::U64(u64::from(salt))]).unwrap(),
             salt: Hash32([salt; 32]),
         }
     }
