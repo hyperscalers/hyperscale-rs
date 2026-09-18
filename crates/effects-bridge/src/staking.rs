@@ -245,7 +245,7 @@ const fn basis_points(stated: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Bytes;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::CONSENSUS_PUBLIC_KEY_BYTES;
     use hyperscale_vm_effects::{Hash32, InstanceMeta, InstanceRegistry, Records};
     use hyperscale_vm_types::{Address, ComponentAddr};
@@ -264,7 +264,7 @@ mod tests {
             &ProtocolHasher,
             InstanceMeta {
                 package: package(1),
-                config: Vec::new(),
+                config: Capped::empty(),
                 salt: Hash32([salt; 32]),
             },
         )

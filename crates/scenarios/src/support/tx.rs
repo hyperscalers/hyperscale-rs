@@ -1257,7 +1257,7 @@ pub(crate) fn lottery_on(shard: ShardId) -> InstanceMeta {
     for salt in 0..=u8::MAX {
         let meta = InstanceMeta {
             package: lottery_package_hash(&ProtocolHasher),
-            config: Vec::new(),
+            config: Capped::empty(),
             salt: Hash32([salt; 32]),
         };
         if trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard {
@@ -1535,7 +1535,7 @@ pub(crate) fn build_transfer_paid_by<S: AccountSigner>(
     // The intent acts as `from` and declares the signer's own key as
     // what attests it — the shape a delegate's transaction has.
     let mut root = Intent::leaf(scenario_header(validity), from, graph);
-    root.attested_by = vec![principal_of(signer)];
+    root.attested_by = Capped::new(vec![principal_of(signer)]).unwrap();
     let envelope = signing::wrap(
         &IntentTree::of_one(root),
         signing::Terms {
@@ -1890,10 +1890,11 @@ pub(crate) fn published_instance(
     // before the transaction exists.
     InstanceMeta {
         package: package_hash(&ProtocolHasher, artifact),
-        config: vec![
+        config: Capped::new(vec![
             Value::Address((*PROTOCOL_RESOURCE).address()),
             Value::Address(founder.address()),
-        ],
+        ])
+        .unwrap(),
         salt: Hash32([salt; 32]),
     }
 }
@@ -1921,11 +1922,12 @@ pub(crate) fn venue_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> In
     for salt in 0..=u8::MAX {
         let meta = InstanceMeta {
             package: amm_package_hash(&ProtocolHasher),
-            config: vec![
+            config: Capped::new(vec![
                 Value::Address(pair.0.address()),
                 Value::Address(pair.1.address()),
                 Value::U128(VENUE_FEE),
-            ],
+            ])
+            .unwrap(),
             salt: Hash32([salt; 32]),
         };
         if trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard {
@@ -2135,7 +2137,7 @@ pub(crate) fn build_instance_instantiate_tx(
         principal_of(payer),
         graph,
     ));
-    tree.instances = vec![meta];
+    tree.instances = Capped::new(vec![meta]).unwrap();
     Transaction::new(client().sign_tree(
         &tree,
         &[payer],
@@ -2417,7 +2419,9 @@ pub(crate) fn build_composed_tx(
     // The signer attests its own declaration's hash, and the attestation
     // travels with the declaration into whatever composes it.
     let mut signed = SignedIntent::unsigned(request.clone());
-    signed.attest(signer_key, &ProtocolHasher);
+    signed
+        .attest(signer_key, &ProtocolHasher)
+        .expect("a scenario intent has room for another attestation");
 
     let client = client();
     let chain = client.records();

@@ -2610,6 +2610,7 @@ name = "hyperscale-transactions"
 version = "0.1.0"
 dependencies = [
  "hyperscale-effects-bridge",
+ "hyperscale-hbor",
  "hyperscale-types",
  "hyperscale-vm-effects",
  "hyperscale-vm-manifest-builder",
@@ -2671,6 +2672,7 @@ dependencies = [
 name = "hyperscale-vm-gate"
 version = "0.1.0"
 dependencies = [
+ "hyperscale-hbor",
  "hyperscale-vm-effects",
  "hyperscale-vm-runtime",
  "hyperscale-vm-types",
@@ -2756,6 +2758,7 @@ dependencies = [
 name = "hyperscale-vm-sdk-macros"
 version = "0.1.0"
 dependencies = [
+ "hyperscale-hbor",
  "hyperscale-vm-effects",
  "proc-macro2",
  "quote",

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
-use hyperscale_hbor::from_slice as hbor_from_slice;
+use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice};
 use hyperscale_vm_effects::{
     ChainRecords, CrossingCell, Hasher, InstanceMeta, InstanceRegistry, Issuance, Marker,
     MetadataCache, PackageHash, PackageMetadata, ResourceMeta, Value, escrow_record_key,
@@ -331,7 +331,10 @@ pub(crate) fn issued_record(
     Some(ResourceMeta {
         namespace: issuer,
         kind: issuance.kind,
-        material: vec![Value::Bytes(issuance.mark.clone()).canonical_bytes()],
+        material: Capped::from_array([Bytes::new(
+            Value::Bytes(issuance.mark.clone()).canonical_bytes(),
+        )
+        .ok()?]),
         rules: issuance.grants.resolve(hasher, issuer, &meta.config).ok()?,
     })
 }
@@ -753,7 +756,7 @@ mod tests {
     fn one_derivation_reads_a_leaf_once_however_often_it_asks() {
         let meta = InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
-            config: vec![Value::U64(4)],
+            config: Capped::new(vec![Value::U64(4)]).unwrap(),
             salt: Hash32([0xA7; 32]),
         };
         let address = meta.address(&ProtocolHasher);
@@ -794,7 +797,7 @@ mod tests {
     fn a_record_absent_from_the_cache_is_read_from_committed_state() {
         let meta = InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
-            config: vec![Value::U64(7)],
+            config: Capped::new(vec![Value::U64(7)]).unwrap(),
             salt: Hash32([3; 32]),
         };
         let address = meta.address(&ProtocolHasher);
@@ -831,7 +834,7 @@ mod tests {
     fn a_record_past_the_bound_is_let_go_and_read_back() {
         let record_at = |salt: u8| InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
-            config: Vec::new(),
+            config: Capped::empty(),
             salt: Hash32([salt; 32]),
         };
         let oldest = record_at(1);
@@ -878,7 +881,7 @@ mod tests {
     fn a_record_seated_twice_takes_one_place_in_the_order() {
         let record_at = |salt: u8| InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
-            config: Vec::new(),
+            config: Capped::empty(),
             salt: Hash32([salt; 32]),
         };
         let first = record_at(1);
@@ -917,7 +920,7 @@ mod tests {
     fn the_genesis_seed_outlives_the_bound() {
         let seeded = InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
-            config: vec![Value::U64(1)],
+            config: Capped::new(vec![Value::U64(1)]).unwrap(),
             salt: Hash32([0xEE; 32]),
         };
         let address = seeded.address(&ProtocolHasher);
@@ -928,7 +931,7 @@ mod tests {
         for salt in 1..=4 {
             instances.seat_record(&InstanceMeta {
                 package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
-                config: Vec::new(),
+                config: Capped::empty(),
                 salt: Hash32([salt; 32]),
             });
         }
@@ -945,7 +948,7 @@ mod tests {
     fn a_cell_holding_another_components_record_answers_for_neither() {
         let meta = InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
-            config: vec![Value::U64(7)],
+            config: Capped::new(vec![Value::U64(7)]).unwrap(),
             salt: Hash32([3; 32]),
         };
         let elsewhere = InstanceMeta {

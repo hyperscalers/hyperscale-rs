@@ -1032,7 +1032,7 @@ impl BridgeStatics {
             // own cell, which the write prefixes below name.
             accounts: Vec::new(),
             nullifiers: Vec::new(),
-            attested_by: tree.root.attested_by.clone(),
+            attested_by: tree.root.attested_by.to_vec(),
             attestations,
             routing: Routing {
                 read_prefixes: Vec::new(),
@@ -1295,7 +1295,7 @@ mod tests {
                 GraphArg::Literal(Value::Address(resource.address())),
                 GraphArg::Literal(Value::U128(amount)),
             ],
-            evidence: [ClaimRef::Account(account)].into(),
+            evidence: Capped::from_members([ClaimRef::Account(account)]),
         }
     }
 
@@ -1314,7 +1314,7 @@ mod tests {
                 },
                 vec![Constraint::ResourceIs(resource)],
             )],
-            evidence: BTreeSet::new(),
+            evidence: Capped::default(),
         }
     }
 
@@ -1323,7 +1323,7 @@ mod tests {
             target: target.into(),
             method: "deposit".into(),
             args: vec![GraphArg::socket(socket)],
-            evidence: BTreeSet::new(),
+            evidence: Capped::default(),
         }
     }
 
@@ -1343,7 +1343,13 @@ mod tests {
     /// A tree of one intent acting as `account` — whose key has to be the
     /// one the envelope around it is signed with.
     fn intent_tree(account: PrincipalAddr, nodes: Vec<GraphNode>) -> IntentTree {
-        IntentTree::of_one(Intent::leaf(HEADER, account, ManifestGraph { nodes }))
+        IntentTree::of_one(Intent::leaf(
+            HEADER,
+            account,
+            ManifestGraph {
+                nodes: Capped::new(nodes).unwrap(),
+            },
+        ))
     }
 
     /// The two-signer composition: the composer pays X for Bob's Y.
@@ -1352,7 +1358,7 @@ mod tests {
             HEADER,
             composer_addr(),
             ManifestGraph {
-                nodes: vec![
+                nodes: Capped::new(vec![
                     withdraw(composer_addr(), RES_X, 100),
                     GraphNode {
                         target: composer_addr().into(),
@@ -1361,38 +1367,44 @@ mod tests {
                             GiveRef { member: 0, give: 0 },
                             vec![Constraint::MinAmount(10)],
                         )],
-                        evidence: BTreeSet::new(),
+                        evidence: Capped::default(),
                     },
-                ],
+                ])
+                .unwrap(),
             },
         );
         let bob = Intent {
-            sockets: vec![Socket::Value {
+            sockets: Capped::new(vec![Socket::Value {
                 resource: RES_X,
                 constraints: vec![Constraint::MinAmount(100)],
-            }],
-            gives: vec![ValueRef::Edge(EdgeRef {
+            }])
+            .unwrap(),
+            gives: Capped::new(vec![ValueRef::Edge(EdgeRef {
                 producer: 0,
                 output: 0,
-            })],
+            })])
+            .unwrap(),
             ..Intent::leaf(
                 HEADER,
                 bob_addr(),
                 ManifestGraph {
-                    nodes: vec![
+                    nodes: Capped::new(vec![
                         withdraw(bob_addr(), RES_Y, 10),
                         deposit_socket(bob_addr(), 0),
-                    ],
+                    ])
+                    .unwrap(),
                 },
             )
         };
-        root.members = vec![Member {
+        root.members = Capped::new(vec![Member {
             signed: SignedIntent::unsigned(bob),
-            wiring: vec![Binding::Value(ValueRef::Edge(EdgeRef {
+            wiring: Capped::new(vec![Binding::Value(ValueRef::Edge(EdgeRef {
                 producer: 0,
                 output: 0,
-            }))],
-        }];
+            }))])
+            .unwrap(),
+        }])
+        .unwrap();
         IntentTree::of_one(root)
     }
 
@@ -1414,7 +1426,7 @@ mod tests {
         let mut keys = member_keys.iter();
         tree.root.for_each_signed_member(&mut |signed| {
             if let Some(key) = keys.next() {
-                signed.attest(*key, &ProtocolHasher);
+                signed.attest(*key, &ProtocolHasher).unwrap();
             }
         });
         TransactionEnvelope {
@@ -2072,7 +2084,7 @@ mod tests {
                 deposit_edge(composer_addr(), 2, RES_Y),
             ],
         );
-        tree.root.accounts = vec![composer_addr(), bob_addr()];
+        tree.root.accounts = Capped::new(vec![composer_addr(), bob_addr()]).unwrap();
         let derived = statics()
             .derive(&envelope(&tree, &[]))
             .expect("one intent acts as both");
@@ -2205,7 +2217,7 @@ mod tests {
                 GraphArg::Literal(Value::Bytes(bob_rule())),
                 GraphArg::Literal(Value::U64(86_400_000)),
             ],
-            evidence,
+            evidence: Capped::new(evidence).unwrap(),
         };
         // A guarded method reached with no evidence at all is a defect in
         // the signed form, so derivation refuses it and nobody pays.
@@ -2274,7 +2286,7 @@ mod tests {
         let impostor = key(11);
         let mut tree = composed_tree();
         tree.root.members[0].signed.intent.attested_by =
-            vec![account_address(&impostor.public_key().0)];
+            Capped::new(vec![account_address(&impostor.public_key().0)]).unwrap();
         assert!(statics().derive(&envelope(&tree, &[&impostor])).is_ok());
 
         // Declaring Bob and attesting with another key is a different
@@ -2482,7 +2494,7 @@ mod tests {
     fn a_record_is_seated_only_under_the_address_it_derives() {
         let meta = InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"honest"])),
-            config: vec![Value::U64(7)],
+            config: Capped::new(vec![Value::U64(7)]).unwrap(),
             salt: Hash32([3; 32]),
         };
         let address = meta.address(&ProtocolHasher).address();
@@ -2530,7 +2542,7 @@ mod tests {
     fn a_records_address_is_read_from_the_record() {
         let meta = InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"served"])),
-            config: Vec::new(),
+            config: Capped::empty(),
             salt: Hash32([5; 32]),
         };
         assert_eq!(

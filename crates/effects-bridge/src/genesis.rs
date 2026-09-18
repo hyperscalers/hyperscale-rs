@@ -7,6 +7,7 @@
 //! engine: a load generator, a wallet and a scenario all need to resolve a
 //! target, and none of them executes anything.
 
+use hyperscale_hbor::Capped;
 use hyperscale_types::{ComponentAddr, PROTOCOL_DISPLAY_DIGITS, ResourceAddr, StakePoolSeat};
 use hyperscale_vm_effects::{
     Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, ResourceKind,
@@ -206,10 +207,10 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
 pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> InstanceMeta {
     InstanceMeta {
         package: staking_package,
-        config: vec![
+        config: Capped::from_array([
             Value::Address(PROTOCOL_RESOURCE.address()),
             Value::Address(seat.operator.address()),
-        ],
+        ]),
         salt: ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.id.inner().to_le_bytes()]),
     }
 }

@@ -225,7 +225,7 @@ const ROUND: u8 = 0x4C;
 fn lottery_meta(salt: u8) -> InstanceMeta {
     InstanceMeta {
         package: lottery_package_hash(&ProtocolHasher),
-        config: Vec::new(),
+        config: Capped::empty(),
         salt: Hash32([salt; 32]),
     }
 }
@@ -2232,7 +2232,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     // well formed.
     let meta = InstanceMeta {
         package: lottery_package_hash(&ProtocolHasher),
-        config: Vec::new(),
+        config: Capped::empty(),
         salt: Hash32([0xA1; 32]),
     };
     let unsealed = meta.address(&ProtocolHasher);
@@ -2270,8 +2270,8 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let carried = Transaction::new(client().sign_tree(
         &IntentTree {
             root: Intent::leaf(HEADER, account_address(&key.public_key().0), graph),
-            instances: vec![meta],
-            resources: Vec::new(),
+            instances: Capped::new(vec![meta]).unwrap(),
+            resources: Capped::empty(),
         },
         &[&key],
         terms(TRANSFER_FEE),
@@ -3240,10 +3240,11 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // record carrying them is what resolves the call.
     let meta = InstanceMeta {
         package,
-        config: vec![
+        config: Capped::new(vec![
             Value::Address((*PROTOCOL_RESOURCE).address()),
             Value::Address(payer.address()),
-        ],
+        ])
+        .unwrap(),
         salt: Hash32([7; 32]),
     };
     let component = meta.address(&ProtocolHasher);
@@ -3264,8 +3265,8 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let graph = b.build().expect("every output is consumed");
     let tree = IntentTree {
         root: Intent::leaf(HEADER, account_address(&key.public_key().0), graph),
-        instances: vec![meta.clone()],
-        resources: Vec::new(),
+        instances: Capped::new(vec![meta.clone()]).unwrap(),
+        resources: Capped::empty(),
     };
 
     // The same call without its record: nothing committed answers for a

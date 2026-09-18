@@ -371,10 +371,9 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use hyperscale_effects_bridge::envelope_bytes;
     use hyperscale_effects_bridge::genesis::account_artifact;
+    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{test_principal, test_validity_range};
     use hyperscale_types::{Ed25519PrivateKey, MAX_ENVELOPE_BYTES};
     use hyperscale_vm_effects::{
@@ -399,7 +398,7 @@ mod tests {
         assert_eq!(
             client.transfer_graph(from, to, 100).unwrap(),
             ManifestGraph {
-                nodes: vec![
+                nodes: Capped::new(vec![
                     GraphNode {
                         target: from.into(),
                         method: "withdraw".into(),
@@ -407,7 +406,7 @@ mod tests {
                             GraphArg::Literal(Value::Address(PROTOCOL_RESOURCE.address())),
                             GraphArg::Literal(Value::U128(100)),
                         ],
-                        evidence: [ClaimRef::Account(from)].into(),
+                        evidence: Capped::from_members([ClaimRef::Account(from)]),
                     },
                     GraphNode {
                         target: to.into(),
@@ -419,9 +418,10 @@ mod tests {
                             },
                             vec![Constraint::ResourceIs(*PROTOCOL_RESOURCE)]
                         )],
-                        evidence: BTreeSet::new(),
+                        evidence: Capped::default(),
                     },
-                ],
+                ])
+                .unwrap(),
             }
         );
     }
