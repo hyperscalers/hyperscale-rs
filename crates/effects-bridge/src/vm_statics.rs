@@ -1242,7 +1242,7 @@ mod tests {
         Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg, GraphNode,
         Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash, ManifestGraph, Member,
         MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket, StoredRule, ValueRef,
-        child_key, never, nullifier_expiry_ms, nullifier_key, package_slot,
+        child_key, never, nullifier_expiry_ms, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::wrap_publish;
     use hyperscale_vm_stdlib::account;
@@ -1960,15 +1960,9 @@ mod tests {
         )));
         let rule_cell =
             DeclaredKey::substate(composer_addr().address(), auth_key(composer_addr()).local.0);
-        let refused = child_key(
-            &ProtocolHasher,
-            bob_addr(),
-            package_slot(0),
-            &[Value::Address(RES_X.address()).canonical_bytes()],
-        );
-        let landing = DeclaredKey::substate(bob_addr().address(), refused.local.0);
-        let mut reads = vec![rule_cell, landing];
-        reads.sort_unstable();
+        // The sender's rule cell and nothing else: a credit has one
+        // destination, so the recipient's side reads no leaf to pick it.
+        let reads = vec![rule_cell];
         assert_eq!(derived.routing.read_keys, reads);
         // The root's nullifier is a creation, so its absence is
         // provisioned to every participant beside what the calls read.
@@ -1986,9 +1980,12 @@ mod tests {
         ));
         provisioned.sort_unstable();
         assert_eq!(derived.routing.provision_keys, provisioned);
-        let mut provisioning = vec![composer_addr().address(), bob_addr().address()];
-        provisioning.sort_unstable();
-        assert_eq!(derived.routing.provision_prefixes, provisioning);
+        // The sender's prefix alone: the recipient's side reads nothing,
+        // so nothing of Bob's has to be provisioned to run the credit.
+        assert_eq!(
+            derived.routing.provision_prefixes,
+            vec![composer_addr().address()]
+        );
         assert_eq!(derived.attestations.len(), 1, "the root's alone");
         let mut owners = vec![composer_addr(), bob_addr()];
         owners.sort_unstable();

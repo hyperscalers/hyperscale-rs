@@ -2201,15 +2201,9 @@ fn the_stdlib_artifact_carries_resolvable_bindings() {
     );
     assert_eq!(
         metadata.methods["deposit"].abi,
-        vec![
-            AbiParam::Handle { clause: 0, site: 0 },
-            AbiParam::Handle { clause: 1, site: 0 },
-            AbiParam::Handle { clause: 2, site: 0 },
-            AbiParam::Bucket(0),
-        ],
-        "one handle per cell the deposit may reach — the flag it reads, the \
-         vault, and the quarantine beside it — each naming the clause that \
-         declared it rather than a position"
+        vec![AbiParam::Handle { clause: 0, site: 0 }, AbiParam::Bucket(0),],
+        "one handle for the one cell a deposit reaches, naming the clause \
+         that declared it rather than a position"
     );
 }
 
