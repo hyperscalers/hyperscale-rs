@@ -584,9 +584,11 @@ impl Executor {
 
     /// The entry a settlement runs: no call, no nullifier, and a
     /// declaration of its own over exactly the cells it touches — each
-    /// record read and deleted, and where a crossing is taken back, its
-    /// claim written and the cell it names credited in the resource the
-    /// record names.
+    /// record read, and where a crossing is taken back, its claim
+    /// written and the cell it names credited in the resource the record
+    /// names. A record nobody may take back is released rather than
+    /// taken: the producer's account of it closes and the balance
+    /// stands.
     ///
     /// A settlement derives from the cell, not the manifest, so it
     /// carries none of the transaction's declaration: no node is
@@ -604,8 +606,9 @@ impl Executor {
     /// present means the crossing was taken and the record is a balance
     /// for a claim that happened, which is deleted; absent means no
     /// consumer took it, and none can now, since the member is admitted
-    /// only past the lapse, which is credited back — and a record
-    /// already gone is skipped rather than refused, since a
+    /// only past the lapse, which is credited back where the record
+    /// names a cell to credit and released where it names nobody — and a
+    /// record already gone is skipped rather than refused, since a
     /// member admitted for several records is one member, and one of
     /// them having been settled by the shard's own evidence path in
     /// between is not a reason to strand the rest.
@@ -652,27 +655,28 @@ impl Executor {
             // reclaim writes, and what holds either settlement to the
             // record's edge.
             let claim = CrossingSite::claim_on(&ProtocolHasher, key.owner, &record);
-            let disposition = if takes_back(on, &record, snapshot) {
-                let Recourse::Producer(credit) = record.recourse else {
-                    return Err(format!("record {key:?} is nobody's to take back"));
-                };
-                declare_here(
-                    Effect {
-                        target: EffectTarget::Point(claim.key()),
-                        mode: Mode::Write { moves: Moves::Both },
-                    },
-                    None,
-                )?;
-                declare_here(
-                    Effect {
-                        target: EffectTarget::Point(credit),
-                        mode: Mode::Delta { moves: Moves::Both },
-                    },
-                    Some(record.resource),
-                )?;
-                Disposition::Reclaim
-            } else {
-                Disposition::Retire
+            let disposition = match (takes_back(on, &record, snapshot), record.recourse) {
+                (false, _) => Disposition::Retire,
+                // Nobody's to take back: the producer's account of the
+                // record closes and the balance stands where it is.
+                (true, Recourse::Nobody) => Disposition::Release,
+                (true, Recourse::Producer(credit)) => {
+                    declare_here(
+                        Effect {
+                            target: EffectTarget::Point(claim.key()),
+                            mode: Mode::Write { moves: Moves::Both },
+                        },
+                        None,
+                    )?;
+                    declare_here(
+                        Effect {
+                            target: EffectTarget::Point(credit),
+                            mode: Mode::Delta { moves: Moves::Both },
+                        },
+                        Some(record.resource),
+                    )?;
+                    Disposition::Reclaim
+                }
             };
             disposals.push(Disposal {
                 record: *key,

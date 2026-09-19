@@ -67,6 +67,7 @@ use hyperscale_types::{
     Window, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
     tick_leader_at,
 };
+use hyperscale_vm_effects::Recourse;
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
@@ -1222,6 +1223,15 @@ impl ExecutionCoordinator {
             // record reconstructed an entry for that keeps no
             // classification to settle from.
             if self.counterparts.ledger.settles_records(record.cell.tx) {
+                continue;
+            }
+            // A record nobody may take back has nothing for this path to
+            // decide. Its retirement is the consumer's claim and its
+            // release is the entry's, and neither is the leaf's: a
+            // settlement composed here would say the same thing every
+            // tick, since what licenses one — a departure, or a claim
+            // read absent — never stops being true.
+            if matches!(record.cell.recourse, Recourse::Nobody) {
                 continue;
             }
             let claim = record.cell.consumer_claim;
@@ -9664,7 +9674,8 @@ mod tests {
     }
 
     /// An escrow record this shard holds: a leaf naming a claim cell
-    /// that sits on `PEER`.
+    /// that sits on `PEER`, and a cell of its own to credit where
+    /// nobody claims it.
     fn held_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -9696,7 +9707,10 @@ mod tests {
             expiry_ms,
             tx: transaction.hash(),
             consumer_claim: claim,
-            recourse: Recourse::Nobody,
+            recourse: Recourse::Producer(SubstateKey {
+                owner: record_key.owner,
+                local: LocalKey([local ^ 0x0F; 16]),
+            }),
         };
         (record_key, claim, cell)
     }
@@ -9855,6 +9869,67 @@ mod tests {
         assert!(
             state.counterparts.held.is_empty(),
             "and the record is taken once",
+        );
+    }
+
+    /// A record nobody may take back is left to its entry, however
+    /// plainly the chain says no consumer claimed it.
+    ///
+    /// The same departure, over a record naming no cell to credit. What
+    /// the leaf path composes is a reclaim, and there is nothing to
+    /// reclaim to: the balance stands under the claim the record names,
+    /// and the only account left to close is an entry's, which this
+    /// record has none of. Composing anyway would say the same thing
+    /// every tick, since a departure never stops being true.
+    #[test]
+    fn a_record_nobody_may_take_back_is_left_to_its_entry() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let expiry_ms = 400_000;
+        let (record_key, _, mut cell) = held_record(0x6A, expiry_ms);
+        cell.recourse = Recourse::Nobody;
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(cell));
+
+        let past = Window::LegEntry
+            .of(Deadline::from_expiry(expiry_ms))
+            .end
+            .plus(Duration::from_secs(1));
+        state.committed_ts = past;
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let actions = commit_recording(
+            &mut state,
+            &schedule,
+            1,
+            past.as_millis(),
+            vec![AbandonmentRecord::new(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                [UnsettledTx::for_transaction(
+                    &transaction,
+                    test_committed(),
+                    transaction.price(&PriceTable::GENESIS),
+                    &PriceTable::GENESIS,
+                )],
+            )],
+        );
+        let runs = actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => {
+                requests.first().map(|request| request.runs.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            !matches!(runs, Some(Runs::Settle { .. })),
+            "nothing settles it here; dispatched {runs:?}",
+        );
+        assert!(
+            state.counterparts.held.contains_key(&record_key),
+            "and the record stands",
         );
     }
 
