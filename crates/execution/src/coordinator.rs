@@ -4250,7 +4250,7 @@ mod tests {
         TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet,
         Window,
     };
-    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash};
+    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash, Recourse};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
     use super::*;
@@ -9696,7 +9696,7 @@ mod tests {
             expiry_ms,
             tx: transaction.hash(),
             consumer_claim: claim,
-            origin: None,
+            recourse: Recourse::Nobody,
         };
         (record_key, claim, cell)
     }

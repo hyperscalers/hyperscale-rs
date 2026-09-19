@@ -37,7 +37,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, IntentRecord,
-    PackageHash, legs_of, package_hash,
+    PackageHash, Recourse, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
@@ -585,13 +585,13 @@ impl Executor {
     /// The entry a settlement runs: no call, no nullifier, and a
     /// declaration of its own over exactly the cells it touches — each
     /// record read and deleted, and where a crossing is taken back, its
-    /// claim written and its origin credited in the resource the record
-    /// names.
+    /// claim written and the cell it names credited in the resource the
+    /// record names.
     ///
     /// A settlement derives from the cell, not the manifest, so it
     /// carries none of the transaction's declaration: no node is
     /// invoked, so no table position matters, and the transaction's own
-    /// mode on the origin — a reservation, where the value left — is not
+    /// mode on that cell — a reservation, where the value left — is not
     /// the credit a reclaim makes. Every term is the record's: the edge
     /// it names, the claim key its expiry derives, the resource, the
     /// amount and the cell to credit.
@@ -614,9 +614,9 @@ impl Executor {
     /// placement was. Every cell a settlement touches sits under the
     /// record's owner, which is a prefix this shard holds or the record
     /// would not be here; and a batch of settlements alone reaches
-    /// beyond nothing, so its writes are unfiltered — a credit to an
-    /// origin owned elsewhere has to trap here rather than land in a
-    /// store that does not own it.
+    /// beyond nothing, so its writes are unfiltered — a credit to a cell
+    /// owned elsewhere has to trap here rather than land in a store that
+    /// does not own it.
     fn prepare_settle(
         records: &[SubstateKey],
         on: Licence,
@@ -653,9 +653,9 @@ impl Executor {
             // record's edge.
             let claim = CrossingSite::claim_on(&ProtocolHasher, key.owner, &record);
             let disposition = if takes_back(on, &record, snapshot) {
-                let origin = record
-                    .origin
-                    .ok_or_else(|| format!("reclaim of record {key:?} names no origin"))?;
+                let Recourse::Producer(credit) = record.recourse else {
+                    return Err(format!("record {key:?} is nobody's to take back"));
+                };
                 declare_here(
                     Effect {
                         target: EffectTarget::Point(claim.key()),
@@ -665,7 +665,7 @@ impl Executor {
                 )?;
                 declare_here(
                     Effect {
-                        target: EffectTarget::Point(origin),
+                        target: EffectTarget::Point(credit),
                         mode: Mode::Delta { moves: Moves::Both },
                     },
                     Some(record.resource),
