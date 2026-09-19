@@ -41,9 +41,10 @@ use hyperscale_engine::legs::Member;
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, Role, Settles, ShardId,
-    StoredReceipt, SubstateKey, TickHalf, TickId, TxHash, TxOutcome, Verified, WeightedTimestamp,
-    compute_global_receipt_root, refused_transactions, settles,
+    GlobalReceiptRoot, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY,
+    MAX_VALIDITY_RANGE, Role, Settles, ShardId, StoredReceipt, SubstateKey, TickHalf, TickId,
+    TxHash, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
+    refused_transactions, settles,
 };
 
 /// A tick whose local execution disagreed with the quorum's.
@@ -1253,8 +1254,9 @@ impl TickState {
     /// success stands unopposed and this shard commits an accept against
     /// the counterparty's abort.
     ///
-    /// Returns `None` when this half has no members, or when the local
-    /// certificate has not landed yet.
+    /// Returns `None` when this half has no members, when the local
+    /// certificate has not landed yet, or when the certificates the half
+    /// needs outgrow what one finalization carries.
     #[must_use]
     fn attestation_for(&self, half: TickHalf, members: &HashSet<TxHash>) -> Option<Finalization> {
         let local = self.local_certificate()?;
@@ -1302,11 +1304,25 @@ impl TickState {
             .collect();
         ecs.sort_by(|a, b| (&a.shard_id(), a.tick_id()).cmp(&(&b.shard_id(), b.tick_id())));
 
-        Some(Finalization::from_verified_ecs(
-            self.tick_id,
-            half,
-            &Capped::new(ecs).expect("a list under the cap its source already met"),
-        ))
+        // The certificates are the proof, so a shorter list proves less
+        // than the members need and truncating one would assert a
+        // verdict nothing carries. A half whose evidence outgrows what a
+        // finalization holds is one this node cannot attest to, and
+        // declining leaves the half for the next pass — the caller marks
+        // it emitted only on a `Some`.
+        let carried = ecs.len();
+        let Ok(ecs) = Capped::new(ecs) else {
+            tracing::error!(
+                tick = %self.tick_id,
+                ?half,
+                carried,
+                cap = MAX_EXECUTION_CERTIFICATES_PER_TICK,
+                "a half's certificates outgrow one finalization; not attesting to it"
+            );
+            return None;
+        };
+
+        Some(Finalization::from_verified_ecs(self.tick_id, half, &ecs))
     }
 
     /// Drain one stored receipt per outcome of `attestation` that settles
@@ -1978,5 +1994,88 @@ mod tests {
             .expect("the local certificate is all it needed");
         assert_eq!(half.execution_certificates().len(), 1, "and all it carries");
         assert!(tick.has_spoken());
+    }
+
+    /// A half needing more certificates than one finalization carries is
+    /// declined, not fatal.
+    ///
+    /// The wire holds [`MAX_EXECUTION_CERTIFICATES_PER_TICK`] of them and
+    /// nothing holds this node's collection to that figure: a member
+    /// awaiting many counterparts takes one certificate from each, and
+    /// each is one the tick keeps because it covers a seat nothing else
+    /// does. So the list the half needs can outgrow what it fits in, and
+    /// what that must not do is take the node down with it.
+    #[test]
+    fn a_half_whose_certificates_outgrow_one_finalization_is_declined() {
+        // A trie deep enough to name every counterpart apart, which the
+        // two-shard helper above is not.
+        let at = |path: u64| ShardId::leaf(11, path);
+        let local = at(0);
+        let member = tx(3);
+        // One counterpart per certificate the wire holds: with the local
+        // projection beside them the half needs one more than it fits.
+        let peers: BTreeSet<ShardId> = (1..=MAX_EXECUTION_CERTIFICATES_PER_TICK as u64)
+            .map(at)
+            .collect();
+        let mut participating = peers.clone();
+        participating.insert(local);
+
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        tick.admit(
+            member,
+            Membership::whole(participating),
+            Some(10),
+            Admission::Executes,
+        );
+        tick.record_execution_result(
+            member,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        tick.record_receipt(receipt(member));
+        let (_, root, outcomes) = tick.build_vote_data().expect("the member came back");
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                *tick.tick_id(),
+                tick.vote_anchor_ts(),
+                root,
+                Capped::new(outcomes).expect("a list written out in a test"),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+
+        // One certificate per counterpart, each awaiting this shard for
+        // the member, so each covers a seat the others do not.
+        for peer in &peers {
+            tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+                ExecutionCertificate::new(
+                    TickId::new(*peer, BlockHeight::new(7)),
+                    WeightedTimestamp::from_millis(1_000),
+                    GlobalReceiptRoot::ZERO,
+                    Capped::from_array([TxOutcome::new(
+                        member,
+                        ExecutionOutcome::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                        },
+                    )
+                    .awaiting(vec![local])]),
+                    AggregateSignature::ZERO,
+                    SignerBitfield::new(4),
+                ),
+            )));
+        }
+
+        let members = HashSet::from([member]);
+        assert!(
+            tick.attestation_for(TickHalf::Determined, &members)
+                .is_none(),
+            "a half that does not fit one finalization is one this node declines"
+        );
     }
 }
