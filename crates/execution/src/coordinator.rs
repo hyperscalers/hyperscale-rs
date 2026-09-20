@@ -4265,7 +4265,7 @@ mod tests {
 
     use super::*;
     use crate::counterparts::HeldRecord;
-    use crate::ledger::Part;
+    use crate::ledger::{Kept, Part};
 
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
@@ -10272,12 +10272,12 @@ mod tests {
                     BlockHeight::new(1),
                     1_000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![Arc::new(tx.clone())],
                 ),
                 1_000,
             ),
         );
-        state.counterparts.ledger.seed(tx_hash, Part::delivery());
+        state.counterparts.ledger.seed(tx_hash, delivery_part(&tx));
         state.counterparts.ledger.certify(tx_hash);
         let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
@@ -10549,6 +10549,13 @@ mod tests {
         assert_eq!(classified.core(), &BTreeSet::from([BEARER]));
         assert!(classified.decomposed());
         classified
+    }
+
+    /// The part of a shard that only delivers `tx`, over the body a
+    /// commit of it froze.
+    fn delivery_part(tx: &Transaction) -> Part {
+        let body = Verifiable::from(Verified::new_unchecked_for_test(tx.clone()));
+        Part::delivery(Kept::of(&body, &delivery_classified()))
     }
 
     /// The claim cell the core writes for what `classified` says

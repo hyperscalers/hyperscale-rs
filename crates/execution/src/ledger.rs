@@ -206,11 +206,11 @@ pub struct Unanswerable {
 /// What this shard's part in a transaction is, which decides what the
 /// entry waits on and what ends it.
 ///
-/// Two of the parts hold nothing beyond their account: a whole shape
-/// and a delivery are decided by their own finalization or abandoned at
-/// their window. The rest keep the body and the classification a
-/// settlement is composed from, and a leg entry — a leg's, or a
-/// resolved issuer's — keeps beside them where that settlement stands.
+/// A whole shape holds nothing beyond its account: it is decided by its
+/// own finalization or abandoned at its deadline. The rest keep the
+/// body and the classification the work they run is composed from, and
+/// a leg entry — a leg's, or a resolved issuer's — keeps beside them
+/// where its settlement stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
     /// This shard's verdict is the transaction's, or a share of it: the
@@ -223,7 +223,9 @@ pub enum Part {
     /// — and, unlike one, out of any tick still holding it, since past
     /// the close the crossing it would claim lapses and its issuer may
     /// reclaim it.
-    Delivery,
+    ///
+    /// Keeps the body and the classification its delivery runs under.
+    Delivery(Kept),
     /// A leg outside the core, held for the settlement of what it
     /// issued: never abandoned, probed past the deadline, released by
     /// the reclaim or the retirement.
@@ -276,9 +278,9 @@ impl Part {
         Self::Whole
     }
 
-    /// A delivery.
-    pub(crate) const fn delivery() -> Self {
-        Self::Delivery
+    /// A delivery, with the body and classification it runs under.
+    pub(crate) const fn delivery(kept: Kept) -> Self {
+        Self::Delivery(kept)
     }
 
     /// A leg outside the core, with the body and classification its
@@ -307,7 +309,7 @@ impl Part {
 
     /// Whether the entry only delivers.
     const fn is_delivery(&self) -> bool {
-        matches!(self, Self::Delivery)
+        matches!(self, Self::Delivery(_))
     }
 
     /// Whether a core issuer still holds crossings its deliveries owe a
@@ -316,7 +318,7 @@ impl Part {
     fn issued(&self, local: ShardId) -> bool {
         match self {
             Self::Core(kept) => !kept.deliveries(local).is_empty(),
-            Self::Whole | Self::Delivery | Self::Leg(_) | Self::Remainder(_) => false,
+            Self::Whole | Self::Delivery(_) | Self::Leg(_) | Self::Remainder(_) => false,
         }
     }
 
@@ -359,24 +361,34 @@ impl Part {
     const fn held(&self) -> Option<&LegEntry> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(held),
-            Self::Whole | Self::Delivery | Self::Core(_) => None,
+            Self::Whole | Self::Delivery(_) | Self::Core(_) => None,
         }
     }
 
     const fn held_mut(&mut self) -> Option<&mut LegEntry> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(held),
-            Self::Whole | Self::Delivery | Self::Core(_) => None,
+            Self::Whole | Self::Delivery(_) | Self::Core(_) => None,
         }
     }
 
-    /// What the entry keeps beside its account, where it keeps anything.
+    /// What the entry keeps beside its account, where it keeps
+    /// anything: every part but a whole shape, which is decided by its
+    /// own finalization and composes nothing.
     const fn kept(&self) -> Option<&Kept> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(&held.kept),
-            Self::Core(kept) => Some(kept),
-            Self::Whole | Self::Delivery => None,
+            Self::Core(kept) | Self::Delivery(kept) => Some(kept),
+            Self::Whole => None,
         }
+    }
+
+    /// What an entry that issues crossings of its own composes their
+    /// settlement from, and whose core a mirrored verdict and a probe
+    /// are read off. A delivery keeps a body and issues nothing, so it
+    /// settles no records, mirrors no verdict and asks nobody.
+    fn settling(&self) -> Option<&Kept> {
+        self.kept().filter(|_| !self.is_delivery())
     }
 
     /// The part `local` plays in a transaction frozen as `classified`,
@@ -401,22 +413,11 @@ impl Part {
         if !classified.decomposed() {
             return Self::whole();
         }
+        let kept = Kept::of(tx, classified);
         let in_core = classified.core().contains(&local);
         if !in_core && classified.only_delivers_at(local) {
-            return Self::delivery();
+            return Self::delivery(kept);
         }
-        // Block-container entries decoded from the wire land as
-        // `Unverified`; lift via `from_persisted` under the same
-        // BFT-transitive trust that gates the containing block. Honest
-        // live-consensus blocks already carry `Verified` entries.
-        let body: Arc<Verified<Transaction>> = match (**tx).clone().into_verified() {
-            Ok(verified) => Arc::new(verified),
-            Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
-        };
-        let kept = Kept {
-            body,
-            classified: classified.clone(),
-        };
         if in_core {
             Self::core(kept)
         } else {
@@ -438,6 +439,24 @@ pub struct Kept {
 }
 
 impl Kept {
+    /// The body and the classification an entry keeps, read off the
+    /// classification the committing block froze.
+    ///
+    /// Block-container entries decoded from the wire land as
+    /// `Unverified`; lift via `from_persisted` under the same
+    /// BFT-transitive trust that gates the containing block. Honest
+    /// live-consensus blocks already carry `Verified` entries.
+    pub(crate) fn of(tx: &Verifiable<Transaction>, classified: &Classified) -> Self {
+        let body: Arc<Verified<Transaction>> = match tx.clone().into_verified() {
+            Ok(verified) => Arc::new(verified),
+            Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
+        };
+        Self {
+            body,
+            classified: classified.clone(),
+        }
+    }
+
     /// Whose refusal is the transaction's, and whose committed cells a
     /// probe asks about. An issuer in the core holds the core it is
     /// part of, itself included; the prober skips this shard, since
@@ -714,7 +733,7 @@ impl Ledger {
     pub(crate) fn leg_core(&self, tx_hash: TxHash) -> Option<&BTreeSet<ShardId>> {
         self.owed
             .get(&tx_hash)
-            .and_then(|owed| owed.part.kept())
+            .and_then(|owed| owed.part.settling())
             .map(Kept::core)
     }
 
@@ -737,7 +756,10 @@ impl Ledger {
     /// question this ledger asked it.
     #[must_use]
     pub(crate) fn consumer_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        let kept = self.owed.get(&tx_hash).and_then(|owed| owed.part.kept());
+        let kept = self
+            .owed
+            .get(&tx_hash)
+            .and_then(|owed| owed.part.settling());
         kept.is_some_and(|kept| {
             kept.every_claim(self.local)
                 .iter()
@@ -829,7 +851,7 @@ impl Ledger {
             if owed.covered() {
                 continue;
             }
-            let Some(kept) = owed.part.kept() else {
+            let Some(kept) = owed.part.settling() else {
                 continue;
             };
             let deadline = owed.figures.deadline;
@@ -889,18 +911,18 @@ impl Ledger {
     /// `tx_hash` issued on this shard, so the leaves are not the leaf
     /// path's to settle beside it.
     ///
-    /// The entries that keep a classification are exactly those: a leg
-    /// and a remainder settle what they issued, and a core member
-    /// becomes a remainder at its own verdict. A whole entry keeps
-    /// none — including one a record reconstructed, which carries the
-    /// figures an abandonment restates and nothing a settlement is
-    /// composed from. That entry gives the verdict and the reservation
-    /// back; the leaves are answered for where they are.
+    /// The entries that issue are exactly those: a leg and a remainder
+    /// settle what they issued, and a core member becomes a remainder
+    /// at its own verdict. A delivery and a whole entry issue none —
+    /// the whole one including a record reconstructed it, which carries
+    /// the figures an abandonment restates and nothing a settlement is
+    /// composed from. Such an entry gives the verdict and the
+    /// reservation back; the leaves are answered for where they are.
     #[must_use]
     pub(crate) fn settles_records(&self, tx_hash: TxHash) -> bool {
         self.owed
             .get(&tx_hash)
-            .is_some_and(|owed| owed.part.kept().is_some())
+            .is_some_and(|owed| owed.part.settling().is_some())
     }
 
     /// Every leg entry no tick has taken the records of yet, with what
@@ -1641,6 +1663,12 @@ mod tests {
         classified
     }
 
+    /// The part of a shard that only delivers, over the body `tx`
+    /// commits, frozen as a shape with a delivery in it.
+    fn delivery_part(tx: &Verifiable<Transaction>) -> Part {
+        Part::delivery(Kept::of(tx, &delivering()))
+    }
+
     /// A transaction paying from `payer` and touching `also`, both given
     /// as the byte an address repeats.
     fn tx_over(payer: u8, also: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
@@ -2295,7 +2323,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
-        ledger.seed(tx.hash(), Part::delivery());
+        ledger.seed(tx.hash(), delivery_part(&tx));
         assert!(ledger.is_delivery(tx.hash()));
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let close = Window::Delivery.of(Deadline::of(ms(60_000))).end;
@@ -2318,7 +2346,7 @@ mod tests {
 
         let mut delivered = Ledger::new(LOCAL);
         commit(&mut delivered, &tx);
-        delivered.seed(tx.hash(), Part::delivery());
+        delivered.seed(tx.hash(), delivery_part(&tx));
         delivered.certify(tx.hash());
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
         delivered.release_resolved(&[Arc::new(Verifiable::from(own))]);
@@ -2623,7 +2651,7 @@ mod tests {
 
         let delivery = tx(3, 60_000);
         commit(&mut ledger, &delivery);
-        ledger.seed(delivery.hash(), Part::delivery());
+        ledger.seed(delivery.hash(), delivery_part(&delivery));
         assert_eq!(
             fw(
                 &ledger,
