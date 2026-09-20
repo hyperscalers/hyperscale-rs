@@ -957,14 +957,13 @@ impl Ledger {
             if !owed.part.is_leg() {
                 continue;
             }
-            for (delivered_by, claim) in kept.deliveries(local) {
-                questions.extend(
-                    BTreeSet::from([delivered_by, trie.shard_for_prefix(claim.owner)])
-                        .into_iter()
-                        .filter_map(|shard| question(shard, claim, Probed::Delivery)),
-                );
-            }
-            for (consumer, claim) in kept.claims(local) {
+            // One question per claim, whichever kind of consumer writes
+            // it: a claim answers by being present and by nothing else,
+            // so the side it was issued to changes nothing about what is
+            // asked. Asked of the shard the classification homed the
+            // consumer on and of whoever holds its prefix now, which are
+            // the same shard until a cut moves it.
+            for (consumer, claim) in kept.every_claim(local) {
                 questions.extend(
                     BTreeSet::from([consumer, trie.shard_for_prefix(claim.owner)])
                         .into_iter()
@@ -2704,7 +2703,7 @@ mod tests {
             leg.hash(),
             DELIVERER,
             claim,
-            Probed::Delivery,
+            Probed::Claim,
             Inclusion::Absent,
         );
         assert_eq!(
@@ -2722,7 +2721,7 @@ mod tests {
             leg.hash(),
             DELIVERER,
             claim,
-            Probed::Delivery,
+            Probed::Claim,
             Inclusion::Present([0xAB; 32]),
         );
         assert!(
@@ -2758,14 +2757,14 @@ mod tests {
             ledger.questions(&delivery_trie()),
             vec![
                 question(BEARER, core_cell(BEARER, &leg), Probed::Core),
-                question(DELIVERER, claim, Probed::Delivery),
+                question(DELIVERER, claim, Probed::Claim),
             ],
         );
         ledger.record_reading(
             leg.hash(),
             DELIVERER,
             claim,
-            Probed::Delivery,
+            Probed::Claim,
             Inclusion::Absent,
         );
         assert!(
@@ -2814,19 +2813,13 @@ mod tests {
                 tx_hash: tx.hash(),
                 shard: delivered_by,
                 key: claim,
-                probed: Probed::Delivery,
+                probed: Probed::Claim,
                 deadline: Deadline::of(ms(60_000)),
                 cued: None,
             }],
             "a remainder asks about its deliveries, and never about itself"
         );
-        ledger.record_reading(
-            tx.hash(),
-            PARTNER,
-            claim,
-            Probed::Delivery,
-            Inclusion::Absent,
-        );
+        ledger.record_reading(tx.hash(), PARTNER, claim, Probed::Claim, Inclusion::Absent);
         let reclaims = ledger.reclaimable();
         assert_eq!(reclaims.len(), 1);
         assert!(
@@ -3235,7 +3228,7 @@ mod tests {
             lapsed.hash(),
             DELIVERER,
             claim,
-            Probed::Delivery,
+            Probed::Claim,
             Inclusion::Absent,
         );
         assert!(

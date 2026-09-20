@@ -208,25 +208,22 @@ pub fn admissible_until(tx: &Transaction) -> WeightedTimestamp {
 /// a reading says is a property of the cell. A committed cell is
 /// written at a core member's inclusion and retracted by its refusal,
 /// so only its absence is an answer: present, the member is still
-/// pending, and the cell is asked again at a newer header. A core
-/// consumer's claim cell is written by the consuming finalization, and
-/// only once every core member certified, so only its presence is an
-/// answer: absent, a sibling may still be pending, and the committed
-/// cell says whether it ever will be. A delivery's claim cell is the
-/// same: the crossing behind it is the consumer's from the moment the
-/// core commits it, so an absence says the delivery has not run yet and
-/// never that it will not.
+/// pending, and the cell is asked again at a newer header. A claim cell
+/// is written by the execution that takes the crossing, so only its
+/// presence is an answer — and that holds whichever consumer wrote it.
+/// A core's claim is absent while a sibling is still pending, and the
+/// committed cell says whether it ever will be; a delivery's is absent
+/// while the delivery has not run, and the crossing behind it is the
+/// consumer's whenever it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Probed {
     /// A core member's committed cell, past the transaction's deadline:
     /// absent where the member never included the transaction, or
     /// included it and refused.
     Core,
-    /// A delivering shard's claim cell: present says the consumer holds
-    /// the crossing, which is what lets the issuer retire the record.
-    Delivery,
-    /// A core consumer's claim cell: present says the core took the
-    /// crossing, and its certificate speaks next.
+    /// A consumer's claim cell: present says that consumer holds the
+    /// crossing. For a core it means its certificate speaks next; for a
+    /// delivery it is what lets the issuer retire the record.
     Claim,
 }
 
@@ -237,7 +234,7 @@ impl Probed {
     pub(crate) const fn absence_window(self) -> Option<Window> {
         match self {
             Self::Core => Some(Window::Core),
-            Self::Delivery | Self::Claim => None,
+            Self::Claim => None,
         }
     }
 
@@ -270,7 +267,7 @@ impl Probed {
     pub(crate) const fn presence_asked_from(self, deadline: Deadline) -> Option<WeightedTimestamp> {
         match self {
             Self::Core => None,
-            Self::Claim | Self::Delivery => Some(deadline.at()),
+            Self::Claim => Some(deadline.at()),
         }
     }
 
@@ -334,8 +331,9 @@ impl Probed {
     #[must_use]
     pub(crate) const fn read(self, inclusion: Inclusion) -> Option<Inclusion> {
         match (inclusion, self) {
-            (Inclusion::Present(_), Self::Claim | Self::Delivery)
-            | (Inclusion::Absent, Self::Core | Self::Delivery) => Some(inclusion),
+            (Inclusion::Present(_), Self::Claim) | (Inclusion::Absent, Self::Core) => {
+                Some(inclusion)
+            }
             (Inclusion::Present(_), Self::Core) | (Inclusion::Absent, Self::Claim) => None,
         }
     }
@@ -491,12 +489,13 @@ mod tests {
         );
     }
 
-    /// A delivery's claim cell answers only by being present. The
-    /// crossing behind it is the consumer's from the moment the core
-    /// commits it, so no absence of the claim — at any anchor — says the
-    /// delivery will not run, and none licenses taking the record back.
+    /// A claim cell answers only by being present, whichever consumer
+    /// wrote it. A core's is absent while a sibling is still pending; a
+    /// delivery's while the delivery has not run, and the crossing
+    /// behind that one is the consumer's whenever it does. Neither
+    /// absence licenses taking a record back, at any anchor.
     #[test]
-    fn a_deliverys_claim_answers_only_by_being_present() {
+    fn a_claim_answers_only_by_being_present() {
         let validity_end = ms(300_000);
         let deadline = Deadline::of(validity_end);
         for anchor in [
@@ -507,14 +506,13 @@ mod tests {
             deadline.at().plus(CLAIM_WINDOW),
         ] {
             assert!(
-                !Probed::Delivery.absence_answers_at(anchor, deadline),
-                "an absence at {anchor:?} says only that the delivery has not run"
+                !Probed::Claim.absence_answers_at(anchor, deadline),
+                "an absence at {anchor:?} says only that the consumer has not run"
             );
         }
         assert_eq!(
-            Probed::Delivery.presence_asked_from(deadline),
             Probed::Claim.presence_asked_from(deadline),
-            "and its presence is asked for on the same terms as a core consumer's"
+            Some(deadline.at())
         );
     }
 
@@ -544,17 +542,12 @@ mod tests {
         );
         assert_eq!(Probed::Claim.read(present), Some(present));
         assert_eq!(Probed::Claim.read(Inclusion::Absent), None);
-        assert_eq!(Probed::Delivery.read(present), Some(present));
-        assert_eq!(
-            Probed::Delivery.read(Inclusion::Absent),
-            Some(Inclusion::Absent)
-        );
     }
 
-    /// A core consumer's claim is asked from the deadline, or one lag
-    /// past a cue heard earlier; a delivery's from its lapse or the same
-    /// cue; a committed cell only inside its absence window, since a cue
-    /// promises a presence and a present committed cell answers nothing.
+    /// A claim is asked from the deadline, or one lag past a cue heard
+    /// earlier; a committed cell only inside its absence window, since a
+    /// cue promises a presence and a present committed cell answers
+    /// nothing.
     #[test]
     fn a_cue_opens_a_presence_question_early_and_never_a_committed_cell() {
         let deadline = Deadline::of(ms(60_000));
@@ -572,13 +565,6 @@ mod tests {
             None
         ));
         assert!(Probed::Claim.asks_at(deadline.at(), deadline, None));
-        assert!(Probed::Delivery.asks_at(readable, deadline, Some(cued)));
-        assert!(!Probed::Delivery.asks_at(
-            deadline.at().minus(Duration::from_millis(1)),
-            deadline,
-            None
-        ));
-        assert!(Probed::Delivery.asks_at(deadline.at(), deadline, None));
         assert!(!Probed::Core.asks_at(readable, deadline, Some(cued)));
         assert!(Probed::Core.asks_at(deadline.at(), deadline, Some(cued)));
     }
