@@ -790,10 +790,22 @@ impl Section for ReoffersSection {
     /// and it is what the block's `provision_tx_roots` bucket the
     /// offers in — so a voter recomputing that map walks the order it
     /// would have built. An offer naming no record promises a bundle
-    /// with nothing in it, which the cap is not spent on. Whether the
-    /// crossing really is unclaimed is the offering shard's own ledger
-    /// question and nobody else's: an offer nobody needed costs one
-    /// bundle, and the consumer's record decides what it is worth.
+    /// with nothing in it, which the cap is not spent on.
+    ///
+    /// Whether the crossing really is unclaimed is not asked. A voter
+    /// could ask it — the outstanding set is a fold over committed
+    /// content, so every replica at one frontier holds the same one —
+    /// and what it would buy does not pay for the frontier disagreement
+    /// it would introduce. An offer nobody needed reaches its target as
+    /// part of the one bundle that block already owed it, since an
+    /// expectation is keyed by source block and not by offer, so a
+    /// proposer filling the section buys itself one larger bundle and
+    /// not one fetch per entry. What it can do is spend the cap on
+    /// nothing while it leads, holding a real offer back a round. A
+    /// crossing stands to the close of its delivery window and is
+    /// offered again no faster than a promise could be answered, so a
+    /// round lost to a proposer that wastes the section is one of very
+    /// many, and the honest round that follows carries it.
     fn admit(
         _ctx: &Admission<'_>,
         fold: &mut Self::Fold,
