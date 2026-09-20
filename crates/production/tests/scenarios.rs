@@ -19,8 +19,8 @@ use hyperscale_scenarios::tx::{
     reshape_lifecycle_accounts, split_straddler_setup,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, a_delivery_cut_off_past_its_window_is_reclaimed,
-    a_delivery_is_reclaimed_when_its_deliverer_splits,
+    ScenarioConfig, a_delivery_cut_off_past_its_window_is_owed,
+    a_delivery_is_owed_when_its_deliverer_splits,
     a_leg_whose_core_never_answers_refuses_at_the_deadline, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
@@ -244,14 +244,14 @@ const fn cross_shard_config() -> ScenarioConfig {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn a_delivery_cut_off_past_its_window_is_reclaimed_prod() {
+fn a_delivery_cut_off_past_its_window_is_owed_prod() {
     let mut cluster = ProdCluster::start_with_grown_accounts(
         &cross_shard_config(),
         42,
         EPOCH_MS,
         cross_shard_genesis_accounts(),
     );
-    cluster.run_faultable(a_delivery_cut_off_past_its_window_is_reclaimed);
+    cluster.run_faultable(a_delivery_cut_off_past_its_window_is_owed);
 }
 
 #[test]
@@ -451,11 +451,11 @@ fn split_straddler_atomic_prod() {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn a_delivery_is_reclaimed_when_its_deliverer_splits_prod() {
+fn a_delivery_is_owed_when_its_deliverer_splits_prod() {
     let setup = split_straddler_setup();
     let mut cluster =
         ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
-    cluster.run_faultable(a_delivery_is_reclaimed_when_its_deliverer_splits);
+    cluster.run_faultable(a_delivery_is_owed_when_its_deliverer_splits);
 }
 
 #[test]

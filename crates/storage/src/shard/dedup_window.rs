@@ -138,10 +138,13 @@ impl DedupWindow {
         let fee_floor = committed_ts.minus(FEE_HOLD_WINDOW);
         let mut window = Self::default();
         let mut height = committed_height;
-        // One descent, each tier stopping at its own floor. The fee tier
-        // reaches deeper, so the dedup tiers pin their coverage on the way
-        // past rather than ending the walk.
+        // One descent, each tier stopping at its own floor, and the walk
+        // ending where both have. The dedup tiers reach deeper — a
+        // transaction is held to the expiry the record a delivery of it
+        // would claim states, where a hold ends one settlement window past its
+        // transaction's — so neither floor alone can end the descent.
         let mut dedup_done = false;
+        let mut fee_done = false;
         // What a finalization already released, gathered descending — a
         // block's certificates are read before its transactions, and a
         // finalization always sits at or above the block that committed
@@ -167,22 +170,30 @@ impl DedupWindow {
             };
             let block = certified.block();
             let anchor = block.header().parent_qc().weighted_timestamp();
-            if anchor < fee_floor {
-                // Below every floor: nothing this walk seeds reaches here.
+            if !fee_done && anchor < fee_floor {
+                // Below the fee floor: every hold this walk seeds is
+                // folded, and the descent continues for the dedup tiers
+                // alone.
                 window.fee_holds_whole = true;
-                return window;
+                fee_done = true;
             }
             if !dedup_done && anchor < dedup_floor {
                 // Below the dedup floor: everything those tiers have to
                 // cover is already folded, and this block is the proof of
-                // it. The descent continues for the fee tier alone.
+                // it.
                 window.covered_from = Some(anchor);
                 dedup_done = true;
+            }
+            if dedup_done && fee_done {
+                // Below every floor: nothing this walk seeds reaches here.
+                return window;
             }
             if !dedup_done {
                 window.fold_block(block, anchor);
             }
-            window.fold_fee_holds(block, committed_ts, &mut released);
+            if !fee_done {
+                window.fold_fee_holds(block, committed_ts, &mut released);
+            }
 
             let Some(previous) = height.prev() else {
                 // Height zero: there is no block beneath it anywhere.

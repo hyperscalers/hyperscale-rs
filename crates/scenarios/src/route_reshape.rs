@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::genesis::GenesisPackages;
+use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId,
@@ -1632,7 +1633,7 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let setup = split_train_setup(SPLIT_TRAIN);
     split_lifecycle(c);
-    let world = train_world(c, &setup.legs);
+    let mut world = train_world(c, &setup.legs);
     let mut charges = Charges::default();
 
     let sent = drive_train(
@@ -1640,6 +1641,7 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
         splitter,
         &setup.legs,
         &mut charges,
+        &mut world,
         |c| split_admitted(c, splitter),
         |c| cast_splitter_vote(c, straddler_split_bytes()),
     );
@@ -1678,7 +1680,7 @@ pub fn a_train_into_a_merging_shard_strands_nothing<C: Cluster>(c: &mut C) {
         (0..4).all(|path| await_serves(c, ShardId::leaf(2, path), epochs(4))),
         "the grown four-shard topology must seat every quarter",
     );
-    let world = train_world(c, &setup.legs);
+    let mut world = train_world(c, &setup.legs);
     let mut charges = Charges::default();
 
     let sent = drive_train(
@@ -1686,6 +1688,7 @@ pub fn a_train_into_a_merging_shard_strands_nothing<C: Cluster>(c: &mut C) {
         merging,
         &setup.legs,
         &mut charges,
+        &mut world,
         |c| merge_keeper_count(c, parent).is_some(),
         |_| {},
     );
@@ -1725,6 +1728,7 @@ fn drive_train<C: Cluster>(
     terminating: ShardId,
     legs: &[(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)],
     charges: &mut Charges,
+    world: &mut World,
     pending: impl Fn(&C) -> bool,
     arm: impl FnOnce(&mut C),
 ) -> Vec<(TxHash, PrincipalAddr, Phase)> {
@@ -1741,6 +1745,7 @@ fn drive_train<C: Cluster>(
         c,
         legs.next().expect("a funded leg"),
         charges,
+        world,
         &mut sent,
         &mut admitted_once,
         &pending,
@@ -1751,7 +1756,16 @@ fn drive_train<C: Cluster>(
 
     let mut draining = 0;
     for leg in legs {
-        if send_leg(c, leg, charges, &mut sent, &mut admitted_once, &pending) == Phase::Draining {
+        if send_leg(
+            c,
+            leg,
+            charges,
+            world,
+            &mut sent,
+            &mut admitted_once,
+            &pending,
+        ) == Phase::Draining
+        {
             draining += 1;
             if draining >= PAST_THE_GATE {
                 break;
@@ -1919,6 +1933,7 @@ fn send_leg<C: Cluster>(
     c: &mut C,
     (key, from, to): &(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
     charges: &mut Charges,
+    world: &mut World,
     sent: &mut Vec<(TxHash, PrincipalAddr, Phase)>,
     admitted_once: &mut bool,
     pending: impl Fn(&C) -> bool,
@@ -1927,6 +1942,15 @@ fn send_leg<C: Cluster>(
     *admitted_once |= pending;
     let phase = phase_of(pending, *admitted_once);
     let tx = build_transfer_tx(key, *from, *to, STRADDLER_PAYMENT, validity_around(c.now()));
+    // A leg the cut costs its delivery leaves its crossing owed,
+    // standing in the record until the successor holding the
+    // recipient's prefix claims it. That is value the world still
+    // holds.
+    world.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    ));
     sent.push((charges.submit(c, tx), *to, phase));
     phase
 }

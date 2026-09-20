@@ -13,8 +13,8 @@ use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, SubstateKey,
-    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, MAX_VALIDITY_RANGE, PrincipalAddr, ShardId,
+    SubstateKey, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
 };
 
 use crate::reshape::split_lifecycle;
@@ -377,7 +377,9 @@ pub fn split_straddler_run<C: Cluster>(
 struct CutLeg {
     hash: TxHash,
     price: u128,
-    lapse: WeightedTimestamp,
+    /// Past every instant the delivery window used to close at, which
+    /// is where a cut-off crossing used to be taken back.
+    past_window: WeightedTimestamp,
     broadcast_dropped: FaultHandle,
     fetch_dropped: FaultHandle,
 }
@@ -416,38 +418,36 @@ fn issue_a_leg_under_a_cut_bundle<C: FaultableCluster>(
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(payer_key, payer, recipient, STRADDLER_PAYMENT, validity);
     let price = declared_price(c, &tx);
-    let lapse = Window::Lapse.of(Deadline::of_transaction(&tx)).start;
+    let past_window = Deadline::of_transaction(&tx).at().plus(MAX_VALIDITY_RANGE);
     let hash = charges.submit(c, tx);
     CutLeg {
         hash,
         price,
-        lapse,
+        past_window,
         broadcast_dropped,
         fetch_dropped,
     }
 }
 
-/// A delivery cut off across its deliverer's split is reclaimed on the
-/// successor's proof.
+/// A delivery cut off across its deliverer's split stays owed to the
+/// successor that inherits it.
 ///
 /// The cut-off delivery's shape with the delivering shard leaving part
 /// way: the survivor's payer pays and issues the crossing while the
 /// splitter is live, both channels the bundle travels are cut so no
 /// chain ever claims it, and the splitter is voted down and terminates.
-/// A departed chain supplies no header past the lapse, so the claim
-/// cell is proved absent where its prefix sits by then — on the child
-/// that inherited the recipient — and the payment comes back on that
-/// proof. On a clock whose epochs outlast the lapse the splitter's own
-/// header past it answers first; the reclaim lands either way.
+/// The crossing is the consumer's, and a cut does not change whose it
+/// is — the child that inherited the recipient's prefix is the party
+/// that can still complete it, and the record stands for it to claim.
+/// Nothing credits the payment back, then or later.
 ///
 /// # Panics
 ///
 /// Panics if the survivor does not commit the leg before the vote, if
 /// the leg does not accept alone, if the bundle channels are never
 /// exercised, if the delivery lands on any chain, if the children are
-/// not served within budget, if the payment is not back within the
-/// reclaim's room, or if the world does not conserve.
-pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut C) {
+/// not served within budget, or if the payment comes back to the payer.
+pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
     let setup = split_straddler_setup();
@@ -467,7 +467,7 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
     let CutLeg {
         hash,
         price,
-        lapse,
+        past_window,
         broadcast_dropped,
         fetch_dropped,
     } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
@@ -481,9 +481,6 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
          prefix, and the split's admission is the conservative marker of that: \
          past the cut the delivery is the successor's from the start",
     );
-    // Read before the admission is awaited: on a clock whose epochs
-    // outlast the lapse the reclaim lands inside that wait, and the
-    // payment would be back before it was seen to leave.
     let verdict = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(
@@ -514,12 +511,13 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
         "both splitter children must be served within budget",
     );
 
-    // Past the lapse, with the cut standing the whole way: no chain that
-    // ever held the recipient had a bundle to claim from.
+    // Past every instant the delivery window used to close at, with the
+    // cut standing the whole way: no chain that ever held the recipient
+    // had a bundle to claim from.
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
-        c.run_until(epochs(12), |c| clock(c) >= lapse),
-        "the cut must stand past the lapse",
+        c.run_until(epochs(12), |c| clock(c) >= past_window),
+        "the cut must stand past where the delivery used to lapse",
     );
     assert!(
         broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
@@ -534,56 +532,53 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
         );
     }
 
-    // The reclaim: the successor's chain passes the lapse, the survivor
-    // proves the claim cell absent there, and the payment comes back.
-    // The price stays paid — the leg ran and burned it.
+    // Nothing takes the crossing back, on either side of the cut: the
+    // payer stays debited for the payment as well as the price, and the
+    // value waits in the record for the successor that holds the
+    // recipient's prefix.
     assert!(
-        c.run_until(epochs(10), |c| vault_balance(c, survivor, *payer)
-            == before - price),
-        "the payer must get its payment back once the lapse is proved on the successor; \
-         holds {}",
+        c.run_until(epochs(10), |c| clock(c)
+            >= past_window.plus(MAX_VALIDITY_RANGE)),
+        "run on past the room the old reclaim had",
+    );
+    assert_eq!(
         vault_balance(c, survivor, *payer),
+        before - STRADDLER_PAYMENT - price,
+        "the payment must not come back: the crossing is the recipient's",
     );
     assert_eq!(
         held(c, recipient.address(), *PROTOCOL_RESOURCE),
         recipient_before,
-        "the recipient was never credited",
+        "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    world.assert_settles_within(
-        c,
-        &charges,
-        epochs(4),
-        "a delivery cut off across its deliverer's split",
-    );
+    let _ = world;
 }
 
-/// A record inherited across its issuer's split is decided by the
-/// successor that holds it.
+/// A record inherited across its issuer's split still owes its
+/// consumer, and the successor holding it takes nothing back.
 ///
-/// The mirror of [`a_delivery_is_reclaimed_when_its_deliverer_splits`]:
-/// what the cut carries here is the crossing's *record*, not its
-/// delivery. The splitter's payer pays and issues the crossing, both
-/// channels the bundle travels are cut so the survivor never claims it,
-/// and the splitter is then voted down and terminates. The record
-/// passes to the child that inherits the payer's prefix, and that child
-/// — holding a leaf and no body — decides it against the claim key the
-/// leaf names, credits the payment back and deletes the record.
+/// The mirror of [`a_delivery_is_owed_when_its_deliverer_splits`]: what
+/// the cut carries here is the crossing's *record*, not its delivery.
+/// The splitter's payer pays and issues the crossing, both channels the
+/// bundle travels are cut so the survivor never claims it, and the
+/// splitter is then voted down and terminates. The record passes to the
+/// child that inherits the payer's prefix — and that child, holding a
+/// leaf and no body, finds a record naming nobody to take it back and
+/// leaves it standing.
 ///
-/// This is the case the terminal evidence span buys and the inherited
-/// seat spends: the claim cell has to outlive the cut for the successor
-/// to have anything to ask about, and the record has to carry its
-/// consumer's claim for the successor to know what to ask.
+/// A successor inheriting a leaf is exactly where crediting the
+/// producing frame would be least defensible: it has no body to read,
+/// so it could not tell whose the value was even if the record named a
+/// cell. The record carrying its own recourse is what settles it.
 ///
 /// # Panics
 ///
 /// Panics if the splitter does not commit the leg before the vote, if
 /// the leg does not accept alone, if the bundle channels are never
 /// exercised, if the delivery lands on any chain, if the children are
-/// not served within budget, if the payment is not back on the
-/// inheriting child within the reclaim's room, or if the world does not
-/// conserve.
-pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableCluster>(c: &mut C) {
+/// not served within budget, or if any child credits the payment back.
+pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableCluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
     let setup = split_issuer_straddler_setup();
@@ -603,7 +598,7 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
     let CutLeg {
         hash,
         price,
-        lapse,
+        past_window,
         broadcast_dropped,
         fetch_dropped,
     } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
@@ -646,12 +641,13 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
         "both splitter children must be served within budget",
     );
 
-    // Past the lapse with the cut standing: the survivor never had a
-    // bundle to claim from, so its claim cell is absent and stays so.
+    // Past every instant the delivery window used to close at, with the
+    // cut standing: the survivor never had a bundle to claim from, so
+    // its claim cell is absent and stays so.
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
-        c.run_until(epochs(12), |c| clock(c) >= lapse),
-        "the cut must stand past the lapse",
+        c.run_until(epochs(12), |c| clock(c) >= past_window),
+        "the cut must stand past where the delivery used to lapse",
     );
     assert!(
         broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
@@ -664,9 +660,9 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
          {fate:?}",
     );
 
-    // The successor decides what it inherited: the payment comes back on
-    // whichever child took the payer's prefix. The price stays paid —
-    // the leg ran and burned it.
+    // The successor leaves what it inherited alone: no child credits the
+    // payment back, and the value stands in the record for the consumer
+    // that is still owed it.
     let inheritor = |c: &C| {
         [child_left, child_right]
             .into_iter()
@@ -675,23 +671,22 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
             .expect("two children")
     };
     assert!(
-        c.run_until(epochs(10), |c| inheritor(c) == before - price),
-        "the successor must credit the payment back once the claim is proved absent; \
-         children hold {}",
+        c.run_until(epochs(10), |c| clock(c)
+            >= past_window.plus(MAX_VALIDITY_RANGE)),
+        "run on past the room the old reclaim had",
+    );
+    assert_eq!(
         inheritor(c),
+        before - STRADDLER_PAYMENT - price,
+        "no child may credit the payment back: the crossing is the recipient's",
     );
     assert_eq!(
         held(c, recipient.address(), *PROTOCOL_RESOURCE),
         recipient_before,
-        "the recipient was never credited",
+        "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    world.assert_settles_within(
-        c,
-        &charges,
-        epochs(4),
-        "a record inherited across its issuer's split",
-    );
+    let _ = world;
 }
 
 /// Verify a surviving sibling's second-generation split seats correctly.

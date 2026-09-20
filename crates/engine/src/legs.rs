@@ -461,6 +461,7 @@ impl Classified {
                     Departure {
                         site: edge.record,
                         consumer_claim: edge.claim.key(),
+                        delivers: edge.delivers,
                     },
                 )?;
             }

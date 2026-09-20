@@ -4,11 +4,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_types::{
     BlockHeight, MAX_VALIDITY_RANGE, ShardId, TimestampRange, Transaction, WeightedTimestamp,
 };
 
-use crate::support::conservation::{Charges, probe_world};
+use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::query::{
     clock, committee_size, epoch_duration_ms, live_shards, scheduled_terminal_epoch,
 };
@@ -182,14 +183,14 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
     let (left, right) = root.children();
 
-    let world = probe_world(c);
+    let mut world = probe_world(c);
     let mut charges = Charges::default();
     let spacing = measure_probe_spacing(c, &mut charges, root);
     assert!(
         await_split_admitted(c, root, epochs(8)),
         "beacon did not admit the root split within budget"
     );
-    let probes = run_probe_train(c, &mut charges, root, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, root, spacing, |c| {
         [left, right].iter().all(|&child| shard_live(c, child))
     });
     let replay = pick_replay(c, root, &probes);
@@ -253,6 +254,7 @@ fn measure_probe_spacing(c: &mut impl Cluster, charges: &mut Charges, shard: Sha
 fn run_probe_train<C: Cluster>(
     c: &mut C,
     charges: &mut Charges,
+    world: &mut World,
     terminating: ShardId,
     spacing: u64,
     handed_over: impl Fn(&C) -> bool,
@@ -262,6 +264,15 @@ fn run_probe_train<C: Cluster>(
     while probes.len() < MAX_REPLAY_PROBES as usize && !live(c) {
         let probe = Arc::new(build_probe_transfer_tx(validity_around(c.now())));
         charges.record(&probe);
+        // A probe whose delivery the cut costs leaves its crossing owed,
+        // standing in the record until whoever holds the recipient's
+        // prefix claims it. That is value the world still holds.
+        world.owing(crossing_records(
+            &probe
+                .try_derived(c.derivation().as_ref())
+                .expect("a scenario transfer derives")
+                .legs,
+        ));
         probes.push(Arc::clone(&probe));
         c.submit(probe);
         let from = committed_height(c, terminating);
@@ -391,14 +402,14 @@ pub fn split_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
     let (left, right) = root.children();
 
-    let world = probe_world(c);
+    let mut world = probe_world(c);
     let mut charges = Charges::default();
     let spacing = measure_probe_spacing(c, &mut charges, root);
     assert!(
         await_split_admitted(c, root, epochs(8)),
         "beacon did not admit the root split within budget"
     );
-    let probes = run_probe_train(c, &mut charges, root, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, root, spacing, |c| {
         [left, right].iter().all(|&child| shard_live(c, child))
     });
     let replay = pick_replay(c, root, &probes);
@@ -608,7 +619,7 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     // The probes all share a payer, so they land on one child; the
     // reformed parent succeeds both regardless, and the sibling that
     // never saw them is the second answer it has to collect.
-    let world = probe_world(c);
+    let mut world = probe_world(c);
     let mut charges = Charges::default();
     let payer_child = probe_payer_shard(c, &mut charges, root);
     let spacing = measure_probe_spacing(c, &mut charges, payer_child);
@@ -616,7 +627,7 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     // so serving is no signal. Its height line continues from the taller
     // child, so passing the child it succeeds is: nothing the departed
     // root chain froze at can reach there.
-    let probes = run_probe_train(c, &mut charges, payer_child, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, payer_child, spacing, |c| {
         c.serves_shard(root) && committed_height(c, root) > committed_height(c, payer_child)
     });
 

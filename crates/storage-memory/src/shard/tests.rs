@@ -764,30 +764,31 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
     );
 }
 
-/// The fee tier reaches deeper than the dedup tiers, because a hold
-/// outlives the delivery window the dedup tiers close on.
+/// The dedup tiers reach deeper than the fee tier, because a crossing an
+/// outbound leg consumes outlives the hold its transaction took.
 ///
-/// A hold lives to its validity end plus `RETENTION_HORIZON`, and the
+/// A hold ends at its validity end plus `RETENTION_HORIZON`, and the
 /// block committing it sits no earlier than one `MAX_VALIDITY_RANGE`
-/// before that end — `FEE_HOLD_WINDOW` past the tip, which is
-/// `MAX_FINALIZATION_DELAY` deeper than `DEDUP_WINDOW`. A walk floored at
-/// the dedup tiers' depth would seed a ledger short of what the payer has
-/// actually engaged.
+/// before that end — `FEE_HOLD_WINDOW` past the tip. A transaction is
+/// held to the expiry the record a delivery of it would claim states,
+/// which is `DEDUP_WINDOW` and deeper. A walk floored at the fee tier's depth
+/// would seed an index that re-admits a transaction its own chain
+/// already committed.
 #[test]
-fn the_fee_tier_is_folded_below_the_dedup_floor() {
+fn the_dedup_tiers_are_folded_below_the_fee_floor() {
     let storage = SimShardStorage::default();
     let dedup_ms = u64::try_from(DEDUP_WINDOW.as_millis()).unwrap();
     let fee_ms = u64::try_from(FEE_HOLD_WINDOW.as_millis()).unwrap();
-    let tip_ms = fee_ms + 100_000;
+    let tip_ms = dedup_ms + 100_000;
 
-    // Height 1 sits between the two floors: below the dedup tiers' reach,
-    // inside the fee tier's.
-    let below_dedup = tip_ms - dedup_ms - 1_000;
+    // Height 1 sits between the two floors: below the fee tier's reach,
+    // inside the dedup tiers'.
+    let below_fee = tip_ms - fee_ms - 1_000;
     let deep = dedup_tx(1, tip_ms + 1_000);
     let deep_hash = deep.hash();
     commit_empty(
         &storage,
-        &block_with_txs(BlockHeight::new(1), below_dedup, vec![deep]),
+        &block_with_txs(BlockHeight::new(1), below_fee, vec![deep]),
     );
     let near = dedup_tx(2, tip_ms + 1_000);
     let near_hash = near.hash();
@@ -809,15 +810,11 @@ fn the_fee_tier_is_folded_below_the_dedup_floor() {
     let committed: Vec<TxHash> = window.committed.iter().map(|(h, _)| *h).collect();
     assert_eq!(
         committed,
-        vec![near_hash],
-        "the dedup tiers stop at their own floor",
+        vec![near_hash, deep_hash],
+        "the dedup tiers reach the block below the fee floor",
     );
     let held: Vec<TxHash> = window.fee_holds.iter().map(|hold| hold.tx_hash).collect();
-    assert_eq!(
-        held,
-        vec![near_hash, deep_hash],
-        "the fee tier reaches the block below it",
-    );
+    assert_eq!(held, vec![near_hash], "the fee tier stops at its own floor");
     assert!(window.fee_holds_whole, "and the descent reached the origin");
 }
 

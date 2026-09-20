@@ -18,8 +18,7 @@ use std::sync::Arc;
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_types::{
-    Deadline, EscrowedValue, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
-    Window,
+    EscrowedValue, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -341,35 +340,33 @@ impl TickCandidates {
         self.candidates.remove(&tx_hash);
     }
 
-    /// Drop every delivering candidate the delivery window has closed on.
+    /// Drop every delivering candidate `owed` no longer names.
     ///
-    /// A delivery is admissible to the window's close and no later: past
-    /// it the crossing lapses and its issuer may reclaim on a proof the
-    /// claim is absent, so a delivery composed past the close would
-    /// claim what a reclaim may already have taken back. Run before
-    /// every composition under the same clock, so [`Self::compose`]
-    /// never sees one. Returns the hashes dropped.
+    /// A delivery runs on no clock of its own — the crossing it claims
+    /// is owed to this shard, and nothing takes it back — so what ends
+    /// its wait is the ledger letting the entry go: at the horizon past
+    /// which the record could not be disposed of anyway, or when the
+    /// delivery's own finalization commits. Read off the ledger rather
+    /// than a deadline here, so the candidate and the obligation end
+    /// together.
     ///
     /// A mixed shard's delivering member is the one that reaches this:
-    /// registered beside its issuing member, and removed by nothing else,
-    /// since its ledger entry is the leg's and a leg is never abandoned.
-    pub fn drop_closed_deliveries(&mut self, now: WeightedTimestamp) -> Vec<TxHash> {
-        let closed: Vec<TxHash> = self
+    /// registered beside its issuing member, and removed by nothing
+    /// else, since its ledger entry is the leg's and a leg is never
+    /// abandoned.
+    pub fn drop_unowed_deliveries(&mut self, owed: impl Fn(TxHash) -> bool) -> Vec<TxHash> {
+        let dropped: Vec<TxHash> = self
             .candidates
             .iter()
-            .filter(|(_, candidate)| {
-                candidate.member.side() == Side::Delivering
-                    && now
-                        >= Window::Delivery
-                            .of(Deadline::of_transaction(&candidate.tx))
-                            .end
+            .filter(|(tx_hash, candidate)| {
+                candidate.member.side() == Side::Delivering && !owed(**tx_hash)
             })
             .map(|(tx_hash, _)| *tx_hash)
             .collect();
-        for tx_hash in &closed {
+        for tx_hash in &dropped {
             self.candidates.remove(tx_hash);
         }
-        closed
+        dropped
     }
 
     /// Whether a transaction is still waiting for a tick.
@@ -399,8 +396,8 @@ impl TickCandidates {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::WeightedTimestamp;
     use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
+    use hyperscale_types::{Deadline, MAX_VALIDITY_RANGE, WeightedTimestamp};
 
     use super::*;
 
@@ -515,11 +512,14 @@ mod tests {
         assert!(admitted[0].request.runs.reaches_beyond());
     }
 
-    /// A delivering candidate the window has closed on is dropped, not
-    /// merely skipped: no tick can take it again, and the shard holding
-    /// it holds the transaction's body and walks it once per block.
+    /// A delivering candidate is on no clock of its own. The crossing it
+    /// claims is owed to this shard from the moment the core committed
+    /// it, so nothing takes it back and nothing here gives it up: the
+    /// candidate waits however long its provision takes, and joins a
+    /// tick whenever the record arrives. What ends the wait is the
+    /// ledger letting the entry go, never a deadline.
     #[test]
-    fn a_delivering_candidate_goes_when_its_window_closes() {
+    fn a_delivering_candidate_waits_however_late_its_provision_is() {
         let mut candidates = TickCandidates::new(LOCAL);
         let remote = ShardId::leaf(1, 1);
         let delivery = tx(6);
@@ -536,28 +536,65 @@ mod tests {
             ms(1_000),
             PriceTable::GENESIS,
         );
-        let issuing = local_only(&mut candidates, tx(7));
 
+        // Past every instant the old delivery window closed at, and past
+        // the transaction's own deadline.
+        let late = Deadline::of(end).at().plus(MAX_VALIDITY_RANGE);
+        let mut provisioning = ProvisioningTracker::new();
         assert!(
             candidates
-                .drop_closed_deliveries(
-                    Window::Delivery
-                        .of(Deadline::of(end))
-                        .end
-                        .minus(std::time::Duration::from_millis(1))
-                )
+                .compose(&provisioning, &mut ProvisionalCells::default(), late)
                 .is_empty(),
-            "short of the close the delivery may still be admitted",
+            "nothing has arrived for it",
+        );
+        assert!(candidates.contains(delivered), "so it is still waiting");
+
+        assert!(
+            candidates.drop_unowed_deliveries(|_| true).is_empty(),
+            "and nothing drops it while the ledger still owes it",
         );
 
+        provisioning.record_required(delivered, BTreeSet::new());
+        let admitted = candidates.compose(&provisioning, &mut ProvisionalCells::default(), late);
         assert_eq!(
-            candidates.drop_closed_deliveries(Window::Delivery.of(Deadline::of(end)).end),
+            admitted.len(),
+            1,
+            "and the record arriving is what takes it, whenever that is",
+        );
+        assert!(!candidates.contains(delivered));
+    }
+
+    /// A delivering candidate the ledger has let go of has nothing left
+    /// to run: the entry it stood for is gone, so the record it would
+    /// claim is past the horizon anything could dispose of it in. An
+    /// issuing candidate is not the ledger's to end this way.
+    #[test]
+    fn a_delivering_candidate_goes_when_its_entry_does() {
+        let mut candidates = TickCandidates::new(LOCAL);
+        let remote = ShardId::leaf(1, 1);
+        let delivery = tx(6);
+        let delivered = delivery.hash();
+        candidates.register_member(
+            delivery,
+            Member::of(
+                Classified::whole(),
+                LOCAL,
+                Side::Delivering,
+                BTreeSet::from([LOCAL, remote]),
+            ),
+            ms(1_000),
+            PriceTable::GENESIS,
+        );
+        let issuing = local_only(&mut candidates, tx(7));
+
+        assert_eq!(
+            candidates.drop_unowed_deliveries(|_| false),
             vec![delivered],
         );
         assert!(!candidates.contains(delivered));
         assert!(
             candidates.contains(issuing),
-            "an issuing candidate is on its own clock",
+            "an issuing candidate ends with its own outcome",
         );
     }
 

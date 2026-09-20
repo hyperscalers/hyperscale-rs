@@ -17,6 +17,7 @@ use hyperscale_types::{
     StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
     TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
 };
+use hyperscale_vm_effects::CrossingCell;
 
 use super::{Budget, Cluster};
 
@@ -129,6 +130,24 @@ pub(crate) fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
         .map_or(0, |bytes| {
             <[u8; 16]>::try_from(bytes.as_slice()).map_or(0, u128::from_le_bytes)
         })
+}
+
+/// What a crossing record standing at `cell` still owes, in `resource`.
+///
+/// Zero where the cell holds nothing, holds something that is not a
+/// record, or holds one denominated in another resource. A record is
+/// value the producing shard holds for a crossing its consumer has not
+/// claimed: it is in the world, and this is where.
+pub(crate) fn owed_at<C: Cluster + ?Sized>(
+    c: &C,
+    cell: SubstateKey,
+    resource: ResourceAddr,
+) -> u128 {
+    let shard = owning_shard(c, cell.owner);
+    c.substate(shard, cell.owner, cell.local.0)
+        .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+        .filter(|record| record.resource == resource)
+        .map_or(0, |record| record.amount)
 }
 
 /// The live shard whose prefix `owner` falls under.

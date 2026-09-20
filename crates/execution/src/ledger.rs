@@ -138,23 +138,20 @@ impl Owed {
     /// What the evidence covering the entry established of the
     /// transaction, where it established a verdict at all: a departure
     /// or a core's committed cell absent says the core never took it,
-    /// which aborts the transaction; a delivery's claim absent says only
-    /// that the delivery lapsed, and the core decided.
+    /// which aborts the transaction. No other absence answers, so no
+    /// other reading reaches here.
     fn abandoned_verdict(&self) -> Option<TransactionDecision> {
         (self.departed_by.is_some() || self.absences().any(|probed| matches!(probed, Probed::Core)))
             .then_some(TransactionDecision::Aborted)
     }
 
     /// The moment the entry stops being settleable and becomes the
-    /// shard's to abandon: the transaction's deadline, or for a delivery
-    /// the close of its window, past which the crossing it would claim
-    /// lapses and its issuer may reclaim it.
-    fn opens(&self) -> WeightedTimestamp {
-        if self.part.is_delivery() {
-            Window::Delivery.of(self.figures.deadline).end
-        } else {
-            self.figures.deadline.at()
-        }
+    /// shard's to abandon: the transaction's deadline. A delivery never
+    /// reaches this — the crossing it claims is owed to this shard and
+    /// nothing takes it back, so there is no instant at which giving up
+    /// on it would be right.
+    const fn opens(&self) -> WeightedTimestamp {
+        self.figures.deadline.at()
     }
 
     /// Where a tick may abandon the entry: from its opening, for the one
@@ -218,13 +215,16 @@ pub enum Part {
     /// verdict.
     Whole,
     /// This shard only delivers: a leg outside the core that bears no
-    /// verdict and issues nothing, admissible to the delivery window's
-    /// close, which is its deadline. Abandoned there like a whole entry
-    /// — and, unlike one, out of any tick still holding it, since past
-    /// the close the crossing it would claim lapses and its issuer may
-    /// reclaim it.
+    /// verdict and issues nothing. Never abandoned — the crossing it
+    /// claims is owed here from the moment the core committed it, and
+    /// no clock makes giving up on it right — so the entry stands until
+    /// its own finalization releases it, or until the horizon past
+    /// which the record it would claim can no longer be disposed of at
+    /// all.
     ///
-    /// Keeps the body and the classification its delivery runs under.
+    /// Keeps the body and the classification its delivery runs under,
+    /// so what the entry owes is stated on the entry rather than only
+    /// in the candidate waiting beside it.
     Delivery(Kept),
     /// A leg outside the core, held for the settlement of what it
     /// issued: never abandoned, probed past the deadline, released by
@@ -1120,15 +1120,6 @@ impl Ledger {
             .collect()
     }
 
-    /// Whether this shard only delivers for `tx_hash`, so no outcome of
-    /// its own bears the verdict and the lapse is what bounds it.
-    #[must_use]
-    pub(crate) fn is_delivery(&self, tx_hash: TxHash) -> bool {
-        self.owed
-            .get(&tx_hash)
-            .is_some_and(|owed| owed.part.is_delivery())
-    }
-
     /// Whether committed content has established that `tx_hash` can
     /// never settle — the question the split-boundary fence otherwise
     /// puts to a settled set that expires.
@@ -1372,12 +1363,14 @@ impl Ledger {
     ///
     /// A leg entry is never here: its tick attested it and its
     /// certificate settled alone, so there is nothing to abandon. What a
-    /// record licenses on one is a reclaim.
+    /// record licenses on one is a reclaim. Nor is a delivery: it owes
+    /// no verdict and abandoning it would give up a crossing that is
+    /// already this shard's.
     #[must_use]
     pub(crate) fn past_deadline(&self, now: WeightedTimestamp) -> Vec<UnsettledTx> {
         self.owed
             .iter()
-            .filter(|(_, owed)| !owed.part.is_leg())
+            .filter(|(_, owed)| !owed.part.is_leg() && !owed.part.is_delivery())
             .filter(|(_, owed)| {
                 let window = owed.abandon_window();
                 now >= window.start && (owed.covered() || now < window.end)
@@ -1441,8 +1434,10 @@ impl Ledger {
             // cell both its members are proved against is swept:
             // past it neither the reclaim nor the retirement can
             // be composed, whatever evidence lands. Short of it
-            // only the finalization that decides it ends it.
-            if owed.part.is_leg() || owed.absences().next().is_some() {
+            // only the finalization that decides it ends it. A
+            // delivery runs to the same horizon, which is where
+            // the record it would claim stops being disposable.
+            if owed.part.is_leg() || owed.part.is_delivery() || owed.absences().next().is_some() {
                 return Window::LegEntry.of(owed.figures.deadline).end > now;
             }
             if let Some(shard) = owed.departed_by {
@@ -2314,35 +2309,49 @@ mod tests {
         );
     }
 
-    /// A delivery-only entry runs on the delivery window's clock: not
-    /// abandoned at the transaction's deadline, abandoned at the window's
-    /// close if it never ran, released by its own finalization if it did,
-    /// and never a leg — nothing to reclaim, nothing to probe.
+    /// A delivery-only entry is on no clock: never abandoned, whatever
+    /// the reading, because the crossing it claims is this shard's from
+    /// the moment the core committed it and no instant makes giving it
+    /// up right. Released by its own finalization when it runs, dropped
+    /// at the horizon past which the record could not be disposed of
+    /// anyway, and never a leg — nothing to reclaim, nothing to probe.
     #[test]
-    fn a_delivery_entry_lives_to_the_windows_close() {
+    fn a_delivery_entry_is_never_abandoned() {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
         ledger.seed(tx.hash(), delivery_part(&tx));
-        assert!(ledger.is_delivery(tx.hash()));
-        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
-        let close = Window::Delivery.of(Deadline::of(ms(60_000))).end;
+        let deadline = Deadline::of(ms(60_000));
+        let horizon = Window::LegEntry.of(deadline).end;
 
-        assert!(
-            ledger.past_deadline(deadline).is_empty(),
-            "the transaction's deadline abandons no delivery"
-        );
+        for at in [
+            deadline.at(),
+            Window::Delivery.of(deadline).end,
+            horizon,
+            horizon.plus(MAX_VALIDITY_RANGE),
+        ] {
+            assert!(
+                ledger.past_deadline(at).is_empty(),
+                "no reading at {at:?} abandons a delivery"
+            );
+        }
         assert!(
             ledger.questions(&ShardTrie::uniform(1)).is_empty(),
             "and nothing probes for it"
         );
-        let abandonable = ledger.past_deadline(close);
+
         assert_eq!(
-            abandonable.len(),
-            1,
-            "the window's close abandons one never run"
+            ledger.prune(horizon.minus(Duration::from_millis(1))).len(),
+            0,
+            "short of the horizon it stands"
         );
-        assert_eq!(abandonable[0].tx_hash, tx.hash());
+        assert_eq!(ledger.len(), 1);
+        ledger.prune(horizon);
+        assert_eq!(
+            ledger.len(),
+            0,
+            "and goes where the record stops being disposable"
+        );
 
         let mut delivered = Ledger::new(LOCAL);
         commit(&mut delivered, &tx);

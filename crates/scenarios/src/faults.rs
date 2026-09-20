@@ -329,7 +329,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 
     await_halt_recovery(c, &halt);
 
-    let stranded = assert_deliveries_agree(c, halted, survivor, &probes, &at_freeze);
+    let owed = assert_deliveries_agree(c, halted, survivor, &probes, &at_freeze);
 
     // The recovered shard's cross-shard rail serves again: a fresh
     // transfer per direction settles on both chains and credits its
@@ -357,18 +357,17 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         revival_report(c, halted, survivor, &revived),
     );
 
-    assert_conserved_less_the_strand(c, &world, &charges, stranded);
+    assert_conserved_less_what_is_owed(c, &world, &charges, owed);
 }
 
-/// Two-sided conservation, less what the halt stranded: a survivor-paid
-/// delivery whose window closed while the recipient was frozen debited
-/// its payer and issued its record cell, and nothing claims it. Its
-/// payer reclaims it on a proof that the claim never landed, taken
-/// against the recipient's chain past the lapse — for as long as the
-/// claim cell that proof reads is still standing. A halt that ends
-/// inside that window gives everything back and the figure is zero; one
-/// that outruns it reaches a swept cell, and what it was owed strands
-/// with nobody able to dispose of it.
+/// Two-sided conservation, less what the halt left owed: a survivor-paid
+/// delivery the recipient was frozen through debited its payer and
+/// issued its record cell, and nothing has claimed it yet. Nothing
+/// takes it back either — the crossing is the recipient's — so the
+/// value sits in the record until the shard holding that prefix
+/// delivers it. A halt that ends while the delivery can still be
+/// admitted lands everything and the figure is zero; one that outruns
+/// that leaves the rest owed.
 ///
 /// The conservation equality reads the figure the chains give, not a
 /// bound. What is bounded is which probes may appear in it: the doomed
@@ -376,25 +375,25 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 /// each landing in whichever bucket it raced into — and nothing from the
 /// settling batch, which finalized on both children before any fault
 /// installed.
-fn assert_conserved_less_the_strand<C: Cluster>(
+fn assert_conserved_less_what_is_owed<C: Cluster>(
     c: &mut C,
     world: &World,
     charges: &Charges,
-    stranded: u128,
+    owed: u128,
 ) {
     assert!(
-        stranded <= 4 * STRADDLER_PAYMENT,
+        owed <= 4 * STRADDLER_PAYMENT,
         "only the doomed batch's two survivor-paid deliveries and the racing \
-         batch's two can strand; nothing from the settling batch can, having \
-         finalized on both children before any fault installed. stranded = {stranded}",
+         batch's two can be left owed; nothing from the settling batch can, having \
+         finalized on both children before any fault installed. owed = {owed}",
     );
     let balanced = c.run_until(epochs(8), |c| {
-        world.held(c) + charges.burned(c) + stranded == world.before()
+        world.held(c) + charges.burned(c) + owed == world.before()
     });
     assert!(
         balanced,
         "a halt and its recovery: the world held {} before and {} after, with {} burned \
-         and {stranded} stranded across the halt",
+         and {owed} still owed across the halt",
         world.before(),
         world.held(c),
         charges.burned(c),
@@ -462,12 +461,12 @@ struct Probe {
     /// The last instant a delivery of it is admissible: the signed
     /// window's end plus the delivery allowance past it.
     delivery_closes: WeightedTimestamp,
-    /// Where the claim cell the payer's reclaim is proved against is
-    /// swept, and so where an unclaimed crossing stops being
-    /// disposable at all: past it the claim reads absent because it was
-    /// swept rather than because it was never written, and neither
-    /// presence nor absence proves anything.
-    claim_closes: WeightedTimestamp,
+    /// Where the entry standing for its crossing runs to, and so the
+    /// last instant a delivery can still be admitted for it. Past this
+    /// whatever the record holds is owed for good: the record outlives
+    /// it — no arm of the sweep reaches one — but nothing is still
+    /// carrying the obligation.
+    owed_until: WeightedTimestamp,
 }
 
 /// Submit one straddler leg, recording what the assertions read back.
@@ -487,7 +486,7 @@ fn submit_probe<C: Cluster>(
         recipient: *to,
         records,
         delivery_closes: window.end_timestamp_exclusive.plus(MAX_VALIDITY_RANGE),
-        claim_closes: Window::LegEntry
+        owed_until: Window::LegEntry
             .of(Deadline::of(window.end_timestamp_exclusive))
             .end,
     }
@@ -538,8 +537,8 @@ fn credited_once<C: Cluster>(c: &C, probe: &Probe) -> bool {
 /// paid for committed nowhere. A survivor-paid probe whose delivery
 /// window is still open lands on the recovered shard.
 ///
-/// Returns what the halt stranded: the payments of every survivor-paid
-/// probe that accepted and whose delivery never landed.
+/// Returns what the halt left owed: the payments of every survivor-paid
+/// probe that accepted and whose delivery has not landed.
 ///
 /// `at_freeze` is the halted chain's own view taken before the recovery:
 /// a commit or an accept in either that snapshot or the post-recovery
@@ -636,13 +635,21 @@ fn assert_deliveries_agree<C: Cluster>(
         "the settling batch finalized on both children before any fault installed, \
          so nothing of it can strand; undelivered probes = {undelivered:?}",
     );
-    strand_left_by(c, probes, &undelivered)
+    owed_left_by(c, probes, &undelivered)
 }
 
-/// What the halt stranded, of the deliveries it left unlanded: the
-/// payments whose record cell is still standing when nothing can dispose
-/// of it any more.
-fn strand_left_by<C: Cluster>(c: &mut C, probes: &[Probe], undelivered: &[usize]) -> u128 {
+/// What the halt left owed, of the deliveries it did not land: the
+/// payments whose record cell is still standing.
+///
+/// A record is value, and value is not swept on a clock — no arm of the
+/// sweep reaches a record cell. Nor does anything take one back: a
+/// crossing an outbound leg consumes is owed to that consumer from the
+/// moment the core committed it, so a delivery the halt cost is a
+/// payment still to be made rather than one returned to its payer.
+/// Either the recovered shard delivers it and the recipient is
+/// credited, or the record stands for whoever holds that prefix to
+/// claim whenever it can.
+fn owed_left_by<C: Cluster>(c: &mut C, probes: &[Probe], undelivered: &[usize]) -> u128 {
     for &idx in undelivered {
         assert!(
             !probes[idx].records.is_empty(),
@@ -650,42 +657,30 @@ fn strand_left_by<C: Cluster>(c: &mut C, probes: &[Probe], undelivered: &[usize]
         );
     }
 
-    // A record is value, and value is not swept on a clock — no arm of
-    // the sweep reaches a record cell. What decides whether the payer
-    // gets its crossing back is the life of the claim cell the reclaim
-    // is proved against: inside it the absence is provable and the
-    // reclaim is licensed, past it the cell is swept and absence proves
-    // nothing, so the record stands with nobody able to dispose of it.
-    // Both fates are correct, and which one a halt reaches is how long
-    // it ran against that one window.
-    let taken_back = c.run_until(epochs(10), |c| {
+    // Give the recovered shard room to deliver what it can — until every
+    // record has gone, or until none of them can still be delivered —
+    // then read off the cells rather than inferring from balances or
+    // from the halt's length.
+    let _ = c.run_until(epochs(10), |c| {
         let now = WeightedTimestamp::ZERO.plus(c.now());
-        undelivered.iter().all(|&idx| {
-            let probe = &probes[idx];
-            now >= probe.claim_closes || !record_stands(c, probe)
-        })
+        undelivered
+            .iter()
+            .all(|&idx| now >= probes[idx].owed_until || !record_stands(c, &probes[idx]))
     });
-    assert!(
-        taken_back,
-        "a reclaim still licensed by the claim cell it is proved against commits, \
-         and the record it takes back goes",
-    );
-
-    // The strand is what is left: read off the cells rather than
-    // inferred from the balances or from the halt's length.
-    let stranded = undelivered
-        .iter()
-        .filter(|&&idx| record_stands(c, &probes[idx]))
-        .count();
     for &idx in undelivered {
         let probe = &probes[idx];
         assert!(
-            !record_stands(c, probe) || WeightedTimestamp::ZERO.plus(c.now()) >= probe.claim_closes,
-            "a record still standing is one nothing could dispose of: probe {idx} on {:?}",
+            record_stands(c, probe) || credited_once(c, probe),
+            "a record that went took its crossing to the recipient, never back to \
+             the payer: probe {idx} on {:?}",
             probe.payer_shard,
         );
     }
-    u128::try_from(stranded).expect("a handful of probes") * STRADDLER_PAYMENT
+    let owed = undelivered
+        .iter()
+        .filter(|&&idx| record_stands(c, &probes[idx]))
+        .count();
+    u128::try_from(owed).expect("a handful of probes") * STRADDLER_PAYMENT
 }
 
 /// Whether any crossing `probe` issued is still sitting in its record
@@ -723,9 +718,9 @@ fn fate_including_freeze<C: Cluster>(
 /// The probes the survivor accepted and the halted shard has not
 /// committed a delivery of, by index.
 ///
-/// Read twice: once to drive whatever is still inside its window onto
-/// the recovered shard, and once after, when what is left is what the
-/// halt stranded.
+/// Read twice: once to drive whatever can still be delivered onto the
+/// recovered shard, and once after, when what is left is what the halt
+/// left owed.
 fn undelivered_survivor_paid<C: Cluster>(
     c: &C,
     halted: ShardId,

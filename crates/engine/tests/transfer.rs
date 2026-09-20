@@ -1468,13 +1468,17 @@ fn a_transfer_executes_divided_on_both_shards() {
     );
 }
 
-/// A refused transfer's escrow comes back. The sender's shard runs the
-/// reclaim — no node, no nullifier, a declaration of its own over the
-/// record, the claim and the origin — and the vault is back at its
-/// pre-escrow balance exactly, read off the cell; the record goes with
-/// it, since the value it held is back where it left.
+/// A transfer's crossing is the recipient's, so a settlement that finds
+/// no claim releases rather than reclaims: nothing moves and the record
+/// stands, holding the value for whoever may still claim it.
+///
+/// The sender's shard runs the settlement all the same — no node, no
+/// nullifier, a declaration of its own over the record — and its own
+/// account closes on it. What it does not do is credit the crossing
+/// anywhere: an outbound leg consumes it, so no cell of the producing
+/// frame is the crossing's to return to.
 #[test]
-fn a_reclaim_restores_the_senders_vault_exactly() {
+fn a_delivered_crossings_settlement_releases_rather_than_reclaims() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
@@ -1531,7 +1535,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         "the escrow debited the vault"
     );
 
-    let reclaimed = run(
+    let released = run(
         &store,
         Runs::Settle {
             member: Member::whole(near_shard),
@@ -1540,23 +1544,23 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
             charged: true,
         },
     );
-    let ConsensusReceipt::Succeeded { writes, .. } = &reclaimed.consensus else {
-        panic!("the reclaim must succeed: {:?}", reclaimed.metadata);
+    let ConsensusReceipt::Succeeded { writes, .. } = &released.consensus else {
+        panic!("the settlement must succeed: {:?}", released.metadata);
     };
-    assert!(reclaimed.escrowed.is_empty(), "a reclaim issues nothing");
+    assert!(released.escrowed.is_empty(), "a settlement issues nothing");
     assert!(
-        reclaimed.fee_receipt.is_none(),
-        "the leg's own certificate settled the price; the reclaim owes none"
+        released.fee_receipt.is_none(),
+        "the leg's own certificate settled the price; the settlement owes none"
     );
     store.apply(writes);
     assert_eq!(
         store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
-        Some(encode_amount(1_000).to_vec()),
-        "and the reclaim restores it exactly"
+        Some(encode_amount(900).to_vec()),
+        "the vault stays debited: the crossing is the recipient's"
     );
     assert!(
-        store.cell(edge.record.key()).is_none(),
-        "the record goes with the value it held"
+        store.cell(edge.record.key()).is_some(),
+        "and the record stands, holding the value for whoever claims it"
     );
 }
 
@@ -1662,12 +1666,16 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
 }
 
 /// A record a shard inherited with a prefix decides itself, against the
-/// claim cell the record names: absent, the value goes back to the cell
-/// it left; present, the record is deleted and nothing moves.
+/// claim cell the record names and the recourse the record carries.
+/// Present, the record is deleted and nothing moves. Absent, this
+/// crossing names nobody to take it back — an outbound leg consumes
+/// it — so it is released: the record stands with its value, and the
+/// issuer's account closes on it either way.
 ///
 /// The member runs with no body at all, which is the point — a merge
 /// successor's store arrives as a prefix of leaves and its ledger begins
-/// empty, so the leaf is the whole of what a reclaim has to work from.
+/// empty, so the leaf is the whole of what a settlement has to work
+/// from, recourse included.
 #[test]
 #[allow(clippy::too_many_lines)] // one member over one fixture, in both its states
 fn an_inherited_record_decides_itself_against_its_claim() {
@@ -1753,11 +1761,11 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     )
     .expect("a record decodes");
     // The engine reads the claim cell alone; that the reading is taken
-    // inside the lapse, where an absence means something, is admission's
-    // business, and this clock sits inside it.
+    // where an absence means something is admission's business, and
+    // this clock sits short of the cell's own sweep.
     let inside = record.expiry_ms - 1;
     assert!(
-        Window::Lapse
+        Window::LegEntry
             .of(Deadline::from_expiry(record.expiry_ms))
             .contains(&WeightedTimestamp::from_millis(inside))
     );
@@ -1767,23 +1775,23 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     let mut claimed = MapDb(unclaimed.0.clone());
     claimed.0.insert(record.consumer_claim, vec![0xAA]);
 
-    let taken_back = settle(&unclaimed, inside);
-    let ConsensusReceipt::Succeeded { writes, .. } = &taken_back.consensus else {
-        panic!("the reclaim must succeed: {:?}", taken_back.metadata);
+    let released = settle(&unclaimed, inside);
+    let ConsensusReceipt::Succeeded { writes, .. } = &released.consensus else {
+        panic!("the settlement must succeed: {:?}", released.metadata);
     };
     assert!(
-        taken_back.fee_receipt.is_none(),
+        released.fee_receipt.is_none(),
         "the chain that issued the crossing settled the price before it ended"
     );
     unclaimed.apply(writes);
     assert_eq!(
         Substates::cell(&unclaimed, vault_key(alice(), *PROTOCOL_RESOURCE)),
-        Some(encode_amount(1_000).to_vec()),
-        "an unclaimed crossing returns to the cell it left"
+        Some(encode_amount(900).to_vec()),
+        "an unclaimed crossing an outbound leg consumes goes back nowhere"
     );
     assert!(
-        Substates::cell(&unclaimed, edge.record.key()).is_none(),
-        "and the record goes with it"
+        Substates::cell(&unclaimed, edge.record.key()).is_some(),
+        "and the record stands, holding it for whoever claims it"
     );
 
     let retired = settle(&claimed, inside);

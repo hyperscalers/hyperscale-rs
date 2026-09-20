@@ -1090,16 +1090,16 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Drop every delivering candidate the delivery window has closed
-    /// on, and what no candidate waits for any more.
+    /// Drop every delivering candidate the ledger no longer owes an
+    /// outcome for, and what no candidate waits for any more.
     ///
-    /// Past the close no tick can take the member, and a mixed shard's
-    /// delivering candidate is removed by nothing else — its ledger entry
-    /// is the leg's, and a leg is never abandoned. What was provisioned
-    /// belongs to the candidates waiting on it, and a mixed shard's
-    /// delivering member is one until its own tick takes it.
+    /// What was provisioned belongs to the candidates waiting on it, and
+    /// a mixed shard's delivering member is one until its own tick takes
+    /// it.
     fn sweep_candidates(&mut self) {
-        self.candidates.drop_closed_deliveries(self.committed_ts);
+        let ledger = &self.counterparts.ledger;
+        self.candidates
+            .drop_unowed_deliveries(|tx_hash| ledger.contains(tx_hash));
         let candidates = &self.candidates;
         self.provisioning
             .sweep(self.committed_ts, |tx_hash| candidates.contains(tx_hash));
@@ -1184,13 +1184,14 @@ impl ExecutionCoordinator {
     /// something in. Where it routes elsewhere the answer is the proof a
     /// block carried, folded before this composes.
     ///
-    /// The window is the lapse for every record, not the claim. A leaf
-    /// does not name its consumer's role, so a delivery-consumed record
-    /// read under the claim window would be judged absent one validity
-    /// range before its consumer could honestly have written the cell.
-    /// The lapse is the later of the two and is honest for both — and
-    /// past it no core shard of any arity can still commit, so the
-    /// silence is final however wide the core was.
+    /// The window runs from the close of [`Window::Core`] to the sweep
+    /// of the claim cell itself. A leaf does not name its consumer's
+    /// role, so nothing narrower is honest: only past the core's close
+    /// can no core shard of any arity still commit, whatever its arity
+    /// was, and past the sweep an absence is a swept cell rather than a
+    /// claim that never happened. Every record a delivery consumes is
+    /// already out of this path — it names nobody, and nobody takes it
+    /// back.
     fn admit_record_disposals(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1243,7 +1244,9 @@ impl ExecutionCoordinator {
                 // this cannot make.
                 Some(Licence::Claimed)
             } else if trie.shard_for_prefix(claim.owner) == local_shard
-                && Window::Lapse.of(record.deadline()).contains(&tick_ts)
+                && (Window::Core.of(record.deadline()).end
+                    ..Window::LegEntry.of(record.deadline()).end)
+                    .contains(&tick_ts)
             {
                 // This shard holds the cell, so the engine reads it
                 // against its own snapshot — the same licence, answered
@@ -3350,17 +3353,15 @@ impl ExecutionCoordinator {
                 if held_by.is_some_and(|tick| tick.abandons(tx_hash)) {
                     return false;
                 }
-                // Two fences refuse the finalization a tick is waiting to
-                // commit, and past either the tick has nothing left to
-                // say: a delivery's is refused at the lapse, and a
-                // success that decides alone at the deadline. Left to,
-                // such a tick holds a member nothing can resolve while
-                // every proposer offers a finalization every voter
-                // refuses. Which clock each runs on is already applied —
-                // an entry reaches here only past its own abandon
-                // window's opening.
+                // One fence refuses the finalization a tick is waiting
+                // to commit, and past it the tick has nothing left to
+                // say: a success that decides alone at the deadline.
+                // Left to, such a tick holds a member nothing can
+                // resolve while every proposer offers a finalization
+                // every voter refuses. Which clock it runs on is already
+                // applied — an entry reaches here only past its own
+                // abandon window's opening.
                 self.counterparts.ledger.is_covered(tx_hash)
-                    || self.counterparts.ledger.is_delivery(tx_hash)
                     || held_by.is_some_and(|tick| tick.decided_alone(tx_hash))
             }
             None => {
@@ -8826,13 +8827,14 @@ mod tests {
             && state.ticks.tick_assignment(tx_hash).is_some()
     }
 
-    /// A delivery that never claimed is probed at its lapse, the
-    /// deadline plus a validity range, and never at a header short of
-    /// it — the deadline itself included, where a core would already be
-    /// asked. The claim the chain carries is read with the lapse as its
-    /// floor, and licenses the reclaim.
+    /// A delivery that has not claimed is probed from its deadline, on
+    /// the same terms a core consumer's claim is. Its claim read absent
+    /// answers nothing and licenses nothing: the crossing is the
+    /// consumer's from the moment the core committed it, and it is the
+    /// consumer's still. The core's own committed cell is asked beside
+    /// it and answers as it always did.
     #[test]
-    fn a_silent_delivery_is_probed_past_the_lapse_and_its_lapse_offered() {
+    fn a_silent_deliverys_absent_claim_licenses_no_reclaim() {
         let schedule = delivery_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -8845,7 +8847,7 @@ mod tests {
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
-        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
+        let past_deadline = deadline.plus(MAX_VALIDITY_RANGE);
         let claim = delivered_claim(&delivery_classified());
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.counterparts.ledger.register_committed(
@@ -8858,7 +8860,7 @@ mod tests {
         let held: [(ShardId, u64, WeightedTimestamp, &[u8]); 3] = [
             (BEARER, 3, deadline, b"bearer"),
             (DELIVERER, 3, deadline, b"deadline"),
-            (DELIVERER, 4, lapse, b"at"),
+            (DELIVERER, 4, past_deadline, b"at"),
         ];
         for (shard, height, ts, tag) in held {
             state.proven_anchors().record(Anchor {
@@ -8869,12 +8871,12 @@ mod tests {
             });
             state.on_committed_remote_header(&schedule, shard);
         }
-        let later = lapse.plus(Duration::from_secs(1));
+        let later = past_deadline.plus(Duration::from_secs(1));
         let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, later, &[], &[claim]);
         let fetches = state_proof_fetches(&opened);
         assert!(
             fetches.contains(&(bundle.anchor, vec![claim])),
-            "the newest header inside the lapse window is the anchor, and the claim cell the key"
+            "the newest header past the deadline is the anchor, and the claim cell the key"
         );
         let core_cell = committed_tx_cell_key(
             BEARER,
@@ -8891,12 +8893,12 @@ mod tests {
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
             reading(&state, DELIVERER, tx_hash, claim),
-            Some(Inclusion::Absent),
-            "the lapse is read off the committed claim"
+            None,
+            "the committed claim absent says only that the delivery has not run"
         );
         assert!(
-            reclaim_admitted(&state, figures.tx_hash),
-            "and licenses the reclaim, with no record in between"
+            !reclaim_admitted(&state, figures.tx_hash),
+            "and licenses no reclaim: the crossing stays the consumer's"
         );
     }
 
@@ -8929,12 +8931,20 @@ mod tests {
             [(&transaction, &delivery_classified())],
         );
         state.counterparts.ledger.certify(tx_hash);
-        let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, later, &[], &[claim]);
+        let (bundle, opened) = proven_at(
+            &mut state,
+            &schedule,
+            DELIVERER,
+            5,
+            later,
+            &[claim],
+            &[claim],
+        );
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
         );
-        fetch_answers(&mut state, &bundle, &[]);
+        fetch_answers(&mut state, &bundle, &[claim]);
         assert_eq!(
             state.offers().state_claims,
             vec![bundle.clone()],
@@ -8979,18 +8989,32 @@ mod tests {
         );
         state.counterparts.ledger.certify(tx_hash);
 
-        let lapse = Window::Lapse
-            .of(Deadline::of_transaction(&transaction))
-            .start;
-        let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, lapse, &[], &[claim]);
+        let asked_from = Deadline::of_transaction(&transaction).at();
+        let (bundle, opened) = proven_at(
+            &mut state,
+            &schedule,
+            DELIVERER,
+            5,
+            asked_from,
+            &[claim],
+            &[claim],
+        );
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
             "the cell is asked about once",
         );
-        fetch_answers(&mut state, &bundle, &[]);
+        fetch_answers(&mut state, &bundle, &[claim]);
 
-        let (_, opened) = proven_at(&mut state, &schedule, DELIVERER, 6, lapse, &[], &[claim]);
+        let (_, opened) = proven_at(
+            &mut state,
+            &schedule,
+            DELIVERER,
+            6,
+            asked_from,
+            &[claim],
+            &[claim],
+        );
         assert!(
             state_proof_fetches(&opened).is_empty(),
             "and not again at a newer header, the answer being in hand",
@@ -9024,7 +9048,7 @@ mod tests {
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
-        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
+        let past_deadline = deadline.plus(MAX_VALIDITY_RANGE);
         // The delivery's target falls under the deliverer's left child,
         // as the trie cuts it.
         let claim = delivered_claim(&delivery_classified());
@@ -9042,10 +9066,10 @@ mod tests {
         state.counterparts.ledger.certify(tx_hash);
         // The local chain has crossed the deliverer's cut: its committee
         // is anchored in a window whose trie names the children.
-        state.committed_committee_anchor_wt = lapse;
+        state.committed_committee_anchor_wt = past_deadline;
 
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
-            [(3, deadline, b"short"), (4, lapse, b"at")];
+            [(3, deadline, b"short"), (4, past_deadline, b"at")];
         for (height, ts, tag) in held {
             state.proven_anchors().record(Anchor {
                 shard: successor,
@@ -9055,34 +9079,41 @@ mod tests {
             });
             state.on_committed_remote_header(&schedule, successor);
         }
-        let later = lapse.plus(Duration::from_secs(1));
+        let later = past_deadline.plus(Duration::from_secs(1));
         let (bundle, opened) = proven_at(&mut state, &schedule, successor, 5, later, &[], &[claim]);
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
-            "the successor's newest header inside the lapse window is the anchor, and the \
-             claim cell the key; the departed deliverer, with no header, is not asked"
+            "the successor's newest header past the deadline is the anchor, and the claim \
+             cell the key; the departed deliverer, with no header, is not asked"
         );
 
-        // A header of the departed deliverer past the lapse is asked as
-        // well.
-        let (peer_bundle, peer_opened) =
-            proven_at(&mut state, &schedule, DELIVERER, 6, lapse, &[], &[claim]);
+        // A header of the departed deliverer past the deadline is asked
+        // as well.
+        let (peer_bundle, peer_opened) = proven_at(
+            &mut state,
+            &schedule,
+            DELIVERER,
+            6,
+            past_deadline,
+            &[],
+            &[claim],
+        );
         assert_eq!(
             state_proof_fetches(&peer_opened),
             vec![(peer_bundle.anchor, vec![claim])],
-            "the shard that was to deliver is asked wherever it has a header past the lapse"
+            "the shard that was to deliver is asked wherever it has a header past the deadline"
         );
 
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
             reading(&state, successor, tx_hash, claim),
-            Some(Inclusion::Absent),
-            "the lapse is read off the successor's claim"
+            None,
+            "the successor's cell absent says only that the delivery has not run"
         );
         assert!(
-            reclaim_admitted(&state, figures.tx_hash),
-            "and licenses the reclaim"
+            !reclaim_admitted(&state, figures.tx_hash),
+            "and licenses nothing: the crossing is the consumer's whenever it runs"
         );
     }
 
@@ -9736,10 +9767,7 @@ mod tests {
             );
         }
         let deadline = Deadline::from_expiry(expiry_ms);
-        let read_at = Window::Lapse
-            .of(deadline)
-            .start
-            .plus(Duration::from_secs(1));
+        let read_at = Window::Core.of(deadline).end.plus(Duration::from_secs(1));
         state
             .counterparts
             .held
@@ -9778,9 +9806,10 @@ mod tests {
     /// that claim, proved.
     ///
     /// Present, the consumer holds the crossing and the record is
-    /// deleted; absent past the lapse, nobody took it and the value goes
-    /// back. Without this a shard skips such a record on every tick
-    /// forever: the value stands on its prefix with nothing naming it.
+    /// deleted; absent where an absence answers, nobody took it and the
+    /// value goes back. Without this a shard skips such a record on
+    /// every tick forever: the value stands on its prefix with nothing
+    /// naming it.
     #[test]
     fn a_held_record_is_decided_against_a_proof_of_its_claim() {
         assert!(
@@ -10249,21 +10278,19 @@ mod tests {
         );
     }
 
-    /// A delivery is abandoned at its window's close out of any tick
-    /// still holding it: past the close its issuer may prove the claim
-    /// absent and take the crossing back, so the tick that would write
-    /// the claim is discarded, its finalization with it.
+    /// A delivery held by a tick is left to it, whatever the clock
+    /// reads. The crossing it claims is this shard's from the moment the
+    /// core committed it and nobody takes it back, so there is no
+    /// instant at which discarding the tick that would write the claim
+    /// is right — and no abandonment for a member that bears no verdict.
     #[test]
-    fn a_delivery_held_by_a_tick_is_abandoned_at_the_close() {
+    fn a_delivery_held_by_a_tick_is_never_abandoned_out_of_it() {
         let schedule = make_test_topology();
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
         let validity_end = tx.validity_range().end_timestamp_exclusive;
-        let close_ms = Window::Delivery
-            .of(Deadline::of(validity_end))
-            .end
-            .as_millis();
+        let deadline = Deadline::of(validity_end);
 
         state.on_block_committed(
             &schedule,
@@ -10282,24 +10309,31 @@ mod tests {
         let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
 
-        let outcomes = abandonment_vote(&mut state, &schedule, 2, close_ms - 1);
-        assert!(
-            outcomes.is_empty(),
-            "inside the window the tick is left to it"
-        );
-        assert!(state.ticks.contains_tick(&held_by));
-
-        let outcomes = abandonment_vote(&mut state, &schedule, 3, close_ms);
-        assert!(
-            outcomes
-                .iter()
-                .any(|outcome| outcome.tx_hash() == tx_hash && outcome.decides()),
-            "at the close the delivery is abandoned: {outcomes:?}"
-        );
-        assert!(
-            !state.ticks.contains_tick(&held_by),
-            "and the tick that held it is discarded"
-        );
+        // The deadline, what used to close the delivery window, and the
+        // last moment short of the horizon the entry itself runs to.
+        let readings = [
+            deadline.at(),
+            validity_end.plus(MAX_VALIDITY_RANGE),
+            Window::LegEntry
+                .of(deadline)
+                .end
+                .minus(Duration::from_millis(1)),
+        ];
+        for (height, at) in (2u64..).zip(readings) {
+            let outcomes = abandonment_vote(&mut state, &schedule, height, at.as_millis());
+            assert!(
+                !outcomes
+                    .iter()
+                    .any(|outcome| outcome.tx_hash() == tx_hash && outcome.decides()),
+                "nothing abandons the delivery at {at:?}: {outcomes:?}"
+            );
+            if at <= validity_end.plus(MAX_VALIDITY_RANGE) {
+                assert!(
+                    state.ticks.contains_tick(&held_by),
+                    "and the tick that holds it is its own to finish at {at:?}"
+                );
+            }
+        }
     }
 
     /// Before its deadline a transaction is merely slow, and nothing

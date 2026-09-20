@@ -37,8 +37,8 @@ use hyperscale_types::{
     Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
     UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, Window, WitnessSources, absorb_committed_cells,
-    commit_witness_window, derive_leaves, fees_over_certificates, local_settled_tx_hashes,
+    VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
+    derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
     signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
@@ -797,10 +797,8 @@ where
         Action::VerifyResolutions {
             block_hash,
             entries,
-            deliveries,
             successes,
             anchor,
-            trie,
             windows,
         } => {
             // A resolution names a transaction committed before it — a
@@ -812,7 +810,6 @@ where
             let hashes: Vec<TxHash> = entries
                 .iter()
                 .map(|entry| entry.tx_hash)
-                .chain(deliveries.iter().copied())
                 .chain(successes.iter().copied())
                 .collect();
             let derivation = ctx.executor.derivation();
@@ -856,17 +853,6 @@ where
                     ) == *entry;
                 Some(restated)
             })
-            .and_deliveries(deliveries, |tx_hash| {
-                // A finalization resolving a name it does not decide is a
-                // leg's or a delivery's; only a delivery here is held to
-                // the lapse, and a body this shard delivers for is one
-                // frozen divided with this shard delivering.
-                held.get(&tx_hash).map(|tx| {
-                    Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie)
-                        .only_delivers_at(ctx.shard)
-                        && anchor >= Window::Lapse.of(Deadline::of_transaction(tx)).start
-                })
-            })
             .and_successes(successes, |tx_hash| {
                 // A success at or past the deadline is one a leg may
                 // already have reclaimed against. That the members held
@@ -875,10 +861,9 @@ where
                 held.get(&tx_hash)
                     .map(|tx| Deadline::of_transaction(tx).passed(anchor))
             });
-            // An exact answer passes; a wrong figure, a lapsed delivery
-            // or an overdue success refuses the block; a name this
-            // validator's store never held is neither — the check waits
-            // for the body.
+            // An exact answer passes; a wrong figure or an overdue
+            // success refuses the block; a name this validator's store
+            // never held is neither — the check waits for the body.
             let outcome = match verdict {
                 Resolutions::Exact => CheckOutcome::Checked { bytes_delta: 0 },
                 Resolutions::Wrong(tx_hash) => {
@@ -886,14 +871,6 @@ where
                         ?block_hash,
                         ?tx_hash,
                         "Resolutions verification FAILED: a record misstates a figure"
-                    );
-                    CheckOutcome::Refused
-                }
-                Resolutions::Lapsed(tx_hash) => {
-                    tracing::warn!(
-                        ?block_hash,
-                        ?tx_hash,
-                        "Resolutions verification FAILED: a finalization delivers past the lapse"
                     );
                     CheckOutcome::Refused
                 }
@@ -1639,6 +1616,7 @@ mod tests {
         BeaconBlockHash, BeaconChainConfig, BeaconState, CertificateRoot, CertifiedBeaconBlock,
         CommittedAt, LocalReceiptRoot, PriceTable, ProposerTimestamp, ProvisionsRoot,
         ShardCommittee, Signer, StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
+        Window,
     };
 
     use super::*;

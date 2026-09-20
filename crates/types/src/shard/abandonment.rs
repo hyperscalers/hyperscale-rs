@@ -255,24 +255,19 @@ impl UnsettledTx {
 ///
 /// The voter's answer, read off committed bodies and blocks. A
 /// validator whose store holds a transaction and the block a name says
-/// committed it answers for it — a figure exactly or wrongly, a
-/// delivery inside its window or past the lapse, a success inside its
-/// deadline or past it — and one whose store never held them, having
+/// committed it answers for it — a figure exactly or wrongly, a success
+/// inside its deadline or past it — and one whose store never held them,
+/// having
 /// synced past the block, cannot say, which is a third answer and not a
 /// pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolutions {
-    /// Every figure of every name is the one its transaction fixes, no
-    /// delivery has lapsed, and no success is overdue.
+    /// Every figure of every name is the one its transaction fixes and
+    /// no success is overdue.
     Exact,
     /// A figure of this name differs from the one its transaction fixes:
     /// the block is refused.
     Wrong(TxHash),
-    /// A finalization delivers a crossing of this transaction at an
-    /// anchor at or past its lapse, where its issuer may already have
-    /// proved the claim absent and taken the crossing back: the block is
-    /// refused.
-    Lapsed(TxHash),
     /// A finalization decides this transaction with success, by its own
     /// execution, at an anchor at or past its deadline, where a leg that
     /// issued for it may already have read the claim absent and taken
@@ -311,27 +306,13 @@ impl Resolutions {
         unknown.map_or(Self::Exact, Self::Unknown)
     }
 
-    /// This answer folded with the deliveries the block's finalizations
-    /// carry, `lapsed` saying whether each has lapsed at the block's
-    /// anchor, `None` for one this validator does not hold.
-    ///
-    /// A refusal answers over a deferral: a block carrying a lapsed
-    /// delivery is refused whatever else this validator cannot say.
-    #[must_use]
-    pub fn and_deliveries(
-        self,
-        deliveries: impl IntoIterator<Item = TxHash>,
-        lapsed: impl Fn(TxHash) -> Option<bool>,
-    ) -> Self {
-        self.and_each(deliveries, lapsed, Self::Lapsed)
-    }
-
     /// This answer folded with the successes the block's finalizations
     /// decide for members that await nobody, `overdue` saying whether
     /// each sits at or past its deadline at the block's anchor, `None`
     /// for one this validator does not hold.
     ///
-    /// A refusal answers over a deferral, as a lapsed delivery does.
+    /// A refusal answers over a deferral: a block carrying an overdue
+    /// success is refused whatever else this validator cannot say.
     #[must_use]
     pub fn and_successes(
         self,
@@ -352,7 +333,7 @@ impl Resolutions {
         refuse: fn(TxHash) -> Self,
     ) -> Self {
         let mut unknown = match self {
-            Self::Wrong(_) | Self::Lapsed(_) | Self::Overdue(_) => return self,
+            Self::Wrong(_) | Self::Overdue(_) => return self,
             Self::Unknown(tx_hash) => Some(tx_hash),
             Self::Exact => None,
         };
@@ -683,25 +664,6 @@ mod tests {
             }
         };
         assert_eq!(
-            Resolutions::Exact.and_deliveries([tx(1).tx_hash], lapsed),
-            Resolutions::Exact
-        );
-        assert_eq!(
-            Resolutions::Exact.and_deliveries([tx(2).tx_hash], lapsed),
-            Resolutions::Unknown(tx(2).tx_hash)
-        );
-        assert_eq!(
-            Resolutions::Unknown(tx(2).tx_hash).and_deliveries([tx(3).tx_hash], lapsed),
-            Resolutions::Lapsed(tx(3).tx_hash)
-        );
-        assert_eq!(
-            Resolutions::Wrong(tx(1).tx_hash).and_deliveries([tx(3).tx_hash], lapsed),
-            Resolutions::Wrong(tx(1).tx_hash)
-        );
-
-        // Successes fold the same way, and a refusal already reached
-        // stands over one: the first refusal is the answer.
-        assert_eq!(
             Resolutions::Exact.and_successes([tx(1).tx_hash], lapsed),
             Resolutions::Exact
         );
@@ -714,12 +676,8 @@ mod tests {
             Resolutions::Overdue(tx(3).tx_hash)
         );
         assert_eq!(
-            Resolutions::Lapsed(tx(1).tx_hash).and_successes([tx(3).tx_hash], lapsed),
-            Resolutions::Lapsed(tx(1).tx_hash)
-        );
-        assert_eq!(
-            Resolutions::Overdue(tx(3).tx_hash).and_deliveries([tx(3).tx_hash], lapsed),
-            Resolutions::Overdue(tx(3).tx_hash)
+            Resolutions::Wrong(tx(1).tx_hash).and_successes([tx(3).tx_hash], lapsed),
+            Resolutions::Wrong(tx(1).tx_hash)
         );
     }
 

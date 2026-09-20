@@ -24,8 +24,8 @@ use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs};
 use hyperscale_types::network::response::{GetProvisionResponse, GetStateProofResponse};
 use hyperscale_types::{
-    Deadline, MerkleInclusionProof, Provisions, ShardId, TransactionDecision, TransactionStatus,
-    WeightedTimestamp, Window,
+    Deadline, MAX_VALIDITY_RANGE, MerkleInclusionProof, Provisions, ShardId, TransactionDecision,
+    TransactionStatus, WeightedTimestamp,
 };
 use support::SimCluster;
 
@@ -114,8 +114,10 @@ fn a_forged_state_proof_convinces_nobody() {
             })
             .collect();
 
-        // The bundle never reaches the recipient, so the delivery lapses
-        // and the payer asks the recipient's chain about the claim cell.
+        // The bundle does not reach the recipient while the cut stands,
+        // so the delivery has not claimed and the payer goes on asking
+        // the recipient's chain about the claim cell — which is the
+        // state-proof fetch this attacks.
         let broadcast_dropped = c.drop_type("provisions.broadcast");
         let fetch_dropped = c.drop_type("provision.request");
 
@@ -139,33 +141,24 @@ fn a_forged_state_proof_convinces_nobody() {
             "the leg pays the payment and the price",
         );
 
-        let lapse = Window::Lapse
-            .of(Deadline::of(validity.end_timestamp_exclusive))
-            .start;
+        let asking = Deadline::of(validity.end_timestamp_exclusive)
+            .at()
+            .plus(MAX_VALIDITY_RANGE);
         assert!(
             c.run_until(epochs(12), |c| WeightedTimestamp::ZERO.plus(c.now())
-                >= lapse),
-            "the cut must stand past the lapse",
+                >= asking),
+            "the cut must stand while the payer is asking about the claim",
         );
         assert!(
             broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
             "both bundle channels must actually have been exercised and cut",
         );
-
-        // The reclaim lands on an honest peer's proof.
-        assert!(
-            c.run_until(epochs(10), |c| vault_balance(c, payer_shard, from)
-                == before - price),
-            "the payment must come back on a proof the checks accept; holds {}",
-            vault_balance(c, payer_shard, from),
-        );
         assert!(
             forged.iter().any(|handle| handle.fired() > 0),
             "the forgery has to have been served, or nothing was attacked",
         );
-        // What the reclaim landing shows is a value arriving, which an
-        // unattacked run shows too. The refusal is the defence itself,
-        // and the reason is what says which check did the refusing.
+        // The refusal is the defence itself, and the reason is what says
+        // which check did the refusing.
         assert!(
             c.metric(
                 "fetch_responses_refused",
@@ -173,10 +166,21 @@ fn a_forged_state_proof_convinces_nobody() {
             ) > refused_before,
             "no state-proof answer was refused on its proof, so the reconstruction never ran",
         );
-        assert_eq!(
+
+        // And the shard makes progress past the attack: with the bundle
+        // flowing again the delivery lands and the recipient is paid,
+        // which is where the crossing was owed all along.
+        c.clear_drops();
+        assert!(
+            c.run_until(epochs(12), |c| vault_balance(c, recipient_shard, to)
+                == recipient_before + 100),
+            "the recipient must be paid once the bundle can reach it; holds {}",
             vault_balance(c, recipient_shard, to),
-            recipient_before,
-            "the recipient was never credited",
+        );
+        assert_eq!(
+            vault_balance(c, payer_shard, from),
+            before - 100 - price,
+            "and nothing took the crossing back on the way",
         );
     });
 }

@@ -18,8 +18,8 @@ use hyperscale_core::{Action, FetchIds, ProtocolEvent};
 use hyperscale_storage::CommittedProvisions;
 use hyperscale_types::{
     BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CompletedRecovery, ForkFence,
-    LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardId,
-    TopologySchedule, Verified, WeightedTimestamp,
+    LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, ShardId,
+    TRANSACTION_EVIDENCE_HORIZON, TopologySchedule, Verified, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -296,14 +296,17 @@ impl ProvisionCoordinator {
         let committed: std::collections::HashSet<ProvisionHash> =
             manifest.provision_hashes().iter().copied().collect();
         self.queue.on_block_committed(&committed);
-        // Single retention cutoff for the orphan sweep — `local_ts -
-        // RETENTION_HORIZON` is the conservative point past which any
-        // expectation is provably useless on every shard.
-        let retention_cutoff = local_ts.minus(RETENTION_HORIZON);
+        // Single retention cutoff for the orphan sweep. A crossing an
+        // outbound leg consumes is owed to that consumer until it
+        // claims, so a bundle carrying one is wanted for as long as the
+        // transaction's evidence stands anywhere — which is the span
+        // the source shard retains the block behind it for, and so the
+        // span in which the fetch can still be answered.
+        let retention_cutoff = local_ts.minus(TRANSACTION_EVIDENCE_HORIZON);
 
         // Drop truly orphaned expectations (and their headers) whose
-        // fallback fetch never resolved within `RETENTION_HORIZON`. Under
-        // normal operation a header is retained exactly while its provisions
+        // fallback fetch never resolved inside that span. Under normal
+        // operation a header is retained exactly while its provisions
         // are outstanding; this only catches entries that would otherwise
         // leak indefinitely. Each dropped key emits an `AbandonFetch` so
         // the io_loop's `ProvisionBinding` clears the matching in-flight.
@@ -1022,9 +1025,9 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
         MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
-        ProvisionTxRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
-        TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable, WeightedTimestamp,
-        WitnessSources, compute_merkle_root,
+        ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
+        StateRoot, TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable,
+        WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -2667,8 +2670,10 @@ mod tests {
         // The orphan sweep keys on the source block's weighted timestamp.
         // This synthetic header carries a genesis (zero) parent-QC timestamp,
         // so the entry ages out the first commit whose retention cutoff goes
-        // positive — i.e. once the local clock passes RETENTION_HORIZON.
-        let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
+        // positive — i.e. once the local clock passes the span an owed
+        // crossing's bundle is still wanted in.
+        let orphan_cutoff_blocks = u64::try_from(TRANSACTION_EVIDENCE_HORIZON.as_millis())
+            .unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
 
         // Walk up to (but not past) the orphan cutoff — no Abandon yet.
@@ -2715,7 +2720,8 @@ mod tests {
 
         // Advance local well past any old time-based cutoff but short of the
         // orphan threshold. Header stays because its provisions hasn't verified yet.
-        let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
+        let orphan_cutoff_blocks = u64::try_from(TRANSACTION_EVIDENCE_HORIZON.as_millis())
+            .unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
         for h in 1..=(orphan_cutoff_blocks / 2) {
             coordinator.on_block_committed(&sched(), &make_block(BlockHeight::new(h)));
@@ -2794,8 +2800,10 @@ mod tests {
         // Not yet past the orphan cutoff — still retained. The sweep keys on
         // the source block's weighted timestamp, which for this synthetic
         // header is the genesis (zero) parent-QC timestamp, so the entry ages
-        // out once the local clock first passes RETENTION_HORIZON.
-        let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
+        // out once the local clock first passes the span an owed crossing's
+        // bundle is still wanted in.
+        let orphan_cutoff_blocks = u64::try_from(TRANSACTION_EVIDENCE_HORIZON.as_millis())
+            .unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
         for h in 2..=orphan_cutoff_blocks {
             coordinator.on_block_committed(&sched(), &make_block(BlockHeight::new(h)));

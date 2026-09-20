@@ -20,7 +20,9 @@ use hyperscale_types::{
     TransactionStatus, TxHash,
 };
 
-use super::query::{MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at};
+use super::query::{
+    MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at, owed_at,
+};
 use super::tx::{recipient, sender};
 use super::{Budget, Cluster};
 
@@ -52,6 +54,12 @@ pub struct World {
     resource: ResourceAddr,
     holders: Vec<Address>,
     cells: Vec<SubstateKey>,
+    /// Record cells a scenario's crossings may leave standing. A
+    /// crossing an outbound leg consumes is owed to that consumer until
+    /// it claims, so its value sits in the record rather than in any
+    /// account — held, not stranded, and counted here so the two sides
+    /// still balance.
+    owed: Vec<SubstateKey>,
     before: u128,
 }
 
@@ -74,6 +82,7 @@ impl World {
             resource,
             holders: holders.into_iter().collect(),
             cells: cells.into_iter().collect(),
+            owed: Vec::new(),
             before: 0,
         };
         world.before = world.held(c);
@@ -91,6 +100,18 @@ impl World {
         self.before
     }
 
+    /// Count the crossings `records` may leave standing as value the
+    /// world still holds.
+    ///
+    /// Registered after submission rather than at [`Self::open`],
+    /// because a record cell's key is derived from the transaction and
+    /// the value only reaches it once the producing leg runs. A key
+    /// whose record never stands reads zero, so registering one costs
+    /// nothing.
+    pub fn owing(&mut self, records: impl IntoIterator<Item = SubstateKey>) {
+        self.owed.extend(records);
+    }
+
     /// What the world sums to now.
     #[must_use]
     pub fn held<C: Cluster + ?Sized>(&self, c: &C) -> u128 {
@@ -98,9 +119,13 @@ impl World {
             .holders
             .iter()
             .fold(0u128, |sum, owner| sum + held(c, *owner, self.resource));
-        self.cells
+        let cells = self
+            .cells
             .iter()
-            .fold(vaults, |sum, cell| sum + held_at(c, *cell))
+            .fold(vaults, |sum, cell| sum + held_at(c, *cell));
+        self.owed.iter().fold(cells, |sum, record| {
+            sum + owed_at(c, *record, self.resource)
+        })
     }
 
     /// Whether what the world holds now, plus what `burned` accounts for,

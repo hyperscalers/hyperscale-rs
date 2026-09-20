@@ -14,7 +14,8 @@ use crate::state_key::jmt_value_hash;
 use crate::{
     BlockHeight, CertifiedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
     ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardId, StateProofError, SubstateEntry,
-    SubstateKey, TxHash, Verified, Verify, WeightedTimestamp,
+    SubstateKey, TRANSACTION_EVIDENCE_HORIZON, TxHash, Verified, Verify, WeightedTimestamp,
+    protocol_statics, protocol_statics_installed,
 };
 
 /// All provisions from a single source block, scoped to a single target shard.
@@ -50,6 +51,14 @@ pub struct Provisions {
     /// Populated on first [`Self::hash`] call; not on the wire.
     #[hbor(skip)]
     hash: OnceLock<ProvisionHash>,
+
+    /// Whether any entry is a crossing record, which decides how long
+    /// the bundle is wanted. Lazily computed like the hash and for the
+    /// same reason: [`Self::deadline`] is read inside the per-commit
+    /// sweeps over every bundle held, and the answer is a property of
+    /// content that never changes. Not on the wire.
+    #[hbor(skip)]
+    carries_record: OnceLock<bool>,
 }
 
 impl Debug for Provisions {
@@ -70,6 +79,10 @@ impl Clone for Provisions {
         if let Some(h) = self.hash.get() {
             let _ = cloned_hash.set(*h);
         }
+        let cloned_carries = OnceLock::new();
+        if let Some(carries) = self.carries_record.get() {
+            let _ = cloned_carries.set(*carries);
+        }
         Self {
             source_shard: self.source_shard,
             target_shard: self.target_shard,
@@ -78,6 +91,7 @@ impl Clone for Provisions {
             proof: self.proof.clone(),
             transactions: self.transactions.clone(),
             hash: cloned_hash,
+            carries_record: cloned_carries,
         }
     }
 }
@@ -111,6 +125,7 @@ impl Provisions {
             proof,
             transactions,
             hash: OnceLock::new(),
+            carries_record: OnceLock::new(),
         }
     }
 
@@ -172,12 +187,54 @@ impl Provisions {
     /// `source_weighted_ts` is the source block's QC `weighted_timestamp`,
     /// available from the paired remote header. Past
     /// `source_weighted_ts + RETENTION_HORIZON` every tx that could have
-    /// referenced this data has expired its `validity_range` and
+    /// referenced a read set has expired its `validity_range` and
     /// completed (or aborted via the all-abort fallback) — no shard can
-    /// still reference these provisions.
+    /// still reference such provisions.
+    ///
+    /// A crossing record is the exception, and the reason is that a
+    /// crossing an outbound leg consumes is owed to that consumer until
+    /// it claims: the transaction terminating on the producing side
+    /// settles nothing about the delivery, which may still run. A bundle
+    /// carrying one lives as long as the transaction's evidence stands
+    /// anywhere, which is the span its source shard keeps the block
+    /// behind it for.
+    ///
+    /// A function of the bundle's own bytes, so every node holding it
+    /// reads the same deadline off it.
     #[must_use]
     pub fn deadline(&self, source_weighted_ts: WeightedTimestamp) -> WeightedTimestamp {
-        source_weighted_ts.plus(RETENTION_HORIZON)
+        if self.carries_record() {
+            source_weighted_ts.plus(TRANSACTION_EVIDENCE_HORIZON)
+        } else {
+            source_weighted_ts.plus(RETENTION_HORIZON)
+        }
+    }
+
+    /// Whether any entry is a crossing record — value a shard holds for
+    /// a crossing it issued, which its consumer may claim long after
+    /// every read set here has gone stale.
+    fn carries_record(&self) -> bool {
+        if let Some(cached) = self.carries_record.get() {
+            return *cached;
+        }
+        // Without the protocol answers installed nothing identifies a
+        // record, and caching that would outlive the installation.
+        if !protocol_statics_installed() {
+            return false;
+        }
+        *self.carries_record.get_or_init(|| {
+            self.transactions.iter().any(|tx| {
+                tx.entries.iter().any(|entry| {
+                    entry.value.as_ref().is_some_and(|value| {
+                        protocol_statics().record_cell(
+                            entry.key.owner.to_bytes(),
+                            entry.key.local.0,
+                            value.as_ref(),
+                        )
+                    })
+                })
+            })
+        })
     }
 
     fn compute_hash(

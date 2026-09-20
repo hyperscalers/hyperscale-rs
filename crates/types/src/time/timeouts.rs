@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use hyperscale_vm_types::{ARTIFACT_GRACE_MS, COMMITTED_GRACE_MS, CROSSING_GRACE_MS};
 
-use crate::{CLAIM_WINDOW, MAX_VALIDITY_RANGE, TERMINAL_EVIDENCE_EPOCHS};
+use crate::{
+    CLAIM_WINDOW, MAX_VALIDITY_RANGE, TERMINAL_EVIDENCE_EPOCHS, TRANSACTION_EVIDENCE_HORIZON,
+};
 
 /// The longest a cross-shard transaction may take to finalize, past the
 /// last block that could have included it.
@@ -75,13 +77,15 @@ pub const RETENTION_HORIZON: Duration =
 /// How far back a chain is folded to rebuild the committed-artifact
 /// dedup window.
 ///
-/// The widest of the index's tiers. A transaction is held to the close of
-/// its delivery window — one [`MAX_VALIDITY_RANGE`] past a validity end
-/// that may itself sit a whole range past the block that committed it —
-/// so an entry still live can come from a block two ranges back. The
-/// resolution and provision tiers are keyed at most
-/// [`RETENTION_HORIZON`] past their own block, which this covers.
-pub const DEDUP_WINDOW: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
+/// The widest of the index's tiers. A transaction is held to the close
+/// of its delivery window, which is the expiry the record a delivery
+/// consumes states — one [`CLAIM_WINDOW`] past a deadline that may itself sit a
+/// whole [`MAX_VALIDITY_RANGE`] past the block that committed it. That
+/// is the transaction's own evidence horizon measured from its commit,
+/// so the walk is exactly it. The resolution and provision tiers are
+/// keyed at most [`RETENTION_HORIZON`] past their own block, which this
+/// covers.
+pub const DEDUP_WINDOW: Duration = TRANSACTION_EVIDENCE_HORIZON;
 
 const _: () = assert!(
     DEDUP_WINDOW.as_secs() >= RETENTION_HORIZON.as_secs(),
@@ -98,16 +102,15 @@ const _: () = assert!(
 /// that. So a hold still engaged can come from a block that far back, and
 /// the walk has to reach it or the ledger it seeds under-counts.
 ///
-/// Deeper than [`DEDUP_WINDOW`] by exactly [`MAX_FINALIZATION_DELAY`],
-/// which is the term the dedup tiers' arithmetic does not carry: their
-/// deepest entry is a delivery window past a validity end, where this one
-/// is a settlement window past it. The two walks share a descent and each
-/// tier stops at its own floor.
+/// Shallower than [`DEDUP_WINDOW`], whose deepest entry stands to the
+/// sweep of a crossing record where a hold ends one settlement window
+/// past its transaction's. The two walks share a descent and each tier
+/// stops at its own floor.
 pub const FEE_HOLD_WINDOW: Duration =
     Duration::from_secs(RETENTION_HORIZON.as_secs() + MAX_VALIDITY_RANGE.as_secs());
 
 const _: () = assert!(
-    FEE_HOLD_WINDOW.as_secs() >= DEDUP_WINDOW.as_secs(),
+    DEDUP_WINDOW.as_secs() >= FEE_HOLD_WINDOW.as_secs(),
     "the recovery descent is floored at the deepest tier it seeds",
 );
 

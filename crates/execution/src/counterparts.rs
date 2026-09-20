@@ -23,13 +23,27 @@ use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
     MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie,
-    Spoken, StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision,
-    TxHash, TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
+    MerkleInclusionProof, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie, Spoken,
+    StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
+    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::CrossingCell;
 
 use crate::ledger::{Ledger, Question, Unanswerable};
+
+/// Whether an absence of a held record's claim, taken at `probed_wt`,
+/// says nobody took the crossing.
+///
+/// From the close of [`Window::Core`], where no core shard of any arity
+/// can still commit, to the sweep of the claim cell itself, past which
+/// an absence is a swept cell rather than a claim that never happened.
+/// A leaf does not name its consumer's role, so nothing narrower is
+/// honest for every record this reads. A record a delivery consumes
+/// never reaches the disposal an absence licenses: it names nobody to
+/// take it back, and nobody does.
+fn held_absence_answers(probed_wt: WeightedTimestamp, deadline: Deadline) -> bool {
+    (Window::Core.of(deadline).end..Window::LegEntry.of(deadline).end).contains(&probed_wt)
+}
 
 /// What one block's abandonment records may still spend.
 ///
@@ -660,13 +674,11 @@ impl Counterparts {
     /// Read a committed proof against the claims the held records
     /// are waiting on.
     ///
-    /// Judged by the same per-word rule the ledger's cells are: a
-    /// presence answers wherever it was taken, since the claim cell is
-    /// written by the consuming execution and by nothing else; an
-    /// absence answers only inside the window it means something in,
-    /// which for a record whose consumer's role the leaf does not name
-    /// is the lapse — past it no core of any arity can still commit, so
-    /// the silence is final.
+    /// A presence answers wherever it was taken, since the claim cell is
+    /// written by the consuming execution and by nothing else. An
+    /// absence answers only inside [`held_absence_answers`], which is
+    /// where a leaf that does not name its consumer's role can read one
+    /// honestly.
     fn fold_held(&mut self, stated: &StateClaim, trie: &ShardTrie) {
         for record in self.held.values_mut() {
             if record.answer.is_some() {
@@ -679,11 +691,11 @@ impl Counterparts {
             let Some(inclusion) = stated.reading(claim) else {
                 continue;
             };
-            let Some(inclusion) =
-                Probed::Delivery.answer(stated.anchor.ts, record.deadline(), inclusion)
-            else {
+            if matches!(inclusion, Inclusion::Absent)
+                && !held_absence_answers(stated.anchor.ts, record.deadline())
+            {
                 continue;
-            };
+            }
             record.answer = Some(inclusion);
         }
     }

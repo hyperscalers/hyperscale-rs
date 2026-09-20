@@ -983,7 +983,7 @@ impl VerificationPipeline {
     /// check. The handler reads each named transaction off the store and
     /// answers with a [`Resolutions`](hyperscale_types::Resolutions), which
     /// the coordinator folds into the pipeline: exact verifies, wrong or
-    /// lapsed refuses, and unknown leaves the root in flight — the vote
+    /// overdue refuses, and unknown leaves the root in flight — the vote
     /// deferred, the block pending.
     pub(crate) fn initiate_resolutions_verification(
         &mut self,
@@ -992,37 +992,30 @@ impl VerificationPipeline {
         schedule: &TopologySchedule,
     ) -> Vec<Action> {
         let anchor = block.header().parent_qc().weighted_timestamp();
-        // No window, no check: the mark is not taken and no action goes
-        // out, so the block stays pending and the next re-drive asks
-        // again — the same shape an unknown name takes. A stand-in would
-        // not be a neutral answer: under one shard every prefix resolves
-        // to it, so no body classifies as delivering here, no delivery
-        // is ever read as lapsed, and the block passes the arm the
-        // abandonment fence rests on — a permissive answer to the
-        // question that keeps a crossing from being claimed after its
-        // issuer may have taken it back. A window this cannot read is
-        // one to wait for.
-        let Some(window) = schedule.at(anchor) else {
+        // No window, no check: a block whose own anchor no retained
+        // window carries is one this node cannot place in the schedule
+        // at all. The mark is not taken and no action goes out, so the
+        // block stays pending and the next re-drive asks again — the
+        // same shape an unknown name takes, and the conservative answer
+        // where a stand-in would be a guess.
+        if schedule.at(anchor).is_none() {
             warn!(
                 ?block_hash,
                 ?anchor,
                 "Deferring resolutions verification — no retained window carries the anchor"
             );
             return Vec::new();
-        };
-        let trie = window.shard_trie().clone();
+        }
         let entries: Vec<UnsettledTx> = block
             .abandonment_records()
             .iter()
             .flat_map(AbandonmentRecord::unsettled)
             .cloned()
             .collect();
-        let deliveries = block.undecided_names();
         let successes = block.successes_decided_alone();
         debug!(
             ?block_hash,
             names = entries.len(),
-            deliveries = deliveries.len(),
             successes = successes.len(),
             "Initiating resolutions verification"
         );
@@ -1030,10 +1023,8 @@ impl VerificationPipeline {
         vec![Action::VerifyResolutions {
             block_hash,
             entries,
-            deliveries,
             successes,
             anchor,
-            trie,
             windows: schedule.windows(),
         }]
     }

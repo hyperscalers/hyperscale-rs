@@ -18,7 +18,7 @@ use hyperscale_types::{
     PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, ShardForkProof,
-    ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
+    ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
     SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
     SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateEntry, SubstateKey, SweepFrontier,
     TerminalRoots, TickId, Timeout, TopologySchedule, TopologySnapshot, Transaction,
@@ -950,21 +950,13 @@ pub enum Action {
         block_hash: BlockHash,
         /// Every name the block's records carry.
         entries: Vec<UnsettledTx>,
-        /// Every transaction the block's finalizations resolve without
-        /// deciding — a delivery or a leg — checked against the lapse
-        /// where the body says this shard delivers for it.
-        deliveries: Vec<TxHash>,
         /// Every transaction the block's finalizations decide with
         /// success by its own execution, for a member that awaits
         /// nobody, checked against the deadline: past it a leg may
         /// already have taken its crossing back.
         successes: Vec<TxHash>,
-        /// The block's own anchor, which the lapse and the deadline are
-        /// read against.
+        /// The block's own anchor, which the deadline is read against.
         anchor: WeightedTimestamp,
-        /// The trie of the anchor's window, which a delivery's body is
-        /// classified against.
-        trie: ShardTrie,
         /// The epoch grid, which places each name's stated commit anchor
         /// in the window that froze its figures. Carried rather than
         /// read off the store because it is a property of the chain

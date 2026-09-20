@@ -33,8 +33,8 @@ mod witnesses;
 
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use execution::{
-    a_delivery_cut_off_past_its_window_is_reclaimed, a_failed_attempt_still_attests_work,
-    a_healed_network_does_not_revive_a_closed_delivery,
+    a_delivery_cut_off_past_its_window_is_owed, a_failed_attempt_still_attests_work,
+    a_healed_network_delivers_past_the_old_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_runs_where_it_was_never_committed,
@@ -96,8 +96,8 @@ pub use route_reshape::{
     merging_caller_genesis_accounts, split_train_genesis_accounts,
 };
 pub use straddler::{
-    a_delivery_is_reclaimed_when_its_deliverer_splits,
-    a_record_is_decided_by_the_successor_when_its_issuer_splits, isolate_ec_intake,
+    a_delivery_is_owed_when_its_deliverer_splits,
+    a_record_is_owed_by_the_successor_when_its_issuer_splits, isolate_ec_intake,
     merge_straddler_atomic, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
 };
