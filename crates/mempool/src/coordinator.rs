@@ -921,6 +921,7 @@ impl MempoolCoordinator {
         }
 
         self.prune_engagement_state();
+        self.retarget_engagement_parks(topology_snapshot);
 
         actions
     }
@@ -1113,6 +1114,34 @@ impl MempoolCoordinator {
     #[must_use]
     pub fn parked_count(&self) -> usize {
         self.parked_engagement.len()
+    }
+
+    /// Point every park at the shard holding its payer's prefix now.
+    ///
+    /// A park names the shard whose bundle releases it, resolved when
+    /// the transaction was admitted. A cut moves the prefix, and a park
+    /// still naming the shard that held it waits on a chain that may
+    /// have terminated without ever including the transaction: the
+    /// successor includes it and bundles under its own name, which the
+    /// park does not match and [`Self::on_engagement_evidence`] drops.
+    /// The transaction then sits `Pending` and unselectable until its
+    /// window closes, having reached no verdict anywhere.
+    ///
+    /// Re-resolved on every commit, against the trie admission would
+    /// read. The prefix never comes home to this shard: a reshape that
+    /// would bring it seats a new shard under a new id, whose mempool
+    /// starts empty.
+    fn retarget_engagement_parks(&mut self, topology_snapshot: &TopologySnapshot) {
+        if self.parked_engagement.is_empty() {
+            return;
+        }
+        let trie = topology_snapshot.shard_trie();
+        let pool = &self.pool;
+        for (hash, payer_shard) in &mut self.parked_engagement {
+            if let Some(entry) = pool.get(hash) {
+                *payer_shard = trie.shard_for_prefix(entry.tx.fee_payer());
+            }
+        }
     }
 
     /// Drop parked entries whose transaction left `Pending` and remembered
@@ -3356,6 +3385,66 @@ mod tests {
                 .ready_transactions(100, MAX_UNSETTLED_TXS - places, trie, now, |_| true)
                 .len(),
             offered.len()
+        );
+    }
+
+    /// A park follows its payer's prefix across a cut.
+    ///
+    /// The shard a park names is resolved when the transaction is
+    /// admitted, and a reshape moves the prefix out from under it. The
+    /// shard that held it may terminate without ever including the
+    /// transaction — the successor includes it and bundles under its own
+    /// name — so a park left pointing at the old one waits on a chain
+    /// that will never speak again, and the transaction reaches no
+    /// verdict anywhere.
+    #[test]
+    fn a_park_follows_its_payers_prefix_across_a_cut() {
+        let committee = TestCommittee::new(4, 42);
+        let before = committee.topology_snapshot(2);
+        let after = committee.topology_snapshot(4);
+        let local = ShardId::leaf(1, 0);
+        let mut mempool = MempoolCoordinator::new(local);
+
+        // A set top bit routes to leaf(1, 0)'s sibling before the cut,
+        // and to one of that sibling's children after it.
+        let local_owner = test_principal(0x01);
+        let payer_owner = test_principal(0x81);
+        let held_by_before = before.shard_trie().shard_for_prefix(payer_owner.address());
+        let held_by_after = after.shard_trie().shard_for_prefix(payer_owner.address());
+        assert_ne!(
+            held_by_before, held_by_after,
+            "the fixture has to move the payer's prefix, or it tests nothing",
+        );
+
+        let parked = stub_vm(payer_owner, &[local_owner.address(), payer_owner.address()]);
+        let parked_hash = parked.hash();
+        mempool.on_transaction_gossip(&before, Arc::clone(&parked), false, LocalTimestamp::ZERO);
+        assert_eq!(mempool.parked_count(), 1);
+
+        // The cut lands. The shard that held the prefix is no longer the
+        // one whose bundle can release the park.
+        let block = make_live_block(
+            local,
+            BlockHeight::new(1),
+            1_234_567_890,
+            ValidatorId::new(0),
+            vec![],
+            vec![],
+        );
+        mempool.on_block_committed(&after, &certify(block, TEST_BLOCK_INTERVAL_MS));
+
+        mempool.on_engagement_evidence(held_by_before, [parked_hash]);
+        assert_eq!(
+            mempool.parked_count(),
+            1,
+            "the shard that used to hold the prefix speaks for nothing now",
+        );
+
+        mempool.on_engagement_evidence(held_by_after, [parked_hash]);
+        assert_eq!(
+            mempool.parked_count(),
+            0,
+            "the successor's bundle is the evidence the park waits for",
         );
     }
 
