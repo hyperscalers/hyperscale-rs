@@ -1468,17 +1468,17 @@ fn a_transfer_executes_divided_on_both_shards() {
     );
 }
 
-/// A transfer's crossing is the recipient's, so a settlement that finds
-/// no claim releases rather than reclaims: nothing moves and the record
-/// stands, holding the value for whoever may still claim it.
+/// A transfer's crossing is the recipient's, so nothing takes it back:
+/// the record is none of the sender's to settle, and a settlement asked
+/// to take it back is refused before the kernel runs.
 ///
-/// The sender's shard runs the settlement all the same — no node, no
-/// nullifier, a declaration of its own over the record — and its own
-/// account closes on it. What it does not do is credit the crossing
-/// anywhere: an outbound leg consumes it, so no cell of the producing
-/// frame is the crossing's to return to.
+/// The classification names it neither way round. What the sender's
+/// shard may settle under the transaction's own name excludes every
+/// delivering record, so the licence this case hands in is one no
+/// composer reaches — and the refusal is what keeps a hand-built one
+/// from crediting value the recipient may still claim.
 #[test]
-fn a_delivered_crossings_settlement_releases_rather_than_reclaims() {
+fn a_delivered_crossing_is_no_ones_to_take_back() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
@@ -1535,7 +1535,12 @@ fn a_delivered_crossings_settlement_releases_rather_than_reclaims() {
         "the escrow debited the vault"
     );
 
-    let released = run(
+    assert!(
+        classified.records_settled(near_shard).is_empty(),
+        "the sender settles none of it under the transaction's own name",
+    );
+
+    let asked = run(
         &store,
         Runs::Settle {
             member: Member::whole(near_shard),
@@ -1544,15 +1549,11 @@ fn a_delivered_crossings_settlement_releases_rather_than_reclaims() {
             charged: true,
         },
     );
-    let ConsensusReceipt::Succeeded { writes, .. } = &released.consensus else {
-        panic!("the settlement must succeed: {:?}", released.metadata);
-    };
-    assert!(released.escrowed.is_empty(), "a settlement issues nothing");
-    assert!(
-        released.fee_receipt.is_none(),
-        "the leg's own certificate settled the price; the settlement owes none"
+    assert_eq!(
+        asked.consensus,
+        ConsensusReceipt::Failed,
+        "the one record it named is left standing, so the member settles nothing",
     );
-    store.apply(writes);
     assert_eq!(
         store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(900).to_vec()),
@@ -1669,8 +1670,8 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
 /// claim cell the record names and the recourse the record carries.
 /// Present, the record is deleted and nothing moves. Absent, this
 /// crossing names nobody to take it back — an outbound leg consumes
-/// it — so it is released: the record stands with its value, and the
-/// issuer's account closes on it either way.
+/// it — so the record is left standing, holding its value for a
+/// consumer that has not run yet.
 ///
 /// The member runs with no body at all, which is the point — a merge
 /// successor's store arrives as a prefix of leaves and its ledger begins
@@ -1775,15 +1776,12 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     let mut claimed = MapDb(unclaimed.0.clone());
     claimed.0.insert(record.consumer_claim, vec![0xAA]);
 
-    let released = settle(&unclaimed, inside);
-    let ConsensusReceipt::Succeeded { writes, .. } = &released.consensus else {
-        panic!("the settlement must succeed: {:?}", released.metadata);
-    };
-    assert!(
-        released.fee_receipt.is_none(),
-        "the chain that issued the crossing settled the price before it ended"
+    let standing = settle(&unclaimed, inside);
+    assert_eq!(
+        standing.consensus,
+        ConsensusReceipt::Failed,
+        "the one record it named is left standing, so the member settles nothing",
     );
-    unclaimed.apply(writes);
     assert_eq!(
         Substates::cell(&unclaimed, vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(900).to_vec()),

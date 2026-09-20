@@ -319,8 +319,8 @@ fn validate_block_work(
 /// section's items through the one [`Section`] predicate the proposer
 /// selected them by, in the order the folds depend on: provisions, the
 /// transactions they engage, finalizations, the records held to their
-/// names, state claims, crossing re-offers. Returns a single diagnostic on the first failure
-/// so the caller can log once.
+/// names, state claims, crossing re-offers. Returns a single diagnostic
+/// on the first failure so the caller can log once.
 pub fn validate_block_for_vote(
     ctx: &Admission<'_>,
     block: &Block,

@@ -606,12 +606,19 @@ impl Executor {
     /// present means the crossing was taken and the record is a balance
     /// for a claim that happened, which is deleted; absent means no
     /// consumer took it, and none can now, since the member is admitted
-    /// only past the lapse, which is credited back where the record
-    /// names a cell to credit and released where it names nobody — and a
-    /// record already gone is skipped rather than refused, since a
+    /// only where an absence answers, which is credited back to the cell
+    /// the record names — and a record already gone is skipped rather
+    /// than refused, since a
     /// member admitted for several records is one member, and one of
     /// them having been settled by the shard's own evidence path in
     /// between is not a reason to strand the rest.
+    ///
+    /// A record naming nobody to credit is left standing wherever the
+    /// licence would take it back: its only disposal is the retirement
+    /// its consumer's claim licenses, and until that claim is there it
+    /// is holding the value for a consumer that may still run. Skipped
+    /// rather than refused, so a member admitted for several records
+    /// settles the ones it can.
     ///
     /// The scope is this shard's own subtree, whatever the transaction's
     /// placement was. Every cell a settlement touches sits under the
@@ -639,6 +646,17 @@ impl Executor {
                     return Err(format!("settlement of record {key:?} reads no record"));
                 }
             };
+            // What the record takes, decided before anything is
+            // declared: a record left standing is declared nothing, or
+            // the member would name a cell it never touches.
+            let takes_back = takes_back(on, &record, snapshot);
+            // Nothing takes a crossing an outbound leg consumes back, so
+            // a licence that would is not about this record: it stands,
+            // holding the value for whoever may still claim it, and the
+            // member goes on to the rest.
+            if takes_back && record.recourse == Recourse::Nobody {
+                continue;
+            }
             let mut declare_here = |effect, holds| {
                 declare(&mut declaration, effect, holds).map_err(|conflict| {
                     format!("settled cell contradicts the declaration: {conflict}")
@@ -655,12 +673,8 @@ impl Executor {
             // reclaim writes, and what holds either settlement to the
             // record's edge.
             let claim = CrossingSite::claim_on(&ProtocolHasher, key.owner, &record);
-            let disposition = match (takes_back(on, &record, snapshot), record.recourse) {
-                (false, _) => Disposition::Retire,
-                // Nobody's to take back: the producer's account of the
-                // record closes and the balance stands where it is.
-                (true, Recourse::Nobody) => Disposition::Release,
-                (true, Recourse::Producer(credit)) => {
+            let disposition = match record.recourse {
+                Recourse::Producer(credit) if takes_back => {
                     declare_here(
                         Effect {
                             target: EffectTarget::Point(claim.key()),
@@ -677,6 +691,9 @@ impl Executor {
                     )?;
                     Disposition::Reclaim
                 }
+                // A claim that happened: the value moved where the
+                // consumer ran and what is left is a cell saying so.
+                Recourse::Producer(_) | Recourse::Nobody => Disposition::Retire,
             };
             disposals.push(Disposal {
                 record: *key,
@@ -685,7 +702,7 @@ impl Executor {
             });
         }
         if disposals.is_empty() {
-            return Err("every inherited record was settled already".to_string());
+            return Err("no inherited record is this member's to settle".to_string());
         }
         let trie = ctx.shard_trie.clone();
         let local = ctx.local_shard;

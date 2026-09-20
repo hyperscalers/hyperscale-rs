@@ -66,7 +66,6 @@ impl Placement {
     }
 }
 
-/// The classification frozen onto a transaction when its block
 /// One delivering crossing a shard issued.
 ///
 /// Who consumes it, the cell whose presence says it was taken, and the

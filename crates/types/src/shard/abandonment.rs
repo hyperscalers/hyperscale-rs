@@ -250,16 +250,15 @@ impl UnsettledTx {
 }
 
 /// How a block's resolutions stand against the transactions they name:
-/// the figures its records restate, and the deliveries its finalizations
-/// carry.
+/// the figures its records restate, and the successes its finalizations
+/// decide.
 ///
 /// The voter's answer, read off committed bodies and blocks. A
 /// validator whose store holds a transaction and the block a name says
 /// committed it answers for it — a figure exactly or wrongly, a success
 /// inside its deadline or past it — and one whose store never held them,
-/// having
-/// synced past the block, cannot say, which is a third answer and not a
-/// pass.
+/// having synced past the block, cannot say, which is a third answer and
+/// not a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolutions {
     /// Every figure of every name is the one its transaction fixes and
