@@ -1973,7 +1973,7 @@ mod tests {
             root_hash,
             nullifier_expiry_ms(&tree.root.header),
         );
-        let mut provisioned = reads.clone();
+        let mut provisioned = reads;
         provisioned.push(DeclaredKey::substate(
             composer_addr().address(),
             root_nullifier.local.0,
