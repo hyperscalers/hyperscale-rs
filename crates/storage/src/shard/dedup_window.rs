@@ -23,8 +23,8 @@
 use std::collections::HashSet;
 
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Deadline, FEE_HOLD_WINDOW, FinalizationHash,
-    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp, Window,
+    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, FEE_HOLD_WINDOW, FinalizationHash,
+    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp, admissible_until,
 };
 
 use super::chain_reader::ShardChainReader;
@@ -33,14 +33,14 @@ use super::chain_reader::ShardChainReader;
 /// whole of it.
 ///
 /// The three maps carry their own deadlines because the tiers differ: a
-/// transaction's is the close of the delivery window its signed
-/// `end_timestamp_exclusive` opens, a resolution's comes off the
-/// resolving certificate, and a provision batch's is keyed to the block
-/// that committed it.
+/// transaction's is the last anchor a block may carry it at, a
+/// resolution's comes off the resolving certificate, and a provision
+/// batch's is keyed to the block that committed it.
 #[derive(Debug, Clone, Default)]
 pub struct DedupWindow {
-    /// `(tx_hash, close of the delivery window)` for every transaction
-    /// the window's blocks committed.
+    /// `(tx_hash, last admissible anchor)` for every transaction the
+    /// window's blocks committed that the reader's clock has not passed
+    /// already.
     pub committed: Vec<(TxHash, WeightedTimestamp)>,
     /// `(tx_hash, deadline)` for every transaction a committed
     /// finalization in the window reached a verdict for.
@@ -189,7 +189,7 @@ impl DedupWindow {
                 return window;
             }
             if !dedup_done {
-                window.fold_block(block, anchor);
+                window.fold_block(block, anchor, committed_ts);
             }
             if !fee_done {
                 window.fold_fee_holds(block, committed_ts, &mut released);
@@ -210,11 +210,17 @@ impl DedupWindow {
     ///
     /// `anchor` is the block's own `parent_qc` weighted timestamp, which
     /// the provision tier keys its deadline on.
-    fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp) {
+    fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp, now: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
         for tx in block.transactions().iter() {
-            let deadline = Window::Delivery.of(Deadline::of_transaction(tx)).end;
-            self.committed.push((tx.hash(), deadline));
+            // Only what the index would still hold. The walk is floored
+            // at the widest tier's window, so most of what it descends
+            // past is a transaction with no delivery to be admitted as,
+            // whose own deadline went by long before this clock.
+            let deadline = admissible_until(tx);
+            if deadline > now {
+                self.committed.push((tx.hash(), deadline));
+            }
         }
         for finalization in block.certificates().iter() {
             let deadline = finalization.local_ec().deadline();

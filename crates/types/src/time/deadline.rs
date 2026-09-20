@@ -14,6 +14,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::LegRole;
 
 use crate::{
     CLAIM_VISIBILITY_LAG, EPOCH_DURATION, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE,
@@ -169,6 +170,34 @@ impl Window {
             Self::Core => at..at.plus(MAX_VALIDITY_RANGE * 2),
             Self::LegEntry => at..at.plus(CLAIM_WINDOW),
         }
+    }
+}
+
+/// The last anchor a block may carry `tx` at, which is how long an index
+/// refusing a second inclusion has to remember it.
+///
+/// A transaction is admissible while its validity range contains the
+/// anchor, and past that only as a delivery — to the close of
+/// [`Window::Delivery`], which is the expiry the record a delivery
+/// consumes states.
+///
+/// Only a transaction with an outbound leg has a delivery to be admitted
+/// as, and settling a placement onto the legs promotes toward the core
+/// and never to [`LegRole::Outbound`], so the stored roles answer this
+/// without one. That is what lets an index ask it off the body alone,
+/// and it is what keeps the ordinary transaction — one carrying no
+/// crossing at all — out of a window sized for the one shape that needs
+/// it: the delivery window is a [`CLAIM_WINDOW`] where a deadline is one
+/// [`MAX_FINALIZATION_DELAY`], and an index holding every committed
+/// transaction to the wider of the two is holding the whole of a shard's
+/// traffic for the sake of the crossings in it.
+#[must_use]
+pub fn admissible_until(tx: &Transaction) -> WeightedTimestamp {
+    let deadline = Deadline::of_transaction(tx);
+    if tx.legs().iter().any(|leg| leg.role == LegRole::Outbound) {
+        Window::Delivery.of(deadline).end
+    } else {
+        deadline.at()
     }
 }
 

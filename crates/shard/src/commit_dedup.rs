@@ -34,8 +34,8 @@ use std::sync::Arc;
 
 use hyperscale_storage::{CommittedProvisions, DedupWindow};
 use hyperscale_types::{
-    DEDUP_WINDOW, Deadline, Finalization, FinalizationHash, ProvisionHash, Provisions,
-    RETENTION_HORIZON, ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp, Window,
+    DEDUP_WINDOW, Finalization, FinalizationHash, ProvisionHash, Provisions, RETENTION_HORIZON,
+    ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp, admissible_until,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
@@ -173,14 +173,16 @@ impl CommitDedupIndex {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
     }
 
-    /// Record a block's transactions in the retention lookup. Each entry's
-    /// stored value is the close of the tx's delivery window — the last
-    /// anchor a block may carry the transaction at.
+    /// Record a block's transactions in the retention lookup. Each
+    /// entry's stored value is the last anchor a block may carry the
+    /// transaction at, which is its delivery window's close where it
+    /// has a delivery and its own deadline where it has none.
     pub(crate) fn register_committed_txs(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
         for tx in transactions {
             let tx_hash = tx.hash();
-            let deadline = Window::Delivery.of(Deadline::of_transaction(tx)).end;
-            self.tx_retention.entry(tx_hash).or_insert(deadline);
+            self.tx_retention
+                .entry(tx_hash)
+                .or_insert_with(|| admissible_until(tx));
         }
     }
 
@@ -314,12 +316,12 @@ impl CommitDedupIndex {
 mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, make_finalization, stub_transaction, test_prefix,
-        test_principal,
+        StubVmStatics, install_stub_protocol_statics, leg_shape, make_finalization,
+        stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
-        TimestampRange, TransactionDecision,
+        BlockHeight, Deadline, Hash, LegRole, MerkleInclusionProof, ProvisionEntry, Provisions,
+        ShardId, TimestampRange, TransactionDecision, Window,
     };
 
     use super::*;
@@ -380,6 +382,24 @@ mod tests {
         )))
     }
 
+    /// The same, with a shape whose outbound leg makes a delivery of it
+    /// admissible past the validity end.
+    fn delivering_tx_with_end(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
+        install_stub_protocol_statics();
+        let range = TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::from_millis(end_ms),
+        );
+        let tx = stub_transaction(test_principal(seed), &[test_prefix(seed)], 1_000, range);
+        Arc::new(Verifiable::from(tx.with_legs(
+            &StubVmStatics,
+            vec![
+                leg_shape(test_prefix(seed), LegRole::Core, &[]),
+                leg_shape(test_prefix(seed ^ 0xFF), LegRole::Outbound, &[(0, 0)]),
+            ],
+        )))
+    }
+
     fn make_fw(height: u64) -> Arc<Verifiable<Finalization>> {
         Arc::new(
             make_finalization(
@@ -417,18 +437,22 @@ mod tests {
         assert_eq!(idx.tx_retention_len(), 1);
     }
 
-    /// A transaction is refusable to the close of its delivery window,
-    /// not to its validity end: a delivery-only member is admissible past
-    /// the end, so an index that forgot the hash there would let a
-    /// proposer commit the same delivery twice.
+    /// A transaction carrying an outbound leg is refusable to the close
+    /// of its delivery window, not to its validity end: a delivery-only
+    /// member is admissible past the end, so an index that forgot the
+    /// hash there would let a proposer commit the same delivery twice.
+    ///
+    /// One with no outbound leg has no delivery to be admitted as, and
+    /// is held only to its own deadline — which is the whole difference
+    /// between an index sized for a shard's crossings and one sized for
+    /// its traffic.
     #[test]
-    fn a_tx_stays_refusable_across_its_delivery_window() {
+    fn a_delivering_tx_stays_refusable_across_its_delivery_window() {
         let mut idx = CommitDedupIndex::new();
-        let tx = tx_with_end(1, 100);
+        let tx = delivering_tx_with_end(1, 100);
         let tx_hash = tx.hash();
-        let close = Window::Delivery
-            .of(Deadline::of(WeightedTimestamp::from_millis(100)))
-            .end;
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(100));
+        let close = Window::Delivery.of(deadline).end;
         idx.register_committed_txs(std::slice::from_ref(&tx));
 
         idx.prune(WeightedTimestamp::from_millis(101));
@@ -445,13 +469,25 @@ mod tests {
             !idx.contains_tx(&tx_hash),
             "at the close nothing may carry it"
         );
+
+        let mut ordinary = CommitDedupIndex::new();
+        let plain = tx_with_end(2, 100);
+        let plain_hash = plain.hash();
+        ordinary.register_committed_txs(std::slice::from_ref(&plain));
+        ordinary.prune(deadline.at().minus(std::time::Duration::from_millis(1)));
+        assert!(ordinary.contains_tx(&plain_hash), "short of its deadline");
+        ordinary.prune(deadline.at());
+        assert!(
+            !ordinary.contains_tx(&plain_hash),
+            "and gone there: nothing carries a transaction with no delivery past it",
+        );
     }
 
     #[test]
     fn prune_drops_txs_past_their_window() {
         let mut idx = CommitDedupIndex::new();
-        let early = tx_with_end(1, 100);
-        let later = tx_with_end(2, 900);
+        let early = delivering_tx_with_end(1, 100);
+        let later = delivering_tx_with_end(2, 900);
         let early_hash = early.hash();
         let later_hash = later.hash();
         idx.register_committed_txs(&[early, later]);

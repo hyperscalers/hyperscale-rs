@@ -22,14 +22,15 @@ use hyperscale_storage::{
     VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
-    install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_transaction,
-    test_prefix, test_principal, test_transaction,
+    StubVmStatics, install_stub_protocol_statics, leg_shape, make_finalization,
+    make_leg_finalization, stub_transaction, test_prefix, test_principal, test_transaction,
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, DEDUP_WINDOW, Deadline, FEE_HOLD_WINDOW, Hash, LocalKey, RETENTION_HORIZON,
-    SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction,
-    TransactionDecision, TxHash, Verifiable, WeightedTimestamp, Window, WitnessSources,
+    ChainOrigin, DEDUP_WINDOW, Deadline, FEE_HOLD_WINDOW, Hash, LegRole, LocalKey,
+    RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange,
+    Transaction, TransactionDecision, TxHash, Verifiable, WeightedTimestamp, Window,
+    WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -611,35 +612,68 @@ fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
     )))
 }
 
-/// The fold recovers each committed transaction against the close of the
-/// delivery window its own signed end opens, not against when the block
-/// carrying it committed.
+/// The same, with a shape whose outbound leg makes a delivery of it
+/// admissible past its validity end.
+fn delivering_dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
+    install_stub_protocol_statics();
+    let validity = TimestampRange::new(
+        WeightedTimestamp::ZERO,
+        WeightedTimestamp::from_millis(end_ms),
+    );
+    let tx = stub_transaction(test_principal(seed), &[test_prefix(seed)], 1_000, validity);
+    Arc::new(Verifiable::from(tx.with_legs(
+        &StubVmStatics,
+        vec![
+            leg_shape(test_prefix(seed), LegRole::Core, &[]),
+            leg_shape(test_prefix(seed ^ 0xFF), LegRole::Outbound, &[(0, 0)]),
+        ],
+    )))
+}
+
+/// The fold recovers each committed transaction against the last anchor
+/// a block may carry it at — its own signed end's, not when the block
+/// carrying it committed — and keeps only what the reader's clock has
+/// not passed.
+///
+/// The two figures differ by the whole of the delivery window: one
+/// carrying an outbound leg is admissible to that window's close, and
+/// one carrying none only to its own deadline. A walk floored at the
+/// wider of the two descends past a great many of the narrower, and
+/// every one of those is an entry the index would drop at the clock it
+/// resumes at.
 #[test]
 fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
     let storage = SimShardStorage::default();
-    let tx = dedup_tx(1, 90_000);
-    let tx_hash = tx.hash();
-    let block = block_with_txs(BlockHeight::new(1), 1_000, vec![tx]);
+    let delivering = delivering_dedup_tx(1, 90_000);
+    let delivering_hash = delivering.hash();
+    let plain = dedup_tx(2, 90_000);
+    let plain_hash = plain.hash();
+    let expired = dedup_tx(3, 1_000);
+    let block = block_with_txs(BlockHeight::new(1), 1_000, vec![delivering, plain, expired]);
     commit_empty(&storage, &block);
 
+    // A clock past the expired one's deadline and short of the other
+    // two: what the reader resumes at is what the index would keep.
+    let resumes_at = WeightedTimestamp::from_millis(30_000);
     let window = DedupWindow::from_reader(
         &storage,
         BlockHeight::new(1),
-        WeightedTimestamp::from_millis(1_000),
+        resumes_at,
         ChainOrigin {
             genesis_height: BlockHeight::new(1),
             anchor_wt: WeightedTimestamp::ZERO,
         },
     );
 
+    let ends_at = Deadline::of(WeightedTimestamp::from_millis(90_000));
     assert_eq!(
         window.committed,
-        vec![(
-            tx_hash,
-            Window::Delivery
-                .of(Deadline::of(WeightedTimestamp::from_millis(90_000)))
-                .end
-        )],
+        vec![
+            (delivering_hash, Window::Delivery.of(ends_at).end),
+            (plain_hash, ends_at.at()),
+        ],
+        "a delivery's window and an ordinary deadline, and nothing the \
+         clock has already passed",
     );
 }
 
@@ -752,9 +786,7 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
         window.committed,
         vec![(
             tx_hash,
-            Window::Delivery
-                .of(Deadline::of(WeightedTimestamp::from_millis(900_000)))
-                .end
+            Deadline::of(WeightedTimestamp::from_millis(900_000)).at()
         )],
     );
     assert!(
