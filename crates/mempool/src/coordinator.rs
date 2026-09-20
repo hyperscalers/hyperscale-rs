@@ -46,7 +46,7 @@
 //! and drops entries past `RETENTION_HORIZON`.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -260,12 +260,18 @@ pub struct MempoolCoordinator {
     expected_txs: ExpectedTxs,
 
     /// Cross-shard transactions parked outside contention until their
-    /// engagement evidence — the payer shard's bundle — arrives. Value is
-    /// the payer shard the evidence must come from. A parked transaction
-    /// is pooled, fetchable, and reported `Pending`, but holds no ready
-    /// slot and no conflict keys, so a payer that never commits cannot
-    /// camp this shard's keys through the deferral set.
-    parked_engagement: HashMap<TxHash, ShardId>,
+    /// engagement evidence — the payer shard's bundle — arrives. A
+    /// parked transaction is pooled, fetchable, and reported `Pending`,
+    /// but holds no ready slot and no conflict keys, so a payer that
+    /// never commits cannot camp this shard's keys through the deferral
+    /// set.
+    ///
+    /// Which shard's bundle releases each one is not stored: a cut moves
+    /// the payer's prefix, and a shard resolved at admission is the one
+    /// that held it then. The question is asked where it is answered, in
+    /// [`Self::on_engagement_evidence`], off the trie of the moment the
+    /// evidence arrives.
+    parked_engagement: HashSet<TxHash>,
 
     /// Engagement evidence observed before its transaction arrived —
     /// `tx → (payer shard, deadline)`. Consulted at admission so the
@@ -337,7 +343,7 @@ impl MempoolCoordinator {
             current_height: BlockHeight::new(0),
             current_ts: WeightedTimestamp::ZERO,
             expected_txs: ExpectedTxs::new(),
-            parked_engagement: HashMap::new(),
+            parked_engagement: HashSet::new(),
             engagement_seen: HashMap::new(),
             config,
             local_shard,
@@ -465,8 +471,8 @@ impl MempoolCoordinator {
 
         // A cross-shard transaction at a non-payer shard enters
         // contention only once its engagement evidence exists.
-        if let Some(payer_shard) = self.engagement_park_target(topology_snapshot, tx, cross_shard) {
-            self.parked_engagement.insert(hash, payer_shard);
+        if self.parks_for_engagement(topology_snapshot, tx, cross_shard) {
+            self.parked_engagement.insert(hash);
         }
         self.tx_store.insert(Arc::clone(tx));
         self.pool.insert(
@@ -921,7 +927,6 @@ impl MempoolCoordinator {
         }
 
         self.prune_engagement_state();
-        self.retarget_engagement_parks(topology_snapshot);
 
         actions
     }
@@ -1054,30 +1059,35 @@ impl MempoolCoordinator {
 
     /// transaction is immediately ready: not VM, not cross-shard, this
     /// shard is the payer's, or the evidence already arrived.
-    fn engagement_park_target(
+    fn parks_for_engagement(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         tx: &Arc<Verified<Transaction>>,
         cross_shard: bool,
-    ) -> Option<ShardId> {
+    ) -> bool {
         if !cross_shard {
-            return None;
+            return false;
         }
-        let payer_shard = topology_snapshot
-            .shard_trie()
-            .shard_for_prefix(tx.fee_payer());
-        if payer_shard == self.local_shard {
-            return None;
-        }
+        let Some(payer_shard) = self.payer_shard(topology_snapshot.shard_trie(), tx) else {
+            return false;
+        };
         let engaged = self
             .engagement_seen
             .get(&tx.hash())
             .is_some_and(|(seen, _)| *seen == payer_shard);
         if engaged {
             self.engagement_seen.remove(&tx.hash());
-            return None;
+            return false;
         }
-        Some(payer_shard)
+        true
+    }
+
+    /// The shard whose bundle is `tx`'s engagement evidence under
+    /// `trie`, or `None` where this shard is the payer's and there is
+    /// nothing to wait for.
+    fn payer_shard(&self, trie: &ShardTrie, tx: &Transaction) -> Option<ShardId> {
+        let payer_shard = trie.shard_for_prefix(tx.fee_payer());
+        (payer_shard != self.local_shard).then_some(payer_shard)
     }
 
     /// Record engagement evidence: a verified or committed bundle from
@@ -1085,27 +1095,36 @@ impl MempoolCoordinator {
     /// into contention; evidence for transactions not yet admitted is
     /// remembered until the retention tier expires it, covering the
     /// bundle-before-transaction arrival order.
+    ///
+    /// Whether `source` is the shard a park waits on is asked against
+    /// `trie` here rather than remembered from admission. A cut moves
+    /// the payer's prefix, and the shard that held it may terminate
+    /// without ever including the transaction — the successor includes
+    /// it and bundles under its own name, which a remembered shard would
+    /// not match, leaving the transaction `Pending` and unselectable
+    /// until its window closed with no verdict anywhere.
     pub fn on_engagement_evidence(
         &mut self,
+        trie: &ShardTrie,
         source: ShardId,
         tx_hashes: impl IntoIterator<Item = TxHash>,
     ) {
         let deadline = self.current_ts.plus(RETENTION_HORIZON);
         for hash in tx_hashes {
-            match self.parked_engagement.get(&hash) {
-                Some(&payer_shard) if payer_shard == source => {
+            if self.parked_engagement.contains(&hash) {
+                let waits_on = self
+                    .pool
+                    .get(&hash)
+                    .and_then(|entry| self.payer_shard(trie, &entry.tx));
+                if waits_on == Some(source) {
                     // Unparked: a Pending entry no longer parked is
                     // selectable by construction.
                     self.parked_engagement.remove(&hash);
                 }
-                Some(_) => {}
-                None => {
-                    if !self.pool.contains_key(&hash) && !self.is_tombstoned(&hash) {
-                        self.engagement_seen
-                            .entry(hash)
-                            .or_insert((source, deadline));
-                    }
-                }
+            } else if !self.pool.contains_key(&hash) && !self.is_tombstoned(&hash) {
+                self.engagement_seen
+                    .entry(hash)
+                    .or_insert((source, deadline));
             }
         }
     }
@@ -1116,39 +1135,11 @@ impl MempoolCoordinator {
         self.parked_engagement.len()
     }
 
-    /// Point every park at the shard holding its payer's prefix now.
-    ///
-    /// A park names the shard whose bundle releases it, resolved when
-    /// the transaction was admitted. A cut moves the prefix, and a park
-    /// still naming the shard that held it waits on a chain that may
-    /// have terminated without ever including the transaction: the
-    /// successor includes it and bundles under its own name, which the
-    /// park does not match and [`Self::on_engagement_evidence`] drops.
-    /// The transaction then sits `Pending` and unselectable until its
-    /// window closes, having reached no verdict anywhere.
-    ///
-    /// Re-resolved on every commit, against the trie admission would
-    /// read. The prefix never comes home to this shard: a reshape that
-    /// would bring it seats a new shard under a new id, whose mempool
-    /// starts empty.
-    fn retarget_engagement_parks(&mut self, topology_snapshot: &TopologySnapshot) {
-        if self.parked_engagement.is_empty() {
-            return;
-        }
-        let trie = topology_snapshot.shard_trie();
-        let pool = &self.pool;
-        for (hash, payer_shard) in &mut self.parked_engagement {
-            if let Some(entry) = pool.get(hash) {
-                *payer_shard = trie.shard_for_prefix(entry.tx.fee_payer());
-            }
-        }
-    }
-
     /// Drop parked entries whose transaction left `Pending` and remembered
     /// evidence past its deadline.
     fn prune_engagement_state(&mut self) {
         let pool = &self.pool;
-        self.parked_engagement.retain(|hash, _| {
+        self.parked_engagement.retain(|hash| {
             pool.get(hash)
                 .is_some_and(|entry| entry.status == TransactionStatus::Pending)
         });
@@ -1222,7 +1213,7 @@ impl MempoolCoordinator {
             .iter()
             .filter(|(hash, entry)| {
                 matches!(entry.status, TransactionStatus::Pending)
-                    && !self.parked_engagement.contains_key(*hash)
+                    && !self.parked_engagement.contains(*hash)
                     && now.saturating_sub(entry.admitted_at) >= min_dwell
                     && engaged(&entry.tx)
             })
@@ -3390,13 +3381,13 @@ mod tests {
 
     /// A park follows its payer's prefix across a cut.
     ///
-    /// The shard a park names is resolved when the transaction is
-    /// admitted, and a reshape moves the prefix out from under it. The
-    /// shard that held it may terminate without ever including the
-    /// transaction — the successor includes it and bundles under its own
-    /// name — so a park left pointing at the old one waits on a chain
-    /// that will never speak again, and the transaction reaches no
-    /// verdict anywhere.
+    /// Which shard's bundle releases a park is asked where the evidence
+    /// arrives, against the trie of that moment, and a reshape moves the
+    /// prefix out from under it. The shard that held it may terminate
+    /// without ever including the transaction — the successor includes
+    /// it and bundles under its own name — so a park held to the old one
+    /// would wait on a chain that will never speak again, and the
+    /// transaction would reach no verdict anywhere.
     #[test]
     fn a_park_follows_its_payers_prefix_across_a_cut() {
         let committee = TestCommittee::new(4, 42);
@@ -3421,26 +3412,24 @@ mod tests {
         mempool.on_transaction_gossip(&before, Arc::clone(&parked), false, LocalTimestamp::ZERO);
         assert_eq!(mempool.parked_count(), 1);
 
-        // The cut lands. The shard that held the prefix is no longer the
-        // one whose bundle can release the park.
-        let block = make_live_block(
-            local,
-            BlockHeight::new(1),
-            1_234_567_890,
-            ValidatorId::new(0),
-            vec![],
-            vec![],
+        // Before the cut, the shard that holds the prefix releases it.
+        mempool.on_engagement_evidence(before.shard_trie(), held_by_after, [parked_hash]);
+        assert_eq!(
+            mempool.parked_count(),
+            1,
+            "a shard that holds nothing of the payer's speaks for nothing",
         );
-        mempool.on_block_committed(&after, &certify(block, TEST_BLOCK_INTERVAL_MS));
 
-        mempool.on_engagement_evidence(held_by_before, [parked_hash]);
+        // Past the cut, that same shard is the one it waits on, and the
+        // one that used to hold the prefix is not.
+        mempool.on_engagement_evidence(after.shard_trie(), held_by_before, [parked_hash]);
         assert_eq!(
             mempool.parked_count(),
             1,
             "the shard that used to hold the prefix speaks for nothing now",
         );
 
-        mempool.on_engagement_evidence(held_by_after, [parked_hash]);
+        mempool.on_engagement_evidence(after.shard_trie(), held_by_after, [parked_hash]);
         assert_eq!(
             mempool.parked_count(),
             0,
@@ -3500,13 +3489,13 @@ mod tests {
         assert_eq!(ready, vec![local_hash]);
 
         // Evidence from the wrong shard promotes nothing.
-        mempool.on_engagement_evidence(local, [parked_hash]);
+        mempool.on_engagement_evidence(topology.shard_trie(), local, [parked_hash]);
         assert_eq!(mempool.parked_count(), 1);
 
         // The payer's bundle unparks the transaction. Nothing arbitrates
         // their shared key any more — both legs are selectable, and the
         // batch they land in is what sequences them.
-        mempool.on_engagement_evidence(payer_shard, [parked_hash]);
+        mempool.on_engagement_evidence(topology.shard_trie(), payer_shard, [parked_hash]);
         assert_eq!(mempool.parked_count(), 0);
         let mut ready: Vec<TxHash> = mempool
             .ready_transactions(
@@ -3537,7 +3526,7 @@ mod tests {
         let tx = stub_vm(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let hash = tx.hash();
 
-        mempool.on_engagement_evidence(payer_shard, [hash]);
+        mempool.on_engagement_evidence(topology.shard_trie(), payer_shard, [hash]);
         mempool.on_transaction_gossip(&topology, Arc::clone(&tx), false, LocalTimestamp::ZERO);
 
         assert_eq!(mempool.parked_count(), 0);

@@ -1072,10 +1072,17 @@ impl Ledger {
     ///
     /// Read off committed content alone, like [`Self::reclaimable`], so
     /// every replica at one frontier offers the same members.
+    ///
+    /// `running` says which transactions something already holds a
+    /// member for, and is asked before the terms are taken off the
+    /// entry: composing one costs a copy of the classification, and at
+    /// a steady tip almost every standing delivery is one a candidate
+    /// or a tick is already carrying.
     #[must_use]
-    pub(crate) fn standing_deliveries(&self) -> Vec<Delivering> {
+    pub(crate) fn standing_deliveries(&self, running: impl Fn(TxHash) -> bool) -> Vec<Delivering> {
         self.owed
             .iter()
+            .filter(|&(&tx_hash, _)| !running(tx_hash))
             .filter_map(|(&tx_hash, owed)| match &owed.part {
                 Part::Delivery(kept) => Some(Delivering {
                     tx_hash,

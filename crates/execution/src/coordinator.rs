@@ -1120,16 +1120,18 @@ impl ExecutionCoordinator {
     /// offers the same members.
     fn reoffer_standing_deliveries(&mut self, topology_schedule: &TopologySchedule) {
         let local_shard = self.local_shard;
+        let candidates = &self.candidates;
+        let ticks = &self.ticks;
+        let standing = self.counterparts.ledger.standing_deliveries(|tx_hash| {
+            candidates.contains(tx_hash) || ticks.tick_assignment(tx_hash).is_some()
+        });
         for Delivering {
             tx_hash,
             body,
             classified,
             committed,
-        } in self.counterparts.ledger.standing_deliveries()
+        } in standing
         {
-            if self.candidates.contains(tx_hash) || self.ticks.tick_assignment(tx_hash).is_some() {
-                continue;
-            }
             // The table the committing block's own committee named,
             // which is what a member reaching an engine has to attest.
             // A window this chain no longer retains prices nothing, and

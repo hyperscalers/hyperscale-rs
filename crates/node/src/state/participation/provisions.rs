@@ -37,6 +37,7 @@ impl ShardParticipation {
                 // proposal latch below gathers ready transactions — the
                 // bundle and its transactions then pair in one proposal.
                 self.mempool_coordinator.on_engagement_evidence(
+                    sched.head().shard_trie(),
                     provisions.source_shard(),
                     provisions.transactions().iter().map(|entry| entry.tx_hash),
                 );
