@@ -12,10 +12,11 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool,
-    StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
+    Address, BlockHash, BlockHeight, ConsensusPublicKey, Deadline, Epoch,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId,
+    ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
+    WeightedTimestamp, Window, sweep_admits_block,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -157,6 +158,37 @@ pub(crate) fn owed_at<C: Cluster + ?Sized>(
                 .is_none()
         })
         .map_or(0, |record| record.amount)
+}
+
+/// What a crossing record standing at `cell` owes that nothing can
+/// claim any more, in `resource`.
+///
+/// [`owed_at`] measured against the close of the record's own delivery
+/// window. Inside it the value is in flight — a delivery may still be
+/// admitted and claim it — and past it none can, because the only writer
+/// of the claim cell is a delivery member of the producing transaction
+/// and admission refuses one there. So a non-zero answer is value no
+/// action of any shard can move again.
+pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
+    c: &C,
+    cell: SubstateKey,
+    resource: ResourceAddr,
+) -> u128 {
+    let shard = owning_shard(c, cell.owner);
+    let closed = c
+        .substate(shard, cell.owner, cell.local.0)
+        .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+        .is_some_and(|record| {
+            Window::Delivery
+                .of(Deadline::from_expiry(record.expiry_ms))
+                .end
+                <= clock(c)
+        });
+    if closed {
+        owed_at(c, cell, resource)
+    } else {
+        0
+    }
 }
 
 /// The live shard whose prefix `owner` falls under.

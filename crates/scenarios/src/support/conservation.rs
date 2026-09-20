@@ -22,6 +22,7 @@ use hyperscale_types::{
 
 use super::query::{
     MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at, owed_at,
+    unclaimable_at,
 };
 use super::tx::{recipient, sender};
 use super::{Budget, Cluster};
@@ -128,6 +129,20 @@ impl World {
         })
     }
 
+    /// Every record this world registered that nothing can claim any
+    /// more: standing, with no claim answering it, past the close of its
+    /// own delivery window.
+    #[must_use]
+    pub fn stranded<C: Cluster + ?Sized>(&self, c: &C) -> Vec<(SubstateKey, u128)> {
+        self.owed
+            .iter()
+            .filter_map(|cell| {
+                let amount = unclaimable_at(c, *cell, self.resource);
+                (amount > 0).then_some((*cell, amount))
+            })
+            .collect()
+    }
+
     /// Whether what the world holds now, plus what `burned` accounts for,
     /// is exactly what it held when opened.
     ///
@@ -171,6 +186,25 @@ impl World {
     /// Panics if the world grew — value from nowhere — or shrank by more
     /// than the burn — value stranded.
     pub fn assert_settled<C: Cluster + ?Sized>(&self, c: &C, burned: u128, context: &str) {
+        // Counting a standing record as value the world holds is what
+        // keeps the sum honest while a crossing is in flight, and it is
+        // also what a strand would hide: the value is there, so the two
+        // sides balance whether or not anything can still reach it. A
+        // record inside its delivery window is in flight and says
+        // nothing; one past it can never be claimed, because the only
+        // writer of the claim cell is a delivery member and admission
+        // refuses one there.
+        //
+        // A tripwire rather than a demonstration: no scenario yet keeps a
+        // shard from its delivery for the width of that window, so this
+        // has never fired. It is what would catch the day one does.
+        let stranded = self.stranded(c);
+        assert!(
+            stranded.is_empty(),
+            "{context}: the world balances with {} crossing(s) past the close of their \
+             delivery window that nothing can claim — {stranded:?}",
+            stranded.len(),
+        );
         let after = self.held(c);
         assert_eq!(
             after + burned,
