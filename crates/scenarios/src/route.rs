@@ -225,7 +225,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         "the certificate channel must actually have been exercised and cut",
     );
     assert!(
-        clock(c) < Window::Delivery.of(Deadline::of(validity_end)).end,
+        clock(c) < Window::Owed.of(Deadline::of(validity_end)).end,
         "the cut has to lift inside the delivery window, or the core's output has nowhere to land",
     );
     for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {

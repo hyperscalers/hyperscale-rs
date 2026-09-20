@@ -114,7 +114,7 @@ impl Verify<&TransactionRootContext<'_>> for TransactionRoot {
             // so its window is the record's rather than the transaction's.
             let admitted = range.contains(ctx.validity_anchor)
                 || (ctx.late_deliveries.contains(&tx.hash())
-                    && Window::Delivery
+                    && Window::Owed
                         .of(Deadline::of(range.end_timestamp_exclusive))
                         .contains(&ctx.validity_anchor));
             if !range.is_well_formed(ctx.validity_anchor) || !admitted {

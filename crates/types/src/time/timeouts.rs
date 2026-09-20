@@ -78,18 +78,17 @@ pub const RETENTION_HORIZON: Duration =
 /// dedup window.
 ///
 /// The widest of the index's tiers. A transaction carrying an outbound
-/// leg is held to the close of its delivery window, which is the expiry
-/// the record a delivery consumes states — one [`CLAIM_WINDOW`] past a
-/// deadline that may itself sit a whole [`MAX_VALIDITY_RANGE`] past the
-/// block that committed it. That is the transaction's own evidence
-/// horizon measured from its commit, so the walk is exactly it.
+/// leg is held to the expiry the record of the crossing it issues
+/// states — one [`CLAIM_WINDOW`] past a deadline that may itself sit a
+/// whole [`MAX_VALIDITY_RANGE`] past the block that committed it. That
+/// is the transaction's own evidence horizon measured from its commit,
+/// so the walk is exactly it.
 ///
 /// Only the walk is. Every other transaction is held to its own
-/// deadline, so what the fold keeps at this depth is the crossings alone
-/// — see
-/// [`admissible_until`](crate::admissible_until). The resolution and
-/// provision tiers are keyed at most [`RETENTION_HORIZON`] past their
-/// own block, which this covers.
+/// deadline, so what the fold keeps at this depth is the crossings
+/// alone — see [`admissible_until`](crate::admissible_until). The
+/// resolution and provision tiers are keyed at most
+/// [`RETENTION_HORIZON`] past their own block, which this covers.
 pub const DEDUP_WINDOW: Duration = TRANSACTION_EVIDENCE_HORIZON;
 
 const _: () = assert!(

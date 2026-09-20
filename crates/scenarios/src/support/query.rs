@@ -179,10 +179,7 @@ pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
         .substate(shard, cell.owner, cell.local.0)
         .and_then(|bytes| CrossingCell::from_bytes(&bytes))
         .is_some_and(|record| {
-            Window::Delivery
-                .of(Deadline::from_expiry(record.expiry_ms))
-                .end
-                <= clock(c)
+            Window::Owed.of(Deadline::from_expiry(record.expiry_ms)).end <= clock(c)
         });
     if closed {
         owed_at(c, cell, resource)

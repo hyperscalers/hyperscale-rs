@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use hyperscale_hbor::Hbor;
-use hyperscale_vm_types::LegRole;
+use hyperscale_vm_types::{CROSSING_GRACE_MS, LegRole};
 
 use crate::{
     CLAIM_VISIBILITY_LAG, EPOCH_DURATION, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE,
@@ -124,19 +124,18 @@ impl Deadline {
 /// A half-open window read off a transaction's deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Window {
-    /// Where a delivery of the transaction's outbound value may be
-    /// admitted: from the validity end, since inside it the transaction
-    /// is admissible as itself, to the close of [`CLAIM_WINDOW`] — the
-    /// expiry the record it consumes states, and the whole of the span
-    /// in which that record can be disposed of at all.
+    /// Where a member consuming an owed crossing may be admitted: from
+    /// the validity end, since inside it the transaction is admissible
+    /// as itself, to the expiry the record it consumes states.
     ///
-    /// A delivery bears no verdict, so the deadline does not bound it,
-    /// and a crossing an outbound leg consumes is owed to that consumer
-    /// and credited nowhere else, so nothing takes it back meanwhile.
-    /// What bounds it is the record: past this instant no claim of it
-    /// can be proved either way, so a delivery admitted there could not
-    /// be settled against it.
-    Delivery,
+    /// Read off the record's own grace and not off [`CLAIM_WINDOW`],
+    /// which is a floor the absence path needs and this path proves
+    /// nothing by. An owed crossing bears no verdict, so the deadline
+    /// does not bound it, and nothing takes it back meanwhile. What
+    /// bounds it is the claim cell: that cell is the only thing refusing
+    /// a second claim, it is swept at the record's expiry, and a member
+    /// admitted past the sweep could claim what was claimed already.
+    Owed,
     /// Where a core's committed cell being absent proves the core never
     /// took the transaction — never included it, or included it and
     /// refused, which retracts the cell: from the deadline, since
@@ -157,6 +156,12 @@ pub enum Window {
     /// both its members are proved against being swept, one
     /// [`CLAIM_WINDOW`] on, past which no evidence that could decide
     /// the leg can still be taken.
+    ///
+    /// [`CLAIM_WINDOW`] is this window's figure, derived for it: the
+    /// span an absence has to be provable in, floored so a reclaim can
+    /// be composed at all and so a reshape successor can decide a record
+    /// it inherited. That [`Self::Owed`] currently ends at the same
+    /// instant is arithmetic, not a shared reason.
     LegEntry,
 }
 
@@ -166,7 +171,10 @@ impl Window {
     pub fn of(self, deadline: Deadline) -> Range<WeightedTimestamp> {
         let at = deadline.at();
         match self {
-            Self::Delivery => deadline.validity_end()..at.plus(CLAIM_WINDOW),
+            Self::Owed => {
+                let validity_end = deadline.validity_end();
+                validity_end..validity_end.plus(Duration::from_millis(CROSSING_GRACE_MS))
+            }
             Self::Core => at..at.plus(MAX_VALIDITY_RANGE * 2),
             Self::LegEntry => at..at.plus(CLAIM_WINDOW),
         }
@@ -177,17 +185,17 @@ impl Window {
 /// refusing a second inclusion has to remember it.
 ///
 /// A transaction is admissible while its validity range contains the
-/// anchor, and past that only as a delivery — to the close of
-/// [`Window::Delivery`], which is the expiry the record a delivery
-/// consumes states.
+/// anchor, and past that only as a member consuming an owed crossing —
+/// to the close of [`Window::Owed`], the expiry that crossing's record
+/// states.
 ///
-/// Only a transaction with an outbound leg has a delivery to be admitted
-/// as, and settling a placement onto the legs promotes toward the core
-/// and never to [`LegRole::Outbound`], so the stored roles answer this
-/// without one. That is what lets an index ask it off the body alone,
-/// and it is what keeps the ordinary transaction — one carrying no
-/// crossing at all — out of a window sized for the one shape that needs
-/// it: the delivery window is a [`CLAIM_WINDOW`] where a deadline is one
+/// Only a transaction with an outbound leg issues an owed crossing, and
+/// settling a placement onto the legs promotes toward the core and never
+/// to [`LegRole::Outbound`], so the stored roles answer this without
+/// one. That is what lets an index ask it off the body alone, and it is
+/// what keeps the ordinary transaction — one carrying no crossing at
+/// all — out of a window sized for the one shape that needs it: an owed
+/// crossing's grace is a [`CLAIM_WINDOW`] where a deadline is one
 /// [`MAX_FINALIZATION_DELAY`], and an index holding every committed
 /// transaction to the wider of the two is holding the whole of a shard's
 /// traffic for the sake of the crossings in it.
@@ -195,7 +203,7 @@ impl Window {
 pub fn admissible_until(tx: &Transaction) -> WeightedTimestamp {
     let deadline = Deadline::of_transaction(tx);
     if tx.legs().iter().any(|leg| leg.role == LegRole::Outbound) {
-        Window::Delivery.of(deadline).end
+        Window::Owed.of(deadline).end
     } else {
         deadline.at()
     }
@@ -362,7 +370,7 @@ mod tests {
     fn the_delivery_window_opens_at_the_validity_end_and_closes_at_the_expiry() {
         let validity_end = ms(60_000);
         let deadline = Deadline::of(validity_end);
-        let window = Window::Delivery.of(deadline);
+        let window = Window::Owed.of(deadline);
         assert_eq!(window.start, validity_end);
         assert_eq!(window.end, deadline.at().plus(CLAIM_WINDOW));
         assert_eq!(
@@ -455,21 +463,42 @@ mod tests {
         assert!(!Probed::Core.absence_answers_at(core.end, deadline));
         assert!(!Probed::Core.absence_answers_at(core.end.plus(Duration::from_secs(60)), deadline));
 
-        let sweep = validity_end.plus(Duration::from_millis(CROSSING_GRACE_MS));
         assert_eq!(
             Window::LegEntry.of(deadline),
-            core.start..sweep,
-            "a leg entry stands to the sweep of the claim cell it is decided against",
+            core.start..deadline.at().plus(CLAIM_WINDOW),
+            "a leg entry stands one claim window past the deadline, which is the \
+             span an absence has to be provable in",
+        );
+    }
+
+    /// Each window against the figure it is derived from, not against
+    /// the other.
+    ///
+    /// They end at the same instant today, and for unrelated reasons: a
+    /// leg entry stands a [`CLAIM_WINDOW`] past the deadline, floored so
+    /// an absence can be proved and a reclaim composed; an owed crossing
+    /// is claimable to the expiry its own record states. Asserting one
+    /// against the other would make a change to either look like a
+    /// change to both.
+    #[test]
+    fn each_window_is_read_off_its_own_figure() {
+        let validity_end = ms(60_000);
+        let deadline = Deadline::of(validity_end);
+
+        assert_eq!(
+            Window::Owed.of(deadline),
+            validity_end..validity_end.plus(Duration::from_millis(CROSSING_GRACE_MS)),
+            "an owed crossing is claimable to the expiry its record states",
         );
         assert_eq!(
-            Window::Delivery.of(deadline).end,
-            sweep,
-            "and a delivery is admissible to the same instant",
+            Window::LegEntry.of(deadline),
+            deadline.at()..deadline.at().plus(CLAIM_WINDOW),
+            "a leg entry stands the span an absence answers in",
         );
         assert_eq!(
-            Window::LegEntry.of(deadline).end,
-            Window::Delivery.of(deadline).end,
-            "one clock for the entry that owes a delivery and the delivery itself",
+            Window::Core.of(deadline),
+            deadline.at()..deadline.at().plus(MAX_VALIDITY_RANGE * 2),
+            "a core's absence answers for one range to refuse in and one to read it",
         );
     }
 
@@ -502,7 +531,7 @@ mod tests {
             validity_end,
             deadline.at(),
             deadline.at().plus(MAX_VALIDITY_RANGE),
-            Window::Delivery.of(deadline).end,
+            Window::Owed.of(deadline).end,
             deadline.at().plus(CLAIM_WINDOW),
         ] {
             assert!(

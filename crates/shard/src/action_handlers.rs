@@ -2361,7 +2361,7 @@ mod tests {
         assert!(verify(end, &late), "admitted at the validity end");
         assert!(
             verify(
-                Window::Delivery
+                Window::Owed
                     .of(Deadline::of(end))
                     .end
                     .minus(Duration::from_millis(1)),
@@ -2370,7 +2370,7 @@ mod tests {
             "and to the last moment of the window"
         );
         assert!(
-            !verify(Window::Delivery.of(Deadline::of(end)).end, &late),
+            !verify(Window::Owed.of(Deadline::of(end)).end, &late),
             "refused at the close"
         );
         assert!(!verify(end, &HashSet::new()), "and refused unnamed");

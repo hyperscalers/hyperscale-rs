@@ -206,7 +206,7 @@ pub fn select_transactions(
             let range = tx.validity_range();
             let admitted = range.contains(ctx.anchor)
                 || (prefilter.late_deliveries.contains(&h)
-                    && Window::Delivery
+                    && Window::Owed
                         .of(Deadline::of(range.end_timestamp_exclusive))
                         .contains(&ctx.anchor));
             if !range.is_well_formed(ctx.anchor) || !admitted {
@@ -1247,7 +1247,7 @@ mod tests {
         );
         assert_eq!(
             select(
-                Window::Delivery
+                Window::Owed
                     .of(Deadline::of(end))
                     .end
                     .minus(Duration::from_millis(1))
@@ -1256,7 +1256,7 @@ mod tests {
             "and to the last moment of its window"
         );
         assert!(
-            select(Window::Delivery.of(Deadline::of(end)).end).is_empty(),
+            select(Window::Owed.of(Deadline::of(end)).end).is_empty(),
             "the close drops it"
         );
     }

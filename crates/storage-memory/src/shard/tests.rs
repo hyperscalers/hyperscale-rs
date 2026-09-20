@@ -669,7 +669,7 @@ fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
     assert_eq!(
         window.committed,
         vec![
-            (delivering_hash, Window::Delivery.of(ends_at).end),
+            (delivering_hash, Window::Owed.of(ends_at).end),
             (plain_hash, ends_at.at()),
         ],
         "a delivery's window and an ordinary deadline, and nothing the \

@@ -1584,7 +1584,7 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
     if !banked {
         let clock = WeightedTimestamp::ZERO.plus(c.now());
         assert!(
-            clock >= Window::Delivery.of(Deadline::of(validity_end)).end,
+            clock >= Window::Owed.of(Deadline::of(validity_end)).end,
             "the route must bank its output for the trader while its delivery window is open; \
              holds {} against {paid}",
             held(c, route.trader.address(), *PROTOCOL_RESOURCE),

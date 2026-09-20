@@ -452,7 +452,7 @@ mod tests {
         let tx = delivering_tx_with_end(1, 100);
         let tx_hash = tx.hash();
         let deadline = Deadline::of(WeightedTimestamp::from_millis(100));
-        let close = Window::Delivery.of(deadline).end;
+        let close = Window::Owed.of(deadline).end;
         idx.register_committed_txs(std::slice::from_ref(&tx));
 
         idx.prune(WeightedTimestamp::from_millis(101));
@@ -493,7 +493,7 @@ mod tests {
         idx.register_committed_txs(&[early, later]);
 
         idx.prune(
-            Window::Delivery
+            Window::Owed
                 .of(Deadline::of(WeightedTimestamp::from_millis(500)))
                 .end,
         );

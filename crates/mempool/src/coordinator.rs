@@ -1051,7 +1051,7 @@ impl MempoolCoordinator {
             )
             .only_delivers_at(self.local_shard);
         if delivers {
-            Window::Delivery.of(Deadline::of(validity_end)).end
+            Window::Owed.of(Deadline::of(validity_end)).end
         } else {
             validity_end
         }

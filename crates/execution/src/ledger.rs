@@ -2533,7 +2533,7 @@ mod tests {
 
         for at in [
             deadline.at(),
-            Window::Delivery.of(deadline).end,
+            Window::Owed.of(deadline).end,
             horizon,
             horizon.plus(MAX_VALIDITY_RANGE),
         ] {
