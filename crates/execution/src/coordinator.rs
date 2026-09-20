@@ -77,7 +77,7 @@ use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalizations::FinalizationStore;
 use crate::gate::{Attested, Gate, gate_certificate};
-use crate::ledger::{Ledger, Settleable, Unanswerable};
+use crate::ledger::{Delivering, Ledger, Settleable, Unanswerable};
 use crate::lookups::{
     assign_participants, attesting_committee, build_provision_requests, ec_has_shard_quorum_power,
     fetch_keys_covered, peers_excluding_self,
@@ -1103,6 +1103,64 @@ impl ExecutionCoordinator {
         let candidates = &self.candidates;
         self.provisioning
             .sweep(self.committed_ts, |tx_hash| candidates.contains(tx_hash));
+    }
+
+    /// Offer again every delivery this shard still owes that no
+    /// candidate and no tick is holding.
+    ///
+    /// A delivery bears no verdict and is never abandoned, so nothing
+    /// but its own finalization ends the entry — while a candidate is a
+    /// tick's rather than the chain's, and a discarded tick releases the
+    /// member it held with nothing left to run it. The entry is the
+    /// chain's, so the member is composed from the entry again here.
+    ///
+    /// Read off committed content alone — the ledger is a fold over
+    /// committed blocks, a tick is released on committed content, and
+    /// the candidate set follows both — so every replica at one frontier
+    /// offers the same members.
+    fn reoffer_standing_deliveries(&mut self, topology_schedule: &TopologySchedule) {
+        let local_shard = self.local_shard;
+        for Delivering {
+            tx_hash,
+            body,
+            classified,
+            committed,
+        } in self.counterparts.ledger.standing_deliveries()
+        {
+            if self.candidates.contains(tx_hash) || self.ticks.tick_assignment(tx_hash).is_some() {
+                continue;
+            }
+            // The table the committing block's own committee named,
+            // which is what a member reaching an engine has to attest.
+            // A window this chain no longer retains prices nothing, and
+            // the entry stands until one does.
+            let Some(window) = topology_schedule.at(committed.committee_anchor) else {
+                continue;
+            };
+            // The participants the commit assigned, read off the body
+            // through the trie its classification was frozen under —
+            // the same derivation against the same placement, so the
+            // member offered is the member the commit registered.
+            let Some(trie) = classified.placement() else {
+                continue;
+            };
+            let participating: BTreeSet<ShardId> = body
+                .routing()
+                .all_prefixes()
+                .into_iter()
+                .map(|prefix| trie.shard_for_prefix(prefix))
+                .collect();
+            let member = Member::of(
+                classified.clone(),
+                local_shard,
+                Side::Delivering,
+                participating,
+            );
+            self.provisioning
+                .record_required(tx_hash, requirements_of(&member, body.legs()));
+            self.candidates
+                .register_member(body, member, committed.anchor, window.prices());
+        }
     }
 
     /// Admit into the tick being composed every reclaim a committed
@@ -2896,6 +2954,10 @@ impl ExecutionCoordinator {
                 .on_commit(trie, topology_schedule, block, self.committed_ts);
         let mut actions = committed.actions;
         self.release_unanswerable(&committed.unanswerable);
+        // After the prune, so a delivery the ledger has let go of is not
+        // offered again, and after the release, so one just resolved is
+        // not either.
+        self.reoffer_standing_deliveries(topology_schedule);
 
         // Timeout checks + pruning run every block, not just commits that
         // carry txs.
@@ -10275,6 +10337,70 @@ mod tests {
         assert!(
             state.counterparts.ledger.retirable().is_empty(),
             "and the ledger has handed it to the tick"
+        );
+    }
+
+    /// A delivery whose candidate went is offered again off the entry
+    /// the chain still holds.
+    ///
+    /// A candidate is a tick's: a discarded tick releases the member it
+    /// held and leaves nothing to run it. The entry is the chain's, and
+    /// a delivery's entry is never abandoned — the crossing it claims is
+    /// this shard's — so the member is composed from the entry again at
+    /// the next commit rather than being lost with the tick.
+    #[test]
+    fn a_standing_delivery_is_offered_again_when_its_candidate_goes() {
+        let schedule = delivery_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tx = straddling_transaction(1);
+        let tx_hash = tx.hash();
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block_on_shard(
+                    HOME,
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx.clone())],
+                ),
+                1_000,
+            ),
+        );
+        state.counterparts.ledger.seed(tx_hash, delivery_part(&tx));
+        assert!(
+            state.candidates.contains(tx_hash),
+            "the commit registered a member for it",
+        );
+
+        // The tick that held it is discarded: the candidate goes with
+        // the tick, and the entry stands.
+        state.candidates.remove(tx_hash);
+        assert!(
+            state.counterparts.ledger.contains(tx_hash),
+            "the entry is the chain's and stands without it",
+        );
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block_on_shard(
+                    HOME,
+                    BlockHeight::new(2),
+                    2_000,
+                    ValidatorId::new(0),
+                    vec![],
+                ),
+                2_000,
+            ),
+        );
+        assert!(
+            state.candidates.contains(tx_hash) || state.ticks.tick_assignment(tx_hash).is_some(),
+            "the next commit runs the member again off the standing entry: \
+             candidate={} tick={:?}",
+            state.candidates.contains(tx_hash),
+            state.ticks.tick_assignment(tx_hash),
         );
     }
 

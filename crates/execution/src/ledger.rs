@@ -223,8 +223,9 @@ pub enum Part {
     /// all.
     ///
     /// Keeps the body and the classification its delivery runs under,
-    /// so what the entry owes is stated on the entry rather than only
-    /// in the candidate waiting beside it.
+    /// which is what lets the shard compose the member again when no
+    /// candidate is left holding it: a candidate is a tick's, and a
+    /// discarded tick would otherwise take the delivery with it.
     Delivery(Kept),
     /// A leg outside the core, held for the settlement of what it
     /// issued: never abandoned, probed past the deadline, released by
@@ -519,6 +520,27 @@ pub struct Settleable {
     /// commits, which is before a retirement can be composed for it — so
     /// only a reclaim ever reads a `false` here.
     pub(crate) charged: bool,
+}
+
+/// A delivery this shard still owes, with what its member is composed
+/// from.
+///
+/// Everything here is the entry's own: the body and the classification
+/// it keeps, and where its committing block sat. A shard that lost the
+/// candidate — a tick discarded, a chain terminated — reads the same
+/// terms off the ledger that the commit gave the candidate, so the
+/// member it offers again is the member it registered.
+#[derive(Debug, Clone)]
+pub struct Delivering {
+    /// The transaction.
+    pub(crate) tx_hash: TxHash,
+    /// Its body, which the delivering member runs.
+    pub(crate) body: Arc<Verified<Transaction>>,
+    /// The classification its committing block froze.
+    pub(crate) classified: Classified,
+    /// Where this chain committed it: the clock the member executes
+    /// under, and the committee anchor its prices are read off.
+    pub(crate) committed: CommittedAt,
 }
 
 /// One cell a counterpart is asked about for one transaction: which
@@ -899,6 +921,34 @@ impl Ledger {
             }
         }
         questions
+    }
+
+    /// Every delivery this shard still owes, with what each member is
+    /// composed from.
+    ///
+    /// A delivery runs on no clock of its own: the crossing it claims is
+    /// this shard's from the moment the core committed it, so the entry
+    /// stands until the delivery's own finalization commits. What the
+    /// member is composed from is stated on the entry rather than only
+    /// in the candidate beside it, so a delivery whose candidate went is
+    /// offered again off the chain.
+    ///
+    /// Read off committed content alone, like [`Self::reclaimable`], so
+    /// every replica at one frontier offers the same members.
+    #[must_use]
+    pub(crate) fn standing_deliveries(&self) -> Vec<Delivering> {
+        self.owed
+            .iter()
+            .filter_map(|(&tx_hash, owed)| match &owed.part {
+                Part::Delivery(kept) => Some(Delivering {
+                    tx_hash,
+                    body: Arc::clone(&kept.body),
+                    classified: kept.classified.clone(),
+                    committed: owed.figures.committed,
+                }),
+                Part::Whole | Part::Leg(_) | Part::Core(_) | Part::Remainder(_) => None,
+            })
+            .collect()
     }
 
     /// Whether this ledger still holds `tx_hash`.
