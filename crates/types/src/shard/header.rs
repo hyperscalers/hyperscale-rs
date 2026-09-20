@@ -10,10 +10,10 @@ use thiserror::Error;
 use crate::{
     AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
     CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, PredecessorTerminal,
-    ProposerTimestamp, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
-    SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier,
-    TerminalRoots, TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify,
-    WeightedTimestamp,
+    ProposerTimestamp, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReofferRoot,
+    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot,
+    StateRoot, SweepFrontier, TerminalRoots, TransactionRoot, TxsInFlight, ValidatorId, Verifiable,
+    Verified, Verify, WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -82,6 +82,10 @@ pub struct BlockHeader {
     /// read.
     abandonment_root: AbandonmentRoot,
     state_claims_root: StateClaimsRoot,
+    /// Commits the block's [`CrossingReoffer`](crate::CrossingReoffer)
+    /// offers — which crossings it promises a consumer again, and the
+    /// record cells each bundle is built from.
+    reoffer_root: ReofferRoot,
     txs_in_flight: TxsInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
@@ -187,6 +191,7 @@ pub struct BlockHeaderParts {
     pub provision_tx_roots: ProvisionTxRootsMap,
     pub abandonment_root: AbandonmentRoot,
     pub state_claims_root: StateClaimsRoot,
+    pub reoffer_root: ReofferRoot,
     pub txs_in_flight: TxsInFlight,
     pub settled_tick_frontier: BlockHeight,
     pub sweep_frontier: SweepFrontier,
@@ -219,6 +224,7 @@ impl Default for BlockHeaderParts {
             provision_tx_roots: Capped::default(),
             abandonment_root: AbandonmentRoot::ZERO,
             state_claims_root: StateClaimsRoot::ZERO,
+            reoffer_root: ReofferRoot::ZERO,
             txs_in_flight: TxsInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -255,6 +261,7 @@ impl BlockHeader {
             provision_tx_roots,
             abandonment_root,
             state_claims_root,
+            reoffer_root,
             txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -283,6 +290,7 @@ impl BlockHeader {
             provision_tx_roots,
             abandonment_root,
             state_claims_root,
+            reoffer_root,
             txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -574,6 +582,14 @@ impl BlockHeader {
         self.state_claims_root
     }
 
+    /// Merkle root over the crossing re-offers the block carries — the
+    /// consumers it promises a bundle to again, and the record cells
+    /// each bundle is built from.
+    #[must_use]
+    pub const fn reoffer_root(&self) -> ReofferRoot {
+        self.reoffer_root
+    }
+
     /// Approximate number of in-flight transactions on this shard at proposal time.
     ///
     /// "In-flight" = committed + executed transactions in the proposer's mempool,
@@ -743,6 +759,7 @@ impl BlockHeader {
             provision_tx_roots: self.provision_tx_roots,
             abandonment_root: self.abandonment_root,
             state_claims_root: self.state_claims_root,
+            reoffer_root: self.reoffer_root,
             txs_in_flight: self.txs_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,

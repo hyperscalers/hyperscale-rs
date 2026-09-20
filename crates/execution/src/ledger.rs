@@ -25,10 +25,10 @@ use std::sync::Arc;
 use hyperscale_engine::legs::{Classified, Licence};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE,
-    PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Window,
+    AbandonmentRecord, CommittedAt, CrossingReoffer, Deadline, Finalization, Inclusion,
+    MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, PriceTable, Probed, RoutePrefix, ShardId,
+    ShardTrie, SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx,
+    Verifiable, Verified, WeightedTimestamp, Window,
 };
 
 /// What the chain read of one cell a counterpart was asked about:
@@ -98,6 +98,24 @@ struct Owed {
     /// saying it succeeded is not the transaction accepted — that is
     /// every core shard saying so, and this is the count.
     accepted: BTreeSet<ShardId>,
+    /// The consumers whose own certificate has reported taking what
+    /// this entry issued them.
+    ///
+    /// Not evidence — the claim cell proved present is that, and it is
+    /// what closes the entry. What a success does say is that the
+    /// crossing reached its consumer, so there is nothing to offer
+    /// again: a bundle that went missing leaves a consumer that never
+    /// ran and never spoke, which is the whole case an offer is for.
+    spoke: BTreeSet<ShardId>,
+    /// When a block of this shard's last offered each consumer the
+    /// crossings it is owed here.
+    ///
+    /// The chain's, like every other term of the entry: an offer counts
+    /// once it is committed, so an offer a proposer composed and lost
+    /// with its round is not one the next proposal skips. What it buys
+    /// is that a crossing is promised again no faster than a promise
+    /// could have been answered.
+    reoffered: BTreeMap<ShardId, WeightedTimestamp>,
     /// What the chain has read of the cells counterparts were asked
     /// about, by the shard each was read on and the cell.
     ///
@@ -110,6 +128,25 @@ struct Owed {
 }
 
 impl Owed {
+    /// Whether a crossing owed to `target` may be offered again at
+    /// `now`: either nothing has offered it, or the last offer is old
+    /// enough that an answer would have come back.
+    ///
+    /// Read beside [`Self::spoke`], which is the first question: a
+    /// consumer that has run needs nothing offered to it, and this only
+    /// paces the ones that have not.
+    ///
+    /// [`MAX_FINALIZATION_DELAY`] is that span by definition — the
+    /// longest a cross-shard transaction may take to finalize past the
+    /// block that could have carried it — and a delivery answering an
+    /// offer is exactly one such round: the bundle out, the delivery
+    /// committed, its certificate back.
+    fn offerable(&self, target: ShardId, now: WeightedTimestamp) -> bool {
+        self.reoffered
+            .get(&target)
+            .is_none_or(|&at| now.elapsed_since(at) >= MAX_FINALIZATION_DELAY)
+    }
+
     /// Whether the chain read `claim` present on some shard: the
     /// consumer holds the crossing the cell was asked about.
     fn claimed(&self, claim: SubstateKey) -> bool {
@@ -496,6 +533,18 @@ impl Kept {
     }
 }
 
+/// One consumer's crossings in one transaction that no claim has
+/// answered, and the record cells an offer of them carries.
+#[derive(Debug, Clone)]
+pub struct Outstanding {
+    /// The transaction the crossings belong to.
+    pub tx_hash: TxHash,
+    /// The shard holding the prefix of every claim here, now.
+    pub target: ShardId,
+    /// The record cells standing for them on this shard.
+    pub records: Vec<SubstateKey>,
+}
+
 /// A leg entry a committed record has licensed a settlement of, with
 /// what the settlement is composed from.
 ///
@@ -721,6 +770,8 @@ impl Ledger {
                 departed_by: None,
                 cued: None,
                 accepted: BTreeSet::new(),
+                spoke: BTreeSet::new(),
+                reoffered: BTreeMap::new(),
                 readings: BTreeMap::new(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
@@ -840,9 +891,10 @@ impl Ledger {
     /// and every member reads it off the same certificate. Where more
     /// than one consumer speaks, the earliest stands — the entry is
     /// asked about as soon as any cell it waits on could be there.
-    pub(crate) fn cue_probe(&mut self, tx_hash: TxHash, at: WeightedTimestamp) {
+    pub(crate) fn cue_probe(&mut self, tx_hash: TxHash, shard: ShardId, at: WeightedTimestamp) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.cued = Some(owed.cued.map_or(at, |cued| cued.min(at)));
+            owed.spoke.insert(shard);
         }
     }
 
@@ -921,6 +973,91 @@ impl Ledger {
             }
         }
         questions
+    }
+
+    /// Every crossing this shard issued that no claim has answered,
+    /// grouped by the shard owed it now.
+    ///
+    /// The mirror of [`Self::standing_deliveries`] on the issuing side.
+    /// A delivering shard learns it is owed anything only when a bundle
+    /// arrives, so nothing it holds can start the offer; the issuer
+    /// holds the whole account — which crossings it issued, which shard
+    /// each claim belongs to, and what the chain has read of each — and
+    /// is the side that can.
+    ///
+    /// Only an entry the chain says has already issued its records: a
+    /// leg whose own finalization committed, or a core issuer its
+    /// verdict resolved. Before that the record cell does not exist,
+    /// and a bundle promising it would carry nothing while telling its
+    /// consumer the transaction's evidence had arrived. The same gate
+    /// [`Self::questions`] asks a delivery's claim behind, for the same
+    /// reason.
+    ///
+    /// `trie` is the offering block's committee's, so a claim follows
+    /// its prefix across a cut to the successor that would deliver it.
+    /// Read off committed content alone, like [`Self::reclaimable`], so
+    /// every replica at one frontier offers the same crossings.
+    #[must_use]
+    pub(crate) fn unclaimed_crossings(
+        &self,
+        trie: &ShardTrie,
+        now: WeightedTimestamp,
+    ) -> Vec<Outstanding> {
+        let local = self.local;
+        let mut outstanding = Vec::new();
+        for (&tx_hash, owed) in &self.owed {
+            let Some(kept) = owed.part.settling() else {
+                continue;
+            };
+            if !owed.part.is_leg() {
+                continue;
+            }
+            // Past the deadline, where a probe asks its questions and
+            // for the same reason: short of it the crossing's own
+            // bundle may still be in flight, and every shard the
+            // transaction reaches is still working on it. An offer
+            // before then promises again what nothing has yet failed to
+            // deliver — one bundle per crossing in flight, every
+            // window, for a loss that has not happened.
+            if now < owed.figures.deadline.at() {
+                continue;
+            }
+            let mut by_target: BTreeMap<ShardId, Vec<SubstateKey>> = BTreeMap::new();
+            for crossing in kept.classified.delivered_crossings(local) {
+                if owed.claimed(crossing.claim) {
+                    continue;
+                }
+                by_target
+                    .entry(trie.shard_for_prefix(crossing.claim.owner))
+                    .or_default()
+                    .push(crossing.record);
+            }
+            outstanding.extend(
+                by_target
+                    .into_iter()
+                    .filter(|(target, _)| {
+                        *target != local
+                            && !owed.spoke.contains(target)
+                            && owed.offerable(*target, now)
+                    })
+                    .map(|(target, records)| Outstanding {
+                        tx_hash,
+                        target,
+                        records,
+                    }),
+            );
+        }
+        outstanding
+    }
+
+    /// Note that a committed block of this shard's offered `reoffers`
+    /// again at `at`.
+    pub(crate) fn record_reoffers(&mut self, at: WeightedTimestamp, reoffers: &[CrossingReoffer]) {
+        for offer in reoffers {
+            if let Some(owed) = self.owed.get_mut(&offer.tx_hash) {
+                owed.reoffered.insert(offer.target, at);
+            }
+        }
     }
 
     /// Every delivery this shard still owes, with what each member is
@@ -1060,6 +1197,18 @@ impl Ledger {
             .collect()
     }
 
+    /// Close an entry whose crossings every consumer has claimed and
+    /// whose records are none of this entry's to settle.
+    ///
+    /// The retirement of a delivering record is the leaf's, so an entry
+    /// that issued only those has nothing to compose and no member
+    /// whose finalization would release it. What licenses the close is
+    /// the same committed readings [`Self::retirable`] reads, so every
+    /// replica at one frontier closes the same entries.
+    pub(crate) fn close_retired(&mut self, tx_hash: TxHash) {
+        self.owed.remove(&tx_hash);
+    }
+
     /// Record that a tick of this shard's has admitted the retirement
     /// of `tx_hash`'s records, so the finalization naming the hash next
     /// is the retirement's and releases the entry.
@@ -1131,6 +1280,8 @@ impl Ledger {
                         departed_by: Some(record.shard()),
                         cued: None,
                         accepted: BTreeSet::new(),
+                        spoke: BTreeSet::new(),
+                        reoffered: BTreeMap::new(),
                         readings: BTreeMap::new(),
                     },
                 );
@@ -2475,6 +2626,104 @@ mod tests {
             ledger.reclaimable().len(),
             1,
             "and the record licenses the reclaim"
+        );
+    }
+
+    /// A crossing an outbound leg consumes is offered again by the
+    /// shard that issued it, to whoever holds the claim's prefix, from
+    /// its deadline until a reading answers the claim present.
+    ///
+    /// The issuer is the only side that can start this: the delivering
+    /// shard holds no entry until a bundle reaches it, so nothing it
+    /// knows says a crossing is owed.
+    #[test]
+    fn an_unclaimed_crossing_is_offered_again_until_its_claim_is_read() {
+        let mut ledger = Ledger::new(LOCAL);
+        let leg = tx(6, 60_000);
+        commit_as(&mut ledger, &leg, &delivering());
+        ledger.certify(leg.hash());
+        let (_, claim) = delivered_claim(&delivering());
+        let deadline = Deadline::of(ms(60_000));
+
+        // Short of the deadline the crossing's own bundle may still be
+        // in flight, and nothing has failed to deliver it yet.
+        assert!(
+            ledger
+                .unclaimed_crossings(
+                    &delivery_trie(),
+                    deadline.at().minus(Duration::from_secs(1))
+                )
+                .is_empty(),
+            "a crossing is not offered again before anything could have lost it",
+        );
+
+        let now = deadline.at();
+        let offered = ledger.unclaimed_crossings(&delivery_trie(), now);
+        assert_eq!(offered.len(), 1, "the one crossing it issued is owed");
+        assert_eq!(offered[0].tx_hash, leg.hash());
+        assert_eq!(
+            offered[0].target, DELIVERER,
+            "offered to whoever holds the claim's prefix now",
+        );
+        assert_eq!(
+            offered[0].records,
+            delivering().records_issued(LOCAL),
+            "and carries the record cells a bundle is built from",
+        );
+
+        // An offer a block carried is not made again until an answer
+        // could have come back.
+        ledger.record_reoffers(
+            now,
+            &[CrossingReoffer::new(
+                DELIVERER,
+                leg.hash(),
+                offered[0].records.clone(),
+            )],
+        );
+        assert!(
+            ledger.unclaimed_crossings(&delivery_trie(), now).is_empty(),
+            "a crossing just promised is not promised again"
+        );
+        assert_eq!(
+            ledger
+                .unclaimed_crossings(&delivery_trie(), now.plus(MAX_FINALIZATION_DELAY))
+                .len(),
+            1,
+            "and is, once the promise could have been answered",
+        );
+
+        // An absent claim is not an answer: the delivery may still run.
+        ledger.record_reading(
+            leg.hash(),
+            DELIVERER,
+            claim,
+            Probed::Delivery,
+            Inclusion::Absent,
+        );
+        assert_eq!(
+            ledger
+                .unclaimed_crossings(&delivery_trie(), now.plus(MAX_FINALIZATION_DELAY))
+                .len(),
+            1,
+            "an absence says the delivery has not run, not that it never will",
+        );
+
+        let mut claimed = Ledger::new(LOCAL);
+        commit_as(&mut claimed, &leg, &delivering());
+        claimed.certify(leg.hash());
+        claimed.record_reading(
+            leg.hash(),
+            DELIVERER,
+            claim,
+            Probed::Delivery,
+            Inclusion::Present([0xAB; 32]),
+        );
+        assert!(
+            claimed
+                .unclaimed_crossings(&delivery_trie(), now)
+                .is_empty(),
+            "a claim read present is the end of the obligation",
         );
     }
 

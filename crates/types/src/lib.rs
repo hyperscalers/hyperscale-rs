@@ -118,7 +118,8 @@ pub use primitives::hash_kinds::{
     AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
     CommittedTxsRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
-    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
+    ReofferRoot, RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TransactionRoot, TxHash,
+    WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex,
@@ -156,6 +157,7 @@ pub use shard::commit_proof::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
 };
 pub use shard::counterpart_mirror::CounterpartMirror;
+pub use shard::crossing_reoffer::CrossingReoffer;
 pub use shard::demands::{CheckOutcome, DeferOn, Demands, VerificationKind};
 pub use shard::evidence::{
     ShardForkProof, ShardForkProofVerifyError, ShardVoteEquivocation, ShardVoteEquivocationContext,
@@ -172,7 +174,7 @@ pub use shard::limits::{
     MAX_BLOCK_READ_BYTES, MAX_BLOCK_RETENTION_BYTES, MAX_BLOCK_WRITE_BYTES, MAX_CELLS_PER_QUERY,
     MAX_CELLS_RESPONSE_BYTES, MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK, MAX_ROUND_GAP,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
     MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
@@ -202,9 +204,9 @@ pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
 pub use shard::{
-    Block, SharedCertificates, SharedProvisions, SharedTransactions, SharedWitnessSources,
-    TerminalRef, VerifiedBlockAssembleError, WitnessSources, derive_block_transactions,
-    fees_over_certificates,
+    Block, SharedCertificates, SharedProvisions, SharedReoffers, SharedTransactions,
+    SharedWitnessSources, TerminalRef, VerifiedBlockAssembleError, WitnessSources,
+    derive_block_transactions, fees_over_certificates,
 };
 pub use signing::{
     BeaconRevealMessage, BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage,

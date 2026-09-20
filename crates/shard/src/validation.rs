@@ -18,14 +18,14 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, LeafRoot, LocalTimestamp,
-    MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad,
-    StateClaimsRoot, TopologySnapshot, Transaction, Verifiable, VoteCount,
+    MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ReofferRoot,
+    ShardId, ShardLoad, StateClaimsRoot, TopologySnapshot, Transaction, Verifiable, VoteCount,
 };
 
 use crate::admission::{
     Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
-    RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
-    TransactionsSection, admit_all, unwrapped,
+    RecordsFold, RecordsSection, ReoffersFold, ReoffersSection, StateClaimsFold,
+    StateClaimsSection, TransactionsFold, TransactionsSection, admit_all, unwrapped,
 };
 
 /// True if `qc.signers()` represents at least 2f+1 of the local committee's
@@ -319,7 +319,7 @@ fn validate_block_work(
 /// section's items through the one [`Section`] predicate the proposer
 /// selected them by, in the order the folds depend on: provisions, the
 /// transactions they engage, finalizations, the records held to their
-/// names, state claims. Returns a single diagnostic on the first failure
+/// names, state claims, crossing re-offers. Returns a single diagnostic on the first failure
 /// so the caller can log once.
 pub fn validate_block_for_vote(
     ctx: &Admission<'_>,
@@ -367,11 +367,13 @@ pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<RecordsSection<'_>>(ctx, &mut records, block.abandonment_records())?;
     let mut state_claims = StateClaimsFold::default();
     admit_all::<StateClaimsSection>(ctx, &mut state_claims, block.state_claims())?;
+    let mut reoffers = ReoffersFold::default();
+    admit_all::<ReoffersSection>(ctx, &mut reoffers, block.reoffers())?;
     Ok(transactions.budget)
 }
 
-/// The header's abandonment root and state-claims root commit the
-/// sections they claim.
+/// The header's abandonment root, state-claims root and re-offer root
+/// commit the sections they claim.
 ///
 /// What this establishes is that every replica reads the same section:
 /// the root binds the items to the header, and the canonical order the
@@ -391,6 +393,13 @@ pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
     if computed != claimed {
         return Err(format!(
             "state claims root {claimed:?} does not commit the block's claims {computed:?}"
+        ));
+    }
+    let computed = ReofferRoot::over(block.reoffers());
+    let claimed = block.header().reoffer_root();
+    if computed != claimed {
+        return Err(format!(
+            "re-offer root {claimed:?} does not commit the block's offers {computed:?}"
         ));
     }
     Ok(())
@@ -431,6 +440,12 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
         return Err(format!(
             "coast block past the terminal window carries {} state claims",
             block.state_claims().len()
+        ));
+    }
+    if !block.reoffers().is_empty() {
+        return Err(format!(
+            "coast block past the terminal window carries {} crossing re-offers",
+            block.reoffers().len()
         ));
     }
     Ok(())
@@ -1002,6 +1017,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -1019,6 +1035,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -1108,6 +1125,7 @@ mod tests {
                 Capped::new(verdicts).expect("a list written out in a test"),
             ),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1132,6 +1150,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
+            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1532,6 +1551,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -1681,6 +1701,7 @@ mod tests {
             certificates: Arc::new(Capped::from_array([Arc::new((*settled).clone().into())])),
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::from_array([AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
@@ -1771,6 +1792,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -1887,6 +1909,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -2141,6 +2164,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
         }
     }
 

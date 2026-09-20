@@ -329,7 +329,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 
     await_halt_recovery(c, &halt);
 
-    let owed = assert_deliveries_agree(c, halted, survivor, &probes, &at_freeze);
+    let undelivered = assert_deliveries_agree(c, halted, survivor, &probes, &at_freeze);
 
     // The recovered shard's cross-shard rail serves again: a fresh
     // transfer per direction settles on both chains and credits its
@@ -357,7 +357,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         revival_report(c, halted, survivor, &revived),
     );
 
-    assert_conserved_less_what_is_owed(c, &world, &charges, owed);
+    assert_conserved_less_what_is_owed(c, &world, &charges, &probes, &undelivered);
 }
 
 /// Two-sided conservation, less what the halt left owed: a survivor-paid
@@ -379,17 +379,20 @@ fn assert_conserved_less_what_is_owed<C: Cluster>(
     c: &mut C,
     world: &World,
     charges: &Charges,
-    owed: u128,
+    probes: &[Probe],
+    undelivered: &[usize],
 ) {
     assert!(
-        owed <= 4 * STRADDLER_PAYMENT,
+        owed_now(c, probes, undelivered) <= 4 * STRADDLER_PAYMENT,
         "only the doomed batch's two survivor-paid deliveries and the racing \
          batch's two can be left owed; nothing from the settling batch can, having \
-         finalized on both children before any fault installed. owed = {owed}",
+         finalized on both children before any fault installed. owed = {}",
+        owed_now(c, probes, undelivered),
     );
     let balanced = c.run_until(epochs(8), |c| {
-        world.held(c) + charges.burned(c) + owed == world.before()
+        world.held(c) + charges.burned(c) + owed_now(c, probes, undelivered) == world.before()
     });
+    let owed = owed_now(c, probes, undelivered);
     assert!(
         balanced,
         "a halt and its recovery: the world held {} before and {} after, with {} burned \
@@ -537,8 +540,11 @@ fn credited_once<C: Cluster>(c: &C, probe: &Probe) -> bool {
 /// paid for committed nowhere. A survivor-paid probe whose delivery
 /// window is still open lands on the recovered shard.
 ///
-/// Returns what the halt left owed: the payments of every survivor-paid
-/// probe that accepted and whose delivery has not landed.
+/// Returns which probes the halt left undelivered: every survivor-paid
+/// one that accepted and whose delivery has not landed. What they are
+/// holding is read where it is used — [`owed_now`] — rather than
+/// carried from here, because a crossing its issuer offers again is
+/// claimed whenever the offer lands.
 ///
 /// `at_freeze` is the halted chain's own view taken before the recovery:
 /// a commit or an accept in either that snapshot or the post-recovery
@@ -550,10 +556,25 @@ fn assert_deliveries_agree<C: Cluster>(
     survivor: ShardId,
     probes: &[Probe],
     at_freeze: &[ChainFate],
-) -> u128 {
+) -> Vec<usize> {
     let fate_on = |c: &C, shard: ShardId, idx: usize, hash: TxHash| {
         fate_including_freeze(c, halted, at_freeze, shard, idx, hash)
     };
+    // A recipient's commit and its credit are two blocks of its chain,
+    // and the crossing its issuer offers anew lands the first before the
+    // second. Recovery completing is therefore not the instant to read
+    // the pair at — a probe caught between them reads as credited
+    // nowhere while its chain says delivered. So settle first, bounded,
+    // and let the walk below report whatever is still astride.
+    let agreed = c.run_until(epochs(10), |c| {
+        probes.iter().enumerate().all(|(idx, probe)| {
+            let delivered = fate_on(c, probe.recipient_shard, idx, probe.hash)
+                .0
+                .is_some();
+            !delivered || credited_once(c, probe)
+        })
+    });
+    let _ = agreed;
     let mut report = String::new();
     let mut settled = 0u32;
     let mut doomed_nowhere = 0u32;
@@ -635,11 +656,13 @@ fn assert_deliveries_agree<C: Cluster>(
         "the settling batch finalized on both children before any fault installed, \
          so nothing of it can strand; undelivered probes = {undelivered:?}",
     );
-    owed_left_by(c, probes, &undelivered)
+    owed_left_by(c, probes, &undelivered);
+    undelivered
 }
 
-/// What the halt left owed, of the deliveries it did not land: the
-/// payments whose record cell is still standing.
+/// What the halt left owed, of the deliveries it did not land: that
+/// every record either went to its recipient or is still standing, and
+/// none of it came back to the payer.
 ///
 /// A record is value, and value is not swept on a clock — no arm of the
 /// sweep reaches a record cell. Nor does anything take one back: a
@@ -648,8 +671,8 @@ fn assert_deliveries_agree<C: Cluster>(
 /// payment still to be made rather than one returned to its payer.
 /// Either the recovered shard delivers it and the recipient is
 /// credited, or the record stands for whoever holds that prefix to
-/// claim whenever it can.
-fn owed_left_by<C: Cluster>(c: &mut C, probes: &[Probe], undelivered: &[usize]) -> u128 {
+/// claim whenever it can. The figure itself is [`owed_now`]'s.
+fn owed_left_by<C: Cluster>(c: &mut C, probes: &[Probe], undelivered: &[usize]) {
     for &idx in undelivered {
         assert!(
             !probes[idx].records.is_empty(),
@@ -676,11 +699,29 @@ fn owed_left_by<C: Cluster>(c: &mut C, probes: &[Probe], undelivered: &[usize]) 
             probe.payer_shard,
         );
     }
-    let owed = undelivered
+}
+
+/// What the probes the halt left undelivered are still owed right now:
+/// a payment whose record cell stands and whose recipient it has not
+/// reached.
+///
+/// Both terms, because the two overlap for as long as a delivery takes
+/// to be confirmed back to its issuer. The crossing is the recipient's
+/// the moment its delivery runs, and the record leaf holding its amount
+/// is deleted a step later — when the issuer reads the claim present
+/// and retires it. Counting the leaf across that step would add a
+/// payment the recipient already holds.
+///
+/// Read wherever the figure is used rather than carried from where it
+/// was first taken: a crossing its issuer offers again is claimed
+/// whenever the offer lands, which may be long after the walk that
+/// noticed it was outstanding.
+fn owed_now<C: Cluster>(c: &C, probes: &[Probe], undelivered: &[usize]) -> u128 {
+    let standing = undelivered
         .iter()
-        .filter(|&&idx| record_stands(c, &probes[idx]))
+        .filter(|&&idx| record_stands(c, &probes[idx]) && !credited_once(c, &probes[idx]))
         .count();
-    u128::try_from(owed).expect("a handful of probes") * STRADDLER_PAYMENT
+    u128::try_from(standing).expect("a handful of probes") * STRADDLER_PAYMENT
 }
 
 /// Whether any crossing `probe` issued is still sitting in its record

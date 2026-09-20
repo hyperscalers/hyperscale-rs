@@ -1867,7 +1867,7 @@ fn assert_train_fates<C: Cluster>(
             ) => 10,
             (owed, other, delivered) => panic!(
                 "a transfer sent {phase:?} and {taken} by the leaving shard owes {owed:?} and \
-                 reached {other:?}, delivered = {delivered}",
+                 reached {other:?}, delivered = {delivered}, tx = {hash}",
             ),
         };
         assert!(

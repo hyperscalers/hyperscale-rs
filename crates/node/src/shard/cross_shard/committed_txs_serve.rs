@@ -245,6 +245,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();

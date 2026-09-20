@@ -135,9 +135,13 @@ pub(crate) fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
 /// What a crossing record standing at `cell` still owes, in `resource`.
 ///
 /// Zero where the cell holds nothing, holds something that is not a
-/// record, or holds one denominated in another resource. A record is
-/// value the producing shard holds for a crossing its consumer has not
-/// claimed: it is in the world, and this is where.
+/// record, or holds one denominated in another resource — and zero once
+/// the consumer's claim cell is there, whatever the record still says.
+/// A record is value the producing shard holds for a crossing its
+/// consumer has **not** claimed; past the claim the value is in the
+/// recipient's vault and the leaf is a receipt awaiting deletion. The
+/// two overlap for as long as the retirement takes to be composed, and
+/// counting both would find a payment twice.
 pub(crate) fn owed_at<C: Cluster + ?Sized>(
     c: &C,
     cell: SubstateKey,
@@ -147,6 +151,11 @@ pub(crate) fn owed_at<C: Cluster + ?Sized>(
     c.substate(shard, cell.owner, cell.local.0)
         .and_then(|bytes| CrossingCell::from_bytes(&bytes))
         .filter(|record| record.resource == resource)
+        .filter(|record| {
+            let claim = record.consumer_claim;
+            c.substate(owning_shard(c, claim.owner), claim.owner, claim.local.0)
+                .is_none()
+        })
         .map_or(0, |record| record.amount)
 }
 

@@ -3,7 +3,7 @@
 //!
 //! One absorption per source shard and transaction —
 //! [`absorbed`](ProvisioningTracker::absorbed) — holds what that shard's
-//! committed bundles carried: the environment its latest bundle stated
+//! committed bundles carried: the environment its earliest bundle stated
 //! and every leaf, by key. It is what a cross-shard dispatch carries,
 //! where a crossing's record cell is read from, and the evidence that
 //! the shard committed the transaction. Beside it, `required` is what
@@ -141,14 +141,14 @@ pub struct SourceAnchor {
 /// What one source shard's committed bundles carried for a transaction.
 #[derive(Debug, Clone)]
 pub struct Absorbed {
-    /// The environment the shard's latest bundle carried.
+    /// The environment the shard's earliest bundle carried.
     anchor: SourceAnchor,
     /// Every leaf the shard's bundles carried, sorted by key. A shard
-    /// sends a transaction two bundles at most — its committed state
-    /// when the transaction commits there, and the record cells its
-    /// certificate wrote when that commits — and a re-broadcast restates
-    /// one of them, so a later bundle restates or adds keys and never
-    /// takes one away.
+    /// sends a transaction bundles off several of its blocks — its
+    /// committed state when the transaction commits there, the record
+    /// cells its certificate wrote when that commits, and those cells
+    /// again off any later block that offers the crossing anew — and
+    /// each restates or adds keys, never taking one away.
     entries: Arc<Vec<SubstateEntry>>,
     /// The commit clock at the latest absorption, which bounds an
     /// absorption no candidate here has filed for.
@@ -167,26 +167,37 @@ impl Absorbed {
         }
     }
 
-    /// Fold a later bundle from the same shard in. A bundle restating
-    /// what is held changes nothing but the clock.
+    /// Fold another bundle from the same shard in. A bundle restating
+    /// what is held adds nothing.
     ///
-    /// The merge is anchor blind — one anchor is stamped over the whole
-    /// held set — and what makes that sound is that the two bundle kinds
-    /// a shard sends carry **disjoint keys**: its committed state for
-    /// the transaction, and the record cells its certificate wrote. A
-    /// key is therefore added by one kind or restated by a re-broadcast
-    /// of the same kind, never carried by both at two anchors with two
+    /// The anchor kept is the earliest a bundle from this shard carried,
+    /// never the latest. It is the environment the transaction runs
+    /// under, which the block that committed it on the source shard
+    /// fixes — and that block is the earliest of that shard's that can
+    /// name the transaction at all. Taking the latest instead would let
+    /// a shard offering a crossing anew restamp the clock its consumer
+    /// executes under, so two consumers reached by different bundles
+    /// would run one transaction in two environments; and it would make
+    /// the answer turn on the order two bundles happened to arrive in,
+    /// where the earliest does not.
+    ///
+    /// The merge is anchor blind — one anchor over the whole held set —
+    /// and what makes that sound is that the bundle kinds a shard sends
+    /// carry **disjoint keys**: its committed state for the
+    /// transaction, and the record cells its certificate wrote. A key
+    /// is therefore added by one kind or restated by a re-broadcast of
+    /// the same kind, never carried by both at two anchors with two
     /// values. Were they to overlap, [`Self::present`] would answer from
-    /// a set mixed across anchors while `anchor` named only the latest,
-    /// and a consumer proving a reading against that anchor would be
-    /// proving it against a value taken at another.
+    /// a set mixed across anchors while `anchor` named only one, and a
+    /// consumer proving a reading against that anchor would be proving
+    /// it against a value taken at another.
     ///
     /// Stated rather than enforced, deliberately: the bundles are a
     /// counterpart's committed content, so refusing a contradiction here
     /// would let one shard halt another.
     fn absorb(&mut self, at: WeightedTimestamp, anchor: SourceAnchor, entries: &[SubstateEntry]) {
         self.at = at;
-        self.anchor = anchor;
+        self.anchor.clock = self.anchor.clock.min(anchor.clock);
         let restated = entries.iter().all(|entry| {
             self.entries
                 .binary_search_by_key(&entry.key, |held| held.key)

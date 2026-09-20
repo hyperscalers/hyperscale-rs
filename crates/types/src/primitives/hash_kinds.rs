@@ -192,6 +192,18 @@ hash_newtype!(
 );
 
 hash_newtype!(
+    /// Merkle root over the [`CrossingReoffer`](crate::CrossingReoffer)
+    /// offers a block carries.
+    ///
+    /// Carried in [`BlockHeader::reoffer_root`](crate::BlockHeader), so
+    /// which crossings a block offers again — and the record cells each
+    /// bundle is built from — is committed content every replica serves
+    /// the same bundle off.
+    pub ReofferRoot,
+    "ReofferRoot"
+);
+
+hash_newtype!(
     /// Merkle root over the transactions a shard committed within its
     /// retention window up to a terminal block.
     ///

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
-use hyperscale_execution::{crossing_requests, provision_request};
+use hyperscale_execution::{crossing_requests, provision_request, reoffer_requests};
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_provisions::build_provisions;
 use hyperscale_storage::{PendingChain, ShardStorage};
@@ -59,8 +59,12 @@ pub fn serve_provision_request<S: ShardStorage>(
         requests.push(request);
     }
     // The crossings the block's certificates commit, after its
-    // transactions — the order the block's roots bucket them in.
-    for mut request in crossing_requests(block.certificates(), local_shard) {
+    // transactions, and the ones it offers again after those — the
+    // order the block's roots bucket them in.
+    for mut request in crossing_requests(block.certificates(), local_shard)
+        .into_iter()
+        .chain(reoffer_requests(block.reoffers(), local_shard))
+    {
         if !request.targets.contains(&req.target_shard) {
             continue;
         }

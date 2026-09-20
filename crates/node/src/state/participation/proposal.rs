@@ -10,8 +10,8 @@ use std::sync::Arc;
 use hyperscale_core::Action;
 use hyperscale_execution::Offers;
 use hyperscale_types::{
-    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId, StateClaim,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
+    AbandonmentRecord, CrossingReoffer, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId,
+    StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -23,6 +23,7 @@ pub(in crate::state) struct ProposalInputs {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
+    pub(crate) reoffers: Vec<CrossingReoffer>,
 }
 
 impl ShardParticipation {
@@ -56,7 +57,8 @@ impl ShardParticipation {
         let Offers {
             state_claims,
             abandonment_records,
-        } = self.execution_coordinator.offers();
+            reoffers,
+        } = self.execution_coordinator.offers(sched);
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
@@ -93,6 +95,7 @@ impl ShardParticipation {
             provisions,
             abandonment_records,
             state_claims,
+            reoffers,
         }
     }
 
@@ -154,6 +157,7 @@ impl ShardParticipation {
             inputs.provisions,
             inputs.abandonment_records,
             inputs.state_claims,
+            inputs.reoffers,
         )
     }
 }

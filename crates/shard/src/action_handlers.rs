@@ -27,14 +27,15 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
-    Deadline, DeferOn, Derivation, Epoch, EpochWindows, Finalization, Hash, LocalReceiptRoot,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition,
-    PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
-    ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
-    Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
+    CrossingReoffer, Deadline, DeferOn, Derivation, Epoch, EpochWindows, Finalization, Hash,
+    LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit,
+    PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal,
+    ReofferRoot, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId, ShardLoad,
+    SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext, Stopwatch,
+    StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
     UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
     VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
@@ -221,6 +222,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     provisions: Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>,
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    reoffers: Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>,
     parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
@@ -345,6 +347,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         topology_snapshot,
         &transactions,
         &certificates,
+        &reoffers,
     )
     .into_inner();
 
@@ -391,6 +394,10 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Proofs of counterparts' cells, committed so every replica folds
     // the same answers at this height.
     let state_claims_root = Verified::<StateClaimsRoot>::compute(&state_claims).into_inner();
+    // The crossings this block offers a consumer again, committed so
+    // every replica builds the same bundle off it — and so the
+    // `provision_tx_roots` promise above has a section behind it.
+    let reoffer_root = Verified::<ReofferRoot>::compute(&reoffers).into_inner();
 
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
@@ -409,6 +416,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         provision_tx_roots,
         abandonment_root,
         state_claims_root,
+        reoffer_root,
         txs_in_flight,
         settled_tick_frontier,
         sweep_frontier,
@@ -428,6 +436,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         provisions: Arc::new(provisions),
         abandonment_records: Arc::new(abandonment_records),
         state_claims: Arc::new(state_claims),
+        reoffers: Arc::new(reoffers),
         witness_sources,
     };
 
@@ -705,6 +714,7 @@ where
             expected,
             transactions,
             certificates,
+            reoffers,
             topology_snapshot,
         } => {
             let start = Stopwatch::start();
@@ -713,6 +723,7 @@ where
                 topology_snapshot: &topology_snapshot,
                 transactions: &transactions,
                 certificates: &certificates,
+                reoffers: &reoffers,
             };
             let result = expected.verify(&ptx_ctx);
             record_signature_verification_latency(
@@ -1187,6 +1198,7 @@ where
             provisions,
             abandonment_records,
             state_claims,
+            reoffers,
             fee_checks,
             fee_read_height,
             parent_in_flight,
@@ -1349,6 +1361,7 @@ where
                 Ok(provisions),
                 Ok(abandonment_records),
                 Ok(state_claims),
+                Ok(reoffers),
                 Ok(ready_signals),
             ) = (
                 Capped::new(transactions),
@@ -1356,6 +1369,7 @@ where
                 Capped::new(provisions),
                 Capped::new(abandonment_records),
                 Capped::new(state_claims),
+                Capped::new(reoffers),
                 Capped::new(ready_signals),
             )
             else {
@@ -1385,6 +1399,7 @@ where
                 provisions.clone(),
                 abandonment_records,
                 state_claims,
+                reoffers,
                 parent_in_flight,
                 parent_settled_frontier,
                 parent_sweep_frontier,

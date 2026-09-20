@@ -21,7 +21,7 @@ use hyperscale_metrics::{
 use hyperscale_storage::is_record_cell;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
-    Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
+    CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
     MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
     MerkleInclusionProof, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie, Spoken,
     StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
@@ -195,6 +195,9 @@ pub struct Offers {
     pub state_claims: Vec<StateClaim>,
     /// The records it has evidence for and has not yet written down.
     pub abandonment_records: Vec<AbandonmentRecord>,
+    /// The crossings its ledger says are still owed a claim, each
+    /// promised to the shard holding that claim's prefix now.
+    pub reoffers: Vec<CrossingReoffer>,
 }
 
 pub struct Counterparts {
@@ -402,6 +405,7 @@ impl Counterparts {
         Offers {
             state_claims: self.state_claims(),
             abandonment_records: self.abandonment_records(),
+            reoffers: Vec::new(),
         }
     }
 
@@ -871,7 +875,7 @@ impl Counterparts {
             return Vec::new();
         }
         if self.ledger.consumer_holds(tx_hash, shard) {
-            self.ledger.cue_probe(tx_hash, at);
+            self.ledger.cue_probe(tx_hash, shard, at);
         }
         if self.ledger.core_holds(tx_hash, shard) && self.ledger.record_acceptance(tx_hash, shard) {
             return vec![Action::Continuation(ProtocolEvent::TransactionsResolved {

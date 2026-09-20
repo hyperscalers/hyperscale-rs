@@ -456,6 +456,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
+            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }

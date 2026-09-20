@@ -11,8 +11,9 @@
 
 use hyperscale_jmt::MAX_PROOF_CLAIMS;
 use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
-    MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS, VERIFY_WEIGHT,
+    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_CROSSINGS_PER_TX, MAX_ENVELOPE_BYTES,
+    MAX_EVENT_BYTES_PER_TX, MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS,
+    VERIFY_WEIGHT,
 };
 
 use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
@@ -310,6 +311,19 @@ const _: () = assert!(MAX_CELLS_RESPONSE_BYTES + CELLS_ANSWER_FIXED_BYTES < MAX_
 /// window — see `has_own_work_at_round` in `hyperscale-shard`.
 pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
 
+/// Hard cap on the crossing re-offers a block can carry.
+///
+/// One offer re-promises one consumer's outstanding crossings in one
+/// transaction. A shard offers again only what its own ledger says is
+/// still unclaimed, which is bounded by what it has in flight rather
+/// than by a clock, and the remainder waits a block — an offer nobody
+/// took is still outstanding next block, so stopping costs nothing.
+/// Sized well under the count so the section's widest form stays a
+/// fraction of the frame: the records of one transaction into one shard
+/// are ordinarily one cell, and the cap prices them at
+/// [`MAX_CROSSINGS_PER_TX`](hyperscale_vm_types::MAX_CROSSINGS_PER_TX).
+pub const MAX_REOFFERS_PER_BLOCK: usize = 64;
+
 /// Byte budget the abandonment records of one block share.
 ///
 /// The one section a block carries verbatim whose per-item cost varies:
@@ -353,6 +367,13 @@ const STATE_CLAIM_BYTES: usize = 64;
 /// Bytes one cell of a claim costs: the key and the reading of it.
 const STATE_CLAIM_CELL_BYTES: usize = 82;
 
+/// Bytes one [`CrossingReoffer`](crate::CrossingReoffer) costs before
+/// its records.
+const REOFFER_BYTES: usize = 64;
+
+/// Bytes one record cell of a re-offer costs.
+const REOFFER_RECORD_BYTES: usize = 50;
+
 /// Bytes a hash-only entry of a manifest costs.
 const HASH_BYTES: usize = 32;
 
@@ -373,7 +394,8 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
     + MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
     + MAX_PROPOSAL_EVIDENCE_BYTES
     + MAX_STATE_CLAIMS_PER_BLOCK
-        * (STATE_CLAIM_BYTES + MAX_PROOFS_PER_QUERY * STATE_CLAIM_CELL_BYTES);
+        * (STATE_CLAIM_BYTES + MAX_PROOFS_PER_QUERY * STATE_CLAIM_CELL_BYTES)
+    + MAX_REOFFERS_PER_BLOCK * (REOFFER_BYTES + MAX_CROSSINGS_PER_TX * REOFFER_RECORD_BYTES);
 
 /// INV-WIRE-1: a proposal every section of which is at its cap still
 /// fits the frame that carries it. The transports drop an oversize

@@ -67,6 +67,23 @@ impl Placement {
 }
 
 /// The classification frozen onto a transaction when its block
+/// One delivering crossing a shard issued.
+///
+/// Who consumes it, the cell whose presence says it was taken, and the
+/// cell a bundle carrying it is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveredCrossing {
+    /// The shard the consuming node was homed on when the transaction
+    /// committed. A cut moves the claim to whoever holds its prefix
+    /// now, which the caller resolves off the trie it is given.
+    pub consumer: ShardId,
+    /// The claim cell the consumer writes when it takes the crossing.
+    pub claim: SubstateKey,
+    /// The record cell standing for the crossing on the issuing shard.
+    pub record: SubstateKey,
+}
+
+/// What a shard runs of a transaction, frozen at the placement its block
 /// committed: the star its shape implies under the trie the block
 /// committed under, and which of its shards deliver.
 ///
@@ -388,6 +405,28 @@ impl Classified {
         self.claims_issued(local, true)
     }
 
+    /// Each delivering crossing a node on `local` issued: the claim
+    /// cell its consumer writes, and the record cell a bundle carrying
+    /// it is built from, under the shard the consumer was homed on.
+    ///
+    /// The two cells of one edge, asked for together because that is
+    /// how an outstanding crossing is offered again: the claim says
+    /// whether it is still owed, and the record is what the offer
+    /// carries. [`Self::delivered_claims`] answers the first half alone,
+    /// for the probe that only asks.
+    #[must_use]
+    pub fn delivered_crossings(&self, local: ShardId) -> Vec<DeliveredCrossing> {
+        self.edges()
+            .iter()
+            .filter(|edge| edge.from == local && edge.delivers)
+            .map(|edge| DeliveredCrossing {
+                consumer: self.home(edge.consumer),
+                claim: edge.claim.key(),
+                record: edge.record.key(),
+            })
+            .collect()
+    }
+
     /// Every record cell a producer on `local` writes for a consumer
     /// elsewhere, in edge order.
     ///
@@ -401,6 +440,25 @@ impl Classified {
         self.edges()
             .iter()
             .filter(|edge| edge.from == local)
+            .map(|edge| edge.record.key())
+            .collect()
+    }
+
+    /// Every record cell a producer on `local` writes that a settlement
+    /// composed under the transaction's own name may dispose.
+    ///
+    /// A crossing an outbound leg consumes is not among them. Nobody may
+    /// take one back, so its only disposal is the deletion its consumer's
+    /// claim licenses — and the shard that has to be able to compose
+    /// that is one holding the record leaf and no ledger entry at all: a
+    /// validator seated after the transaction committed, a split
+    /// successor whose ledger begins empty. The leaf owns those, and an
+    /// entry that settled them too would put two members over one cell.
+    #[must_use]
+    pub fn records_settled(&self, local: ShardId) -> Vec<SubstateKey> {
+        self.edges()
+            .iter()
+            .filter(|edge| edge.from == local && !edge.delivers)
             .map(|edge| edge.record.key())
             .collect()
     }
