@@ -511,7 +511,7 @@ impl Kept {
     /// departed deliverer's successor, which [`Ledger::questions`]
     /// resolves off the trie it is given.
     fn deliveries(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.classified.delivered_claims(local)
+        self.classified.owed_claims(local)
     }
 
     /// The claim cells core consumers write for the crossings a leg on
@@ -521,7 +521,7 @@ impl Kept {
     /// core is the core's, so nothing a core shard produces is claimed
     /// by a core it is not in.
     fn claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.classified.core_claims(local)
+        self.classified.escrowed_claims(local)
     }
 
     /// Every claim cell a consumer elsewhere writes for what `local`
@@ -1022,7 +1022,7 @@ impl Ledger {
                 continue;
             }
             let mut by_target: BTreeMap<ShardId, Vec<SubstateKey>> = BTreeMap::new();
-            for crossing in kept.classified.delivered_crossings(local) {
+            for crossing in kept.classified.owed_crossings(local) {
                 if owed.claimed(crossing.claim) {
                     continue;
                 }
@@ -1206,8 +1206,8 @@ impl Ledger {
     /// Close an entry whose crossings every consumer has claimed and
     /// whose records are none of this entry's to settle.
     ///
-    /// The retirement of a delivering record is the leaf's, so an entry
-    /// that issued only those has nothing to compose and no member
+    /// The retirement of an owed record is the leaf's, so an entry that
+    /// issued only those has nothing to compose and no member
     /// whose finalization would release it. What licenses the close is
     /// the same committed readings [`Self::retirable`] reads, so every
     /// replica at one frontier closes the same entries.
@@ -1763,7 +1763,7 @@ mod tests {
     /// The claim cell the core writes for what `classified` says `LOCAL`
     /// issued, under the shard holding the consumer's target.
     fn core_claim(classified: &Classified) -> (ShardId, SubstateKey) {
-        let claims = classified.core_claims(LOCAL);
+        let claims = classified.escrowed_claims(LOCAL);
         assert_eq!(
             claims.len(),
             1,
@@ -1784,7 +1784,7 @@ mod tests {
     /// The claim cell a delivery writes for what `classified` says
     /// `LOCAL` issued, under the shard that delivers it.
     fn delivered_claim(classified: &Classified) -> (ShardId, SubstateKey) {
-        let claims = classified.delivered_claims(LOCAL);
+        let claims = classified.owed_claims(LOCAL);
         assert_eq!(
             claims.len(),
             1,

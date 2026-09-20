@@ -1536,7 +1536,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
     );
 
     assert!(
-        classified.records_settled(near_shard).is_empty(),
+        classified.escrowed_records(near_shard).is_empty(),
         "the sender settles none of it under the transaction's own name",
     );
 

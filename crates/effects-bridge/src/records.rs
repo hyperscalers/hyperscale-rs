@@ -1012,7 +1012,7 @@ mod tests {
     /// it, so a sweep that could reach it would burn value on a clock.
     #[test]
     fn a_claim_is_judged_off_its_leaf_and_a_record_is_swept_by_nothing() {
-        use hyperscale_vm_effects::{CrossingSite, IntentHeader, Recourse, crossing_expiry_ms};
+        use hyperscale_vm_effects::{CrossingSite, IntentHeader, Terms, crossing_expiry_ms};
         use hyperscale_vm_types::{AddressClass, CROSSING_GRACE_MS, IntentHash, NetworkId, TxHash};
 
         let header = IntentHeader {
@@ -1034,7 +1034,7 @@ mod tests {
             ResourceAddr::new([0xE0; 31]),
             500,
             claim_site.key(),
-            Recourse::Nobody,
+            Terms::Owed,
         );
         let claim = claim_site.claimed_by(TxHash(Hash32([0xC0; 32])));
 

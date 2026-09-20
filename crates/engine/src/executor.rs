@@ -37,7 +37,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, IntentRecord,
-    PackageHash, Recourse, legs_of, package_hash,
+    PackageHash, Terms, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
@@ -650,11 +650,11 @@ impl Executor {
             // declared: a record left standing is declared nothing, or
             // the member would name a cell it never touches.
             let takes_back = takes_back(on, &record, snapshot);
-            // Nothing takes a crossing an outbound leg consumes back, so
-            // a licence that would is not about this record: it stands,
-            // holding the value for whoever may still claim it, and the
-            // member goes on to the rest.
-            if takes_back && record.recourse == Recourse::Nobody {
+            // Nothing takes an owed crossing back, so a licence that
+            // would is not about this record: it stands, holding the
+            // value for whoever may still claim it, and the member goes
+            // on to the rest.
+            if takes_back && record.terms == Terms::Owed {
                 continue;
             }
             let mut declare_here = |effect, holds| {
@@ -673,8 +673,8 @@ impl Executor {
             // reclaim writes, and what holds either settlement to the
             // record's edge.
             let claim = CrossingSite::claim_on(&ProtocolHasher, key.owner, &record);
-            let disposition = match record.recourse {
-                Recourse::Producer(credit) if takes_back => {
+            let disposition = match record.terms {
+                Terms::Escrowed { credit } if takes_back => {
                     declare_here(
                         Effect {
                             target: EffectTarget::Point(claim.key()),
@@ -693,7 +693,7 @@ impl Executor {
                 }
                 // A claim that happened: the value moved where the
                 // consumer ran and what is left is a cell saying so.
-                Recourse::Producer(_) | Recourse::Nobody => Disposition::Retire,
+                Terms::Escrowed { .. } | Terms::Owed => Disposition::Retire,
             };
             disposals.push(Disposal {
                 record: *key,

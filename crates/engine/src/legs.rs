@@ -29,7 +29,7 @@ use hyperscale_types::{
     Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction,
 };
 use hyperscale_vm_effects::{CrossingEdge as StarEdge, Star, running_at, star_at};
-use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
+use hyperscale_vm_kernel::{Crossed, Departure, Kind, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
 use crate::sharding::TrieShardResolver;
@@ -66,12 +66,12 @@ impl Placement {
     }
 }
 
-/// One delivering crossing a shard issued.
+/// One owed crossing a shard issued.
 ///
 /// Who consumes it, the cell whose presence says it was taken, and the
 /// cell a bundle carrying it is built from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeliveredCrossing {
+pub struct OwedCrossing {
     /// The shard the consuming node was homed on when the transaction
     /// committed. A cut moves the claim to whoever holds its prefix
     /// now, which the caller resolves off the trie it is given.
@@ -372,53 +372,54 @@ impl Classified {
     /// core runs it.
     ///
     /// One fold, asked for by name in two halves rather than returned as
-    /// one list: a delivery's claim is probed at the lapse and a core
-    /// consumer's at the deadline, so a caller that took them together
-    /// would have to split them again before asking.
-    fn claims_issued(&self, local: ShardId, delivered: bool) -> Vec<(ShardId, SubstateKey)> {
+    /// one list: what a probe asks is the same of both, but what the
+    /// answer licenses is not, so the callers that act on one kind's
+    /// claims take that kind's alone.
+    fn claims_issued(&self, local: ShardId, owed: bool) -> Vec<(ShardId, SubstateKey)> {
         self.edges()
             .iter()
-            .filter(|edge| edge.from == local && edge.delivers == delivered)
+            .filter(|edge| edge.from == local && edge.delivers == owed)
             .map(|edge| (self.home(edge.consumer), edge.claim.key()))
             .collect()
     }
 
-    /// The claim cells core consumers write for the crossings a leg on
-    /// `local` issued. What a probe asks the core about once the
-    /// transaction's deadline has passed: a claim present there says
-    /// the core took the crossing.
+    /// The claim cells core consumers write for the escrowed crossings
+    /// a leg on `local` issued. A claim present there says the core took
+    /// the crossing, which is what retires the record; absent inside the
+    /// window an absence answers in, nobody took it and the producer
+    /// credits it back.
     #[must_use]
-    pub fn core_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+    pub fn escrowed_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
         self.claims_issued(local, false)
     }
 
-    /// The claim cells deliveries elsewhere write for the crossings a
-    /// node on `local` issued — an inbound leg's, or the core's on a
+    /// The claim cells consumers elsewhere write for the owed crossings
+    /// a node on `local` issued — an inbound leg's, or the core's on a
     /// core shard.
     ///
-    /// A delivery that never claimed leaves exactly this cell absent,
-    /// which is what a lapse probe asks the delivering shard about, and
-    /// the crossing is then the producer's to take back.
+    /// Only a presence answers: the crossing is its consumer's from the
+    /// moment the core committed it, so the cell absent says the
+    /// consumer has not run and never that it will not.
     #[must_use]
-    pub fn delivered_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+    pub fn owed_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
         self.claims_issued(local, true)
     }
 
-    /// Each delivering crossing a node on `local` issued: the claim
-    /// cell its consumer writes, and the record cell a bundle carrying
-    /// it is built from, under the shard the consumer was homed on.
+    /// Each owed crossing a node on `local` issued: the claim cell its
+    /// consumer writes, and the record cell a bundle carrying it is
+    /// built from, under the shard the consumer was homed on.
     ///
     /// The two cells of one edge, asked for together because that is
     /// how an outstanding crossing is offered again: the claim says
     /// whether it is still owed, and the record is what the offer
-    /// carries. [`Self::delivered_claims`] answers the first half alone,
-    /// for the probe that only asks.
+    /// carries. [`Self::owed_claims`] answers the first half alone, for
+    /// the probe that only asks.
     #[must_use]
-    pub fn delivered_crossings(&self, local: ShardId) -> Vec<DeliveredCrossing> {
+    pub fn owed_crossings(&self, local: ShardId) -> Vec<OwedCrossing> {
         self.edges()
             .iter()
             .filter(|edge| edge.from == local && edge.delivers)
-            .map(|edge| DeliveredCrossing {
+            .map(|edge| OwedCrossing {
                 consumer: self.home(edge.consumer),
                 claim: edge.claim.key(),
                 record: edge.record.key(),
@@ -444,17 +445,18 @@ impl Classified {
     }
 
     /// Every record cell a producer on `local` writes that a settlement
-    /// composed under the transaction's own name may dispose.
+    /// composed under the transaction's own name may dispose: the
+    /// escrowed ones.
     ///
-    /// A crossing an outbound leg consumes is not among them. Nobody may
-    /// take one back, so its only disposal is the deletion its consumer's
-    /// claim licenses — and the shard that has to be able to compose
-    /// that is one holding the record leaf and no ledger entry at all: a
-    /// validator seated after the transaction committed, a split
-    /// successor whose ledger begins empty. The leaf owns those, and an
-    /// entry that settled them too would put two members over one cell.
+    /// An owed crossing is not among them. Nobody may take one back, so
+    /// its only disposal is the deletion its consumer's claim licenses —
+    /// and the shard that has to be able to compose that is one holding
+    /// the record leaf and no ledger entry at all: a validator seated
+    /// after the transaction committed, a split successor whose ledger
+    /// begins empty. The leaf owns those, and an entry that settled them
+    /// too would put two members over one cell.
     #[must_use]
-    pub fn records_settled(&self, local: ShardId) -> Vec<SubstateKey> {
+    pub fn escrowed_records(&self, local: ShardId) -> Vec<SubstateKey> {
         self.edges()
             .iter()
             .filter(|edge| edge.from == local && !edge.delivers)
@@ -518,7 +520,11 @@ impl Classified {
                     Departure {
                         site: edge.record,
                         consumer_claim: edge.claim.key(),
-                        delivers: edge.delivers,
+                        kind: if edge.delivers {
+                            Kind::Owed
+                        } else {
+                            Kind::Escrowed
+                        },
                     },
                 )?;
             }
@@ -1058,31 +1064,93 @@ mod tests {
         classified
     }
 
-    /// The claim cells a shard's issued crossings are owed by deliveries
-    /// elsewhere: a transfer's withdraw is owed the deposit's claim on
-    /// the recipient's shard, the recipient's shard issues nothing, and a
-    /// swap's withdraw is consumed by the core, which is no delivery.
+    /// The claim cells a shard's owed crossings are answered by: a
+    /// transfer's withdraw is owed the deposit's claim on the
+    /// recipient's shard, the recipient's shard issues nothing, and a
+    /// swap's withdraw is consumed by the core, which owes nothing.
     #[test]
-    fn delivered_claims_name_the_deliveries_of_what_a_shard_issued() {
+    fn owed_claims_name_the_consumers_of_what_a_shard_issued() {
         let legs = transfer();
         let bob = owner(0x22, true);
         let expected = CrossingSite::claim_of(&ProtocolHasher, bob, &legs[1], 0).key();
-        assert_eq!(
-            frozen(&legs).delivered_claims(low()),
-            vec![(high(), expected)]
-        );
+        assert_eq!(frozen(&legs).owed_claims(low()), vec![(high(), expected)]);
         assert!(
-            frozen(&legs).delivered_claims(high()).is_empty(),
+            frozen(&legs).owed_claims(high()).is_empty(),
             "the delivering shard issued nothing",
         );
         assert!(
-            Classified::whole().delivered_claims(low()).is_empty(),
+            Classified::whole().owed_claims(low()).is_empty(),
             "a whole shape hands nothing between shards",
         );
 
         assert!(
-            frozen(&swap()).delivered_claims(low()).is_empty(),
+            frozen(&swap()).owed_claims(low()).is_empty(),
             "a crossing the core consumes is answered by the core, not a delivery",
+        );
+    }
+
+    /// The two kinds partition what a shard issues, exactly.
+    ///
+    /// Every record a producer here writes is one or the other, and the
+    /// plan the same classification builds stamps each departure with
+    /// the kind whose terms the kernel then writes onto the leaf. The
+    /// entry path settles the escrowed ones under the transaction's own
+    /// name and the leaf path disposes the owed ones; if the two sets
+    /// overlapped, a second member would read a cell the first deleted,
+    /// and if they left a gap its value would stand with nothing naming
+    /// it.
+    #[test]
+    fn every_record_a_shard_issues_is_of_exactly_one_kind() {
+        let mut saw_escrowed = false;
+        let mut saw_owed = false;
+        for legs in [transfer(), swap()] {
+            let classified = frozen(&legs);
+            for local in [low(), high()] {
+                let issued: BTreeSet<SubstateKey> =
+                    classified.records_issued(local).into_iter().collect();
+                let escrowed: BTreeSet<SubstateKey> =
+                    classified.escrowed_records(local).into_iter().collect();
+                let owed: BTreeSet<SubstateKey> = classified
+                    .owed_crossings(local)
+                    .into_iter()
+                    .map(|crossing| crossing.record)
+                    .collect();
+
+                saw_escrowed |= !escrowed.is_empty();
+                saw_owed |= !owed.is_empty();
+                assert!(
+                    escrowed.is_disjoint(&owed),
+                    "no record is both kinds at {local:?}",
+                );
+                assert_eq!(
+                    &escrowed | &owed,
+                    issued,
+                    "and between them they are everything issued at {local:?}",
+                );
+
+                // The kind each departure carries is the kind the leaf
+                // will state, so the partition above is the one the
+                // kernel writes down.
+                let plan = classified.plan(&[], local, Side::Issuing);
+                if let Ok(plan) = plan {
+                    for record in plan.legs.records() {
+                        let departing = classified
+                            .edges()
+                            .iter()
+                            .find(|edge| edge.record.key() == record)
+                            .expect("a planned record is an edge of the shape");
+                        assert_eq!(
+                            departing.delivers,
+                            owed.contains(&record),
+                            "the departure's kind and the accessor agree on {record:?}",
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_escrowed && saw_owed,
+            "the fixtures have to issue both kinds, or the partition holds for free",
         );
     }
 
@@ -1200,7 +1268,7 @@ mod tests {
         assert_eq!(reclaimed[0].owner, owner(0x33, true));
         assert_eq!(
             divided
-                .delivered_claims(high())
+                .owed_claims(high())
                 .into_iter()
                 .map(|(shard, _)| shard)
                 .collect::<Vec<_>>(),

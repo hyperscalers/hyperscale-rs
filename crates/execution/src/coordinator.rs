@@ -67,7 +67,7 @@ use hyperscale_types::{
     Window, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
     tick_leader_at,
 };
-use hyperscale_vm_effects::Recourse;
+use hyperscale_vm_effects::Terms;
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
@@ -1274,16 +1274,19 @@ impl ExecutionCoordinator {
         // nothing back.
         let mut due: BTreeMap<(TxHash, Licence), Vec<SubstateKey>> = BTreeMap::new();
         for (key, record) in &self.counterparts.held {
-            // A record nobody may take back is the leaf's whoever holds
-            // an entry for its transaction. Its only disposal is the
-            // deletion its consumer's claim licenses, and the shard that
-            // has to be able to compose that is one holding the leaf and
-            // no entry — a validator seated after the transaction
-            // committed, a split successor whose ledger begins empty. An
-            // entry settles none of them, so there is no second member
-            // over the cell.
-            let delivering = matches!(record.cell.recourse, Recourse::Nobody);
-            // Every other record is its entry's while one is here: the
+            // What licences a record is decided by follows from what
+            // kind of record it is.
+            //
+            // An owed one is the leaf's whoever holds an entry for its
+            // transaction: its only disposal is the deletion its
+            // consumer's claim licenses, and the shard that has to be
+            // able to compose that is one holding the leaf and no entry
+            // — a validator seated after the transaction committed, a
+            // split successor whose ledger begins empty. An entry
+            // settles none of them, so there is no second member over
+            // the cell.
+            //
+            // An escrowed one is its entry's while one is here: the
             // reclaim and the retirement compose from the same leaves
             // under the transaction's own name, and two members over one
             // record would leave the second reading a cell the first
@@ -1292,48 +1295,52 @@ impl ExecutionCoordinator {
             // entry has been pruned, and every one an abandonment record
             // reconstructed an entry for that keeps no classification to
             // settle from.
-            if !delivering && self.counterparts.ledger.settles_records(record.cell.tx) {
-                continue;
-            }
             let claim = record.cell.consumer_claim;
-            let licence = if matches!(record.answer, Some(Inclusion::Present(_))) {
-                // A claim proved present is the consumer holding the
-                // crossing, and a presence is bounded by no window. It
-                // answers over every other reading here: taking back
-                // value a consumer demonstrably has is the one mistake
-                // this cannot make.
-                Some(Licence::Claimed)
-            } else if trie.shard_for_prefix(claim.owner) == local_shard
-                && (Window::Core.of(record.deadline()).end
-                    ..Window::LegEntry.of(record.deadline()).end)
-                    .contains(&tick_ts)
-            {
-                // This shard holds the cell, so the engine reads it
-                // against its own snapshot — the same licence, answered
-                // without a fetch, and the cell itself is the closest
-                // evidence there is while the window it answers in
-                // stands.
-                Some(Licence::OwnLeaf)
-            } else if record.unclaimable() {
-                // A departure says the chain that was to consume this
-                // crossing can never settle what issued it, and a claim
-                // read absent inside its window says nobody took it.
-                // Either way the value goes back.
-                Some(Licence::Unclaimed)
-            } else {
-                None
+            // A claim proved present is the consumer holding the
+            // crossing, and a presence is bounded by no window. It
+            // answers over every other reading here: taking back value a
+            // consumer demonstrably has is the one mistake this cannot
+            // make.
+            let claimed = matches!(record.answer, Some(Inclusion::Present(_)));
+            let licence = match record.cell.terms {
+                // Nothing takes an owed crossing back, so the licences
+                // that credit one say nothing about it: a claim read
+                // absent leaves it owed rather than returned. Only the
+                // presence decides it, and what it licenses is the
+                // deletion.
+                Terms::Owed => claimed.then_some(Licence::Claimed),
+                Terms::Escrowed { .. } => {
+                    if self.counterparts.ledger.settles_records(record.cell.tx) {
+                        continue;
+                    }
+                    if claimed {
+                        Some(Licence::Claimed)
+                    } else if trie.shard_for_prefix(claim.owner) == local_shard
+                        && (Window::Core.of(record.deadline()).end
+                            ..Window::LegEntry.of(record.deadline()).end)
+                            .contains(&tick_ts)
+                    {
+                        // This shard holds the cell, so the engine reads
+                        // it against its own snapshot — the same
+                        // licence, answered without a fetch, and the
+                        // cell itself is the closest evidence there is
+                        // while the window it answers in stands.
+                        Some(Licence::OwnLeaf)
+                    } else if record.unclaimable() {
+                        // A departure says the chain that was to consume
+                        // this crossing can never settle what issued it,
+                        // and a claim read absent inside its window says
+                        // nobody took it. Either way the value goes
+                        // back.
+                        Some(Licence::Unclaimed)
+                    } else {
+                        None
+                    }
+                }
             };
             let Some(licence) = licence else {
                 continue;
             };
-            // Nothing takes a delivering crossing back, so the licences
-            // that credit one say nothing about it: a claim read absent
-            // leaves the crossing owed, not returned. Only the claim
-            // read present decides it, and what it licenses is the
-            // deletion.
-            if delivering && licence != Licence::Claimed {
-                continue;
-            }
             due.entry((record.cell.tx, licence)).or_default().push(*key);
         }
         for ((issued_by, licence), records) in due {
@@ -1381,13 +1388,13 @@ impl ExecutionCoordinator {
             if self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash) {
                 continue;
             }
-            // What the entry owns: the records a consumer claimed
-            // through the core. The delivering ones are the leaf's, and
-            // an entry whose crossings were all delivering has nothing
-            // left to compose — every claim it issued is read present,
-            // so it closes here rather than on a member that would
-            // settle no cell.
-            let records = classified.records_settled(local_shard);
+            // What the entry owns: the escrowed records, which a
+            // consumer claimed through the core. The owed ones are the
+            // leaf's, and an entry whose crossings were all owed has
+            // nothing left to compose — every claim it issued is read
+            // present, so it closes here rather than on a member that
+            // would settle no cell.
+            let records = classified.escrowed_records(local_shard);
             if records.is_empty() {
                 self.counterparts.ledger.close_retired(tx_hash);
                 continue;
@@ -4377,7 +4384,7 @@ mod tests {
         TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet,
         Window,
     };
-    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash, Recourse};
+    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
     use super::*;
@@ -9873,10 +9880,12 @@ mod tests {
             expiry_ms,
             tx: transaction.hash(),
             consumer_claim: claim,
-            recourse: Recourse::Producer(SubstateKey {
-                owner: record_key.owner,
-                local: LocalKey([local ^ 0x0F; 16]),
-            }),
+            terms: Terms::Escrowed {
+                credit: SubstateKey {
+                    owner: record_key.owner,
+                    local: LocalKey([local ^ 0x0F; 16]),
+                },
+            },
         };
         (record_key, claim, cell)
     }
@@ -10051,7 +10060,7 @@ mod tests {
         let mut state = make_test_state();
         let expiry_ms = 400_000;
         let (record_key, _, mut cell) = held_record(0x6A, expiry_ms);
-        cell.recourse = Recourse::Nobody;
+        cell.terms = Terms::Owed;
         state
             .counterparts
             .held
@@ -10800,7 +10809,7 @@ mod tests {
     /// The claim cell the core writes for what `classified` says
     /// [`HOME`] issued, under the shard holding the consumer's target.
     fn core_claim(classified: &Classified) -> SubstateKey {
-        let claims = classified.core_claims(HOME);
+        let claims = classified.escrowed_claims(HOME);
         assert_eq!(
             claims.len(),
             1,
@@ -10812,7 +10821,7 @@ mod tests {
     /// The claim cell a delivery writes for what `classified` says
     /// [`HOME`] issued.
     fn delivered_claim(classified: &Classified) -> SubstateKey {
-        let claims = classified.delivered_claims(HOME);
+        let claims = classified.owed_claims(HOME);
         assert_eq!(
             claims.len(),
             1,
