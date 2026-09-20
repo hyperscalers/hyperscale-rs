@@ -2682,11 +2682,10 @@ mod tests {
         // could have come back.
         ledger.record_reoffers(
             now,
-            &[CrossingReoffer::new(
-                DELIVERER,
-                leg.hash(),
-                offered[0].records.clone(),
-            )],
+            &[
+                CrossingReoffer::new(DELIVERER, leg.hash(), offered[0].records.clone())
+                    .expect("the crossings of one transaction fit an offer"),
+            ],
         );
         assert!(
             ledger.unclaimed_crossings(&delivery_trie(), now).is_empty(),

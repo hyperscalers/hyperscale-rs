@@ -371,9 +371,10 @@ mod tests {
         };
         let offered = TxHash::from(Hash::from_bytes(&[7; 32]));
         let offers = vec![
-            CrossingReoffer::new(target, offered, [cell(1)]),
+            CrossingReoffer::new(target, offered, [cell(1)]).expect("a set inside the cap"),
             // An offer this shard owes itself is not one it sends.
-            CrossingReoffer::new(local, TxHash::from(Hash::from_bytes(&[8; 32])), [cell(2)]),
+            CrossingReoffer::new(local, TxHash::from(Hash::from_bytes(&[8; 32])), [cell(2)])
+                .expect("a set inside the cap"),
         ];
 
         let roots = Verified::<ProvisionTxRootsMap>::compute(local, &topo, &[], &[], &offers);

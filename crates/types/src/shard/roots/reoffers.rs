@@ -51,6 +51,7 @@ mod tests {
             TxHash::from(Hash::from_bytes(&[seed; 8])),
             [key(seed)],
         )
+        .expect("a set inside the cap")
     }
 
     #[test]
@@ -69,7 +70,8 @@ mod tests {
                 ShardId::leaf(1, 0),
                 TxHash::from(Hash::from_bytes(&[1; 8])),
                 [key(1), key(2)],
-            )]),
+            )
+            .expect("a set inside the cap"),]),
         );
     }
 

@@ -2714,7 +2714,10 @@ impl ExecutionCoordinator {
             .ledger
             .unclaimed_crossings(trie, self.committed_ts)
             .into_iter()
-            .map(|outstanding| {
+            // The records of one transaction into one shard are a subset
+            // of the crossings that transaction may carry, so the cap is
+            // met by construction and nothing here is dropped.
+            .filter_map(|outstanding| {
                 CrossingReoffer::new(outstanding.target, outstanding.tx_hash, outstanding.records)
             })
             .collect();
