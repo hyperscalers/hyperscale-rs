@@ -1570,8 +1570,20 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
 /// inside the span leaves none there — its chain freezes below the span
 /// and produces nothing inside it — so the absence is never readable, the
 /// presence never exists, and the record stands with the stake in it.
-/// Cutting both roads a header travels reaches the same state, and
-/// reaches it on a cluster that needs no committee to fail.
+/// Cutting both roads a header travels reaches the same state from the
+/// producer's side, and reaches it on a cluster that needs no committee
+/// to fail.
+///
+/// **The cut is never lifted, and that is what makes the proxy
+/// faithful.** A cut core goes on committing, so it has an in-window
+/// suffix where a halted one has none; the cut delays those headers
+/// rather than preventing them, and the moment it lifts they are
+/// commit-proven and the newest of them answers. The reclaim that
+/// follows is correct — nothing ever claimed — but it is not this
+/// scenario's subject, and a control that heals asserts the loss only
+/// for as long as the backlog happens to stay undelivered. Which is a
+/// span measured in epochs against a window measured in seconds: it held
+/// at a 30s epoch and did not at 300s.
 ///
 /// # Panics
 ///
@@ -1649,10 +1661,10 @@ pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: 
         "the core must never have certified anything for the stake",
     );
 
-    // Provable again, and too late: every anchor of the core the producer
-    // can prove now sits past the span, so no reading it takes answers
-    // either way.
-    c.clear_drops();
+    // On past the room the reclaim had, with the core still unreadable.
+    // Nothing the producer can prove of it lies inside the span, so no
+    // reading it takes answers either way — which is what a chain frozen
+    // below the span leaves behind.
     assert!(
         c.run_until(epochs(20), |c| clock(c)
             >= Window::LegEntry.of(deadline).end.plus(MAX_VALIDITY_RANGE)),
