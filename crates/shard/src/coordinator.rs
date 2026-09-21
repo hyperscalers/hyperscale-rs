@@ -2278,8 +2278,15 @@ impl ShardCoordinator {
             abandonment_records,
         );
         let reoffers = select_reoffers(&ctx, &mut ReoffersFold::default(), reoffers);
-        let declines =
-            select_declines(&ctx, &mut DeclinesFold::after(&finalization_fold), declines);
+        // Against the claims this block will carry, for the reason the
+        // late-delivery licence is: a refusal's cell is the producer's
+        // own committed bytes or it is the proposer's word, and a claim
+        // the cap dropped pins nothing.
+        let declines = select_declines(
+            &ctx,
+            &mut DeclinesFold::after(&finalization_fold, &state_claims),
+            declines,
+        );
 
         self.build_and_dispatch_proposal(
             topology_schedule,

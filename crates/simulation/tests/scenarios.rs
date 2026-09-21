@@ -25,7 +25,8 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::{
     Budget, Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_delivery_cut_off_past_its_window_is_owed, a_delivery_is_owed_when_its_deliverer_splits,
+    a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
+    a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_the_bundle_arrives,
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
@@ -761,6 +762,16 @@ fn route_cluster_on_dedicated_hosts() -> SimCluster {
         &route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
+}
+
+/// The refusal's own shape: a shard handed a crossing it never holds a
+/// body for, so no tick and no candidate of its can ever write the
+/// claim. Sim-only for the same reason as its neighbours — the
+/// conservation runs to the producer's own reclaim.
+#[test]
+fn a_crossing_the_consumer_refuses_is_declined_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(a_crossing_the_consumer_refuses_is_declined);
 }
 
 /// Its neighbour's other outcome: the same cut, held the whole way, so

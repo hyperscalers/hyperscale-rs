@@ -26,11 +26,11 @@ use std::sync::Arc;
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, BlockHeight, CrossingAnswers, CrossingDecline, CrossingReoffer,
-    Deadline, DeclaredWork, Finalization, FinalizationHash, MAX_DECLINES_PER_BLOCK,
+    Deadline, DeclaredWork, Finalization, FinalizationHash, Inclusion, MAX_DECLINES_PER_BLOCK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_REOFFERS_PER_BLOCK,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
-    Provisions, ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    Verifiable, WeightedTimestamp, budget_admits_block, caps_admit_transaction,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Probed, ProvisionHash,
+    Provisions, ShardId, StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, Verifiable, WeightedTimestamp, budget_admits_block, caps_admit_transaction,
     evidence_admits_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::Terms;
@@ -718,6 +718,25 @@ impl<'f> Section for RecordsSection<'f> {
     }
 }
 
+/// What some claim the block carries says about `record`, by
+/// [`Probed::Record`]'s own rule: a presence at whatever anchor the
+/// claim names, since a record is written by the one execution that
+/// issues the crossing and is swept by nothing.
+///
+/// One statement of it, because two sections read it — a late delivery
+/// is licensed by the record it consumes standing, and a decline is
+/// tied to a real crossing by the same reading, whose value hash is
+/// what makes the cell it carries the producer's own bytes.
+pub(crate) fn record_reading(
+    state_claims: &[StateClaim],
+    record: SubstateKey,
+) -> Option<Inclusion> {
+    state_claims
+        .iter()
+        .filter_map(|claim| claim.reading(record))
+        .find_map(|inclusion| Probed::Record.read(inclusion))
+}
+
 /// The block's state claims.
 pub(crate) struct StateClaimsSection;
 
@@ -857,6 +876,9 @@ pub(crate) struct DeclinesFold<'a> {
     /// The finalizations the block carries, whose writes may hold the
     /// very claim a decline says is absent.
     pub(crate) finalizations: &'a FinalizationsFold,
+    /// The claims the block carries, which is where a decline's cell
+    /// stops being the proposer's word and becomes the producer's.
+    pub(crate) state_claims: &'a [StateClaim],
     /// The last admitted decline, which the next must follow.
     pub(crate) previous: Option<CrossingDecline>,
     /// How many have been admitted, against the block's cap.
@@ -864,11 +886,16 @@ pub(crate) struct DeclinesFold<'a> {
 }
 
 impl<'a> DeclinesFold<'a> {
-    /// A fold after the block's `finalizations`.
+    /// A fold after the block's `finalizations`, over the `state_claims`
+    /// the same block carries.
     #[must_use]
-    pub(crate) const fn after(finalizations: &'a FinalizationsFold) -> Self {
+    pub(crate) const fn after(
+        finalizations: &'a FinalizationsFold,
+        state_claims: &'a [StateClaim],
+    ) -> Self {
         Self {
             finalizations,
+            state_claims,
             previous: None,
             count: 0,
         }
@@ -997,24 +1024,72 @@ impl DeclinesSection<'_> {
         }
         Ok(())
     }
+
+    /// Whether the block proves the record present, with the bytes the
+    /// entry carries.
+    ///
+    /// This is what makes every other conjunct a rule about a real
+    /// crossing rather than about whatever the proposer wrote down. The
+    /// record key pins the edge, since the cell's own value must
+    /// re-derive it — but the deadline the refusal is fenced at, the
+    /// transaction whose members must be gone, the claim key read
+    /// absent and the terms that say a refusal is allowed at all are
+    /// none of them in the key, and the consumer holds no leaf of its
+    /// own to read them off. Unpinned, a proposer states an early
+    /// deadline, names a transaction nothing here holds a member for,
+    /// and writes a refusal under any owner it likes.
+    ///
+    /// A presence reading carries the leaf's value hash, so checking
+    /// the carried cell against it makes every field the producer's own
+    /// committed bytes. One claim answers many records at one anchor,
+    /// so this costs a claim per batch rather than per decline.
+    ///
+    /// No recency bound, for the late delivery's licence's own reason:
+    /// which anchor is newest is a question each validator
+    /// answers from its own fetches, and a stale reading says only that
+    /// the producer may have disposed already — a refusal it ignores is
+    /// junk on the declining shard's own floor.
+    ///
+    /// # Errors
+    ///
+    /// That the block proves no such record, or proves one holding
+    /// other bytes.
+    fn the_record_stands(fold: &DeclinesFold<'_>, decline: &CrossingDecline) -> Result<(), String> {
+        let Some(reading) = record_reading(fold.state_claims, decline.record) else {
+            return Err(format!(
+                "crossing decline names {:?}, which no claim the block carries reads present",
+                decline.record
+            ));
+        };
+        if !decline.stands_against(reading) {
+            return Err(format!(
+                "crossing decline names {:?}, whose carried cell is not the bytes the block's \
+                 claim reads there",
+                decline.record
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl<'f> Section for DeclinesSection<'f> {
     type Item = CrossingDecline;
     type Fold = DeclinesFold<'f>;
 
-    /// A well-formed decline, in its place in the section's ascending
-    /// order without repeats, within the block's cap.
+    /// A well-formed decline of a crossing this shard may refuse, in
+    /// its place in the section's ascending order without repeats,
+    /// within the block's cap.
     ///
-    /// Well-formed is the whole of what is checked *here*, and the split
-    /// is the same one every section makes: the order and the cap are
-    /// facts about the block, and whether this shard may refuse the
-    /// crossing is a fact about its own state and the producer's, which
-    /// the fence checks where it checks every other claim about another
-    /// chain. What this rule does carry is the one term that is neither
-    /// — the record cell naming the edge its own key derives — because a
-    /// decline whose cell does not name its record is not a refusal of
-    /// anything and no later check would look at it again.
+    /// Unlike an offer, which promises rather than decides, a refusal
+    /// moves value at the producer — so the whole rule is here rather
+    /// than half of it. Its four facts are all read from what the block
+    /// and the chain behind it carry: the record's own committed bytes,
+    /// pinned by a claim the same block carries; the terms those bytes
+    /// hold, which say whether the consumer's verdict is final; the
+    /// deadline they name, past the block's anchor; and the absence of
+    /// any answer or held member of this shard's. Every replica at one
+    /// frontier reads the same pair of folds, which is why this is a
+    /// content rule and not the fence's.
     ///
     /// The order is ascending by record, which gives uniqueness and one
     /// encoding together: one record is one crossing, so two entries for
@@ -1046,6 +1121,7 @@ impl<'f> Section for DeclinesSection<'f> {
                 "block carries more than {MAX_DECLINES_PER_BLOCK} crossing declines"
             ));
         }
+        Self::the_record_stands(fold, decline)?;
         Self::verdict_is_final(decline)?;
         Self::nobody_answered(ctx, fold, decline)?;
         Self::deadline_has_passed(ctx, decline)?;

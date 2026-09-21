@@ -19,7 +19,7 @@ use hyperscale_types::{
 use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{assert_reclaimed_leg, declared_price, held, held_at, vault_balance};
-use crate::support::tx::{build_route_tx, validity_around};
+use crate::support::tx::{build_route_tx, build_swap_tx, validity_around};
 use crate::support::wait::await_blocks;
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
@@ -480,6 +480,125 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
         protocol_resource.settles(c, charges.burned(c)),
         "and the resource is conserved: the input paid once and came back once",
     );
+}
+
+/// A crossing whose consumer has refused it, and whose producer has not
+/// heard, is declined.
+///
+/// The ordinary refusal, held open long enough to see the answer
+/// written. A venue asked for a price no pool this size can pay refuses
+/// its member, and a refused member's writes are discarded — so the
+/// claim is never written and the record stands. With the venue's
+/// verdict cut off from the shard that staged the value, the producer
+/// cannot reclaim off it either, and past the deadline the venue holds
+/// no tick and no candidate that could still speak. The refusal is the
+/// crossing's only answer.
+///
+/// Its pair is [`a_route_whose_core_never_combines_is_reclaimed_once`],
+/// where a venue *does* hold a member and refuses nothing however late.
+/// The two together are the decline's third conjunct read from both
+/// ends: the same cell, the same clock, and what tells them apart is
+/// whether an execution here could still write a claim.
+///
+/// **What this pins at phase 6 is the write and the conservation across
+/// it, not the reclaim.** Nothing reads a decline yet: the input comes
+/// home once the verdict reaches the producer, which is what lifting the
+/// cut does. What would be caught here is a refusal that moved value on
+/// its own, or one written beside a claim.
+///
+/// Requires disjoint committees, as its neighbours do.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the caller's
+/// leg never pays, if the venue does not refuse, if the cut never fires,
+/// if the venue writes no refusal past the deadline, if the producer
+/// reclaims while it cannot have heard the verdict, or if either side of
+/// the pair is not conserved.
+pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, trader) = &traders[0];
+    // The venue's own committee certifies its refusal; what is cut is
+    // the road that verdict takes to the shard holding the record, so
+    // the producer has nothing to reclaim off and the record stands past
+    // the deadline.
+    let cut = isolate_ec_intake(c, TRADER_SHARD, FIRST_VENUE_SHARD);
+    let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
+
+    let mut charges = Charges::default();
+    let validity = validity_around(c.now());
+    let swap = build_swap_tx(
+        key,
+        *trader,
+        &first.meta,
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        REFUSED_FLOOR,
+        validity,
+    );
+    let hash = charges.submit(c, swap);
+
+    assert!(
+        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
+            < SWAPPER_FUNDING - ROUTE_INPUT),
+        "the caller's leg must stage the input, or no crossing was ever handed across",
+    );
+    let staged = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    assert!(
+        c.run_until(epochs(8), |c| matches!(
+            c.chain_fate(FIRST_VENUE_SHARD, hash).1,
+            Some((_, TransactionDecision::Reject))
+        )),
+        "the venue must refuse the swap: a refused member is what leaves the claim unwritten",
+    );
+
+    // From the deadline — the instant past which nothing can be included
+    // anywhere — and needing the record proved present in the same
+    // block, which the producer still holds because it has not heard.
+    let deadline = Deadline::of(validity.end_timestamp_exclusive);
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let refused = c.run_until(epochs(10), |c| {
+        !c.declined(FIRST_VENUE_SHARD, hash).is_empty()
+    });
+    assert!(
+        cut.fired() > 0,
+        "the certificate channel must actually have been exercised and cut",
+    );
+    assert!(
+        refused,
+        "a venue that refused and holds no member must write the crossing's answer past \
+         the deadline {:?}; clock {:?}",
+        deadline.at(),
+        clock(c),
+    );
+    assert!(
+        clock(c) >= deadline.at(),
+        "and not before it: inside its own window the member could still be composed again",
+    );
+    assert_eq!(
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+        staged,
+        "the producer must not have heard the verdict, or the record it is asked about \
+         was disposed of before the refusal was written",
+    );
+
+    // Nothing reads the refusal yet, so what brings the input home is
+    // the verdict itself. What the refusal must not do is move value
+    // beside it.
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(10), |c| held(
+            c,
+            trader.address(),
+            *PROTOCOL_RESOURCE
+        ) > staged),
+        "the input must come home once the verdict reaches the producer: caller holds {}",
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+    );
+    protocol_resource.assert_settles_within(c, &charges, epochs(10), "a refused crossing");
+    units.assert_settles_within(c, &Charges::default(), epochs(10), "a refused crossing");
 }
 
 /// Everything that can hold each side of the pair in a route scenario:

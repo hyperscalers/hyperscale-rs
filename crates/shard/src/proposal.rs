@@ -22,10 +22,10 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CrossingDecline,
-    CrossingReoffer, Epoch, Finalization, Hash, LocalTimestamp, Probed, ProposerTimestamp,
-    Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, SubstateKey,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp,
+    CrossingReoffer, Epoch, Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions,
+    ReadySignal, ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -33,7 +33,7 @@ use crate::admission::{
     Admission, DeclinesFold, DeclinesSection, FinalizationsFold, FinalizationsSection,
     ProvisionsFold, ProvisionsSection, RecordsFold, RecordsSection, ReoffersFold, ReoffersSection,
     StateClaimsFold, StateClaimsSection, TransactionsFold, TransactionsSection, admit_each,
-    unwrapped,
+    record_reading, unwrapped,
 };
 use crate::chain_view::ChainView;
 use crate::precut::Precut;
@@ -285,25 +285,10 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
                 && classified
                     .records_consumed(local_shard)
                     .into_iter()
-                    .all(|record| record_stands(state_claims, record))
+                    .all(|record| record_reading(state_claims, record).is_some())
         })
         .map(|tx| tx.hash())
         .collect()
-}
-
-/// Whether some claim the block carries reads `record` present.
-///
-/// At any anchor the claim names. A record is written by the one
-/// execution that issues the crossing and is swept by nothing, so a
-/// presence read anywhere is a presence — which is [`Probed::Record`]'s
-/// own rule, asked here rather than restated.
-fn record_stands(state_claims: &[StateClaim], record: SubstateKey) -> bool {
-    state_claims.iter().any(|claim| {
-        claim
-            .reading(record)
-            .and_then(|inclusion| Probed::Record.read(inclusion))
-            .is_some()
-    })
 }
 
 /// Select finalizations for inclusion: what [`FinalizationsSection`]
@@ -628,6 +613,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_hbor::Capped;
+    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_finalization, make_undecided_finalization,
         stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
@@ -635,8 +621,8 @@ mod tests {
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CommittedAt, CommittedTxsRoot, Deadline, Hash,
         Inclusion, LocalKey, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE,
-        NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot, TimestampRange,
-        TransactionDecision, UnsettledTx, ValidatorSet,
+        NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot, SubstateKey,
+        TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
     };
     use hyperscale_vm_effects::{
         CrossingCell, Hash32, ProtocolHasher, Terms, crossing_claim_key, escrow_record_key,
@@ -718,12 +704,40 @@ mod tests {
         against
     }
 
+    /// A claim of the producer's chain reading each decline's record
+    /// present, holding the bytes that decline carries — what ties a
+    /// refusal to a crossing someone actually issued.
+    fn licensing_claims(declines: &[&CrossingDecline]) -> Vec<StateClaim> {
+        vec![StateClaim::new(
+            Anchor {
+                shard: ShardId::leaf(1, 1),
+                height: BlockHeight::new(7),
+                state_root: StateRoot::from_raw(Hash::ZERO),
+                ts: ts(1_000),
+            },
+            declines.iter().map(|decline| {
+                (
+                    decline.record,
+                    Inclusion::Present(jmt_value_hash(&decline.cell.to_bytes())),
+                )
+            }),
+        )]
+    }
+
     fn admit_decline(against: &Against, decline: &CrossingDecline) -> Result<(), String> {
+        admit_decline_against(against, &licensing_claims(&[decline]), decline)
+    }
+
+    fn admit_decline_against(
+        against: &Against,
+        claims: &[StateClaim],
+        decline: &CrossingDecline,
+    ) -> Result<(), String> {
         let ctx = against.ctx();
         let finalizations = FinalizationsFold::from(&ctx);
         <DeclinesSection<'_> as Section>::admit(
             &ctx,
-            &mut DeclinesFold::after(&finalizations),
+            &mut DeclinesFold::after(&finalizations, claims),
             decline,
         )
     }
@@ -865,6 +879,82 @@ mod tests {
         assert!(admit_decline(&declines_against(past), &elsewhere).is_err());
     }
 
+    /// A refusal the block proves nothing about is refused.
+    ///
+    /// The whole rule reads the carried cell, and the key pins only the
+    /// edge — so without a reading of the record there is nothing
+    /// saying the crossing was ever issued, let alone on these terms.
+    #[test]
+    fn a_decline_the_block_proves_no_record_for_is_refused() {
+        let owner = Address::new([0xA0; 31], AddressClass::Component);
+        let decline = decline_of(escrowed_cell(owner, 60_000));
+        let past = Deadline::from_expiry(decline.cell.expiry_ms).at();
+        let against = declines_against(past);
+
+        assert!(
+            admit_decline_against(&against, &[], &decline).is_err(),
+            "a block carrying no claim pins no crossing",
+        );
+        let absent = vec![StateClaim::new(
+            Anchor {
+                shard: ShardId::leaf(1, 1),
+                height: BlockHeight::new(7),
+                state_root: StateRoot::from_raw(Hash::ZERO),
+                ts: ts(1_000),
+            },
+            [(decline.record, Inclusion::Absent)],
+        )];
+        assert!(
+            admit_decline_against(&against, &absent, &decline).is_err(),
+            "and a record read absent is the producer having disposed already",
+        );
+        assert!(
+            admit_decline_against(&against, &licensing_claims(&[&decline]), &decline).is_ok(),
+            "the record read present with these bytes is the whole of what ties the two",
+        );
+    }
+
+    /// A decline cannot state terms the producer never committed.
+    ///
+    /// The deadline is the one that costs: an early expiry passes the
+    /// deadline conjunct while the transaction is still admissible
+    /// here, so the refusal commits and the member it names runs
+    /// afterwards and writes the claim — both cells, on a lie the key
+    /// cannot catch, since the expiry is not in the key. What catches
+    /// it is the presence reading's value hash, which makes every field
+    /// the producer's own bytes.
+    #[test]
+    fn a_decline_cannot_restate_the_terms_the_record_holds() {
+        let owner = Address::new([0xA0; 31], AddressClass::Component);
+        let cell = escrowed_cell(owner, 60_000);
+        let honest = decline_of(cell);
+        let early = decline_of(CrossingCell {
+            expiry_ms: cell.expiry_ms - 10_000,
+            ..cell
+        });
+        assert_eq!(
+            early.record, honest.record,
+            "an expiry is not in the record's key, so the forgery sits at the same key",
+        );
+
+        // Past the deadline the forged cell states, inside the one the
+        // producer committed: exactly where an unpinned expiry buys a
+        // refusal of a crossing whose claim is still coming.
+        let between = Deadline::from_expiry(early.cell.expiry_ms).at();
+        assert!(between < Deadline::from_expiry(cell.expiry_ms).at());
+        let against = declines_against(between);
+        let claims = licensing_claims(&[&honest]);
+
+        assert!(
+            admit_decline_against(&against, &claims, &early).is_err(),
+            "the producer's own bytes are what the deadline is read off",
+        );
+        assert!(
+            admit_decline_against(&against, &claims, &honest).is_err(),
+            "and against those bytes the deadline has not passed",
+        );
+    }
+
     /// The section carries its declines in one order, without repeats.
     #[test]
     fn a_blocks_declines_have_one_order_and_one_entry_per_crossing() {
@@ -881,10 +971,11 @@ mod tests {
         let against = declines_against(past);
         let ctx = against.ctx();
         let finalizations = FinalizationsFold::from(&ctx);
+        let claims = licensing_claims(&[&first, &second]);
 
         let selected = select_declines(
             &ctx,
-            &mut DeclinesFold::after(&finalizations),
+            &mut DeclinesFold::after(&finalizations, &claims),
             vec![second.clone(), first.clone(), second.clone()],
         );
         let mut expected = vec![first, second];
@@ -1511,19 +1602,19 @@ mod tests {
         };
 
         assert!(
-            !record_stands(&[], record),
+            record_reading(&[], record).is_none(),
             "a block carrying nothing licenses nothing"
         );
         assert!(
-            record_stands(&[claim(7, Inclusion::Present([0xAB; 32]))], record),
+            record_reading(&[claim(7, Inclusion::Present([0xAB; 32]))], record).is_some(),
             "the record proved present is the whole licence",
         );
         assert!(
-            record_stands(&[claim(1, Inclusion::Present([0xAB; 32]))], record),
+            record_reading(&[claim(1, Inclusion::Present([0xAB; 32]))], record).is_some(),
             "and it answers at an old anchor too: a presence is not bounded by a clock",
         );
         assert!(
-            !record_stands(&[claim(7, Inclusion::Absent)], record),
+            record_reading(&[claim(7, Inclusion::Absent)], record).is_none(),
             "a record read absent says the producer disposed of it, which licenses nobody",
         );
         let elsewhere = SubstateKey {
@@ -1531,7 +1622,7 @@ mod tests {
             ..record
         };
         assert!(
-            !record_stands(&[claim(7, Inclusion::Present([0xAB; 32]))], elsewhere),
+            record_reading(&[claim(7, Inclusion::Present([0xAB; 32]))], elsewhere).is_none(),
             "and a claim over some other cell is not this crossing's licence",
         );
     }
