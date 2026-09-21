@@ -25,9 +25,9 @@ use hyperscale_types::{
     CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_FINALIZATION_DELAY,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_REOFFERS_PER_BLOCK,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed,
-    ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey,
-    TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx,
-    Verifiable, Verified, WeightedTimestamp, Window,
+    ProvenAnchors, ProvenCells, RETENTION_HORIZON, SettledTxSet, ShardId, ShardTrie, Spoken,
+    StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
+    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{CrossingAnswer, CrossingCell, ProtocolHasher, crossing_decline_key};
 
@@ -242,21 +242,147 @@ pub struct AnsweredCrossing {
     /// node's target. Read off the leaf, which is the only thing that
     /// names it.
     pub(crate) record: SubstateKey,
-    /// The newest producer header the record has been asked at, so the
-    /// question is not re-sent at the same one every block.
-    asked_at: Option<BlockHeight>,
-    /// What a committed claim read of the record, once one has read it.
-    pub(crate) answer: Option<Inclusion>,
+    /// What the last question about this record was put against: the
+    /// producer header it was asked at, and this chain's clock when it
+    /// was.
+    ///
+    /// Two figures, because they bound two different failures and
+    /// neither covers the other's — [`HeldRecord::offered_at`]'s
+    /// argument, on the question side. The height stops a producer that
+    /// has **stopped**: a chain that has not advanced could not have
+    /// disposed of anything, so it is asked once. The clock stops one
+    /// that is **running**: a live producer commit-proves a header here
+    /// every block, and a record stands until that producer learns the
+    /// answer — so paced on the height alone the question is put once a
+    /// block, for every crossing this shard has ever answered, and each
+    /// answer rides a block as a claim every voter must prove for
+    /// itself.
+    ///
+    /// **The clock is [`RETENTION_HORIZON`], and asking faster buys
+    /// nothing.** Two absences license a deletion only a span apart, so
+    /// the shortest path from a standing record to a cleanable answer
+    /// is one span whatever the polling rate — and a deletion is
+    /// housekeeping with no deadline behind it. Paced here the whole
+    /// loop costs one question per answer cell per span; paced at a
+    /// round it costs six times that and buys back at most one span on
+    /// a path nothing waits on.
+    asked_at: Option<(BlockHeight, WeightedTimestamp)>,
+    /// How far the record has been read gone.
+    pub cleanup: Cleanup,
 }
 
 impl AnsweredCrossing {
-    /// The answer as the leaves give it: unasked, unanswered.
+    /// The answer as the leaves give it: unasked, with nothing yet read
+    /// of the record it names.
     #[must_use]
     const fn of(claim: &CrossingAnswer) -> Self {
         Self {
             record: claim.record,
             asked_at: None,
-            answer: None,
+            cleanup: Cleanup::Standing(None),
+        }
+    }
+}
+
+/// How far a crossing this shard answered has been read gone on its
+/// producer's chain.
+///
+/// An answer cell is needed only while the record it answers for
+/// stands. Once the producer has disposed of that record — retired it
+/// on a claim, credited it back on a decline — no replay is possible,
+/// so the consumer deletes its own cell. What licenses the deletion is
+/// the record read **absent**, and it is a true absence for this
+/// consumer alone: the consumer answered against that record, so it
+/// existed, and the only thing that removes one is the producer's
+/// disposal.
+///
+/// **A presence is not a state here.** It says the producer still holds
+/// the record, which is the question being put again rather than an
+/// answer to it — and the happy path is the absence, since a producer
+/// disposes the moment it reads the claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleanup {
+    /// The record still stands, as far as anything read of it goes —
+    /// carrying the newest producer anchor a reading was folded at, or
+    /// `None` where none has been.
+    ///
+    /// The anchor is what makes a folded reading **spent**. A reading
+    /// is offered from `fetched` in every block until nothing wants it,
+    /// so one that answered and is still wanted is one every block
+    /// carries again, for every voter to verify against its own proven
+    /// cells.
+    Standing(Option<Anchor>),
+    /// Read absent once, at this anchor of the producer.
+    Once(Anchor),
+    /// Read absent at two anchors of the producer far enough apart that
+    /// nothing it once promised is servable any more.
+    Twice(Anchor, Anchor),
+}
+
+impl Cleanup {
+    /// The same record read absent at `anchor`.
+    ///
+    /// **The span is between two anchors of the producer, and that is
+    /// the whole of the rule.** A retention floor moves inside the
+    /// producer's own commit — `retire_dated` takes
+    /// `cutoff = tip_ts.minus(RETENTION_HORIZON)` — so a halted
+    /// producer's floor freezes with its tip and it goes on serving
+    /// every block at or below the absence anchor indefinitely, while
+    /// this chain's clock runs on. Measured here it is `retire_dated`'s
+    /// own inequality read from the other side; measured on the
+    /// consumer's clock it would delete on schedule into a producer
+    /// still serving the bundle a replay needs.
+    ///
+    /// And measured from the **absence**, never from a reading that
+    /// found the record present. The producer goes on re-offering until
+    /// it learns the answer, so every block between the claim and its
+    /// disposal promises a bundle built from the record — a gap that is
+    /// the producer's observe latency and unbounded in principle. At
+    /// the absence anchor the record is gone, so every block that ever
+    /// promised a bundle is at or below it, which is exactly the set
+    /// the serving span bounds.
+    #[must_use]
+    fn read(self, anchor: Anchor, inclusion: Inclusion) -> Self {
+        match (self, inclusion) {
+            (Self::Standing(_), Inclusion::Absent) => Self::Once(anchor),
+            (Self::Once(first), Inclusion::Absent) if Self::spans(first, anchor) => {
+                Self::Twice(first, anchor)
+            }
+            // The record is still there, so what this reading gives is
+            // the anchor it was read at: the question is worth putting
+            // again, and not at any header this one already answered
+            // for.
+            (Self::Standing(seen), Inclusion::Present(_))
+                if seen.is_none_or(|seen| anchor.height > seen.height) =>
+            {
+                Self::Standing(Some(anchor))
+            }
+            (other, _) => other,
+        }
+    }
+
+    /// Whether `second` stands far enough past `first` on the
+    /// producer's clock that nothing the producer promised below
+    /// `first` is servable at `second`.
+    #[must_use]
+    fn spans(first: Anchor, second: Anchor) -> bool {
+        second.ts > first.ts.plus(RETENTION_HORIZON)
+    }
+
+    /// Whether a reading taken at `anchor` could still advance this.
+    ///
+    /// The pacing, and it is the one place a question that cannot be
+    /// answered is not asked. After a first absence every anchor short
+    /// of the span is a fetch that tells this shard what it already
+    /// knows — some seventy of them per crossing at an ordinary block
+    /// rate, which is the flood shape a rate defect takes every time it
+    /// appears in this family.
+    #[must_use]
+    fn wants(self, anchor: Anchor) -> bool {
+        match self {
+            Self::Standing(seen) => seen.is_none_or(|seen| anchor.height > seen.height),
+            Self::Once(first) => Self::spans(first, anchor),
+            Self::Twice(..) => false,
         }
     }
 }
@@ -271,7 +397,8 @@ fn awaited_by(held: &BTreeMap<SubstateKey, HeldRecord>, key: SubstateKey) -> boo
     })
 }
 
-/// Whether any answer of this shard's is still waiting on `key`.
+/// Whether any answer of this shard's still wants a reading of `key`
+/// taken at `anchor`.
 ///
 /// [`awaited_by`] on the answering side, and needed for the same reason:
 /// a question driven by leaves rather than by entries is one the probe
@@ -279,14 +406,26 @@ fn awaited_by(held: &BTreeMap<SubstateKey, HeldRecord>, key: SubstateKey) -> boo
 /// recognised off the key or it is fetched and then dropped — and a
 /// question whose answer is never offered is a question asked again at
 /// every header of the counterpart, for as long as the leaf stands.
-fn awaits_record(answered: &BTreeMap<SubstateKey, AnsweredCrossing>, key: SubstateKey) -> bool {
+///
+/// **The anchor is the difference from that side, and it is what a
+/// second reading needs.** What this asks for is not one reading but
+/// two, at producer anchors a retention span apart, so a reading is
+/// wanted where it would advance the pair and spent where it would not
+/// — and the same reading is both, first and second. Keyed on the cell
+/// alone, a reading already folded would be held for the whole span
+/// while the question that wants its successor stood down for it.
+fn awaits_record(
+    answered: &BTreeMap<SubstateKey, AnsweredCrossing>,
+    anchor: Anchor,
+    key: SubstateKey,
+) -> bool {
     answered
         .values()
-        .any(|answer| answer.answer.is_none() && answer.record == key)
+        .any(|answer| answer.record == key && answer.cleanup.wants(anchor))
 }
 
-/// Whether any leaf-driven question of this shard's is waiting on a
-/// reading of `key`.
+/// Whether any leaf-driven question of this shard's wants a reading of
+/// `key` taken at `anchor`.
 ///
 /// The three sources [`Counterparts::probe`] asks from, read back as one
 /// predicate, because two sites need exactly this set and needed it to
@@ -301,9 +440,10 @@ fn wants_reading(
     held: &BTreeMap<SubstateKey, HeldRecord>,
     answered: &BTreeMap<SubstateKey, AnsweredCrossing>,
     arrivals: &BTreeMap<SubstateKey, BlockHeight>,
+    anchor: Anchor,
     key: SubstateKey,
 ) -> bool {
-    awaited_by(held, key) || awaits_record(answered, key) || arrivals.contains_key(&key)
+    awaited_by(held, key) || awaits_record(answered, anchor, key) || arrivals.contains_key(&key)
 }
 
 /// Whether any answer cell of this shard's names `key`.
@@ -920,9 +1060,6 @@ impl Counterparts {
         wanted: &mut BTreeMap<Anchor, Vec<SubstateKey>>,
     ) {
         for answer in self.answered.values_mut() {
-            if answer.answer.is_some() {
-                continue;
-            }
             let record = answer.record;
             let shard = trie.shard_for_prefix(record.owner);
             if shard == self.ledger.local() {
@@ -931,15 +1068,19 @@ impl Counterparts {
             let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
                 continue;
             };
-            if answer.asked_at.is_some_and(|asked| asked >= anchor.height)
-                || self
-                    .fetched
-                    .keys()
-                    .any(|claim| claim.anchor.shard == shard && claim.reading(record).is_some())
+            if !answer.cleanup.wants(anchor)
+                || answer.asked_at.is_some_and(|(asked, when)| {
+                    asked >= anchor.height || now.elapsed_since(when) < RETENTION_HORIZON
+                })
+                || self.fetched.keys().any(|claim| {
+                    claim.anchor.shard == shard
+                        && claim.reading(record).is_some()
+                        && answer.cleanup.wants(claim.anchor)
+                })
             {
                 continue;
             }
-            answer.asked_at = Some(anchor.height);
+            answer.asked_at = Some((anchor.height, now));
             wanted.entry(anchor).or_default().push(record);
         }
     }
@@ -1044,10 +1185,9 @@ impl Counterparts {
             }
         }
         answering.extend(
-            inclusions
-                .iter()
-                .map(|(key, _)| *key)
-                .filter(|key| wants_reading(&self.held, &self.answered, &self.arrivals, *key)),
+            inclusions.iter().map(|(key, _)| *key).filter(|key| {
+                wants_reading(&self.held, &self.answered, &self.arrivals, anchor, *key)
+            }),
         );
         if answering.is_empty() {
             return;
@@ -1162,14 +1302,11 @@ impl Counterparts {
     /// anything off an absence here yet.
     fn fold_answered(&mut self, stated: &StateClaim, trie: &ShardTrie) {
         for answer in self.answered.values_mut() {
-            if answer.answer.is_some() {
-                continue;
-            }
             if trie.shard_for_prefix(answer.record.owner) != stated.anchor.shard {
                 continue;
             }
             if let Some(inclusion) = stated.reading(answer.record) {
-                answer.answer = Some(inclusion);
+                answer.cleanup = answer.cleanup.read(stated.anchor, inclusion);
             }
         }
     }
@@ -1455,7 +1592,7 @@ impl Counterparts {
                 || claim
                     .cells
                     .iter()
-                    .any(|(key, _)| wants_reading(held, answered, arrivals, *key))
+                    .any(|(key, _)| wants_reading(held, answered, arrivals, claim.anchor, *key))
         });
         // The one retention rule for what counterparts said: an entry
         // there speaks for a transaction this ledger still owes an
@@ -1711,7 +1848,7 @@ mod tests {
             AnsweredCrossing {
                 record,
                 asked_at: None,
-                answer: None,
+                cleanup: Cleanup::Standing(None),
             },
         );
         (
@@ -1801,33 +1938,232 @@ mod tests {
              question whose answer never reaches a block is asked forever",
         );
 
-        // A reading lands, either way it went, and the question closes.
-        // A record is swept by nothing, so an absence of one is a fact
-        // about the producer rather than a cell that aged out — which is
-        // what lets the asking stop before anything licenses a thing.
-        counterparts.fold_answered(
-            &StateClaim {
-                anchor,
-                cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
-            },
-            &trie,
-        );
+        // The record reads absent, which is the producer having
+        // disposed of it — a fact, because a record is swept by
+        // nothing. One of those is not enough to clean up against,
+        // so what it closes is this anchor and not the question.
+        let read_absent = |counterparts: &mut Counterparts, at: Anchor| {
+            counterparts.fold_answered(
+                &StateClaim {
+                    anchor: at,
+                    cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
+                },
+                &trie,
+            );
+        };
+        read_absent(&mut counterparts, anchor);
         anchors.record(Anchor {
             height: BlockHeight::new(8),
             ..anchor
         });
         assert!(
             counterparts.probe(&trie, now, &BTreeMap::new()).is_empty(),
-            "a record the chain has read is not asked about again at any header",
+            "no anchor short of the span could tell this shard anything it does not know",
         );
         assert_eq!(
             counterparts
                 .answered
                 .values()
                 .next()
-                .and_then(|answer| answer.answer),
-            Some(Inclusion::Absent),
-            "and what it read is held",
+                .map(|answer| answer.cleanup),
+            Some(Cleanup::Once(anchor)),
+            "and the one absence is held, with the anchor it was read at",
+        );
+    }
+
+    /// A record that still stands is asked about again, but only once
+    /// a span has passed.
+    ///
+    /// Both halves cost something and each is asserted where the other
+    /// would hide it. A reading that is never repeated never learns the
+    /// producer disposed, so the answer cell stands for good and the
+    /// state this plan ships never drains. A reading repeated at every
+    /// header of a live producer is a fetch a block and a claim in
+    /// every block — each one a cell every voter proves for itself,
+    /// which is enough under cross-shard load to burn a round.
+    ///
+    /// The span is the pace because asking faster cannot help: two
+    /// absences license a deletion only a [`RETENTION_HORIZON`] apart,
+    /// so the shortest path to a cleanable answer is one span whatever
+    /// the rate.
+    #[test]
+    fn a_standing_record_is_asked_about_again_only_once_a_span_has_passed() {
+        let record = producer_record(0x42);
+        let (mut counterparts, trie, anchors) = answering(record);
+        let now = WeightedTimestamp::from_millis(60_000);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(7),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: now,
+        };
+        let (state_root, proof) = state_and_proof(PRODUCER, &[record], &[record]);
+        let anchor = Anchor {
+            state_root,
+            ..anchor
+        };
+        anchors.record(anchor);
+        assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
+        counterparts.on_proof_fetched(anchor, vec![record], proof);
+
+        // The record is there: the producer has not disposed of it, so
+        // the question is worth putting again — and this reading is
+        // spent, or every block carries it again.
+        let landed = counterparts
+            .fetched
+            .keys()
+            .find(|claim| claim.reading(record).is_some())
+            .cloned()
+            .expect("the proof landed as a reading");
+        assert!(
+            matches!(landed.reading(record), Some(Inclusion::Present(_))),
+            "the fixture's proof says the record stands",
+        );
+        counterparts.fold_answered(&landed, &trie);
+        counterparts.release_answered_fetches(&trie);
+        assert!(
+            !counterparts
+                .fetched
+                .keys()
+                .any(|claim| claim.reading(record).is_some()),
+            "a folded reading is spent whichever way it went",
+        );
+
+        let next = Anchor {
+            height: BlockHeight::new(8),
+            ts: now.plus(Duration::from_secs(1)),
+            ..anchor
+        };
+        anchors.record(next);
+        assert!(
+            counterparts
+                .probe(&trie, next.ts, &BTreeMap::new())
+                .is_empty(),
+            "and a header a block later is not worth a second question",
+        );
+
+        let later = Anchor {
+            height: BlockHeight::new(9),
+            ts: now.plus(RETENTION_HORIZON).plus(Duration::from_secs(1)),
+            ..anchor
+        };
+        anchors.record(later);
+        assert_eq!(
+            counterparts.probe(&trie, later.ts, &BTreeMap::new()).len(),
+            1,
+            "a span later it is: nothing else would ever learn the record had gone",
+        );
+    }
+
+    /// A second absence, past the span, closes the question — and what
+    /// the answer then holds is the pair a deletion is composed
+    /// against.
+    #[test]
+    fn a_second_absence_past_the_span_closes_the_question() {
+        let record = producer_record(0x42);
+        let (mut counterparts, trie, anchors) = answering(record);
+        let now = WeightedTimestamp::from_millis(60_000);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(7),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: now,
+        };
+        let read_absent = |counterparts: &mut Counterparts, at: Anchor| {
+            counterparts.fold_answered(
+                &StateClaim {
+                    anchor: at,
+                    cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
+                },
+                &trie,
+            );
+        };
+        read_absent(&mut counterparts, anchor);
+
+        let far = Anchor {
+            height: BlockHeight::new(9),
+            ts: now.plus(RETENTION_HORIZON).plus(Duration::from_secs(1)),
+            ..anchor
+        };
+        anchors.record(far);
+        assert_eq!(
+            counterparts.probe(&trie, far.ts, &BTreeMap::new()).len(),
+            1,
+            "an anchor far enough past the first is one a second reading can come from",
+        );
+        read_absent(&mut counterparts, far);
+        assert_eq!(
+            counterparts
+                .answered
+                .values()
+                .next()
+                .map(|answer| answer.cleanup),
+            Some(Cleanup::Twice(anchor, far)),
+            "two absences far enough apart are the licence, and they are what it carries",
+        );
+        anchors.record(Anchor {
+            height: BlockHeight::new(10),
+            ..far
+        });
+        assert!(
+            counterparts
+                .probe(&trie, far.ts, &BTreeMap::new())
+                .is_empty(),
+            "and the question is closed: nothing more is worth asking of this record",
+        );
+    }
+
+    /// Two absences license a deletion only at two anchors of the
+    /// producer a retention span apart.
+    ///
+    /// The span is the whole of the rule, and it is measured on the
+    /// **producer's** clock. A retention floor moves inside the
+    /// producer's own commit, so a halted producer's floor freezes with
+    /// its tip and it serves every block at or below the absence anchor
+    /// indefinitely — while this chain's clock runs on. A pair read too
+    /// close together names a producer that may still be serving the
+    /// bundle a replay needs, and a replay needs no stale evidence: the
+    /// bundle is fresh and the record-present proof sits below the
+    /// disposal.
+    #[test]
+    fn two_absences_license_nothing_until_a_retention_span_separates_them() {
+        let at = |secs: u64| Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(secs),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: WeightedTimestamp::from_millis(secs * 1_000),
+        };
+        let first = at(1_000);
+        let one = Cleanup::Standing(None).read(first, Inclusion::Absent);
+        assert_eq!(one, Cleanup::Once(first));
+        assert!(
+            !matches!(one, Cleanup::Twice(..)),
+            "one absence licenses nothing",
+        );
+
+        let close = at(1_000 + RETENTION_HORIZON.as_secs());
+        assert!(
+            !one.wants(close),
+            "an anchor at exactly the span is not past it, so it is not worth asking at",
+        );
+        assert_eq!(
+            one.read(close, Inclusion::Absent),
+            one,
+            "and a reading taken there advances nothing",
+        );
+
+        let far = at(1_001 + RETENTION_HORIZON.as_secs());
+        assert!(one.wants(far), "past the span it is worth asking at");
+        let two = one.read(far, Inclusion::Absent);
+        assert_eq!(two, Cleanup::Twice(first, far));
+        assert!(
+            !two.wants(at(9_999)),
+            "and nothing further is worth asking: the answer is cleanable",
+        );
+        assert_eq!(
+            two.read(at(9_999), Inclusion::Absent),
+            two,
+            "the pair a deletion is composed against does not drift to newer anchors",
         );
     }
 
@@ -1885,6 +2221,69 @@ mod tests {
         assert!(
             counterparts.probe(&trie, now, &BTreeMap::new()).is_empty(),
             "so the question is not put again at the producer's next header",
+        );
+    }
+
+    /// A reading that has been folded is released, and the question
+    /// that wants its successor is not held down by it.
+    ///
+    /// The retention rule and the asking rule are one rule, and this is
+    /// the case where keying it on the cell alone comes apart: a first
+    /// absence is folded, the reading that carried it is spent, and the
+    /// question now wants a *second* at an anchor a span later. Held on
+    /// the key, the spent reading is kept for the whole span and the
+    /// asking stands down for it — a question and its answer each
+    /// waiting on the other, for one retention horizon per crossing.
+    #[test]
+    fn a_folded_reading_is_released_and_does_not_hold_down_its_successor() {
+        let record = producer_record(0x42);
+        let (mut counterparts, trie, anchors) = answering(record);
+        let now = WeightedTimestamp::from_millis(60_000);
+        let (state_root, proof) = state_and_proof(PRODUCER, &[], &[record]);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(7),
+            state_root,
+            ts: now,
+        };
+        anchors.record(anchor);
+        assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
+        counterparts.on_proof_fetched(anchor, vec![record], proof);
+        counterparts.release_answered_fetches(&trie);
+        assert!(
+            counterparts
+                .fetched
+                .keys()
+                .any(|claim| claim.reading(record).is_some()),
+            "before it is folded the reading is still what the question wants",
+        );
+
+        counterparts.fold_answered(
+            &StateClaim {
+                anchor,
+                cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
+            },
+            &trie,
+        );
+        counterparts.release_answered_fetches(&trie);
+        assert!(
+            !counterparts
+                .fetched
+                .keys()
+                .any(|claim| claim.reading(record).is_some()),
+            "and once folded it is spent: no later reading of this record comes from here",
+        );
+
+        let far = Anchor {
+            height: BlockHeight::new(8),
+            ts: now.plus(RETENTION_HORIZON).plus(Duration::from_secs(1)),
+            ..anchor
+        };
+        anchors.record(far);
+        assert_eq!(
+            counterparts.probe(&trie, far.ts, &BTreeMap::new()).len(),
+            1,
+            "so the question for the second absence is put",
         );
     }
 
