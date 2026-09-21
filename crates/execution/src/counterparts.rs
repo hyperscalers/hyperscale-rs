@@ -673,8 +673,7 @@ impl Counterparts {
             record_rebuilt_record_entry();
         }
         self.cover_recorded(block);
-        self.fold_record_writes(block);
-        self.fold_claim_writes(block);
+        self.fold_crossing_writes(block);
         self.fold_reoffers(block.reoffers(), now);
         self.cover_held(block);
         self.stamp_departures(topology_schedule, now);
@@ -1375,23 +1374,45 @@ impl Counterparts {
         }
     }
 
-    /// Follow the record cells this block's finalizations write and
-    /// delete, so what is held is what the leaves hold.
+    /// Follow the crossing cells this block's finalizations put into
+    /// state, so what is held is what the leaves hold and what is
+    /// answered is what they answer.
     ///
-    /// The set the leaf path composes from has to be the leaf set, and
+    /// One walk for both families, because it is one question — what did
+    /// this block write — with two readers, and two walks that had to
+    /// name the same receipts is a shape this plan keeps paying for.
+    ///
+    /// The set the leaf paths compose from has to be the leaf set, and
     /// a scan at startup is only its first term. A crossing issued after
     /// it would otherwise never be held at all, and a record the ledger
     /// disposed of would be held after its leaf was gone — and a
     /// disposal composed over a cell nothing can read is refused, which
-    /// strands the rest of its member with it.
+    /// strands the rest of its member with it. The answering side is the
+    /// same need from the other end: a crossing answered after the scan
+    /// would never be held, and an answer already deleted would be held
+    /// after its leaf was gone.
+    ///
+    /// **[`Finalization::settling_receipts`] and not `receipts`**, which
+    /// is not the same set and was the defect here. A finalization
+    /// carries every receipt its tick produced; what reaches state is
+    /// what its certificates *decide*, which drops every member
+    /// `uncovered_transactions` names and every refused one bar its
+    /// charge — the distinction that function's own doc draws, between
+    /// what execution produced and what the tick decided. A member that
+    /// succeeded here and was then left uncovered by a counterpart
+    /// carries `Succeeded` writes with its cell in them, and those
+    /// writes never land. Folded from the wider set, this shard holds a
+    /// record no disposal can read, and an answer for a crossing nobody
+    /// answered — which stands `admit_refusals` down for good, so the
+    /// producer waits on a verdict that is never coming.
     ///
     /// Read off this shard's own finalizations, which is where its
     /// writes are stated, so every replica at one frontier folds the
     /// same set from the same blocks. A leaf that does not decode is one
-    /// no disposal could be composed from, as at the scan.
-    fn fold_record_writes(&mut self, block: &Block) {
+    /// no member could be composed from, as at the scan.
+    fn fold_crossing_writes(&mut self, block: &Block) {
         for finalization in block.certificates().iter() {
-            for receipt in finalization.as_unverified().receipts() {
+            for receipt in finalization.as_unverified().settling_receipts() {
                 let Some(writes) = receipt.consensus.writes() else {
                     continue;
                 };
@@ -1404,36 +1425,6 @@ impl Counterparts {
                                     .or_insert_with(|| HeldRecord::of(cell));
                             }
                         }
-                        None => {
-                            self.held.remove(key);
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-        }
-    }
-
-    /// Follow the owed claim cells this block's finalizations write and
-    /// delete, so what is answered is what the leaves answer.
-    ///
-    /// [`fold_record_writes`](Self::fold_record_writes) on the answering
-    /// side, and a scan at startup is its first term for the same reason:
-    /// a crossing answered after the scan would otherwise never be held,
-    /// and an answer already deleted would be held after its leaf was
-    /// gone.
-    ///
-    /// Read off this shard's own finalizations, which is where its writes
-    /// are stated, so every replica at one frontier folds the same set
-    /// from the same blocks.
-    fn fold_claim_writes(&mut self, block: &Block) {
-        for finalization in block.certificates().iter() {
-            for receipt in finalization.as_unverified().receipts() {
-                let Some(writes) = receipt.consensus.writes() else {
-                    continue;
-                };
-                for (key, value) in &writes.cells {
-                    match value {
                         Some(bytes) if is_crossing_answer_cell(*key, bytes) => {
                             if let Some(claim) = CrossingAnswer::from_bytes(bytes) {
                                 self.answered
@@ -1442,6 +1433,7 @@ impl Counterparts {
                             }
                         }
                         None => {
+                            self.held.remove(key);
                             self.answered.remove(key);
                         }
                         Some(_) => {}

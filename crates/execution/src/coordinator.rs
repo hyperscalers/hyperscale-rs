@@ -4497,7 +4497,7 @@ mod tests {
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
-        make_finalization_leaving, make_leg_finalization,
+        make_finalization_leaving, make_finalization_uncovered, make_leg_finalization,
         make_live_block as helpers_make_live_block, state_and_proof, test_prefix, test_transaction,
         test_transaction_running, test_transaction_with_prefixes,
     };
@@ -9027,6 +9027,49 @@ mod tests {
         assert!(
             state.counterparts.held.is_empty(),
             "the leaf is gone, so nothing here still owes for it",
+        );
+    }
+
+    /// A member no set of certificates covers writes nothing this shard
+    /// follows, in either direction.
+    ///
+    /// The fold's set has to be the set that reaches state. A
+    /// finalization carries every receipt its tick produced, and what
+    /// lands is what its certificates decide — so a member that
+    /// succeeded here and was left uncovered by a counterpart carries
+    /// `Succeeded` writes that never settle. Folded from the wider set,
+    /// this shard lets go of a leaf that is still there, and on the
+    /// other side holds an answer for a crossing nobody answered, which
+    /// stands the refusal down for good.
+    #[test]
+    fn an_uncovered_members_writes_are_not_followed() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let (record_key, _, cell) = held_record(0x6A, 400_000);
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(cell));
+
+        commit_finalizing(
+            &mut state,
+            &schedule,
+            1,
+            1_000,
+            make_finalization_uncovered(
+                BlockHeight::new(1),
+                cell.tx,
+                StateWrites {
+                    cells: BTreeMap::from([(record_key, None)]),
+                    ..StateWrites::default()
+                },
+                PEER,
+            ),
+        );
+        assert!(
+            state.counterparts.held.contains_key(&record_key),
+            "the deletion never settled, so the leaf is still there and still this \
+             shard's to dispose of",
         );
     }
 
