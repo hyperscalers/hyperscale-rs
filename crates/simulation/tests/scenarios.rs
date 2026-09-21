@@ -44,6 +44,7 @@ use hyperscale_scenarios::{
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
+    a_route_whose_core_never_combines_is_reclaimed_once,
     a_spent_nullifier_is_swept_once_unreachable, a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
@@ -760,6 +761,15 @@ fn route_cluster_on_dedicated_hosts() -> SimCluster {
         &route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
+}
+
+/// Its neighbour's other outcome: the same cut, held the whole way, so
+/// the leaf reclaims instead of the core settling. Sim-only — the span
+/// runs to the close of `Window::LegEntry`, minutes of weighted time.
+#[test]
+fn a_route_whose_core_never_combines_is_reclaimed_once_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(a_route_whose_core_never_combines_is_reclaimed_once);
 }
 
 #[test]

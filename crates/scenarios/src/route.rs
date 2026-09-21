@@ -13,7 +13,7 @@ use std::time::Duration;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     Address, BUNDLE_WAIT, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
-    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 
 use crate::straddler::isolate_ec_intake;
@@ -324,6 +324,149 @@ fn assert_venues_gave_back<C: Cluster>(
          the route, {} and {} after the chain ran on",
         held_at(c, first_cell),
         held_at(c, second_cell),
+    );
+}
+
+/// A core whose siblings never combine is reclaimed against, once, and
+/// its late return takes nothing.
+///
+/// [`a_route_cut_off_across_its_deadline_is_not_reclaimed`] holds the
+/// same cut and lifts it before the producer's leaf can read anything,
+/// and the route settles whole. This one holds it the whole way and the
+/// other outcome is pinned: the input goes back to the trader and the
+/// venues, speaking again too late, take nothing.
+///
+/// **Two rules read one cell, and only one of them is a window.** The
+/// trader's *entry* asks the core for its committed cell and for its
+/// claim, and a claim's absence answers nothing at any anchor — the
+/// consumer has not run, never that it will not. The producer's *leaf*
+/// reads the same committed reading under `held_absence_answers`, which
+/// treats a claim absent between the close of [`Window::Core`] and the
+/// close of [`Window::LegEntry`] as nobody having taken the crossing.
+/// The leaf only gets to act once the entry that would otherwise settle
+/// the record has pruned, and that is the same close its own window ends
+/// at — so the reclaim lands in the last instants of a span minutes
+/// wide, which is why this waits on the refund rather than on a clock.
+///
+/// **What it pins is that the two ends expire together.** The reclaim is
+/// sound only while no tick can still write the claim, and the argument
+/// for that is `TICK_SETTLEABLE_SPAN` — which
+/// `release_wedged_ticks` cannot enforce for a member awaiting a
+/// sibling, since its only reader is gated on a determined half and such
+/// a member has none. The span is not what holds here. What holds is
+/// that the core's tick goes with the entries at the same close, so the
+/// crossing has no second answer coming. Break that and the input pays
+/// twice: credited back to the trader, then claimed by a core that
+/// returned.
+///
+/// Requires disjoint committees, as its neighbour does.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the trader's
+/// leg never pays, if the cut never fires, if the reclaim does not fire
+/// inside the span that answers, if a venue certifies after the fact, or
+/// if the resource is not conserved.
+pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, trader) = &traders[0];
+    let cut = [
+        isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+    ];
+    let (protocol_resource, _units) = route_worlds(c, &first, &second, &traders);
+
+    let mut charges = Charges::default();
+    let validity = validity_around(c.now());
+    let funded = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity,
+    );
+    let hash = charges.submit(c, route);
+
+    assert!(
+        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
+            < funded - ROUTE_INPUT),
+        "the trader's leg must pay the input and the price before the core is asked anything",
+    );
+    let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
+
+    // The cut stands while the producer's leaf reads the claim absent and
+    // takes the input back. The reading has to fall inside
+    // `held_absence_answers` — from the close of [`Window::Core`] to the
+    // close of [`Window::LegEntry`] — and the leaf only gets to act on it
+    // once the entry that would otherwise settle the record has pruned,
+    // which is at that same close. So the two meet in the last instants
+    // of a span minutes wide, and what this waits on is the refund
+    // itself rather than a clock that happens to land near it.
+    let deadline = Deadline::of(validity.end_timestamp_exclusive);
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let reclaimed = c.run_until(epochs(70), |c| {
+        held(c, trader.address(), *PROTOCOL_RESOURCE) >= paid + ROUTE_INPUT
+    });
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut",
+    );
+    assert!(
+        reclaimed,
+        "the leaf must reclaim the input while the core is still holding its member; \
+         trader holds {} against {paid}, clock {:?} against the window \
+         {:?}..{:?}",
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+        clock(c),
+        Window::Core.of(deadline).end,
+        Window::LegEntry.of(deadline).end,
+    );
+    assert!(
+        clock(c) >= Window::Core.of(deadline).end,
+        "and it must read the absence inside the span that answers, not before it",
+    );
+    for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.chain_fate(shard, hash).1.is_none(),
+            "neither venue may have certified while its sibling was silent",
+        );
+    }
+    let refunded = held(c, trader.address(), *PROTOCOL_RESOURCE);
+
+    // The sibling speaks again, and it is too late for it to matter: the
+    // core's tick went with the entries at the same close the leaf's
+    // window ends at, so nothing is left to certify and no claim is ever
+    // written against a crossing whose value has gone home.
+    c.clear_drops();
+    let banked = c.run_until(epochs(12), |c| {
+        held(c, trader.address(), *PROTOCOL_RESOURCE) > refunded
+    });
+    assert!(
+        !banked,
+        "a core that never combined must bank nothing once its sibling speaks: \
+         the input it would have taken was credited back",
+    );
+    for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.chain_fate(shard, hash).1.is_none(),
+            "and neither venue certifies after the fact",
+        );
+    }
+
+    let after = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    assert_eq!(
+        after, refunded,
+        "the trader ends holding its input and having paid the price, once: \
+         funded = {funded}, after = {after}, input = {ROUTE_INPUT}",
+    );
+    assert!(
+        protocol_resource.settles(c, charges.burned(c)),
+        "and the resource is conserved: the input paid once and came back once",
     );
 }
 
