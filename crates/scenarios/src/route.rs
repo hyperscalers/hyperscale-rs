@@ -500,11 +500,15 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
 /// ends: the same cell, the same clock, and what tells them apart is
 /// whether an execution here could still write a claim.
 ///
-/// **What this pins at phase 6 is the write and the conservation across
-/// it, not the reclaim.** Nothing reads a decline yet: the input comes
-/// home once the verdict reaches the producer, which is what lifting the
-/// cut does. What would be caught here is a refusal that moved value on
-/// its own, or one written beside a claim.
+/// **What this pins is the write and the conservation across it, not
+/// which road the value comes home by.** A refusal and the producer's
+/// own probe of the core's committed cell open at the same instant —
+/// the deadline — and while the caller's leg entry stands, the leaf
+/// that would read the refusal stands down for it. So the input may be
+/// home before the cut lifts or after it, and the scenario asserts only
+/// that it comes home once and that nothing moved twice. What would be
+/// caught here is a refusal that moved value on its own, or one written
+/// beside a claim.
 ///
 /// Requires disjoint committees, as its neighbours do.
 ///
@@ -512,9 +516,8 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
 ///
 /// Panics if either venue misses its budget standing up, if the caller's
 /// leg never pays, if the venue does not refuse, if the cut never fires,
-/// if the venue writes no refusal past the deadline, if the producer
-/// reclaims while it cannot have heard the verdict, or if either side of
-/// the pair is not conserved.
+/// if the venue writes no refusal past the deadline, if the input never
+/// comes home, or if either side of the pair is not conserved.
 pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
@@ -577,16 +580,19 @@ pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut 
         clock(c) >= deadline.at(),
         "and not before it: inside its own window the member could still be composed again",
     );
-    assert_eq!(
-        held(c, trader.address(), *PROTOCOL_RESOURCE),
-        staged,
-        "the producer must not have heard the verdict, or the record it is asked about \
-         was disposed of before the refusal was written",
-    );
-
-    // Nothing reads the refusal yet, so what brings the input home is
-    // the verdict itself. What the refusal must not do is move value
-    // beside it.
+    // **Which road brings the input home is not this scenario's to
+    // say.** Both open at the deadline: the refusal here, and the
+    // producer's own probe of the core's committed cell, which a
+    // refusal retracts. While the trader's leg entry stands, the leaf
+    // that would read the refusal stands down for it
+    // (`settles_records`), so the entry's absence is the likelier
+    // road — and at a production epoch the run reaches far enough past
+    // the deadline for it to fire before the cut lifts. Telling the
+    // two apart wants one settler, which is phase 10's.
+    //
+    // What this pins either way is the refusal: written past the
+    // deadline, by a shard whose verdict never reached the producer,
+    // with the pair conserving across it.
     c.clear_drops();
     assert!(
         c.run_until(epochs(10), |c| held(
