@@ -172,13 +172,15 @@ const _: () = assert!(
     "a committed cell lives to the close of the window its absence answers in",
 );
 
-/// The exception is the crossing, whose cells are swept where the claim
-/// window closes: swept earlier and the proof would license a reclaim of
-/// state already gone, retained later and it is state nobody can retire.
-/// And the claim window is the terminal evidence span, so a record a
-/// successor inherits across a cut stays decidable for as long as any
-/// other reshape evidence is readable — which is the whole reason this
-/// family is not on the default.
+/// The exception is the crossing, whose cells no sweep reaches at all.
+/// Its grace is not a life but a round trip: the VM stamps a record's
+/// expiry as the producing intent's validity end plus this figure, and a
+/// reader holding nothing but the leaf recovers the deadline by taking
+/// the claim window back off it. The two terms have to be the same terms
+/// or the deadline a record states is not the deadline it was written
+/// with. The claim window is in turn the terminal evidence span, so a
+/// record a successor inherits across a cut states a deadline as
+/// readable as any other reshape evidence.
 const _: () = assert!(
     (MAX_FINALIZATION_DELAY.as_secs() + CLAIM_WINDOW.as_secs()) * 1_000 == CROSSING_GRACE_MS
         && EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS * 1_000 == CROSSING_GRACE_MS,

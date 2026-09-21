@@ -60,17 +60,17 @@ pub fn is_record_cell(key: SubstateKey, value: &[u8]) -> bool {
         && protocol_statics().record_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
-/// Whether a committed cell is an owed claim — a consumer's answer to a
-/// crossing nothing takes back.
+/// Whether a committed cell is a crossing claim — a consumer's answer to
+/// a crossing it was handed.
 ///
 /// [`is_record_cell`]'s neighbour, on the same seam and for the same
 /// reason: the two families a sweep never reaches are the two a reader
 /// holding the leaf can only tell apart by asking which role its value
 /// re-derives its key under.
 #[must_use]
-pub fn is_owed_claim_cell(key: SubstateKey, value: &[u8]) -> bool {
+pub fn is_crossing_claim_cell(key: SubstateKey, value: &[u8]) -> bool {
     protocol_statics_installed()
-        && protocol_statics().owed_claim_cell(key.owner.to_bytes(), key.local.0, value)
+        && protocol_statics().crossing_claim_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
 /// One row of the sweep index: an owner holding sweepable cells in a

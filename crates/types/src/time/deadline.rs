@@ -20,9 +20,8 @@ use crate::{
     RETENTION_HORIZON, TERMINAL_EVIDENCE_EPOCHS, Transaction, WeightedTimestamp,
 };
 
-/// The span past the deadline in which the claim cell a crossing's
-/// consumer writes is still standing, and so the whole of the span in
-/// which a record can be disposed of at all.
+/// The span past the deadline in which a record can be disposed of at
+/// all.
 ///
 /// Two validity ranges is the floor — the span a core's absence answers
 /// in, which a leg entry has to outlive or the reclaim that absence
@@ -49,9 +48,10 @@ const _: () = assert!(
 /// A transaction committed at `T` states a validity end at most one
 /// [`MAX_VALIDITY_RANGE`] on and a deadline one
 /// [`MAX_FINALIZATION_DELAY`] past that — [`RETENTION_HORIZON`] in
-/// total. A leg entry stands one [`CLAIM_WINDOW`] further, to where the
-/// claim cell both its members are proved against is swept. Past this
-/// nothing of the transaction can be asked, answered or reclaimed.
+/// total. A leg entry stands one [`CLAIM_WINDOW`] further, which is
+/// where a record a reshape successor inherits stops being decidable.
+/// Past this nothing of the transaction can be asked, answered or
+/// reclaimed.
 ///
 /// A duration rather than a count of windows, because none of its terms
 /// is a window: a chain that runs shorter epochs measures the same span
@@ -88,12 +88,12 @@ impl Deadline {
 
     /// The deadline an escrow record's expiry was derived from.
     ///
-    /// A record is never swept — no arm of the sweep reaches it, which
-    /// is what makes it a balance rather than a witness. What the expiry
-    /// names is the sweep of the claim cell the record is decided
-    /// against, keyed by the same figure so the two agree, and the
-    /// producing intent's deadline sits one [`CLAIM_WINDOW`] before it.
-    /// For a reader holding the record and no body.
+    /// Neither a record nor the claim that answers it is ever swept, so
+    /// the expiry names no life. What it names is the one figure a
+    /// reader holding the leaf and no body needs: the producing intent's
+    /// validity end plus the crossing grace, which is the deadline one
+    /// [`CLAIM_WINDOW`] on. Taking the window back off it is how that
+    /// reader recovers the deadline.
     #[must_use]
     pub const fn from_expiry(expiry_ms: u64) -> Self {
         Self(WeightedTimestamp::from_millis(
@@ -139,10 +139,9 @@ pub enum Window {
     /// every crossing that fed the core strands on a cell nobody can
     /// prove absent.
     Core,
-    /// Where a leg entry stands: from the deadline to the claim cell
-    /// both its members are proved against being swept, one
-    /// [`CLAIM_WINDOW`] on, past which no evidence that could decide
-    /// the leg can still be taken.
+    /// Where a leg entry stands: from the deadline to one
+    /// [`CLAIM_WINDOW`] on, past which no evidence that could decide the
+    /// leg can still be taken.
     ///
     /// [`CLAIM_WINDOW`] is this window's figure, derived for it: the
     /// span an absence has to be provable in, floored so a reclaim can
@@ -288,10 +287,11 @@ impl Probed {
     ///
     /// A presence is bounded by neither end of a window: the cell was
     /// written by the one execution that writes it, whenever the reading
-    /// was taken, and a swept one reads absent rather than present. That
-    /// asymmetry is the whole of why a retirement can be licensed across
-    /// a cut and a reclaim cannot. An absence answers only inside its
-    /// window. Which readings answer at all is [`Self::read`].
+    /// was taken. An absence has to be read inside the window its cell
+    /// is still standing in, or it is a swept cell rather than a write
+    /// that never happened — which is the whole of why a retirement can
+    /// be licensed across a cut and a reclaim cannot. Which readings
+    /// answer at all is [`Self::read`].
     #[must_use]
     pub fn answer(
         self,
@@ -313,10 +313,10 @@ impl Probed {
     /// whoever fetched it. A committed cell answers absent — the member
     /// never included the transaction, or refused and retracted the
     /// cell — and present is a member still pending, whose refusal may
-    /// yet retract it. A core consumer's claim answers present — the
-    /// consuming finalization committed, which it does only once every
-    /// core member certified — and absent is a sibling still pending. A
-    /// delivery's claim answers either way. A record answers present —
+    /// yet retract it. A claim answers present — it is written by the
+    /// one execution that takes the crossing and is swept by nothing —
+    /// and its absence says only that the consumer has not answered
+    /// yet, whichever consumer it is. A record answers present —
     /// it is written by the one execution that issues the crossing and
     /// is swept by nothing, so a presence read at any anchor is a
     /// presence — and its absence says only that the producer has
@@ -389,13 +389,8 @@ mod tests {
 
     /// The core window closes where the committed cell may be swept: a
     /// proof there is a true proof of a cell that was present, so it
-    /// licenses nothing. The claim windows close at the crossing
-    /// family's grace, the claim cell's own sweep.
+    /// licenses nothing.
     ///
-    /// Each window's own end is the sweep of the cell its absence asks
-    /// about, and the two families are sized apart: the core window is
-    /// one validity range wide, and the lapse runs from the same offset
-    /// to a sweep the crossing family sets far later.
     /// A refusal at the last moment a core may abandon in is still
     /// readable, and stays so for a range past it.
     ///
@@ -538,9 +533,8 @@ mod tests {
         assert_eq!(entry.end.elapsed_since(entry.start), CLAIM_WINDOW);
     }
 
-    /// A committed cell answers absent and never present, a core
-    /// consumer's claim answers present and never absent, and a
-    /// delivery's claim answers either way.
+    /// A committed cell answers absent and never present; a claim and a
+    /// record answer present and never absent.
     #[test]
     fn each_cell_answers_with_the_reading_its_writer_makes_final() {
         let present = Inclusion::Present([7; 32]);

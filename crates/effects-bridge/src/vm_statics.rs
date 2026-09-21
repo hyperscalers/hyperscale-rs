@@ -25,8 +25,8 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    Admitted, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, Intent, IntentHeader,
-    IntentRecord, IntentTree, MARKER_CELL_BYTES, ManifestHash, NodeCall, OWED_CLAIM_CELL_BYTES,
+    Admitted, CROSSING_CELL_BYTES, CROSSING_CLAIM_CELL_BYTES, ChainRecords, Claim, CrossingSite,
+    Intent, IntentHeader, IntentRecord, IntentTree, MARKER_CELL_BYTES, ManifestHash, NodeCall,
     PackageHash, Value, admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes,
     effect_units, legs_of, package_hash, package_key as canonical_package_key, principal_address,
     protocol_resource,
@@ -34,15 +34,15 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectTarget, LegRole,
-    LegShape, LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey, Terms,
-    TermsRefusal, admit_event_bounds, attestation_work, read_bytes, written_leaf,
+    AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectTarget, LegShape,
+    LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey, Terms, TermsRefusal,
+    admit_event_bounds, attestation_work, read_bytes, written_leaf,
 };
 
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 use crate::records::{
-    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, owed_claim_cell,
+    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, crossing_claim_cell,
     record_cell, sweepable_cell,
 };
 
@@ -228,26 +228,20 @@ pub fn declared_vector(
                     ..DeclaredWork::ZERO
                 },
             );
-            // A consumer's answer is priced by the family its kind puts
-            // it in: an outbound leg's arrival is owed, and an owed claim
-            // carries the record it answers for where a marker carries
-            // only the edge.
-            let claim_bytes = if consumer.role == LegRole::Outbound {
-                u64::from(OWED_CLAIM_CELL_BYTES)
-            } else {
-                u64::from(MARKER_CELL_BYTES)
-            };
+            // A consumer's answer is one family whatever the crossing's
+            // terms, and it carries the record it answers for — which is
+            // what makes it wider than a marker.
             add(
                 consumer.target,
                 DeclaredWork {
-                    write_bytes: written_leaf(claim_bytes),
+                    write_bytes: written_leaf(u64::from(CROSSING_CLAIM_CELL_BYTES)),
                     footprint: point_write,
                     ..DeclaredWork::ZERO
                 },
             );
             retained = retained
                 .saturating_add(u64::from(CROSSING_CELL_BYTES))
-                .saturating_add(claim_bytes);
+                .saturating_add(u64::from(CROSSING_CLAIM_CELL_BYTES));
         }
     }
 
@@ -1221,8 +1215,8 @@ impl ProtocolStatics for BridgeStatics {
         Address::from_bytes(owner).is_ok_and(|owner| record_cell(owner, local, value))
     }
 
-    fn owed_claim_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
-        Address::from_bytes(owner).is_ok_and(|owner| owed_claim_cell(owner, local, value))
+    fn crossing_claim_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
+        Address::from_bytes(owner).is_ok_and(|owner| crossing_claim_cell(owner, local, value))
     }
 
     fn rule_admits(
@@ -1524,7 +1518,7 @@ mod tests {
             "the record sits under the producer beside its own declaration"
         );
         assert!(
-            consumer.write_bytes >= u64::from(MARKER_CELL_BYTES)
+            consumer.write_bytes >= u64::from(CROSSING_CLAIM_CELL_BYTES)
                 && consumer.footprint >= point_write,
             "the claim sits under the consumer"
         );
@@ -1759,13 +1753,10 @@ mod tests {
         // Against what the second pair's leaves KEEP — its edge's record
         // and claim at their own widths — and not against what they cost
         // to write, which carries a per-leaf floor retention never sees.
-        // The deposit is an outbound leg, so the claim it keeps is the
-        // owed one, which is wider than a marker by the record key it
-        // carries.
         assert_eq!(
             twice.work.retention - derived.work.retention,
             moving
-                + u64::from(CROSSING_CELL_BYTES + OWED_CLAIM_CELL_BYTES)
+                + u64::from(CROSSING_CELL_BYTES + CROSSING_CLAIM_CELL_BYTES)
                 + (wider_bytes - envelope_bytes),
             "the second pair adds its own event bound, the cells its edge keeps, and its own envelope"
         );

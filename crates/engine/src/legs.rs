@@ -1094,7 +1094,7 @@ mod tests {
     fn owed_claims_name_the_consumers_of_what_a_shard_issued() {
         let legs = transfer();
         let bob = owner(0x22, true);
-        let expected = CrossingSite::claim_of(&ProtocolHasher, bob, &legs[1], 0, Kind::Owed).key();
+        let expected = CrossingSite::claim_of(&ProtocolHasher, bob, &legs[1], 0).key();
         assert_eq!(frozen(&legs).owed_claims(low()), vec![(high(), expected)]);
         assert!(
             frozen(&legs).owed_claims(high()).is_empty(),

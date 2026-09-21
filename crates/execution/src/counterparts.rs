@@ -19,7 +19,7 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
-use hyperscale_storage::{CrossingLeaves, is_owed_claim_cell, is_record_cell};
+use hyperscale_storage::{CrossingLeaves, is_crossing_claim_cell, is_record_cell};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_FINALIZATION_DELAY,
@@ -29,7 +29,7 @@ use hyperscale_types::{
     TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx,
     Verifiable, Verified, WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::{CrossingCell, OwedClaim};
+use hyperscale_vm_effects::{CrossingCell, CrossingClaim};
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 use crate::provisioning::Arrival;
@@ -38,12 +38,12 @@ use crate::provisioning::Arrival;
 /// says nobody took the crossing.
 ///
 /// From the close of [`Window::Core`], where no core shard of any arity
-/// can still commit, to the sweep of the claim cell itself, past which
-/// an absence is a swept cell rather than a claim that never happened.
-/// A leaf does not name its consumer's role, so nothing narrower is
-/// honest for every record this reads. A record a delivery consumes
-/// never reaches the disposal an absence licenses: it names nobody to
-/// take it back, and nobody does.
+/// can still commit, to the close of [`Window::LegEntry`], which is as
+/// far as any evidence deciding the transaction can be taken. A leaf
+/// does not name its consumer's role, so nothing narrower is honest for
+/// every record this reads. A record a delivery consumes never reaches
+/// the disposal an absence licenses: it names nobody to take it back,
+/// and nobody does.
 fn held_absence_answers(probed_wt: WeightedTimestamp, deadline: Deadline) -> bool {
     (Window::Core.of(deadline).end..Window::LegEntry.of(deadline).end).contains(&probed_wt)
 }
@@ -210,7 +210,7 @@ pub struct AnsweredCrossing {
 impl AnsweredCrossing {
     /// The answer as the leaves give it: unasked, unanswered.
     #[must_use]
-    const fn of(claim: &OwedClaim) -> Self {
+    const fn of(claim: &CrossingClaim) -> Self {
         Self {
             record: claim.record,
             asked_at: None,
@@ -240,6 +240,27 @@ fn awaits_record(answered: &BTreeMap<SubstateKey, AnsweredCrossing>, key: Substa
     answered
         .values()
         .any(|answer| answer.answer.is_none() && answer.record == key)
+}
+
+/// Whether any leaf-driven question of this shard's is waiting on a
+/// reading of `key`.
+///
+/// The three sources [`Counterparts::probe`] asks from, read back as one
+/// predicate, because two sites need exactly this set and needed it to
+/// be the same set. A fetch that lands is offered in a block only if
+/// something here wants it, and a reading held to offer is kept only
+/// while something here wants it — so a source named in one and missed
+/// in the other is a reading fetched, dropped at the next commit and
+/// fetched again at the counterpart's next header, for as long as the
+/// leaf stands. None of these questions names a transaction of this
+/// chain's, which is why the keys are read rather than the names.
+fn wants_reading(
+    held: &BTreeMap<SubstateKey, HeldRecord>,
+    answered: &BTreeMap<SubstateKey, AnsweredCrossing>,
+    arrivals: &BTreeMap<SubstateKey, BlockHeight>,
+    key: SubstateKey,
+) -> bool {
+    awaited_by(held, key) || awaits_record(answered, key) || arrivals.contains_key(&key)
 }
 
 /// Whether any answer cell of this shard's names `key`.
@@ -417,10 +438,13 @@ impl Counterparts {
                 })
                 .collect(),
             answered: leaves
-                .owed_claims
+                .claims
                 .iter()
                 .filter_map(|(key, value)| {
-                    Some((*key, AnsweredCrossing::of(&OwedClaim::from_bytes(value)?)))
+                    Some((
+                        *key,
+                        AnsweredCrossing::of(&CrossingClaim::from_bytes(value)?),
+                    ))
                 })
                 .collect(),
             arrivals: BTreeMap::new(),
@@ -466,7 +490,7 @@ impl Counterparts {
         }
         self.cover_recorded(block);
         self.fold_record_writes(block);
-        self.fold_owed_claim_writes(block);
+        self.fold_claim_writes(block);
         self.fold_reoffers(block.reoffers(), now);
         self.cover_held(block);
         self.stamp_departures(topology_schedule, now);
@@ -949,15 +973,12 @@ impl Counterparts {
                 record_reclaim_probe_pending();
             }
         }
-        // A leaf-driven question names no transaction of this chain's, so
-        // what it wants is read off the keys — on both sides, since a
-        // record this shard holds and an answer this shard wrote are the
-        // same question asked from opposite ends.
-        answering.extend(inclusions.iter().map(|(key, _)| *key).filter(|key| {
-            awaited_by(&self.held, *key)
-                || awaits_record(&self.answered, *key)
-                || self.arrivals.contains_key(key)
-        }));
+        answering.extend(
+            inclusions
+                .iter()
+                .map(|(key, _)| *key)
+                .filter(|key| wants_reading(&self.held, &self.answered, &self.arrivals, *key)),
+        );
         if answering.is_empty() {
             return;
         }
@@ -1038,13 +1059,14 @@ impl Counterparts {
     /// is the whole of what a record is: there is no window here, so
     /// **every** reading is recorded, whichever way it went.
     ///
-    /// A claim cell is swept, so an absence of one outside its window is
-    /// a swept cell rather than a claim that never happened, and reading
-    /// it would be reading nothing. A record is swept by nothing. So a
-    /// reading of one is a fact at whatever anchor it was taken — present
-    /// says the producer still holds the value, absent says it has
-    /// disposed of it — and both are worth holding, if only so the
-    /// question stops being asked.
+    /// A claim's absence is read inside a window because a leaf holding
+    /// one cannot tell a consumer that refused from one that has not run
+    /// yet. A record's cannot be mistaken that way: it is written by the
+    /// one execution that issues the crossing and removed by the one
+    /// that disposes of it. So a reading of one is a fact at whatever
+    /// anchor it was taken — present says the producer still holds the
+    /// value, absent says it has disposed of it — and both are worth
+    /// holding, if only so the question stops being asked.
     ///
     /// What a fact *licenses* is a separate question, and
     /// [`Probed::read`] is where it is answered. Nothing licenses
@@ -1178,7 +1200,7 @@ impl Counterparts {
     /// Read off this shard's own finalizations, which is where its writes
     /// are stated, so every replica at one frontier folds the same set
     /// from the same blocks.
-    fn fold_owed_claim_writes(&mut self, block: &Block) {
+    fn fold_claim_writes(&mut self, block: &Block) {
         for finalization in block.certificates().iter() {
             for receipt in finalization.as_unverified().receipts() {
                 let Some(writes) = receipt.consensus.writes() else {
@@ -1186,8 +1208,8 @@ impl Counterparts {
                 };
                 for (key, value) in &writes.cells {
                     match value {
-                        Some(bytes) if is_owed_claim_cell(*key, bytes) => {
-                            if let Some(claim) = OwedClaim::from_bytes(bytes) {
+                        Some(bytes) if is_crossing_claim_cell(*key, bytes) => {
+                            if let Some(claim) = CrossingClaim::from_bytes(bytes) {
                                 self.answered
                                     .entry(*key)
                                     .or_insert_with(|| AnsweredCrossing::of(&claim));
@@ -1330,14 +1352,21 @@ impl Counterparts {
     fn release_answered_fetches(&mut self, trie: &ShardTrie) -> Vec<Action> {
         let unresolved = &self.ledger;
         // A claim is worth carrying while something still wants what it
-        // answers: a transaction the ledger owes an outcome for, or an
-        // a held record whose claim it speaks to. The second has no
-        // transaction here at all, which is why the keys are read rather
-        // than the names.
+        // answers: a transaction the ledger owes an outcome for, or a
+        // leaf-driven question of this shard's, by [`wants_reading`] —
+        // the same predicate that decided the reading was worth keeping
+        // when the fetch landed.
         let held = &self.held;
-        self.fetched.retain(|claim, answered| {
-            answered.iter().any(|tx_hash| unresolved.contains(*tx_hash))
-                || claim.cells.iter().any(|(key, _)| awaited_by(held, *key))
+        let answered = &self.answered;
+        let arrivals = &self.arrivals;
+        self.fetched.retain(|claim, speaks_for| {
+            speaks_for
+                .iter()
+                .any(|tx_hash| unresolved.contains(*tx_hash))
+                || claim
+                    .cells
+                    .iter()
+                    .any(|(key, _)| wants_reading(held, answered, arrivals, *key))
         });
         // The one retention rule for what counterparts said: an entry
         // there speaks for a transaction this ledger still owes an
@@ -1710,6 +1739,63 @@ mod tests {
                 .and_then(|answer| answer.answer),
             Some(Inclusion::Absent),
             "and what it read is held",
+        );
+    }
+
+    /// A reading a leaf-driven question wanted survives the commit that
+    /// follows it, and is still there to be offered.
+    ///
+    /// The retention rule and the rule that decides a landed fetch is
+    /// worth keeping are the same rule, and a source named in one and
+    /// missed in the other is not a dropped answer but an unbounded
+    /// stream: the reading goes at the next commit, no block ever carries
+    /// it, the fold never fires, and the question is put again at the
+    /// producer's next header — once per block, per crossing this shard
+    /// ever answered.
+    ///
+    /// Asserted across the commit's own release rather than at the
+    /// fetch, because that is where the two rules can come apart: the
+    /// fetch site keeps the reading and the release throws it away, so a
+    /// test that stops at the fetch passes either way.
+    #[test]
+    fn a_reading_a_leaf_wanted_outlives_the_commit_that_follows_it() {
+        let record = producer_record(0x42);
+        let (mut counterparts, trie, anchors) = answering(record);
+        let now = WeightedTimestamp::from_millis(60_000);
+        let (state_root, proof) = state_and_proof(PRODUCER, &[], &[record]);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(7),
+            state_root,
+            ts: now,
+        };
+        anchors.record(anchor);
+        assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
+        counterparts.on_proof_fetched(anchor, vec![record], proof);
+
+        // The commit's own pass over what is still wanted. Nothing here
+        // names a transaction this ledger owes an outcome for, which is
+        // the other half of the retention rule.
+        counterparts.release_answered_fetches(&trie);
+        assert!(
+            counterparts
+                .fetched
+                .keys()
+                .any(|claim| claim.reading(record).is_some()),
+            "the reading is still there to offer",
+        );
+        assert_eq!(
+            counterparts.state_claims().len(),
+            1,
+            "and a block this validator proposes carries it",
+        );
+        anchors.record(Anchor {
+            height: BlockHeight::new(8),
+            ..anchor
+        });
+        assert!(
+            counterparts.probe(&trie, now, &BTreeMap::new()).is_empty(),
+            "so the question is not put again at the producer's next header",
         );
     }
 

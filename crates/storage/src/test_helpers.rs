@@ -13,7 +13,7 @@ use hyperscale_hbor::{Bytes, Capped, from_slice};
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    stub_owed_claim_cell, stub_record_cell, stub_sweepable_cell, test_transaction,
+    stub_crossing_claim_cell, stub_record_cell, stub_sweepable_cell, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
@@ -1574,7 +1574,7 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
         owed(shard),
         CrossingLeaves {
             records: vec![(record, stub_record_cell(7))],
-            owed_claims: Vec::new(),
+            claims: Vec::new(),
         },
         "a record reads back with the bytes a reclaim composes from, and a \
          record under the sibling's prefix is not this shard's to owe",
@@ -1583,7 +1583,7 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
         owed(ShardId::leaf(1, 1)),
         CrossingLeaves {
             records: vec![(sibling, stub_record_cell(8))],
-            owed_claims: Vec::new(),
+            claims: Vec::new(),
         },
         "and the sibling's own scan answers with its own",
     );
@@ -1597,21 +1597,21 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
         "a record taken back is no longer owed",
     );
 
-    // The answering side of the same scan: an owed claim this shard
-    // wrote is found by the one question a leaf can be asked, beside the
-    // records rather than among them.
+    // The answering side of the same scan: a claim this shard wrote is
+    // found by the one question a leaf can be asked, beside the records
+    // rather than among them.
     let claim = state_key(3, 3);
     commit(&SettledWrites::from_absolutes(BTreeMap::from([(
         claim,
-        Some(stub_owed_claim_cell(11)),
+        Some(stub_crossing_claim_cell(11)),
     )])));
     assert_eq!(
         owed(shard),
         CrossingLeaves {
             records: Vec::new(),
-            owed_claims: vec![(claim, stub_owed_claim_cell(11))],
+            claims: vec![(claim, stub_crossing_claim_cell(11))],
         },
-        "an owed claim is the other family the scan answers with",
+        "a claim is the other family the scan answers with",
     );
 }
 

@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice};
 use hyperscale_vm_effects::{
-    ChainRecords, CrossingCell, Hasher, InstanceMeta, InstanceRegistry, Issuance, Marker,
-    MetadataCache, OwedClaim, PackageHash, PackageMetadata, ResourceMeta, Value, escrow_record_key,
+    ChainRecords, CrossingCell, CrossingClaim, Hasher, InstanceMeta, InstanceRegistry, Issuance,
+    Marker, MetadataCache, PackageHash, PackageMetadata, ResourceMeta, Value, escrow_record_key,
     package_hash,
 };
 use hyperscale_vm_types::{
@@ -72,19 +72,16 @@ const WASM_PREAMBLE: &[u8] = b"\0asm";
 /// cannot claim a life its declaration does not name — the key a false
 /// expiry produces is not the key the declaration covers.
 ///
-/// Three families: the nullifier, the committed-transaction cell, and
-/// the escrow claim. Each arm is its own derivation, so arms cannot
-/// overlap and the order they are tried in does not decide the answer —
-/// a value that decodes under two layouts re-derives at most one
-/// family's key.
+/// Two families: the nullifier and the committed-transaction cell. Each
+/// arm is its own derivation, so arms cannot overlap and the order they
+/// are tried in does not decide the answer — a value that decodes under
+/// two layouts re-derives at most one family's key.
 ///
-/// Two families are deliberately not among them, and for one reason: an
-/// escrow record and the owed claim that answers it are both keyed by
-/// the edge alone, carrying no bucket for a sweep to walk. A record is a
-/// balance, retired by whoever consumes it; an owed claim is what refuses
-/// a second delivery for as long as one could be admitted. The escrowed
-/// claim here is neither — it is a witness read inside a window on its
-/// own chain's clock, and keeps its bucket.
+/// The crossing families are deliberately not among them, and for one
+/// reason: an escrow record and the claim that answers it are both keyed
+/// by the edge alone, carrying no bucket for a sweep to walk. A record
+/// is a balance, retired by whoever consumes it; a claim is the answer
+/// its producer reads, at whatever anchor it gets there.
 ///
 /// Three tests, cheapest first, because this runs over every cell of
 /// every commit. The decode rejects on shape alone; the bucket check
@@ -116,16 +113,16 @@ pub(crate) fn record_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool
     key.local.0 == local
 }
 
-/// Whether a committed cell is an owed claim — a consumer's answer to a
-/// crossing nothing takes back.
+/// Whether a committed cell is a crossing claim — a consumer's answer to
+/// a crossing it was handed.
 ///
 /// Judged the way [`record_cell`] is, and beside it for the same reason:
 /// both families are outside every sweep's reach, so the value
 /// re-deriving its key under its own role is the only thing that tells a
 /// reader holding the leaf which one it is holding.
 #[must_use]
-pub(crate) fn owed_claim_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
-    let Ok(claim) = hbor_from_slice::<OwedClaim>(value) else {
+pub(crate) fn crossing_claim_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
+    let Ok(claim) = hbor_from_slice::<CrossingClaim>(value) else {
         return false;
     };
     claim.key(&ProtocolHasher, owner).local.0 == local
@@ -692,7 +689,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use hyperscale_hbor::to_vec as hbor_to_vec;
-    use hyperscale_vm_effects::{Hash32, Kind, Value};
+    use hyperscale_vm_effects::{Hash32, Value};
     use hyperscale_vm_stdlib::account;
 
     use super::*;
@@ -1022,13 +1019,16 @@ mod tests {
         );
     }
 
-    /// An escrow claim is judged sweepable off its own leaf, at the
-    /// producing intent's validity end plus the escrow grace, and at no
-    /// other local and under no other owner. The record beside it is
-    /// swept by nothing: it is a balance, retired by whoever consumes
-    /// it, so a sweep that could reach it would burn value on a clock.
+    /// Neither half of a crossing is swept: a record is a balance,
+    /// retired by whoever consumes it, and a claim is the answer its
+    /// producer reads, at whatever anchor it gets there. A sweep that
+    /// could reach either would burn value on a clock.
+    ///
+    /// Each is judged off its own leaf under its own role, and at no
+    /// other local and under no other owner — which is the only thing
+    /// that tells a reader holding the leaf which of the two it holds.
     #[test]
-    fn a_claim_is_judged_off_its_leaf_and_a_record_is_swept_by_nothing() {
+    fn neither_half_of_a_crossing_is_swept_and_each_is_judged_off_its_leaf() {
         use hyperscale_vm_effects::{CrossingSite, IntentHeader, Terms, crossing_expiry_ms};
         use hyperscale_vm_types::{AddressClass, CROSSING_GRACE_MS, IntentHash, NetworkId, TxHash};
 
@@ -1045,15 +1045,7 @@ mod tests {
         let taker = Address::new([0x5C; 31], AddressClass::Component);
         let intent = IntentHash(Hash32([0xB0; 32]));
         let record_site = CrossingSite::record(&ProtocolHasher, producer, intent, 1, 0, expiry_ms);
-        let claim_site = CrossingSite::claim(
-            &ProtocolHasher,
-            taker,
-            intent,
-            1,
-            0,
-            expiry_ms,
-            Kind::Escrowed,
-        );
+        let claim_site = CrossingSite::claim(&ProtocolHasher, taker, intent, 1, 0, expiry_ms);
         let record = record_site.crossing(
             TxHash(Hash32([0xC0; 32])),
             ResourceAddr::new([0xE0; 31]),
@@ -1065,42 +1057,36 @@ mod tests {
         );
         let claim_value = claim_site.claimed_by(TxHash(Hash32([0xC0; 32])), record_site.key());
         let local = claim_site.key().local.0;
-        assert_eq!(sweepable_cell(taker, local, &claim_value), Some(expiry_ms));
         let mut elsewhere = local;
         elsewhere[15] ^= 1;
-        assert_eq!(sweepable_cell(taker, elsewhere, &claim_value), None);
         let other_owner = Address::new([0x5B; 31], AddressClass::Component);
-        assert_eq!(sweepable_cell(other_owner, local, &claim_value), None);
-
-        // The record answers for nothing, at its own leaf or anywhere
-        // else: no arm claims it, so no sweep can name it.
         let record_value = record.to_bytes();
-        assert_eq!(
-            sweepable_cell(producer, record_site.key().local.0, &record_value),
-            None
-        );
-        assert_eq!(
-            sweepable_cell(producer, claim_site.key().local.0, &record_value),
-            None
-        );
-        assert_eq!(
-            sweepable_cell(taker, record_site.key().local.0, &claim_value),
-            None
-        );
 
-        // The owed claim is the record's neighbour here, not the
-        // marker's: no sweep names it, and what does name it is the one
-        // question a reader holding the leaf can ask.
-        let owed_site =
-            CrossingSite::claim(&ProtocolHasher, taker, intent, 1, 0, expiry_ms, Kind::Owed);
-        let owed_value = owed_site.claimed_by(TxHash(Hash32([0xC0; 32])), record_site.key());
-        let owed_local = owed_site.key().local.0;
-        assert_eq!(sweepable_cell(taker, owed_local, &owed_value), None);
-        assert!(owed_claim_cell(taker, owed_local, &owed_value));
-        assert!(!owed_claim_cell(other_owner, owed_local, &owed_value));
-        assert!(!owed_claim_cell(taker, elsewhere, &owed_value));
-        assert!(!record_cell(taker, owed_local, &owed_value));
-        assert!(!owed_claim_cell(
+        // No arm of the sweep claims either, at its own leaf or
+        // anywhere else.
+        for (owner, at, value) in [
+            (taker, local, &claim_value),
+            (taker, elsewhere, &claim_value),
+            (other_owner, local, &claim_value),
+            (taker, record_site.key().local.0, &claim_value),
+            (producer, record_site.key().local.0, &record_value),
+            (producer, claim_site.key().local.0, &record_value),
+        ] {
+            assert_eq!(sweepable_cell(owner, at, value), None);
+        }
+
+        // What does name each is the one question a reader holding the
+        // leaf can ask: which role its value re-derives its key under.
+        assert!(crossing_claim_cell(taker, local, &claim_value));
+        assert!(!crossing_claim_cell(other_owner, local, &claim_value));
+        assert!(!crossing_claim_cell(taker, elsewhere, &claim_value));
+        assert!(!record_cell(taker, local, &claim_value));
+        assert!(record_cell(
+            producer,
+            record_site.key().local.0,
+            &record_value
+        ));
+        assert!(!crossing_claim_cell(
             producer,
             record_site.key().local.0,
             &record_value
