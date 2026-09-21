@@ -32,7 +32,7 @@ impl ShardParticipation {
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
     /// the ready-transaction + abort intents + certificates gathering logic.
     pub(in crate::state) fn gather_proposal_inputs(
-        &self,
+        &mut self,
         sched: &TopologySchedule,
     ) -> ProposalInputs {
         // The wire cap, not the packing bound — a block cannot encode

@@ -12,6 +12,7 @@
 //! what to do with a strand nobody can answer for.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
@@ -21,11 +22,12 @@ use hyperscale_metrics::{
 use hyperscale_storage::{CrossingLeaves, is_owed_claim_cell, is_record_cell};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
-    CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie, Spoken,
-    StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
-    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
+    CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_FINALIZATION_DELAY,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_REOFFERS_PER_BLOCK,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, ProvenAnchors,
+    ProvenCells, SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey,
+    TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx,
+    Verifiable, Verified, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{CrossingCell, OwedClaim};
 
@@ -115,6 +117,24 @@ pub struct HeldRecord {
     /// The newest counterpart header the claim has been asked at, so
     /// the question is not re-sent at the same one every block.
     asked_at: Option<BlockHeight>,
+    /// What the last committed offer of this crossing was made against:
+    /// the consumer header it was paced on, and the chain's clock at the
+    /// block that carried it.
+    ///
+    /// Two figures because an offer is bounded by two different
+    /// failures, and neither bound covers the other's. The clock is how
+    /// long an answer takes to come back — a round, by
+    /// [`MAX_FINALIZATION_DELAY`]'s own definition — and it is what
+    /// paces a consumer that is running, whose headers land here far
+    /// faster than that. The height is what stops a consumer that is
+    /// not: a target whose chain has not advanced could not have
+    /// answered however long is waited, and off a leaf, which does not
+    /// die, a clock alone would promise into it forever.
+    ///
+    /// Stamped where the offer commits rather than where it is composed:
+    /// a proposer that composed one and lost its round promised nothing,
+    /// and the next proposal must not skip the crossing for it.
+    offered_at: Option<(BlockHeight, WeightedTimestamp)>,
     /// What a committed claim read of the cell, once one has read it:
     /// present at any anchor, absent only past the lapse.
     pub(crate) answer: Option<Inclusion>,
@@ -138,6 +158,7 @@ impl HeldRecord {
         Self {
             cell,
             asked_at: None,
+            offered_at: None,
             answer: None,
             departed: false,
         }
@@ -326,6 +347,18 @@ pub struct Counterparts {
     /// either there is no entry to name it — and the leaf carries the one
     /// term the question needs, the record it answers for.
     pub(crate) answered: BTreeMap<SubstateKey, AnsweredCrossing>,
+    /// Where this validator's last composed offer reached, so the next
+    /// one starts past it rather than at the lowest keys every time.
+    ///
+    /// A rotation hint and nothing more. What decides whether a crossing
+    /// is promised is [`HeldRecord::offered_at`]; this only spreads one
+    /// block's cap over a backlog wider than it, so no record at the
+    /// tail waits on the head being answered. Which records a proposer
+    /// reaches is not consensus content — only what a block carries is —
+    /// so it is node-local and empty after a restart, and a restart
+    /// re-offers each record at most once before the walk laps.
+    offer_cursor: Option<(ShardId, TxHash)>,
+
     /// The questions this validator has put to counterparts, by the
     /// shard asked and the cell: the header each was asked at, and
     /// whether the fetch returned. A probe lives while its question is
@@ -370,6 +403,7 @@ impl Counterparts {
                     Some((*key, AnsweredCrossing::of(&OwedClaim::from_bytes(value)?)))
                 })
                 .collect(),
+            offer_cursor: None,
             probes: BTreeMap::new(),
         }
     }
@@ -411,6 +445,7 @@ impl Counterparts {
         self.cover_recorded(block);
         self.fold_record_writes(block);
         self.fold_owed_claim_writes(block);
+        self.fold_reoffers(block.reoffers(), now);
         self.cover_held(block);
         self.stamp_departures(topology_schedule, now);
         let unanswerable = self.ledger.prune(now);
@@ -470,12 +505,89 @@ impl Counterparts {
 
     /// What this validator holds to offer in a block it proposes.
     #[must_use]
-    pub(crate) fn offers(&self) -> Offers {
+    pub(crate) fn offers(&mut self, trie: &ShardTrie, now: WeightedTimestamp) -> Offers {
         Offers {
             state_claims: self.state_claims(),
             abandonment_records: self.abandonment_records(),
-            reoffers: Vec::new(),
+            reoffers: self.reoffers(trie, now),
         }
+    }
+
+    /// The crossings this shard still holds a record for, each promised
+    /// again to whoever holds its claim's prefix now.
+    ///
+    /// Composed off the leaves, which is what lets an offer outlive the
+    /// entry that once made it: a record stands until its consumer
+    /// answers, and nothing else says a crossing is still owed. The
+    /// deadline is the floor, read off the record's own expiry, because
+    /// short of it the crossing's first bundle may still be in flight
+    /// and nothing has failed to deliver it yet.
+    ///
+    /// Paced on the consumer's chain **and** on a clock, because the two
+    /// bound different failures. An entry dies, so one offer a round is
+    /// a bounded promise against it; a leaf does not, so the clock alone
+    /// would promise into an unreachable target forever, every round,
+    /// into a section capped at [`MAX_REOFFERS_PER_BLOCK`] and shared
+    /// with every live one. The target's newest proven header closes
+    /// that — a chain that has not advanced is offered once — but it
+    /// does not replace the clock: a target that *is* running lands
+    /// headers here every block, and paced on those alone a crossing is
+    /// promised many times over inside the one round its answer takes,
+    /// which is a bundle rebuilt and rebroadcast for each.
+    ///
+    /// One offer per transaction per target, because an offer promises a
+    /// bundle built from exactly the cells it names and a bundle per
+    /// record would promise several partial ones. The records of one
+    /// transaction into one shard are a subset of the crossings it
+    /// carries, so [`MAX_CROSSINGS_PER_TX`](hyperscale_vm_types::MAX_CROSSINGS_PER_TX)
+    /// is met by construction.
+    fn reoffers(&mut self, trie: &ShardTrie, now: WeightedTimestamp) -> Vec<CrossingReoffer> {
+        let local = self.ledger.local();
+        let mut outstanding: BTreeMap<(ShardId, TxHash), Vec<SubstateKey>> = BTreeMap::new();
+        for (&key, record) in &self.held {
+            if record.answer.is_some() || now < record.deadline().at() {
+                continue;
+            }
+            let target = trie.shard_for_prefix(record.cell.consumer_claim.owner);
+            if target == local {
+                continue;
+            }
+            let Some(anchor) = self.proven_anchors.newest_licensed(target, now, |_| true) else {
+                continue;
+            };
+            if record.offered_at.is_some_and(|(at, when)| {
+                at >= anchor.height || now.elapsed_since(when) < MAX_FINALIZATION_DELAY
+            }) {
+                continue;
+            }
+            outstanding
+                .entry((target, record.cell.tx))
+                .or_default()
+                .push(key);
+        }
+        // From past the last offer this validator composed, wrapping
+        // once, so a backlog wider than a block's cap is walked rather
+        // than the same head of it offered every time.
+        let cursor = self.offer_cursor;
+        let offers: Vec<CrossingReoffer> = outstanding
+            .range((
+                cursor.map_or(Bound::Unbounded, Bound::Excluded),
+                Bound::Unbounded,
+            ))
+            .chain(
+                outstanding
+                    .iter()
+                    .take_while(|(key, _)| cursor.is_some_and(|at| **key <= at)),
+            )
+            .take(MAX_REOFFERS_PER_BLOCK)
+            .filter_map(|(&(target, tx_hash), records)| {
+                CrossingReoffer::new(target, tx_hash, records.iter().copied())
+            })
+            .collect();
+        if let Some(last) = offers.last() {
+            self.offer_cursor = Some((last.target, last.tx_hash));
+        }
+        offers
     }
 
     /// Ask each silent counterpart whether it took the transaction a
@@ -1006,6 +1118,33 @@ impl Counterparts {
         }
     }
 
+    /// Stamp the records this block promised again with the consumer
+    /// header each promise was made against, so the next proposal does
+    /// not promise the same crossing before that consumer could have
+    /// answered.
+    ///
+    /// Read off the block rather than off what a proposer composed: an
+    /// offer counts once it is committed, so one composed and lost with
+    /// its round is not one the next proposal skips. The header is this
+    /// validator's own newest proven one of the target, which is pacing
+    /// and licenses nothing — what a block carries is what every replica
+    /// agrees on.
+    fn fold_reoffers(&mut self, reoffers: &[CrossingReoffer], now: WeightedTimestamp) {
+        for offer in reoffers {
+            let Some(anchor) = self
+                .proven_anchors
+                .newest_licensed(offer.target, now, |_| true)
+            else {
+                continue;
+            };
+            for key in offer.records.iter() {
+                if let Some(record) = self.held.get_mut(key) {
+                    record.offered_at = Some((anchor.height, now));
+                }
+            }
+        }
+    }
+
     /// Tell the mempool a core's refusal of a transaction a leg here
     /// issued for: the verdict, as the counterpart's certificate carries
     /// it. Nothing is written down — what licenses taking the crossing
@@ -1044,7 +1183,7 @@ impl Counterparts {
             return Vec::new();
         }
         if self.ledger.consumer_holds(tx_hash, shard) {
-            self.ledger.cue_probe(tx_hash, shard, at);
+            self.ledger.cue_probe(tx_hash, at);
         }
         if self.ledger.core_holds(tx_hash, shard) && self.ledger.record_acceptance(tx_hash, shard) {
             return vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
@@ -1263,12 +1402,15 @@ impl Counterparts {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::state_and_proof;
     use hyperscale_types::{
-        AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Hash, LocalKey, RoutePrefix,
-        evidence_admits_block,
+        AbortCharge, Address, AddressClass, BlockHeight, CLAIM_WINDOW, CommittedAt, Hash, LocalKey,
+        ResourceAddr, RoutePrefix, StateRoot, evidence_admits_block,
     };
+    use hyperscale_vm_effects::{Hash32, IntentHash, Terms};
 
     use super::*;
 
@@ -1453,6 +1595,211 @@ mod tests {
                 .and_then(|answer| answer.answer),
             Some(Inclusion::Absent),
             "and what it read is held",
+        );
+    }
+
+    /// A record this shard holds, naming a claim cell `CONSUMER` holds
+    /// the prefix of, and a deadline read back off the expiry.
+    fn producer_cell(seed: u8, deadline: Deadline) -> CrossingCell {
+        CrossingCell {
+            resource: ResourceAddr::new([0xE1; 31]),
+            amount: 1_000,
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 0,
+            output: 0,
+            expiry_ms: deadline.at().as_millis() + CLAIM_WINDOW.as_secs() * 1_000,
+            tx: TxHash::from(Hash::from_bytes(&[seed; 32])),
+            consumer_claim: SubstateKey {
+                owner: Address::new([0x11; 31], AddressClass::Component),
+                local: LocalKey([seed; 16]),
+            },
+            terms: Terms::Owed,
+        }
+    }
+
+    /// A producer holding `count` records, each its own transaction,
+    /// over a two-shard trie — and no ledger entry for any of them.
+    fn producing(count: u8, deadline: Deadline) -> (Counterparts, ShardTrie, Arc<ProvenAnchors>) {
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::holding(
+            PRODUCER,
+            Arc::clone(&anchors),
+            Arc::new(ProvenCells::default()),
+            Arc::new(CounterpartMirror::default()),
+            &CrossingLeaves::default(),
+        );
+        for seed in 0..count {
+            counterparts.held.insert(
+                producer_record(seed),
+                HeldRecord::of(producer_cell(seed, deadline)),
+            );
+        }
+        (
+            counterparts,
+            ShardTrie::from_leaves([CONSUMER, PRODUCER]),
+            anchors,
+        )
+    }
+
+    /// An anchor of `CONSUMER` at `height`, which is all an offer reads
+    /// of a target: what it holds is never fetched, only whether its
+    /// chain has advanced.
+    fn consumer_anchor(height: u64, ts: WeightedTimestamp) -> Anchor {
+        Anchor {
+            shard: CONSUMER,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts,
+        }
+    }
+
+    /// A crossing is offered again off the leaf that holds it, from its
+    /// deadline until its consumer answers, with no entry anywhere.
+    ///
+    /// The whole of what makes an offer leaf-driven: the ledger here is
+    /// empty, so nothing the chain still owes an outcome for names this
+    /// transaction, and the record is offered all the same. An entry
+    /// prunes; a record stands until it is answered, which is the side
+    /// the obligation has to be read from.
+    #[test]
+    fn a_crossing_is_offered_off_its_leaf_until_its_consumer_answers() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let (mut producer, trie, anchors) = producing(1, deadline);
+        let record = producer_record(0);
+        let now = deadline.at();
+
+        assert!(
+            producer
+                .reoffers(&trie, now.minus(Duration::from_millis(1)))
+                .is_empty(),
+            "short of the deadline the crossing's own bundle may still be in flight",
+        );
+        assert!(
+            producer.reoffers(&trie, now).is_empty(),
+            "and a consumer this node has proven no anchor of could not have answered",
+        );
+
+        anchors.record(consumer_anchor(7, now));
+        let offered = producer.reoffers(&trie, now);
+        assert_eq!(offered.len(), 1, "the one crossing it holds is owed");
+        assert_eq!(
+            offered[0].target, CONSUMER,
+            "offered to whoever holds the claim's prefix now",
+        );
+        assert_eq!(offered[0].tx_hash, producer_cell(0, deadline).tx);
+        assert_eq!(
+            offered[0].records.as_slice(),
+            [record],
+            "and carries the record cell a bundle is built from",
+        );
+        assert_eq!(
+            producer.reoffers(&trie, now),
+            offered,
+            "a proposer that composed an offer and lost its round promised nothing",
+        );
+
+        producer.fold_reoffers(&offered, now);
+        assert!(
+            producer.reoffers(&trie, now).is_empty(),
+            "a crossing a committed block promised is not promised again at that header",
+        );
+        anchors.record(consumer_anchor(8, now));
+        let answerable = now.plus(MAX_FINALIZATION_DELAY);
+        assert_eq!(
+            producer.reoffers(&trie, answerable).len(),
+            1,
+            "and is, once the consumer's chain has moved and could have answered",
+        );
+
+        producer
+            .held
+            .get_mut(&record)
+            .expect("the record this shard holds")
+            .answer = Some(Inclusion::Present([0xAB; 32]));
+        assert!(
+            producer.reoffers(&trie, answerable).is_empty(),
+            "a claim read present is the end of the obligation",
+        );
+    }
+
+    /// An offer waits on the consumer's chain and on the clock, and
+    /// each bound is asserted where the other would let the offer
+    /// through.
+    ///
+    /// A halted target lands no header, so the clock alone would promise
+    /// into it every round for as long as it stays down — off a leaf,
+    /// which does not die, that is forever, into a section shared with
+    /// every live target. A running target lands a header every block,
+    /// so the height alone would promise many times over inside the one
+    /// round an answer takes, each promise a bundle rebuilt and
+    /// rebroadcast.
+    #[test]
+    fn an_offer_waits_on_its_target_and_on_the_round_an_answer_takes() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let (mut producer, trie, anchors) = producing(1, deadline);
+        let now = deadline.at();
+        anchors.record(consumer_anchor(7, now));
+
+        let offered = producer.reoffers(&trie, now);
+        assert_eq!(offered.len(), 1);
+        producer.fold_reoffers(&offered, now);
+
+        // The height, where the clock has long since run out.
+        for hours in 1..6 {
+            assert!(
+                producer
+                    .reoffers(&trie, now.plus(Duration::from_secs(hours * 3_600)))
+                    .is_empty(),
+                "a halted target is offered once, however long it stays down",
+            );
+        }
+
+        // The clock, where the target's chain has moved on.
+        for height in 8..12 {
+            anchors.record(consumer_anchor(height, now));
+            assert!(
+                producer.reoffers(&trie, now).is_empty(),
+                "a running target lands headers faster than it can answer",
+            );
+        }
+        assert_eq!(
+            producer
+                .reoffers(&trie, now.plus(MAX_FINALIZATION_DELAY))
+                .len(),
+            1,
+            "and is promised again once an answer could have come back",
+        );
+    }
+
+    /// A backlog wider than one block's cap is walked rather than
+    /// re-offering its head, so the record at the tail does not wait on
+    /// the one at the head being answered.
+    #[test]
+    fn a_backlog_wider_than_the_offer_cap_laps_before_it_repeats() {
+        let count = u8::try_from(2 * MAX_REOFFERS_PER_BLOCK).expect("two blocks' worth");
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let (mut producer, trie, anchors) = producing(count, deadline);
+        let now = deadline.at();
+        anchors.record(consumer_anchor(7, now));
+
+        let mut carried: BTreeSet<SubstateKey> = BTreeSet::new();
+        for _ in 0..2 {
+            let offered = producer.reoffers(&trie, now);
+            assert_eq!(
+                offered.len(),
+                MAX_REOFFERS_PER_BLOCK,
+                "each proposal fills the cap",
+            );
+            for offer in &offered {
+                for &key in offer.records.iter() {
+                    assert!(carried.insert(key), "and offers nothing a lap has carried");
+                }
+            }
+        }
+        assert_eq!(
+            carried,
+            (0..count).map(producer_record).collect(),
+            "two laps of the cap reach every record",
         );
     }
 

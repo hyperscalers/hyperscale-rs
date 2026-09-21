@@ -2708,27 +2708,14 @@ impl ExecutionCoordinator {
 
     /// What this validator holds to offer in a block it proposes.
     ///
-    /// The crossings are composed here rather than beside the readings,
-    /// because which shard owes a claim is a question about the trie the
-    /// block's committee resolves — the same one the ledger's probes are
-    /// asked under, so an offer and a question follow a cut together.
+    /// The trie is the block's committee's — the same one the probes are
+    /// asked under — so a crossing whose claim moved to a successor is
+    /// offered and asked about on one side of a cut together.
     #[must_use]
-    pub fn offers(&self, topology_schedule: &TopologySchedule) -> Offers {
+    pub fn offers(&mut self, topology_schedule: &TopologySchedule) -> Offers {
         let trie = self.counterpart_trie(topology_schedule);
-        let mut offers = self.counterparts.offers();
-        offers.reoffers = self
-            .counterparts
-            .ledger
-            .unclaimed_crossings(trie, self.committed_ts)
-            .into_iter()
-            // The records of one transaction into one shard are a subset
-            // of the crossings that transaction may carry, so the cap is
-            // met by construction and nothing here is dropped.
-            .filter_map(|outstanding| {
-                CrossingReoffer::new(outstanding.target, outstanding.tx_hash, outstanding.records)
-            })
-            .collect();
-        offers
+        let now = self.committed_ts;
+        self.counterparts.offers(trie, now)
     }
 
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
@@ -3157,12 +3144,6 @@ impl ExecutionCoordinator {
         if !provisions.is_empty() {
             self.apply_committed_provisions(provisions);
         }
-        // What the block offered again, so the entry knows a crossing
-        // has been promised and the next proposal does not promise it
-        // afresh before this one could have landed.
-        self.counterparts
-            .ledger
-            .record_reoffers(self.committed_ts, reoffers);
         // Every commit, not only one carrying provisions: a bundle that
         // committed before its transaction did is evidence already in
         // hand, and a payer whose wait only ever cleared on a later
