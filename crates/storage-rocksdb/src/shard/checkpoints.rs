@@ -19,9 +19,9 @@ use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, SubstateStore, Substates,
-    SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell, key_under_prefix,
-    prefix_low_key,
+    AdoptSource, BoundaryStore, CrossingLeaves, ImportProgress, JmtSnapshot, LeafRows,
+    SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
+    is_owed_claim_cell, is_record_cell, key_under_prefix, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, StateRoot, SubstateKey, SubstateLeaf,
@@ -516,13 +516,21 @@ impl Substates for CheckpointStore {
 impl BoundaryStore for RocksDbShardStorage {
     type Boundary = CheckpointStore;
 
-    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
+    fn crossing_leaves(&self, shard: ShardId) -> CrossingLeaves {
         let cf = self.cf();
         let prefix = shard_prefix_path(shard);
-        iter_from::<StateCf>(&self.db, StateCf::handle(&cf), &prefix_low_key(&prefix))
-            .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
-            .filter(|(key, value)| is_record_cell(*key, value))
-            .collect()
+        let mut leaves = CrossingLeaves::default();
+        for (key, value) in
+            iter_from::<StateCf>(&self.db, StateCf::handle(&cf), &prefix_low_key(&prefix))
+                .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
+        {
+            if is_record_cell(key, &value) {
+                leaves.records.push((key, value));
+            } else if is_owed_claim_cell(key, &value) {
+                leaves.owed_claims.push((key, value));
+            }
+        }
+        leaves
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {

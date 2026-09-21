@@ -225,7 +225,7 @@ impl SimShardStorage {
                 .unwrap_or(0),
             chain_origin,
             safe_vote_registers,
-            escrow_records: self.escrow_records(shard),
+            crossing_leaves: self.crossing_leaves(shard),
             voted_blocks: self.voted_blocks_above(committed_height),
         }
     }

@@ -600,7 +600,7 @@ impl ExecutionCoordinator {
                 proven_anchors,
                 proven_cells,
                 mirror,
-                &recovered.escrow_records,
+                &recovered.crossing_leaves,
             ),
             finalized,
             committed_height,

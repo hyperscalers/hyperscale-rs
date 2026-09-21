@@ -426,23 +426,41 @@ pub trait BoundaryStore {
     /// store's version line doesn't carry it.
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64>;
 
-    /// Every escrow record `shard`'s slice of the committed state holds,
+    /// Every crossing leaf `shard`'s slice of the committed state holds,
     /// with its bytes.
     ///
     /// Derived on demand rather than indexed, because the state is the
     /// authority and the one caller asks once: a reshape successor whose
     /// adoption just filled its trie, and whose ledger begins empty
     /// while the value its predecessors escrowed rides the prefix in.
-    /// Nothing else names those records — the entry that would is the
+    /// Nothing else names those leaves — the entry that would is the
     /// predecessor's ledger's, a fold over a chain the successor never
-    /// replays, and the cell is outside every sweep's reach.
+    /// replays, and both families are outside every sweep's reach.
     ///
     /// Bounded by the shard's own prefix rather than run over the store:
     /// a split child's store is a clone of its parent's and holds the
     /// sibling's leaves too, and an obligation the sibling owns is not
     /// this seat's to take. The keyspace is owner-major, so the prefix is
     /// a contiguous run and the scan is that run and nothing else.
-    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)>;
+    fn crossing_leaves(&self, shard: ShardId) -> CrossingLeaves;
+}
+
+/// The crossing leaves under one shard's prefix, by the side of a
+/// crossing each answers for.
+///
+/// One scan, two families, because the two are the same fact read from
+/// opposite ends: a record is value this shard holds for a crossing it
+/// issued, and an owed claim is this shard's answer to a crossing
+/// somebody else issued. Both sit outside every sweep, so neither can be
+/// found any way but by asking each leaf which role its value re-derives
+/// its key under — and asking that twice over one prefix would be one
+/// scan too many.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CrossingLeaves {
+    /// Records this shard holds, with their committed bytes.
+    pub records: Vec<(SubstateKey, Vec<u8>)>,
+    /// Owed claims this shard has written, with their committed bytes.
+    pub owed_claims: Vec<(SubstateKey, Vec<u8>)>,
 }
 
 #[cfg(test)]

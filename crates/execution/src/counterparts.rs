@@ -18,7 +18,7 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
-use hyperscale_storage::is_record_cell;
+use hyperscale_storage::{CrossingLeaves, is_owed_claim_cell, is_record_cell};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
@@ -27,7 +27,7 @@ use hyperscale_types::{
     StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
     TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::CrossingCell;
+use hyperscale_vm_effects::{CrossingCell, OwedClaim};
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 
@@ -161,6 +161,42 @@ impl HeldRecord {
     }
 }
 
+/// A crossing this shard has answered, and where its one question
+/// stands.
+///
+/// [`HeldRecord`] read from the other end. A producer holds a record and
+/// asks whether its consumer claimed; a consumer holds an answer and asks
+/// whether the producer still holds the record — the same channel, the
+/// same pacing, and the opposite direction.
+///
+/// One question, to one shard, so the bookkeeping is one height. There is
+/// no deadline here because no window is read: only a presence answers,
+/// and a presence answers wherever it was taken.
+#[derive(Debug, Clone)]
+pub struct AnsweredCrossing {
+    /// The record cell this claim answers for, under the producing
+    /// node's target. Read off the leaf, which is the only thing that
+    /// names it.
+    pub(crate) record: SubstateKey,
+    /// The newest producer header the record has been asked at, so the
+    /// question is not re-sent at the same one every block.
+    asked_at: Option<BlockHeight>,
+    /// What a committed claim read of the record, once one has read it.
+    pub(crate) answer: Option<Inclusion>,
+}
+
+impl AnsweredCrossing {
+    /// The answer as the leaves give it: unasked, unanswered.
+    #[must_use]
+    const fn of(claim: &OwedClaim) -> Self {
+        Self {
+            record: claim.record,
+            asked_at: None,
+            answer: None,
+        }
+    }
+}
+
 /// Whether any undisposed record is still waiting on `key`.
 ///
 /// Read off the keys rather than off a name, because a record's issuing
@@ -168,6 +204,20 @@ impl HeldRecord {
 fn awaited_by(held: &BTreeMap<SubstateKey, HeldRecord>, key: SubstateKey) -> bool {
     held.values()
         .any(|record| record.answer.is_none() && record.cell.consumer_claim == key)
+}
+
+/// Whether any answer of this shard's is still waiting on `key`.
+///
+/// [`awaited_by`] on the answering side, and needed for the same reason:
+/// a question driven by leaves rather than by entries is one the probe
+/// account knows nothing about, so a reading that answers it has to be
+/// recognised off the key or it is fetched and then dropped — and a
+/// question whose answer is never offered is a question asked again at
+/// every header of the counterpart, for as long as the leaf stands.
+fn awaits_record(answered: &BTreeMap<SubstateKey, AnsweredCrossing>, key: SubstateKey) -> bool {
+    answered
+        .values()
+        .any(|answer| answer.answer.is_none() && answer.record == key)
 }
 
 /// A question this validator put to a counterpart: the question, the
@@ -266,6 +316,16 @@ pub struct Counterparts {
     /// the question is a counterpart's to answer, like every other
     /// question in this file.
     pub(crate) held: BTreeMap<SubstateKey, HeldRecord>,
+
+    /// The owed claims this shard has written under its prefix, each
+    /// still undeleted, by cell key.
+    ///
+    /// The mirror of [`held`](Self::held) on the answering side, read
+    /// from the leaves for the same reason: a seat's ledger begins empty
+    /// and a restart replays only a window, so for an answer older than
+    /// either there is no entry to name it — and the leaf carries the one
+    /// term the question needs, the record it answers for.
+    pub(crate) answered: BTreeMap<SubstateKey, AnsweredCrossing>,
     /// The questions this validator has put to counterparts, by the
     /// shard asked and the cell: the header each was asked at, and
     /// whether the fetch returned. A probe lives while its question is
@@ -288,7 +348,7 @@ impl Counterparts {
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
         mirror: Arc<CounterpartMirror>,
-        records: &[(SubstateKey, Vec<u8>)],
+        leaves: &CrossingLeaves,
     ) -> Self {
         Self {
             ledger: Ledger::new(local_shard),
@@ -296,10 +356,18 @@ impl Counterparts {
             proven_anchors,
             proven_cells,
             fetched: BTreeMap::new(),
-            held: records
+            held: leaves
+                .records
                 .iter()
                 .filter_map(|(key, value)| {
                     Some((*key, HeldRecord::of(CrossingCell::from_bytes(value)?)))
+                })
+                .collect(),
+            answered: leaves
+                .owed_claims
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((*key, AnsweredCrossing::of(&OwedClaim::from_bytes(value)?)))
                 })
                 .collect(),
             probes: BTreeMap::new(),
@@ -342,6 +410,7 @@ impl Counterparts {
         }
         self.cover_recorded(block);
         self.fold_record_writes(block);
+        self.fold_owed_claim_writes(block);
         self.cover_held(block);
         self.stamp_departures(topology_schedule, now);
         let unanswerable = self.ledger.prune(now);
@@ -531,6 +600,34 @@ impl Counterparts {
             record.asked_at = Some(anchor.height);
             wanted.entry(anchor).or_default().push(claim);
         }
+        // The answers this shard holds ask one question each, of the
+        // shard holding the record's prefix now: does the producer still
+        // hold it. The mirror of the loop above and paced by the same
+        // rule — nothing asked of a record this shard holds itself, and
+        // nothing asked twice at one header.
+        for answer in self.answered.values_mut() {
+            if answer.answer.is_some() {
+                continue;
+            }
+            let record = answer.record;
+            let shard = trie.shard_for_prefix(record.owner);
+            if shard == self.ledger.local() {
+                continue;
+            }
+            let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
+                continue;
+            };
+            if answer.asked_at.is_some_and(|asked| asked >= anchor.height)
+                || self
+                    .fetched
+                    .keys()
+                    .any(|claim| claim.anchor.shard == shard && claim.reading(record).is_some())
+            {
+                continue;
+            }
+            answer.asked_at = Some(anchor.height);
+            wanted.entry(anchor).or_default().push(record);
+        }
         wanted
             .into_iter()
             .map(|(anchor, keys)| {
@@ -624,13 +721,15 @@ impl Counterparts {
                 record_reclaim_probe_pending();
             }
         }
-        // A held record names no transaction of this chain's, so what
-        // it wants is read off the keys.
+        // A leaf-driven question names no transaction of this chain's, so
+        // what it wants is read off the keys — on both sides, since a
+        // record this shard holds and an answer this shard wrote are the
+        // same question asked from opposite ends.
         answering.extend(
             inclusions
                 .iter()
                 .map(|(key, _)| *key)
-                .filter(|key| awaited_by(&self.held, *key)),
+                .filter(|key| awaited_by(&self.held, *key) || awaits_record(&self.answered, *key)),
         );
         if answering.is_empty() {
             return;
@@ -671,6 +770,7 @@ impl Counterparts {
         for claim in block.state_claims() {
             actions.extend(self.fold_cells(claim, &questions));
             self.fold_held(claim, trie);
+            self.fold_answered(claim, trie);
         }
         actions
     }
@@ -701,6 +801,38 @@ impl Counterparts {
                 continue;
             }
             record.answer = Some(inclusion);
+        }
+    }
+
+    /// Read a committed proof against the records this shard's own
+    /// answers are waiting on.
+    ///
+    /// [`fold_held`](Self::fold_held) mirrored, with one difference that
+    /// is the whole of what a record is: there is no window here, so
+    /// **every** reading is recorded, whichever way it went.
+    ///
+    /// A claim cell is swept, so an absence of one outside its window is
+    /// a swept cell rather than a claim that never happened, and reading
+    /// it would be reading nothing. A record is swept by nothing. So a
+    /// reading of one is a fact at whatever anchor it was taken — present
+    /// says the producer still holds the value, absent says it has
+    /// disposed of it — and both are worth holding, if only so the
+    /// question stops being asked.
+    ///
+    /// What a fact *licenses* is a separate question, and
+    /// [`Probed::read`] is where it is answered. Nothing licenses
+    /// anything off an absence here yet.
+    fn fold_answered(&mut self, stated: &StateClaim, trie: &ShardTrie) {
+        for answer in self.answered.values_mut() {
+            if answer.answer.is_some() {
+                continue;
+            }
+            if trie.shard_for_prefix(answer.record.owner) != stated.anchor.shard {
+                continue;
+            }
+            if let Some(inclusion) = stated.reading(answer.record) {
+                answer.answer = Some(inclusion);
+            }
         }
     }
 
@@ -799,6 +931,43 @@ impl Counterparts {
                         }
                         None => {
                             self.held.remove(key);
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Follow the owed claim cells this block's finalizations write and
+    /// delete, so what is answered is what the leaves answer.
+    ///
+    /// [`fold_record_writes`](Self::fold_record_writes) on the answering
+    /// side, and a scan at startup is its first term for the same reason:
+    /// a crossing answered after the scan would otherwise never be held,
+    /// and an answer already deleted would be held after its leaf was
+    /// gone.
+    ///
+    /// Read off this shard's own finalizations, which is where its writes
+    /// are stated, so every replica at one frontier folds the same set
+    /// from the same blocks.
+    fn fold_owed_claim_writes(&mut self, block: &Block) {
+        for finalization in block.certificates().iter() {
+            for receipt in finalization.as_unverified().receipts() {
+                let Some(writes) = receipt.consensus.writes() else {
+                    continue;
+                };
+                for (key, value) in &writes.cells {
+                    match value {
+                        Some(bytes) if is_owed_claim_cell(*key, bytes) => {
+                            if let Some(claim) = OwedClaim::from_bytes(bytes) {
+                                self.answered
+                                    .entry(*key)
+                                    .or_insert_with(|| AnsweredCrossing::of(&claim));
+                            }
+                        }
+                        None => {
+                            self.answered.remove(key);
                         }
                         Some(_) => {}
                     }
@@ -1095,6 +1264,7 @@ impl Counterparts {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
+    use hyperscale_types::test_utils::state_and_proof;
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Hash, LocalKey, RoutePrefix,
         evidence_admits_block,
@@ -1133,6 +1303,157 @@ mod tests {
             )
             .expect("a reach written out in a test"),
         }
+    }
+
+    /// The shard a record's owner prefix routes to, and the one this
+    /// fixture's consumer is not.
+    const PRODUCER: ShardId = ShardId::leaf(1, 1);
+    const CONSUMER: ShardId = ShardId::leaf(1, 0);
+
+    /// A record cell under a prefix `PRODUCER` holds.
+    fn producer_record(seed: u8) -> SubstateKey {
+        SubstateKey {
+            owner: Address::new([0xAA; 31], AddressClass::Component),
+            local: LocalKey([seed; 16]),
+        }
+    }
+
+    /// A consumer holding one owed claim, over a two-shard trie.
+    fn answering(record: SubstateKey) -> (Counterparts, ShardTrie, Arc<ProvenAnchors>) {
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::holding(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(ProvenCells::default()),
+            Arc::new(CounterpartMirror::default()),
+            &CrossingLeaves::default(),
+        );
+        counterparts.answered.insert(
+            SubstateKey {
+                owner: Address::new([0x11; 31], AddressClass::Component),
+                local: LocalKey([0x01; 16]),
+            },
+            AnsweredCrossing {
+                record,
+                asked_at: None,
+                answer: None,
+            },
+        );
+        (
+            counterparts,
+            ShardTrie::from_leaves([CONSUMER, PRODUCER]),
+            anchors,
+        )
+    }
+
+    /// A consumer asks its producer about the record its own answer
+    /// names, and stops once the chain has read it.
+    ///
+    /// The one question that runs from consumer to producer, and the
+    /// whole of what the leaf has to carry for it to be askable: the
+    /// claim's own key derives under the consuming node's target and the
+    /// record's under the producing node's, so without the record on the
+    /// leaf there is nothing here to name.
+    ///
+    /// Paced like the producer's own probe — one question per header, and
+    /// none at a header already asked at — because it is the same loop
+    /// read from the other end.
+    #[test]
+    fn a_consumer_asks_its_producer_about_the_record_its_answer_names() {
+        let record = producer_record(0x42);
+        let (mut counterparts, trie, anchors) = answering(record);
+        let now = WeightedTimestamp::from_millis(60_000);
+
+        assert!(
+            counterparts.probe(&trie, now).is_empty(),
+            "a producer this node has proven no anchor of is unaskable",
+        );
+
+        // The producer's tree with the record gone — the ordinary case,
+        // since a producer retires a record the moment it reads the
+        // claim answering it.
+        let (state_root, proof) = state_and_proof(PRODUCER, &[], &[record]);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(7),
+            state_root,
+            ts: now,
+        };
+        anchors.record(anchor);
+        let asked = counterparts.probe(&trie, now);
+        assert_eq!(
+            asked.len(),
+            1,
+            "the record is asked for, at the newest anchor of the shard holding it",
+        );
+        assert!(
+            matches!(
+                &asked[0],
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::StateProofs(keys),
+                    shard,
+                    ..
+                }) if *shard == PRODUCER && keys.as_slice() == [(anchor, record)],
+            ),
+            "and what is asked for is the record itself: {:?}",
+            asked[0],
+        );
+        assert!(
+            counterparts.probe(&trie, now).is_empty(),
+            "and not again at the same header",
+        );
+
+        // Nor at a newer one while the fetch is still out. A question
+        // driven by a leaf is not in the probe account, so nothing else
+        // would stop it being put again at every header the producer
+        // commits — one fetch a block, per crossing this shard ever
+        // answered, until the reading lands.
+        anchors.record(Anchor {
+            height: BlockHeight::new(8),
+            ..anchor
+        });
+        counterparts.on_proof_fetched(anchor, vec![record], proof);
+        assert!(
+            counterparts.probe(&trie, now).is_empty(),
+            "and not at a newer header while the reading is held to offer",
+        );
+        assert!(
+            counterparts
+                .fetched
+                .keys()
+                .any(|claim| claim.reading(record).is_some()),
+            "the reading a leaf-driven question wanted is offered, not dropped: a \
+             question whose answer never reaches a block is asked forever",
+        );
+
+        // A reading lands, either way it went, and the question closes.
+        // A record is swept by nothing, so an absence of one is a fact
+        // about the producer rather than a cell that aged out — which is
+        // what lets the asking stop before anything licenses a thing.
+        counterparts.fold_answered(
+            &StateClaim {
+                anchor,
+                cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
+            },
+            &trie,
+        );
+        anchors.record(Anchor {
+            height: BlockHeight::new(8),
+            ..anchor
+        });
+        assert!(
+            counterparts.probe(&trie, now).is_empty(),
+            "a record the chain has read is not asked about again at any header",
+        );
+        assert_eq!(
+            counterparts
+                .answered
+                .values()
+                .next()
+                .and_then(|answer| answer.answer),
+            Some(Inclusion::Absent),
+            "and what it read is held",
+        );
     }
 
     /// A backlog wider than one block's bytes is carried across blocks

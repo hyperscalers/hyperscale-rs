@@ -233,6 +233,11 @@ pub enum Probed {
     /// crossing. For a core it means its certificate speaks next; for a
     /// delivery it is what lets the issuer retire the record.
     Claim,
+    /// The record cell of a crossing, asked of the producer's chain by a
+    /// consumer that answered it: present says the producer still holds
+    /// the value, so a delivery consuming it has something to run
+    /// against and a claim answering it is not yet cleanable.
+    Record,
 }
 
 impl Probed {
@@ -242,7 +247,7 @@ impl Probed {
     pub(crate) const fn absence_window(self) -> Option<Window> {
         match self {
             Self::Core => Some(Window::Core),
-            Self::Claim => None,
+            Self::Claim | Self::Record => None,
         }
     }
 
@@ -275,7 +280,7 @@ impl Probed {
     pub(crate) const fn presence_asked_from(self, deadline: Deadline) -> Option<WeightedTimestamp> {
         match self {
             Self::Core => None,
-            Self::Claim => Some(deadline.at()),
+            Self::Claim | Self::Record => Some(deadline.at()),
         }
     }
 
@@ -335,14 +340,22 @@ impl Probed {
     /// yet retract it. A core consumer's claim answers present — the
     /// consuming finalization committed, which it does only once every
     /// core member certified — and absent is a sibling still pending. A
-    /// delivery's claim answers either way.
+    /// delivery's claim answers either way. A record answers present —
+    /// it is written by the one execution that issues the crossing and
+    /// is swept by nothing, so a presence read at any anchor is a
+    /// presence — and its absence says only that the producer has
+    /// disposed of it by some road, which no asker can yet name.
+    ///
+    /// Public because a question with no absence window has no clock to
+    /// be read against, so its reader has nothing to hand
+    /// [`Self::answer`] and asks this directly.
     #[must_use]
-    pub(crate) const fn read(self, inclusion: Inclusion) -> Option<Inclusion> {
+    pub const fn read(self, inclusion: Inclusion) -> Option<Inclusion> {
         match (inclusion, self) {
-            (Inclusion::Present(_), Self::Claim) | (Inclusion::Absent, Self::Core) => {
-                Some(inclusion)
-            }
-            (Inclusion::Present(_), Self::Core) | (Inclusion::Absent, Self::Claim) => None,
+            (Inclusion::Present(_), Self::Claim | Self::Record)
+            | (Inclusion::Absent, Self::Core) => Some(inclusion),
+            (Inclusion::Present(_), Self::Core)
+            | (Inclusion::Absent, Self::Claim | Self::Record) => None,
         }
     }
 }
@@ -571,6 +584,39 @@ mod tests {
         );
         assert_eq!(Probed::Claim.read(present), Some(present));
         assert_eq!(Probed::Claim.read(Inclusion::Absent), None);
+        assert_eq!(Probed::Record.read(present), Some(present));
+        assert_eq!(Probed::Record.read(Inclusion::Absent), None);
+    }
+
+    /// A record answers present at any anchor and absent at none.
+    ///
+    /// Nothing sweeps a record, so the presence needs no window and is
+    /// taken wherever it was read. The absence is the half a consumer
+    /// that answered the crossing may read, and nobody else — so until
+    /// the asker that may read it exists, it answers nothing at all,
+    /// which is what keeps a record reading out of the set a coverage is
+    /// decided by.
+    #[test]
+    fn a_record_answers_present_at_any_anchor_and_absent_at_none() {
+        let deadline = Deadline::of(ms(60_000));
+        assert_eq!(Probed::Record.absence_window(), None);
+        assert_eq!(
+            Probed::Record.presence_asked_from(deadline),
+            Some(deadline.at()),
+        );
+        for at in [
+            deadline.at(),
+            Window::Core.of(deadline).end,
+            Window::LegEntry.of(deadline).end.plus(MAX_VALIDITY_RANGE),
+        ] {
+            assert!(!Probed::Record.absence_answers_at(at, deadline));
+            assert!(Probed::Record.asks_at(at, deadline, None));
+            assert_eq!(
+                Probed::Record.answer(at, deadline, Inclusion::Present([7; 32])),
+                Some(Inclusion::Present([7; 32])),
+            );
+            assert_eq!(Probed::Record.answer(at, deadline, Inclusion::Absent), None);
+        }
     }
 
     /// A claim is asked from the deadline, or one lag past a cue heard

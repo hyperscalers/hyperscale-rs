@@ -13,9 +13,9 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, SubstateStore,
-    Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
-    key_under_prefix, prefix_low_key,
+    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, CrossingLeaves, ImportProgress, LeafRows,
+    SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
+    is_owed_claim_cell, is_record_cell, key_under_prefix, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, ShardId, StateRoot, SubstateKey,
@@ -97,15 +97,21 @@ impl Substates for SimBoundary {
 impl BoundaryStore for SimShardStorage {
     type Boundary = SimBoundary;
 
-    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
+    fn crossing_leaves(&self, shard: ShardId) -> CrossingLeaves {
         let prefix = shard_prefix_path(shard);
-        read_or_recover(&self.state)
+        let mut leaves = CrossingLeaves::default();
+        for (key, value) in read_or_recover(&self.state)
             .current_state
             .range(prefix_low_key(&prefix)..)
             .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
-            .filter(|(key, value)| is_record_cell(**key, value))
-            .map(|(key, value)| (*key, value.to_vec()))
-            .collect()
+        {
+            if is_record_cell(*key, value) {
+                leaves.records.push((*key, value.to_vec()));
+            } else if is_owed_claim_cell(*key, value) {
+                leaves.owed_claims.push((*key, value.to_vec()));
+            }
+        }
+        leaves
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {

@@ -1268,6 +1268,10 @@ impl ProtocolStatics for StubVmStatics {
     fn record_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
         value.first() == Some(&STUB_RECORD_MARKER)
     }
+
+    fn owed_claim_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
+        value.first() == Some(&STUB_OWED_CLAIM_MARKER)
+    }
 }
 
 /// The local-key first byte the stub judges a package cell by, in place
@@ -1291,11 +1295,25 @@ pub const STUB_SWEEPABLE_MARKER: u8 = 0xCD;
 /// the value is the whole of the judgement.
 pub const STUB_RECORD_MARKER: u8 = 0xEF;
 
+/// The value's first byte the stub judges an owed claim by.
+///
+/// Beside [`STUB_RECORD_MARKER`] and on the same terms, since the two
+/// families the sweep never reaches are told apart by their values and
+/// by nothing else.
+pub const STUB_OWED_CLAIM_MARKER: u8 = 0xED;
+
 /// A stub escrow record's value, which [`StubVmStatics`] judges a record
 /// wherever it sits.
 #[must_use]
 pub fn stub_record_cell(body: u8) -> Vec<u8> {
     vec![STUB_RECORD_MARKER, body]
+}
+
+/// A stub owed claim's value, which [`StubVmStatics`] judges an owed
+/// claim wherever it sits.
+#[must_use]
+pub fn stub_owed_claim_cell(body: u8) -> Vec<u8> {
+    vec![STUB_OWED_CLAIM_MARKER, body]
 }
 
 /// A stub sweepable cell's value and the local key it must sit at for

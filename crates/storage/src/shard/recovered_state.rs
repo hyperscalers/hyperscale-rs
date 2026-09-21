@@ -7,9 +7,10 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip,
     Hash, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor,
-    StateRoot, SubstateKey, ValidatorId, Verified, WeightedTimestamp,
+    StateRoot, ValidatorId, Verified, WeightedTimestamp,
 };
 
+use super::boundary::CrossingLeaves;
 use super::chain_reader::ShardChainReader;
 use super::dedup_window::DedupWindow;
 use super::unresolved::ReplayWindow;
@@ -184,16 +185,16 @@ pub struct RecoveredState {
     /// snap-sync, where the imported store carries no signing history.
     pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
 
-    /// The escrow records this store holds under the shard's prefix,
+    /// The crossing leaves this store holds under the shard's prefix,
     /// with their committed bytes.
     ///
-    /// Value this shard owes an answer for, read from the leaves that
-    /// hold it and from nothing else — every start's first term, which
-    /// the commits after it add to and take from. Nothing else can name
-    /// them: the
-    /// entry that would is a fold over a chain a successor never
-    /// replays and a restart replays only a window of, and the cell is
-    /// outside every sweep's reach. The state is the authority, and it
+    /// Value this shard owes an answer for and answers this shard owes a
+    /// cleanup for, read from the leaves that hold them and from nothing
+    /// else — every start's first term, which the commits after it add
+    /// to and take from. Nothing else can name them: the entry that
+    /// would is a fold over a chain a successor never replays and a
+    /// restart replays only a window of, and both families are outside
+    /// every sweep's reach. The state is the authority, and it
     /// is what every node holding the prefix has — which is what makes
     /// the set a function of committed content rather than of how a
     /// node got here.
@@ -203,7 +204,7 @@ pub struct RecoveredState {
     /// snap-sync. A set seeded by an event one node witnessed and
     /// another did not is a set two replicas compose different ticks
     /// from.
-    pub escrow_records: Vec<(SubstateKey, Vec<u8>)>,
+    pub crossing_leaves: CrossingLeaves,
 
     /// The uncommitted blocks the store kept beside the safe-vote
     /// registers, above the committed tip and in height order.
@@ -289,7 +290,7 @@ impl RecoveredState {
                 ChainOrigin::ROOT
             },
             safe_vote_registers: BTreeMap::new(),
-            escrow_records: Vec::new(),
+            crossing_leaves: CrossingLeaves::default(),
             voted_blocks: Vec::new(),
             recent_headers: Vec::new(),
         }

@@ -13,7 +13,7 @@ use hyperscale_hbor::{Bytes, Capped, from_slice};
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    stub_record_cell, stub_sweepable_cell, test_transaction,
+    stub_owed_claim_cell, stub_record_cell, stub_sweepable_cell, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
@@ -36,10 +36,11 @@ use hyperscale_types::{
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BOUNDARY_RETAIN, BoundaryStore, GenesisCommit, ImportCursor, ImportProgress,
-    JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState, SafeVoteRegisterStore,
-    ShardChainReader, ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore,
-    WitnessSeed, committed_tx_cell_key, committed_tx_cells, holds_state, sweep_for_block,
+    Anchored, BOUNDARY_RETAIN, BoundaryStore, CrossingLeaves, GenesisCommit, ImportCursor,
+    ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
+    SweepIndex, VersionedStore, WitnessSeed, committed_tx_cell_key, committed_tx_cells,
+    holds_state, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -1534,9 +1535,9 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
     S: BoundaryStore + TestStore,
 {
     let owed = |shard: ShardId| {
-        let scanned = storage.escrow_records(shard);
+        let scanned = storage.crossing_leaves(shard);
         assert_eq!(
-            recovered(shard).escrow_records,
+            recovered(shard).crossing_leaves,
             scanned,
             "a resumed store owes what a running one does",
         );
@@ -1550,15 +1551,17 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
     let commit = |writes: &SettledWrites| {
         commit_writes(storage, writes);
     };
-    assert!(
-        owed(shard).is_empty(),
+    assert_eq!(
+        owed(shard),
+        CrossingLeaves::default(),
         "a store holding nothing owes nothing",
     );
 
     commit(&make_settled_writes(1, 1, vec![9, 9, 9]));
-    assert!(
-        owed(shard).is_empty(),
-        "an ordinary cell is not a record, wherever it sits",
+    assert_eq!(
+        owed(shard),
+        CrossingLeaves::default(),
+        "an ordinary cell is neither family, wherever it sits",
     );
 
     let record = state_key(2, 2);
@@ -1569,22 +1572,46 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
     ])));
     assert_eq!(
         owed(shard),
-        vec![(record, stub_record_cell(7))],
+        CrossingLeaves {
+            records: vec![(record, stub_record_cell(7))],
+            owed_claims: Vec::new(),
+        },
         "a record reads back with the bytes a reclaim composes from, and a \
          record under the sibling's prefix is not this shard's to owe",
     );
     assert_eq!(
         owed(ShardId::leaf(1, 1)),
-        vec![(sibling, stub_record_cell(8))],
+        CrossingLeaves {
+            records: vec![(sibling, stub_record_cell(8))],
+            owed_claims: Vec::new(),
+        },
         "and the sibling's own scan answers with its own",
     );
 
     commit(&SettledWrites::from_absolutes(BTreeMap::from([(
         record, None,
     )])));
-    assert!(
-        owed(shard).is_empty(),
+    assert_eq!(
+        owed(shard),
+        CrossingLeaves::default(),
         "a record taken back is no longer owed",
+    );
+
+    // The answering side of the same scan: an owed claim this shard
+    // wrote is found by the one question a leaf can be asked, beside the
+    // records rather than among them.
+    let claim = state_key(3, 3);
+    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
+        claim,
+        Some(stub_owed_claim_cell(11)),
+    )])));
+    assert_eq!(
+        owed(shard),
+        CrossingLeaves {
+            records: Vec::new(),
+            owed_claims: vec![(claim, stub_owed_claim_cell(11))],
+        },
+        "an owed claim is the other family the scan answers with",
     );
 }
 
