@@ -22,9 +22,10 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CrossingReoffer, Deadline,
-    Epoch, Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal,
-    ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
+    Epoch, Finalization, Hash, LocalTimestamp, Probed, ProposerTimestamp, Provisions, ReadySignal,
+    ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, SubstateKey, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, Window,
 };
 use tracing::debug;
 
@@ -244,17 +245,31 @@ pub fn select_transactions(
 }
 
 /// The transactions among `txs`, past their validity end at `anchor`,
-/// that `local_shard` only delivers for: frozen divided against the trie
-/// of `anchor`'s window with this shard outside the core and every leg
-/// here a delivery.
+/// that `local_shard` only delivers for and that `state_claims`
+/// licenses: frozen divided against the trie of `anchor`'s window with
+/// this shard outside the core and every leg here a delivery, and every
+/// record that delivery consumes proved present by a claim the block
+/// carries.
 ///
-/// Computed against the block's own anchor by the proposer selecting
-/// and by every voter checking, so the set is one set. Empty when the
-/// anchor's window is not retained — a block there is refused on other
-/// grounds.
+/// Computed against the block's own anchor and the block's own claims,
+/// by the proposer selecting and by every voter checking, so the set is
+/// one set. Empty when the anchor's window is not retained — a block
+/// there is refused on other grounds.
+///
+/// **The licence is the record read present, and nothing about when.**
+/// A presence answers wherever it was taken, and a claim at an old
+/// anchor is admitted on purpose: there is no recency rule here and
+/// there cannot be one, because which anchor is newest is a question
+/// each validator answers from its own fetches, so a voter holding a
+/// newer one would refuse a block with nothing to fetch that would
+/// change its mind. What stops a stale proof mattering sits on the other
+/// side — a consumer deletes the answer it holds only once no replay
+/// could still be served against the record — so the wait lives on that
+/// deletion rather than on this admission.
 #[must_use]
 pub fn late_deliveries<T: Deref<Target = Transaction>>(
     txs: &[Arc<T>],
+    state_claims: &[StateClaim],
     topology_schedule: &TopologySchedule,
     anchor: WeightedTimestamp,
     local_shard: ShardId,
@@ -266,11 +281,30 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
     txs.iter()
         .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
         .filter(|tx| {
-            Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie)
-                .only_delivers_at(local_shard)
+            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
+            classified.only_delivers_at(local_shard)
+                && classified
+                    .records_consumed(local_shard)
+                    .into_iter()
+                    .all(|record| record_stands(state_claims, record))
         })
         .map(|tx| tx.hash())
         .collect()
+}
+
+/// Whether some claim the block carries reads `record` present.
+///
+/// At any anchor the claim names. A record is written by the one
+/// execution that issues the crossing and is swept by nothing, so a
+/// presence read anywhere is a presence — which is [`Probed::Record`]'s
+/// own rule, asked here rather than restated.
+fn record_stands(state_claims: &[StateClaim], record: SubstateKey) -> bool {
+    state_claims.iter().any(|claim| {
+        claim
+            .reading(record)
+            .and_then(|inclusion| Probed::Record.read(inclusion))
+            .is_some()
+    })
 }
 
 /// Select finalizations for inclusion: what [`FinalizationsSection`]
@@ -578,10 +612,10 @@ mod tests {
         stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, MAX_INTENTS,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PredecessorTerminal, RoutePrefix, TimestampRange, TransactionDecision, UnsettledTx,
-        ValidatorSet,
+        Address, AddressClass, Anchor, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, Inclusion,
+        LocalKey, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE,
+        NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot, TimestampRange,
+        TransactionDecision, UnsettledTx, ValidatorSet,
     };
 
     use super::*;
@@ -1204,6 +1238,60 @@ mod tests {
         assert!(
             selected.is_empty(),
             "anchor == end_exclusive must be excluded (half-open)"
+        );
+    }
+
+    /// A record read present licenses a late delivery, at whatever
+    /// anchor the reading was taken, and nothing else does.
+    ///
+    /// Both arms matter and they are not symmetric. A record is written
+    /// by the one execution that issues the crossing and swept by
+    /// nothing, so a presence anywhere is a presence and an old anchor
+    /// is admitted on purpose — which is why there is no recency rule
+    /// here. An absence says only that the producer has disposed of it
+    /// by some road, which licenses nobody: it is the reading a replay
+    /// would arrive holding.
+    #[test]
+    fn a_late_delivery_is_licensed_by_the_record_read_present() {
+        let record = SubstateKey {
+            owner: Address::new([0xAA; 31], AddressClass::Component),
+            local: LocalKey([0x01; 16]),
+        };
+        let claim = |height: u64, inclusion: Inclusion| {
+            StateClaim::new(
+                Anchor {
+                    shard: ShardId::leaf(1, 1),
+                    height: BlockHeight::new(height),
+                    state_root: StateRoot::from_raw(Hash::ZERO),
+                    ts: ts(1_000),
+                },
+                [(record, inclusion)],
+            )
+        };
+
+        assert!(
+            !record_stands(&[], record),
+            "a block carrying nothing licenses nothing"
+        );
+        assert!(
+            record_stands(&[claim(7, Inclusion::Present([0xAB; 32]))], record),
+            "the record proved present is the whole licence",
+        );
+        assert!(
+            record_stands(&[claim(1, Inclusion::Present([0xAB; 32]))], record),
+            "and it answers at an old anchor too: a presence is not bounded by a clock",
+        );
+        assert!(
+            !record_stands(&[claim(7, Inclusion::Absent)], record),
+            "a record read absent says the producer disposed of it, which licenses nobody",
+        );
+        let elsewhere = SubstateKey {
+            local: LocalKey([0x02; 16]),
+            ..record
+        };
+        assert!(
+            !record_stands(&[claim(7, Inclusion::Present([0xAB; 32]))], elsewhere),
+            "and a claim over some other cell is not this crossing's licence",
         );
     }
 

@@ -1606,7 +1606,13 @@ impl VerificationPipeline {
                     }
                 }
                 VerificationKind::TransactionRoot => {
-                    let late = late_deliveries(block.transactions(), schedule, anchor, local_shard);
+                    let late = late_deliveries(
+                        block.transactions(),
+                        block.state_claims(),
+                        schedule,
+                        anchor,
+                        local_shard,
+                    );
                     actions.extend(
                         self.initiate_transaction_root_verification(block_hash, block, late),
                     );

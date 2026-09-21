@@ -17,10 +17,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Member, Side};
+use hyperscale_storage::is_record_cell;
 use hyperscale_types::{
-    Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
+    Deadline, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
     WeightedTimestamp,
 };
+use hyperscale_vm_effects::CrossingCell;
 use hyperscale_vm_types::{AddressClass, LegShape};
 
 /// One thing a cross-shard member waits for before it can run.
@@ -224,12 +226,41 @@ impl Absorbed {
     }
 }
 
+/// A crossing a committed bundle has handed this shard, read off the
+/// record cell the bundle carried.
+///
+/// The one thing a delivery cannot be composed without, so this is
+/// exactly the set of crossings this shard could still run a delivery
+/// for. Past the transaction's validity end that delivery is admissible
+/// only against a proof the record still stands, and this is what says
+/// from when the question is worth asking. Who to ask is not here: the
+/// record's prefix answers that, and follows it to a successor across a
+/// cut where the shard that sent the bundle would not.
+#[derive(Debug, Clone, Copy)]
+pub struct Arrival {
+    /// The deadline the record states, which the validity end the
+    /// licence is needed past is read back off.
+    pub(crate) deadline: Deadline,
+    /// The transaction the crossing belongs to, so the arrival goes when
+    /// its absorption does.
+    pub(crate) tx: TxHash,
+}
+
 pub struct ProvisioningTracker {
     /// What each source shard's committed bundles carried for each
     /// transaction. Written when a bundle is absorbed; read when a
     /// candidate is composed, for its dispatch and for the arrivals its
     /// legs consume.
     absorbed: HashMap<TxHash, BTreeMap<ShardId, Absorbed>>,
+
+    /// Every crossing a committed bundle has handed this shard, by the
+    /// record cell that carried it.
+    ///
+    /// Written where a bundle is absorbed and dropped where that
+    /// absorption is, so it never outlives the evidence it reads. Kept
+    /// by cell rather than by transaction because what asks about it
+    /// asks one question per record, of one shard.
+    arrived: BTreeMap<SubstateKey, Arrival>,
 
     /// What each candidate waits for. One set per transaction, indexed
     /// by nothing else, filed when the candidate is registered.
@@ -251,6 +282,7 @@ impl ProvisioningTracker {
     pub(crate) fn new() -> Self {
         Self {
             absorbed: HashMap::new(),
+            arrived: BTreeMap::new(),
             required: HashMap::new(),
             payer_shards: HashMap::new(),
             now: WeightedTimestamp::ZERO,
@@ -343,6 +375,28 @@ impl ProvisioningTracker {
                 .entry(source_shard)
                 .and_modify(|absorbed| absorbed.absorb(self.now, anchor, &tx_entry.entries))
                 .or_insert_with(|| Absorbed::new(self.now, anchor, &tx_entry.entries));
+            // What the bundle handed this shard, which is what a
+            // delivery of it would run against. A leaf that does not
+            // decode is one no delivery could be composed from, so it is
+            // passed over rather than held.
+            for entry in &tx_entry.entries {
+                let Some(bytes) = entry.value.as_ref() else {
+                    continue;
+                };
+                if !is_record_cell(entry.key, bytes) {
+                    continue;
+                }
+                let Some(cell) = CrossingCell::from_bytes(bytes) else {
+                    continue;
+                };
+                self.arrived.insert(
+                    entry.key,
+                    Arrival {
+                        deadline: Deadline::from_expiry(cell.expiry_ms),
+                        tx: tx_hash,
+                    },
+                );
+            }
             touched.push(tx_hash);
         }
         touched
@@ -373,6 +427,9 @@ impl ProvisioningTracker {
                     .values()
                     .any(|absorbed| absorbed.at.plus(RETENTION_HORIZON) > now)
         });
+        let absorbed = &self.absorbed;
+        self.arrived
+            .retain(|_, arrival| absorbed.contains_key(&arrival.tx));
         before - self.absorbed.len()
     }
 
@@ -403,6 +460,13 @@ impl ProvisioningTracker {
         key: SubstateKey,
     ) -> Option<&[u8]> {
         self.absorbed.get(&tx_hash)?.get(&source)?.present(key)
+    }
+
+    /// Every crossing a committed bundle has handed this shard, by the
+    /// record cell that carried it.
+    #[must_use]
+    pub(crate) const fn arrived(&self) -> &BTreeMap<SubstateKey, Arrival> {
+        &self.arrived
     }
 
     /// Transactions with at least one bundle absorbed.

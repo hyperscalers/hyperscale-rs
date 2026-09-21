@@ -2223,11 +2223,19 @@ impl ShardCoordinator {
         );
         // In the order the folds depend on: provisions first, since a
         // cross-shard transaction rides only beside (or after) its payer
-        // bundle; finalizations before the records held to their names.
+        // bundle; the claims before the transactions they license;
+        // finalizations before the records held to their names.
         let mut provision_fold = ProvisionsFold::default();
         let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
+        let state_claims = select_state_claims(&ctx, &mut StateClaimsFold::default(), state_claims);
+        // A delivery past its validity end is admissible only against a
+        // proof the record it consumes still stands, so the licence is
+        // read off the claims this block will carry rather than off the
+        // ones offered: a claim the cap dropped licenses nothing, and
+        // the voter recomputes the set from the block alone.
         let late = late_deliveries(
             ready_txs,
+            &state_claims,
             topology_schedule,
             validity_anchor,
             self.local_shard,
@@ -2248,7 +2256,6 @@ impl ShardCoordinator {
             &mut RecordsFold::after(&finalization_fold),
             abandonment_records,
         );
-        let state_claims = select_state_claims(&ctx, &mut StateClaimsFold::default(), state_claims);
         let reoffers = select_reoffers(&ctx, &mut ReoffersFold::default(), reoffers);
 
         self.build_and_dispatch_proposal(

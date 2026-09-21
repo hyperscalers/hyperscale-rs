@@ -464,6 +464,27 @@ impl Classified {
             .collect()
     }
 
+    /// The record cells a delivery on `local` consumes: the crossings a
+    /// core elsewhere handed the outbound legs seated here.
+    ///
+    /// [`Self::owed_crossings`] read from the far end. There the issuer
+    /// asks which of its own records are still owed a claim; here the
+    /// consumer asks which records it would be running against — the
+    /// cells a bundle has to carry, and the ones a block admitting the
+    /// delivery past its validity end proves still present.
+    ///
+    /// A crossing this shard also produces is not among them: `to` is
+    /// every shard running the consumer that does not also run the
+    /// producer, so a member holding both ends reads the cell itself.
+    #[must_use]
+    pub fn records_consumed(&self, local: ShardId) -> Vec<SubstateKey> {
+        self.edges()
+            .iter()
+            .filter(|edge| edge.delivers && edge.to.contains(&local))
+            .map(|edge| edge.record.key())
+            .collect()
+    }
+
     /// What `local` runs of the transaction on `side`, what arrives for
     /// it, and what departs from it.
     ///
@@ -1088,6 +1109,48 @@ mod tests {
             frozen(&swap()).owed_claims(low()).is_empty(),
             "a crossing the core consumes is answered by the core, not a delivery",
         );
+    }
+
+    /// A delivering member consumes exactly records some other shard
+    /// owes it, and never one of its own.
+    ///
+    /// The pairing a late delivery's licence rests on: the producer
+    /// names a record still owed a claim and offers the crossing again,
+    /// and the consumer names the same cell as the one a block admitting
+    /// its delivery past the validity end must prove present. Two folds
+    /// over one edge set, so a filter wrong at either end licenses
+    /// nothing or everything.
+    #[test]
+    fn a_delivery_consumes_the_owed_records_issued_to_it() {
+        let mut saw = false;
+        for legs in [transfer(), swap()] {
+            let classified = frozen(&legs);
+            for local in [low(), high()] {
+                let consumed: BTreeSet<SubstateKey> =
+                    classified.records_consumed(local).into_iter().collect();
+                let issued: BTreeSet<SubstateKey> =
+                    classified.records_issued(local).into_iter().collect();
+                let owed_elsewhere: BTreeSet<SubstateKey> = [low(), high()]
+                    .into_iter()
+                    .filter(|&producer| producer != local)
+                    .flat_map(|producer| classified.owed_crossings(producer))
+                    .map(|crossing| crossing.record)
+                    .collect();
+
+                saw |= !consumed.is_empty();
+                assert!(
+                    consumed.is_disjoint(&issued),
+                    "a member holding both ends reads the cell rather than waiting on \
+                     a bundle, at {local:?}",
+                );
+                assert!(
+                    consumed.is_subset(&owed_elsewhere),
+                    "every record a delivery here consumes is one another shard owes \
+                     it, at {local:?}",
+                );
+            }
+        }
+        assert!(saw, "one of these shapes hands a delivery a crossing");
     }
 
     /// The two kinds partition what a shard issues, exactly.

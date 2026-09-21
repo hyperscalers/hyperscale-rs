@@ -2693,7 +2693,8 @@ impl ExecutionCoordinator {
     /// says who was party to each transaction.
     fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let trie = self.counterpart_trie(topology_schedule);
-        self.counterparts.probe(trie, self.committed_ts)
+        self.counterparts
+            .probe(trie, self.committed_ts, self.provisioning.arrived())
     }
 
     /// Keep a fetched proof for a block this validator proposes.
@@ -2982,9 +2983,13 @@ impl ExecutionCoordinator {
         // ask them; the strands no counterpart can answer for any more
         // are let go of below.
         let trie = self.counterpart_trie(topology_schedule);
-        let committed =
-            self.counterparts
-                .on_commit(trie, topology_schedule, block, self.committed_ts);
+        let committed = self.counterparts.on_commit(
+            trie,
+            topology_schedule,
+            block,
+            self.committed_ts,
+            self.provisioning.arrived(),
+        );
         let mut actions = committed.actions;
         self.release_unanswerable(&committed.unanswerable);
         // After the prune, so a delivery the ledger has let go of is not
