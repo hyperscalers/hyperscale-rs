@@ -7,8 +7,8 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, Derivation, Event, PriceTable, ShardId, Signer, StateRoot,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    WeightedTimestamp,
+    SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxsInFlight, WeightedTimestamp,
 };
 
 use super::Budget;
@@ -221,6 +221,17 @@ pub trait Cluster {
     /// fact about its blocks that no balance reads back once the
     /// reclaim and the settlement it races have both landed.
     fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)>;
+
+    /// Every crossing decline on `shard`'s chain naming `tx`: the height
+    /// each committed at and the record it refuses.
+    ///
+    /// An observation seam on [`Self::named_unsettled`]'s terms, and for
+    /// the same reason: a decline licenses a producer to credit its
+    /// value back, and whether a chain wrote one is a fact about its
+    /// blocks rather than a balance — a crossing nobody ever answered
+    /// and one refused in so many words leave the same value in the same
+    /// cell until the producer acts on the difference.
+    fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)>;
 
     /// Where `tx` landed on `shard`: the height it committed at (if any), and
     /// the height plus decision of its execution outcome (if any).

@@ -24,8 +24,8 @@ use hyperscale_scenarios::{
 };
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, Derivation, NetworkDefinition, PrincipalAddr,
-    ReshapeThresholds, ShardId, StateRoot, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
+    ReshapeThresholds, ShardId, StateRoot, SubstateKey, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
@@ -311,6 +311,10 @@ impl Cluster for ProdCluster {
 
     fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)> {
         self.inner.named_unsettled(shard, tx)
+    }
+
+    fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
+        self.inner.declined(shard, tx)
     }
 
     fn chain_fate(

@@ -456,6 +456,18 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
             c.chain_fate(shard, hash).1.is_none(),
             "and neither venue certifies after the fact",
         );
+        // Nor does either refuse the crossing it was handed, at any age.
+        // Both hold a member for it the whole way through — the tick a
+        // sibling's silence leaves standing — and while one does, a
+        // claim may still be coming. A rule keyed on the deadline alone
+        // would have written a refusal here minutes in, and the crossing
+        // would carry both answers.
+        assert!(
+            c.declined(shard, hash).is_empty(),
+            "a venue still holding its member must refuse nothing, however late: \
+             {shard:?} declined {:?}",
+            c.declined(shard, hash),
+        );
     }
 
     let after = held(c, trader.address(), *PROTOCOL_RESOURCE);

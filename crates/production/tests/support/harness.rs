@@ -24,14 +24,16 @@ use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageFactory,
 };
-use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership, records_naming};
+use hyperscale_scenarios::query::{
+    RanAs, chain_fate, chain_membership, declines_naming, records_naming,
+};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, ShardId, StateRoot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
-    WeightedTimestamp, shard_prefix_path,
+    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    ValidatorId, WeightedTimestamp, shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
@@ -401,6 +403,14 @@ impl Harness {
     pub fn named_unsettled(&self, shard: ShardId, hash: TxHash) -> Vec<(BlockHeight, ShardId)> {
         self.store_for(shard)
             .map_or_else(Vec::new, |store| records_naming(store.as_ref(), hash))
+    }
+
+    /// [`declines_naming`] over the live store — every crossing on
+    /// `shard`'s chain that it refused for `hash`.
+    #[must_use]
+    pub fn declined(&self, shard: ShardId, hash: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
+        self.store_for(shard)
+            .map_or_else(Vec::new, |store| declines_naming(store.as_ref(), hash))
     }
 
     /// [`chain_fate`] over the live store the runner writes to — the shared

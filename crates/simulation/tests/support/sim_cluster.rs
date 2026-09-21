@@ -20,7 +20,7 @@ use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
-    RanAs, chain_fate, chain_membership, records_naming, status_rank,
+    RanAs, chain_fate, chain_membership, declines_naming, records_naming, status_rank,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
@@ -730,6 +730,14 @@ impl Cluster for SimCluster {
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
             .map(|store| records_naming(store, tx))
+            .find(|named| !named.is_empty())
+            .unwrap_or_default()
+    }
+
+    fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .map(|store| declines_naming(store, tx))
             .find(|named| !named.is_empty())
             .unwrap_or_default()
     }

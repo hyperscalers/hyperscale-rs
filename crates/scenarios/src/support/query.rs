@@ -278,6 +278,37 @@ pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHe
     named
 }
 
+/// Walk `store`'s committed chain for every crossing decline naming
+/// `tx`: the height each committed at and the record it refuses.
+///
+/// What a decline moves at its producer is the cell the block writes for
+/// it, and the section is what that cell is derived from — so a scenario
+/// asking whether this shard refused a crossing asks the chain rather
+/// than the state, and gets the height it happened at with the answer.
+#[must_use]
+pub fn declines_naming(
+    store: &impl ShardChainReader,
+    tx: TxHash,
+) -> Vec<(BlockHeight, SubstateKey)> {
+    let tip = store.committed_height();
+    let mut named = Vec::new();
+    let mut height = BlockHeight::new(1);
+    while height <= tip {
+        if let Some(certified) = store.get_block(height) {
+            named.extend(
+                certified
+                    .block()
+                    .declines()
+                    .iter()
+                    .filter(|decline| decline.cell.tx == tx)
+                    .map(|decline| (height, decline.record)),
+            );
+        }
+        height = height.next();
+    }
+    named
+}
+
 /// One thing a shard's own certificate said it ran of a transaction.
 ///
 /// Read off the local execution certificate's outcome, so it is the
