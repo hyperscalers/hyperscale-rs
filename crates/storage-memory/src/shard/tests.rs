@@ -220,7 +220,6 @@ fn test_transactions_batch_with_indexed_block() {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -236,7 +235,6 @@ fn test_transactions_batch_with_indexed_block() {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -581,7 +579,6 @@ fn block_with_txs(
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             witness_sources,
             ..
         } => Block::Live {
@@ -592,7 +589,6 @@ fn block_with_txs(
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,

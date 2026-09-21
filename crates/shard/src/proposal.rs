@@ -21,19 +21,18 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CrossingDecline,
-    CrossingReoffer, Epoch, Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions,
-    ReadySignal, ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CrossingReoffer, Epoch,
+    Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal, ReshapeTrigger,
+    RevealChain, Round, ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 use tracing::debug;
 
 use crate::admission::{
-    Admission, DeclinesFold, DeclinesSection, FinalizationsFold, FinalizationsSection,
-    ProvisionsFold, ProvisionsSection, RecordsFold, RecordsSection, ReoffersFold, ReoffersSection,
-    StateClaimsFold, StateClaimsSection, TransactionsFold, TransactionsSection, admit_each,
-    record_reading, unwrapped,
+    Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
+    RecordsFold, RecordsSection, ReoffersFold, ReoffersSection, StateClaimsFold,
+    StateClaimsSection, TransactionsFold, TransactionsSection, admit_each, record_reading,
+    unwrapped,
 };
 use crate::chain_view::ChainView;
 use crate::precut::Precut;
@@ -67,7 +66,6 @@ pub struct ProposalPayload {
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
     pub(crate) reoffers: Vec<CrossingReoffer>,
-    pub(crate) declines: Vec<CrossingDecline>,
 }
 
 #[derive(Debug, Clone)]
@@ -396,26 +394,6 @@ pub fn select_reoffers(
     admit_each::<ReoffersSection, _>(ctx, fold, sorted, |offer| offer).0
 }
 
-/// Select the crossing declines for inclusion: what
-/// [`DeclinesSection`] admits, in the one order it carries them —
-/// ascending by record, without repeats, and no more than the block's
-/// cap, with the rest waiting a block.
-///
-/// A decline the cap drops is one this shard refuses again next block:
-/// nothing about it has changed, and the producer goes on offering the
-/// crossing until an answer reaches it.
-#[must_use]
-pub fn select_declines(
-    ctx: &Admission<'_>,
-    fold: &mut DeclinesFold<'_>,
-    declines: Vec<CrossingDecline>,
-) -> Vec<CrossingDecline> {
-    let mut sorted = declines;
-    sorted.sort_unstable();
-    sorted.dedup_by(|a, b| a.record == b.record);
-    admit_each::<DeclinesSection<'_>, _>(ctx, fold, sorted, |decline| decline).0
-}
-
 /// Select provisions for inclusion: what [`ProvisionsSection`] admits
 /// from the FIFO queue, folding into `fold`. Oldest batches go first so
 /// the queue drains monotonically; unselected batches remain queued for
@@ -525,7 +503,6 @@ pub fn assemble_build_action(
         abandonment_records,
         state_claims,
         reoffers,
-        declines,
     } = payload;
 
     // The proposer's new BlockHeader will carry parent_qc in its wire
@@ -549,7 +526,6 @@ pub fn assemble_build_action(
         abandonment_records,
         state_claims,
         reoffers,
-        declines,
         fee_checks,
         fee_read_height,
         parent_in_flight,
@@ -613,7 +589,6 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_hbor::Capped;
-    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_finalization, make_undecided_finalization,
         stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
@@ -624,13 +599,8 @@ mod tests {
         NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot, SubstateKey,
         TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
     };
-    use hyperscale_vm_effects::{
-        CrossingCell, Hash32, ProtocolHasher, Terms, crossing_claim_key, escrow_record_key,
-    };
-    use hyperscale_vm_types::{CROSSING_GRACE_MS, IntentHash, ResourceAddr};
 
     use super::*;
-    use crate::admission::Section;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
     use crate::commit_dedup::CommitDedupIndex;
 
@@ -661,326 +631,6 @@ mod tests {
         ));
         against.dedup = dedup;
         against
-    }
-
-    /// A record cell for an escrowed crossing whose producing intent's
-    /// window ends at `validity_end_ms`, under `owner`.
-    fn escrowed_cell(owner: Address, validity_end_ms: u64) -> CrossingCell {
-        let consumer = Address::new([0xC0; 31], AddressClass::Component);
-        let intent = IntentHash(Hash32([0xB0; 32]));
-        CrossingCell {
-            resource: ResourceAddr::new([0xE1; 31]),
-            amount: 1_000,
-            intent,
-            local: 0,
-            output: 0,
-            expiry_ms: validity_end_ms + CROSSING_GRACE_MS,
-            tx: TxHash::from(Hash::from_bytes(b"crossing")),
-            consumer_claim: crossing_claim_key(&ProtocolHasher, consumer, intent, 0, 0),
-            terms: Terms::Escrowed {
-                credit: escrow_record_key(&ProtocolHasher, owner, intent, 0, 1),
-            },
-        }
-    }
-
-    /// The decline of that crossing, at the key the record's own value
-    /// derives.
-    fn decline_of(cell: CrossingCell) -> CrossingDecline {
-        let owner = Address::new([0xA0; 31], AddressClass::Component);
-        CrossingDecline::new(
-            escrow_record_key(&ProtocolHasher, owner, cell.intent, cell.local, cell.output),
-            cell,
-        )
-    }
-
-    /// Admission for a decline at `anchor`.
-    fn declines_against(anchor: WeightedTimestamp) -> Against {
-        let mut against = Against::window(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            1,
-            ValidatorSet::new(Vec::new()),
-        ));
-        against.anchor = anchor;
-        against
-    }
-
-    /// A claim of the producer's chain reading each decline's record
-    /// present, holding the bytes that decline carries — what ties a
-    /// refusal to a crossing someone actually issued.
-    fn licensing_claims(declines: &[&CrossingDecline]) -> Vec<StateClaim> {
-        vec![StateClaim::new(
-            Anchor {
-                shard: ShardId::leaf(1, 1),
-                height: BlockHeight::new(7),
-                state_root: StateRoot::from_raw(Hash::ZERO),
-                ts: ts(1_000),
-            },
-            declines.iter().map(|decline| {
-                (
-                    decline.record,
-                    Inclusion::Present(jmt_value_hash(&decline.cell.to_bytes())),
-                )
-            }),
-        )]
-    }
-
-    fn admit_decline(against: &Against, decline: &CrossingDecline) -> Result<(), String> {
-        admit_decline_against(against, &licensing_claims(&[decline]), decline)
-    }
-
-    fn admit_decline_against(
-        against: &Against,
-        claims: &[StateClaim],
-        decline: &CrossingDecline,
-    ) -> Result<(), String> {
-        let ctx = against.ctx();
-        let finalizations = FinalizationsFold::from(&ctx);
-        <DeclinesSection<'_> as Section>::admit(
-            &ctx,
-            &mut DeclinesFold::after(&finalizations, claims),
-            decline,
-        )
-    }
-
-    /// A core committing at the end of its window is not declined
-    /// against.
-    ///
-    /// The claim is written at a member's coverage, not at its
-    /// admission, so a core admitted a millisecond before its window
-    /// closed has a whole finalization delay to write one. A rule keyed
-    /// on the validity end fires inside that span — and both cells land
-    /// on the healthy path of a core that simply committed late.
-    ///
-    /// Asserted at both instants, because one of them is where a rule
-    /// with the wrong clock passes and the other is where the right one
-    /// does.
-    #[test]
-    fn a_core_committing_at_the_end_of_its_window_is_not_declined_against() {
-        let validity_end = 60_000;
-        let cell = escrowed_cell(
-            Address::new([0xA0; 31], AddressClass::Component),
-            validity_end,
-        );
-        let decline = decline_of(cell);
-        let deadline = Deadline::from_expiry(cell.expiry_ms);
-        assert_eq!(
-            deadline,
-            Deadline::of(WeightedTimestamp::from_millis(validity_end))
-        );
-
-        for anchor in [
-            WeightedTimestamp::from_millis(validity_end),
-            deadline.at().minus(Duration::from_millis(1)),
-        ] {
-            assert!(
-                admit_decline(&declines_against(anchor), &decline).is_err(),
-                "a decline at {anchor:?} refuses a crossing whose claim is still coming",
-            );
-        }
-        assert!(
-            admit_decline(&declines_against(deadline.at()), &decline).is_ok(),
-            "and the deadline itself is where a refusal first becomes composable",
-        );
-    }
-
-    /// A core whose sibling still holds a member here is not declined
-    /// against, at any age.
-    ///
-    /// The deadline bounds inclusion and nothing else: a core member
-    /// with a sibling settles on the sibling's clock however late, so
-    /// the clock alone would write a decline for a crossing whose claim
-    /// lands hours afterwards. What closes it is the tick and candidate
-    /// sets read directly, which is why this is asserted far past the
-    /// deadline rather than near it.
-    #[test]
-    fn a_core_whose_member_is_still_held_here_is_not_declined_against_at_any_age() {
-        let cell = escrowed_cell(Address::new([0xA0; 31], AddressClass::Component), 60_000);
-        let decline = decline_of(cell);
-        let deadline = Deadline::from_expiry(cell.expiry_ms);
-        let long_after = deadline.at().plus(Duration::from_hours(6));
-
-        let against = declines_against(long_after);
-        against.answers.hold_members_for([cell.tx]);
-        assert!(
-            admit_decline(&against, &decline).is_err(),
-            "while a member is held here, a claim may still be coming",
-        );
-
-        against.answers.hold_members_for([]);
-        assert!(
-            admit_decline(&against, &decline).is_ok(),
-            "and the instant nothing holds one is where a refusal becomes composable",
-        );
-    }
-
-    /// A crossing this shard has already answered is not declined
-    /// against.
-    ///
-    /// Both cells present would license a retirement and a reclaim of
-    /// one value, and nothing structural prevents it — they are two
-    /// keys. This is what does.
-    #[test]
-    fn a_crossing_already_answered_is_not_declined_against() {
-        let cell = escrowed_cell(Address::new([0xA0; 31], AddressClass::Component), 60_000);
-        let decline = decline_of(cell);
-        let past = Deadline::from_expiry(cell.expiry_ms).at();
-
-        let against = declines_against(past);
-        assert!(admit_decline(&against, &decline).is_ok());
-        against.answers.answered(decline.record);
-        assert!(
-            admit_decline(&against, &decline).is_err(),
-            "a crossing gets one answer, and the claim is one",
-        );
-    }
-
-    /// A delivery may not decline.
-    ///
-    /// Its failure decides nothing and there is no cell to credit back
-    /// to, so the record stands for a later attempt. A decline on one
-    /// would credit a cell nobody named.
-    #[test]
-    fn an_owed_crossing_is_never_declined_against() {
-        let owner = Address::new([0xA0; 31], AddressClass::Component);
-        let owed = CrossingCell {
-            terms: Terms::Owed,
-            ..escrowed_cell(owner, 60_000)
-        };
-        let decline = decline_of(owed);
-        let past = Deadline::from_expiry(owed.expiry_ms).at();
-        assert!(
-            admit_decline(&declines_against(past), &decline).is_err(),
-            "nothing takes an owed crossing back, so no refusal of one is composable",
-        );
-    }
-
-    /// A decline carrying a cell that is not the record's own is
-    /// refused.
-    ///
-    /// The key pins the edge, and a cell claiming another edge is at no
-    /// key its own value names — which is the one term this rule can
-    /// check without the producer's bytes, and the one that makes every
-    /// other term's key derivation honest.
-    #[test]
-    fn a_decline_whose_cell_does_not_name_its_record_is_refused() {
-        let owner = Address::new([0xA0; 31], AddressClass::Component);
-        let cell = escrowed_cell(owner, 60_000);
-        let elsewhere = CrossingDecline::new(
-            escrow_record_key(
-                &ProtocolHasher,
-                owner,
-                cell.intent,
-                cell.local,
-                cell.output + 1,
-            ),
-            cell,
-        );
-        let past = Deadline::from_expiry(cell.expiry_ms).at();
-        assert!(admit_decline(&declines_against(past), &elsewhere).is_err());
-    }
-
-    /// A refusal the block proves nothing about is refused.
-    ///
-    /// The whole rule reads the carried cell, and the key pins only the
-    /// edge — so without a reading of the record there is nothing
-    /// saying the crossing was ever issued, let alone on these terms.
-    #[test]
-    fn a_decline_the_block_proves_no_record_for_is_refused() {
-        let owner = Address::new([0xA0; 31], AddressClass::Component);
-        let decline = decline_of(escrowed_cell(owner, 60_000));
-        let past = Deadline::from_expiry(decline.cell.expiry_ms).at();
-        let against = declines_against(past);
-
-        assert!(
-            admit_decline_against(&against, &[], &decline).is_err(),
-            "a block carrying no claim pins no crossing",
-        );
-        let absent = vec![StateClaim::new(
-            Anchor {
-                shard: ShardId::leaf(1, 1),
-                height: BlockHeight::new(7),
-                state_root: StateRoot::from_raw(Hash::ZERO),
-                ts: ts(1_000),
-            },
-            [(decline.record, Inclusion::Absent)],
-        )];
-        assert!(
-            admit_decline_against(&against, &absent, &decline).is_err(),
-            "and a record read absent is the producer having disposed already",
-        );
-        assert!(
-            admit_decline_against(&against, &licensing_claims(&[&decline]), &decline).is_ok(),
-            "the record read present with these bytes is the whole of what ties the two",
-        );
-    }
-
-    /// A decline cannot state terms the producer never committed.
-    ///
-    /// The deadline is the one that costs: an early expiry passes the
-    /// deadline conjunct while the transaction is still admissible
-    /// here, so the refusal commits and the member it names runs
-    /// afterwards and writes the claim — both cells, on a lie the key
-    /// cannot catch, since the expiry is not in the key. What catches
-    /// it is the presence reading's value hash, which makes every field
-    /// the producer's own bytes.
-    #[test]
-    fn a_decline_cannot_restate_the_terms_the_record_holds() {
-        let owner = Address::new([0xA0; 31], AddressClass::Component);
-        let cell = escrowed_cell(owner, 60_000);
-        let honest = decline_of(cell);
-        let early = decline_of(CrossingCell {
-            expiry_ms: cell.expiry_ms - 10_000,
-            ..cell
-        });
-        assert_eq!(
-            early.record, honest.record,
-            "an expiry is not in the record's key, so the forgery sits at the same key",
-        );
-
-        // Past the deadline the forged cell states, inside the one the
-        // producer committed: exactly where an unpinned expiry buys a
-        // refusal of a crossing whose claim is still coming.
-        let between = Deadline::from_expiry(early.cell.expiry_ms).at();
-        assert!(between < Deadline::from_expiry(cell.expiry_ms).at());
-        let against = declines_against(between);
-        let claims = licensing_claims(&[&honest]);
-
-        assert!(
-            admit_decline_against(&against, &claims, &early).is_err(),
-            "the producer's own bytes are what the deadline is read off",
-        );
-        assert!(
-            admit_decline_against(&against, &claims, &honest).is_err(),
-            "and against those bytes the deadline has not passed",
-        );
-    }
-
-    /// The section carries its declines in one order, without repeats.
-    #[test]
-    fn a_blocks_declines_have_one_order_and_one_entry_per_crossing() {
-        let owner = Address::new([0xA0; 31], AddressClass::Component);
-        let first = decline_of(escrowed_cell(owner, 60_000));
-        let second = {
-            let cell = CrossingCell {
-                output: 1,
-                ..escrowed_cell(owner, 60_000)
-            };
-            decline_of(cell)
-        };
-        let past = Deadline::from_expiry(first.cell.expiry_ms).at();
-        let against = declines_against(past);
-        let ctx = against.ctx();
-        let finalizations = FinalizationsFold::from(&ctx);
-        let claims = licensing_claims(&[&first, &second]);
-
-        let selected = select_declines(
-            &ctx,
-            &mut DeclinesFold::after(&finalizations, &claims),
-            vec![second.clone(), first.clone(), second.clone()],
-        );
-        let mut expected = vec![first, second];
-        expected.sort_unstable();
-        assert_eq!(selected, expected);
     }
 
     const DEPARTED: ShardId = ShardId::leaf(1, 0);

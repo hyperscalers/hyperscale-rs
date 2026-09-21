@@ -2635,7 +2635,6 @@ dependencies = [
  "hyperscale-crypto-bls",
  "hyperscale-hbor",
  "hyperscale-jmt",
- "hyperscale-vm-effects",
  "hyperscale-vm-types",
  "k256",
  "ml-dsa",

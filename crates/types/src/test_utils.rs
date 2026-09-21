@@ -373,7 +373,6 @@ pub fn make_live_block(
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
         reoffers: Arc::new(Capped::empty()),
-        declines: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -800,7 +799,6 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             witness_sources,
         } => Block::Live {
             header: restamp(header),
@@ -810,7 +808,6 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             witness_sources,
         },
         Block::Sealed {
@@ -821,7 +818,6 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             witness_sources,
         } => Block::Sealed {
             header: restamp(header),
@@ -831,7 +827,6 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             witness_sources,
         },
     }

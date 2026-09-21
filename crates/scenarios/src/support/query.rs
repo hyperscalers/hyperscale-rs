@@ -18,7 +18,7 @@ use hyperscale_types::{
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
     WeightedTimestamp, Window, sweep_admits_block,
 };
-use hyperscale_vm_effects::{CrossingCell, Terms};
+use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingCell, Terms};
 
 use super::{Budget, Cluster};
 
@@ -278,13 +278,14 @@ pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHe
     named
 }
 
-/// Walk `store`'s committed chain for every crossing decline naming
+/// Walk `store`'s committed chain for every crossing refusal naming
 /// `tx`: the height each committed at and the record it refuses.
 ///
-/// What a decline moves at its producer is the cell the block writes for
-/// it, and the section is what that cell is derived from — so a scenario
-/// asking whether this shard refused a crossing asks the chain rather
-/// than the state, and gets the height it happened at with the answer.
+/// Read off the decline cells this shard's own finalizations wrote,
+/// which is where a refusal is: a member that runs no node, writes the
+/// one cell and moves nothing. So a scenario asking whether this shard
+/// refused a crossing asks the chain rather than the state, and gets the
+/// height it happened at with the answer.
 #[must_use]
 pub fn declines_naming(
     store: &impl ShardChainReader,
@@ -295,14 +296,18 @@ pub fn declines_naming(
     let mut height = BlockHeight::new(1);
     while height <= tip {
         if let Some(certified) = store.get_block(height) {
-            named.extend(
-                certified
-                    .block()
-                    .declines()
-                    .iter()
-                    .filter(|decline| decline.cell.tx == tx)
-                    .map(|decline| (height, decline.record)),
-            );
+            for finalization in certified.block().certificates().iter() {
+                for receipt in finalization.as_unverified().receipts() {
+                    let Some(writes) = receipt.consensus.writes() else {
+                        continue;
+                    };
+                    named.extend(writes.cells.values().filter_map(|value| {
+                        let answer = CrossingAnswer::from_bytes(value.as_ref()?)?;
+                        (answer.answered == Answered::Declined && answer.tx == tx)
+                            .then_some((height, answer.record))
+                    }));
+                }
+            }
         }
         height = height.next();
     }

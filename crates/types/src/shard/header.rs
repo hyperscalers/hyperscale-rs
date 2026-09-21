@@ -9,11 +9,11 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-    CertificateRoot, ChainOrigin, CommittedTxsRoot, DeclineRoot, Hash, LocalReceiptRoot,
-    PredecessorTerminal, ProposerTimestamp, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate,
-    ReofferRoot, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots,
-    StateClaimsRoot, StateRoot, SweepFrontier, TerminalRoots, TransactionRoot, TxsInFlight,
-    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
+    CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, PredecessorTerminal,
+    ProposerTimestamp, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReofferRoot,
+    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot,
+    StateRoot, SweepFrontier, TerminalRoots, TransactionRoot, TxsInFlight, ValidatorId, Verifiable,
+    Verified, Verify, WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -86,14 +86,6 @@ pub struct BlockHeader {
     /// offers — which crossings it promises a consumer again, and the
     /// record cells each bundle is built from.
     reoffer_root: ReofferRoot,
-    /// Commits the block's [`CrossingDecline`](crate::CrossingDecline)
-    /// refusals — which crossings it answers with a decline, and the
-    /// record cell each refusal is judged against.
-    ///
-    /// The cells the block writes for them are derived from this
-    /// section, so what a decline moves at its producer is committed
-    /// content rather than a proposer's word.
-    decline_root: DeclineRoot,
     txs_in_flight: TxsInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
@@ -200,7 +192,6 @@ pub struct BlockHeaderParts {
     pub abandonment_root: AbandonmentRoot,
     pub state_claims_root: StateClaimsRoot,
     pub reoffer_root: ReofferRoot,
-    pub decline_root: DeclineRoot,
     pub txs_in_flight: TxsInFlight,
     pub settled_tick_frontier: BlockHeight,
     pub sweep_frontier: SweepFrontier,
@@ -234,7 +225,6 @@ impl Default for BlockHeaderParts {
             abandonment_root: AbandonmentRoot::ZERO,
             state_claims_root: StateClaimsRoot::ZERO,
             reoffer_root: ReofferRoot::ZERO,
-            decline_root: DeclineRoot::ZERO,
             txs_in_flight: TxsInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -272,7 +262,6 @@ impl BlockHeader {
             abandonment_root,
             state_claims_root,
             reoffer_root,
-            decline_root,
             txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -302,7 +291,6 @@ impl BlockHeader {
             abandonment_root,
             state_claims_root,
             reoffer_root,
-            decline_root,
             txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -602,13 +590,6 @@ impl BlockHeader {
         self.reoffer_root
     }
 
-    /// Merkle root over the crossing declines the block carries — the
-    /// crossings it refuses, and the record cell each refusal names.
-    #[must_use]
-    pub const fn decline_root(&self) -> DeclineRoot {
-        self.decline_root
-    }
-
     /// Approximate number of in-flight transactions on this shard at proposal time.
     ///
     /// "In-flight" = committed + executed transactions in the proposer's mempool,
@@ -779,7 +760,6 @@ impl BlockHeader {
             abandonment_root: self.abandonment_root,
             state_claims_root: self.state_claims_root,
             reoffer_root: self.reoffer_root,
-            decline_root: self.decline_root,
             txs_in_flight: self.txs_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,

@@ -399,7 +399,6 @@ impl RocksDbShardStorage {
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
         };
 
@@ -536,7 +535,6 @@ impl RocksDbShardStorage {
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
         };
         let provision_hashes = provision_hashes_bounded;

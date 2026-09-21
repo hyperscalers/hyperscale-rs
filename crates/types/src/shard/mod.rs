@@ -36,8 +36,6 @@ pub mod certified_header;
 pub mod chain_origin;
 pub mod commit_proof;
 pub mod counterpart_mirror;
-pub mod crossing_answers;
-pub mod crossing_decline;
 pub mod crossing_reoffer;
 pub mod demands;
 pub mod evidence;

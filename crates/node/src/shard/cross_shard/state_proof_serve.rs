@@ -285,7 +285,6 @@ mod tests {
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
                 reoffers: Arc::new(Capped::empty()),
-                declines: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
             let creations = committed_tx_cells(

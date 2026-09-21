@@ -50,24 +50,26 @@ use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
-use hyperscale_engine::{CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_fee_receipt};
+use hyperscale_engine::{
+    CodeAvailability, PROTOCOL_RESOURCE, Refusal, TickEnvironment, build_fee_receipt,
+};
 use hyperscale_metrics::{
     record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
 };
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
-    CommittedAt, ConsensusPublicKey, CounterpartMirror, CrossingAnswers, CrossingDecline,
-    CrossingReoffer, Deadline, DeclaredKey, Derivation, ExecutionCertificate,
-    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
-    FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, MerkleInclusionProof, Mode,
-    Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions, SettledSetVerdict, SettledTxSet,
-    ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window, WindowView,
-    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    CommittedAt, ConsensusPublicKey, CounterpartMirror, CrossingReoffer, Deadline, DeclaredKey,
+    Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
+    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
+    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions,
+    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey,
+    TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
+    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    Window, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
+    tick_leader_at,
 };
-use hyperscale_vm_effects::Terms;
+use hyperscale_vm_effects::{ProtocolHasher, Terms, crossing_decline_key};
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
@@ -534,7 +536,6 @@ impl ExecutionCoordinator {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
-            Arc::new(CrossingAnswers::new()),
         )
     }
 
@@ -571,7 +572,6 @@ impl ExecutionCoordinator {
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
         mirror: Arc<CounterpartMirror>,
-        answers: Arc<CrossingAnswers>,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
         // replay carries the frontier up to the tip rather than starting
@@ -602,7 +602,6 @@ impl ExecutionCoordinator {
                 proven_anchors,
                 proven_cells,
                 mirror,
-                answers,
                 &recovered.crossing_leaves,
             ),
             finalized,
@@ -1367,6 +1366,121 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Admit into the tick being composed a refusal of every crossing
+    /// handed to this shard that nothing here can still take.
+    ///
+    /// The escrowed path's obligation, discharged. A crossing arrives as
+    /// a bundle, so its consumer knows it owes an answer; a refusal is
+    /// the answer where no execution here will ever give the other one,
+    /// and the producer credits the value back off it rather than
+    /// inferring anything from a silence.
+    ///
+    /// **Three conditions, and each bounds a different way a claim could
+    /// still be coming.**
+    ///
+    /// The crossing is *unanswered* — this shard holds no answer cell
+    /// naming its record. Read off `answered`, which seeds from the
+    /// answer leaves in state rather than from a replay, so a restarted
+    /// seat reads it whole. The kernel reads the claim again against the
+    /// committed baseline, which is what makes the two answers exclusive
+    /// by construction; this is selection, so that a member which would
+    /// refuse is not composed.
+    ///
+    /// The transaction's *deadline has passed*, read off the record's
+    /// own expiry. The deadline and not the validity end: a claim is
+    /// written at a member's coverage rather than at its admission, so a
+    /// core admitted a millisecond before its window closed has a whole
+    /// finalization delay to write one, and a rule keyed on the validity
+    /// end refuses a crossing whose claim is still coming — on the
+    /// healthy path of a core that simply committed late.
+    ///
+    /// And *nothing here still holds a member* for it. The deadline does
+    /// not bound this, which is why it is its own condition: the
+    /// deadline fence on finalizations refuses only what decides alone,
+    /// so a core member with a sibling settles on the sibling's clock
+    /// however late. While a tick or a candidate holds one, a claim may
+    /// still be coming; once neither does, none ever can, because a
+    /// member composed past the deadline runs nothing and writes
+    /// nothing.
+    ///
+    /// **Composed off the arrivals, and nothing narrower would do.** A
+    /// consumer holds no leaf for a crossing it has not answered and no
+    /// entry either, for exactly the crossing this exists for: one whose
+    /// member this shard never composed. What a bundle handed it is the
+    /// provisioning account's to say, and the producer goes on offering
+    /// the crossing until an answer reaches it, so an arrival a restart
+    /// forgot is one the next offer brings back.
+    fn admit_refusals(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        prices: PriceTable,
+        state: &mut TickState,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+    ) {
+        let Some(window) = topology_schedule.at(tick_ts) else {
+            return;
+        };
+        let trie = window.shard_trie();
+        let local_shard = self.local_shard;
+        // One member per issuing transaction, so crossings refused
+        // together settle together and one still waiting holds nothing
+        // back.
+        let mut due: BTreeMap<TxHash, Vec<Refusal>> = BTreeMap::new();
+        for (&record, arrival) in self.provisioning.arrived() {
+            let cell = arrival.cell;
+            if !matches!(cell.terms, Terms::Escrowed { .. }) {
+                continue;
+            }
+            // The producer's, wherever its prefix sits now: a crossing
+            // refused across a cut is answered to the successor.
+            if trie.shard_for_prefix(record.owner) == local_shard {
+                continue;
+            }
+            if self.counterparts.holds_answer_for(record)
+                || !Deadline::from_expiry(cell.expiry_ms).passed(tick_ts)
+                || self.holds_member_for(cell.tx)
+            {
+                continue;
+            }
+            due.entry(cell.tx).or_default().push(Refusal {
+                record,
+                cell,
+                site: crossing_decline_key(
+                    &ProtocolHasher,
+                    cell.consumer_claim.owner,
+                    cell.intent,
+                    cell.local,
+                    cell.output,
+                ),
+            });
+        }
+        for (issued_by, crossings) in due {
+            let records: Vec<SubstateKey> = crossings.iter().map(|one| one.record).collect();
+            let tx_hash = disposal_member_name(issued_by, &records);
+            state.admit(
+                tx_hash,
+                Membership::whole(BTreeSet::from([local_shard])).settling(),
+                None,
+                Admission::Executes,
+            );
+            self.ticks.assign_tx(tx_hash, tick_id);
+            requests.push(CrossShardExecutionRequest {
+                tx_hash,
+                transaction: None,
+                provisions: Vec::new(),
+                clock: tick_ts,
+                prices,
+                runs: Runs::Refuse {
+                    member: Member::whole(local_shard),
+                    crossings,
+                },
+                arrivals: Vec::new(),
+            });
+        }
+    }
+
     /// Admit into the tick being composed every retirement a committed
     /// record has licensed: a member running no node, awaiting nobody,
     /// reserving nothing, charged nothing, that deletes the records of
@@ -1623,6 +1737,14 @@ impl ExecutionCoordinator {
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_record_disposals(
+            topology_schedule,
+            tick_id,
+            block.ts,
+            tick_prices,
+            &mut state,
+            &mut requests,
+        );
+        self.admit_refusals(
             topology_schedule,
             tick_id,
             block.ts,
@@ -2722,32 +2844,7 @@ impl ExecutionCoordinator {
     pub fn offers(&mut self, topology_schedule: &TopologySchedule) -> Offers {
         let trie = self.counterpart_trie(topology_schedule);
         let now = self.committed_ts;
-        let declines = self.declines();
-        self.counterparts.offers(trie, now, declines)
-    }
-
-    /// The crossings this shard could refuse, each carrying the record
-    /// cell its producer committed.
-    ///
-    /// The candidates and not the verdict. Whether a crossing may be
-    /// refused is
-    /// [`DeclinesSection`](../../hyperscale_shard/admission/struct.DeclinesSection.html)'s
-    /// one rule, which the proposer's selection and every voter's walk
-    /// both run — so it is stated there and nowhere else. What is here
-    /// is the only thing that rule cannot reach: the set of crossings
-    /// this shard was ever handed.
-    ///
-    /// The arrivals are that set, and nothing narrower would do. A
-    /// consumer holds no leaf for a crossing it has not answered — that
-    /// is the whole asymmetry of this direction — and no entry either,
-    /// for exactly the crossing a decline exists for: one whose member
-    /// this shard never composed.
-    fn declines(&self) -> Vec<CrossingDecline> {
-        self.provisioning
-            .arrived()
-            .iter()
-            .map(|(record, arrival)| CrossingDecline::new(*record, arrival.cell))
-            .collect()
+        self.counterparts.offers(trie, now)
     }
 
     /// Whether a tick or a candidate of this shard still holds a member
@@ -2762,30 +2859,6 @@ impl ExecutionCoordinator {
     #[must_use]
     pub fn holds_member_for(&self, tx_hash: TxHash) -> bool {
         self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash)
-    }
-
-    /// Publish the transactions a tick or a candidate here still holds a
-    /// member for, where a block's declines are admitted against them.
-    ///
-    /// Rewritten whole at each commit rather than edited at each of the
-    /// several sites that move a member, and affordable because the set
-    /// is bounded by what the chain has in flight. The answering half of
-    /// the same mirror is edited where it changes, because that one is
-    /// not.
-    pub fn publish_held_members(&self) {
-        self.counterparts
-            .answers
-            .hold_members_for(self.held_member_txs());
-    }
-
-    /// The transactions a tick or a candidate here still holds a member
-    /// for.
-    fn held_member_txs(&self) -> BTreeSet<TxHash> {
-        self.ticks
-            .ticks_iter()
-            .flat_map(|(_, tick)| tick.tx_hashes().to_vec())
-            .chain(self.candidates.tx_hashes())
-            .collect()
     }
 
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
@@ -4440,7 +4513,8 @@ mod tests {
         Window,
     };
     use hyperscale_vm_effects::{
-        CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, crossing_decline_key,
+        Answered, CrossingAnswer, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms,
+        crossing_decline_key,
     };
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
@@ -7346,7 +7420,6 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
-            Arc::new(CrossingAnswers::new()),
         );
 
         // The first post-restart commit extends the tip and dates itself
@@ -8002,7 +8075,6 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
-            Arc::new(CrossingAnswers::new()),
         );
 
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -8058,7 +8130,6 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
-            Arc::new(CrossingAnswers::new()),
         );
 
         let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -8134,7 +8205,6 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
-            Arc::new(CrossingAnswers::new()),
         );
 
         let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -8210,7 +8280,6 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
-            Arc::new(CrossingAnswers::new()),
         );
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
 
@@ -8287,7 +8356,6 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
-            Arc::new(CrossingAnswers::new()),
         );
         assert!(
             restarted.candidates.is_empty(),
@@ -8875,7 +8943,6 @@ mod tests {
             abandonment_records,
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -8918,7 +8985,6 @@ mod tests {
             abandonment_records,
             state_claims,
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -9001,7 +9067,6 @@ mod tests {
             ),
             state_claims,
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -9956,6 +10021,29 @@ mod tests {
         (record_key, claim, cell)
     }
 
+    /// A crossing handed *to* this shard: the record sits on `PEER`
+    /// where its producer committed it, and the claim under a target of
+    /// `HOME`'s, which is what makes the answer this shard's to give.
+    ///
+    /// [`held_record`] read from the other end, and the ends are what
+    /// the two fixtures differ in: a producer holds the record and asks
+    /// about the answer, a consumer holds the answer and is asked for
+    /// it.
+    fn arrived_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+        let (claim, record_key, base) = held_record(local, expiry_ms);
+        let cell = CrossingCell {
+            consumer_claim: claim,
+            terms: Terms::Escrowed {
+                credit: SubstateKey {
+                    owner: record_key.owner,
+                    local: LocalKey([local ^ 0x0F; 16]),
+                },
+            },
+            ..base
+        };
+        (record_key, claim, cell)
+    }
+
     /// What a shard holding one record dispatches, once a block carries
     /// a proof of its claim. `owed_here` registers the issuing
     /// transaction in the ledger, which is the shard's other way of
@@ -10376,6 +10464,157 @@ mod tests {
         assert!(
             declined_settlement(at_deadline, true, false).is_some(),
             "and the leaf answers where no entry does",
+        );
+    }
+
+    /// What a shard handed one crossing composes at `at`, given what
+    /// else it holds.
+    ///
+    /// Returns the refusal the commit dispatched, if any.
+    /// An expiry well past [`CLAIM_WINDOW`], so the deadline it derives
+    /// is an instant the tests can sit either side of rather than one
+    /// the subtraction floors at zero.
+    const REFUSED_EXPIRY_MS: u64 = 4_000_000;
+
+    fn refusal_at(
+        at: WeightedTimestamp,
+        terms: Terms,
+        holds_member: bool,
+        answered: bool,
+    ) -> Option<Runs> {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let (record_key, claim, base) = arrived_record(0x6A, REFUSED_EXPIRY_MS);
+        let cell = CrossingCell { terms, ..base };
+        state.provisioning.handed(record_key, cell, at);
+        if holds_member {
+            // A seated tick, not a bare assignment: an assignment whose
+            // tick has no state is pruned at the commit, which is the
+            // registry keeping itself consistent rather than anything
+            // this is about.
+            let tick_id = TickId::new(HOME, BlockHeight::new(1));
+            state.ticks.insert_tick(
+                tick_id,
+                TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at),
+            );
+            state.ticks.assign_tx(cell.tx, tick_id);
+        }
+        if answered {
+            let answer = CrossingAnswer {
+                tx: cell.tx,
+                intent: cell.intent,
+                local: cell.local,
+                output: cell.output,
+                record: record_key,
+                answered: Answered::Taken,
+            };
+            state
+                .counterparts
+                .note_answer(answer.key(&ProtocolHasher, claim.owner), &answer);
+        }
+        state.committed_ts = at;
+        let actions = commit_carrying(&mut state, &schedule, 1, at.as_millis(), vec![]);
+        actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => requests
+                .iter()
+                .find(|request| matches!(request.runs, Runs::Refuse { .. }))
+                .map(|request| request.runs.clone()),
+            _ => None,
+        })
+    }
+
+    /// The escrowed cell `held_record` gives, whose terms name a cell to
+    /// credit back.
+    fn escrowed_terms() -> Terms {
+        arrived_record(0x6A, REFUSED_EXPIRY_MS).2.terms
+    }
+
+    /// A crossing is refused past its deadline and not before it.
+    ///
+    /// The deadline and not the validity end. A claim is written at a
+    /// member's coverage rather than at its admission, so a core
+    /// admitted a millisecond before its window closed has a whole
+    /// finalization delay to write one — and a rule keyed on the
+    /// validity end refuses a crossing whose claim is still coming, on
+    /// the healthy path of a core that simply committed late.
+    #[test]
+    fn a_crossing_is_refused_past_its_deadline_and_not_before_it() {
+        let deadline = Deadline::from_expiry(REFUSED_EXPIRY_MS);
+        let terms = escrowed_terms();
+        assert!(
+            refusal_at(
+                deadline.at().minus(Duration::from_millis(1)),
+                terms,
+                false,
+                false
+            )
+            .is_none(),
+            "short of the deadline a member may still be composed anywhere",
+        );
+        assert!(
+            refusal_at(deadline.at(), terms, false, false).is_some(),
+            "and past it nothing can be included, so nothing here can still claim",
+        );
+        // The validity end the deadline was derived from, which is
+        // where a rule keyed on admission would fire: a whole
+        // finalization delay before a member that committed at the very
+        // end of its window has written its claim.
+        assert!(
+            refusal_at(
+                deadline.at().minus(MAX_FINALIZATION_DELAY),
+                terms,
+                false,
+                false
+            )
+            .is_none(),
+            "a rule keyed on the validity end fires while the claim is still coming",
+        );
+    }
+
+    /// A crossing a member here still holds is not refused, at any age.
+    ///
+    /// The deadline does not bound this, which is why it is its own
+    /// condition: the deadline fence on finalizations refuses only what
+    /// decides alone, so a core member with a sibling settles on the
+    /// sibling's clock however late. While a tick or a candidate holds
+    /// one, a claim may still be coming.
+    #[test]
+    fn a_crossing_a_member_here_still_holds_is_not_refused_at_any_age() {
+        let terms = escrowed_terms();
+        let ages = [
+            Deadline::from_expiry(REFUSED_EXPIRY_MS).at(),
+            WeightedTimestamp::from_millis(REFUSED_EXPIRY_MS * 10),
+        ];
+        for at in ages {
+            assert!(
+                refusal_at(at, terms, true, false).is_none(),
+                "a tick here may still write the claim, at {at:?}",
+            );
+            assert!(
+                refusal_at(at, terms, false, false).is_some(),
+                "and once it lets go the refusal is the crossing's answer, at {at:?}",
+            );
+        }
+    }
+
+    /// A crossing this shard has already answered is not refused, and
+    /// one owed to its consumer is never refused at all.
+    ///
+    /// Both arms lose value if they are wrong: a second answer licenses
+    /// a retirement and a reclaim of one value, and a refusal of an owed
+    /// crossing credits a cell nobody named. The kernel refuses both
+    /// against committed state; this is the selection that keeps a
+    /// member which would be refused from being composed.
+    #[test]
+    fn neither_an_answered_crossing_nor_an_owed_one_is_refused() {
+        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        assert!(
+            refusal_at(at, escrowed_terms(), false, true).is_none(),
+            "a crossing this shard claimed is answered, and answered once",
+        );
+        assert!(
+            refusal_at(at, Terms::Owed, false, false).is_none(),
+            "and nothing takes an owed crossing back, so no refusal of one is composable",
         );
     }
 

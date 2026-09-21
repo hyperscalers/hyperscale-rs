@@ -123,8 +123,7 @@ mod tests {
             Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),
-            Capped::empty(),
-            Capped::empty(),
+            Capped::from_array([]),
             WitnessSources::empty(),
         );
 
@@ -143,8 +142,7 @@ mod tests {
             Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),
-            Capped::empty(),
-            Capped::empty(),
+            Capped::from_array([]),
             WitnessSources::empty(),
         );
 
@@ -168,8 +166,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
-                Capped::empty(),
-                Capped::empty(),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             zero_sig(),

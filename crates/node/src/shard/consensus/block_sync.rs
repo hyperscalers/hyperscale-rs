@@ -28,10 +28,9 @@ use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, DeclineRoot,
-    ElidedCertifiedBlock, Hash, Inventory, LocalReceiptRoot, ProvisionHash, ProvisionsRoot,
-    RehydrateError, ReofferRoot, StateClaimsRoot, StoredReceipt, TransactionRoot, Verifiable,
-    Verified,
+    AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash,
+    Inventory, LocalReceiptRoot, ProvisionHash, ProvisionsRoot, RehydrateError, ReofferRoot,
+    StateClaimsRoot, StoredReceipt, TransactionRoot, Verifiable, Verified,
 };
 
 use crate::event::classify_fetch_error;
@@ -439,12 +438,6 @@ fn validate_synced_block(
         return Err("reoffer_root_mismatch");
     }
 
-    if Verified::<DeclineRoot>::compute(certified.block().declines()).into_inner()
-        != header.decline_root()
-    {
-        return Err("decline_root_mismatch");
-    }
-
     if Verified::<TransactionRoot>::compute(certified.block().transactions()).into_inner()
         != header.transaction_root()
     {
@@ -633,7 +626,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -651,7 +643,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -673,7 +664,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -699,7 +689,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -767,7 +756,6 @@ mod tests {
                 Capped::new(state_claims).expect("a rebuilt block keeps the caps its source met"),
             ),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -820,7 +808,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::from_array([boundary_record()])),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -850,7 +837,6 @@ mod tests {
             ),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -881,7 +867,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -909,7 +894,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -938,7 +922,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -963,7 +946,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1003,7 +985,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -1040,7 +1021,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1101,7 +1081,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1133,7 +1112,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1191,7 +1169,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);

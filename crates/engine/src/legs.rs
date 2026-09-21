@@ -29,7 +29,7 @@ use hyperscale_types::{
     Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction,
 };
 use hyperscale_vm_effects::{CrossingEdge as StarEdge, Kind, Star, running_at, star_at};
-use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
+use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault, Refusal};
 use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
 use crate::sharding::TrieShardResolver;
@@ -870,6 +870,22 @@ pub enum Runs {
         /// that dissolved.
         charged: bool,
     },
+    /// No node at all: the crossings handed to this shard that nothing
+    /// here will ever take, each answered with a decline cell.
+    ///
+    /// [`Self::Settle`]'s mirror. That one disposes of records this
+    /// shard holds, on evidence of what its consumer did; this one
+    /// answers records another shard holds, and the evidence is that
+    /// nothing here can still speak. It moves no value — the producer
+    /// already has it, and the cell is the licence to keep it.
+    Refuse {
+        /// The member the refusal runs as: whole, on its own shard,
+        /// reaching nobody else.
+        member: Member,
+        /// The crossings refused, each carrying the record cell its
+        /// producer committed and the key the decline sits at.
+        crossings: Vec<Refusal>,
+    },
 }
 
 impl Runs {
@@ -877,7 +893,9 @@ impl Runs {
     #[must_use]
     pub const fn member(&self) -> &Member {
         match self {
-            Self::Shape(member) | Self::Settle { member, .. } => member,
+            Self::Shape(member) | Self::Settle { member, .. } | Self::Refuse { member, .. } => {
+                member
+            }
         }
     }
 
@@ -888,7 +906,7 @@ impl Runs {
     pub fn reaches_beyond(&self) -> bool {
         match self {
             Self::Shape(member) => member.reaches_beyond(),
-            Self::Settle { .. } => false,
+            Self::Settle { .. } | Self::Refuse { .. } => false,
         }
     }
 
@@ -898,7 +916,7 @@ impl Runs {
     pub fn abortable(&self) -> bool {
         match self {
             Self::Shape(member) => member.abortable(),
-            Self::Settle { .. } => false,
+            Self::Settle { .. } | Self::Refuse { .. } => false,
         }
     }
 
@@ -915,10 +933,15 @@ impl Runs {
                 charged,
                 ..
             } => *charged,
+            // A refusal charges nothing for the reason a retirement
+            // does not: it is housekeeping on a transaction this shard
+            // never ran and was never asked to price, so whatever it
+            // owed was owed where it committed.
             Self::Settle {
                 on: Licence::Claimed | Licence::OwnLeaf,
                 ..
-            } => true,
+            }
+            | Self::Refuse { .. } => true,
         }
     }
 }

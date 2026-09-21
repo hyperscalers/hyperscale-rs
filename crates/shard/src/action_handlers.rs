@@ -14,8 +14,7 @@ use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore,
-    SubstateView, SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, decline_cells,
-    sweep_for_block,
+    SubstateView, SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, sweep_for_block,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -28,19 +27,18 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
-    CrossingDecline, CrossingReoffer, Deadline, DeclineRoot, DeferOn, Derivation, Epoch,
-    EpochWindows, Finalization, Hash, LocalReceiptRoot, MAX_DECLINES_PER_BLOCK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReofferRoot, ReshapeTrigger,
-    Resolutions, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots, StateClaim,
-    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey,
-    SweepFrontier, TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionRootContext, TxHash, TxsInFlight, UnsettledTx, ValidatorId,
-    Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
+    CrossingReoffer, Deadline, DeferOn, Derivation, Epoch, EpochWindows, Finalization, Hash,
+    LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit,
+    PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal,
+    ReofferRoot, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId, ShardLoad,
+    SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext, Stopwatch,
+    StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
+    UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
     derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
     signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
@@ -225,7 +223,6 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
     reoffers: Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>,
-    declines: Capped<Vec<CrossingDecline>, MAX_DECLINES_PER_BLOCK>,
     parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
@@ -266,13 +263,11 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         parent_qc.weighted_timestamp(),
     );
     // What the chain writes of its own accord: a committed-transaction
-    // cell for every transaction the block carries, and a decline cell
-    // for every crossing it refuses. Both are derived from the block's
-    // own sections, so every reader of the root — the proposer's voters,
-    // a replica committing on the certificate alone, a split child
-    // following the block — derives the same set.
-    let mut creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
-    creations.extend(decline_cells(declines.iter()));
+    // cell for every transaction the block carries. Derived from the
+    // block's own transactions, so every reader of the root — the
+    // proposer's voters, a replica committing on the certificate alone,
+    // a split child following the block — derives the same set.
+    let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,
@@ -409,7 +404,6 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // The crossings this block refuses, committed so the cells it wrote
     // for them are a fact about the block rather than about whoever
     // built it.
-    let decline_root = Verified::<DeclineRoot>::compute(&declines).into_inner();
 
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
@@ -429,7 +423,6 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         abandonment_root,
         state_claims_root,
         reoffer_root,
-        decline_root,
         txs_in_flight,
         settled_tick_frontier,
         sweep_frontier,
@@ -450,7 +443,6 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         abandonment_records: Arc::new(abandonment_records),
         state_claims: Arc::new(state_claims),
         reoffers: Arc::new(reoffers),
-        declines: Arc::new(declines),
         witness_sources,
     };
 
@@ -1213,7 +1205,6 @@ where
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             fee_checks,
             fee_read_height,
             parent_in_flight,
@@ -1377,7 +1368,6 @@ where
                 Ok(abandonment_records),
                 Ok(state_claims),
                 Ok(reoffers),
-                Ok(declines),
                 Ok(ready_signals),
             ) = (
                 Capped::new(transactions),
@@ -1386,7 +1376,6 @@ where
                 Capped::new(abandonment_records),
                 Capped::new(state_claims),
                 Capped::new(reoffers),
-                Capped::new(declines),
                 Capped::new(ready_signals),
             )
             else {
@@ -1417,7 +1406,6 @@ where
                 abandonment_records,
                 state_claims,
                 reoffers,
-                declines,
                 parent_in_flight,
                 parent_settled_frontier,
                 parent_sweep_frontier,

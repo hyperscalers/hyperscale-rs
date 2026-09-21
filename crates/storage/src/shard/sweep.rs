@@ -12,14 +12,11 @@ use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    Address, Block, CrossingDecline, Finalization, LocalKey, MAX_SWEEP_PER_BLOCK,
-    SWEEP_BUCKET_BYTES, SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateKey, SweepBucket,
-    SweepFrontier, Transaction, TxHash, Verifiable, WeightedTimestamp, protocol_statics,
-    protocol_statics_installed,
+    Address, Block, Finalization, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites,
+    ShardId, ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction,
+    TxHash, Verifiable, WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
-use hyperscale_vm_effects::{
-    Answered, CrossingAnswer, Marked, Marker, ProtocolHasher, committed_tx_key,
-};
+use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
 use crate::tree::JmtSnapshot;
 use crate::{
@@ -573,43 +570,6 @@ pub fn committed_tx_cells<'a>(
             (
                 committed_tx_cell_key(local_shard, cell.tx, validity_end),
                 cell.to_bytes(),
-            )
-        })
-        .collect()
-}
-
-/// The decline cells a block writes for the crossings it refuses: one
-/// each, under the consuming node's target, naming the record it
-/// answers for.
-///
-/// Derived from the section and from nothing else, so every replica
-/// folds the same cells and a producer asking whether its crossing was
-/// refused names the same key from the record alone. No kernel writes
-/// one: a refused member's writes are discarded and a member that never
-/// ran writes nothing, which is the case a decline exists for.
-///
-/// The transaction is the record's own, which is the consumer's too — a
-/// crossing is an edge inside one transaction's manifest, from the node
-/// that produced the value to the node that would have taken it.
-#[must_use]
-pub fn decline_cells<'a>(
-    declines: impl IntoIterator<Item = &'a CrossingDecline>,
-) -> Vec<(SubstateKey, Vec<u8>)> {
-    declines
-        .into_iter()
-        .map(|decline| {
-            let cell = &decline.cell;
-            let answer = CrossingAnswer {
-                tx: cell.tx,
-                intent: cell.intent,
-                local: cell.local,
-                output: cell.output,
-                record: decline.record,
-                answered: Answered::Declined,
-            };
-            (
-                answer.key(&ProtocolHasher, cell.consumer_claim.owner),
-                answer.to_bytes(),
             )
         })
         .collect()

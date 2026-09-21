@@ -41,7 +41,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
-    LegPlan, ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
+    LegPlan, ManifestWalk, OwnerSet, Receipt, Refusal, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -712,6 +712,68 @@ impl Executor {
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
             // A settlement invokes no node, so nothing of it emits.
+            event_bytes: Vec::new(),
+            work: DeclaredWork::ZERO,
+            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
+        })
+    }
+
+    /// Lower a refusal: the cells it writes, declared, and nothing
+    /// read.
+    ///
+    /// [`Self::prepare_settle`]'s mirror, and shorter for the reason the
+    /// two differ: a settlement reads a record this shard holds and
+    /// decides what becomes of it, where a refusal holds no record at
+    /// all. Its every term comes in with the member — the producer's own
+    /// committed cell, carried from the bundle that proved it — so what
+    /// is left here is declaring the one cell it writes.
+    ///
+    /// What the refusal may not do is checked inside the kernel against
+    /// the committed baseline, not here: a crossing owed to its consumer
+    /// is not refusable, and one this shard has already claimed is
+    /// answered. Both are value, and both are refused where every
+    /// replica reads the same state rather than where a composer reads
+    /// its own.
+    ///
+    /// # Errors
+    ///
+    /// A refusal naming no crossing, or a declaration two of its cells
+    /// contradict.
+    fn prepare_refuse(
+        crossings: &[Refusal],
+        ctx: &TickBatchContext<'_>,
+    ) -> Result<PreparedTx, String> {
+        if crossings.is_empty() {
+            return Err("this shard has no crossing to refuse".to_string());
+        }
+        let mut declaration = Declaration::default();
+        for refusal in crossings {
+            let mut declare_here = |effect| {
+                declare(&mut declaration, effect, None).map_err(|conflict| {
+                    format!("refused cell contradicts the declaration: {conflict}")
+                })
+            };
+            declare_here(Effect {
+                target: EffectTarget::Point(refusal.site),
+                mode: Mode::Write { moves: Moves::Both },
+            })?;
+            // The claim the kernel reads to establish the crossing is
+            // unanswered. Declared because everything a member touches
+            // is, and read because a refusal writes it under no
+            // circumstances: the one cell here it looks at and leaves.
+            declare_here(Effect {
+                target: EffectTarget::Point(refusal.cell.consumer_claim),
+                mode: Mode::Read,
+            })?;
+        }
+        let trie = ctx.shard_trie.clone();
+        let local = ctx.local_shard;
+        Ok(PreparedTx {
+            job: Job::Refusals(crossings.to_vec()),
+            declaration,
+            nullifiers: Vec::new(),
+            gas_limits: Vec::new(),
+            // A refusal invokes no node, so nothing of it emits.
             event_bytes: Vec::new(),
             work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
@@ -1505,6 +1567,7 @@ impl Executor {
                 Runs::Settle { records, on, .. } => {
                     Self::prepare_settle(records, *on, ctx, snapshot)
                 }
+                Runs::Refuse { crossings, .. } => Self::prepare_refuse(crossings, ctx),
                 Runs::Shape(shape) => input
                     .transaction
                     .ok_or_else(|| "a member running a shape holds no body".to_string())

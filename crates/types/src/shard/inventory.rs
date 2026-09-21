@@ -25,10 +25,10 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
-    CrossingDecline, CrossingReoffer, Finalization, FinalizationHash, MAX_DECLINES_PER_BLOCK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
-    MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, StateClaim, Transaction, TxHash, Verifiable, WitnessSources,
+    CrossingReoffer, Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate,
+    StateClaim, Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -120,10 +120,6 @@ pub struct ElidedCertifiedBlock {
     /// built off the block for each, so a hop that dropped them would
     /// hand back a block whose header promises what it cannot serve.
     reoffers: Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>,
-    /// The crossings the block refuses, always inline: the cells they
-    /// write are the block's own creations, so a hop that dropped them
-    /// would hand back a block whose state root nothing could reproduce.
-    declines: Capped<Vec<CrossingDecline>, MAX_DECLINES_PER_BLOCK>,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
@@ -261,7 +257,6 @@ impl ElidedCertifiedBlock {
             abandonment_records: block.abandonment_records().clone(),
             state_claims: block.state_claims().clone(),
             reoffers: block.reoffers().clone(),
-            declines: block.declines().clone(),
             witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
@@ -355,7 +350,6 @@ impl ElidedCertifiedBlock {
                     abandonment_records: Arc::new(self.abandonment_records.clone()),
                     state_claims: Arc::new(self.state_claims.clone()),
                     reoffers: Arc::new(self.reoffers.clone()),
-                    declines: Arc::new(self.declines.clone()),
                     witness_sources: Arc::new(self.witness_sources.clone()),
                 }
             }
@@ -367,7 +361,6 @@ impl ElidedCertifiedBlock {
                 abandonment_records: Arc::new(self.abandonment_records.clone()),
                 state_claims: Arc::new(self.state_claims.clone()),
                 reoffers: Arc::new(self.reoffers.clone()),
-                declines: Arc::new(self.declines.clone()),
                 witness_sources: Arc::new(self.witness_sources.clone()),
             },
             (None, ElidedProvisions::Live(_)) => {
@@ -494,7 +487,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -536,7 +528,6 @@ mod tests {
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             witness_sources,
             ..
         } = create_test_block()
@@ -551,7 +542,6 @@ mod tests {
             abandonment_records,
             state_claims,
             reoffers,
-            declines,
             witness_sources,
         }
     }

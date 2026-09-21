@@ -17,17 +17,15 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, DeclineRoot, LeafRoot,
-    LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate,
-    ReofferRoot, ShardId, ShardLoad, StateClaimsRoot, TopologySnapshot, Transaction, Verifiable,
-    VoteCount,
+    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, LeafRoot, LocalTimestamp,
+    MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ReofferRoot,
+    ShardId, ShardLoad, StateClaimsRoot, TopologySnapshot, Transaction, Verifiable, VoteCount,
 };
 
 use crate::admission::{
-    Admission, DeclinesFold, DeclinesSection, FinalizationsFold, FinalizationsSection,
-    ProvisionsFold, ProvisionsSection, RecordsFold, RecordsSection, ReoffersFold, ReoffersSection,
-    StateClaimsFold, StateClaimsSection, TransactionsFold, TransactionsSection, admit_all,
-    unwrapped,
+    Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
+    RecordsFold, RecordsSection, ReoffersFold, ReoffersSection, StateClaimsFold,
+    StateClaimsSection, TransactionsFold, TransactionsSection, admit_all, unwrapped,
 };
 
 /// True if `qc.signers()` represents at least 2f+1 of the local committee's
@@ -371,8 +369,6 @@ pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<StateClaimsSection>(ctx, &mut state_claims, block.state_claims())?;
     let mut reoffers = ReoffersFold::default();
     admit_all::<ReoffersSection>(ctx, &mut reoffers, block.reoffers())?;
-    let mut declines = DeclinesFold::after(&finalizations, block.state_claims());
-    admit_all::<DeclinesSection<'_>>(ctx, &mut declines, block.declines())?;
     Ok(transactions.budget)
 }
 
@@ -404,13 +400,6 @@ pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
     if computed != claimed {
         return Err(format!(
             "re-offer root {claimed:?} does not commit the block's offers {computed:?}"
-        ));
-    }
-    let computed = DeclineRoot::over(block.declines());
-    let claimed = block.header().decline_root();
-    if computed != claimed {
-        return Err(format!(
-            "decline root {claimed:?} does not commit the block's refusals {computed:?}"
         ));
     }
     Ok(())
@@ -500,27 +489,22 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::Capped;
-    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_undecided_finalization, stub_abort_charge,
         test_principal,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
-        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, CrossingDecline,
-        Deadline, DeclineRoot, ExecutionOutcome, Finalization, Hash, Inclusion, LocalKey,
-        MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition, PriceTable,
-        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, Round,
-        RoutePrefix, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
-        StateRoot, SubstateKey, TimestampRange, Transaction, TransactionDecision, TxHash,
-        TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
-        WeightedTimestamp, WitnessSources, test_utils,
+        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline,
+        ExecutionOutcome, Finalization, Hash, Inclusion, LocalKey, MAX_INTENTS,
+        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
+        ProvisionEntry, Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad,
+        Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
+        TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
+        WitnessSources, test_utils,
     };
-    use hyperscale_vm_effects::{
-        CrossingCell, Hash32, ProtocolHasher, Terms, crossing_claim_key, escrow_record_key,
-    };
-    use hyperscale_vm_types::{CROSSING_GRACE_MS, IntentHash, ResourceAddr};
 
     use super::*;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
@@ -1034,7 +1018,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -1053,7 +1036,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -1144,7 +1126,6 @@ mod tests {
             ),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1170,7 +1151,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1229,114 +1209,6 @@ mod tests {
         let err = held(empty.clone(), StateClaimsRoot::over(&empty))
             .expect_err("a bundle naming no key is refused");
         assert!(err.contains("empty"), "{err}");
-    }
-
-    /// A block carrying `declines` under a header claiming their root,
-    /// beside the `state_claims` that pin them.
-    fn block_with_declines(declines: Vec<CrossingDecline>, state_claims: Vec<StateClaim>) -> Block {
-        let base = header_at_height(BlockHeight::new(6), 100_000);
-        Block::Live {
-            header: BlockHeader::new(BlockHeaderParts {
-                height: base.height(),
-                parent_block_hash: base.parent_block_hash(),
-                parent_qc: base.parent_qc().clone().into(),
-                proposer: base.proposer(),
-                timestamp: base.timestamp(),
-                round: base.round(),
-                provision_tx_roots: Capped::default(),
-                state_claims_root: StateClaimsRoot::over(&state_claims),
-                decline_root: DeclineRoot::over(&declines),
-                ..Default::default()
-            }),
-            transactions: Arc::new(Capped::empty()),
-            certificates: Arc::new(Capped::empty()),
-            provisions: Arc::new(Capped::empty()),
-            abandonment_records: Arc::new(Capped::empty()),
-            state_claims: Arc::new(
-                Capped::new(state_claims).expect("a list written out in a test"),
-            ),
-            reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::new(declines).expect("a list written out in a test")),
-            witness_sources: Arc::new(WitnessSources::empty()),
-        }
-    }
-
-    /// A voter runs the decline section, and the record proof is what it
-    /// runs it against.
-    ///
-    /// The whole of a refusal's rule is content — every replica at one
-    /// frontier reads the same folds — so a block carrying one that no
-    /// claim of its own pins is refused here, on the voter's walk, and
-    /// not left to the proposer's own courtesy. A section admitted
-    /// nowhere in [`admit_sections`] would pass this file unread, which
-    /// is why the pinned case is a whole block rather than the rule.
-    #[test]
-    fn a_voter_refuses_a_decline_its_block_proves_no_record_for() {
-        let owner = Address::new([0xA0; 31], AddressClass::Component);
-        let consumer = Address::new([0xC0; 31], AddressClass::Component);
-        let intent = IntentHash(Hash32([0xB0; 32]));
-        let validity_end = 60_000;
-        let cell = CrossingCell {
-            resource: ResourceAddr::new([0xE1; 31]),
-            amount: 1_000,
-            intent,
-            local: 0,
-            output: 0,
-            expiry_ms: validity_end + CROSSING_GRACE_MS,
-            tx: TxHash::from(Hash::from_bytes(b"crossing")),
-            consumer_claim: crossing_claim_key(&ProtocolHasher, consumer, intent, 0, 0),
-            terms: Terms::Escrowed {
-                credit: escrow_record_key(&ProtocolHasher, owner, intent, 0, 1),
-            },
-        };
-        let record = escrow_record_key(&ProtocolHasher, owner, intent, 0, 0);
-        let decline = CrossingDecline::new(record, cell);
-        let claim_of = |inclusion| {
-            StateClaim::new(
-                Anchor {
-                    shard: ShardId::ROOT,
-                    height: BlockHeight::new(3),
-                    state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
-                    ts: WeightedTimestamp::from_millis(3_000),
-                },
-                [(record, inclusion)],
-            )
-        };
-
-        let mut against = plain();
-        against.anchor = Deadline::from_expiry(cell.expiry_ms).at();
-        let held = |claims: Vec<StateClaim>| {
-            let block = block_with_declines(vec![decline.clone()], claims);
-            validate_roots_commit_sections(&block).and_then(|()| admit(&against, &block))
-        };
-
-        let err = held(Vec::new()).expect_err("a block pinning nothing licenses no refusal");
-        assert!(
-            err.contains("no claim the block carries reads present"),
-            "{err}"
-        );
-
-        let err = held(vec![claim_of(Inclusion::Absent)])
-            .expect_err("a record read absent is the producer having disposed already");
-        assert!(
-            err.contains("no claim the block carries reads present"),
-            "{err}"
-        );
-
-        let err = held(vec![claim_of(Inclusion::Present([0xAB; 32]))])
-            .expect_err("a presence of other bytes is some other cell at that key");
-        assert!(
-            err.contains("not the bytes the block's claim reads there"),
-            "{err}"
-        );
-
-        assert!(
-            held(vec![claim_of(Inclusion::Present(jmt_value_hash(
-                &cell.to_bytes()
-            )))])
-            .is_ok(),
-            "the record's own committed bytes are what the rest of the rule is read off",
-        );
     }
 
     /// The figures of a name reaching one route under each departed
@@ -1682,7 +1554,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -1833,7 +1704,6 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::from_array([AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
@@ -1925,7 +1795,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -2043,7 +1912,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -2299,7 +2167,6 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
-            declines: Arc::new(Capped::empty()),
         }
     }
 

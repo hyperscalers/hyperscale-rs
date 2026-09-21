@@ -324,21 +324,6 @@ pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
 /// [`MAX_CROSSINGS_PER_TX`](hyperscale_vm_types::MAX_CROSSINGS_PER_TX).
 pub const MAX_REOFFERS_PER_BLOCK: usize = 64;
 
-/// Hard cap on the crossing declines a block can carry.
-///
-/// One decline refuses one crossing, and a crossing is refused once —
-/// the cell the block writes is what stops a second, so the section
-/// drains rather than repeating. What fills it is a producer's re-offers
-/// arriving faster than this shard can answer them, which is the same
-/// rate [`MAX_REOFFERS_PER_BLOCK`] bounds from the other end, so the two
-/// are the one figure. The remainder waits a block: a crossing this
-/// block does not decline is one the producer offers again.
-///
-/// Sized against that rather than against the frame, which the byte
-/// assertion below is what holds: a decline carries a whole record cell,
-/// so it is the widest per-item entry of any section here.
-pub const MAX_DECLINES_PER_BLOCK: usize = 64;
-
 /// Byte budget the abandonment records of one block share.
 ///
 /// The one section a block carries verbatim whose per-item cost varies:
@@ -389,10 +374,6 @@ const REOFFER_BYTES: usize = 64;
 /// Bytes one record cell of a re-offer costs.
 const REOFFER_RECORD_BYTES: usize = 50;
 
-/// Bytes one [`CrossingDecline`](crate::CrossingDecline) costs: the
-/// record cell it names and the whole of what that cell holds.
-const DECLINE_BYTES: usize = 384;
-
 /// Bytes a hash-only entry of a manifest costs.
 const HASH_BYTES: usize = 32;
 
@@ -414,8 +395,7 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
     + MAX_PROPOSAL_EVIDENCE_BYTES
     + MAX_STATE_CLAIMS_PER_BLOCK
         * (STATE_CLAIM_BYTES + MAX_PROOFS_PER_QUERY * STATE_CLAIM_CELL_BYTES)
-    + MAX_REOFFERS_PER_BLOCK * (REOFFER_BYTES + MAX_CROSSINGS_PER_TX * REOFFER_RECORD_BYTES)
-    + MAX_DECLINES_PER_BLOCK * DECLINE_BYTES;
+    + MAX_REOFFERS_PER_BLOCK * (REOFFER_BYTES + MAX_CROSSINGS_PER_TX * REOFFER_RECORD_BYTES);
 
 /// INV-WIRE-1: a proposal every section of which is at its cap still
 /// fits the frame that carries it. The transports drop an oversize

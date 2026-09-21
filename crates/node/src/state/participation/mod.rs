@@ -161,7 +161,6 @@ impl ShardParticipation {
             Arc::clone(shard_coordinator.proven_anchors()),
             Arc::clone(shard_coordinator.proven_cells()),
             Arc::clone(shard_coordinator.mirror()),
-            Arc::clone(shard_coordinator.answers()),
         );
         let committed_provisions = Arc::clone(shard_coordinator.committed_provisions());
         // The shard's committed-provision window, shared rather than

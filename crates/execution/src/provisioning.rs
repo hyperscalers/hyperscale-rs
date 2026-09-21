@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Member, Side};
+#[cfg(test)]
+use hyperscale_hbor::Bytes;
 use hyperscale_storage::is_record_cell;
 use hyperscale_types::{
     Deadline, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
@@ -241,10 +243,13 @@ pub struct Arrival {
     /// The record cell itself, as the producer committed it.
     ///
     /// Carried whole rather than reduced to the terms each reader wants,
-    /// because one of them wants all of it: a decline is composed from
-    /// the cell and carries it into the block, where the producer's own
-    /// value hash is what a voter holds it to. The deadline and the
-    /// transaction the other readers ask for are the cell's own.
+    /// because one of them wants all of it: a refusal is composed from
+    /// the cell and carries it into the member that writes the decline,
+    /// where the producer's own bytes are what the kernel reads its
+    /// terms off. The deadline and the transaction the other readers ask
+    /// for are the cell's own — and they are the producer's bytes for
+    /// the same reason, proven against its committed state root by the
+    /// bundle that carried them.
     pub(crate) cell: CrossingCell,
 }
 
@@ -472,6 +477,30 @@ impl ProvisioningTracker {
         key: SubstateKey,
     ) -> Option<&[u8]> {
         self.absorbed.get(&tx_hash)?.get(&source)?.present(key)
+    }
+
+    /// Hand this shard a crossing, as a committed bundle would.
+    ///
+    /// The absorption itself is
+    /// [`absorb_provisions`](Self::absorb_provisions)' and tested there;
+    /// this is for the readers of what it leaves, which are a question
+    /// of their own.
+    #[cfg(test)]
+    pub(crate) fn handed(
+        &mut self,
+        record: SubstateKey,
+        cell: CrossingCell,
+        at: WeightedTimestamp,
+    ) {
+        let entry = SubstateEntry {
+            key: record,
+            value: Some(Bytes::new(cell.to_bytes()).expect("a crossing cell is small")),
+        };
+        self.absorbed.entry(cell.tx).or_default().insert(
+            ShardId::ROOT,
+            Absorbed::new(at, SourceAnchor { clock: at }, &[entry]),
+        );
+        self.arrived.insert(record, Arrival { cell });
     }
 
     /// Every crossing a committed bundle has handed this shard, by the

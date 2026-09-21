@@ -11,14 +11,11 @@
 use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass, Anchor,
-    BlockHeight, CommittedAt, CrossingDecline, Deadline, Hash, Inclusion, LocalKey,
-    MAX_ARTIFACT_BYTES, MAX_ENVELOPE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_UNSETTLED_PER_BLOCK,
-    ROUTE_PREFIX_BYTES, RoutePrefix, SchemeId, ShardId, StateClaim, StateRoot, SubstateKey,
-    TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp,
-    evidence_admits_block,
+    BlockHeight, CommittedAt, Deadline, Hash, Inclusion, LocalKey, MAX_ARTIFACT_BYTES,
+    MAX_ENVELOPE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_UNSETTLED_PER_BLOCK, ROUTE_PREFIX_BYTES,
+    RoutePrefix, SchemeId, ShardId, StateClaim, StateRoot, SubstateKey, TransactionEnvelope,
+    TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp, evidence_admits_block,
 };
-use hyperscale_vm_effects::{CrossingCell, Hash32, Terms};
-use hyperscale_vm_types::{IntentHash, ResourceAddr};
 
 /// The widest envelope the caps admit: an artifact at its ceiling,
 /// every signature it may bind at the widest registered scheme, a
@@ -204,39 +201,6 @@ fn a_claims_cells_encode_under_the_figure_the_frame_is_budgeted_at() {
             CLAIM_BYTES + cells * CELL_BYTES,
         );
     }
-}
-
-/// A decline encodes under the figure the frame is budgeted at.
-///
-/// It carries a whole record cell, which makes it the widest per-item
-/// entry of any section the frame prices — so it is the one whose figure
-/// a change to the cell would silently move.
-#[test]
-fn a_declines_record_cell_encodes_under_the_figure_the_frame_is_budgeted_at() {
-    /// The figure `limits.rs` prices a decline at.
-    const DECLINE_BYTES: usize = 384;
-
-    let widest = CrossingDecline::new(
-        key(0xFF),
-        CrossingCell {
-            resource: ResourceAddr::new([0xFF; 31]),
-            amount: u128::MAX,
-            intent: IntentHash(Hash32([0xFF; 32])),
-            local: u32::MAX,
-            output: u32::MAX,
-            expiry_ms: u64::MAX,
-            tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
-            consumer_claim: key(0xFE),
-            // The wider arm: an owed record names no cell to credit.
-            terms: Terms::Escrowed { credit: key(0xFD) },
-        },
-    );
-    let encoded = hbor_to_vec(&widest).expect("a decline encodes");
-    assert!(
-        encoded.len() <= DECLINE_BYTES,
-        "a decline encodes to {} bytes, over the {DECLINE_BYTES} the frame budgets it at",
-        encoded.len(),
-    );
 }
 
 /// The budget is what bounds the section, not the name count: the names
