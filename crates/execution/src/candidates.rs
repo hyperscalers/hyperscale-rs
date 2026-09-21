@@ -375,6 +375,11 @@ impl TickCandidates {
         self.candidates.contains_key(&tx_hash)
     }
 
+    /// Every transaction still waiting for a tick, in hash order.
+    pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
+        self.candidates.keys().copied()
+    }
+
     /// Drop every candidate. Called when the local chain terminates: a
     /// tick is a block's, and a terminated chain commits no further block.
     pub fn clear(&mut self) {

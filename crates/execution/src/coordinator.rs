@@ -57,15 +57,15 @@ use hyperscale_metrics::{
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
-    CommittedAt, ConsensusPublicKey, CounterpartMirror, CrossingReoffer, Deadline, DeclaredKey,
-    Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey,
-    TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
-    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    Window, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
-    tick_leader_at,
+    CommittedAt, ConsensusPublicKey, CounterpartMirror, CrossingAnswers, CrossingDecline,
+    CrossingReoffer, Deadline, DeclaredKey, Derivation, ExecutionCertificate,
+    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
+    FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, MerkleInclusionProof, Mode,
+    Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions, SettledSetVerdict, SettledTxSet,
+    ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window, WindowView,
+    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::Terms;
 use tracing::instrument;
@@ -534,6 +534,7 @@ impl ExecutionCoordinator {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
+            Arc::new(CrossingAnswers::new()),
         )
     }
 
@@ -570,6 +571,7 @@ impl ExecutionCoordinator {
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
         mirror: Arc<CounterpartMirror>,
+        answers: Arc<CrossingAnswers>,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
         // replay carries the frontier up to the tip rather than starting
@@ -600,6 +602,7 @@ impl ExecutionCoordinator {
                 proven_anchors,
                 proven_cells,
                 mirror,
+                answers,
                 &recovered.crossing_leaves,
             ),
             finalized,
@@ -2716,7 +2719,70 @@ impl ExecutionCoordinator {
     pub fn offers(&mut self, topology_schedule: &TopologySchedule) -> Offers {
         let trie = self.counterpart_trie(topology_schedule);
         let now = self.committed_ts;
-        self.counterparts.offers(trie, now)
+        let declines = self.declines();
+        self.counterparts.offers(trie, now, declines)
+    }
+
+    /// The crossings this shard could refuse, each carrying the record
+    /// cell its producer committed.
+    ///
+    /// The candidates and not the verdict. Whether a crossing may be
+    /// refused is
+    /// [`DeclinesSection`](../../hyperscale_shard/admission/struct.DeclinesSection.html)'s
+    /// one rule, which the proposer's selection and every voter's walk
+    /// both run — so it is stated there and nowhere else. What is here
+    /// is the only thing that rule cannot reach: the set of crossings
+    /// this shard was ever handed.
+    ///
+    /// The arrivals are that set, and nothing narrower would do. A
+    /// consumer holds no leaf for a crossing it has not answered — that
+    /// is the whole asymmetry of this direction — and no entry either,
+    /// for exactly the crossing a decline exists for: one whose member
+    /// this shard never composed.
+    fn declines(&self) -> Vec<CrossingDecline> {
+        self.provisioning
+            .arrived()
+            .iter()
+            .map(|(record, arrival)| CrossingDecline::new(*record, arrival.cell))
+            .collect()
+    }
+
+    /// Whether a tick or a candidate of this shard still holds a member
+    /// for `tx_hash`, so an execution that would write a claim may yet
+    /// run.
+    ///
+    /// The pair [`admit_retirements`](Self::admit_retirements) already
+    /// reads for the same question, and for the same reason: the ledger
+    /// is a fold over committed blocks, a tick is released on committed
+    /// content, and the candidate set follows both, so every replica at
+    /// one frontier answers alike.
+    #[must_use]
+    pub fn holds_member_for(&self, tx_hash: TxHash) -> bool {
+        self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash)
+    }
+
+    /// Publish the transactions a tick or a candidate here still holds a
+    /// member for, where a block's declines are admitted against them.
+    ///
+    /// Rewritten whole at each commit rather than edited at each of the
+    /// several sites that move a member, and affordable because the set
+    /// is bounded by what the chain has in flight. The answering half of
+    /// the same mirror is edited where it changes, because that one is
+    /// not.
+    pub fn publish_held_members(&self) {
+        self.counterparts
+            .answers
+            .hold_members_for(self.held_member_txs());
+    }
+
+    /// The transactions a tick or a candidate here still holds a member
+    /// for.
+    fn held_member_txs(&self) -> BTreeSet<TxHash> {
+        self.ticks
+            .ticks_iter()
+            .flat_map(|(_, tick)| tick.tx_hashes().to_vec())
+            .chain(self.candidates.tx_hashes())
+            .collect()
     }
 
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
@@ -7275,6 +7341,7 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
+            Arc::new(CrossingAnswers::new()),
         );
 
         // The first post-restart commit extends the tip and dates itself
@@ -7930,6 +7997,7 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
+            Arc::new(CrossingAnswers::new()),
         );
 
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -7985,6 +8053,7 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
+            Arc::new(CrossingAnswers::new()),
         );
 
         let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -8060,6 +8129,7 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
+            Arc::new(CrossingAnswers::new()),
         );
 
         let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -8135,6 +8205,7 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
+            Arc::new(CrossingAnswers::new()),
         );
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
 
@@ -8211,6 +8282,7 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
+            Arc::new(CrossingAnswers::new()),
         );
         assert!(
             restarted.candidates.is_empty(),
@@ -8798,6 +8870,7 @@ mod tests {
             abandonment_records,
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -8840,6 +8913,7 @@ mod tests {
             abandonment_records,
             state_claims,
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -8922,6 +8996,7 @@ mod tests {
             ),
             state_claims,
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))

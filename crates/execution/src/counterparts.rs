@@ -22,12 +22,12 @@ use hyperscale_metrics::{
 use hyperscale_storage::{CrossingLeaves, is_crossing_answer_cell, is_record_cell};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
-    CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_FINALIZATION_DELAY,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_REOFFERS_PER_BLOCK,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, ProvenAnchors,
-    ProvenCells, SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey,
-    TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx,
-    Verifiable, Verified, WeightedTimestamp, Window,
+    CrossingAnswers, CrossingDecline, CrossingReoffer, Deadline, ExecutionCertificate, Inclusion,
+    MAX_FINALIZATION_DELAY, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
+    MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MerkleInclusionProof, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie, Spoken,
+    StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
+    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{CrossingAnswer, CrossingCell};
 
@@ -301,6 +301,9 @@ pub struct Offers {
     /// The crossings its ledger says are still owed a claim, each
     /// promised to the shard holding that claim's prefix now.
     pub reoffers: Vec<CrossingReoffer>,
+    /// The crossings this shard could refuse, each carrying the record
+    /// cell its producer committed.
+    pub declines: Vec<CrossingDecline>,
 }
 
 pub struct Counterparts {
@@ -379,6 +382,16 @@ pub struct Counterparts {
     /// either there is no entry to name it — and the leaf carries the one
     /// term the question needs, the record it answers for.
     pub(crate) answered: BTreeMap<SubstateKey, AnsweredCrossing>,
+
+    /// The records this shard holds an answer for, shared with the
+    /// admission that judges a block's declines: a crossing already
+    /// answered is one no refusal of may be composed.
+    ///
+    /// Written here, beside the map it mirrors, so the two cannot come
+    /// apart. The other half of the same mirror — the transactions a
+    /// tick or a candidate still holds a member for — is the
+    /// coordinator's, which is where those live.
+    pub(crate) answers: Arc<CrossingAnswers>,
     /// The producer header each crossing handed to this shard has been
     /// asked about at, by the record cell a bundle carried.
     ///
@@ -422,9 +435,17 @@ impl Counterparts {
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
         mirror: Arc<CounterpartMirror>,
+        answers: Arc<CrossingAnswers>,
         leaves: &CrossingLeaves,
     ) -> Self {
+        answers.seed_answered(
+            leaves
+                .claims
+                .iter()
+                .filter_map(|(_, value)| Some(CrossingAnswer::from_bytes(value)?.record)),
+        );
         Self {
+            answers,
             ledger: Ledger::new(local_shard),
             mirror,
             proven_anchors,
@@ -551,11 +572,17 @@ impl Counterparts {
 
     /// What this validator holds to offer in a block it proposes.
     #[must_use]
-    pub(crate) fn offers(&mut self, trie: &ShardTrie, now: WeightedTimestamp) -> Offers {
+    pub(crate) fn offers(
+        &mut self,
+        trie: &ShardTrie,
+        now: WeightedTimestamp,
+        declines: Vec<CrossingDecline>,
+    ) -> Offers {
         Offers {
             state_claims: self.state_claims(),
             abandonment_records: self.abandonment_records(),
             reoffers: self.reoffers(trie, now),
+            declines,
         }
     }
 
@@ -832,7 +859,7 @@ impl Counterparts {
     ) {
         self.arrivals.retain(|key, _| arrived.contains_key(key));
         for (&record, arrival) in arrived {
-            if now < arrival.deadline.validity_end() || answered_for(&self.answered, record) {
+            if now < arrival.deadline().validity_end() || answered_for(&self.answered, record) {
                 continue;
             }
             let shard = trie.shard_for_prefix(record.owner);
@@ -1210,13 +1237,16 @@ impl Counterparts {
                     match value {
                         Some(bytes) if is_crossing_answer_cell(*key, bytes) => {
                             if let Some(claim) = CrossingAnswer::from_bytes(bytes) {
+                                self.answers.answered(claim.record);
                                 self.answered
                                     .entry(*key)
                                     .or_insert_with(|| AnsweredCrossing::of(&claim));
                             }
                         }
                         None => {
-                            self.answered.remove(key);
+                            if let Some(gone) = self.answered.remove(key) {
+                                self.answers.unanswered(&gone.record);
+                            }
                         }
                         Some(_) => {}
                     }
@@ -1612,6 +1642,7 @@ mod tests {
             Arc::clone(&anchors),
             Arc::new(ProvenCells::default()),
             Arc::new(CounterpartMirror::default()),
+            Arc::new(CrossingAnswers::new()),
             &CrossingLeaves::default(),
         );
         counterparts.answered.insert(
@@ -1827,6 +1858,7 @@ mod tests {
             Arc::clone(&anchors),
             Arc::new(ProvenCells::default()),
             Arc::new(CounterpartMirror::default()),
+            Arc::new(CrossingAnswers::new()),
             &CrossingLeaves::default(),
         );
         for seed in 0..count {

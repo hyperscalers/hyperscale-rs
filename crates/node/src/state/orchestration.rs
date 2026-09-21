@@ -149,6 +149,12 @@ impl NodeStateMachine {
         s.shard_coordinator
             .set_owed_determined(s.execution_coordinator.owed_determined_ticks());
 
+        // The same seam for the other fold a block's content is judged
+        // against: which transactions this shard still holds a member
+        // for, which is what says a crossing's claim may yet be coming
+        // and so that no decline of it is composable.
+        s.execution_coordinator.publish_held_members();
+
         s.shard_coordinator.queue_ready_proposal();
 
         // The fork-proof dedup fence clears once the attested recovery for

@@ -25,13 +25,15 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, BlockHeight, CrossingReoffer, DeclaredWork, Finalization,
-    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    ProvisionHash, Provisions, ShardId, StateClaim, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, Verifiable, WeightedTimestamp, budget_admits_block,
-    caps_admit_transaction, evidence_admits_block, sweep_admits_block,
+    AbandonmentRecord, BlockHash, BlockHeight, CrossingAnswers, CrossingDecline, CrossingReoffer,
+    Deadline, DeclaredWork, Finalization, FinalizationHash, MAX_DECLINES_PER_BLOCK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_REOFFERS_PER_BLOCK,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
+    Provisions, ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    Verifiable, WeightedTimestamp, budget_admits_block, caps_admit_transaction,
+    evidence_admits_block, sweep_admits_block,
 };
+use hyperscale_vm_effects::Terms;
 
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
@@ -135,6 +137,12 @@ pub(crate) struct Admission<'a> {
     /// tick holds it in no set and enforces nothing, so the rule refuses
     /// only what a composing quorum would refuse anyway.
     pub(crate) owed_determined: &'a BTreeSet<BlockHeight>,
+    /// What this shard has answered about the crossings handed to it,
+    /// and what it might still answer — the two folds a decline is
+    /// judged against. Shared with the execution coordinator that writes
+    /// them, so a proposer composes a refusal against the same pair its
+    /// voters read.
+    pub(crate) answers: &'a CrossingAnswers,
 }
 
 /// One section of a block, and the rule that admits an item to it.
@@ -838,6 +846,216 @@ impl Section for ReoffersSection {
     }
 }
 
+/// The block's crossing declines, admitted after the finalizations whose
+/// writes they must not contradict.
+pub(crate) struct DeclinesSection<'f>(PhantomData<&'f FinalizationsFold>);
+
+/// What the declines admitted so far amount to, beside the
+/// finalizations admitted before them.
+#[derive(Debug)]
+pub(crate) struct DeclinesFold<'a> {
+    /// The finalizations the block carries, whose writes may hold the
+    /// very claim a decline says is absent.
+    pub(crate) finalizations: &'a FinalizationsFold,
+    /// The last admitted decline, which the next must follow.
+    pub(crate) previous: Option<CrossingDecline>,
+    /// How many have been admitted, against the block's cap.
+    pub(crate) count: usize,
+}
+
+impl<'a> DeclinesFold<'a> {
+    /// A fold after the block's `finalizations`.
+    #[must_use]
+    pub(crate) const fn after(finalizations: &'a FinalizationsFold) -> Self {
+        Self {
+            finalizations,
+            previous: None,
+            count: 0,
+        }
+    }
+}
+
+impl DeclinesSection<'_> {
+    /// Whether the crossing is one its consumer may refuse at all.
+    ///
+    /// A consumer may decline exactly where its verdict is final. A core
+    /// bears the transaction's verdict, so its refusal is the last word
+    /// and the value goes back to the cell the record names; a delivery
+    /// bears none, and the crossing behind a failed one is still its
+    /// consumer's for a later attempt. Both arms lose value if they are
+    /// wrong, which is why the rule reads the record's own terms rather
+    /// than anything about the shape that reached this shard.
+    ///
+    /// # Errors
+    ///
+    /// Why the crossing may not be refused.
+    fn verdict_is_final(decline: &CrossingDecline) -> Result<(), String> {
+        if !matches!(decline.cell.terms, Terms::Escrowed { .. }) {
+            return Err(format!(
+                "crossing decline names {:?}, a crossing owed to its consumer, which no refusal \
+                 takes back",
+                decline.record
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this shard has left the crossing unanswered — in the
+    /// chain behind the block, and in the block itself.
+    ///
+    /// A claim present means a member ran and took the value, so the
+    /// record is a retirement's and a refusal beside it would license a
+    /// retirement and a reclaim of one value. The block's own
+    /// finalizations are read as well as the chain behind it, because a
+    /// block may carry the finalization that writes the claim and, if
+    /// only the parent frontier were read, a refusal of the same
+    /// crossing — both cells, in one block. The same reading
+    /// [`RecordsSection::name_stands`] takes of a name the block itself
+    /// resolves.
+    ///
+    /// # Errors
+    ///
+    /// That this shard has already answered the crossing.
+    fn nobody_answered(
+        ctx: &Admission<'_>,
+        fold: &DeclinesFold<'_>,
+        decline: &CrossingDecline,
+    ) -> Result<(), String> {
+        if ctx.answers.holds_answer(&decline.record) {
+            return Err(format!(
+                "crossing decline names {:?}, which this shard has already answered",
+                decline.record
+            ));
+        }
+        if fold.finalizations.resolved_here.contains(&decline.cell.tx) {
+            return Err(format!(
+                "crossing decline names {:?}, whose transaction the same block resolves",
+                decline.record
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the transaction's deadline has passed at the block's own
+    /// anchor.
+    ///
+    /// The deadline and not the validity end. A claim is written at a
+    /// member's coverage rather than at its admission, so a core
+    /// admitted a millisecond before its window closed has a whole
+    /// [`MAX_FINALIZATION_DELAY`](hyperscale_types::MAX_FINALIZATION_DELAY)
+    /// to finalize and write one — and a rule keyed on the validity end
+    /// would refuse a crossing whose claim was still coming, on the
+    /// healthy path of a core that simply committed late in its window.
+    /// What the deadline is, is the instant past which nothing can be
+    /// *included* anywhere.
+    ///
+    /// Read off the record's own expiry, which derives from the
+    /// producing intent's window where the transaction's derives from
+    /// the intersection of its members'. So the leaf's deadline is never
+    /// earlier than the transaction's, and the error is in the direction
+    /// of waiting longer.
+    ///
+    /// # Errors
+    ///
+    /// That the deadline has not passed.
+    fn deadline_has_passed(ctx: &Admission<'_>, decline: &CrossingDecline) -> Result<(), String> {
+        let deadline = Deadline::from_expiry(decline.cell.expiry_ms);
+        if !deadline.passed(ctx.anchor) {
+            return Err(format!(
+                "crossing decline names {:?}, whose deadline {:?} the block's anchor {:?} has not \
+                 passed",
+                decline.record, deadline, ctx.anchor,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether nothing here still holds a member that could write the
+    /// claim.
+    ///
+    /// The deadline does not bound this, and that is the whole of why it
+    /// is its own conjunct: the deadline fence on finalizations refuses
+    /// only what decides alone, so a core member with a sibling settles
+    /// on the sibling's clock however late. While a tick or a candidate
+    /// holds one, a claim may still be coming; once neither does, none
+    /// ever can, because a member composed past the deadline runs
+    /// nothing and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// That a member of the transaction is still held here.
+    fn nothing_here_still_runs(
+        ctx: &Admission<'_>,
+        decline: &CrossingDecline,
+    ) -> Result<(), String> {
+        if ctx.answers.holds_member_for(&decline.cell.tx) {
+            return Err(format!(
+                "crossing decline names {:?}, whose transaction a tick or a candidate here still \
+                 holds a member for",
+                decline.record
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<'f> Section for DeclinesSection<'f> {
+    type Item = CrossingDecline;
+    type Fold = DeclinesFold<'f>;
+
+    /// A well-formed decline, in its place in the section's ascending
+    /// order without repeats, within the block's cap.
+    ///
+    /// Well-formed is the whole of what is checked *here*, and the split
+    /// is the same one every section makes: the order and the cap are
+    /// facts about the block, and whether this shard may refuse the
+    /// crossing is a fact about its own state and the producer's, which
+    /// the fence checks where it checks every other claim about another
+    /// chain. What this rule does carry is the one term that is neither
+    /// — the record cell naming the edge its own key derives — because a
+    /// decline whose cell does not name its record is not a refusal of
+    /// anything and no later check would look at it again.
+    ///
+    /// The order is ascending by record, which gives uniqueness and one
+    /// encoding together: one record is one crossing, so two entries for
+    /// one record would leave which cell counts to the reader, and a
+    /// reordering would be a second form of the same block.
+    fn admit(
+        ctx: &Admission<'_>,
+        fold: &mut Self::Fold,
+        decline: &CrossingDecline,
+    ) -> Result<(), String> {
+        if !decline.names_its_record() {
+            return Err(format!(
+                "crossing decline {} carries a cell that does not name the record it refuses",
+                fold.count
+            ));
+        }
+        if fold
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.record >= decline.record)
+        {
+            return Err(format!(
+                "crossing decline {} repeats or precedes the one before it",
+                fold.count
+            ));
+        }
+        if fold.count >= MAX_DECLINES_PER_BLOCK {
+            return Err(format!(
+                "block carries more than {MAX_DECLINES_PER_BLOCK} crossing declines"
+            ));
+        }
+        Self::verdict_is_final(decline)?;
+        Self::nobody_answered(ctx, fold, decline)?;
+        Self::deadline_has_passed(ctx, decline)?;
+        Self::nothing_here_still_runs(ctx, decline)?;
+        fold.previous = Some(decline.clone());
+        fold.count += 1;
+        Ok(())
+    }
+}
+
 /// Run `S::admit` over `items` in order, refusing on the first item it
 /// refuses — the voter's walk over a section.
 ///
@@ -891,9 +1109,9 @@ pub(crate) mod fixtures {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, NetworkDefinition,
-        ShardAnchor, ShardId, StateRoot, TopologySchedule, TopologySnapshot, ValidatorSet,
-        WeightedTimestamp,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, CrossingAnswers, Epoch, Hash,
+        NetworkDefinition, ShardAnchor, ShardId, StateRoot, TopologySchedule, TopologySnapshot,
+        ValidatorSet, WeightedTimestamp,
     };
 
     use super::{Admission, QcChainSets};
@@ -912,6 +1130,7 @@ pub(crate) mod fixtures {
         pub(crate) dedup: CommitDedupIndex,
         pub(crate) parent_settled_frontier: Option<BlockHeight>,
         pub(crate) owed_determined: BTreeSet<BlockHeight>,
+        pub(crate) answers: CrossingAnswers,
     }
 
     impl Against {
@@ -934,6 +1153,7 @@ pub(crate) mod fixtures {
                 dedup: CommitDedupIndex::new(),
                 parent_settled_frontier: Some(BlockHeight::GENESIS),
                 owed_determined: BTreeSet::new(),
+                answers: CrossingAnswers::new(),
             }
         }
 
@@ -948,6 +1168,7 @@ pub(crate) mod fixtures {
                 dedup: &self.dedup,
                 parent_settled_frontier: self.parent_settled_frontier,
                 owed_determined: &self.owed_determined,
+                answers: &self.answers,
             }
         }
     }

@@ -17,9 +17,10 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, LeafRoot, LocalTimestamp,
-    MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ReofferRoot,
-    ShardId, ShardLoad, StateClaimsRoot, TopologySnapshot, Transaction, Verifiable, VoteCount,
+    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, DeclineRoot, LeafRoot,
+    LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate,
+    ReofferRoot, ShardId, ShardLoad, StateClaimsRoot, TopologySnapshot, Transaction, Verifiable,
+    VoteCount,
 };
 
 use crate::admission::{
@@ -400,6 +401,13 @@ pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
     if computed != claimed {
         return Err(format!(
             "re-offer root {claimed:?} does not commit the block's offers {computed:?}"
+        ));
+    }
+    let computed = DeclineRoot::over(block.declines());
+    let claimed = block.header().decline_root();
+    if computed != claimed {
+        return Err(format!(
+            "decline root {claimed:?} does not commit the block's refusals {computed:?}"
         ));
     }
     Ok(())
@@ -1018,6 +1026,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -1036,6 +1045,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -1126,6 +1136,7 @@ mod tests {
             ),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1151,6 +1162,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1554,6 +1566,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -1704,6 +1717,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::from_array([AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
@@ -1795,6 +1809,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -1912,6 +1927,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -2167,6 +2183,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         }
     }
 

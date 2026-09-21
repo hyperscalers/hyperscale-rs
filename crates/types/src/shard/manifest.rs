@@ -5,10 +5,10 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
-    CrossingReoffer, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, StateClaim, TxHash, Verifiable,
-    WitnessSources,
+    CrossingDecline, CrossingReoffer, FinalizationHash, MAX_DECLINES_PER_BLOCK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
+    MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    QuorumCertificate, StateClaim, TxHash, Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -37,6 +37,11 @@ pub struct BlockManifest {
     /// bundle is built off the block for each, so a block rebuilt from
     /// its manifest has to promise — and serve — exactly what it did.
     reoffers: Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>,
+    /// The crossings the block refuses, mirrored verbatim: the decline
+    /// cells it writes are derived from them, so a block rebuilt from
+    /// its manifest has to write the same cells or its state root is
+    /// another block's.
+    declines: Capped<Vec<CrossingDecline>, MAX_DECLINES_PER_BLOCK>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
@@ -55,6 +60,7 @@ impl Default for BlockManifest {
             abandonment_records: Capped::empty(),
             state_claims: Capped::empty(),
             reoffers: Capped::empty(),
+            declines: Capped::empty(),
             witness_sources: WitnessSources::empty(),
         }
     }
@@ -64,6 +70,7 @@ impl BlockManifest {
     /// Build a manifest from its parts. Per-field caps are enforced at
     /// encode and decode, not here.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // one section of the block each
     pub const fn new(
         tx_hashes: Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK>,
         cert_ids: Capped<Vec<FinalizationHash>, MAX_FINALIZED_TX_PER_BLOCK>,
@@ -71,6 +78,7 @@ impl BlockManifest {
         abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
         state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
         reoffers: Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>,
+        declines: Capped<Vec<CrossingDecline>, MAX_DECLINES_PER_BLOCK>,
         witness_sources: WitnessSources,
     ) -> Self {
         Self {
@@ -80,6 +88,7 @@ impl BlockManifest {
             abandonment_records,
             state_claims,
             reoffers,
+            declines,
             witness_sources,
         }
     }
@@ -127,6 +136,12 @@ impl BlockManifest {
         &self.reoffers
     }
 
+    /// The crossings the block refuses.
+    #[must_use]
+    pub const fn declines(&self) -> &Capped<Vec<CrossingDecline>, MAX_DECLINES_PER_BLOCK> {
+        &self.declines
+    }
+
     /// The block's beacon-witness inputs.
     #[must_use]
     pub const fn witness_sources(&self) -> &WitnessSources {
@@ -163,6 +178,7 @@ impl BlockManifest {
             block.abandonment_records().clone(),
             block.state_claims().clone(),
             block.reoffers().clone(),
+            block.declines().clone(),
             block.witness_sources().as_ref().clone(),
         )
     }

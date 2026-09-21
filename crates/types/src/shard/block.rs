@@ -12,12 +12,13 @@ use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use crate::{
-    AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CrossingReoffer, Demands,
-    Derivation, ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate,
-    ShardId, SharedWitnessSources, SplitChildRoots, StateClaim, StateRoot, Transaction, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CrossingDecline,
+    CrossingReoffer, Demands, Derivation, ExecutionOutcome, Finalization, MAX_DECLINES_PER_BLOCK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
+    MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
+    StateRoot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -78,6 +79,9 @@ pub type SharedProvisions = Arc<Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PRO
 /// Shared crossing re-offer list — same rationale as
 /// [`SharedCertificates`].
 pub type SharedReoffers = Arc<Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>>;
+
+/// The decline section as blocks carry it.
+pub type SharedDeclines = Arc<Capped<Vec<CrossingDecline>, MAX_DECLINES_PER_BLOCK>>;
 
 /// What a shard charged across the ticks `certificates` settle, in
 /// quanta.
@@ -141,6 +145,11 @@ pub enum Block {
         /// the block's `provision_tx_roots` promise past its own
         /// certificates.
         reoffers: SharedReoffers,
+        /// The crossings this block refuses: the record cell of each and
+        /// the cell its producer committed for it. Committed via the
+        /// header's `decline_root`, and what the decline cells this
+        /// block writes are derived from.
+        declines: SharedDeclines,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -177,6 +186,11 @@ pub enum Block {
         /// for as long as the crossing is owed, which outlasts the
         /// execution window by far.
         reoffers: SharedReoffers,
+        /// The crossings the block refused, retained through sealing
+        /// like the claims: the cells they wrote are the block's own
+        /// creations, so a replay of any depth re-derives them off the
+        /// block it reads.
+        declines: SharedDeclines,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -252,6 +266,7 @@ impl Block {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -280,6 +295,7 @@ impl Block {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -311,6 +327,7 @@ impl Block {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -478,6 +495,25 @@ impl Block {
         }
     }
 
+    /// The crossings the block refuses, regardless of variant — what the
+    /// decline cells it writes are derived from, and what a producer
+    /// reading one of those cells present credits its value back on.
+    #[must_use]
+    pub fn declines(&self) -> &Capped<Vec<CrossingDecline>, MAX_DECLINES_PER_BLOCK> {
+        match self {
+            Self::Live { declines, .. } | Self::Sealed { declines, .. } => declines,
+        }
+    }
+
+    /// The decline section as the shared handle a verification action
+    /// holds, so the root check owns the list without deep-cloning it.
+    #[must_use]
+    pub fn declines_shared(&self) -> SharedDeclines {
+        match self {
+            Self::Live { declines, .. } | Self::Sealed { declines, .. } => Arc::clone(declines),
+        }
+    }
+
     /// Every transaction the block's finalizations resolve without
     /// deciding: a delivery's or a leg's, checked against the lapse
     /// where the body says this shard delivers for it.
@@ -615,6 +651,7 @@ impl Block {
                 abandonment_records,
                 state_claims,
                 reoffers,
+                declines,
                 witness_sources,
             } => {
                 // One hash per body, so the list keeps the cap the
@@ -628,6 +665,7 @@ impl Block {
                     abandonment_records,
                     state_claims,
                     reoffers,
+                    declines,
                     witness_sources,
                 }
             }
@@ -653,6 +691,7 @@ impl Block {
                 abandonment_records,
                 state_claims,
                 reoffers,
+                declines,
                 witness_sources,
                 ..
             } => Self::Live {
@@ -663,6 +702,7 @@ impl Block {
                 abandonment_records,
                 state_claims,
                 reoffers,
+                declines,
                 witness_sources,
             },
             Self::Live { .. } => {

@@ -613,6 +613,7 @@ impl PendingBlock {
             block.abandonment_records().clone(),
             block.state_claims().clone(),
             block.reoffers().clone(),
+            block.declines().clone(),
             block.witness_sources().as_ref().clone(),
         );
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
@@ -817,6 +818,7 @@ impl PendingBlock {
             abandonment_records: Arc::new(self.manifest.abandonment_records().clone()),
             state_claims: Arc::new(self.manifest.state_claims().clone()),
             reoffers: Arc::new(self.manifest.reoffers().clone()),
+            declines: Arc::new(self.manifest.declines().clone()),
             witness_sources: Arc::new(self.manifest.witness_sources().clone()),
         });
 
@@ -992,6 +994,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1029,6 +1032,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1064,6 +1068,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1103,6 +1108,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1140,6 +1146,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         };
 
         let pending = PendingBlock::from_complete_block(
@@ -1170,6 +1177,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1221,6 +1229,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1234,6 +1243,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1264,6 +1274,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1278,6 +1289,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::empty(),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,

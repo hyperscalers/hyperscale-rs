@@ -416,6 +416,7 @@ impl ShardParticipation {
             inputs.abandonment_records,
             inputs.state_claims,
             inputs.reoffers,
+            inputs.declines,
         )
     }
 
@@ -808,6 +809,7 @@ mod tests {
             Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),
+            Capped::empty(),
             WitnessSources::empty(),
         );
 

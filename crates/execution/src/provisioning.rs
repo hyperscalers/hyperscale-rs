@@ -238,12 +238,30 @@ impl Absorbed {
 /// cut where the shard that sent the bundle would not.
 #[derive(Debug, Clone, Copy)]
 pub struct Arrival {
+    /// The record cell itself, as the producer committed it.
+    ///
+    /// Carried whole rather than reduced to the terms each reader wants,
+    /// because one of them wants all of it: a decline is composed from
+    /// the cell and carries it into the block, where the producer's own
+    /// value hash is what a voter holds it to. The deadline and the
+    /// transaction the other readers ask for are the cell's own.
+    pub(crate) cell: CrossingCell,
+}
+
+impl Arrival {
     /// The deadline the record states, which the validity end the
     /// licence is needed past is read back off.
-    pub(crate) deadline: Deadline,
+    #[must_use]
+    pub(crate) const fn deadline(&self) -> Deadline {
+        Deadline::from_expiry(self.cell.expiry_ms)
+    }
+
     /// The transaction the crossing belongs to, so the arrival goes when
     /// its absorption does.
-    pub(crate) tx: TxHash,
+    #[must_use]
+    pub(crate) const fn tx(&self) -> TxHash {
+        self.cell.tx
+    }
 }
 
 pub struct ProvisioningTracker {
@@ -389,13 +407,7 @@ impl ProvisioningTracker {
                 let Some(cell) = CrossingCell::from_bytes(bytes) else {
                     continue;
                 };
-                self.arrived.insert(
-                    entry.key,
-                    Arrival {
-                        deadline: Deadline::from_expiry(cell.expiry_ms),
-                        tx: tx_hash,
-                    },
-                );
+                self.arrived.insert(entry.key, Arrival { cell });
             }
             touched.push(tx_hash);
         }
@@ -429,7 +441,7 @@ impl ProvisioningTracker {
         });
         let absorbed = &self.absorbed;
         self.arrived
-            .retain(|_, arrival| absorbed.contains_key(&arrival.tx));
+            .retain(|_, arrival| absorbed.contains_key(&arrival.tx()));
         before - self.absorbed.len()
     }
 

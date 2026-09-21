@@ -414,6 +414,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
@@ -426,6 +427,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             abandonment_records,
             state_claims,
             reoffers,
+            declines,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -438,6 +440,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 abandonment_records,
                 state_claims,
                 reoffers,
+                declines,
                 witness_sources,
             }
         }
@@ -449,6 +452,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             abandonment_records,
             state_claims,
             reoffers,
+            declines,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -461,6 +465,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 abandonment_records,
                 state_claims,
                 reoffers,
+                declines,
                 witness_sources,
             }
         }
@@ -659,6 +664,7 @@ fn test_commit_block_stores_certificates() {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -674,6 +680,7 @@ fn test_commit_block_stores_certificates() {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };

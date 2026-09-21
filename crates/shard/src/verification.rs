@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_storage::committed_tx_cells;
+use hyperscale_storage::{committed_tx_cells, decline_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
@@ -29,19 +29,22 @@ use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
 use crate::proposal::late_deliveries;
 
-/// The committed cells `block` writes.
+/// The cells `block` writes of the chain's own accord.
 ///
-/// One per transaction it carries, under the block's own shard. Every
-/// reader of the block's root — the proposer's voters, a replica
-/// committing it on its certificate alone, a split child following it —
-/// derives the same set from the same two facts, and no window enters
-/// it.
+/// A committed-transaction cell per transaction it carries, under the
+/// block's own shard, and a decline cell per crossing it refuses, under
+/// the consuming node's target. Every reader of the block's root — the
+/// proposer's voters, a replica committing it on its certificate alone,
+/// a split child following it — derives the same set from the same
+/// sections, and no window enters it.
 #[must_use]
 pub fn committed_cells_for(block: &Block) -> Vec<(SubstateKey, Vec<u8>)> {
-    committed_tx_cells(
+    let mut cells = committed_tx_cells(
         block.header().shard_id(),
         block.transactions().iter().map(|tx| tx.as_unverified()),
-    )
+    );
+    cells.extend(decline_cells(block.declines().iter()));
+    cells
 }
 
 /// Lifecycle position for a verification entry. `InFlight` covers the
@@ -2243,6 +2246,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -2304,6 +2308,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -2352,6 +2357,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         }
     }
 
@@ -3066,6 +3072,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             reoffers: Arc::new(Capped::empty()),
+            declines: Arc::new(Capped::empty()),
         };
         let demands = block.demands();
         assert!(demands.contains(VerificationKind::TransactionRoot));

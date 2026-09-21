@@ -875,6 +875,7 @@ impl ShardCoordinatorSim {
             vec![],
             vec![],
             vec![],
+            vec![],
         )
     }
 
@@ -1205,6 +1206,7 @@ impl ShardCoordinatorSim {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
             ),
         }
     }
@@ -1434,6 +1436,7 @@ impl ShardCoordinatorSim {
                 abandonment_records,
                 state_claims,
                 reoffers,
+                declines,
                 provisions,
                 fee_checks: _,
                 fee_read_height: _,
@@ -1561,6 +1564,7 @@ impl ShardCoordinatorSim {
                     Capped::new(abandonment_records).expect("a list written out in a test"),
                     Capped::new(state_claims).expect("a list written out in a test"),
                     Capped::new(reoffers).expect("a list written out in a test"),
+                    Capped::new(declines).expect("a list written out in a test"),
                     parent_in_flight,
                     parent_settled_frontier,
                     parent_sweep_frontier,

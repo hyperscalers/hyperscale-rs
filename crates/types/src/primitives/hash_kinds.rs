@@ -204,6 +204,19 @@ hash_newtype!(
 );
 
 hash_newtype!(
+    /// Merkle root over the [`CrossingDecline`](crate::CrossingDecline)
+    /// refusals a block carries.
+    ///
+    /// Carried in [`BlockHeader::decline_root`](crate::BlockHeader),
+    /// because a decline moves value at the crossing's producer: the
+    /// cells this block writes for its consumers are derived from this
+    /// section, so every replica folds the same ones and a voter checks
+    /// the same entries the proposer selected.
+    pub DeclineRoot,
+    "DeclineRoot"
+);
+
+hash_newtype!(
     /// Merkle root over the transactions a shard committed within its
     /// retention window up to a terminal block.
     ///

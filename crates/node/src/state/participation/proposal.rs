@@ -10,8 +10,9 @@ use std::sync::Arc;
 use hyperscale_core::Action;
 use hyperscale_execution::Offers;
 use hyperscale_types::{
-    AbandonmentRecord, CrossingReoffer, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId,
-    StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
+    AbandonmentRecord, CrossingDecline, CrossingReoffer, Finalization, MAX_TXS_PER_BLOCK,
+    Provisions, ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -24,6 +25,7 @@ pub(in crate::state) struct ProposalInputs {
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
     pub(crate) reoffers: Vec<CrossingReoffer>,
+    pub(crate) declines: Vec<CrossingDecline>,
 }
 
 impl ShardParticipation {
@@ -58,6 +60,7 @@ impl ShardParticipation {
             state_claims,
             abandonment_records,
             reoffers,
+            declines,
         } = self.execution_coordinator.offers(sched);
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
@@ -96,6 +99,7 @@ impl ShardParticipation {
             abandonment_records,
             state_claims,
             reoffers,
+            declines,
         }
     }
 
@@ -158,6 +162,7 @@ impl ShardParticipation {
             inputs.abandonment_records,
             inputs.state_claims,
             inputs.reoffers,
+            inputs.declines,
         )
     }
 }
