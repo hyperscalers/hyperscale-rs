@@ -13,7 +13,7 @@ use hyperscale_hbor::{Bytes, Capped, from_slice};
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    stub_crossing_claim_cell, stub_record_cell, stub_sweepable_cell, test_transaction,
+    stub_crossing_answer_cell, stub_record_cell, stub_sweepable_cell, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
@@ -1603,13 +1603,13 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
     let claim = state_key(3, 3);
     commit(&SettledWrites::from_absolutes(BTreeMap::from([(
         claim,
-        Some(stub_crossing_claim_cell(11)),
+        Some(stub_crossing_answer_cell(11)),
     )])));
     assert_eq!(
         owed(shard),
         CrossingLeaves {
             records: Vec::new(),
-            claims: vec![(claim, stub_crossing_claim_cell(11))],
+            claims: vec![(claim, stub_crossing_answer_cell(11))],
         },
         "a claim is the other family the scan answers with",
     );

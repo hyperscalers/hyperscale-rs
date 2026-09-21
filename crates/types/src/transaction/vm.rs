@@ -666,16 +666,17 @@ pub trait ProtocolStatics: Send + Sync {
         false
     }
 
-    /// Whether this committed cell is a crossing claim — a consumer's
-    /// answer to a crossing it was handed.
+    /// Whether this committed cell is a crossing answer — a consumer's
+    /// claim on a crossing it was handed, or its decline of one.
     ///
     /// Judged from the bytes as [`Self::record_cell`] is, and asked for
     /// the same reason: both families sit outside every sweep, so the
     /// value re-deriving its own key is what tells a reader holding the
     /// leaf which family it belongs to. What a consumer answers this for
-    /// is the record the claim names, which is on another chain and so
-    /// is carried rather than derived.
-    fn crossing_claim_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
+    /// is the record the answer names, which is on another chain and so
+    /// is carried rather than derived; which way the answer went is the
+    /// role its own value re-derives.
+    fn crossing_answer_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
         let _ = (owner, local, value);
         false
     }

@@ -1269,8 +1269,8 @@ impl ProtocolStatics for StubVmStatics {
         value.first() == Some(&STUB_RECORD_MARKER)
     }
 
-    fn crossing_claim_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
-        value.first() == Some(&STUB_CROSSING_CLAIM_MARKER)
+    fn crossing_answer_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
+        value.first() == Some(&STUB_CROSSING_ANSWER_MARKER)
     }
 }
 
@@ -1295,12 +1295,12 @@ pub const STUB_SWEEPABLE_MARKER: u8 = 0xCD;
 /// the value is the whole of the judgement.
 pub const STUB_RECORD_MARKER: u8 = 0xEF;
 
-/// The value's first byte the stub judges a crossing claim by.
+/// The value's first byte the stub judges a crossing answer by.
 ///
 /// Beside [`STUB_RECORD_MARKER`] and on the same terms, since the two
 /// families the sweep never reaches are told apart by their values and
 /// by nothing else.
-pub const STUB_CROSSING_CLAIM_MARKER: u8 = 0xED;
+pub const STUB_CROSSING_ANSWER_MARKER: u8 = 0xED;
 
 /// A stub escrow record's value, which [`StubVmStatics`] judges a record
 /// wherever it sits.
@@ -1309,11 +1309,11 @@ pub fn stub_record_cell(body: u8) -> Vec<u8> {
     vec![STUB_RECORD_MARKER, body]
 }
 
-/// A stub crossing claim's value, which [`StubVmStatics`] judges a
-/// claim wherever it sits.
+/// A stub crossing answer's value, which [`StubVmStatics`] judges an
+/// answer wherever it sits.
 #[must_use]
-pub fn stub_crossing_claim_cell(body: u8) -> Vec<u8> {
-    vec![STUB_CROSSING_CLAIM_MARKER, body]
+pub fn stub_crossing_answer_cell(body: u8) -> Vec<u8> {
+    vec![STUB_CROSSING_ANSWER_MARKER, body]
 }
 
 /// A stub sweepable cell's value and the local key it must sit at for

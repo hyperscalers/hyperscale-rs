@@ -19,7 +19,7 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
-use hyperscale_storage::{CrossingLeaves, is_crossing_claim_cell, is_record_cell};
+use hyperscale_storage::{CrossingLeaves, is_crossing_answer_cell, is_record_cell};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_FINALIZATION_DELAY,
@@ -29,7 +29,7 @@ use hyperscale_types::{
     TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx,
     Verifiable, Verified, WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::{CrossingCell, CrossingClaim};
+use hyperscale_vm_effects::{CrossingAnswer, CrossingCell};
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 use crate::provisioning::Arrival;
@@ -210,7 +210,7 @@ pub struct AnsweredCrossing {
 impl AnsweredCrossing {
     /// The answer as the leaves give it: unasked, unanswered.
     #[must_use]
-    const fn of(claim: &CrossingClaim) -> Self {
+    const fn of(claim: &CrossingAnswer) -> Self {
         Self {
             record: claim.record,
             asked_at: None,
@@ -443,7 +443,7 @@ impl Counterparts {
                 .filter_map(|(key, value)| {
                     Some((
                         *key,
-                        AnsweredCrossing::of(&CrossingClaim::from_bytes(value)?),
+                        AnsweredCrossing::of(&CrossingAnswer::from_bytes(value)?),
                     ))
                 })
                 .collect(),
@@ -1208,8 +1208,8 @@ impl Counterparts {
                 };
                 for (key, value) in &writes.cells {
                     match value {
-                        Some(bytes) if is_crossing_claim_cell(*key, bytes) => {
-                            if let Some(claim) = CrossingClaim::from_bytes(bytes) {
+                        Some(bytes) if is_crossing_answer_cell(*key, bytes) => {
+                            if let Some(claim) = CrossingAnswer::from_bytes(bytes) {
                                 self.answered
                                     .entry(*key)
                                     .or_insert_with(|| AnsweredCrossing::of(&claim));

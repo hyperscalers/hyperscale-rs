@@ -208,6 +208,14 @@ pub enum Probed {
     /// crossing. For a core it means its certificate speaks next; for a
     /// delivery it is what lets the issuer retire the record.
     Claim,
+    /// A consumer's decline cell: present says that consumer will never
+    /// take the crossing, so the value is the producer's to credit back.
+    ///
+    /// [`Self::Claim`]'s other half, and the same shape — only a
+    /// presence answers, and its absence says nothing but that the
+    /// consumer has not spoken. The two are two keys under one owner, so
+    /// one probe asks both and one claim carries both readings.
+    Decline,
     /// The record cell of a crossing, asked of the producer's chain by a
     /// consumer that answered it: present says the producer still holds
     /// the value, so a delivery consuming it has something to run
@@ -222,7 +230,7 @@ impl Probed {
     pub(crate) const fn absence_window(self) -> Option<Window> {
         match self {
             Self::Core => Some(Window::Core),
-            Self::Claim | Self::Record => None,
+            Self::Claim | Self::Decline | Self::Record => None,
         }
     }
 
@@ -255,7 +263,7 @@ impl Probed {
     pub(crate) const fn presence_asked_from(self, deadline: Deadline) -> Option<WeightedTimestamp> {
         match self {
             Self::Core => None,
-            Self::Claim | Self::Record => Some(deadline.at()),
+            Self::Claim | Self::Decline | Self::Record => Some(deadline.at()),
         }
     }
 
@@ -313,10 +321,10 @@ impl Probed {
     /// whoever fetched it. A committed cell answers absent — the member
     /// never included the transaction, or refused and retracted the
     /// cell — and present is a member still pending, whose refusal may
-    /// yet retract it. A claim answers present — it is written by the
-    /// one execution that takes the crossing and is swept by nothing —
-    /// and its absence says only that the consumer has not answered
-    /// yet, whichever consumer it is. A record answers present —
+    /// yet retract it. A claim and a decline answer present — each is
+    /// written once by the one thing that writes it and is swept by
+    /// nothing — and either absence says only that the consumer has not
+    /// answered that way. A record answers present —
     /// it is written by the one execution that issues the crossing and
     /// is swept by nothing, so a presence read at any anchor is a
     /// presence — and its absence says only that the producer has
@@ -328,10 +336,10 @@ impl Probed {
     #[must_use]
     pub const fn read(self, inclusion: Inclusion) -> Option<Inclusion> {
         match (inclusion, self) {
-            (Inclusion::Present(_), Self::Claim | Self::Record)
+            (Inclusion::Present(_), Self::Claim | Self::Decline | Self::Record)
             | (Inclusion::Absent, Self::Core) => Some(inclusion),
             (Inclusion::Present(_), Self::Core)
-            | (Inclusion::Absent, Self::Claim | Self::Record) => None,
+            | (Inclusion::Absent, Self::Claim | Self::Decline | Self::Record) => None,
         }
     }
 }
@@ -494,30 +502,31 @@ mod tests {
         );
     }
 
-    /// A claim cell answers only by being present, whichever consumer
-    /// wrote it. A core's is absent while a sibling is still pending; a
-    /// delivery's while the delivery has not run, and the crossing
-    /// behind that one is the consumer's whenever it does. Neither
-    /// absence licenses taking a record back, at any anchor.
+    /// Both answer cells answer only by being present, whichever
+    /// consumer wrote them and at whatever anchor. A claim is absent
+    /// while the consumer has not taken the crossing; a decline while it
+    /// has not refused. Neither absence licenses taking a record back,
+    /// at any anchor — which is the whole of what this plan's two cells
+    /// are for, and the property a sweep on either would destroy.
     #[test]
-    fn a_claim_answers_only_by_being_present() {
+    fn both_answers_answer_only_by_being_present() {
         let validity_end = ms(300_000);
         let deadline = Deadline::of(validity_end);
-        for anchor in [
-            validity_end,
-            deadline.at(),
-            deadline.at().plus(MAX_VALIDITY_RANGE),
-            deadline.at().plus(CLAIM_WINDOW),
-        ] {
-            assert!(
-                !Probed::Claim.absence_answers_at(anchor, deadline),
-                "an absence at {anchor:?} says only that the consumer has not run"
-            );
+        for probed in [Probed::Claim, Probed::Decline] {
+            for anchor in [
+                validity_end,
+                deadline.at(),
+                deadline.at().plus(MAX_VALIDITY_RANGE),
+                deadline.at().plus(CLAIM_WINDOW),
+            ] {
+                assert!(
+                    !probed.absence_answers_at(anchor, deadline),
+                    "an absence of {probed:?} at {anchor:?} says only that the \
+                     consumer has not answered that way"
+                );
+            }
+            assert_eq!(probed.presence_asked_from(deadline), Some(deadline.at()));
         }
-        assert_eq!(
-            Probed::Claim.presence_asked_from(deadline),
-            Some(deadline.at())
-        );
     }
 
     /// A record's expiry names the deadline it was derived from, and the
@@ -533,8 +542,8 @@ mod tests {
         assert_eq!(entry.end.elapsed_since(entry.start), CLAIM_WINDOW);
     }
 
-    /// A committed cell answers absent and never present; a claim and a
-    /// record answer present and never absent.
+    /// A committed cell answers absent and never present; a claim, a
+    /// decline and a record answer present and never absent.
     #[test]
     fn each_cell_answers_with_the_reading_its_writer_makes_final() {
         let present = Inclusion::Present([7; 32]);
@@ -545,6 +554,8 @@ mod tests {
         );
         assert_eq!(Probed::Claim.read(present), Some(present));
         assert_eq!(Probed::Claim.read(Inclusion::Absent), None);
+        assert_eq!(Probed::Decline.read(present), Some(present));
+        assert_eq!(Probed::Decline.read(Inclusion::Absent), None);
         assert_eq!(Probed::Record.read(present), Some(present));
         assert_eq!(Probed::Record.read(Inclusion::Absent), None);
     }

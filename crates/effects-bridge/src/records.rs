@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice};
 use hyperscale_vm_effects::{
-    ChainRecords, CrossingCell, CrossingClaim, Hasher, InstanceMeta, InstanceRegistry, Issuance,
+    ChainRecords, CrossingAnswer, CrossingCell, Hasher, InstanceMeta, InstanceRegistry, Issuance,
     Marker, MetadataCache, PackageHash, PackageMetadata, ResourceMeta, Value, escrow_record_key,
     package_hash,
 };
@@ -113,16 +113,16 @@ pub(crate) fn record_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool
     key.local.0 == local
 }
 
-/// Whether a committed cell is a crossing claim — a consumer's answer to
-/// a crossing it was handed.
+/// Whether a committed cell is a crossing answer — a consumer's claim on
+/// a crossing it was handed, or its decline of one.
 ///
 /// Judged the way [`record_cell`] is, and beside it for the same reason:
 /// both families are outside every sweep's reach, so the value
 /// re-deriving its key under its own role is the only thing that tells a
 /// reader holding the leaf which one it is holding.
 #[must_use]
-pub(crate) fn crossing_claim_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
-    let Ok(claim) = hbor_from_slice::<CrossingClaim>(value) else {
+pub(crate) fn crossing_answer_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
+    let Ok(claim) = hbor_from_slice::<CrossingAnswer>(value) else {
         return false;
     };
     claim.key(&ProtocolHasher, owner).local.0 == local
@@ -1077,16 +1077,16 @@ mod tests {
 
         // What does name each is the one question a reader holding the
         // leaf can ask: which role its value re-derives its key under.
-        assert!(crossing_claim_cell(taker, local, &claim_value));
-        assert!(!crossing_claim_cell(other_owner, local, &claim_value));
-        assert!(!crossing_claim_cell(taker, elsewhere, &claim_value));
+        assert!(crossing_answer_cell(taker, local, &claim_value));
+        assert!(!crossing_answer_cell(other_owner, local, &claim_value));
+        assert!(!crossing_answer_cell(taker, elsewhere, &claim_value));
         assert!(!record_cell(taker, local, &claim_value));
         assert!(record_cell(
             producer,
             record_site.key().local.0,
             &record_value
         ));
-        assert!(!crossing_claim_cell(
+        assert!(!crossing_answer_cell(
             producer,
             record_site.key().local.0,
             &record_value
