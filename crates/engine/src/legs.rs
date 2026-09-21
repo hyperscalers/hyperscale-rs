@@ -28,8 +28,8 @@ use std::sync::Arc;
 use hyperscale_types::{
     Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction,
 };
-use hyperscale_vm_effects::{CrossingEdge as StarEdge, Star, running_at, star_at};
-use hyperscale_vm_kernel::{Crossed, Departure, Kind, LegPlan, OwnerSet, PlanFault};
+use hyperscale_vm_effects::{CrossingEdge as StarEdge, Kind, Star, running_at, star_at};
+use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
 use crate::sharding::TrieShardResolver;
@@ -512,6 +512,7 @@ impl Classified {
                         amount: arrived.amount,
                     },
                     edge.claim,
+                    edge.record.key(),
                 )?;
             } else if runs_here(edge.producer) && !runs_here(edge.consumer) {
                 plan.departs(
@@ -1072,7 +1073,7 @@ mod tests {
     fn owed_claims_name_the_consumers_of_what_a_shard_issued() {
         let legs = transfer();
         let bob = owner(0x22, true);
-        let expected = CrossingSite::claim_of(&ProtocolHasher, bob, &legs[1], 0).key();
+        let expected = CrossingSite::claim_of(&ProtocolHasher, bob, &legs[1], 0, Kind::Owed).key();
         assert_eq!(frozen(&legs).owed_claims(low()), vec![(high(), expected)]);
         assert!(
             frozen(&legs).owed_claims(high()).is_empty(),

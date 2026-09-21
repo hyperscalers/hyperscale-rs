@@ -665,6 +665,20 @@ pub trait ProtocolStatics: Send + Sync {
         let _ = (owner, local, value);
         false
     }
+
+    /// Whether this committed cell is an owed claim — a consumer's
+    /// answer to a crossing nothing takes back.
+    ///
+    /// Judged from the bytes as [`Self::record_cell`] is, and asked for
+    /// the same reason: both families sit outside every sweep, so the
+    /// value re-deriving its own key is what tells a reader holding the
+    /// leaf which family it belongs to. What a consumer answers this for
+    /// is the record the claim names, which is on another chain and so
+    /// is carried rather than derived.
+    fn owed_claim_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
+        let _ = (owner, local, value);
+        false
+    }
 }
 
 static PROTOCOL_STATICS: OnceLock<Box<dyn ProtocolStatics>> = OnceLock::new();
