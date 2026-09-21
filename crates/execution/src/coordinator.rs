@@ -1330,11 +1330,14 @@ impl ExecutionCoordinator {
                         // while the window it answers in stands.
                         Some(Licence::OwnLeaf)
                     } else if record.unclaimable() {
-                        // A departure says the chain that was to consume
-                        // this crossing can never settle what issued it,
-                        // and a claim read absent inside its window says
-                        // nobody took it. Either way the value goes
-                        // back.
+                        // The consumer's own decline read present is the
+                        // crossing's answer and is bounded by nothing: it
+                        // says the value will never be taken, so it is
+                        // the producer's to credit back. A departure says
+                        // the chain that was to consume this crossing can
+                        // never settle what issued it, and a claim read
+                        // absent inside its window says nobody took it.
+                        // Each way the value goes back.
                         Some(Licence::Unclaimed)
                     } else {
                         None
@@ -4436,7 +4439,9 @@ mod tests {
         TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet,
         Window,
     };
-    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash, Terms};
+    use hyperscale_vm_effects::{
+        CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, crossing_decline_key,
+    };
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
     use super::*;
@@ -10249,6 +10254,128 @@ mod tests {
             ),
             "the cut lands past the entry and the crossing still comes back; \
              dispatched {runs:?}",
+        );
+    }
+
+    /// What a shard holding one record dispatches once a block proves
+    /// its consumer's *decline* present, read at `read_at`.
+    ///
+    /// `owed_here` registers the issuing transaction in the ledger,
+    /// which is the shard's other way of reaching the same leaves.
+    fn declined_settlement(
+        read_at: WeightedTimestamp,
+        present: bool,
+        owed_here: bool,
+    ) -> Option<Runs> {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let expiry_ms = 400_000;
+        let (record_key, claim, cell) = held_record(0x6A, expiry_ms);
+        let decline = crossing_decline_key(
+            &ProtocolHasher,
+            claim.owner,
+            cell.intent,
+            cell.local,
+            cell.output,
+        );
+        if owed_here {
+            let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+                Verified::new_unchecked_for_test(straddling_transaction(1)),
+            ));
+            state.counterparts.ledger.register_committed(
+                test_committed(),
+                &PriceTable::GENESIS,
+                [(&transaction, &leg_classified())],
+            );
+        }
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(cell));
+
+        state.committed_ts = read_at;
+        let present_keys: Vec<SubstateKey> = if present { vec![decline] } else { Vec::new() };
+        let (bundle, _) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            5,
+            read_at,
+            &present_keys,
+            &[claim, decline],
+        );
+        let actions = commit_carrying(&mut state, &schedule, 1, read_at.as_millis(), vec![bundle]);
+        actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => {
+                requests.first().map(|request| request.runs.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// A decline read present credits the value back, and does it
+    /// before the window an absence answers in has opened.
+    ///
+    /// The instant is the whole assertion. A refusal is composable from
+    /// the deadline, and [`held_absence_answers`] does not begin until
+    /// the close of [`Window::Core`] — two validity ranges and a
+    /// finalization delay later. So a reclaim at the deadline is one no
+    /// silence could have licensed, which is what tells the consumer's
+    /// own word apart from an inference about it.
+    #[test]
+    fn a_decline_read_present_credits_back_before_any_silence_answers() {
+        let deadline = Deadline::from_expiry(400_000);
+        let at_deadline = deadline.at().plus(Duration::from_secs(1));
+        assert!(
+            at_deadline < Window::Core.of(deadline).end,
+            "the instant has to sit short of where an absence starts answering",
+        );
+
+        assert!(
+            matches!(
+                declined_settlement(at_deadline, true, false),
+                Some(Runs::Settle {
+                    on: Licence::Unclaimed,
+                    ..
+                })
+            ),
+            "the consumer's own refusal is the licence, and it needs no clock",
+        );
+        assert!(
+            declined_settlement(at_deadline, false, false).is_none(),
+            "and its absence licenses nothing: a consumer that has not refused \
+             may still take the crossing",
+        );
+    }
+
+    /// A decline reaches the leaf's disposal and not the entry's, so a
+    /// record an entry here still owns waits on the entry's own clock.
+    ///
+    /// Both paths compose from the same leaves, so the leaf stands down
+    /// while an entry stands — and the entry is decided by a core's
+    /// committed cell read absent inside [`Window::Core`], which is the
+    /// reading this plan family is removing. So the refusal is the
+    /// faster road only where no entry is asking, which is every record
+    /// older than what this chain replays: the halted consumer that
+    /// returns hours later, the seat that came up after the commit, the
+    /// split successor whose ledger begins empty.
+    ///
+    /// Pinned rather than left implicit, because "the decline licenses
+    /// the reclaim" reads as covering both and does not — and what
+    /// makes it cover both is collapsing the two settlers into one,
+    /// which is its own change with its own agreement test.
+    #[test]
+    fn a_decline_does_not_reach_a_record_an_entry_here_still_owns() {
+        let at_deadline = Deadline::from_expiry(400_000)
+            .at()
+            .plus(Duration::from_secs(1));
+        assert!(
+            declined_settlement(at_deadline, true, true).is_none(),
+            "an entry here settles its own records, whatever the leaf has read",
+        );
+        assert!(
+            declined_settlement(at_deadline, true, false).is_some(),
+            "and the leaf answers where no entry does",
         );
     }
 

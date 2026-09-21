@@ -25,11 +25,11 @@ use hyperscale_types::{
     CrossingAnswers, CrossingDecline, CrossingReoffer, Deadline, ExecutionCertificate, Inclusion,
     MAX_FINALIZATION_DELAY, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
     MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie, Spoken,
-    StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
-    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
+    MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie,
+    Spoken, StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision,
+    TxHash, TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::{CrossingAnswer, CrossingCell};
+use hyperscale_vm_effects::{CrossingAnswer, CrossingCell, ProtocolHasher, crossing_decline_key};
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 use crate::provisioning::Arrival;
@@ -136,9 +136,27 @@ pub struct HeldRecord {
     /// a proposer that composed one and lost its round promised nothing,
     /// and the next proposal must not skip the crossing for it.
     offered_at: Option<(BlockHeight, WeightedTimestamp)>,
+    /// The decline cell's key, under the same target the claim's key
+    /// sits at and off the same edge.
+    ///
+    /// Held rather than re-derived because three sites compare against
+    /// it in every block — the probe that asks, the retention rule that
+    /// keeps what lands, and the fold that reads it — and the record
+    /// carries the claim's key for the same reason.
+    pub(crate) consumer_decline: SubstateKey,
     /// What a committed claim read of the cell, once one has read it:
     /// present at any anchor, absent only past the lapse.
     pub(crate) answer: Option<Inclusion>,
+    /// Whether a committed claim read the consumer's decline cell
+    /// present: its own word that it will never take the crossing, so
+    /// the value is the producer's to credit back.
+    ///
+    /// A presence and nothing else. The cell is written once by the one
+    /// thing that writes it and swept by nothing, so a reading of it at
+    /// any anchor is a fact — and its absence says only that the
+    /// consumer has not refused, which is what the claim beside it is
+    /// asked about.
+    pub(crate) declined: bool,
     /// Whether a committed abandonment record says the chain that was
     /// to consume this crossing can never settle the transaction that
     /// issued it.
@@ -155,23 +173,47 @@ pub struct HeldRecord {
 impl HeldRecord {
     /// The record as the leaves give it: undisposed, unasked.
     #[must_use]
-    pub(crate) const fn of(cell: CrossingCell) -> Self {
+    pub(crate) fn of(cell: CrossingCell) -> Self {
         Self {
+            consumer_decline: crossing_decline_key(
+                &ProtocolHasher,
+                cell.consumer_claim.owner,
+                cell.intent,
+                cell.local,
+                cell.output,
+            ),
             cell,
             asked_at: None,
             offered_at: None,
             answer: None,
+            declined: false,
             departed: false,
         }
     }
 
+    /// Whether the consumer has answered this crossing, either way.
+    ///
+    /// Stated once because four sites ask it — the probe that puts the
+    /// question, the fold that records what comes back, the offer that
+    /// applies the pressure, and the retention rule that keeps a
+    /// reading to carry. A record is answered by a claim read present,
+    /// by a decline read present, or, until the absence path goes, by a
+    /// claim read absent inside the window one answers in; and a
+    /// conjunction copied four times is one three of them forget to
+    /// grow.
+    #[must_use]
+    pub(crate) const fn answered(&self) -> bool {
+        self.answer.is_some() || self.declined
+    }
+
     /// Whether the crossing this record holds can never be claimed, so
-    /// the value is the producer's to take back: a departure says so
-    /// outright, and so does the claim read absent inside the window an
-    /// absence means something in.
+    /// the value is the producer's to take back: the consumer's own
+    /// decline says so, a departure says so outright, and so does the
+    /// claim read absent inside the window an absence means something
+    /// in.
     #[must_use]
     pub(crate) const fn unclaimable(&self) -> bool {
-        self.departed || matches!(self.answer, Some(Inclusion::Absent))
+        self.declined || self.departed || matches!(self.answer, Some(Inclusion::Absent))
     }
 
     /// The deadline every window this record is read against derives
@@ -224,8 +266,9 @@ impl AnsweredCrossing {
 /// Read off the keys rather than off a name, because a record's issuing
 /// transaction need not be one this chain committed.
 fn awaited_by(held: &BTreeMap<SubstateKey, HeldRecord>, key: SubstateKey) -> bool {
-    held.values()
-        .any(|record| record.answer.is_none() && record.cell.consumer_claim == key)
+    held.values().any(|record| {
+        !record.answered() && (record.cell.consumer_claim == key || record.consumer_decline == key)
+    })
 }
 
 /// Whether any answer of this shard's is still waiting on `key`.
@@ -618,7 +661,7 @@ impl Counterparts {
         let local = self.ledger.local();
         let mut outstanding: BTreeMap<(ShardId, TxHash), Vec<SubstateKey>> = BTreeMap::new();
         for (&key, record) in &self.held {
-            if record.answer.is_some() || now < record.deadline().at() {
+            if record.answered() || now < record.deadline().at() {
                 continue;
             }
             let target = trie.shard_for_prefix(record.cell.consumer_claim.owner);
@@ -809,7 +852,7 @@ impl Counterparts {
         let local = self.ledger.local();
         let ledger = &self.ledger;
         for record in self.held.values_mut() {
-            if record.answer.is_some() || ledger.settles_records(record.cell.tx) {
+            if record.answered() || ledger.settles_records(record.cell.tx) {
                 continue;
             }
             let claim = record.cell.consumer_claim;
@@ -824,7 +867,14 @@ impl Counterparts {
                 continue;
             }
             record.asked_at = Some(anchor.height);
-            wanted.entry(anchor).or_default().push(claim);
+            // Both cells, at one anchor. They are two keys under one
+            // owner, so this is the one fetch it always was and one
+            // claim carries both readings — and the question is not
+            // "did the consumer claim" but "what did it answer", which
+            // has two shapes and one of them is the refusal.
+            let entry = wanted.entry(anchor).or_default();
+            entry.push(claim);
+            entry.push(record.consumer_decline);
         }
     }
 
@@ -1050,32 +1100,51 @@ impl Counterparts {
         actions
     }
 
-    /// Read a committed proof against the claims the held records
+    /// Read a committed proof against the two cells the held records
     /// are waiting on.
     ///
-    /// A presence answers wherever it was taken, since the claim cell is
-    /// written by the consuming execution and by nothing else. An
-    /// absence answers only inside [`held_absence_answers`], which is
-    /// where a leaf that does not name its consumer's role can read one
-    /// honestly.
+    /// Both answers are presences, and each is written by the one thing
+    /// that writes it: the claim by the consuming execution, the
+    /// decline by the consumer's chain. So a presence of either answers
+    /// wherever it was taken, and [`Probed`]'s own rule is what says
+    /// so rather than a second statement of it here.
+    ///
+    /// **The claim is read first, and that ordering is the rule.** A
+    /// record carrying both cells present is a refusal rather than a
+    /// preference — the consumer's own licence is what makes it
+    /// impossible — but a producer reading one is not the place to
+    /// discover it, and taking back value a consumer demonstrably holds
+    /// is the one mistake this cannot make. So a presence of the claim
+    /// decides, and nothing below it is reached.
+    ///
+    /// The claim's *absence* is read last, and only inside
+    /// [`held_absence_answers`], which is where a leaf that does not
+    /// name its consumer's role can read one honestly. It is the road
+    /// the decline replaces, kept until every reader of it goes
+    /// together.
     fn fold_held(&mut self, stated: &StateClaim, trie: &ShardTrie) {
         for record in self.held.values_mut() {
-            if record.answer.is_some() {
+            if record.answered() {
                 continue;
             }
             let claim = record.cell.consumer_claim;
             if trie.shard_for_prefix(claim.owner) != stated.anchor.shard {
                 continue;
             }
-            let Some(inclusion) = stated.reading(claim) else {
-                continue;
+            let read = |key, probed: Probed| {
+                stated
+                    .reading(key)
+                    .and_then(|inclusion| probed.read(inclusion))
             };
-            if matches!(inclusion, Inclusion::Absent)
-                && !held_absence_answers(stated.anchor.ts, record.deadline())
+            if let Some(inclusion) = read(claim, Probed::Claim) {
+                record.answer = Some(inclusion);
+            } else if read(record.consumer_decline, Probed::Decline).is_some() {
+                record.declined = true;
+            } else if matches!(stated.reading(claim), Some(Inclusion::Absent))
+                && held_absence_answers(stated.anchor.ts, record.deadline())
             {
-                continue;
+                record.answer = Some(Inclusion::Absent);
             }
-            record.answer = Some(inclusion);
         }
     }
 
@@ -1952,6 +2021,144 @@ mod tests {
         assert!(
             producer.reoffers(&trie, answerable).is_empty(),
             "a claim read present is the end of the obligation",
+        );
+    }
+
+    /// The decline cell of the crossing `producer_cell(seed, ..)`
+    /// records, which sits under the same target its claim does.
+    fn consumer_decline(seed: u8, deadline: Deadline) -> SubstateKey {
+        let cell = producer_cell(seed, deadline);
+        crossing_decline_key(
+            &ProtocolHasher,
+            cell.consumer_claim.owner,
+            cell.intent,
+            cell.local,
+            cell.output,
+        )
+    }
+
+    /// A producer asks after both answers at one anchor, and a decline
+    /// read present ends the crossing.
+    ///
+    /// The channel end to end, because each step of it is a rule of its
+    /// own and a source added to one and missed in another is a reading
+    /// fetched and dropped forever: the probe names both cells in one
+    /// fetch, the landed reading is kept across the commit that follows
+    /// it, a block carries it, and the fold reads it as the answer.
+    #[test]
+    fn a_producer_asks_both_answers_and_a_decline_ends_the_crossing() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let (mut producer, trie, anchors) = producing(1, deadline);
+        let record = producer_record(0);
+        let claim = producer_cell(0, deadline).consumer_claim;
+        let decline = consumer_decline(0, deadline);
+        let now = deadline.at();
+        assert_eq!(
+            decline.owner, claim.owner,
+            "both cells sit under the consuming node's own target, which is what              makes this one fetch",
+        );
+
+        let (state_root, proof) = state_and_proof(CONSUMER, &[decline], &[claim, decline]);
+        let anchor = Anchor {
+            shard: CONSUMER,
+            height: BlockHeight::new(7),
+            state_root,
+            ts: now,
+        };
+        anchors.record(anchor);
+        let asked = producer.probe(&trie, now, &BTreeMap::new());
+        assert_eq!(asked.len(), 1, "two keys under one owner are one fetch");
+        let [
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::StateProofs(ids),
+                ..
+            }),
+        ] = asked.as_slice()
+        else {
+            panic!("a probe asks for state proofs: {asked:?}");
+        };
+        assert_eq!(
+            ids.as_slice(),
+            [(anchor, claim), (anchor, decline)],
+            "and it asks after both answers at the one anchor",
+        );
+
+        producer.on_proof_fetched(anchor, vec![claim, decline], proof);
+        producer.release_answered_fetches(&trie);
+        let carried = producer.state_claims();
+        assert_eq!(
+            carried.len(),
+            1,
+            "the reading survives the commit and a block carries it",
+        );
+        assert!(
+            carried[0].reading(decline).is_some(),
+            "including the refusal's own cell, which nothing else here would keep",
+        );
+
+        producer.fold_held(&carried[0], &trie);
+        let held = producer.held.get(&record).expect("the record still stands");
+        assert!(
+            held.declined,
+            "a decline read present is the crossing's answer"
+        );
+        assert!(
+            held.unclaimable(),
+            "and it licenses the credit back, with no window anywhere in the path",
+        );
+        assert!(
+            producer
+                .reoffers(&trie, now.plus(MAX_FINALIZATION_DELAY))
+                .is_empty(),
+            "the pressure stops where the answer arrives",
+        );
+        anchors.record(Anchor {
+            height: BlockHeight::new(8),
+            ..anchor
+        });
+        assert!(
+            producer.probe(&trie, now, &BTreeMap::new()).is_empty(),
+            "and the question is not put again at the consumer's next header",
+        );
+    }
+
+    /// A claim read present answers over a decline read beside it.
+    ///
+    /// Both cells present is a refusal rather than a preference, and the
+    /// consumer's own licence is what makes it impossible. A producer
+    /// reading one is not where that is discovered, and of the two
+    /// mistakes available here only one is unrecoverable: taking back
+    /// value a consumer demonstrably holds.
+    #[test]
+    fn a_claim_read_present_answers_over_a_decline_beside_it() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let (mut producer, trie, _anchors) = producing(1, deadline);
+        let record = producer_record(0);
+        let claim = producer_cell(0, deadline).consumer_claim;
+        let decline = consumer_decline(0, deadline);
+
+        let both = StateClaim::new(
+            Anchor {
+                shard: CONSUMER,
+                height: BlockHeight::new(7),
+                state_root: StateRoot::from_raw(Hash::ZERO),
+                ts: deadline.at(),
+            },
+            [
+                (claim, Inclusion::Present([0xAB; 32])),
+                (decline, Inclusion::Present([0xCD; 32])),
+            ],
+        );
+        producer.fold_held(&both, &trie);
+
+        let held = producer.held.get(&record).expect("the record still stands");
+        assert!(
+            matches!(held.answer, Some(Inclusion::Present(_))),
+            "the claim is what the record is answered by",
+        );
+        assert!(
+            !held.declined && !held.unclaimable(),
+            "so nothing licenses crediting back value the consumer holds",
         );
     }
 
