@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::ProtocolHasher;
-use hyperscale_effects_bridge::vm_statics::{config_key, package_key, round_key};
+use hyperscale_effects_bridge::vm_statics::{config_key, crossing_records, package_key, round_key};
 use hyperscale_engine::genesis::{draw_key, vault_key};
 use hyperscale_engine::{
     DOMAIN_SEALED_DRAW, PROTOCOL_RESOURCE, PreviewGrants, PreviewOutcome, PreviewReport,
@@ -23,7 +23,7 @@ use hyperscale_engine::{
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
     AccountSigner, Address, BlockHeight, Deadline, Epoch, MAX_VALIDITY_RANGE, SWEEP_BUCKET_MS,
-    SchemeId, ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
+    SchemeId, ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
@@ -32,7 +32,7 @@ use hyperscale_vm_types::{ARTIFACT_GRACE_MS, SEAL_MATURITY_EPOCHS};
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::FaultableCluster;
-use crate::support::query::{beacon_epoch, declared_price, owning_shard, vault_balance};
+use crate::support::query::{beacon_epoch, clock, declared_price, owning_shard, vault_balance};
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
     build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
@@ -1548,6 +1548,134 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     world.assert_settled(c, charges.burned(c), "a leg refused at its deadline");
 }
 
+/// A leg whose core cannot be read inside the window its absence answers
+/// in strands the value the leg staged.
+///
+/// [`a_leg_whose_core_never_answers_refuses_at_the_deadline`] is the case
+/// the absence path answers: the core never engages at all, so the leg
+/// never composes, and the deadline abandons it with the stake still in
+/// the vault. Nothing is staged there and nothing can strand.
+///
+/// Value is staged only once the core *does* engage — the leg composes,
+/// runs, and its finalization writes the record the crossing sits in.
+/// From then the record is decided by one reading: the consumer's claim
+/// cell, read absent at an anchor of the core's chain inside the span
+/// from the close of [`Window::Core`] to the close of
+/// [`Window::LegEntry`]. Before that span the core may still claim; past
+/// it the cell is swept, so an absence is a swept cell rather than a
+/// claim that never happened.
+///
+/// That reading is a probe, and a probe is taken at an anchor of the
+/// core's chain that the producer has commit-proven. A core that halts
+/// inside the span leaves none there — its chain freezes below the span
+/// and produces nothing inside it — so the absence is never readable, the
+/// presence never exists, and the record stands with the stake in it.
+/// Cutting both roads a header travels reaches the same state, and
+/// reaches it on a cluster that needs no committee to fail.
+///
+/// # Panics
+///
+/// Panics if the core never commits the stake, if the leg never stages
+/// it, if either cut is never exercised, if the stake is credited back,
+/// or if the record does not stand past every window that could dispose
+/// of it.
+pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: &mut C) {
+    let (payer_key, payer) = remote_delegator();
+    let pool = pool_at(GENESIS_POOL_ID);
+    let payer_shard = account_shard(payer, 2);
+    let core = account_shard(pool, 2);
+    assert_ne!(
+        payer_shard, core,
+        "the delegator has to sit off the pool's shard for its stake to be a leg",
+    );
+    let before = vault_balance(c, payer_shard, payer);
+    let mut world = World::open(c, *PROTOCOL_RESOURCE, [payer.address(), pool.address()], []);
+    let mut charges = Charges::default();
+
+    // The core's committee can commit but cannot certify: each member
+    // holds only its own execution vote, so no tick of the core's ever
+    // reaches a quorum and no claim is ever written. Every other channel
+    // is open, which is what lets the core engage the leg and the leg
+    // run.
+    let core_hosts = c.committee_hosts(core);
+    let votes_cut = c.drop_type_between(&core_hosts, &core_hosts, "execution.vote");
+
+    let validity = validity_around(c.now());
+    let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity);
+    let price = declared_price(c, &tx);
+    // The record the leg's crossing writes is value the world still holds
+    // while it stands, and value nothing can reach once the span closes.
+    world.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario stake derives")
+            .legs,
+    ));
+    let hash = charges.submit(c, tx);
+
+    assert!(
+        c.run_until(epochs(10), |c| c.chain_fate(core, hash).0.is_some()),
+        "the core must commit the stake: that commit is what engages the leg",
+    );
+    assert!(
+        c.run_until(epochs(10), |c| vault_balance(c, payer_shard, payer)
+            == before - STAKE - price),
+        "the leg must run and stage the stake; the vault holds {}",
+        vault_balance(c, payer_shard, payer),
+    );
+
+    // Now the core's chain stops being provable, for the whole of the span
+    // an absence of its claim answers in. Both roads a header travels are
+    // cut — the gossip that pushes one and the fetch that pulls it — so
+    // the producer's newest commit-proven anchor of the core freezes below
+    // the span and the next one it can prove is past it. That is what a
+    // halted chain leaves behind, and it is why no reading taken after the
+    // heal undoes it: the anchors an absence would have to be taken at were
+    // never produced. The fetch rule names the *request* type, since the
+    // fault engine tags a request and its response alike.
+    let headers_cut = c.drop_type("remote_header.request");
+    let gossip_cut = c.drop_type("block.committed");
+    let deadline = Deadline::of(validity.end_timestamp_exclusive);
+    assert!(
+        c.run_until(epochs(70), |c| clock(c)
+            >= Window::LegEntry.of(deadline).end),
+        "the cut must stand past the close of the span an absence answers in",
+    );
+    assert!(
+        votes_cut.fired() > 0 && headers_cut.fired() > 0 && gossip_cut.fired() > 0,
+        "every cut must actually have been exercised",
+    );
+    assert!(
+        c.chain_fate(core, hash).1.is_none(),
+        "the core must never have certified anything for the stake",
+    );
+
+    // Provable again, and too late: every anchor of the core the producer
+    // can prove now sits past the span, so no reading it takes answers
+    // either way.
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(20), |c| clock(c)
+            >= Window::LegEntry.of(deadline).end.plus(MAX_VALIDITY_RANGE)),
+        "run on past the room the reclaim had",
+    );
+
+    let after = vault_balance(c, payer_shard, payer);
+    assert_eq!(
+        after,
+        before - STAKE - price,
+        "the stake stays staged and the price is settled: before = {before}, \
+         after = {after}, stake = {STAKE}, price = {price}",
+    );
+    let stranded = world.stranded(c);
+    assert_eq!(
+        stranded.len(),
+        1,
+        "the leg's record must stand past the close of every window that \
+         decides it, holding a stake nobody can reach; stranded = {stranded:?}",
+    );
+    assert_eq!(stranded[0].1, STAKE, "and what it holds is the whole stake");
+}
+
 /// A delivery cut off past its window is owed, not taken back.
 ///
 /// A transfer's payer settles alone: its leg pays, issues the crossing
@@ -1737,6 +1865,114 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
         epochs(4),
         "a delivery whose record arrived past the old window",
     );
+}
+
+/// A delivery cut off past the window its record is claimable in
+/// strands the crossing, however whole the network is afterwards.
+///
+/// [`a_healed_network_delivers_past_the_old_window`] holds the same cut
+/// across the deadline and heals inside [`Window::Owed`], and the
+/// delivery lands: the crossing is still owed, the record still stands,
+/// and the delivering shard asks the producer for it. What bounds that
+/// is the window rather than the crossing — past its close admission
+/// refuses the delivery, and the claim cell the record is decided
+/// against is swept — so the same cut held wider loses the payment
+/// outright.
+///
+/// The payer is debited, the recipient is never paid, and the record
+/// stands holding value nobody can reach: not the recipient, whose
+/// delivery can no longer be admitted, and not the payer, because
+/// nothing takes an owed crossing back.
+///
+/// # Panics
+///
+/// Panics if the payer's leg does not accept, if the bundle channels are
+/// never exercised, if the delivery lands while the cut stands, if the
+/// payment comes back to the payer, if the recipient is paid once the
+/// network heals, or if the record does not stand past the close of its
+/// window.
+pub fn a_delivery_cut_off_past_its_owed_window<C: FaultableCluster>(c: &mut C) {
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+    let before = vault_balance(c, payer_shard, from);
+    let recipient_before = vault_balance(c, recipient_shard, to);
+    let mut world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+
+    let broadcast_dropped = c.drop_type("provisions.broadcast");
+    let fetch_dropped = c.drop_type("provision.request");
+
+    let validity = validity_around(c.now());
+    let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
+    let price = declared_price(c, &tx);
+    world.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    ));
+    let hash = charges.submit(c, tx);
+
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| vault_balance(c, payer_shard, from)
+            == before - 100 - price),
+        "the leg pays the payment and the price",
+    );
+
+    // Past the close of the window the record states, with the cut
+    // standing the whole way.
+    let closed = Window::Owed
+        .of(Deadline::of(validity.end_timestamp_exclusive))
+        .end;
+    assert!(
+        c.run_until(epochs(60), |c| clock(c) >= closed),
+        "the cut must stand past the close of the crossing's own window",
+    );
+    assert!(
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
+        "both bundle channels must actually have been exercised and cut",
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the delivery must never have landed while its bundle was cut off",
+    );
+
+    // Whole again, and too late. Nothing on either side moves after
+    // this: the delivery is inadmissible and the crossing is not the
+    // payer's to take back.
+    c.clear_drops();
+    let _ = c.run_until(epochs(8), |_| false);
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the delivery is refused past the close of its window, however \
+         whole the network is",
+    );
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "so the recipient is never paid",
+    );
+    assert_eq!(
+        vault_balance(c, payer_shard, from),
+        before - 100 - price,
+        "and the payment does not come back: nothing takes an owed crossing back",
+    );
+    let stranded = world.stranded(c);
+    assert_eq!(
+        stranded.len(),
+        1,
+        "the crossing's record must stand past the close of its window, \
+         holding a payment nobody can reach; stranded = {stranded:?}",
+    );
+    assert_eq!(stranded[0].1, 100, "and what it holds is the payment");
 }
 
 /// What the deadline scenario stakes: well under its funding, so the

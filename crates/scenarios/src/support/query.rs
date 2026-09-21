@@ -18,7 +18,7 @@ use hyperscale_types::{
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
     WeightedTimestamp, Window, sweep_admits_block,
 };
-use hyperscale_vm_effects::CrossingCell;
+use hyperscale_vm_effects::{CrossingCell, Terms};
 
 use super::{Budget, Cluster};
 
@@ -163,12 +163,22 @@ pub(crate) fn owed_at<C: Cluster + ?Sized>(
 /// What a crossing record standing at `cell` owes that nothing can
 /// claim any more, in `resource`.
 ///
-/// [`owed_at`] measured against the close of the record's own delivery
-/// window. Inside it the value is in flight — a delivery may still be
-/// admitted and claim it — and past it none can, because the only writer
-/// of the claim cell is a delivery member of the producing transaction
-/// and admission refuses one there. So a non-zero answer is value no
-/// action of any shard can move again.
+/// [`owed_at`] measured against the close of the window the record's own
+/// kind is decided in. Inside it the value is in flight; past it no
+/// action of any shard can move it again, so a non-zero answer is value
+/// stranded.
+///
+/// The two kinds close for different reasons and the arms are kept
+/// apart, since the instants agreeing today is arithmetic rather than a
+/// shared argument:
+///
+/// - an **owed** record is claimed by a delivery, and admission refuses
+///   one past [`Window::Owed`] — the only writer of the claim cell is
+///   gone;
+/// - an **escrowed** one is taken by a core or credited back to the cell
+///   it names, and past [`Window::LegEntry`] neither can be composed:
+///   the core is long past its deadline and no absence of the claim
+///   answers any more.
 pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
     c: &C,
     cell: SubstateKey,
@@ -179,7 +189,12 @@ pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
         .substate(shard, cell.owner, cell.local.0)
         .and_then(|bytes| CrossingCell::from_bytes(&bytes))
         .is_some_and(|record| {
-            Window::Owed.of(Deadline::from_expiry(record.expiry_ms)).end <= clock(c)
+            let deadline = Deadline::from_expiry(record.expiry_ms);
+            let window = match record.terms {
+                Terms::Owed => Window::Owed,
+                Terms::Escrowed { .. } => Window::LegEntry,
+            };
+            window.of(deadline).end <= clock(c)
         });
     if closed {
         owed_at(c, cell, resource)

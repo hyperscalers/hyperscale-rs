@@ -25,12 +25,13 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::{
     Budget, Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_delivery_cut_off_past_its_window_is_owed, a_delivery_is_owed_when_its_deliverer_splits,
-    a_departing_venue_clears_swaps_and_carries_on,
+    a_delivery_cut_off_past_its_owed_window, a_delivery_cut_off_past_its_window_is_owed,
+    a_delivery_is_owed_when_its_deliverer_splits, a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
     a_healed_network_delivers_past_the_old_window,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
+    a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_priority_is_charged_over_the_table_price,
@@ -799,6 +800,23 @@ fn a_delivery_cut_off_past_its_window_is_owed_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     cluster.run_faultable(a_delivery_cut_off_past_its_window_is_owed);
+}
+
+#[test]
+fn a_delivery_cut_off_past_its_owed_window_sim() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    cluster.run_faultable(a_delivery_cut_off_past_its_owed_window);
+}
+
+#[test]
+fn a_leg_whose_core_never_answers_inside_its_window_sim() {
+    let mut cluster = SimCluster::with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        &[(remote_delegator().1, 1_000_000)],
+    );
+    cluster.run_faultable(a_leg_whose_core_never_answers_inside_its_window);
 }
 
 #[test]
