@@ -265,6 +265,13 @@ impl Charges {
         hash
     }
 
+    /// The envelope recorded under `hash`, for a scenario that has to
+    /// offer the same signed transaction again.
+    #[must_use]
+    pub fn recorded(&self, hash: TxHash) -> Option<&Arc<Transaction>> {
+        self.owed.get(&hash)
+    }
+
     /// How many of the recorded transactions have been charged.
     #[must_use]
     pub fn charged<C: Cluster + ?Sized>(&self, c: &C) -> usize {

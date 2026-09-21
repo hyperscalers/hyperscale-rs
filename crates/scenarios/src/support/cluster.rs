@@ -64,6 +64,16 @@ pub trait Cluster {
     /// Submit a transaction, routed to whichever host serves its source shard.
     fn submit(&mut self, tx: Arc<Transaction>);
 
+    /// Submit a transaction to a host of `shard`, whatever its source
+    /// shard would have been.
+    ///
+    /// What a client does when the shard that would run its transaction
+    /// is not the one routing would pick. The case is a late delivery:
+    /// the producing shard is long past the window it could include the
+    /// transaction in and refuses it, where the delivering shard admits
+    /// it on the record it consumes still standing.
+    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>);
+
     /// A derivation the cluster answers alike to — what a scenario reads
     /// a routed fact off a transaction it built itself through.
     ///

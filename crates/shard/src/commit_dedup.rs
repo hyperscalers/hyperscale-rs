@@ -35,13 +35,14 @@ use std::sync::Arc;
 use hyperscale_storage::{CommittedProvisions, DedupWindow};
 use hyperscale_types::{
     DEDUP_WINDOW, Finalization, FinalizationHash, ProvisionHash, Provisions, RETENTION_HORIZON,
-    ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp, admissible_until,
+    ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
 pub struct CommitDedupIndex {
-    /// `tx_hash → the close of its delivery window`. Pruned
-    /// when the deadline is at or below `current_committed_ts`.
+    /// `tx_hash → deadline`, where each deadline is one
+    /// [`DEDUP_WINDOW`] past the block that carried it. Pruned when that
+    /// is at or below `current_committed_ts`.
     tx_retention: HashMap<TxHash, WeightedTimestamp>,
     /// `tx_hash → vote_anchor_ts + RETENTION_HORIZON` of the finalization
     /// that resolved it. Every transaction a committed finalization
@@ -173,16 +174,31 @@ impl CommitDedupIndex {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
     }
 
-    /// Record a block's transactions in the retention lookup. Each
-    /// entry's stored value is the last anchor a block may carry the
-    /// transaction at, which is its delivery window's close where it
-    /// has a delivery and its own deadline where it has none.
-    pub(crate) fn register_committed_txs(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
+    /// Record a block's transactions in the retention lookup, each held
+    /// one [`RETENTION_HORIZON`] past `anchor` — the block's own.
+    ///
+    /// Keyed off the block rather than off the body, and that is the
+    /// whole of what this tier refuses: a second inclusion of what this
+    /// chain already carried. A transaction admitted *inside* its window
+    /// has a deadline of its own that sits at or below this instant, so
+    /// for those the figure changes nothing. A delivery admitted past
+    /// that window has no deadline left to be held to, and it is the one
+    /// that needs holding: the claim cell its execution writes is what
+    /// refuses the second run, and that cell is a step behind — it is in
+    /// state only once the delivery's finalization commits. This tier is
+    /// what covers the step, so a replay lands either here or on a
+    /// baseline that already holds the claim.
+    ///
+    /// The figure is [`DEDUP_WINDOW`], which is this index's own depth,
+    /// so nothing is held that the walk rebuilding it would not reach.
+    pub(crate) fn register_committed_txs(
+        &mut self,
+        transactions: &[Arc<Verifiable<Transaction>>],
+        anchor: WeightedTimestamp,
+    ) {
+        let deadline = anchor.plus(DEDUP_WINDOW);
         for tx in transactions {
-            let tx_hash = tx.hash();
-            self.tx_retention
-                .entry(tx_hash)
-                .or_insert_with(|| admissible_until(tx));
+            self.tx_retention.entry(tx.hash()).or_insert(deadline);
         }
     }
 
@@ -321,7 +337,7 @@ mod tests {
     };
     use hyperscale_types::{
         BlockHeight, Deadline, Hash, LegRole, MerkleInclusionProof, ProvisionEntry, Provisions,
-        ShardId, TimestampRange, TransactionDecision, Window,
+        ShardId, TimestampRange, TransactionDecision,
     };
 
     use super::*;
@@ -432,71 +448,72 @@ mod tests {
         let mut idx = CommitDedupIndex::new();
         let tx = tx_with_end(1, 60_000);
         let tx_hash = tx.hash();
-        idx.register_committed_txs(std::slice::from_ref(&tx));
+        idx.register_committed_txs(std::slice::from_ref(&tx), WeightedTimestamp::ZERO);
         assert!(idx.contains_tx(&tx_hash));
         assert_eq!(idx.tx_retention_len(), 1);
     }
 
-    /// A transaction carrying an outbound leg is refusable to the close
-    /// of its delivery window, not to its validity end: a delivery-only
-    /// member is admissible past the end, so an index that forgot the
-    /// hash there would let a proposer commit the same delivery twice.
+    /// A transaction committed past its own window is refusable all the
+    /// same, and that is the case this tier exists for.
     ///
-    /// One with no outbound leg has no delivery to be admitted as, and
-    /// is held only to its own deadline — which is the whole difference
-    /// between an index sized for a shard's crossings and one sized for
-    /// its traffic.
+    /// A delivery is admissible past its validity end on a licence
+    /// rather than a clock, so its body has no deadline left to be held
+    /// to — and the cell that refuses a second run of it, the claim its
+    /// execution writes, is a step behind: it reaches state only once
+    /// that execution's finalization commits. This tier covers the step.
+    /// An index keyed on the body would forget the hash the instant the
+    /// block carried it and let a proposer commit the same delivery
+    /// twice into that gap.
+    ///
+    /// The figure is the block's, so a transaction admitted inside its
+    /// own window reads the same rule and is unaffected: its deadline
+    /// sits at or below this instant either way.
     #[test]
-    fn a_delivering_tx_stays_refusable_across_its_delivery_window() {
+    fn a_tx_committed_past_its_own_window_is_still_refusable() {
         let mut idx = CommitDedupIndex::new();
-        let tx = delivering_tx_with_end(1, 100);
-        let tx_hash = tx.hash();
-        let deadline = Deadline::of(WeightedTimestamp::from_millis(100));
-        let close = Window::Owed.of(deadline).end;
-        idx.register_committed_txs(std::slice::from_ref(&tx));
+        // Committed a long way past the end it signed, which is what a
+        // delivery licensed by its record looks like.
+        let late = delivering_tx_with_end(1, 100);
+        let late_hash = late.hash();
+        let anchor = WeightedTimestamp::from_millis(500_000);
+        idx.register_committed_txs(std::slice::from_ref(&late), anchor);
 
-        idx.prune(WeightedTimestamp::from_millis(101));
+        idx.prune(Deadline::of(WeightedTimestamp::from_millis(100)).at());
         assert!(
-            idx.contains_tx(&tx_hash),
-            "past the validity end a delivery may still be admitted",
+            idx.contains_tx(&late_hash),
+            "its own deadline went by before the block that carried it",
         );
 
-        idx.prune(close.minus(std::time::Duration::from_millis(1)));
-        assert!(idx.contains_tx(&tx_hash), "short of the window's close");
-
-        idx.prune(close);
+        let held_until = anchor.plus(DEDUP_WINDOW);
+        idx.prune(held_until.minus(std::time::Duration::from_millis(1)));
         assert!(
-            !idx.contains_tx(&tx_hash),
-            "at the close nothing may carry it"
+            idx.contains_tx(&late_hash),
+            "and it is held one horizon past that block",
         );
-
-        let mut ordinary = CommitDedupIndex::new();
-        let plain = tx_with_end(2, 100);
-        let plain_hash = plain.hash();
-        ordinary.register_committed_txs(std::slice::from_ref(&plain));
-        ordinary.prune(deadline.at().minus(std::time::Duration::from_millis(1)));
-        assert!(ordinary.contains_tx(&plain_hash), "short of its deadline");
-        ordinary.prune(deadline.at());
+        idx.prune(held_until);
         assert!(
-            !ordinary.contains_tx(&plain_hash),
-            "and gone there: nothing carries a transaction with no delivery past it",
+            !idx.contains_tx(&late_hash),
+            "past which the claim its execution wrote is what refuses a second run",
         );
     }
 
+    /// The index prunes each entry against the block that carried it,
+    /// so two transactions committed at two anchors go at two instants.
     #[test]
-    fn prune_drops_txs_past_their_window() {
+    fn prune_drops_txs_past_their_own_blocks_horizon() {
         let mut idx = CommitDedupIndex::new();
         let early = delivering_tx_with_end(1, 100);
         let later = delivering_tx_with_end(2, 900);
         let early_hash = early.hash();
         let later_hash = later.hash();
-        idx.register_committed_txs(&[early, later]);
+        let early_anchor = WeightedTimestamp::from_millis(100);
+        let later_anchor = WeightedTimestamp::from_millis(900);
+        idx.register_committed_txs(std::slice::from_ref(&early), early_anchor);
+        idx.register_committed_txs(std::slice::from_ref(&later), later_anchor);
 
-        idx.prune(
-            Window::Owed
-                .of(Deadline::of(WeightedTimestamp::from_millis(500)))
-                .end,
-        );
+        // Between the two horizons: the earlier block's entry goes and
+        // the later block's stands.
+        idx.prune(early_anchor.plus(DEDUP_WINDOW));
 
         assert!(!idx.contains_tx(&early_hash));
         assert!(idx.contains_tx(&later_hash));

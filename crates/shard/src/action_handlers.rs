@@ -1631,7 +1631,6 @@ mod tests {
         BeaconBlockHash, BeaconChainConfig, BeaconState, CertificateRoot, CertifiedBeaconBlock,
         CommittedAt, LocalReceiptRoot, PriceTable, ProposerTimestamp, ProvisionsRoot,
         ShardCommittee, Signer, StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
-        Window,
     };
 
     use super::*;
@@ -2332,10 +2331,10 @@ mod tests {
     }
 
     /// An expired transaction the block's late-delivery set names passes
-    /// the root check while the delivery window is open and fails at its
-    /// close; one the set does not name fails at the validity end.
+    /// the root check at any anchor past its validity end; one the set
+    /// does not name fails there.
     #[test]
-    fn verify_transaction_root_admits_a_late_delivery_to_the_windows_close() {
+    fn verify_transaction_root_admits_a_named_late_delivery_at_any_anchor() {
         use std::time::Duration;
 
         let end = WeightedTimestamp::from_millis(1_000);
@@ -2360,18 +2359,9 @@ mod tests {
         };
         assert!(verify(end, &late), "admitted at the validity end");
         assert!(
-            verify(
-                Window::Owed
-                    .of(Deadline::of(end))
-                    .end
-                    .minus(Duration::from_millis(1)),
-                &late
-            ),
-            "and to the last moment of the window"
-        );
-        assert!(
-            !verify(Window::Owed.of(Deadline::of(end)).end, &late),
-            "refused at the close"
+            verify(end.plus(Duration::from_hours(24)), &late),
+            "and at any anchor past it: what admits a late delivery is the licence \
+             the set stands for, and a licence is not on a clock"
         );
         assert!(!verify(end, &HashSet::new()), "and refused unnamed");
     }

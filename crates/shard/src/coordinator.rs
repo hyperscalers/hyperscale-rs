@@ -5323,10 +5323,10 @@ impl ShardCoordinator {
         manifest: &BlockManifest,
         commit_ts: WeightedTimestamp,
     ) {
+        let anchor = block.header().parent_qc().weighted_timestamp();
+        self.dedup_index.cover(anchor);
         self.dedup_index
-            .cover(block.header().parent_qc().weighted_timestamp());
-        self.dedup_index
-            .register_committed_txs(block.transactions());
+            .register_committed_txs(block.transactions(), anchor);
         self.dedup_index
             .register_committed_certs(block.certificates());
         self.dedup_index

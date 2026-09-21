@@ -25,9 +25,9 @@ use std::sync::Arc;
 use hyperscale_engine::legs::{Classified, Licence};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE,
-    PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    AbandonmentRecord, BUNDLE_WAIT, CommittedAt, Deadline, Finalization, Inclusion,
+    MAX_VALIDITY_RANGE, PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey,
+    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window,
 };
 
@@ -1498,14 +1498,23 @@ impl Ledger {
         let mut unanswerable = Vec::new();
         let mut entries = std::mem::take(&mut self.owed);
         entries.retain(|tx_hash, owed| {
+            // A delivery waits on an arrival, and an arrival has no
+            // window: it stands [`BUNDLE_WAIT`] past the block that
+            // committed it, which is the longest a bundle can be late
+            // for a cause that is not a halt. Measured from its own
+            // commit and not from a deadline, because a deadline sits
+            // anywhere from one round to one horizon past the commit,
+            // and a figure read off it gives a transaction committed
+            // early in its window no rounds at all.
+            if owed.part.is_delivery() {
+                return owed.figures.committed.anchor.plus(BUNDLE_WAIT) > now;
+            }
             // A leg entry goes at its horizon, where the claim
             // cell both its members are proved against is swept:
             // past it neither the reclaim nor the retirement can
             // be composed, whatever evidence lands. Short of it
-            // only the finalization that decides it ends it. A
-            // delivery runs to the same horizon, which is where
-            // the record it would claim stops being disposable.
-            if owed.part.is_leg() || owed.part.is_delivery() || owed.absences().next().is_some() {
+            // only the finalization that decides it ends it.
+            if owed.part.is_leg() || owed.absences().next().is_some() {
                 return Window::LegEntry.of(owed.figures.deadline).end > now;
             }
             if let Some(shard) = owed.departed_by {
@@ -2377,26 +2386,33 @@ mod tests {
         );
     }
 
-    /// A delivery-only entry is on no clock: never abandoned, whatever
-    /// the reading, because the crossing it claims is this shard's from
-    /// the moment the core committed it and no instant makes giving it
-    /// up right. Released by its own finalization when it runs, dropped
-    /// at the horizon past which the record could not be disposed of
-    /// anyway, and never a leg — nothing to reclaim, nothing to probe.
+    /// A delivery-only entry is on no clock of the transaction's: never
+    /// abandoned, whatever the reading, because the crossing it claims
+    /// is this shard's from the moment the core committed it and no
+    /// instant makes giving it up right. Released by its own
+    /// finalization when it runs, and never a leg — nothing to reclaim,
+    /// nothing to probe.
+    ///
+    /// What it does stand on is its own commit. A delivery waits on an
+    /// arrival, and an arrival has no window, so the entry lives
+    /// [`BUNDLE_WAIT`] past the block that committed it rather than a
+    /// span past a deadline — the two differ by where in its validity
+    /// window the transaction happened to be committed, which is the
+    /// whole of why the origin moved.
     #[test]
-    fn a_delivery_entry_is_never_abandoned() {
+    fn a_delivery_entry_stands_a_bundle_wait_past_its_own_commit() {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
         ledger.seed(tx.hash(), delivery_part(&tx));
         let deadline = Deadline::of(ms(60_000));
-        let horizon = Window::LegEntry.of(deadline).end;
+        let horizon = committed_at(&tx).anchor.plus(BUNDLE_WAIT);
 
         for at in [
             deadline.at(),
-            Window::Owed.of(deadline).end,
             horizon,
             horizon.plus(MAX_VALIDITY_RANGE),
+            Window::LegEntry.of(deadline).end,
         ] {
             assert!(
                 ledger.past_deadline(at).is_empty(),
@@ -2411,7 +2427,7 @@ mod tests {
         assert_eq!(
             ledger.prune(horizon.minus(Duration::from_millis(1))).len(),
             0,
-            "short of the horizon it stands"
+            "short of its wait it stands"
         );
         assert_eq!(ledger.len(), 1);
         ledger.prune(horizon);

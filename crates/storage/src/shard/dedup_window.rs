@@ -24,7 +24,7 @@ use std::collections::HashSet;
 
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, FEE_HOLD_WINDOW, FinalizationHash,
-    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp, admissible_until,
+    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
@@ -139,10 +139,10 @@ impl DedupWindow {
         let mut window = Self::default();
         let mut height = committed_height;
         // One descent, each tier stopping at its own floor, and the walk
-        // ending where both have. The dedup tiers reach deeper — a
-        // transaction is held to the expiry the record a delivery of it
-        // would claim states, where a hold ends one settlement window past its
-        // transaction's — so neither floor alone can end the descent.
+        // ending where both have. The fee tier reaches deeper — a hold
+        // ends one settlement window past its transaction's, where a
+        // committed transaction is held one horizon past the block that
+        // carried it — so neither floor alone can end the descent.
         let mut dedup_done = false;
         let mut fee_done = false;
         // What a finalization already released, gathered descending — a
@@ -212,13 +212,16 @@ impl DedupWindow {
     /// the provision tier keys its deadline on.
     fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp, now: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
-        for tx in block.transactions().iter() {
-            // Only what the index would still hold. The walk is floored
-            // at the widest tier's window, so most of what it descends
-            // past is a transaction with no delivery to be admitted as,
-            // whose own deadline went by long before this clock.
-            let deadline = admissible_until(tx);
-            if deadline > now {
+        // What the index would still hold, keyed the way the live one
+        // keys it: one horizon past the block that carried each, which
+        // is this walk's own depth. Read off the block rather than off
+        // the body, because what the tier refuses is a second inclusion
+        // of what this chain already carried, and a transaction
+        // admitted past its own window — a delivery licensed by the
+        // record it consumes — has no deadline left to be held to.
+        let deadline = anchor.plus(RETENTION_HORIZON);
+        if deadline > now {
+            for tx in block.transactions().iter() {
                 self.committed.push((tx.hash(), deadline));
             }
         }

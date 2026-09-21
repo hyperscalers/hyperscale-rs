@@ -56,7 +56,7 @@ use hyperscale_metrics::{
     record_expected_tx_dropped, record_transaction_aborted, record_transaction_rejected,
 };
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
+    BUNDLE_WAIT, BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
     LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId,
     ShardTrie, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
     TxResolution, Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
@@ -398,9 +398,10 @@ impl MempoolCoordinator {
         }
 
         // Reject once nothing here could include it: past its validity
-        // end, or past the delivery window where this shard may only be
-        // delivering. The proposer applies the exact rule; this is the
-        // admission boundary that keeps dead entries out of the pool.
+        // end. A transaction this shard only delivers for never reads
+        // past — its figure is measured from now — because no clock here
+        // decides a delivery: the block that admits one carries the
+        // record proof that licenses it.
         let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
         let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
         if admissible_until <= self.current_ts {
@@ -1030,18 +1031,29 @@ impl MempoolCoordinator {
     ///
     /// Its validity end, except where this shard only delivers for it —
     /// frozen divided against the head trie with this shard outside the
-    /// core and every leg here a delivery — which is admissible to the
-    /// delivery window's close. The proposer reads the same predicate
-    /// against its block's own anchor, so what this widens is
-    /// retention: the body and the tombstone are held while a delivery
-    /// could still be composed from them, and for nothing else.
+    /// core and every leg here a delivery — which is held one
+    /// [`BUNDLE_WAIT`] from **now**.
+    ///
+    /// The change of origin is the point, not the figure. A delivery is
+    /// admissible whenever the record it consumes can be proved present,
+    /// which is a question about the producer's chain and not about this
+    /// transaction's window — so a clock read off that window would put
+    /// back the bound this shard just stopped enforcing, and an envelope
+    /// offered again after it would be refused by the pool that should
+    /// have carried it. Measured from admission the pool holds a
+    /// delivering body for as long as a member composed from it would
+    /// wait on its bundle, and takes the same body again whenever it is
+    /// offered.
+    ///
+    /// Retention, and nothing else: what refuses a second delivery is
+    /// the claim cell its execution writes, and what licenses a late one
+    /// is the record proof the admitting block carries. Neither is this.
     fn admissible_until(
         &self,
         topology_snapshot: &TopologySnapshot,
         tx: &Transaction,
         cross_shard: bool,
     ) -> WeightedTimestamp {
-        let validity_end = tx.validity_range().end_timestamp_exclusive;
         let delivers = cross_shard
             && Classified::freeze(
                 tx.legs(),
@@ -1051,9 +1063,9 @@ impl MempoolCoordinator {
             )
             .only_delivers_at(self.local_shard);
         if delivers {
-            Window::Owed.of(Deadline::of(validity_end)).end
+            self.current_ts.plus(BUNDLE_WAIT)
         } else {
-            validity_end
+            tx.validity_range().end_timestamp_exclusive
         }
     }
 

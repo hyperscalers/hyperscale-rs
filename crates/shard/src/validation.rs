@@ -1529,7 +1529,9 @@ mod tests {
         let dup_tx = Arc::clone(&txs[0]);
         let block = block_with_transactions(BlockHeight::new(6), txs);
         let mut against = plain();
-        against.dedup.register_committed_txs(&[dup_tx]);
+        against
+            .dedup
+            .register_committed_txs(&[dup_tx], WeightedTimestamp::ZERO);
         let err = admit(&against, &block).unwrap_err();
         assert!(err.contains("already committed"));
     }

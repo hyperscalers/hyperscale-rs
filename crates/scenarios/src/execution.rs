@@ -1867,31 +1867,29 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
     );
 }
 
-/// A delivery cut off past the window its record is claimable in
-/// strands the crossing, however whole the network is afterwards.
+/// A delivery cut off for longer than any window still lands, because
+/// nothing about the crossing is on a clock.
 ///
 /// [`a_healed_network_delivers_past_the_old_window`] holds the same cut
-/// across the deadline and heals inside [`Window::Owed`], and the
-/// delivery lands: the crossing is still owed, the record still stands,
-/// and the delivering shard asks the producer for it. What bounds that
-/// is the window rather than the crossing — past its close admission
-/// refuses the delivery, and the claim cell the record is decided
-/// against is swept — so the same cut held wider loses the payment
-/// outright.
+/// across the deadline and heals a little after it. This one holds it
+/// past the instant that used to close admission for good, and the
+/// delivery lands all the same: the record still stands, the producer
+/// still offers the crossing, and the block that admits the delivery
+/// carries a proof of the record rather than a clock that permits it.
 ///
-/// The payer is debited, the recipient is never paid, and the record
-/// stands holding value nobody can reach: not the recipient, whose
-/// delivery can no longer be admitted, and not the payer, because
-/// nothing takes an owed crossing back.
+/// How long that can run is not the protocol's question any more but
+/// the pool's: a delivering body is held for as long as a member
+/// composed from it would wait on its bundle, measured from when it was
+/// offered here, and a delivery admitted past that needs the envelope
+/// from whoever still holds it.
 ///
 /// # Panics
 ///
 /// Panics if the payer's leg does not accept, if the bundle channels are
 /// never exercised, if the delivery lands while the cut stands, if the
-/// payment comes back to the payer, if the recipient is paid once the
-/// network heals, or if the record does not stand past the close of its
-/// window.
-pub fn a_delivery_cut_off_past_its_owed_window<C: FaultableCluster>(c: &mut C) {
+/// recipient is not paid once the network heals, or if any value is left
+/// stranded.
+pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCluster>(c: &mut C) {
     let (payer_key, from, to) = cross_shard_cast();
     let payer_shard = ShardId::leaf(1, 0);
     let recipient_shard = ShardId::leaf(1, 1);
@@ -1927,14 +1925,15 @@ pub fn a_delivery_cut_off_past_its_owed_window<C: FaultableCluster>(c: &mut C) {
         "the leg pays the payment and the price",
     );
 
-    // Past the close of the window the record states, with the cut
-    // standing the whole way.
-    let closed = Window::Owed
-        .of(Deadline::of(validity.end_timestamp_exclusive))
-        .end;
+    // Well past the deadline, with the cut standing the whole way: the
+    // transaction can no longer finalize anywhere, and under the rule
+    // this replaces the delivery was already running out the one window
+    // it had left.
+    let deadline = Deadline::of(validity.end_timestamp_exclusive);
     assert!(
-        c.run_until(epochs(60), |c| clock(c) >= closed),
-        "the cut must stand past the close of the crossing's own window",
+        c.run_until(epochs(60), |c| clock(c)
+            >= deadline.at().plus(MAX_VALIDITY_RANGE)),
+        "the cut must stand well past the transaction's deadline",
     );
     assert!(
         broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
@@ -1945,34 +1944,28 @@ pub fn a_delivery_cut_off_past_its_owed_window<C: FaultableCluster>(c: &mut C) {
         "the delivery must never have landed while its bundle was cut off",
     );
 
-    // Whole again, and too late. Nothing on either side moves after
-    // this: the delivery is inadmissible and the crossing is not the
-    // payer's to take back.
+    // Whole again, and not too late. The producer never stopped holding
+    // the record and never stopped offering the crossing, so the bundle
+    // reaches the recipient's shard on the next offer — and the block
+    // that admits the delivery proves the record present rather than
+    // reading a clock that would long since have closed.
     c.clear_drops();
-    let _ = c.run_until(epochs(8), |_| false);
     assert!(
-        c.chain_fate(recipient_shard, hash).0.is_none(),
-        "the delivery is refused past the close of its window, however \
-         whole the network is",
-    );
-    assert_eq!(
+        c.run_until(epochs(20), |c| vault_balance(c, recipient_shard, to)
+            == recipient_before + 100),
+        "the recipient must be paid once the crossing can reach it; holds {}",
         vault_balance(c, recipient_shard, to),
-        recipient_before,
-        "so the recipient is never paid",
     );
     assert_eq!(
         vault_balance(c, payer_shard, from),
         before - 100 - price,
-        "and the payment does not come back: nothing takes an owed crossing back",
+        "the payer is debited once: the payment crosses, it does not come back",
     );
     let stranded = world.stranded(c);
-    assert_eq!(
-        stranded.len(),
-        1,
-        "the crossing's record must stand past the close of its window, \
-         holding a payment nobody can reach; stranded = {stranded:?}",
+    assert!(
+        stranded.is_empty(),
+        "and nothing is left standing in a record; stranded = {stranded:?}",
     );
-    assert_eq!(stranded[0].1, 100, "and what it holds is the payment");
 }
 
 /// What the deadline scenario stakes: well under its funding, so the

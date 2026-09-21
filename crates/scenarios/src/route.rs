@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    Address, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
-    TransactionStatus, TxHash, WeightedTimestamp, Window,
+    Address, BUNDLE_WAIT, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
 };
 
 use crate::straddler::isolate_ec_intake;
@@ -225,8 +225,9 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         "the certificate channel must actually have been exercised and cut",
     );
     assert!(
-        clock(c) < Window::Owed.of(Deadline::of(validity_end)).end,
-        "the cut has to lift inside the delivery window, or the core's output has nowhere to land",
+        clock(c) < validity_end.plus(BUNDLE_WAIT),
+        "the cut has to lift while the delivering member is still waiting on its bundle, \
+         or the core's output has nowhere to land",
     );
     for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
         assert!(

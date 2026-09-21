@@ -169,12 +169,12 @@ pub(crate) fn owed_at<C: Cluster + ?Sized>(
 /// stranded.
 ///
 /// The two kinds close for different reasons and the arms are kept
-/// apart, since the instants agreeing today is arithmetic rather than a
-/// shared argument:
+/// apart:
 ///
-/// - an **owed** record is claimed by a delivery, and admission refuses
-///   one past [`Window::Owed`] — the only writer of the claim cell is
-///   gone;
+/// - an **owed** record is claimed by a delivery, and nothing closes
+///   that: the crossing is its consumer's whenever it runs, so the value
+///   is in flight for as long as the record stands and this arm never
+///   reports it stranded;
 /// - an **escrowed** one is taken by a core or credited back to the cell
 ///   it names, and past [`Window::LegEntry`] neither can be composed:
 ///   the core is long past its deadline and no absence of the claim
@@ -190,11 +190,10 @@ pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
         .and_then(|bytes| CrossingCell::from_bytes(&bytes))
         .is_some_and(|record| {
             let deadline = Deadline::from_expiry(record.expiry_ms);
-            let window = match record.terms {
-                Terms::Owed => Window::Owed,
-                Terms::Escrowed { .. } => Window::LegEntry,
-            };
-            window.of(deadline).end <= clock(c)
+            match record.terms {
+                Terms::Owed => false,
+                Terms::Escrowed { .. } => Window::LegEntry.of(deadline).end <= clock(c),
+            }
         });
     if closed {
         owed_at(c, cell, resource)

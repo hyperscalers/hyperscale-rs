@@ -521,6 +521,14 @@ impl SimCluster {
     /// after the teardown on a host that serves nothing — dropped, not
     /// delayed. A client routes to the committee the beacon names, and
     /// so does this.
+    fn submit_at(&mut self, host: NodeIndex, tx: Arc<Transaction>) {
+        self.runner.schedule_initial_event(
+            host,
+            Duration::ZERO,
+            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
+        );
+    }
+
     fn host_for_tx(&self, tx: &Transaction) -> Option<NodeIndex> {
         let topology_snapshot = self.runner.host_topology(0)?;
         // Built by the harness rather than by a node, so nothing has
@@ -551,11 +559,16 @@ impl Cluster for SimCluster {
 
     fn submit(&mut self, tx: Arc<Transaction>) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
-        self.runner.schedule_initial_event(
-            host,
-            Duration::ZERO,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
-        );
+        self.submit_at(host, tx);
+    }
+
+    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
+        let host = self
+            .live_committee_hosts(shard)
+            .first()
+            .copied()
+            .unwrap_or(0);
+        self.submit_at(host, tx);
     }
 
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool {

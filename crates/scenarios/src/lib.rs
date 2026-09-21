@@ -33,7 +33,8 @@ mod witnesses;
 
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use execution::{
-    a_delivery_cut_off_past_its_owed_window, a_delivery_cut_off_past_its_window_is_owed,
+    a_delivery_cut_off_past_its_window_is_owed,
+    a_delivery_lands_past_every_window_once_the_bundle_arrives,
     a_failed_attempt_still_attests_work, a_healed_network_delivers_past_the_old_window,
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,

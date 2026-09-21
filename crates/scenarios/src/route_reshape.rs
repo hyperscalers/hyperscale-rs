@@ -20,9 +20,9 @@ use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId,
+    BUNDLE_WAIT, BlockHeight, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId,
     SubstateKey, TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    WeightedTimestamp, Window,
+    WeightedTimestamp,
 };
 
 use crate::reshape::split_lifecycle;
@@ -1584,8 +1584,9 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
     if !banked {
         let clock = WeightedTimestamp::ZERO.plus(c.now());
         assert!(
-            clock >= Window::Owed.of(Deadline::of(validity_end)).end,
-            "the route must bank its output for the trader while its delivery window is open; \
+            clock >= validity_end.plus(BUNDLE_WAIT),
+            "the route must bank its output for the trader while a delivering member is still \
+             waiting on its bundle; \
              holds {} against {paid}",
             held(c, route.trader.address(), *PROTOCOL_RESOURCE),
         );

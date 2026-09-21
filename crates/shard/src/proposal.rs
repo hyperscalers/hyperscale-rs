@@ -21,11 +21,11 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CrossingReoffer, Deadline,
-    Epoch, Finalization, Hash, LocalTimestamp, Probed, ProposerTimestamp, Provisions, ReadySignal,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CrossingReoffer, Epoch,
+    Finalization, Hash, LocalTimestamp, Probed, ProposerTimestamp, Provisions, ReadySignal,
     ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, SubstateKey, TopologySchedule,
     TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, Window,
+    WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -179,7 +179,7 @@ pub struct Prefilter<'a> {
 
 /// Filter ready transactions for proposal inclusion. Drops what the
 /// voters' delegated root check refuses — a `validity_range` malformed
-/// against the anchor or not containing it, unless the anchor admits
+/// against the anchor or not containing it, unless the block licenses
 /// the transaction as a late delivery — and what their fence defers on
 /// — a transaction opening before the chain's origin that no
 /// predecessor has proven absent; then keeps what
@@ -202,14 +202,11 @@ pub fn select_transactions(
         .iter()
         .filter(|tx| {
             let h = tx.hash();
-            // A delivery is admissible to its record's window, not the
-            // transaction's — the same rule the voters' root check reads.
+            // A delivery is admissible past its transaction's window on
+            // a licence rather than on a clock — the same rule the
+            // voters' root check reads.
             let range = tx.validity_range();
-            let admitted = range.contains(ctx.anchor)
-                || (prefilter.late_deliveries.contains(&h)
-                    && Window::Owed
-                        .of(Deadline::of(range.end_timestamp_exclusive))
-                        .contains(&ctx.anchor));
+            let admitted = range.contains(ctx.anchor) || prefilter.late_deliveries.contains(&h);
             if !range.is_well_formed(ctx.anchor) || !admitted {
                 expired += 1;
                 return false;
@@ -612,8 +609,8 @@ mod tests {
         stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, Inclusion,
-        LocalKey, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE,
+        Address, AddressClass, Anchor, BlockHeight, CommittedAt, CommittedTxsRoot, Deadline, Hash,
+        Inclusion, LocalKey, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE,
         NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot, TimestampRange,
         TransactionDecision, UnsettledTx, ValidatorSet,
     };
@@ -1296,10 +1293,10 @@ mod tests {
     }
 
     /// A transaction named a late delivery is offered past its validity
-    /// end while the delivery window is open, and dropped at the close;
-    /// one not named is dropped at the validity end as before.
+    /// end at any anchor; one not named is dropped at the validity end
+    /// as before.
     #[test]
-    fn select_transactions_offers_a_late_delivery_to_the_windows_close() {
+    fn select_transactions_offers_a_named_late_delivery_at_any_anchor() {
         let end = ts(1_000);
         let range = TimestampRange::new(ts(500), end);
         let delivery = tx_with_range(7, range);
@@ -1334,18 +1331,10 @@ mod tests {
             "at the end only the delivery"
         );
         assert_eq!(
-            select(
-                Window::Owed
-                    .of(Deadline::of(end))
-                    .end
-                    .minus(Duration::from_millis(1))
-            ),
+            select(end.plus(Duration::from_hours(24))),
             vec![delivery.hash()],
-            "and to the last moment of its window"
-        );
-        assert!(
-            select(Window::Owed.of(Deadline::of(end)).end).is_empty(),
-            "the close drops it"
+            "and at any anchor past it, since the licence the set stands for is \
+             not on a clock"
         );
     }
 

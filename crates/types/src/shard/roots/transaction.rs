@@ -6,8 +6,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    Deadline, Hash, Transaction, TransactionRoot, TxHash, Verifiable, Verified, Verify,
-    WeightedTimestamp, Window, compute_merkle_root,
+    Hash, Transaction, TransactionRoot, TxHash, Verifiable, Verified, Verify, WeightedTimestamp,
+    compute_merkle_root,
 };
 
 /// Inputs the [`TransactionRoot`] verifier reads against.
@@ -26,10 +26,11 @@ pub struct TransactionRootContext<'a> {
     /// during transaction selection.
     pub validity_anchor: WeightedTimestamp,
     /// Transactions this shard only delivers for — frozen divided with
-    /// this shard outside the core and every leg here a delivery — which
-    /// the anchor admits past their validity end, up to the delivery
-    /// window's close. The set is the caller's, computed against the
-    /// block's own anchor, so proposer and voters derive one set.
+    /// this shard outside the core and every leg here a delivery — whose
+    /// records this block proves still present, and which the anchor
+    /// therefore admits past their validity end. The set is the
+    /// caller's, computed against the block's own anchor and the block's
+    /// own claims, so proposer and voters derive one set.
     pub late_deliveries: &'a HashSet<TxHash>,
 }
 
@@ -110,13 +111,13 @@ impl Verify<&TransactionRootContext<'_>> for TransactionRoot {
         }
         for tx in ctx.transactions {
             let range = tx.validity_range();
-            // A delivery bears no verdict and claims a cell consumed once,
-            // so its window is the record's rather than the transaction's.
-            let admitted = range.contains(ctx.validity_anchor)
-                || (ctx.late_deliveries.contains(&tx.hash())
-                    && Window::Owed
-                        .of(Deadline::of(range.end_timestamp_exclusive))
-                        .contains(&ctx.validity_anchor));
+            // A delivery bears no verdict and claims a cell consumed
+            // once, so it is admissible past its transaction's window on
+            // a licence rather than on a clock: the record it consumes
+            // proved present by a claim this block carries, which is
+            // what `late_deliveries` names it for.
+            let admitted =
+                range.contains(ctx.validity_anchor) || ctx.late_deliveries.contains(&tx.hash());
             if !range.is_well_formed(ctx.validity_anchor) || !admitted {
                 return Err(TxRootVerifyError::ValidityWindowExpired {
                     tx_hash: tx.hash(),
