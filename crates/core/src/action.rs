@@ -12,19 +12,18 @@ use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusPublicKey, CrossingReoffer, DeclaredRange, Epoch, EpochWindows,
-    EscrowedValue, ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash,
-    HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteEquivocation, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain,
-    Round, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates,
-    SharedReoffers, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
-    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot,
-    SubstateEntry, SubstateKey, SweepFrontier, TerminalRoots, TickId, Timeout, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
-    WeightedTimestamp,
+    CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
+    ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
+    LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
+    PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, ShardForkProof,
+    ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
+    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
+    SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateEntry, SubstateKey, SweepFrontier,
+    TerminalRoots, TickId, Timeout, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId,
+    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
@@ -913,9 +912,6 @@ pub enum Action {
         /// Certificates in the block, whose committed outcomes promise
         /// crossing bundles.
         certificates: SharedCertificates,
-        /// Crossing re-offers in the block, whose targets it promises a
-        /// bundle past what its certificates commit.
-        reoffers: SharedReoffers,
         /// Topology snapshot used to route txs to target shards.
         topology_snapshot: TopologySnapshot,
     },
@@ -1014,12 +1010,6 @@ pub enum Action {
         /// Proofs of counterparts' cells this proposer's fetches
         /// answered, for every replica to fold at commit.
         state_claims: Vec<StateClaim>,
-        /// The crossings this block offers a consumer again, because
-        /// this shard's ledger says no claim has answered them. The
-        /// block's `provision_tx_roots` promise each target a bundle
-        /// built at this height, which is what lets a consumer that
-        /// missed the first offer admit the record at all.
-        reoffers: Vec<CrossingReoffer>,
         /// Prior fee-reservation demand per local payer among the
         /// candidate transactions — in-flight holds plus the uncommitted
         /// window, excluding the candidates themselves. The builder

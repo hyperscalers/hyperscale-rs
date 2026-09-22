@@ -18,12 +18,12 @@ use hyperscale_core::{
     Action, CommitSource, FeeDemand, FetchIds, FetchRequest, ProtocolEvent, TimerId,
 };
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, CrossingReoffer,
-    DeferOn, Epoch, FinalizationHash, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
-    PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvenCells, ProvisionHash, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
-    StoredReceipt, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
-    derive_reshape_trigger, ready_signal_window,
+    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
+    FinalizationHash, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr,
+    ProposerTimestamp, ProvenAnchors, ProvenCells, ProvisionHash, ReadySignal, ReshapeThresholds,
+    ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
+    SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, derive_reshape_trigger,
+    ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -164,8 +164,8 @@ use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::admission::{
-    Admission, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, ReoffersFold,
-    StateClaimsFold, TransactionsFold,
+    Admission, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateClaimsFold,
+    TransactionsFold,
 };
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
@@ -184,7 +184,7 @@ use crate::precut::Precut;
 use crate::proposal::{
     Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
     dispatch_or_defer, late_deliveries, select_abandonment_records, select_finalizations,
-    select_provisions, select_reoffers, select_state_claims, select_transactions,
+    select_provisions, select_state_claims, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -2123,7 +2123,6 @@ impl ShardCoordinator {
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
         state_claims: Vec<StateClaim>,
-        reoffers: Vec<CrossingReoffer>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -2256,7 +2255,6 @@ impl ShardCoordinator {
             &mut RecordsFold::after(&finalization_fold),
             abandonment_records,
         );
-        let reoffers = select_reoffers(&ctx, &mut ReoffersFold::default(), reoffers);
 
         self.build_and_dispatch_proposal(
             topology_schedule,
@@ -2268,7 +2266,6 @@ impl ShardCoordinator {
                 provisions,
                 abandonment_records,
                 state_claims,
-                reoffers,
             }),
         )
     }
@@ -4856,7 +4853,6 @@ impl ShardCoordinator {
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
         state_claims: Vec<StateClaim>,
-        reoffers: Vec<CrossingReoffer>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -4916,7 +4912,6 @@ impl ShardCoordinator {
             provisions,
             abandonment_records,
             state_claims,
-            reoffers,
         ));
 
         actions
@@ -7741,7 +7736,6 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8236,7 +8230,6 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
-                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -8319,7 +8312,6 @@ mod tests {
                 provisions: Arc::new(Capped::empty()),
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
-                reoffers: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -8535,7 +8527,6 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8980,7 +8971,6 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -10644,7 +10634,6 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            vec![],
         );
 
         // Should emit BuildProposal for height 4 even with empty content.
@@ -10700,7 +10689,6 @@ mod tests {
             block_3_hash,
             &qc,
             &[],
-            vec![],
             vec![],
             vec![],
             vec![],
@@ -10770,15 +10758,7 @@ mod tests {
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
 
-        let first = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let first = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -10790,15 +10770,7 @@ mod tests {
             "defer slot should be recorded"
         );
 
-        let second = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let second = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             second.is_empty(),
             "second try_propose for same (height, round) must be suppressed"
@@ -10816,15 +10788,7 @@ mod tests {
             "deferred slot should be cleared"
         );
 
-        let third = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let third = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             third.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -10871,7 +10835,7 @@ mod tests {
         // the sync-commit shape, whose commits carry no byte delta.
         assert_ne!(state.substate_bytes_frontier.0, state.committed_height);
 
-        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![], vec![]);
+        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -10890,7 +10854,7 @@ mod tests {
             "the reconcile must latch a proposal retry"
         );
 
-        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![], vec![]);
+        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![]);
         assert!(
             second.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -11182,7 +11146,6 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            vec![],
         );
 
         let proposal = actions
@@ -11238,15 +11201,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         let Some(Action::BuildProposal { timestamp, .. }) = actions
             .iter()
             .find(|a| matches!(a, Action::BuildProposal { .. }))
@@ -11279,15 +11234,7 @@ mod tests {
 
         let height = BlockHeight::new(4);
         let round = Round::new(4);
-        let actions = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             actions
                 .iter()
@@ -11310,15 +11257,7 @@ mod tests {
         assert_eq!(state.last_voted_round(), round);
 
         // The retry at the same view must be a no-op, not a sibling build.
-        let retry = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let retry = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(retry.is_empty(), "retry built a sibling: {retry:?}");
     }
 
@@ -11379,7 +11318,7 @@ mod tests {
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
-        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![], vec![], vec![]);
+        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![], vec![]);
         let classification = actions
             .iter()
             .find_map(|a| match a {
@@ -12296,7 +12235,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -12367,7 +12305,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -12417,7 +12354,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -12470,15 +12406,7 @@ mod tests {
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
-        let _ = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let _ = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
 
         assert_eq!(
             state.view_change.last_leader_activity,
@@ -12589,15 +12517,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             actions
                 .iter()
@@ -12641,7 +12561,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -12677,7 +12596,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         };
 
         let result = state.admit_transactions(&topology, &block);
@@ -12783,7 +12701,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -12817,7 +12734,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -13106,7 +13022,6 @@ mod tests {
                 Capped::new(records).expect("a list written out in a test"),
             ),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -13124,7 +13039,6 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -13741,7 +13655,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -14104,7 +14017,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -14199,7 +14111,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -14222,7 +14133,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         }
     }
 

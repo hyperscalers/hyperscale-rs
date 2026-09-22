@@ -12,12 +12,12 @@ use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use crate::{
-    AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CrossingReoffer, Demands,
-    Derivation, ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate,
-    ShardId, SharedWitnessSources, SplitChildRoots, StateClaim, StateRoot, Transaction, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
+    ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
+    StateRoot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -75,10 +75,6 @@ pub type SharedCertificates =
 /// Shared provision list — same rationale as [`SharedCertificates`].
 pub type SharedProvisions = Arc<Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>>;
 
-/// Shared crossing re-offer list — same rationale as
-/// [`SharedCertificates`].
-pub type SharedReoffers = Arc<Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>>;
-
 /// What a shard charged across the ticks `certificates` settle, in
 /// quanta.
 ///
@@ -135,12 +131,6 @@ pub enum Block {
         /// headers. Committed via the header's `state_claims_root` and
         /// folded by every replica at commit.
         state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
-        /// The crossings this block offers a consumer again: the shard
-        /// owed each claim and the record cells its bundle is built
-        /// from. Committed via the header's `reoffer_root`, and what
-        /// the block's `provision_tx_roots` promise past its own
-        /// certificates.
-        reoffers: SharedReoffers,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -172,11 +162,6 @@ pub enum Block {
         /// the records: a replay of any depth re-folds its answers off
         /// the block it reads, and the root binds at every stage.
         state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
-        /// The crossings the block offered again, retained through
-        /// sealing like the claims: a bundle is built off this block
-        /// for as long as the crossing is owed, which outlasts the
-        /// execution window by far.
-        reoffers: SharedReoffers,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -251,7 +236,6 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -279,7 +263,6 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -310,7 +293,6 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -458,26 +440,6 @@ impl Block {
         }
     }
 
-    /// The crossings the block offers a consumer again, regardless of
-    /// variant — what its `provision_tx_roots` promise past its own
-    /// certificates, and what a bundle built off this block carries for
-    /// each target named here.
-    #[must_use]
-    pub fn reoffers(&self) -> &Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK> {
-        match self {
-            Self::Live { reoffers, .. } | Self::Sealed { reoffers, .. } => reoffers,
-        }
-    }
-
-    /// The re-offer section as the shared handle a verification action
-    /// holds, so the root check owns the list without deep-cloning it.
-    #[must_use]
-    pub fn reoffers_shared(&self) -> SharedReoffers {
-        match self {
-            Self::Live { reoffers, .. } | Self::Sealed { reoffers, .. } => Arc::clone(reoffers),
-        }
-    }
-
     /// Every transaction the block's finalizations resolve without
     /// deciding: a delivery's or a leg's, checked against the lapse
     /// where the body says this shard delivers for it.
@@ -614,7 +576,6 @@ impl Block {
                 provisions,
                 abandonment_records,
                 state_claims,
-                reoffers,
                 witness_sources,
             } => {
                 // One hash per body, so the list keeps the cap the
@@ -627,7 +588,6 @@ impl Block {
                     provision_hashes: Arc::new(hashes),
                     abandonment_records,
                     state_claims,
-                    reoffers,
                     witness_sources,
                 }
             }
@@ -652,7 +612,6 @@ impl Block {
                 certificates,
                 abandonment_records,
                 state_claims,
-                reoffers,
                 witness_sources,
                 ..
             } => Self::Live {
@@ -662,7 +621,6 @@ impl Block {
                 provisions,
                 abandonment_records,
                 state_claims,
-                reoffers,
                 witness_sources,
             },
             Self::Live { .. } => {

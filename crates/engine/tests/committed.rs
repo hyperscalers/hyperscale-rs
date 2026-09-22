@@ -122,7 +122,6 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
         provisions,
         abandonment_records,
         state_claims,
-        reoffers,
         witness_sources,
         ..
     } = block_settling(BlockHeight::new(1), vec![right_half])
@@ -136,7 +135,6 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
         provisions,
         abandonment_records,
         state_claims,
-        reoffers,
         witness_sources,
     };
 

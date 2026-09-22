@@ -281,7 +281,6 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
-        reoffers: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -525,7 +524,6 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             provisions,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -537,7 +535,6 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
                 provisions,
                 abandonment_records,
                 state_claims,
-                reoffers,
                 witness_sources,
             }
         }
@@ -548,7 +545,6 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             provision_hashes,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -560,7 +556,6 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
                 provision_hashes,
                 abandonment_records,
                 state_claims,
-                reoffers,
                 witness_sources,
             }
         }
@@ -576,7 +571,6 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             certificates,
             provisions,
             state_claims,
-            reoffers,
             witness_sources,
             ..
         } => Block::Live {
@@ -586,7 +580,6 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             provisions,
             abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
-            reoffers,
             witness_sources,
         },
         Block::Sealed {
@@ -595,7 +588,6 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             certificates,
             provision_hashes,
             state_claims,
-            reoffers,
             witness_sources,
             ..
         } => Block::Sealed {
@@ -605,7 +597,6 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             provision_hashes,
             abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
-            reoffers,
             witness_sources,
         },
     }
@@ -819,7 +810,6 @@ pub fn commit_block_with_witnesses(
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
-        reoffers: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -876,7 +866,6 @@ pub fn commit_block_with_witness_window(
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
-        reoffers: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -1974,7 +1963,6 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             certificates,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
             ..
         } => Block::Live {
@@ -1984,7 +1972,6 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -2000,7 +1987,6 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             provisions,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
             ..
         } => Block::Live {
@@ -2010,7 +1996,6 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             provisions,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,

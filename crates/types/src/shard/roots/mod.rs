@@ -27,7 +27,6 @@ pub mod leaf;
 pub mod local_receipt;
 pub mod provision_tx;
 pub mod provisions;
-pub mod reoffers;
 pub mod reveal_chain;
 pub mod settled_txs;
 pub mod state;

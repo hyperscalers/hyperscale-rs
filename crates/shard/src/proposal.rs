@@ -21,18 +21,17 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CrossingReoffer, Epoch,
-    Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal, ReshapeTrigger,
-    RevealChain, Round, ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
+    LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
+    ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 use tracing::debug;
 
 use crate::admission::{
     Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
-    RecordsFold, RecordsSection, ReoffersFold, ReoffersSection, StateClaimsFold,
-    StateClaimsSection, TransactionsFold, TransactionsSection, admit_each, record_reading,
-    unwrapped,
+    RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
+    TransactionsSection, admit_each, record_reading, unwrapped,
 };
 use crate::chain_view::ChainView;
 use crate::precut::Precut;
@@ -65,7 +64,6 @@ pub struct ProposalPayload {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
-    pub(crate) reoffers: Vec<CrossingReoffer>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,29 +369,6 @@ pub fn select_state_claims(
     admit_each::<StateClaimsSection, _>(ctx, fold, sorted, |bundle| bundle).0
 }
 
-/// The crossings a block may offer again: what
-/// [`ReoffersSection`] admits from the ledger's outstanding set, in the
-/// one order it carries them — ascending, without repeats, and no more
-/// than the block's cap, with the rest waiting a block.
-///
-/// An offer naming no record promises a bundle with nothing in it, so
-/// it is dropped rather than carried: the crossing stays outstanding
-/// and is offered again when it has something to carry.
-#[must_use]
-pub fn select_reoffers(
-    ctx: &Admission<'_>,
-    fold: &mut ReoffersFold,
-    reoffers: Vec<CrossingReoffer>,
-) -> Vec<CrossingReoffer> {
-    let mut sorted: Vec<CrossingReoffer> = reoffers
-        .into_iter()
-        .filter(CrossingReoffer::is_well_formed)
-        .collect();
-    sorted.sort_unstable();
-    sorted.dedup();
-    admit_each::<ReoffersSection, _>(ctx, fold, sorted, |offer| offer).0
-}
-
 /// Select provisions for inclusion: what [`ProvisionsSection`] admits
 /// from the FIFO queue, folding into `fold`. Oldest batches go first so
 /// the queue drains monotonically; unselected batches remain queued for
@@ -502,7 +477,6 @@ pub fn assemble_build_action(
         provisions,
         abandonment_records,
         state_claims,
-        reoffers,
     } = payload;
 
     // The proposer's new BlockHeader will carry parent_qc in its wire
@@ -525,7 +499,6 @@ pub fn assemble_build_action(
         provisions,
         abandonment_records,
         state_claims,
-        reoffers,
         fee_checks,
         fee_read_height,
         parent_in_flight,

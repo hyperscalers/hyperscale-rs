@@ -25,12 +25,12 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, BlockHeight, CrossingReoffer, DeclaredWork, Finalization,
-    FinalizationHash, Inclusion, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    Probed, ProvisionHash, Provisions, ShardId, StateClaim, SubstateKey, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp, budget_admits_block,
-    caps_admit_transaction, evidence_admits_block, sweep_admits_block,
+    AbandonmentRecord, BlockHash, BlockHeight, DeclaredWork, Finalization, FinalizationHash,
+    Inclusion, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Probed, ProvisionHash, Provisions, ShardId,
+    StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable,
+    WeightedTimestamp, budget_admits_block, caps_admit_transaction, evidence_admits_block,
+    sweep_admits_block,
 };
 
 use crate::chain_view::ChainView;
@@ -780,77 +780,6 @@ impl Section for StateClaimsSection {
             ));
         }
         fold.previous = Some(claim.clone());
-        fold.count += 1;
-        Ok(())
-    }
-}
-
-/// The block's crossing re-offers.
-pub(crate) struct ReoffersSection;
-
-/// What the offers admitted so far amount to.
-#[derive(Debug, Default)]
-pub(crate) struct ReoffersFold {
-    /// The last admitted offer, which the next must follow.
-    pub(crate) previous: Option<CrossingReoffer>,
-    /// How many have been admitted, against the block's cap.
-    pub(crate) count: usize,
-}
-
-impl Section for ReoffersSection {
-    type Item = CrossingReoffer;
-    type Fold = ReoffersFold;
-
-    /// A well-formed offer, in its place in the section's ascending
-    /// order without repeats, within the block's cap.
-    ///
-    /// The canonical order means one outstanding set has one encoding,
-    /// and it is what the block's `provision_tx_roots` bucket the
-    /// offers in — so a voter recomputing that map walks the order it
-    /// would have built. An offer naming no record promises a bundle
-    /// with nothing in it, which the cap is not spent on.
-    ///
-    /// Whether the crossing really is unclaimed is not asked. A voter
-    /// could ask it — the outstanding set is a fold over committed
-    /// content, so every replica at one frontier holds the same one —
-    /// and what it would buy does not pay for the frontier disagreement
-    /// it would introduce. An offer nobody needed reaches its target as
-    /// part of the one bundle that block already owed it, since an
-    /// expectation is keyed by source block and not by offer, so a
-    /// proposer filling the section buys itself one larger bundle and
-    /// not one fetch per entry. What it can do is spend the cap on
-    /// nothing while it leads, holding a real offer back a round. A
-    /// crossing stands to the close of its delivery window and is
-    /// offered again no faster than a promise could be answered, so a
-    /// round lost to a proposer that wastes the section is one of very
-    /// many, and the honest round that follows carries it.
-    fn admit(
-        _ctx: &Admission<'_>,
-        fold: &mut Self::Fold,
-        offer: &CrossingReoffer,
-    ) -> Result<(), String> {
-        if !offer.is_well_formed() {
-            return Err(format!(
-                "crossing re-offer {} is empty, over its cap, or out of order",
-                fold.count
-            ));
-        }
-        if fold
-            .previous
-            .as_ref()
-            .is_some_and(|previous| previous >= offer)
-        {
-            return Err(format!(
-                "crossing re-offer {} repeats or precedes the one before it",
-                fold.count
-            ));
-        }
-        if fold.count >= MAX_REOFFERS_PER_BLOCK {
-            return Err(format!(
-                "block carries more than {MAX_REOFFERS_PER_BLOCK} crossing re-offers"
-            ));
-        }
-        fold.previous = Some(offer.clone());
         fold.count += 1;
         Ok(())
     }

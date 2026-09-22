@@ -947,7 +947,6 @@ impl VerificationPipeline {
             expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
             certificates: block.certificates().clone(),
-            reoffers: block.reoffers_shared(),
             topology_snapshot: topology_snapshot.clone(),
         }]
     }
@@ -2243,7 +2242,6 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -2304,7 +2302,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -2352,7 +2349,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         }
     }
 
@@ -3066,7 +3062,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
         };
         let demands = block.demands();
         assert!(demands.contains(VerificationKind::TransactionRoot));

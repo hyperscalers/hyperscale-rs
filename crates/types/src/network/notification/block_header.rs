@@ -123,7 +123,6 @@ mod tests {
             Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),
-            Capped::from_array([]),
             WitnessSources::empty(),
         );
 
@@ -138,7 +137,6 @@ mod tests {
         let header = make_header(BlockHeight::new(5));
         let manifest = BlockManifest::new(
             Capped::from_array([TxHash::from(Hash::from_bytes(b"tx1"))]),
-            Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),
@@ -162,7 +160,6 @@ mod tests {
             make_header(BlockHeight::new(1)),
             BlockManifest::new(
                 Capped::from_array([tx1, tx2, tx3]),
-                Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),

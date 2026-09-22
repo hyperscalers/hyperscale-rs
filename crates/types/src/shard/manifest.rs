@@ -5,10 +5,9 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
-    CrossingReoffer, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, StateClaim, TxHash, Verifiable,
-    WitnessSources,
+    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    QuorumCertificate, StateClaim, TxHash, Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -33,10 +32,6 @@ pub struct BlockManifest {
     /// a voter checks each against a proof of its own rather than
     /// against anything it could fetch back from a later source.
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
-    /// The crossings the block offers again, mirrored verbatim: a
-    /// bundle is built off the block for each, so a block rebuilt from
-    /// its manifest has to promise — and serve — exactly what it did.
-    reoffers: Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
@@ -54,7 +49,6 @@ impl Default for BlockManifest {
             provision_hashes: Capped::empty(),
             abandonment_records: Capped::empty(),
             state_claims: Capped::empty(),
-            reoffers: Capped::empty(),
             witness_sources: WitnessSources::empty(),
         }
     }
@@ -70,7 +64,6 @@ impl BlockManifest {
         provision_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
         abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
         state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
-        reoffers: Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>,
         witness_sources: WitnessSources,
     ) -> Self {
         Self {
@@ -79,7 +72,6 @@ impl BlockManifest {
             provision_hashes,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
         }
     }
@@ -121,12 +113,6 @@ impl BlockManifest {
         &self.state_claims
     }
 
-    /// The crossings the block offers a consumer again.
-    #[must_use]
-    pub const fn reoffers(&self) -> &Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK> {
-        &self.reoffers
-    }
-
     /// The block's beacon-witness inputs.
     #[must_use]
     pub const fn witness_sources(&self) -> &WitnessSources {
@@ -162,7 +148,6 @@ impl BlockManifest {
             provision_hashes,
             block.abandonment_records().clone(),
             block.state_claims().clone(),
-            block.reoffers().clone(),
             block.witness_sources().as_ref().clone(),
         )
     }

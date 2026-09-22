@@ -117,7 +117,6 @@ mod tests {
             &topology_snapshot,
             &[],
             &[],
-            &[],
         );
         assert!(map.is_empty());
     }
@@ -135,7 +134,6 @@ mod tests {
             ShardId::leaf(1, 0),
             &topology_snapshot,
             &[tx],
-            &[],
             &[],
         );
         assert!(map.is_empty(), "single-shard tx must not produce an entry");
@@ -163,7 +161,6 @@ mod tests {
             ShardId::leaf(1, 0),
             &topology_snapshot,
             &[tx_a.clone(), tx_b.clone()],
-            &[],
             &[],
         );
 

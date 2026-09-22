@@ -25,10 +25,9 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
-    CrossingReoffer, Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_REOFFERS_PER_BLOCK,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate,
-    StateClaim, Transaction, TxHash, Verifiable, WitnessSources,
+    Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, StateClaim, Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -119,7 +118,6 @@ pub struct ElidedCertifiedBlock {
     /// The crossings the block offers again, always inline: a bundle is
     /// built off the block for each, so a hop that dropped them would
     /// hand back a block whose header promises what it cannot serve.
-    reoffers: Capped<Vec<CrossingReoffer>, MAX_REOFFERS_PER_BLOCK>,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
@@ -256,7 +254,6 @@ impl ElidedCertifiedBlock {
             provisions,
             abandonment_records: block.abandonment_records().clone(),
             state_claims: block.state_claims().clone(),
-            reoffers: block.reoffers().clone(),
             witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
@@ -349,7 +346,6 @@ impl ElidedCertifiedBlock {
                     provisions: Arc::new(provisions),
                     abandonment_records: Arc::new(self.abandonment_records.clone()),
                     state_claims: Arc::new(self.state_claims.clone()),
-                    reoffers: Arc::new(self.reoffers.clone()),
                     witness_sources: Arc::new(self.witness_sources.clone()),
                 }
             }
@@ -360,7 +356,6 @@ impl ElidedCertifiedBlock {
                 provision_hashes: Arc::new(hashes.clone()),
                 abandonment_records: Arc::new(self.abandonment_records.clone()),
                 state_claims: Arc::new(self.state_claims.clone()),
-                reoffers: Arc::new(self.reoffers.clone()),
                 witness_sources: Arc::new(self.witness_sources.clone()),
             },
             (None, ElidedProvisions::Live(_)) => {
@@ -486,7 +481,6 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -527,7 +521,6 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
             ..
         } = create_test_block()
@@ -541,7 +534,6 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
         }
     }

@@ -10,10 +10,9 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
-    BlockHeight, ConsensusPublicKey, CrossingReoffer, DeclaredKey, DeclaredRange,
-    ExecutionCertificate, Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, VoteCount, WeightedTimestamp,
-    committed_crossings,
+    BlockHeight, ConsensusPublicKey, DeclaredKey, DeclaredRange, ExecutionCertificate,
+    Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, ValidatorId, Verifiable, VoteCount, WeightedTimestamp, committed_crossings,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -275,41 +274,14 @@ pub fn record_requests(
         .collect()
 }
 
-/// The crossing bundles a block's re-offers promise: one request per
-/// offer, naming the record cells it carries and the single shard owed
-/// them.
-///
-/// Read off the block's own section, in block order — the order its
-/// provision roots bucket them, after the transactions and the
-/// certificates — so a proposer broadcasting a bundle and a peer
-/// answering a fetch for it stage the same requests.
-#[must_use]
-pub fn reoffer_requests(
-    reoffers: &[CrossingReoffer],
-    local_shard: ShardId,
-) -> Vec<ProvisionsRequest> {
-    reoffers
-        .iter()
-        .filter(|offer| offer.target != local_shard)
-        .map(|offer| ProvisionsRequest {
-            tx_hash: offer.tx_hash,
-            targets: vec![offer.target],
-            local_keys: offer.records.to_vec(),
-            local_ranges: Vec::new(),
-        })
-        .collect()
-}
-
 /// Build provision requests and shard recipients for cross-shard
-/// transactions, for the crossings the block's certificates commit, and
-/// for the crossings it offers again.
+/// transactions and for the crossings the block's certificates commit.
 ///
 /// Returns `None` if nothing in the block owes anyone a bundle.
 pub fn build_provision_requests(
     topology_snapshot: &TopologySnapshot,
     transactions: &[Arc<Verifiable<Transaction>>],
     certificates: &[Arc<Verifiable<Finalization>>],
-    reoffers: &[CrossingReoffer],
     me: ValidatorId,
     local_shard: ShardId,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
@@ -324,10 +296,8 @@ pub fn build_provision_requests(
             provision_requests.push(request);
         }
     }
-    // After the transactions, as the block's roots bucket them, and the
-    // re-offers after those.
+    // After the transactions, as the block's roots bucket them.
     provision_requests.extend(crossing_requests(certificates, local_shard));
-    provision_requests.extend(reoffer_requests(reoffers, local_shard));
 
     if provision_requests.is_empty() {
         return None;

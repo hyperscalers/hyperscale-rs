@@ -362,7 +362,6 @@ impl ExecutionSim {
                 certificates,
                 abandonment_records,
                 state_claims,
-                reoffers,
                 witness_sources,
                 ..
             } => Block::Live {
@@ -372,7 +371,6 @@ impl ExecutionSim {
                 provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
                 abandonment_records,
                 state_claims,
-                reoffers,
                 witness_sources,
             },
             sealed @ Block::Sealed { .. } => sealed,

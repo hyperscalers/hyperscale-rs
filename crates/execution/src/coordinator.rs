@@ -59,8 +59,8 @@ use hyperscale_metrics::{
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
-    CommittedAt, ConsensusPublicKey, CounterpartMirror, CrossingReoffer, Deadline, DeclaredKey,
-    Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
+    CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
     FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
     MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions,
     SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey,
@@ -3008,15 +3008,9 @@ impl ExecutionCoordinator {
     }
 
     /// What this validator holds to offer in a block it proposes.
-    ///
-    /// The trie is the block's committee's — the same one the probes are
-    /// asked under — so a crossing whose claim moved to a successor is
-    /// offered and asked about on one side of a cut together.
     #[must_use]
-    pub fn offers(&mut self, topology_schedule: &TopologySchedule) -> Offers {
-        let trie = self.counterpart_trie(topology_schedule);
-        let now = self.committed_ts;
-        self.counterparts.offers(trie, now)
+    pub fn offers(&self) -> Offers {
+        self.counterparts.offers()
     }
 
     /// Whether a tick or a candidate of this shard still holds a member
@@ -3378,7 +3372,6 @@ impl ExecutionCoordinator {
                 transactions,
                 certificates,
                 provisions,
-                reoffers,
                 ..
             } => actions.extend(self.on_live_block_committed(
                 topology_schedule,
@@ -3387,7 +3380,6 @@ impl ExecutionCoordinator {
                 transactions,
                 certificates,
                 provisions,
-                reoffers,
             )),
             Block::Sealed {
                 header,
@@ -3416,7 +3408,6 @@ impl ExecutionCoordinator {
         transactions: &[Arc<Verifiable<Transaction>>],
         certificates: &[Arc<Verifiable<Finalization>>],
         provisions: &[Arc<Verifiable<Provisions>>],
-        reoffers: &[CrossingReoffer],
     ) -> Vec<Action> {
         let height = header.height();
         let mut actions = Vec::new();
@@ -3436,14 +3427,9 @@ impl ExecutionCoordinator {
         // ── Provision broadcasting (proposer only) ─────────────────────
         if runnable && self.me == header.proposer() {
             let local_shard = self.local_shard;
-            if let Some((requests, shard_recipients)) = build_provision_requests(
-                anchored,
-                transactions,
-                certificates,
-                reoffers,
-                self.me,
-                local_shard,
-            ) {
+            if let Some((requests, shard_recipients)) =
+                build_provision_requests(anchored, transactions, certificates, self.me, local_shard)
+            {
                 actions.push(Action::FetchAndBroadcastProvisions {
                     block_hash,
                     requests,
@@ -8925,10 +8911,7 @@ mod tests {
             "the mempool hears the core's verdict"
         );
         assert!(
-            state
-                .offers(&make_topology())
-                .abandonment_records
-                .is_empty(),
+            state.offers().abandonment_records.is_empty(),
             "and no record restates it"
         );
     }
@@ -8966,12 +8949,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
             }),
         );
-        assert!(
-            accepting
-                .offers(&make_topology())
-                .abandonment_records
-                .is_empty()
-        );
+        assert!(accepting.offers().abandonment_records.is_empty());
         assert_eq!(
             resolved(&actions),
             vec![(
@@ -9121,7 +9099,6 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
-            reoffers: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -9163,7 +9140,6 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims,
-            reoffers: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -9288,7 +9264,6 @@ mod tests {
                 Capped::new(records).expect("a list written out in a test"),
             ),
             state_claims,
-            reoffers: Arc::new(Capped::empty()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -9433,7 +9408,7 @@ mod tests {
         );
         fetch_answers(&mut state, &bundle, &[claim]);
         assert_eq!(
-            state.offers(&make_topology()).state_claims,
+            state.offers().state_claims,
             vec![bundle.clone()],
             "dated to the clock the probe read off the header"
         );
@@ -9441,13 +9416,13 @@ mod tests {
         let deadline_ms = deadline.as_millis();
         commit_carrying(&mut state, &schedule, 1, deadline_ms, Vec::new());
         assert_eq!(
-            state.offers(&make_topology()).state_claims,
+            state.offers().state_claims,
             vec![bundle.clone()],
             "a block carrying no proofs leaves the offer standing"
         );
         commit_carrying(&mut state, &schedule, 2, deadline_ms, vec![bundle]);
         assert!(
-            state.offers(&make_topology()).state_claims.is_empty(),
+            state.offers().state_claims.is_empty(),
             "a proof the chain carries is everybody's"
         );
     }
@@ -9507,7 +9482,7 @@ mod tests {
             "and not again at a newer header, the answer being in hand",
         );
         assert_eq!(
-            state.offers(&make_topology()).state_claims,
+            state.offers().state_claims,
             vec![bundle],
             "while the proof is still offered, since only a block makes it everybody's",
         );
@@ -9812,12 +9787,7 @@ mod tests {
             )),
             "and no certificate is fetched on it"
         );
-        assert!(
-            state
-                .offers(&make_topology())
-                .abandonment_records
-                .is_empty()
-        );
+        assert!(state.offers().abandonment_records.is_empty());
 
         // A block later the sibling aborted it and retracted its cell.
         let later = deadline.plus(Duration::from_secs(1));
@@ -9907,10 +9877,7 @@ mod tests {
             "and its silence is written down",
         );
         assert!(
-            state
-                .offers(&make_topology())
-                .abandonment_records
-                .is_empty(),
+            state.offers().abandonment_records.is_empty(),
             "with no record to restate it"
         );
 
@@ -11549,10 +11516,7 @@ mod tests {
             "the presence is read off the committed claim"
         );
         assert!(
-            state
-                .offers(&make_topology())
-                .abandonment_records
-                .is_empty(),
+            state.offers().abandonment_records.is_empty(),
             "and no record restates it"
         );
         let request = folded
@@ -11604,10 +11568,7 @@ mod tests {
         )));
         state.handle_attestation(&schedule, &certificate);
         assert!(
-            state
-                .offers(&make_topology())
-                .abandonment_records
-                .is_empty(),
+            state.offers().abandonment_records.is_empty(),
             "an acceptance is a cue: the retirement waits on the presence its probe reads"
         );
 
@@ -12357,7 +12318,7 @@ mod tests {
             },
         );
 
-        let records = state.offers(&make_topology()).abandonment_records;
+        let records = state.offers().abandonment_records;
         assert_eq!(records.len(), 1, "the peer's departure is answerable");
         assert_eq!(records[0].shard(), PEER);
         assert_eq!(
@@ -12375,10 +12336,7 @@ mod tests {
 
         // And what it does not offer twice.
         assert!(
-            state
-                .offers(&make_topology())
-                .abandonment_records
-                .is_empty(),
+            state.offers().abandonment_records.is_empty(),
             "a departure is answered once",
         );
 
@@ -12467,7 +12425,7 @@ mod tests {
         state.record_settled_txs(&sched, LOWER, set(120_000));
         state.record_settled_txs(&sched, UPPER, set(60_000));
 
-        let records = state.offers(&make_topology()).abandonment_records;
+        let records = state.offers().abandonment_records;
         assert_eq!(
             records
                 .iter()
@@ -12507,7 +12465,7 @@ mod tests {
         state.record_settled_txs(&sched, peer_left, set(120_000));
         state.record_settled_txs(&sched, PEER, set(60_000));
 
-        let records = state.offers(&make_topology()).abandonment_records;
+        let records = state.offers().abandonment_records;
         assert_eq!(
             records
                 .iter()

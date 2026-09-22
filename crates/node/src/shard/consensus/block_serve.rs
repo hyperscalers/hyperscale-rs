@@ -177,7 +177,6 @@ mod tests {
             certificates,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
             ..
         } = make_test_block(BlockHeight::new(1)).into_sealed()
@@ -191,7 +190,6 @@ mod tests {
             provision_hashes: Arc::new(Capped::from_array([hash])),
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
         };
         commit_settled_at(
@@ -221,7 +219,6 @@ mod tests {
             certificates,
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
             ..
         } = make_test_block(height)
@@ -235,7 +232,6 @@ mod tests {
             provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
             abandonment_records,
             state_claims,
-            reoffers,
             witness_sources,
         }
     }

@@ -7,9 +7,8 @@ use hyperscale_hbor::Capped;
 use thiserror::Error;
 
 use crate::{
-    CrossingReoffer, Finalization, Hash, MAX_PROVISION_TARGET_SHARDS, ProvisionTxRoot, ShardId,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, Verifiable, Verified, Verify,
-    compute_merkle_root,
+    Finalization, Hash, MAX_PROVISION_TARGET_SHARDS, ProvisionTxRoot, ShardId, TopologySnapshot,
+    Transaction, TransactionDecision, TxHash, Verifiable, Verified, Verify, compute_merkle_root,
 };
 
 /// Inputs the provision-tx-roots verifier reads against.
@@ -27,9 +26,6 @@ pub struct ProvisionTxRootsContext<'a> {
     /// The block's certificates in block order — whose committed
     /// outcomes promise crossing bundles.
     pub certificates: &'a [Arc<Verifiable<Finalization>>],
-    /// The block's crossing re-offers in block order — the crossings it
-    /// promises a consumer again because no claim has answered them.
-    pub reoffers: &'a [CrossingReoffer],
 }
 
 /// The transactions a committed finalization promises a crossing bundle
@@ -125,7 +121,6 @@ impl Verified<ProvisionTxRootsMap> {
         topology_snapshot: &TopologySnapshot,
         transactions: &[Arc<Verifiable<Transaction>>],
         certificates: &[Arc<Verifiable<Finalization>>],
-        reoffers: &[CrossingReoffer],
     ) -> Self {
         let mut per_target: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
 
@@ -176,19 +171,6 @@ impl Verified<ProvisionTxRootsMap> {
             }
         }
 
-        // After the certificates, as the block's bundle builders stage
-        // them: an offer promises its target the same bundle a fresh
-        // crossing would, built at this block's own height.
-        for offer in reoffers {
-            if offer.target == local_shard {
-                continue;
-            }
-            per_target
-                .entry(offer.target)
-                .or_default()
-                .push(Hash::from(offer.tx_hash));
-        }
-
         let map: ProvisionTxRootsMap = Capped::new(
             per_target
                 .into_iter()
@@ -217,7 +199,6 @@ impl Verify<&ProvisionTxRootsContext<'_>> for ProvisionTxRootsMap {
             ctx.topology_snapshot,
             ctx.transactions,
             ctx.certificates,
-            ctx.reoffers,
         );
         if computed.as_ref() != self {
             return Err(ProvisionTxRootsVerifyError::Mismatch {
@@ -235,10 +216,7 @@ mod tests {
     use crate::test_utils::{
         TestCommittee, install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
     };
-    use crate::{
-        Address, AddressClass, LocalKey, PrincipalAddr, SubstateKey, TimestampRange,
-        WeightedTimestamp,
-    };
+    use crate::{PrincipalAddr, TimestampRange, WeightedTimestamp};
 
     fn cross_shard_tx(payer: PrincipalAddr) -> Arc<Verifiable<Transaction>> {
         install_stub_protocol_statics();
@@ -267,13 +245,13 @@ mod tests {
         let txs = vec![cross_shard_tx(test_principal(0x81))];
 
         let at_counterpart =
-            Verified::<ProvisionTxRootsMap>::compute(counterpart, &topo, &txs, &[], &[]);
+            Verified::<ProvisionTxRootsMap>::compute(counterpart, &topo, &txs, &[]);
         let targets: Vec<ShardId> = at_counterpart.as_ref().keys().copied().collect();
         assert_eq!(targets, vec![payer_shard]);
 
         // The payer still fans out to every participant: its bundle is
         // the engagement evidence.
-        let at_payer = Verified::<ProvisionTxRootsMap>::compute(payer_shard, &topo, &txs, &[], &[]);
+        let at_payer = Verified::<ProvisionTxRootsMap>::compute(payer_shard, &topo, &txs, &[]);
         let targets: Vec<ShardId> = at_payer.as_ref().keys().copied().collect();
         assert_eq!(targets, vec![counterpart]);
     }
@@ -343,7 +321,6 @@ mod tests {
             &topo,
             &[],
             std::slice::from_ref(&finalization),
-            &[],
         );
         assert_eq!(
             roots.get(&target),
@@ -353,41 +330,5 @@ mod tests {
             ]))),
         );
         assert!(!roots.contains_key(&local));
-    }
-
-    /// A re-offer promises its target the same bundle a fresh crossing
-    /// would, bucketed after the block's certificates — so a consumer
-    /// that missed the first offer acquires a header naming it and
-    /// registers the expectation the bundle is admitted against.
-    #[test]
-    fn a_reoffer_promises_its_target_after_the_blocks_certificates() {
-        install_stub_protocol_statics();
-        let topo = TestCommittee::new(4, 42).topology_snapshot(2);
-        let local = ShardId::leaf(1, 0);
-        let target = ShardId::leaf(1, 1);
-        let cell = |seed: u8| SubstateKey {
-            owner: Address::new([seed; 31], AddressClass::Component),
-            local: LocalKey([seed; 16]),
-        };
-        let offered = TxHash::from(Hash::from_bytes(&[7; 32]));
-        let offers = vec![
-            CrossingReoffer::new(target, offered, [cell(1)]).expect("a set inside the cap"),
-            // An offer this shard owes itself is not one it sends.
-            CrossingReoffer::new(local, TxHash::from(Hash::from_bytes(&[8; 32])), [cell(2)])
-                .expect("a set inside the cap"),
-        ];
-
-        let roots = Verified::<ProvisionTxRootsMap>::compute(local, &topo, &[], &[], &offers);
-        assert_eq!(
-            roots.get(&target),
-            Some(&ProvisionTxRoot::from_raw(compute_merkle_root(&[
-                Hash::from(offered)
-            ]))),
-        );
-        assert!(!roots.contains_key(&local));
-
-        // Nothing offered, nothing promised: the map is the one a block
-        // with no outstanding crossing carries.
-        assert!(Verified::<ProvisionTxRootsMap>::compute(local, &topo, &[], &[], &[]).is_empty(),);
     }
 }

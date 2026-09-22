@@ -10,8 +10,8 @@ use std::sync::Arc;
 use hyperscale_core::Action;
 use hyperscale_execution::Offers;
 use hyperscale_types::{
-    AbandonmentRecord, CrossingReoffer, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId,
-    StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
+    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId, StateClaim,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -23,7 +23,6 @@ pub(in crate::state) struct ProposalInputs {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
-    pub(crate) reoffers: Vec<CrossingReoffer>,
 }
 
 impl ShardParticipation {
@@ -32,7 +31,7 @@ impl ShardParticipation {
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
     /// the ready-transaction + abort intents + certificates gathering logic.
     pub(in crate::state) fn gather_proposal_inputs(
-        &mut self,
+        &self,
         sched: &TopologySchedule,
     ) -> ProposalInputs {
         // The wire cap, not the packing bound — a block cannot encode
@@ -57,8 +56,7 @@ impl ShardParticipation {
         let Offers {
             state_claims,
             abandonment_records,
-            reoffers,
-        } = self.execution_coordinator.offers(sched);
+        } = self.execution_coordinator.offers();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
@@ -95,7 +93,6 @@ impl ShardParticipation {
             provisions,
             abandonment_records,
             state_claims,
-            reoffers,
         }
     }
 
@@ -157,7 +154,6 @@ impl ShardParticipation {
             inputs.provisions,
             inputs.abandonment_records,
             inputs.state_claims,
-            inputs.reoffers,
         )
     }
 }

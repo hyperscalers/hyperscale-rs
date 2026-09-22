@@ -42,6 +42,6 @@ pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats
 pub use counterparts::Offers;
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
-pub use lookups::{crossing_requests, provision_request, record_requests, reoffer_requests};
+pub use lookups::{crossing_requests, provision_request, record_requests};
 pub use tick_state::TickState;
 pub use vote_tracker::VoteTracker;

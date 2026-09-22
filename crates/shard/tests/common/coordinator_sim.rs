@@ -874,7 +874,6 @@ impl ShardCoordinatorSim {
             vec![],
             vec![],
             vec![],
-            vec![],
         )
     }
 
@@ -1204,7 +1203,6 @@ impl ShardCoordinatorSim {
                 vec![],
                 vec![],
                 vec![],
-                vec![],
             ),
         }
     }
@@ -1433,7 +1431,6 @@ impl ShardCoordinatorSim {
                 finalizations,
                 abandonment_records,
                 state_claims,
-                reoffers,
                 provisions,
                 fee_checks: _,
                 fee_read_height: _,
@@ -1560,7 +1557,6 @@ impl ShardCoordinatorSim {
                     Capped::new(provisions.clone()).expect("a list written out in a test"),
                     Capped::new(abandonment_records).expect("a list written out in a test"),
                     Capped::new(state_claims).expect("a list written out in a test"),
-                    Capped::new(reoffers).expect("a list written out in a test"),
                     parent_in_flight,
                     parent_settled_frontier,
                     parent_sweep_frontier,
@@ -1732,7 +1728,6 @@ impl ShardCoordinatorSim {
                 expected,
                 transactions,
                 certificates,
-                reoffers,
                 topology_snapshot,
             } => {
                 let ptx_ctx = ProvisionTxRootsContext {
@@ -1740,7 +1735,6 @@ impl ShardCoordinatorSim {
                     topology_snapshot: &topology_snapshot,
                     transactions: &transactions,
                     certificates: &certificates,
-                    reoffers: &reoffers,
                 };
                 let result = expected.verify(&ptx_ctx);
                 self.loopback_q.push_back(Envelope {

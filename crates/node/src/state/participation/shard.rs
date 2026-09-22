@@ -415,7 +415,6 @@ impl ShardParticipation {
             inputs.provisions,
             inputs.abandonment_records,
             inputs.state_claims,
-            inputs.reoffers,
         )
     }
 
@@ -803,7 +802,6 @@ mod tests {
 
         let manifest = BlockManifest::new(
             Capped::from_array([TxHash::ZERO]),
-            Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),

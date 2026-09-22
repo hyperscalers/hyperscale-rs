@@ -36,7 +36,6 @@ pub mod certified_header;
 pub mod chain_origin;
 pub mod commit_proof;
 pub mod counterpart_mirror;
-pub mod crossing_reoffer;
 pub mod demands;
 pub mod evidence;
 pub mod fork_fence;
@@ -59,7 +58,7 @@ pub mod vote_registers;
 pub mod witness_sources;
 
 pub use block::{
-    Block, SharedCertificates, SharedProvisions, SharedReoffers, SharedTransactions, TerminalRef,
+    Block, SharedCertificates, SharedProvisions, SharedTransactions, TerminalRef,
     VerifiedBlockAssembleError, derive_block_transactions, fees_over_certificates,
 };
 pub use witness_sources::{SharedWitnessSources, WitnessSources};
