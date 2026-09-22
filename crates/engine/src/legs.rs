@@ -29,7 +29,9 @@ use hyperscale_types::{
     Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction,
 };
 use hyperscale_vm_effects::{CrossingEdge as StarEdge, Kind, Star, running_at, star_at};
-use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault, Refusal};
+use hyperscale_vm_kernel::{
+    Crossed, Departure, LegPlan, Obligations, OwnerSet, PlanFault, Refusal,
+};
 use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
 use crate::sharding::TrieShardResolver;
@@ -886,6 +888,21 @@ pub enum Runs {
         /// producer committed and the key the decline sits at.
         crossings: Vec<Refusal>,
     },
+    /// No node at all: this shard's own note of what it was handed and
+    /// has not answered, brought in line with the bundles that reached
+    /// it and the answers it has given.
+    ///
+    /// Housekeeping on cells nobody outside this shard reads. What it
+    /// writes is a bundle's crossing made durable, so the refusal
+    /// [`Self::Refuse`] may later compose needs no bundle at any age;
+    /// what it removes is a note whose answer already stands.
+    Owe {
+        /// The member the ledger work runs as: whole, on its own shard,
+        /// reaching nobody else.
+        member: Member,
+        /// What to write down and what to let go of.
+        work: Obligations,
+    },
 }
 
 impl Runs {
@@ -893,9 +910,10 @@ impl Runs {
     #[must_use]
     pub const fn member(&self) -> &Member {
         match self {
-            Self::Shape(member) | Self::Settle { member, .. } | Self::Refuse { member, .. } => {
-                member
-            }
+            Self::Shape(member)
+            | Self::Settle { member, .. }
+            | Self::Refuse { member, .. }
+            | Self::Owe { member, .. } => member,
         }
     }
 
@@ -906,7 +924,7 @@ impl Runs {
     pub fn reaches_beyond(&self) -> bool {
         match self {
             Self::Shape(member) => member.reaches_beyond(),
-            Self::Settle { .. } | Self::Refuse { .. } => false,
+            Self::Settle { .. } | Self::Refuse { .. } | Self::Owe { .. } => false,
         }
     }
 
@@ -916,7 +934,7 @@ impl Runs {
     pub fn abortable(&self) -> bool {
         match self {
             Self::Shape(member) => member.abortable(),
-            Self::Settle { .. } | Self::Refuse { .. } => false,
+            Self::Settle { .. } | Self::Refuse { .. } | Self::Owe { .. } => false,
         }
     }
 
@@ -941,7 +959,8 @@ impl Runs {
                 on: Licence::Claimed | Licence::OwnLeaf,
                 ..
             }
-            | Self::Refuse { .. } => true,
+            | Self::Refuse { .. }
+            | Self::Owe { .. } => true,
         }
     }
 }

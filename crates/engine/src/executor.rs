@@ -41,7 +41,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
-    LegPlan, ManifestWalk, OwnerSet, Receipt, Refusal, Substates, execute_batch,
+    LegPlan, ManifestWalk, Obligations, OwnerSet, Receipt, Refusal, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -726,7 +726,8 @@ impl Executor {
     /// decides what becomes of it, where a refusal holds no record at
     /// all. Its every term comes in with the member — the producer's own
     /// committed cell, carried from the bundle that proved it — so what
-    /// is left here is declaring the one cell it writes.
+    /// is left here is declaring the cells it touches: the decline it
+    /// writes, the claim it reads, and the note it retires.
     ///
     /// What the refusal may not do is checked inside the kernel against
     /// the committed baseline, not here: a crossing owed to its consumer
@@ -765,6 +766,15 @@ impl Executor {
                 target: EffectTarget::Point(refusal.cell.consumer_claim),
                 mode: Mode::Read,
             })?;
+            // And the note this shard wrote itself about the crossing,
+            // which the answer retires. A write, because a removal is
+            // one — and the cell need not be there, since a crossing
+            // refused before the ledger caught up with it never had a
+            // note to retire.
+            declare_here(Effect {
+                target: EffectTarget::Point(refusal.obligation),
+                mode: Mode::Write { moves: Moves::Both },
+            })?;
         }
         let trie = ctx.shard_trie.clone();
         let local = ctx.local_shard;
@@ -774,6 +784,54 @@ impl Executor {
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
             // A refusal invokes no node, so nothing of it emits.
+            event_bytes: Vec::new(),
+            work: DeclaredWork::ZERO,
+            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
+        })
+    }
+
+    /// Lower obligation-ledger work: the notes it writes and the notes
+    /// it lets go of, declared, and nothing read.
+    ///
+    /// [`Self::prepare_refuse`]'s neighbour, and shorter still. A
+    /// refusal reads the claim that would make the crossing answered;
+    /// this reads nothing at all, because what licenses each half was
+    /// read by the composer off this shard's own state and there is
+    /// nothing in a note to hold it to.
+    ///
+    /// # Errors
+    ///
+    /// Work naming nothing, or a declaration two of its cells
+    /// contradict.
+    fn prepare_owe(work: &Obligations, ctx: &TickBatchContext<'_>) -> Result<PreparedTx, String> {
+        if work.owe.is_empty() && work.disown.is_empty() {
+            return Err("this shard has no obligation to record".to_string());
+        }
+        let mut declaration = Declaration::default();
+        for key in work
+            .owe
+            .iter()
+            .map(|refusal| refusal.obligation)
+            .chain(work.disown.iter().copied())
+        {
+            declare(
+                &mut declaration,
+                Effect {
+                    target: EffectTarget::Point(key),
+                    mode: Mode::Write { moves: Moves::Both },
+                },
+                None,
+            )
+            .map_err(|conflict| format!("obligation contradicts the declaration: {conflict}"))?;
+        }
+        let trie = ctx.shard_trie.clone();
+        let local = ctx.local_shard;
+        Ok(PreparedTx {
+            job: Job::Obligations(work.clone()),
+            declaration,
+            nullifiers: Vec::new(),
+            gas_limits: Vec::new(),
+            // A ledger entry invokes no node, so nothing of it emits.
             event_bytes: Vec::new(),
             work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
@@ -1568,6 +1626,7 @@ impl Executor {
                     Self::prepare_settle(records, *on, ctx, snapshot)
                 }
                 Runs::Refuse { crossings, .. } => Self::prepare_refuse(crossings, ctx),
+                Runs::Owe { work, .. } => Self::prepare_owe(work, ctx),
                 Runs::Shape(shape) => input
                     .transaction
                     .ok_or_else(|| "a member running a shape holds no body".to_string())

@@ -1808,6 +1808,122 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     );
 }
 
+/// A shard writes down the crossing a bundle handed it, and the note
+/// lands as a committed cell the commit fold can read back.
+///
+/// The end of the chain phase 3 composes from: an obligation member
+/// runs no node, reads nothing, and leaves one leaf. Driven through the
+/// engine rather than asserted at the admitter, because everything
+/// between the two — the declaration, the batch screen, the owner the
+/// write is filtered by — is where a cell that is composed but never
+/// written would go missing.
+#[test]
+fn an_obligation_member_leaves_the_note_in_state() {
+    use hyperscale_engine::{Obligations, Refusal};
+    use hyperscale_vm_effects::{CrossingObligation, crossing_obligation_key};
+
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
+    assert!(classified.decomposed());
+    let edge = classified.edges()[0].clone();
+
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let issued = {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(0),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(0),
+            runs: Runs::Shape(Member::of(
+                classified.clone(),
+                near_shard,
+                classified.first_side_at(near_shard),
+                BTreeSet::from([near_shard, trie.shard_for_prefix(far())]),
+            )),
+            arrivals: &[],
+        };
+        executor
+            .execute_tick_batch(&ctx, &store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
+    };
+    let ConsensusReceipt::Succeeded { writes, .. } = &issued.consensus else {
+        panic!("the sender's legs must succeed: {:?}", issued.metadata);
+    };
+    store.apply(writes);
+    let cell = CrossingCell::from_bytes(
+        &Substates::cell(&store, edge.record.key()).expect("the record is written"),
+    )
+    .expect("a record decodes");
+
+    // What the composer hands the member: the record as its producer
+    // committed it, and the key the note sits at under the consuming
+    // node's own target.
+    let obligation = crossing_obligation_key(
+        &ProtocolHasher,
+        cell.consumer_claim.owner,
+        cell.intent,
+        cell.local,
+        cell.output,
+    );
+    let consumer_shard = trie.shard_for_prefix(cell.consumer_claim.owner);
+    let ctx = TickBatchContext {
+        local_shard: consumer_shard,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+    };
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash: TxHash::from(Hash::from_bytes(b"the note")),
+        transaction: None,
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(1),
+        runs: Runs::Owe {
+            member: Member::whole(consumer_shard),
+            work: Obligations {
+                owe: vec![Refusal {
+                    record: edge.record.key(),
+                    cell,
+                    site: edge.claim.key(),
+                    obligation,
+                }],
+                disown: Vec::new(),
+            },
+        },
+        arrivals: &[],
+    };
+    let noted = executor
+        .execute_tick_batch(&ctx, &store, &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0);
+    let ConsensusReceipt::Succeeded { writes, .. } = &noted.consensus else {
+        panic!("the note must be written: {:?}", noted.metadata);
+    };
+    store.apply(writes);
+
+    let held = Substates::cell(&store, obligation).expect("the note is a committed cell");
+    let note = CrossingObligation::from_bytes(&held).expect("and it decodes as one");
+    assert_eq!(note.record, edge.record.key());
+    assert_eq!(note.cell, cell);
+}
+
 /// The reclaim of a leg that never ran finds no record to reclaim from,
 /// and is refused before the kernel runs. The refusal is the sender's
 /// terminal on this shard and the one receipt left to carry the price:

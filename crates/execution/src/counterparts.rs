@@ -19,7 +19,9 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
-use hyperscale_storage::{CrossingLeaves, is_crossing_answer_cell, is_record_cell};
+use hyperscale_storage::{
+    CrossingLeaves, is_crossing_answer_cell, is_crossing_obligation_cell, is_record_cell,
+};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     CrossingReoffer, Deadline, ExecutionCertificate, Inclusion, MAX_FINALIZATION_DELAY,
@@ -29,7 +31,9 @@ use hyperscale_types::{
     StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
     TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::{CrossingAnswer, CrossingCell, ProtocolHasher, crossing_decline_key};
+use hyperscale_vm_effects::{
+    CrossingAnswer, CrossingCell, CrossingObligation, ProtocolHasher, crossing_decline_key,
+};
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 use crate::provisioning::Arrival;
@@ -563,6 +567,17 @@ pub struct Counterparts {
     /// term the question needs, the record it answers for.
     pub(crate) answered: BTreeMap<SubstateKey, AnsweredCrossing>,
 
+    /// The crossings this shard was handed and has not answered, by the
+    /// obligation cell it wrote down for each.
+    ///
+    /// Read from the leaves like [`held`](Self::held) and
+    /// [`answered`](Self::answered) beside it, and for a reason those
+    /// two do not have: what a bundle handed this shard is otherwise
+    /// known only to the provisioning account, which no replica
+    /// reproduces and no restart recovers. The leaf is the arrival made
+    /// durable, so a refusal is composable from state at any age.
+    pub(crate) owed: BTreeMap<SubstateKey, CrossingObligation>,
+
     /// The producer header each crossing handed to this shard has been
     /// asked about at, by the record cell a bundle carried.
     ///
@@ -630,6 +645,11 @@ impl Counterparts {
                         AnsweredCrossing::of(&CrossingAnswer::from_bytes(value)?),
                     ))
                 })
+                .collect(),
+            owed: leaves
+                .obligations
+                .iter()
+                .filter_map(|(key, value)| Some((*key, CrossingObligation::from_bytes(value)?)))
                 .collect(),
             arrivals: BTreeMap::new(),
             offer_cursor: None,
@@ -1103,6 +1123,24 @@ impl Counterparts {
         answered_for(&self.answered, record)
     }
 
+    /// Whether this shard has already written down that it owes an
+    /// answer for the crossing `record` names.
+    ///
+    /// [`holds_answer_for`](Self::holds_answer_for)'s neighbour, on the
+    /// same terms: read off the cells this shard holds, which
+    /// [`holding`](Self::holding) seeds from state, so a seat that came
+    /// up after the note was written reads it whole.
+    #[must_use]
+    pub fn holds_obligation_for(&self, record: SubstateKey) -> bool {
+        self.owed.values().any(|note| note.record == record)
+    }
+
+    /// Every obligation this shard holds, by the cell it sits at.
+    #[must_use]
+    pub const fn obligations(&self) -> &BTreeMap<SubstateKey, CrossingObligation> {
+        &self.owed
+    }
+
     /// Whether this validator holds an answering reading of `key` on
     /// `shard` to offer, so the question is not put to a counterpart
     /// again for an answer already in hand.
@@ -1432,9 +1470,15 @@ impl Counterparts {
                                     .or_insert_with(|| AnsweredCrossing::of(&claim));
                             }
                         }
+                        Some(bytes) if is_crossing_obligation_cell(*key, bytes) => {
+                            if let Some(note) = CrossingObligation::from_bytes(bytes) {
+                                self.owed.entry(*key).or_insert(note);
+                            }
+                        }
                         None => {
                             self.held.remove(key);
                             self.answered.remove(key);
+                            self.owed.remove(key);
                         }
                         Some(_) => {}
                     }

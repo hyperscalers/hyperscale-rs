@@ -1319,6 +1319,10 @@ impl ProtocolStatics for StubVmStatics {
     fn crossing_answer_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
         value.first() == Some(&STUB_CROSSING_ANSWER_MARKER)
     }
+
+    fn crossing_obligation_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
+        value.first() == Some(&STUB_CROSSING_OBLIGATION_MARKER)
+    }
 }
 
 /// The local-key first byte the stub judges a package cell by, in place
@@ -1349,6 +1353,11 @@ pub const STUB_RECORD_MARKER: u8 = 0xEF;
 /// by nothing else.
 pub const STUB_CROSSING_ANSWER_MARKER: u8 = 0xED;
 
+/// The value's first byte the stub judges a crossing obligation by.
+///
+/// The third of the families outside the sweep, told apart the same way.
+pub const STUB_CROSSING_OBLIGATION_MARKER: u8 = 0xEC;
+
 /// A stub escrow record's value, which [`StubVmStatics`] judges a record
 /// wherever it sits.
 #[must_use]
@@ -1361,6 +1370,13 @@ pub fn stub_record_cell(body: u8) -> Vec<u8> {
 #[must_use]
 pub fn stub_crossing_answer_cell(body: u8) -> Vec<u8> {
     vec![STUB_CROSSING_ANSWER_MARKER, body]
+}
+
+/// A stub crossing obligation's value, which [`StubVmStatics`] judges an
+/// obligation wherever it sits.
+#[must_use]
+pub fn stub_crossing_obligation_cell(body: u8) -> Vec<u8> {
+    vec![STUB_CROSSING_OBLIGATION_MARKER, body]
 }
 
 /// A stub sweepable cell's value and the local key it must sit at for

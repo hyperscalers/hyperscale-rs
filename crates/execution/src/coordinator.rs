@@ -51,7 +51,7 @@ use hyperscale_core::{
 };
 use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
 use hyperscale_engine::{
-    CodeAvailability, PROTOCOL_RESOURCE, Refusal, TickEnvironment, build_fee_receipt,
+    CodeAvailability, Obligations, PROTOCOL_RESOURCE, Refusal, TickEnvironment, build_fee_receipt,
 };
 use hyperscale_metrics::{
     record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
@@ -69,7 +69,9 @@ use hyperscale_types::{
     Window, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
     tick_leader_at,
 };
-use hyperscale_vm_effects::{ProtocolHasher, Terms, crossing_decline_key};
+use hyperscale_vm_effects::{
+    CrossingCell, ProtocolHasher, Terms, crossing_decline_key, crossing_obligation_key,
+};
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
@@ -320,6 +322,69 @@ fn disposal_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
     let mut parts: Vec<&[u8]> = vec![b"hyperscale.record.disposal", &issued_by.0.0];
     parts.extend(keys.iter().map(Vec::as_slice));
     TxHash::from(Hash::from_parts(&parts))
+}
+
+/// The name a housekeeping member over this shard's obligation ledger
+/// takes.
+///
+/// [`disposal_member_name`]'s neighbour and derived the same way, under
+/// its own domain so the two never collide: a shard writing down what it
+/// owes and a shard disposing of what it holds are two members over one
+/// transaction's crossings, and a chain that admitted one name for both
+/// would compose only the first.
+fn obligation_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
+    let keys: Vec<Vec<u8>> = records.iter().map(|key| key.to_bytes().to_vec()).collect();
+    let mut parts: Vec<&[u8]> = vec![b"hyperscale.crossing.obligation", &issued_by.0.0];
+    parts.extend(keys.iter().map(Vec::as_slice));
+    TxHash::from(Hash::from_parts(&parts))
+}
+
+/// Whether this shard owes an answer for the crossing a bundle handed
+/// it at `record`.
+///
+/// The one rule both housekeeping admitters select on, stated once
+/// because they must not drift: a refusal and the note it is later
+/// composed from answer for exactly the same set.
+///
+/// Three terms. The crossing is **escrowed**, since nothing takes an
+/// owed one back and its consumer's verdict is never final. Its record
+/// is **not this shard's**, wherever the producer's prefix sits now — a
+/// crossing whose two ends have converged here is one this shard
+/// answers to itself. And its consumer's target **is** this shard's,
+/// because both the note and the decline sit under that target and a
+/// session writes a crossing cell only where the member's shard applies
+/// its owner: composed anywhere else, the member runs, succeeds, writes
+/// nothing, and is composed again at every commit thereafter.
+fn owes_an_answer(
+    trie: &ShardTrie,
+    local_shard: ShardId,
+    record: SubstateKey,
+    cell: &CrossingCell,
+) -> bool {
+    matches!(cell.terms, Terms::Escrowed { .. })
+        && trie.shard_for_prefix(record.owner) != local_shard
+        && trie.shard_for_prefix(cell.consumer_claim.owner) == local_shard
+}
+
+/// The refusal of the crossing `cell` records at `record`: the
+/// producer's own bytes, and the two keys under the consuming node's
+/// target that this shard writes about it.
+///
+/// Derived in one place so the answer and the note it retires always
+/// name one edge.
+fn refusal_of(record: SubstateKey, cell: CrossingCell) -> Refusal {
+    let (owner, intent, local, output) = (
+        cell.consumer_claim.owner,
+        cell.intent,
+        cell.local,
+        cell.output,
+    );
+    Refusal {
+        record,
+        cell,
+        site: crossing_decline_key(&ProtocolHasher, owner, intent, local, output),
+        obligation: crossing_obligation_key(&ProtocolHasher, owner, intent, local, output),
+    }
 }
 
 /// Execution state machine.
@@ -1430,12 +1495,7 @@ impl ExecutionCoordinator {
         let mut due: BTreeMap<TxHash, Vec<Refusal>> = BTreeMap::new();
         for (&record, arrival) in self.provisioning.arrived() {
             let cell = arrival.cell;
-            if !matches!(cell.terms, Terms::Escrowed { .. }) {
-                continue;
-            }
-            // The producer's, wherever its prefix sits now: a crossing
-            // refused across a cut is answered to the successor.
-            if trie.shard_for_prefix(record.owner) == local_shard {
+            if !owes_an_answer(trie, local_shard, record, &cell) {
                 continue;
             }
             if self.counterparts.holds_answer_for(record)
@@ -1444,17 +1504,9 @@ impl ExecutionCoordinator {
             {
                 continue;
             }
-            due.entry(cell.tx).or_default().push(Refusal {
-                record,
-                cell,
-                site: crossing_decline_key(
-                    &ProtocolHasher,
-                    cell.consumer_claim.owner,
-                    cell.intent,
-                    cell.local,
-                    cell.output,
-                ),
-            });
+            due.entry(cell.tx)
+                .or_default()
+                .push(refusal_of(record, cell));
         }
         for (issued_by, crossings) in due {
             let records: Vec<SubstateKey> = crossings.iter().map(|one| one.record).collect();
@@ -1493,6 +1545,98 @@ impl ExecutionCoordinator {
                 runs: Runs::Refuse {
                     member: Member::whole(local_shard),
                     crossings,
+                },
+                arrivals: Vec::new(),
+            });
+        }
+    }
+
+    /// Admit into the tick being composed the ledger work this shard's
+    /// obligations need: a note for every escrowed crossing a bundle
+    /// handed it and it has not answered, and the removal of every note
+    /// whose answer now stands.
+    ///
+    /// **This is the last composition that reads `arrived`, and it reads
+    /// it for the one thing it can answer**: what a bundle handed this
+    /// shard, while that bundle is in hand. Every verdict downstream
+    /// reads the leaf this writes, which is state — seeded at a seat,
+    /// folded from committed blocks, and bounded by no horizon. What the
+    /// arrival map was never able to be is reproducible; what it is good
+    /// for is being the thing that saw the bundle.
+    ///
+    /// **What stops the member being composed again**, asked explicitly
+    /// because the answer is never the obvious one: the note's own write,
+    /// which is blocks away. So the guard is on this member's own name,
+    /// exactly as the refusal's is — `holds_obligation_for` reads state
+    /// that has not changed yet, and would let every commit in between
+    /// compose the member afresh.
+    ///
+    /// The owed crossings are left alone. Nothing here ever refuses one
+    /// — its consumer's verdict is not final — so a note this shard
+    /// could never answer from would be a cell written for nobody.
+    fn admit_obligations(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        prices: PriceTable,
+        state: &mut TickState,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+    ) {
+        let Some(window) = topology_schedule.at(tick_ts) else {
+            return;
+        };
+        let trie = window.shard_trie();
+        let local_shard = self.local_shard;
+        // One member per issuing transaction, as the refusal beside it
+        // does, so the notes of one crossing's siblings are made and let
+        // go of together.
+        let mut due: BTreeMap<TxHash, Obligations> = BTreeMap::new();
+        for (&record, arrival) in self.provisioning.arrived() {
+            let cell = arrival.cell;
+            if !owes_an_answer(trie, local_shard, record, &cell) {
+                continue;
+            }
+            if self.counterparts.holds_answer_for(record)
+                || self.counterparts.holds_obligation_for(record)
+            {
+                continue;
+            }
+            due.entry(cell.tx)
+                .or_default()
+                .owe
+                .push(refusal_of(record, cell));
+        }
+        // And the other half of the one job: a note whose crossing this
+        // shard has answered, either way, says nothing any more.
+        for (&key, note) in self.counterparts.obligations() {
+            if self.counterparts.holds_answer_for(note.record) {
+                due.entry(note.cell.tx).or_default().disown.push(key);
+            }
+        }
+        for (issued_by, work) in due {
+            let mut records: Vec<SubstateKey> = work.owe.iter().map(|one| one.record).collect();
+            records.extend(work.disown.iter().copied());
+            let tx_hash = obligation_member_name(issued_by, &records);
+            if self.holds_member_for(tx_hash) {
+                continue;
+            }
+            state.admit(
+                tx_hash,
+                Membership::whole(BTreeSet::from([local_shard])).settling(),
+                None,
+                Admission::Executes,
+            );
+            self.ticks.assign_tx(tx_hash, tick_id);
+            requests.push(CrossShardExecutionRequest {
+                tx_hash,
+                transaction: None,
+                provisions: Vec::new(),
+                clock: tick_ts,
+                prices,
+                runs: Runs::Owe {
+                    member: Member::whole(local_shard),
+                    work,
                 },
                 arrivals: Vec::new(),
             });
@@ -1763,6 +1907,14 @@ impl ExecutionCoordinator {
             &mut requests,
         );
         self.admit_refusals(
+            topology_schedule,
+            tick_id,
+            block.ts,
+            tick_prices,
+            &mut state,
+            &mut requests,
+        );
+        self.admit_obligations(
             topology_schedule,
             tick_id,
             block.ts,
@@ -4531,8 +4683,8 @@ mod tests {
         Window,
     };
     use hyperscale_vm_effects::{
-        Answered, CrossingAnswer, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms,
-        crossing_decline_key,
+        Answered, CrossingAnswer, CrossingCell, CrossingObligation, Hash32, IntentHash,
+        ProtocolHasher, Terms, crossing_decline_key,
     };
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
@@ -10544,7 +10696,7 @@ mod tests {
         answered: bool,
     ) -> Option<Runs> {
         let schedule = two_shard_topology();
-        let mut state = make_test_state();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let (record_key, claim, base) = arrived_record(0x6A, REFUSED_EXPIRY_MS);
         let cell = CrossingCell { terms, ..base };
         state.provisioning.handed(record_key, cell, at);
@@ -10603,7 +10755,7 @@ mod tests {
     #[test]
     fn a_composed_refusal_is_not_composed_again() {
         let schedule = two_shard_topology();
-        let mut state = make_test_state();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let (record_key, _, cell) = arrived_record(0x6A, REFUSED_EXPIRY_MS);
         let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
         state.provisioning.handed(record_key, cell, at);
@@ -10636,6 +10788,222 @@ mod tests {
             0,
             "and the answer is still on its way, so nothing is composed again",
         );
+    }
+
+    /// Compose this shard's obligation-ledger work once, at `height`,
+    /// and report the members it produced.
+    fn compose_obligations(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        height: u64,
+        at: WeightedTimestamp,
+    ) -> Vec<Obligations> {
+        let tick_id = TickId::new(HOME, BlockHeight::new(height));
+        let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
+        let mut requests = Vec::new();
+        state.admit_obligations(
+            schedule,
+            tick_id,
+            at,
+            PriceTable::GENESIS,
+            &mut tick,
+            &mut requests,
+        );
+        requests
+            .iter()
+            .filter_map(|request| match &request.runs {
+                Runs::Owe { work, .. } => Some(work.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A bundle's crossing is written down once, and the member is not
+    /// composed again while the note is on its way.
+    ///
+    /// The second half is this family's shipped defect asked of a new
+    /// admitter: nothing about the crossing changes until the note the
+    /// member writes reaches state, so a guard on anything but **this
+    /// member's own name** lets every commit in between compose it
+    /// afresh — a tick full of members that cannot run, and the one note
+    /// they were composed to write never getting through.
+    ///
+    /// Driven straight at the admitter, because a second
+    /// `commit_carrying` at one height dispatches nothing whatever the
+    /// guard says.
+    #[test]
+    fn a_handed_crossing_is_written_down_once() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = arrived_record(0x6A, REFUSED_EXPIRY_MS);
+        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        state.provisioning.handed(record_key, cell, at);
+        state.committed_ts = at;
+
+        let first = compose_obligations(&mut state, &schedule, 1, at);
+        assert_eq!(first.len(), 1, "the crossing arrived and is unanswered");
+        assert_eq!(
+            first[0]
+                .owe
+                .iter()
+                .map(|one| one.record)
+                .collect::<Vec<_>>(),
+            vec![record_key],
+            "and the note names the record a bundle carried",
+        );
+        assert!(first[0].disown.is_empty());
+
+        assert!(
+            compose_obligations(&mut state, &schedule, 2, at).is_empty(),
+            "and the note is still on its way, so nothing is composed again",
+        );
+    }
+
+    /// A crossing whose consumer sits on another shard is neither
+    /// written down nor refused here.
+    ///
+    /// **The liveness defect this guard exists for, and it is not
+    /// theoretical.** A bundle carries what its target needs to run, so
+    /// after a cut moves a prefix it can hand this shard a crossing
+    /// whose consuming node's target belongs to somebody else. Both the
+    /// note and the decline sit under that target, and a session writes
+    /// a crossing cell only where the member's shard applies its owner
+    /// — so a member composed here runs, succeeds and writes nothing.
+    /// Nothing about the crossing changes, so the next commit composes
+    /// it again, and every commit after that, until the tick carries
+    /// nothing else and the shard stops making progress.
+    ///
+    /// Driven at both admitters, because the guard has to be in both:
+    /// one writes the note, the other writes the answer, and they sit
+    /// at two keys under the one owner neither of them holds.
+    #[test]
+    fn a_crossing_answered_by_another_shard_is_neither_noted_nor_refused() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, claim, mut cell) = arrived_record(0x6D, REFUSED_EXPIRY_MS);
+        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        // The consuming node's target moves to the counterpart, which is
+        // what a cut does to a prefix. Everything else is unchanged.
+        let trie = schedule.at(at).expect("the window is seated").shard_trie();
+        assert_eq!(
+            trie.shard_for_prefix(claim.owner),
+            HOME,
+            "the fixture's consumer is this shard's before it is moved",
+        );
+        cell.consumer_claim = SubstateKey {
+            owner: committed_tx_cell_key(PEER, cell.tx, WeightedTimestamp::from_millis(1)).owner,
+            local: claim.local,
+        };
+        assert_ne!(
+            trie.shard_for_prefix(cell.consumer_claim.owner),
+            HOME,
+            "and somebody else's after",
+        );
+        state.provisioning.handed(record_key, cell, at);
+        state.committed_ts = at;
+
+        assert!(
+            compose_obligations(&mut state, &schedule, 1, at).is_empty(),
+            "a note this shard could never write is not composed",
+        );
+
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
+        let mut requests = Vec::new();
+        state.admit_refusals(
+            &schedule,
+            tick_id,
+            at,
+            PriceTable::GENESIS,
+            &mut tick,
+            &mut requests,
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request.runs, Runs::Refuse { .. })),
+            "and neither is an answer it could never write",
+        );
+    }
+
+    /// A crossing answered before the ledger caught up with it is never
+    /// written down.
+    ///
+    /// The happy path, which is the one this phase must not make pay: a
+    /// bundle arrives, a member runs, the claim lands, and no note is
+    /// ever composed for it.
+    #[test]
+    fn a_crossing_answered_first_is_never_written_down() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, claim, cell) = arrived_record(0x6B, REFUSED_EXPIRY_MS);
+        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        state.provisioning.handed(record_key, cell, at);
+        state.committed_ts = at;
+        let answer = CrossingAnswer {
+            tx: cell.tx,
+            intent: cell.intent,
+            local: cell.local,
+            output: cell.output,
+            record: record_key,
+            answered: Answered::Taken,
+        };
+        state
+            .counterparts
+            .note_answer(answer.key(&ProtocolHasher, claim.owner), &answer);
+
+        assert!(
+            compose_obligations(&mut state, &schedule, 1, at).is_empty(),
+            "a crossing this shard has answered needs no note of what it owes",
+        );
+    }
+
+    /// And a note whose answer now stands is let go of.
+    ///
+    /// The other half of the one job. Without it the note is a permanent
+    /// cell for a question nobody will ever ask again, which is the
+    /// defect this plan family exists to stop making.
+    #[test]
+    fn an_answered_note_is_let_go_of() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, claim, cell) = arrived_record(0x6C, REFUSED_EXPIRY_MS);
+        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        state.committed_ts = at;
+        let note_key = crossing_obligation_key(
+            &ProtocolHasher,
+            claim.owner,
+            cell.intent,
+            cell.local,
+            cell.output,
+        );
+        state.counterparts.owed.insert(
+            note_key,
+            CrossingObligation {
+                record: record_key,
+                cell,
+            },
+        );
+        assert!(
+            compose_obligations(&mut state, &schedule, 1, at).is_empty(),
+            "an unanswered crossing's note stands",
+        );
+
+        let answer = CrossingAnswer {
+            tx: cell.tx,
+            intent: cell.intent,
+            local: cell.local,
+            output: cell.output,
+            record: record_key,
+            answered: Answered::Declined,
+        };
+        state
+            .counterparts
+            .note_answer(answer.key(&ProtocolHasher, claim.owner), &answer);
+        let work = compose_obligations(&mut state, &schedule, 2, at);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].disown, vec![note_key]);
+        assert!(work[0].owe.is_empty());
     }
 
     /// The escrowed cell `held_record` gives, whose terms name a cell to

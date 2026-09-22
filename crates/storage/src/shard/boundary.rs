@@ -461,6 +461,14 @@ pub struct CrossingLeaves {
     pub records: Vec<(SubstateKey, Vec<u8>)>,
     /// Claims this shard has written, with their committed bytes.
     pub claims: Vec<(SubstateKey, Vec<u8>)>,
+    /// Crossings this shard was handed and has not answered, with their
+    /// committed bytes.
+    ///
+    /// The set a refusal is composed from once no bundle is in hand:
+    /// what a seat reads here is what a bundle proved to this chain
+    /// while it still existed, so a shard that came up long after can
+    /// still answer.
+    pub obligations: Vec<(SubstateKey, Vec<u8>)>,
 }
 
 #[cfg(test)]

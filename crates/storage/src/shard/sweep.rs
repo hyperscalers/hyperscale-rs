@@ -73,6 +73,19 @@ pub fn is_crossing_answer_cell(key: SubstateKey, value: &[u8]) -> bool {
         && protocol_statics().crossing_answer_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
+/// Whether a committed cell is a crossing obligation — a crossing a
+/// bundle handed this shard and that it has not answered.
+///
+/// The third of the families no sweep reaches, on the same seam and for
+/// the same reason. What asks is a shard reading back at a seat what it
+/// still owes an answer for, which is a fact about a bundle that has
+/// long since expired.
+#[must_use]
+pub fn is_crossing_obligation_cell(key: SubstateKey, value: &[u8]) -> bool {
+    protocol_statics_installed()
+        && protocol_statics().crossing_obligation_cell(key.owner.to_bytes(), key.local.0, value)
+}
+
 /// One row of the sweep index: an owner holding sweepable cells in a
 /// bucket.
 pub type SweepRow = (SweepBucket, Address);
