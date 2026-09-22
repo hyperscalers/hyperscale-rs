@@ -23,12 +23,12 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight,
-    CROSSING_BUNDLE_WINDOW, CounterpartMirror, Deadline, ExecutionCertificate, Inclusion,
+    CROSSING_BUNDLE_WINDOW, CounterpartMirror, ExecutionCertificate, Inclusion,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells,
     SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey, TerminalEvidence,
     TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Window,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     CrossingAnswer, CrossingCell, CrossingObligation, ProtocolHasher, Terms, crossing_decline_key,
@@ -36,20 +36,6 @@ use hyperscale_vm_effects::{
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 use crate::provisioning::Arrival;
-
-/// Whether an absence of a held record's claim, taken at `probed_wt`,
-/// says nobody took the crossing.
-///
-/// From the close of [`Window::Core`], where no core shard of any arity
-/// can still commit, to the close of [`Window::LegEntry`], which is as
-/// far as any evidence deciding the transaction can be taken. A leaf
-/// does not name its consumer's role, so nothing narrower is honest for
-/// every record this reads. A record a delivery consumes never reaches
-/// the disposal an absence licenses: it names nobody to take it back,
-/// and nobody does.
-fn held_absence_answers(probed_wt: WeightedTimestamp, deadline: Deadline) -> bool {
-    (Window::Core.of(deadline).end..Window::LegEntry.of(deadline).end).contains(&probed_wt)
-}
 
 /// What one block's abandonment records may still spend.
 ///
@@ -129,9 +115,16 @@ pub struct HeldRecord {
     /// keeps what lands, and the fold that reads it — and the record
     /// carries the claim's key for the same reason.
     pub(crate) consumer_decline: SubstateKey,
-    /// What a committed claim read of the cell, once one has read it:
-    /// present at any anchor, absent only past the lapse.
-    pub(crate) answer: Option<Inclusion>,
+    /// Whether a committed claim read the consumer's claim cell
+    /// present: the consumer holds the crossing, so the record is
+    /// answered and the value is not the producer's to take back.
+    ///
+    /// A presence and nothing else, which is the whole of what this
+    /// phase settled. The cell's *absence* says only that the consumer
+    /// has not run yet — a leaf does not name its consumer's role, so
+    /// no window makes one honest for every record — and the decline
+    /// beside it is what says the crossing will never be taken.
+    pub(crate) claimed: bool,
     /// Whether a committed claim read the consumer's decline cell
     /// present: its own word that it will never take the crossing, so
     /// the value is the producer's to credit back.
@@ -169,7 +162,7 @@ impl HeldRecord {
             ),
             cell,
             asked_at: None,
-            answer: None,
+            claimed: false,
             declined: false,
             departed: false,
         }
@@ -180,32 +173,25 @@ impl HeldRecord {
     /// Stated once because four sites ask it — the probe that puts the
     /// question, the fold that records what comes back, the offer that
     /// applies the pressure, and the retention rule that keeps a
-    /// reading to carry. A record is answered by a claim read present,
-    /// by a decline read present, or, until the absence path goes, by a
-    /// claim read absent inside the window one answers in; and a
-    /// conjunction copied four times is one three of them forget to
-    /// grow.
+    /// reading to carry. Both halves are presences: a claim read
+    /// present or a decline read present, and a conjunction copied four
+    /// times is one three of them forget to grow.
     #[must_use]
     pub(crate) const fn answered(&self) -> bool {
-        self.answer.is_some() || self.declined
+        self.claimed || self.declined
     }
 
     /// Whether the crossing this record holds can never be claimed, so
-    /// the value is the producer's to take back: the consumer's own
-    /// decline says so, a departure says so outright, and so does the
-    /// claim read absent inside the window an absence means something
-    /// in.
+    /// the value is the producer's to take back.
+    ///
+    /// Two presences and no absence. The consumer's own decline says
+    /// the crossing will never be taken; a departure says the chain
+    /// that was to consume it can never settle what issued it. Each is
+    /// committed content read present, and neither is bounded by a
+    /// window.
     #[must_use]
     pub(crate) const fn unclaimable(&self) -> bool {
-        self.declined || self.departed || matches!(self.answer, Some(Inclusion::Absent))
-    }
-
-    /// The deadline every window this record is read against derives
-    /// from — the producing intent's, recovered from the expiry the leaf
-    /// states.
-    #[must_use]
-    pub(crate) const fn deadline(&self) -> Deadline {
-        Deadline::from_expiry(self.cell.expiry_ms)
+        self.declined || self.departed
     }
 }
 
@@ -728,6 +714,7 @@ impl Counterparts {
         }
         self.cover_recorded(block);
         self.fold_crossing_writes(block);
+        self.cover_held_here(trie);
         self.cover_held(block);
         self.stamp_departures(topology_schedule, now);
         let unanswerable = self.ledger.prune(now);
@@ -1277,11 +1264,9 @@ impl Counterparts {
     /// is the one mistake this cannot make. So a presence of the claim
     /// decides, and nothing below it is reached.
     ///
-    /// The claim's *absence* is read last, and only inside
-    /// [`held_absence_answers`], which is where a leaf that does not
-    /// name its consumer's role can read one honestly. It is the road
-    /// the decline replaces, kept until every reader of it goes
-    /// together.
+    /// The claim's *absence* is read for nothing. A leaf does not name
+    /// its consumer's role, so an absence says only that the consumer
+    /// has not run yet — and the decline is the road that replaced it.
     fn fold_held(&mut self, stated: &StateClaim, trie: &ShardTrie) {
         for record in self.held.values_mut() {
             if record.answered() {
@@ -1296,14 +1281,10 @@ impl Counterparts {
                     .reading(key)
                     .and_then(|inclusion| probed.read(inclusion))
             };
-            if let Some(inclusion) = read(claim, Probed::Claim) {
-                record.answer = Some(inclusion);
+            if read(claim, Probed::Claim).is_some() {
+                record.claimed = true;
             } else if read(record.consumer_decline, Probed::Decline).is_some() {
                 record.declined = true;
-            } else if matches!(stated.reading(claim), Some(Inclusion::Absent))
-                && held_absence_answers(stated.anchor.ts, record.deadline())
-            {
-                record.answer = Some(Inclusion::Absent);
             }
         }
     }
@@ -1504,6 +1485,39 @@ impl Counterparts {
                         Some(_) => {}
                     }
                 }
+            }
+        }
+    }
+
+    /// Answer the records whose consumer sits on this shard, off the
+    /// answer cells this shard itself holds.
+    ///
+    /// [`ask_held_records`](Self::ask_held_records) puts no question to
+    /// a local consumer — there is no counterpart to ask — so no
+    /// [`StateClaim`] about one is ever composed and
+    /// [`fold_held`](Self::fold_held) never reaches it. A reshape
+    /// successor inheriting a producer's prefix holds exactly these:
+    /// both ends of the crossing, and nobody to ask about either.
+    ///
+    /// The evidence is here instead, and it is the same evidence the
+    /// remote path folds. An answer sits at one of two keys under the
+    /// consuming node's target, and which key carries it is which
+    /// answer it is — so this reads a **presence** twice over, at no
+    /// anchor and inside no window, where the licence it replaces read
+    /// the claim cell absent inside one.
+    fn cover_held_here(&mut self, trie: &ShardTrie) {
+        let local = self.ledger.local();
+        for record in self.held.values_mut() {
+            if record.answered() {
+                continue;
+            }
+            if trie.shard_for_prefix(record.cell.consumer_claim.owner) != local {
+                continue;
+            }
+            if self.answered.contains_key(&record.cell.consumer_claim) {
+                record.claimed = true;
+            } else if self.answered.contains_key(&record.consumer_decline) {
+                record.declined = true;
             }
         }
     }
@@ -1807,10 +1821,10 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::state_and_proof;
     use hyperscale_types::{
-        AbortCharge, Address, AddressClass, BlockHeight, CLAIM_WINDOW, CommittedAt, Hash, LocalKey,
-        RETENTION_HORIZON, ResourceAddr, RoutePrefix, StateRoot, evidence_admits_block,
+        AbortCharge, Address, AddressClass, BlockHeight, CLAIM_WINDOW, CommittedAt, Deadline, Hash,
+        LocalKey, RETENTION_HORIZON, ResourceAddr, RoutePrefix, StateRoot, evidence_admits_block,
     };
-    use hyperscale_vm_effects::{Hash32, IntentHash, Terms};
+    use hyperscale_vm_effects::{Answered, Hash32, IntentHash, Terms};
 
     use super::*;
 
@@ -2316,6 +2330,75 @@ mod tests {
         )
     }
 
+    /// A producer whose consumer sits on its own shard is answered off
+    /// the answer cells it holds itself, both ways.
+    ///
+    /// The reshape successor's case, and the only one there is for it:
+    /// `ask_held_records` puts no question to a local consumer, so no
+    /// state claim about one is ever composed and nothing else can
+    /// reach these records. A decline present credits the value back; a
+    /// claim present does not, and neither reading is taken at an
+    /// anchor or inside a window.
+    #[test]
+    fn a_local_consumers_answer_decides_the_record_it_sits_beside() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let seated = |answer_at: Option<SubstateKey>, answered: Answered| {
+            // Seated at the shard the consumer's target routes to, which
+            // is what a successor inheriting the producer's prefix
+            // becomes.
+            let mut counterparts = Counterparts::holding(
+                CONSUMER,
+                Arc::new(ProvenAnchors::default()),
+                Arc::new(ProvenCells::default()),
+                Arc::new(CounterpartMirror::default()),
+                &CrossingLeaves::default(),
+            );
+            let cell = producer_cell(0, deadline);
+            counterparts
+                .held
+                .insert(producer_record(0), HeldRecord::of(cell));
+            if let Some(key) = answer_at {
+                counterparts.note_answer(
+                    key,
+                    &CrossingAnswer {
+                        tx: cell.tx,
+                        intent: cell.intent,
+                        local: cell.local,
+                        output: cell.output,
+                        record: producer_record(0),
+                        answered,
+                    },
+                );
+            }
+            counterparts.cover_held_here(&trie);
+            let record = counterparts
+                .held
+                .get(&producer_record(0))
+                .expect("the record still stands");
+            (record.claimed, record.declined, record.unclaimable())
+        };
+
+        assert_eq!(
+            seated(None, Answered::Declined),
+            (false, false, false),
+            "a consumer that has not answered leaves the record waiting",
+        );
+        assert_eq!(
+            seated(Some(consumer_decline(0, deadline)), Answered::Declined),
+            (false, true, true),
+            "its own decline credits the value back, at no anchor and in no window",
+        );
+        assert_eq!(
+            seated(
+                Some(producer_cell(0, deadline).consumer_claim),
+                Answered::Taken
+            ),
+            (true, false, false),
+            "and its own claim answers without licensing a credit",
+        );
+    }
+
     /// A producer asks after both answers at one anchor, and a decline
     /// read present ends the crossing.
     ///
@@ -2425,10 +2508,7 @@ mod tests {
         producer.fold_held(&both, &trie);
 
         let held = producer.held.get(&record).expect("the record still stands");
-        assert!(
-            matches!(held.answer, Some(Inclusion::Present(_))),
-            "the claim is what the record is answered by",
-        );
+        assert!(held.claimed, "the claim is what the record is answered by");
         assert!(
             !held.declined && !held.unclaimable(),
             "so nothing licenses crediting back value the consumer holds",

@@ -26,12 +26,12 @@ use hyperscale_storage::{
 };
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline, DeclaredRange,
+    BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
     GlobalReceipt, Hash, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
     ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
-    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, Window,
-    absorb_committed_cells, compute_merkle_root,
+    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
+    compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, CrossingCell, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree,
@@ -1673,147 +1673,151 @@ fn a_retirement_retires_the_record_and_moves_nothing() {
     );
 }
 
-/// A record a shard inherited with a prefix decides itself, against the
-/// claim cell the record names and the recourse the record carries.
-/// Present, the record is deleted and nothing moves. Absent, this
-/// crossing names nobody to take it back — an outbound leg consumes
-/// it — so the record is left standing, holding its value for a
-/// consumer that has not run yet.
-///
-/// The member runs with no body at all, which is the point — a merge
-/// successor's store arrives as a prefix of leaves and its ledger begins
-/// empty, so the leaf is the whole of what a settlement has to work
-/// from, recourse included.
-#[test]
-#[allow(clippy::too_many_lines)] // one member over one fixture, in both its states
-fn an_inherited_record_decides_itself_against_its_claim() {
+/// A store holding the record an outbound leg wrote, and the pieces a
+/// settlement of it needs — what a reshape successor inherits: leaves,
+/// and no ledger to read them beside.
+struct Inherited {
+    executor: Executor,
+    trie: ShardTrie,
+    shard: ShardId,
+    store: MapDb,
+    record: SubstateKey,
+}
+
+/// Run the sending half over a fresh store, so the record stands with
+/// the value behind it.
+fn inherited_record() -> Inherited {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
-    let near_shard = trie.shard_for_prefix(alice());
+    let shard = trie.shard_for_prefix(alice());
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     let edge = classified.edges()[0].clone();
-
-    // The sending half, which writes the record the successor inherits.
-    let issued = |store: &MapDb| {
-        let ctx = TickBatchContext {
-            local_shard: near_shard,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(1_000),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-        };
-        let input = TickTxInput {
-            prices: PriceTable::GENESIS,
-            tx_hash: tx.hash(),
-            transaction: Some(&tx),
-            provisions: &[],
-            clock: WeightedTimestamp::from_millis(1_000),
-            runs: Runs::Shape(Member::of(
-                classified.clone(),
-                near_shard,
-                Side::Issuing,
-                std::iter::once(near_shard)
-                    .chain(edge.to.iter().copied())
-                    .collect(),
-            )),
-            arrivals: &[],
-        };
-        executor
-            .execute_tick_batch(&ctx, store, &[input])
-            .expect("the harness engine holds every package it runs")
-            .remove(0)
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let ctx = TickBatchContext {
+        local_shard: shard,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
     };
-
-    // The housekeeping half: no body, and a clock inside the window an
-    // absent claim answers in.
-    let settle = |store: &MapDb, at: u64| {
-        let ctx = TickBatchContext {
-            local_shard: near_shard,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(at),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-        };
-        let input = TickTxInput {
-            prices: PriceTable::GENESIS,
-            tx_hash: TxHash::from(Hash::from_bytes(b"housekeeping")),
-            transaction: None,
-            provisions: &[],
-            clock: WeightedTimestamp::from_millis(at),
-            runs: Runs::Settle {
-                member: Member::whole(near_shard),
-                records: vec![edge.record.key()],
-                on: Licence::OwnLeaf,
-                charged: true,
-            },
-            arrivals: &[],
-        };
-        executor
-            .execute_tick_batch(&ctx, store, &[input])
-            .expect("the harness engine holds every package it runs")
-            .remove(0)
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash: tx.hash(),
+        transaction: Some(&tx),
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(1_000),
+        runs: Runs::Shape(Member::of(
+            classified,
+            shard,
+            Side::Issuing,
+            std::iter::once(shard)
+                .chain(edge.to.iter().copied())
+                .collect(),
+        )),
+        arrivals: &[],
     };
-
-    let mut unclaimed = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
-    let sent = issued(&unclaimed);
+    let sent = executor
+        .execute_tick_batch(&ctx, &store, &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0);
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
         panic!("the sender's legs must succeed: {:?}", sent.metadata);
     };
-    unclaimed.apply(writes);
-    let record = CrossingCell::from_bytes(
-        &Substates::cell(&unclaimed, edge.record.key()).expect("the record is written"),
-    )
-    .expect("a record decodes");
-    // The engine reads the claim cell alone; that the reading is taken
-    // where an absence means something is admission's business, and
-    // this clock sits short of the cell's own sweep.
-    let inside = record.expiry_ms - 1;
+    store.apply(writes);
+    Inherited {
+        executor,
+        trie,
+        shard,
+        store,
+        record: edge.record.key(),
+    }
+}
+
+/// Settle the inherited record under `on`, with no body and no clock
+/// that matters: the licence is the whole of the member's input.
+fn settle_inherited(held: &Inherited, on: Licence) -> ExecutedTx {
+    let ctx = TickBatchContext {
+        local_shard: held.shard,
+        shard_trie: &held.trie,
+        tick_ts: WeightedTimestamp::from_millis(2_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+    };
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash: TxHash::from(Hash::from_bytes(b"housekeeping")),
+        transaction: None,
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(2_000),
+        runs: Runs::Settle {
+            member: Member::whole(held.shard),
+            records: vec![held.record],
+            on,
+            charged: true,
+        },
+        arrivals: &[],
+    };
+    held.executor
+        .execute_tick_batch(&ctx, &held.store, &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0)
+}
+
+/// A record a shard inherited with a prefix, settled where its consumer
+/// claimed: retired to a tombstone, with the value left where the claim
+/// took it.
+///
+/// The member runs with no body at all, which is the point — a merge
+/// successor's store arrives as a prefix of leaves and its ledger begins
+/// empty, so the leaf is the whole of what a settlement has to work
+/// from. What it no longer works from is a window or a cell read to
+/// decide the licence: the licence is a presence its own chain
+/// committed.
+#[test]
+fn an_inherited_record_is_retired_where_its_consumer_claimed() {
+    let mut held = inherited_record();
+    let retired = settle_inherited(&held, Licence::Claimed);
+    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
+        panic!("the retirement must succeed: {:?}", retired.metadata);
+    };
+    held.store.apply(writes);
     assert!(
-        Window::LegEntry
-            .of(Deadline::from_expiry(record.expiry_ms))
-            .contains(&WeightedTimestamp::from_millis(inside))
+        Substates::cell(&held.store, held.record)
+            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+            .is_some_and(|tomb| tomb.terms == CrossingTerms::Retired && tomb.amount == 0),
+        "a claimed crossing's record is retired to a tombstone, not removed"
     );
+    assert_eq!(
+        Substates::cell(&held.store, vault_key(alice(), *PROTOCOL_RESOURCE)),
+        Some(encode_amount(900).to_vec()),
+        "and the value stays where the claim took it"
+    );
+}
 
-    // A store where the claim is present is the same store plus that one
-    // cell, so the two runs differ in nothing else.
-    let mut claimed = MapDb(unclaimed.0.clone());
-    claimed.0.insert(record.consumer_claim, vec![0xAA]);
-
-    let standing = settle(&unclaimed, inside);
+/// The same record under the licence that credits back, which this
+/// crossing has no recourse for: an outbound leg consumes it, so it
+/// names nobody to take it back and the record is left standing.
+#[test]
+fn an_inherited_record_with_no_recourse_is_left_standing() {
+    let held = inherited_record();
+    let standing = settle_inherited(&held, Licence::Unclaimed);
     assert_eq!(
         standing.consensus,
         ConsensusReceipt::Failed,
         "the one record it named is left standing, so the member settles nothing",
     );
     assert_eq!(
-        Substates::cell(&unclaimed, vault_key(alice(), *PROTOCOL_RESOURCE)),
+        Substates::cell(&held.store, vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(900).to_vec()),
         "an unclaimed crossing an outbound leg consumes goes back nowhere"
     );
     assert!(
-        Substates::cell(&unclaimed, edge.record.key()).is_some(),
+        Substates::cell(&held.store, held.record).is_some(),
         "and the record stands, holding it for whoever claims it"
-    );
-
-    let retired = settle(&claimed, inside);
-    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
-        panic!("the retirement must succeed: {:?}", retired.metadata);
-    };
-    claimed.apply(writes);
-    assert!(
-        Substates::cell(&claimed, edge.record.key())
-            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
-            .is_some_and(|tomb| tomb.terms == CrossingTerms::Retired && tomb.amount == 0),
-        "a claimed crossing's record is retired to a tombstone, not removed"
-    );
-    assert_eq!(
-        Substates::cell(&claimed, vault_key(alice(), *PROTOCOL_RESOURCE)),
-        Some(encode_amount(900).to_vec()),
-        "and the value stays where the claim took it"
     );
 }
 

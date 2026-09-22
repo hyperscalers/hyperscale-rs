@@ -336,28 +336,23 @@ fn assert_venues_gave_back<C: Cluster>(
 /// other outcome is pinned: the input goes back to the trader and the
 /// venues, speaking again too late, take nothing.
 ///
-/// **Two rules read one cell, and only one of them is a window.** The
-/// trader's *entry* asks the core for its committed cell and for its
-/// claim, and a claim's absence answers nothing at any anchor — the
-/// consumer has not run, never that it will not. The producer's *leaf*
-/// reads the same committed reading under `held_absence_answers`, which
-/// treats a claim absent between the close of [`Window::Core`] and the
-/// close of [`Window::LegEntry`] as nobody having taken the crossing.
-/// The leaf only gets to act once the entry that would otherwise settle
-/// the record has pruned, and that is the same close its own window ends
-/// at — so the reclaim lands in the last instants of a span minutes
-/// wide, which is why this waits on the refund rather than on a clock.
+/// **The verdict is a presence, and the consumer is what speaks it.** A
+/// claim's absence answers nothing at any anchor — the consumer has not
+/// run, never that it will not — so the producer waits on the venue's
+/// *decline*. What makes one possible here is that a member awaiting a
+/// sibling that never arrives stops standing the refusal down once the
+/// close of [`Window::Core`] has passed: past it the member can no
+/// longer commit, so it is not one that could still write the claim, and
+/// `release_wedged_ticks` will never release it — its only reader is
+/// gated on a determined half and such a member has none.
 ///
-/// **What it pins is that the two ends expire together.** The reclaim is
-/// sound only while no tick can still write the claim, and the argument
-/// for that is `TICK_SETTLEABLE_SPAN` — which
-/// `release_wedged_ticks` cannot enforce for a member awaiting a
-/// sibling, since its only reader is gated on a determined half and such
-/// a member has none. The span is not what holds here. What holds is
-/// that the core's tick goes with the entries at the same close, so the
-/// crossing has no second answer coming. Break that and the input pays
-/// twice: credited back to the trader, then claimed by a core that
-/// returned.
+/// **And the decline is the interlock, not just the evidence.** A
+/// producer crediting back on silence leaves the consumer free to claim
+/// afterwards, and the input pays twice: credited to the trader, then
+/// banked by a core that returned. A decline *written* forecloses that —
+/// the crossing carrying both cells is a refusal the consumer's own
+/// licence makes impossible — so what used to rest on the core's tick
+/// expiring with the entries now rests on a cell.
 ///
 /// Requires disjoint committees, as its neighbour does.
 ///
@@ -365,8 +360,9 @@ fn assert_venues_gave_back<C: Cluster>(
 ///
 /// Panics if either venue misses its budget standing up, if the trader's
 /// leg never pays, if the cut never fires, if the reclaim does not fire
-/// inside the span that answers, if a venue certifies after the fact, or
-/// if the resource is not conserved.
+/// inside the span that answers, if a venue never declines the crossing
+/// it cannot run, if a venue certifies after the fact, or if the
+/// resource is not conserved.
 pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
@@ -399,14 +395,12 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
     );
     let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
-    // The cut stands while the producer's leaf reads the claim absent and
-    // takes the input back. The reading has to fall inside
-    // `held_absence_answers` — from the close of [`Window::Core`] to the
-    // close of [`Window::LegEntry`] — and the leaf only gets to act on it
-    // once the entry that would otherwise settle the record has pruned,
-    // which is at that same close. So the two meet in the last instants
-    // of a span minutes wide, and what this waits on is the refund
-    // itself rather than a clock that happens to land near it.
+    // The cut stands while the venue declines the crossing it can no
+    // longer run and the producer takes the input back off that decline.
+    // The venue cannot speak before the close of [`Window::Core`], and
+    // the leaf only settles once the entry that would otherwise settle
+    // the record has pruned — so what this waits on is the refund itself
+    // rather than a clock that happens to land near it.
     let deadline = Deadline::of(validity.end_timestamp_exclusive);
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     let reclaimed = c.run_until(epochs(70), |c| {
@@ -428,7 +422,7 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
     );
     assert!(
         clock(c) >= Window::Core.of(deadline).end,
-        "and it must read the absence inside the span that answers, not before it",
+        "and it must land past the close the venue may first speak at, not before it",
     );
     for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
         assert!(
@@ -456,19 +450,20 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
             c.chain_fate(shard, hash).1.is_none(),
             "and neither venue certifies after the fact",
         );
-        // Nor does either refuse the crossing it was handed, at any age.
-        // Both hold a member for it the whole way through — the tick a
-        // sibling's silence leaves standing — and while one does, a
-        // claim may still be coming. A rule keyed on the deadline alone
-        // would have written a refusal here minutes in, and the crossing
-        // would carry both answers.
-        assert!(
-            c.declined(shard, hash).is_empty(),
-            "a venue still holding its member must refuse nothing, however late: \
-             {shard:?} declined {:?}",
-            c.declined(shard, hash),
-        );
     }
+    // And one of them said so. The crossing the trader staged lands on
+    // one venue's prefix, so one decline is the whole verdict — written
+    // by a venue still holding a member it can never run, which is the
+    // case this scenario exists for. The claim beside it was never
+    // written: a crossing carrying both cells is what the decline
+    // forecloses.
+    assert!(
+        [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+            .iter()
+            .any(|shard| !c.declined(*shard, hash).is_empty()),
+        "the venue holding a member it can never run must decline the crossing, \
+         which is what the producer credits back off",
+    );
 
     let after = held(c, trader.address(), *PROTOCOL_RESOURCE);
     assert_eq!(

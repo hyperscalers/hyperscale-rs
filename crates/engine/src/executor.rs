@@ -640,17 +640,16 @@ impl Executor {
         let mut disposals = Vec::with_capacity(records.len());
         let mut declaration = Declaration::default();
         for key in records {
-            let record = match (read_record(snapshot, *key), on) {
-                (Some(record), _) => record,
-                (None, Licence::OwnLeaf) => continue,
-                (None, Licence::Claimed | Licence::Unclaimed) => {
-                    return Err(format!("settlement of record {key:?} reads no record"));
-                }
+            let Some(record) = read_record(snapshot, *key) else {
+                return Err(format!("settlement of record {key:?} reads no record"));
             };
             // What the record takes, decided before anything is
             // declared: a record left standing is declared nothing, or
-            // the member would name a cell it never touches.
-            let takes_back = takes_back(on, &record, snapshot);
+            // the member would name a cell it never touches. The
+            // licence is the whole of it — no cell is read here to
+            // decide it, because every licence is a presence a
+            // counterpart wrote and this shard's chain committed.
+            let takes_back = on == Licence::Unclaimed;
             // Nothing takes an owed crossing back, so a licence that
             // would is not about this record: it stands, holding the
             // value for whoever may still claim it, and the member goes
@@ -1614,22 +1613,6 @@ struct BatchMember {
     /// fee is weighed at, carried per member because that is the grain
     /// the anchor has.
     prices: PriceTable,
-}
-
-/// Whether the settlement of `record` under `on` takes the crossing
-/// back rather than deleting a record whose claim happened: what the
-/// licence says, or for a record on this shard's own leaf what its
-/// claim cell says — present is a claim that happened, absent is one
-/// that never will. That the absence is read inside the window it
-/// means something in is the licence's business: a member is admitted
-/// on this shard's own leaf only inside the lapse, as it is admitted on
-/// a counterpart's evidence only once that evidence stands.
-fn takes_back(on: Licence, record: &CrossingCell, snapshot: &(dyn Substates + Sync)) -> bool {
-    match on {
-        Licence::Claimed => false,
-        Licence::Unclaimed => true,
-        Licence::OwnLeaf => snapshot.cell(record.consumer_claim).is_none(),
-    }
 }
 
 /// The record a leaf holds, or nothing where the cell is absent or is

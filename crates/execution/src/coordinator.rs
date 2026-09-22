@@ -62,13 +62,12 @@ use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey,
-    TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
-    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    Window, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
-    tick_leader_at,
+    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, MerkleInclusionProof, Mode,
+    Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions, SettledSetVerdict, SettledTxSet,
+    ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window, WindowView,
+    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::{
     CrossingCell, ProtocolHasher, Terms, crossing_decline_key, crossing_obligation_key,
@@ -1357,7 +1356,6 @@ impl ExecutionCoordinator {
     /// back.
     fn admit_record_disposals(
         &mut self,
-        topology_schedule: &TopologySchedule,
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
         prices: PriceTable,
@@ -1367,11 +1365,6 @@ impl ExecutionCoordinator {
         if self.counterparts.held.is_empty() {
             return;
         }
-        let Some(window) = topology_schedule.at(tick_ts) else {
-            return;
-        };
-        let trie = window.shard_trie();
-        let local_shard = self.local_shard;
         // One licence per issuing transaction, so records answered the
         // same way settle together and a record still waiting holds
         // nothing back.
@@ -1398,13 +1391,12 @@ impl ExecutionCoordinator {
             // entry has been pruned, and every one an abandonment record
             // reconstructed an entry for that keeps no classification to
             // settle from.
-            let claim = record.cell.consumer_claim;
             // A claim proved present is the consumer holding the
             // crossing, and a presence is bounded by no window. It
             // answers over every other reading here: taking back value a
             // consumer demonstrably has is the one mistake this cannot
             // make.
-            let claimed = matches!(record.answer, Some(Inclusion::Present(_)));
+            let claimed = record.claimed;
             let licence = match record.cell.terms {
                 // Nothing takes an owed crossing back, so the licences
                 // that credit one say nothing about it: a claim read
@@ -1422,26 +1414,17 @@ impl ExecutionCoordinator {
                     }
                     if claimed {
                         Some(Licence::Claimed)
-                    } else if trie.shard_for_prefix(claim.owner) == local_shard
-                        && (Window::Core.of(record.deadline()).end
-                            ..Window::LegEntry.of(record.deadline()).end)
-                            .contains(&tick_ts)
-                    {
-                        // This shard holds the cell, so the engine reads
-                        // it against its own snapshot — the same
-                        // licence, answered without a fetch, and the
-                        // cell itself is the closest evidence there is
-                        // while the window it answers in stands.
-                        Some(Licence::OwnLeaf)
                     } else if record.unclaimable() {
                         // The consumer's own decline read present is the
                         // crossing's answer and is bounded by nothing: it
                         // says the value will never be taken, so it is
                         // the producer's to credit back. A departure says
                         // the chain that was to consume this crossing can
-                        // never settle what issued it, and a claim read
-                        // absent inside its window says nobody took it.
-                        // Each way the value goes back.
+                        // never settle what issued it. Both are committed
+                        // content read present, and a consumer sitting on
+                        // this shard writes the first of them into this
+                        // shard's own state — which is where
+                        // `cover_held_here` reads it.
                         Some(Licence::Unclaimed)
                     } else {
                         None
@@ -1540,10 +1523,23 @@ impl ExecutionCoordinator {
             if !owes_an_answer(trie, local_shard, record, &cell) {
                 continue;
             }
-            if self.counterparts.holds_answer_for(&cell)
-                || !Deadline::from_expiry(cell.expiry_ms).passed(tick_ts)
-                || self.holds_member_for(cell.tx)
-            {
+            let deadline = Deadline::from_expiry(cell.expiry_ms);
+            if self.counterparts.holds_answer_for(&cell) || !deadline.passed(tick_ts) {
+                continue;
+            }
+            // A member of the crossing's own transaction could still
+            // write the claim, so a refusal beside it would be a second
+            // answer — until the instant that premise expires. Past the
+            // close of `Window::Core` no core member can still commit,
+            // and a member held past it is one awaiting a sibling that
+            // is never coming: `release_wedged_ticks` cannot release it,
+            // because its only reader is gated on a determined half and
+            // such a member has none.
+            //
+            // Read on this shard's own clock about this shard's own
+            // member, which is what makes it a different question from
+            // reading a counterpart's cell absent inside a window.
+            if Window::Core.of(deadline).end >= tick_ts && self.holds_member_for(cell.tx) {
                 continue;
             }
             due.entry(cell.tx)
@@ -1959,9 +1955,7 @@ impl ExecutionCoordinator {
         // on the transaction.
         let membership = match on {
             Licence::Claimed => Membership::housekeeping(local_shard),
-            Licence::Unclaimed | Licence::OwnLeaf => {
-                Membership::whole(BTreeSet::from([local_shard])).settling()
-            }
+            Licence::Unclaimed => Membership::whole(BTreeSet::from([local_shard])).settling(),
         };
         state.admit(tx_hash, membership, None, Admission::Executes);
         self.ticks.assign_tx(tx_hash, tick_id);
@@ -2135,14 +2129,7 @@ impl ExecutionCoordinator {
         let tick_prices = prices_at(topology_schedule, block.ts);
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
-        self.admit_record_disposals(
-            topology_schedule,
-            tick_id,
-            block.ts,
-            tick_prices,
-            &mut state,
-            &mut requests,
-        );
+        self.admit_record_disposals(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_refusals(
             topology_schedule,
             tick_id,
@@ -4912,7 +4899,7 @@ mod tests {
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
         BeaconWitnessLeafCount, CLAIM_VISIBILITY_LAG, CROSSING_BUNDLE_WINDOW, ConsensusPublicKey,
         ConsensusReceipt, ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows,
-        ExecutionOutcome, GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY,
+        ExecutionOutcome, GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
         MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate,
         RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
         ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, StoredReceipt, SubstateKey,
@@ -10506,11 +10493,23 @@ mod tests {
         (record_key, claim, cell)
     }
 
+    /// Which of the two answer cells a proof carries, of the pair one
+    /// probe asks for.
+    #[derive(Clone, Copy)]
+    enum Proved {
+        /// The consumer holds the crossing.
+        Claim,
+        /// The consumer will never take it.
+        Decline,
+        /// Neither cell is there, which answers nothing.
+        Neither,
+    }
+
     /// What a shard holding one record dispatches, once a block carries
-    /// a proof of its claim. `owed_here` registers the issuing
-    /// transaction in the ledger, which is the shard's other way of
-    /// reaching the same leaves.
-    fn held_settlement(present: bool, owed_here: bool) -> Option<Runs> {
+    /// a proof of its consumer's two answer cells. `owed_here` registers
+    /// the issuing transaction in the ledger, which is the shard's other
+    /// way of reaching the same leaves.
+    fn held_settlement(proved: Proved, owed_here: bool) -> Option<Runs> {
         let schedule = two_shard_topology();
         let mut state = make_test_state();
         // Past the lapse, which is where an absence answers.
@@ -10528,6 +10527,13 @@ mod tests {
         }
         let deadline = Deadline::from_expiry(expiry_ms);
         let read_at = Window::Core.of(deadline).end.plus(Duration::from_secs(1));
+        let decline = crossing_decline_key(
+            &ProtocolHasher,
+            cell.consumer_claim.owner,
+            cell.intent,
+            cell.local,
+            cell.output,
+        );
         state
             .counterparts
             .held
@@ -10535,7 +10541,11 @@ mod tests {
 
         // The claim sits on PEER, so the seat asks rather than reads.
         state.committed_ts = read_at;
-        let present_keys: Vec<SubstateKey> = if present { vec![claim] } else { Vec::new() };
+        let present_keys: Vec<SubstateKey> = match proved {
+            Proved::Claim => vec![claim],
+            Proved::Decline => vec![decline],
+            Proved::Neither => Vec::new(),
+        };
         let (bundle, opened) = proven_at(
             &mut state,
             &schedule,
@@ -10543,7 +10553,7 @@ mod tests {
             5,
             read_at,
             &present_keys,
-            &[claim],
+            &[claim, decline],
         );
         assert_eq!(
             state_proof_fetches(&opened)
@@ -10562,19 +10572,21 @@ mod tests {
         })
     }
 
-    /// A held record whose claim routes elsewhere is decided against
-    /// that claim, proved.
+    /// A held record whose consumer routes elsewhere is decided against
+    /// that consumer's answer, proved — and by nothing else.
     ///
-    /// Present, the consumer holds the crossing and the record is
-    /// deleted; absent where an absence answers, nobody took it and the
-    /// value goes back. Without this a shard skips such a record on
-    /// every tick forever: the value stands on its prefix with nothing
-    /// naming it.
+    /// Two presences and no absence. The claim present is the consumer
+    /// holding the crossing, so the record is retired; the decline
+    /// present is the consumer's word that it never will, so the value
+    /// goes back. Neither cell there says only that the consumer has
+    /// not spoken, at any clock: a leaf does not name its consumer's
+    /// role, so no window makes an absence honest for every record this
+    /// reads.
     #[test]
-    fn a_held_record_is_decided_against_a_proof_of_its_claim() {
+    fn a_held_record_is_decided_against_a_proof_of_its_consumers_answer() {
         assert!(
             matches!(
-                held_settlement(true, false),
+                held_settlement(Proved::Claim, false),
                 Some(Runs::Settle {
                     on: Licence::Claimed,
                     ..
@@ -10584,13 +10596,17 @@ mod tests {
         );
         assert!(
             matches!(
-                held_settlement(false, false),
+                held_settlement(Proved::Decline, false),
                 Some(Runs::Settle {
                     on: Licence::Unclaimed,
                     ..
                 })
             ),
-            "and proved absent past the lapse takes the crossing back"
+            "a decline proved present takes the crossing back"
+        );
+        assert!(
+            held_settlement(Proved::Neither, false).is_none(),
+            "and neither cell proved present decides nothing, however late the reading",
         );
     }
 
@@ -11703,30 +11719,40 @@ mod tests {
         );
     }
 
-    /// A crossing a member here still holds is not refused, at any age.
+    /// A crossing a member here still holds is not refused until that
+    /// member can no longer run, and is refused once it cannot.
     ///
-    /// The deadline does not bound this, which is why it is its own
-    /// condition: the deadline fence on finalizations refuses only what
-    /// decides alone, so a core member with a sibling settles on the
-    /// sibling's clock however late. While a tick or a candidate holds
-    /// one, a claim may still be coming.
+    /// The deadline does not bound the held-member condition, which is
+    /// why it is its own: the deadline fence on finalizations refuses
+    /// only what decides alone, so a core member with a sibling settles
+    /// on the sibling's clock. What bounds it is the close of
+    /// [`Window::Core`], past which no core member can still commit — so
+    /// a member held past it is one awaiting a sibling that never
+    /// arrives, which nothing releases. Without the bound such a
+    /// crossing is never answered by anybody and its producer holds the
+    /// value forever.
     #[test]
-    fn a_crossing_a_member_here_still_holds_is_not_refused_at_any_age() {
+    fn a_crossing_a_member_here_still_holds_is_refused_once_it_cannot_run() {
         let terms = escrowed_terms();
-        let ages = [
-            Deadline::from_expiry(REFUSED_EXPIRY_MS).at(),
-            WeightedTimestamp::from_millis(REFUSED_EXPIRY_MS * 10),
-        ];
-        for at in ages {
-            assert!(
-                refusal_at(at, terms, true, false).is_none(),
-                "a tick here may still write the claim, at {at:?}",
-            );
-            assert!(
-                refusal_at(at, terms, false, false).is_some(),
-                "and once it lets go the refusal is the crossing's answer, at {at:?}",
-            );
-        }
+        let deadline = Deadline::from_expiry(REFUSED_EXPIRY_MS);
+        let close = Window::Core.of(deadline).end;
+
+        assert!(
+            refusal_at(deadline.at(), terms, true, false).is_none(),
+            "inside the window the member may still write the claim",
+        );
+        assert!(
+            refusal_at(close, terms, true, false).is_none(),
+            "and at the close itself it has not run out of room",
+        );
+        assert!(
+            refusal_at(close.plus(Duration::from_secs(1)), terms, true, false).is_some(),
+            "past it the member can never run, so the refusal is the crossing's answer",
+        );
+        assert!(
+            refusal_at(deadline.at(), terms, false, false).is_some(),
+            "and a shard holding no member refuses from the deadline, as before",
+        );
     }
 
     /// A crossing this shard has already answered is not refused, and
@@ -11760,11 +11786,11 @@ mod tests {
     #[test]
     fn a_record_the_ledger_still_owes_for_is_left_to_the_ledger() {
         assert!(
-            held_settlement(false, true).is_none(),
+            held_settlement(Proved::Decline, true).is_none(),
             "an entry here settles its own records",
         );
         assert!(
-            held_settlement(false, false).is_some(),
+            held_settlement(Proved::Decline, false).is_some(),
             "and the leaf answers where no entry does",
         );
     }

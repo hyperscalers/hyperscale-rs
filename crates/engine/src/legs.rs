@@ -847,14 +847,6 @@ pub enum Licence {
     /// No consumer ever claimed, on the evidence of a committed record:
     /// the crossings are credited back and the records deleted.
     Unclaimed,
-    /// This shard's own state: records it inherited with a prefix, each
-    /// decided against the claim cell it names — credited back where
-    /// that cell is absent inside the window an absence means something
-    /// in, deleted where it is there. The one licence that is this
-    /// shard's own evidence: a record arriving with a prefix has no
-    /// counterpart left to ask, and the shard that inherited it holds
-    /// both halves of the crossing or cannot decide it at all.
-    OwnLeaf,
 }
 
 /// What a member runs of its transaction: the shape its committing
@@ -1017,7 +1009,7 @@ impl Runs {
             // never ran and was never asked to price, so whatever it
             // owed was owed where it committed.
             Self::Settle {
-                on: Licence::Claimed | Licence::OwnLeaf,
+                on: Licence::Claimed,
                 ..
             }
             | Self::Refuse { .. }
