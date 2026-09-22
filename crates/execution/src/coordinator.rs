@@ -1459,6 +1459,24 @@ impl ExecutionCoordinator {
         for (issued_by, crossings) in due {
             let records: Vec<SubstateKey> = crossings.iter().map(|one| one.record).collect();
             let tx_hash = disposal_member_name(issued_by, &records);
+            // A refusal already in flight is not composed again, and
+            // the guard has to be on **this member's** name rather than
+            // on the transaction's. The condition above reads
+            // `holds_member_for(cell.tx)`, which asks whether an
+            // execution of the crossing's own transaction could still
+            // write a claim — a different question with a different
+            // hash, so it never sees the refusal beside it.
+            //
+            // What ends the composition is the decline reaching state,
+            // which `holds_answer_for` then reads; and until it does,
+            // every commit that still sees the arrival composes the
+            // member again. The kernel refuses all but the first, so
+            // nothing is written twice — but the tick fills with
+            // members that cannot run, and the decline they were
+            // composed to write never gets through.
+            if self.holds_member_for(tx_hash) {
+                continue;
+            }
             state.admit(
                 tx_hash,
                 Membership::whole(BTreeSet::from([local_shard])).settling(),
@@ -10564,6 +10582,60 @@ mod tests {
                 .map(|request| request.runs.clone()),
             _ => None,
         })
+    }
+
+    /// A refusal already in flight is not composed again.
+    ///
+    /// Nothing about the crossing changes until the decline its member
+    /// writes reaches state, so without a guard on **this member's own
+    /// name** every later commit that still sees the arrival composes
+    /// it afresh. The kernel refuses all but the first, so no cell is
+    /// written twice — what it costs is the tick, which fills with
+    /// members that cannot run while the one decline they were composed
+    /// to write never gets through. The condition beside it reads
+    /// `holds_member_for(cell.tx)`, a different question about a
+    /// different hash, and never sees this.
+    ///
+    /// Driven straight at the admitter rather than through two commits:
+    /// a second `commit_carrying` composes nothing whatever the guard
+    /// says, so an assertion over one passes without the code it is
+    /// about.
+    #[test]
+    fn a_composed_refusal_is_not_composed_again() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let (record_key, _, cell) = arrived_record(0x6A, REFUSED_EXPIRY_MS);
+        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        state.provisioning.handed(record_key, cell, at);
+        state.committed_ts = at;
+
+        let compose = |state: &mut ExecutionCoordinator, height: u64| {
+            let tick_id = TickId::new(HOME, BlockHeight::new(height));
+            let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
+            let mut requests = Vec::new();
+            state.admit_refusals(
+                &schedule,
+                tick_id,
+                at,
+                PriceTable::GENESIS,
+                &mut tick,
+                &mut requests,
+            );
+            requests
+                .iter()
+                .filter(|request| matches!(request.runs, Runs::Refuse { .. }))
+                .count()
+        };
+        assert_eq!(
+            compose(&mut state, 1),
+            1,
+            "the crossing is past its deadline and nothing here holds a member",
+        );
+        assert_eq!(
+            compose(&mut state, 2),
+            0,
+            "and the answer is still on its way, so nothing is composed again",
+        );
     }
 
     /// The escrowed cell `held_record` gives, whose terms name a cell to
