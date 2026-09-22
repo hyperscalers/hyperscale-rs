@@ -3305,6 +3305,13 @@ impl ExecutionCoordinator {
             self.provisioning.arrived(),
         );
         let mut actions = committed.actions;
+        // The crossings a delivery here waits on that no push can still
+        // serve, asked of whoever holds each record now.
+        actions.extend(self.counterparts.pull_unpushed_crossings(
+            trie,
+            self.committed_ts,
+            &self.provisioning.unpushed_crossings(),
+        ));
         self.release_unanswerable(&committed.unanswerable);
         // After the prune, so a delivery the ledger has let go of is not
         // offered again, and after the release, so one just resolved is
@@ -10892,6 +10899,220 @@ mod tests {
             compose_obligations(&mut state, &schedule, 2, at).is_empty(),
             "and the note is still on its way, so nothing is composed again",
         );
+    }
+
+    /// A crossing the push can still serve is not pulled.
+    ///
+    /// **The floor is the whole of the arming, and it is measured in the
+    /// wait.** `Requirement::Crossing` is filed at classification, for a
+    /// value edge landing here from a node this shard does not run —
+    /// which is before the producer has run the leg that writes the
+    /// record. Pull on the unfloored set and the ask runs ahead of the
+    /// cell's existence, of which the only possible answer is silence.
+    #[test]
+    fn a_crossing_the_push_can_still_serve_is_not_pulled() {
+        let (mut state, trie, record_key, filed_at) = a_delivery_waiting_on_a_crossing();
+        let still_promptly = filed_at
+            .plus(RETENTION_HORIZON)
+            .minus(Duration::from_millis(1));
+        state.provisioning.advance_clock(still_promptly);
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 9, still_promptly));
+        let unpushed = state.provisioning.unpushed_crossings();
+        assert!(
+            !unpushed.contains(&record_key),
+            "short of the horizon the push and its height-keyed fallback own the case",
+        );
+        assert!(
+            state
+                .counterparts
+                .pull_unpushed_crossings(&trie, still_promptly, &unpushed)
+                .is_empty(),
+            "so nothing is asked, with a proven anchor standing that could be asked at",
+        );
+    }
+
+    /// Past the horizon it is pulled, at an anchor this validator has
+    /// proven, from whoever holds the record's prefix now.
+    ///
+    /// **What the pull is for.** A pushed bundle is pinned to the block
+    /// that promised it, and a delivery that has waited long enough for
+    /// that block to age past the producer's retention can never be
+    /// served one again. The pull names an anchor this validator chose
+    /// because it can verify it, so there is no height to age out.
+    #[test]
+    fn a_crossing_no_push_can_serve_is_pulled_at_a_proven_anchor() {
+        let (mut state, trie, record_key, filed_at) = a_delivery_waiting_on_a_crossing();
+        let at = filed_at.plus(RETENTION_HORIZON);
+        state.provisioning.advance_clock(at);
+        let unpushed = state.provisioning.unpushed_crossings();
+        assert!(
+            unpushed.contains(&record_key),
+            "past the horizon no push can serve it, so it is what a pull asks for",
+        );
+        assert_eq!(
+            trie.shard_for_prefix(record_key.owner),
+            PEER,
+            "and the record's own prefix is what says who to ask",
+        );
+
+        // With no proven anchor of the producer there is nothing to ask
+        // against, and nothing is asked.
+        assert!(
+            state
+                .counterparts
+                .pull_unpushed_crossings(&trie, at, &unpushed)
+                .is_empty(),
+            "an anchor this validator cannot verify is no anchor to ask at",
+        );
+
+        let anchor = proven_anchor_of(PEER, 9, at);
+        state.counterparts.proven_anchors.record(anchor);
+        let asked = state
+            .counterparts
+            .pull_unpushed_crossings(&trie, at, &unpushed);
+        assert_eq!(asked.len(), 1, "one producer, one ask; got {asked:?}");
+        assert!(
+            matches!(
+                &asked[0],
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::CrossingPulls(ids),
+                    shard,
+                    ..
+                }) if *shard == PEER && ids.as_slice() == [(anchor, record_key)]
+            ),
+            "the pull names the record and the anchor it is read at; got {:?}",
+            asked[0],
+        );
+    }
+
+    /// And it is not put again until the producer has moved *and* a
+    /// round trip's worth of time has passed.
+    ///
+    /// **Both halves, because either alone over-asks.** An anchor that
+    /// has not advanced would be read the same way twice, so a producer
+    /// standing still is asked once. And a producer that is running
+    /// lands anchors here every block, far faster than a round trip
+    /// resolves, so paced on the anchor alone the same question goes out
+    /// many times over before its first answer.
+    #[test]
+    fn a_pull_is_not_put_again_until_the_producer_has_moved() {
+        let (mut state, trie, _, filed_at) = a_delivery_waiting_on_a_crossing();
+        let at = filed_at.plus(RETENTION_HORIZON);
+        state.provisioning.advance_clock(at);
+        let unpushed = state.provisioning.unpushed_crossings();
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 9, at));
+        assert_eq!(
+            state
+                .counterparts
+                .pull_unpushed_crossings(&trie, at, &unpushed)
+                .len(),
+            1,
+            "the first ask goes out",
+        );
+        assert!(
+            state
+                .counterparts
+                .pull_unpushed_crossings(&trie, at, &unpushed)
+                .is_empty(),
+            "and is not repeated at the same anchor",
+        );
+
+        let later = at.plus(MAX_FINALIZATION_DELAY);
+        assert!(
+            state
+                .counterparts
+                .pull_unpushed_crossings(&trie, later, &unpushed)
+                .is_empty(),
+            "nor once the clock has run on, while the producer stands still",
+        );
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 10, at));
+        assert!(
+            state
+                .counterparts
+                .pull_unpushed_crossings(&trie, at, &unpushed)
+                .is_empty(),
+            "nor on a newer anchor inside one round trip",
+        );
+        assert_eq!(
+            state
+                .counterparts
+                .pull_unpushed_crossings(&trie, later, &unpushed)
+                .len(),
+            1,
+            "only a producer that has moved, a round trip later, is asked again",
+        );
+    }
+
+    /// And a crossing a bundle already carried is not pulled at all.
+    #[test]
+    fn a_crossing_already_in_hand_is_not_pulled() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = arrived_record(0x72, REFUSED_EXPIRY_MS);
+        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        state.provisioning.advance_clock(at);
+        state.provisioning.record_required(
+            cell.tx,
+            BTreeSet::from([Requirement::Crossing {
+                source: ShardId::ROOT,
+                key: record_key,
+            }]),
+        );
+        state.provisioning.handed(record_key, cell, at);
+        state.provisioning.advance_clock(at.plus(RETENTION_HORIZON));
+        assert!(
+            state.provisioning.unpushed_crossings().is_empty(),
+            "the bundle carried it, so there is nothing to ask for",
+        );
+    }
+
+    /// A shard seated at [`HOME`] with a delivery waiting on a crossing
+    /// [`PEER`] writes, and no bundle for it. Returns the record and the
+    /// clock the requirement was filed at, which is what the pull's
+    /// floor is measured from.
+    fn a_delivery_waiting_on_a_crossing() -> (
+        ExecutionCoordinator,
+        ShardTrie,
+        SubstateKey,
+        WeightedTimestamp,
+    ) {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = arrived_record(0x71, REFUSED_EXPIRY_MS);
+        let filed_at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        state.provisioning.advance_clock(filed_at);
+        state.provisioning.record_required(
+            cell.tx,
+            BTreeSet::from([Requirement::Crossing {
+                source: PEER,
+                key: record_key,
+            }]),
+        );
+        let trie = schedule
+            .at(filed_at)
+            .expect("the window is seated")
+            .shard_trie()
+            .clone();
+        (state, trie, record_key, filed_at)
+    }
+
+    /// An anchor of `shard` at `height`, as a validator that has proven
+    /// it holds one.
+    fn proven_anchor_of(shard: ShardId, height: u64, ts: WeightedTimestamp) -> Anchor {
+        Anchor {
+            shard,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::ZERO,
+            ts,
+        }
     }
 
     /// A shard that has forgotten the bundle still refuses the crossing.

@@ -24,10 +24,10 @@ mod state_proof_serve;
 pub use committed_txs_serve::{CommittedTxsCache, serve_committed_txs_request};
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
-    CommittedTxBinding, CommittedTxFetch, ExecCertBinding, ExecCertFetch, FinalizationBinding,
-    FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding,
-    ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding, StateProofFetch,
-    StateProofRelayBinding,
+    CommittedTxBinding, CommittedTxFetch, CrossingPullBinding, ExecCertBinding, ExecCertFetch,
+    FinalizationBinding, FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch,
+    ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding,
+    StateProofFetch, StateProofRelayBinding,
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
@@ -73,6 +73,12 @@ pub struct CrossShardState {
     /// Settled-set fetch against departed shards' terminals (rotates
     /// through the terminal committee).
     pub(crate) settled_txs: SettledTxsFetch,
+    /// Crossing-record pull against a producer's commit-proven anchor,
+    /// for a delivery that needs the record's value. Its own slot beside
+    /// [`Self::provision`] because the two are keyed differently: that
+    /// one by the block that promised a bundle, this one by the anchor
+    /// the asker can verify.
+    pub(crate) crossing_pull: StateProofFetch,
 }
 
 impl CrossShardState {
@@ -131,6 +137,14 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
+            crossing_pull: StateProofFetch::new(
+                "crossing_pull",
+                FetchConfig {
+                    max_in_flight: 64,
+                    max_ids_per_request: 16,
+                    parallel_chunks_per_tick: 2,
+                },
+            ),
         }
     }
 
@@ -149,6 +163,7 @@ impl CrossShardState {
             || self.state_proof.has_pending()
             || self.relayed_state_proof.has_pending()
             || self.settled_txs.has_pending()
+            || self.crossing_pull.has_pending()
     }
 
     /// Drive the remote-header-sync FSM's periodic tick. Returns range

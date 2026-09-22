@@ -11,7 +11,7 @@ use hyperscale_provisions::build_provisions;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::{Anchored, GetProvisionsRequest};
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{ShardId, ShardTrie, SubstateKey};
+use hyperscale_types::{BlockHeight, ShardId, ShardTrie, SubstateKey};
 use tracing::warn;
 
 /// Serve an inbound provision request from a target shard needing our state.
@@ -39,8 +39,8 @@ pub fn serve_provision_request<S: ShardStorage>(
 ) -> GetProvisionResponse {
     let height = match &req.asks {
         Anchored::Block(height) => *height,
-        Anchored::Records(records) => {
-            return serve_records(pending_chain, local_shard, shard_trie, req, records);
+        Anchored::Records { at, keys } => {
+            return serve_records(pending_chain, local_shard, shard_trie, req, *at, keys);
         }
     };
     let Some(certified) = pending_chain.certified_block(height) else {
@@ -96,15 +96,17 @@ pub fn serve_provision_request<S: ShardStorage>(
     GetProvisionResponse { provisions }
 }
 
-/// Serve a pull: the record cells named, read at this shard's own
-/// committed tip.
+/// Serve a pull: the record cells named, read at the height the asker
+/// named.
 ///
-/// **No height is named and none is needed.** A record stands until its
-/// producer disposes of it, so there is always a tip that holds one —
-/// and once disposed there is no tip that does, so a bundle for it comes
-/// back empty. That is what makes disposal stop the serving, where a
-/// height-pinned read goes on serving a disposed record out of an old
-/// version until its retention runs out.
+/// **The height is the asker's newest commit-proven anchor of this
+/// shard, not this shard's tip.** A bundle is checked against a header,
+/// and only a commit-proven one will do — a bare quorum certificate does
+/// not establish that this shard canonicalized the block. An asker
+/// cannot hold such a proof for a tip that only just happened, so it
+/// names the freshest anchor it can actually verify. Nothing here is
+/// pinned to the height that issued the crossing, which is the height
+/// that ages out.
 ///
 /// The transaction each cell belongs to is read off the cell rather than
 /// taken from the asker: a record names its own issuing transaction, and
@@ -119,17 +121,17 @@ fn serve_records<S: ShardStorage>(
     local_shard: ShardId,
     shard_trie: &ShardTrie,
     req: &GetProvisionsRequest,
+    height: BlockHeight,
     records: &[SubstateKey],
 ) -> GetProvisionResponse {
-    let view = pending_chain.view_at_committed_tip();
-    let height = view.base().committed_height();
     let Some(anchor) = pending_chain.certified_header(height) else {
         warn!(
             height = height.inner(),
-            "Provision pull: no certified header for our own tip"
+            "Provision pull: no certified header at the height asked"
         );
         return GetProvisionResponse { provisions: None };
     };
+    let view = pending_chain.view_at_committed_tip();
 
     let held: Vec<(SubstateKey, Vec<u8>)> = records
         .iter()

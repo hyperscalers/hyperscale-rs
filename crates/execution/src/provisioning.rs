@@ -285,9 +285,14 @@ pub struct ProvisioningTracker {
     /// asks one question per record, of one shard.
     arrived: BTreeMap<SubstateKey, Arrival>,
 
-    /// What each candidate waits for. One set per transaction, indexed
-    /// by nothing else, filed when the candidate is registered.
-    required: HashMap<TxHash, BTreeSet<Requirement>>,
+    /// What each candidate waits for, and the clock it was filed at.
+    /// One set per transaction, indexed by nothing else, filed when the
+    /// candidate is registered.
+    ///
+    /// The stamp is how long this shard has been waiting, which is what
+    /// [`unpushed_crossings`](Self::unpushed_crossings) measures its
+    /// floor against.
+    required: HashMap<TxHash, (WeightedTimestamp, BTreeSet<Requirement>)>,
 
     /// The payer shard of each cross-shard transaction whose payer is
     /// remote, recorded beside `required`. Resolves which absorption
@@ -328,7 +333,7 @@ impl ProvisioningTracker {
     /// matter: a bundle absorbed before its requirement is filed still
     /// answers it.
     pub(crate) fn record_required(&mut self, tx_hash: TxHash, requirements: BTreeSet<Requirement>) {
-        self.required.insert(tx_hash, requirements);
+        self.required.insert(tx_hash, (self.now, requirements));
     }
 
     /// Record the remote payer shard of a cross-shard transaction, so
@@ -364,7 +369,7 @@ impl ProvisioningTracker {
     /// aren't tracking). A recorded empty set is immediately satisfied —
     /// the member that waits on nothing and dispatches without waiting.
     pub(crate) fn is_fully_provisioned(&self, tx_hash: TxHash) -> bool {
-        self.required.get(&tx_hash).is_some_and(|required| {
+        self.required.get(&tx_hash).is_some_and(|(_, required)| {
             required.iter().all(|requirement| match requirement {
                 Requirement::CommittedState(shard) => self.has_received_from(tx_hash, *shard),
                 Requirement::Crossing { source, key } => {
@@ -372,6 +377,49 @@ impl ProvisioningTracker {
                 }
             })
         })
+    }
+
+    /// Every crossing a candidate here waits on that no push can still
+    /// serve, by record cell.
+    ///
+    /// What a pull is composed from, and the floor is the whole of the
+    /// arming. A crossing unmet for longer than one `RETENTION_HORIZON`
+    /// is one no push can still deliver: whatever block promised it —
+    /// and whether one ever did — is older than the horizon by now, so
+    /// the height-keyed fallback cannot rebuild it either. Short of the
+    /// horizon the push and that fallback own the case, and a pull put
+    /// then only races them.
+    ///
+    /// **The floor is what keeps the question answerable.**
+    /// `Requirement::Crossing` is filed by `divided_requirements` at
+    /// classification, for every value edge landing here from a node
+    /// this shard does not run — which is before the producer has run
+    /// the leg that writes the record. Unfloored, this set is dominated
+    /// by crossings whose cells no producer has written yet, of which
+    /// the only honest answer is silence.
+    ///
+    /// The records alone, and **not the shard the requirement names**.
+    /// That is where the producer sat when the transaction was
+    /// classified; who holds the record now is the record's own prefix,
+    /// read against the current trie by whoever asks. A cut moves a
+    /// prefix, and asking the shard that used to hold it is asking
+    /// somebody who cannot answer.
+    pub(crate) fn unpushed_crossings(&self) -> BTreeSet<SubstateKey> {
+        let mut wanted = BTreeSet::new();
+        for (tx_hash, (filed_at, required)) in &self.required {
+            if self.now < filed_at.plus(RETENTION_HORIZON) {
+                continue;
+            }
+            for requirement in required {
+                let Requirement::Crossing { source, key } = requirement else {
+                    continue;
+                };
+                if self.present_cell(*tx_hash, *source, *key).is_none() {
+                    wanted.insert(*key);
+                }
+            }
+        }
+        wanted
     }
 
     // ─── Batch absorption ───────────────────────────────────────────────
@@ -1021,7 +1069,7 @@ mod tests {
                 .map(Requirement::CommittedState)
                 .collect(),
         );
-        assert_eq!(t.required.get(&tx).map_or(0, BTreeSet::len), 2);
+        assert_eq!(t.required.get(&tx).map_or(0, |(_, r)| r.len()), 2);
     }
 
     /// An absorption no candidate has filed for lives one horizon past

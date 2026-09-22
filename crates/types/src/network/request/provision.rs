@@ -24,18 +24,38 @@ pub enum Anchored {
     /// producing header's `provision_tx_roots` says what a complete
     /// answer is.
     Block(BlockHeight),
-    /// The cells named, at whatever the source's committed tip is when
-    /// it answers.
+    /// The cells named, at an anchor of the source's that the asker has
+    /// already commit-proven.
     ///
-    /// The pull. A record stands until its producer disposes of it, so
-    /// there is always a tip that holds one — and once disposed there is
-    /// no tip that does, which is how disposal stops the serving instead
-    /// of a retention span stopping it. Nothing is pinned to a height
-    /// that can expire, because nothing names a height at all.
+    /// The pull. **Nothing is pinned to a height that can expire**,
+    /// which is the property this exists for — but the height is the
+    /// *asker's* newest proven anchor rather than the block that issued
+    /// the crossing, so it moves forward as the asker proves more and
+    /// never ages out from under it.
+    ///
+    /// It cannot be the source's own tip, however fresh that would be. A
+    /// bundle is verified against a header, and only a commit-proven one
+    /// will do: a bare quorum certificate does not establish that the
+    /// source canonicalized the block, and an f+1..2f corrupt committee
+    /// can certify a sibling that never commits. An asker cannot hold a
+    /// commit proof for a tip that only just happened, because such a
+    /// proof needs a round-contiguous pair above it.
+    ///
+    /// A record read here is safe to be slightly behind. The pull serves
+    /// the **owed** path, and an owed record is never credited back —
+    /// `escrow_settle` refuses a reclaim of one — so its only disposal is
+    /// retirement against the asker's own claim, and that claim is what
+    /// stops a second delivery. There is no credit to race.
     ///
     /// No promise says what a complete answer is here, and none is
     /// needed: the asker named the keys, so it already knows.
-    Records(Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>),
+    Records {
+        /// The source height to read at, which the asker holds a commit
+        /// proof for.
+        at: BlockHeight,
+        /// The record cells wanted.
+        keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
+    },
 }
 
 /// Request to fetch provisions from a source shard.
@@ -58,14 +78,15 @@ impl GetProvisionsRequest {
         }
     }
 
-    /// Read `records` at the source's own committed tip.
+    /// Read `keys` at `at`, a source height the asker has commit-proven.
     #[must_use]
     pub const fn for_records(
-        records: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
+        at: BlockHeight,
+        keys: Capped<Vec<SubstateKey>, MAX_PROOFS_PER_QUERY>,
         target_shard: ShardId,
     ) -> Self {
         Self {
-            asks: Anchored::Records(records),
+            asks: Anchored::Records { at, keys },
             target_shard,
         }
     }
@@ -112,15 +133,19 @@ mod tests {
     }
 
     #[test]
-    fn a_pull_names_its_keys_and_no_height() {
-        let request =
-            GetProvisionsRequest::for_records(Capped::from_array([key(1), key(2)]), ShardId::ROOT);
+    fn a_pull_names_its_keys_and_a_proven_anchor() {
+        let request = GetProvisionsRequest::for_records(
+            BlockHeight::new(7),
+            Capped::from_array([key(1), key(2)]),
+            ShardId::ROOT,
+        );
         let encoded = hbor_to_vec(&request).unwrap();
         let decoded: GetProvisionsRequest = hbor_from_slice(&encoded).unwrap();
         assert_eq!(request, decoded);
-        let Anchored::Records(records) = decoded.asks else {
+        let Anchored::Records { at, keys } = decoded.asks else {
             panic!("a pull names records");
         };
-        assert_eq!(records.len(), 2);
+        assert_eq!(at, BlockHeight::new(7));
+        assert_eq!(keys.len(), 2);
     }
 }

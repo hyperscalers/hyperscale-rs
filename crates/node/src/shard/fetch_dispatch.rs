@@ -13,8 +13,9 @@ use super::{ShardLoop, TimerOp};
 use crate::beacon::{self, BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Intent, Release};
 use crate::shard::cross_shard::{
-    CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding, SettledTxsBinding, StateProofBinding, StateProofRelayBinding,
+    CommittedTxBinding, CrossingPullBinding, ExecCertBinding, FinalizationBinding,
+    LocalProvisionBinding, ProvisionBinding, SettledTxsBinding, StateProofBinding,
+    StateProofRelayBinding,
 };
 use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
@@ -145,6 +146,9 @@ where
                 self.drive_fetch::<CommittedTxBinding>(intent.input(ids));
             }
             FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(intent.input(ids)),
+            FetchIds::CrossingPulls(ids) => {
+                self.drive_fetch::<CrossingPullBinding>(intent.input(ids));
+            }
             FetchIds::RelayedStateProofs(ids) => {
                 self.drive_fetch::<StateProofRelayBinding>(intent.input(ids));
             }

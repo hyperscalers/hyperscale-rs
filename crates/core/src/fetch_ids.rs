@@ -42,6 +42,15 @@ pub enum FetchIds {
     CommittedTxs(Vec<(PredecessorTerminal, TxHash)>),
     /// State-proof probes as `(anchor, key)`.
     StateProofs(Vec<(Anchor, SubstateKey)>),
+    /// Crossing records pulled as `(anchor, record)`: the producer
+    /// anchor the asker has commit-proven, and one record cell whose
+    /// value it needs to deliver.
+    ///
+    /// [`Self::RemoteProvisions`]' other half. That one names the block
+    /// that promised a bundle and ages out with it; this one names an
+    /// anchor the asker picked because it can verify it, so it moves
+    /// forward rather than expiring.
+    CrossingPulls(Vec<(Anchor, SubstateKey)>),
     /// State-proof relays as `(anchor, key)` — the same question as
     /// [`Self::StateProofs`], put to this shard's own committee.
     RelayedStateProofs(Vec<(Anchor, SubstateKey)>),

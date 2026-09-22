@@ -20,6 +20,15 @@ impl ShardParticipation {
             ProtocolEvent::UnverifiedProvisionsReceived { provisions } => self
                 .provisions_coordinator
                 .on_state_provisions_received(sched, std::sync::Arc::unwrap_or_clone(provisions)),
+            ProtocolEvent::PulledProvisionsReceived {
+                provisions,
+                anchor,
+                records,
+            } => self.provisions_coordinator.on_pulled_provisions_received(
+                anchor,
+                records,
+                provisions.map(std::sync::Arc::unwrap_or_clone),
+            ),
             ProtocolEvent::VerifiedProvisionsReceived { provisions } => self
                 .provisions_coordinator
                 .on_verified_state_provisions_received(sched, provisions, self.now),
