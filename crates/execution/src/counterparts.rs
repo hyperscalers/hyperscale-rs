@@ -450,14 +450,31 @@ fn wants_reading(
     awaited_by(held, key) || awaits_record(answered, anchor, key) || arrivals.contains_key(&key)
 }
 
-/// Whether any answer cell of this shard's names `key`.
+/// Whether this shard has answered the crossing `cell` records, either
+/// way.
 ///
 /// What ends the arrival question and starts the answer one: a shard
 /// that has delivered holds a claim naming the record, and that claim is
 /// what asks about it from then on. Read whatever the answer says, since
 /// a crossing this shard has answered is one it will not deliver again.
-fn answered_for(answered: &BTreeMap<SubstateKey, AnsweredCrossing>, key: SubstateKey) -> bool {
-    answered.values().any(|answer| answer.record == key)
+///
+/// **Two lookups rather than a walk, and the cell is what makes that
+/// possible.** An answer sits at one of two keys under the consuming
+/// node's own target: the claim, which the record carries outright, and
+/// the decline, which derives from the same edge. Asked from the
+/// record's side there is no owner to derive either from — the record's
+/// owner is the *producing* node's target — so the question could only
+/// be answered by scanning every answer this shard has ever written.
+/// Every caller holds the cell, so none of them has to.
+fn answered_for(answered: &BTreeMap<SubstateKey, AnsweredCrossing>, cell: &CrossingCell) -> bool {
+    answered.contains_key(&cell.consumer_claim)
+        || answered.contains_key(&crossing_decline_key(
+            &ProtocolHasher,
+            cell.consumer_claim.owner,
+            cell.intent,
+            cell.local,
+            cell.output,
+        ))
 }
 
 /// A question this validator put to a counterpart: the question, the
@@ -1042,7 +1059,9 @@ impl Counterparts {
     ) {
         self.arrivals.retain(|key, _| arrived.contains_key(key));
         for (&record, arrival) in arrived {
-            if now < arrival.deadline().validity_end() || answered_for(&self.answered, record) {
+            if now < arrival.deadline().validity_end()
+                || answered_for(&self.answered, &arrival.cell)
+            {
                 continue;
             }
             let shard = trie.shard_for_prefix(record.owner);
@@ -1119,8 +1138,8 @@ impl Counterparts {
     /// replay — so a seat that came up after the answer was written
     /// reads it whole.
     #[must_use]
-    pub fn holds_answer_for(&self, record: SubstateKey) -> bool {
-        answered_for(&self.answered, record)
+    pub fn holds_answer_for(&self, cell: &CrossingCell) -> bool {
+        answered_for(&self.answered, cell)
     }
 
     /// Whether this shard has already written down that it owes an
