@@ -220,16 +220,16 @@ where
         }
     }
 
-    /// Dispatch a single-height block fetch. Reads the current sync
-    /// target and `force_full` flag from the FSM at dispatch time.
+    /// Dispatch a single-height block fetch. This node syncs to
+    /// execute, so every fetch states that intent; the `force_full`
+    /// flag comes from the FSM at dispatch time.
     fn dispatch_block_sync_fetch(
         &self,
         height: BlockHeight,
         inventory_cache: &mut Option<Inventory>,
     ) {
-        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 
-        let target_height = self.io.consensus.block_sync.target(&()).unwrap_or(height);
         let force_full = self.io.consensus.block_sync.force_full(height);
 
         // Heights flagged `force_full` were rehydration misses last time —
@@ -247,7 +247,7 @@ where
         self.process.network.request(
             self.shard,
             None,
-            GetBlockRequest::new(height, target_height).with_inventory(inventory),
+            GetBlockRequest::new(height, BlockIntent::Execute).with_inventory(inventory),
             None,
             Box::new(move |result: Result<GetBlockResponse, _>| {
                 match result {

@@ -28,7 +28,7 @@ use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
-use hyperscale_types::network::request::GetBlockRequest;
+use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_transaction};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
@@ -173,7 +173,7 @@ impl Fixture {
 }
 
 fn block_request() -> GetBlockRequest {
-    GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1))
+    GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute)
 }
 
 #[test]

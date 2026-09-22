@@ -473,12 +473,6 @@ impl<B: SyncBinding> Sync<B> {
         self.scopes.values().map(|s| s.in_flight_ranges).sum()
     }
 
-    /// Per-scope target. `None` if the scope has no entry yet.
-    #[must_use]
-    pub(crate) fn target(&self, scope: &B::Scope) -> Option<B::Key> {
-        self.scopes.get(scope).map(|s| s.target)
-    }
-
     /// Per-scope status snapshot.
     #[must_use]
     pub(crate) fn status(&self, scope: &B::Scope) -> ScopeStatus {
@@ -2236,7 +2230,7 @@ mod tests {
             scope: (),
             height: BlockHeight::new(5),
         });
-        assert_eq!(s.target(&()), Some(BlockHeight::new(5)));
+        assert_eq!(s.status(&()).target_height, 5);
     }
 
     #[test]

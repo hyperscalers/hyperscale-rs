@@ -26,7 +26,7 @@ use std::time::Duration;
 use hyperscale_shard::committed_cells_for;
 use hyperscale_storage::ImportProgress;
 use hyperscale_types::network::request::{
-    GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
+    BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
 };
 use hyperscale_types::network::response::{
     GetBlockResponse, GetRemoteHeadersResponse, GetStateRangeResponse,
@@ -1244,7 +1244,7 @@ impl ReshapeOrchestrator {
                         duty: child,
                         from: child,
                         kind: FetchKind::Block {
-                            request: GetBlockRequest::new(terminal, terminal),
+                            request: GetBlockRequest::new(terminal, BlockIntent::Execute),
                         },
                     });
                     *requested = true;
@@ -1712,7 +1712,7 @@ impl ReshapeOrchestrator {
                         duty: child,
                         from: parent,
                         kind: FetchKind::Block {
-                            request: GetBlockRequest::new(terminal, terminal),
+                            request: GetBlockRequest::new(terminal, BlockIntent::Execute),
                         },
                     });
                     *requested = true;
@@ -1875,7 +1875,7 @@ fn advance_keeper_half(
             duty,
             from: half.child,
             kind: FetchKind::Block {
-                request: GetBlockRequest::new(terminal, terminal),
+                request: GetBlockRequest::new(terminal, BlockIntent::Execute),
             },
         });
         half.terminal_requested = true;

@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_request_creates_pending_request() {
-        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 
         let adapter = SimNetworkAdapter::default();
         let preferred = Some(ValidatorId::new(7));
@@ -424,7 +424,7 @@ mod tests {
         adapter.request(
             shard,
             preferred,
-            GetBlockRequest::new(BlockHeight::new(42), BlockHeight::new(42)),
+            GetBlockRequest::new(BlockHeight::new(42), BlockIntent::Execute),
             None,
             Box::new(|_| ResponseVerdict::Accept),
         );
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_request_callback_decodes_response() {
-        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
         use hyperscale_types::network::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
@@ -454,7 +454,7 @@ mod tests {
         adapter.request(
             ShardId::leaf(2, 0),
             None,
-            GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
+            GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute),
             None,
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_request_callback_propagates_error() {
-        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
         use hyperscale_types::network::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
@@ -488,7 +488,7 @@ mod tests {
         adapter.request(
             ShardId::leaf(2, 0),
             None,
-            GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
+            GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute),
             None,
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);

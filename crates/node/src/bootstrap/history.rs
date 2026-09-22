@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_types::network::request::GetBlockRequest;
+use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, RETENTION_HORIZON, ShardAnchor, WeightedTimestamp,
@@ -127,9 +127,12 @@ impl HistoryBackfill {
         let mut height = self.next;
         for _ in 0..WINDOW {
             if !self.held.contains_key(&height) && self.asked.insert(height) {
-                // No inventory: a store this fresh can rehydrate nothing,
-                // so every body has to ride inline.
-                requests.push(GetBlockRequest::new(height, height));
+                // The walk records each block below a frontier it
+                // already holds and never executes one, so no
+                // provision body is wanted. No inventory either: a
+                // store this fresh can rehydrate nothing, so every
+                // body it does want rides inline.
+                requests.push(GetBlockRequest::new(height, BlockIntent::History));
             }
             let Some(prev) = height.prev() else { break };
             height = prev;

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::network::request::{
-    GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
+    BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
 };
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
@@ -503,7 +503,7 @@ impl ObserverTail {
             return None;
         }
         self.in_flight = true;
-        Some(GetBlockRequest::new(self.next, self.next))
+        Some(GetBlockRequest::new(self.next, BlockIntent::Execute))
     }
 
     /// The next certified-header fetch from `source`, for a recognizing

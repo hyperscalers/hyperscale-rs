@@ -21,7 +21,7 @@ mod sync;
 mod transaction;
 mod witness_history;
 
-pub use block::GetBlockRequest;
+pub use block::{BlockIntent, GetBlockRequest};
 pub use cells::{CellRange, GetCellsRequest, MAX_RANGES_PER_QUERY};
 pub use committed_txs::GetCommittedTxsRequest;
 pub use execution_cert::GetExecutionCertsRequest;
