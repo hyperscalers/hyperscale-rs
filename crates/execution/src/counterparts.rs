@@ -22,16 +22,16 @@ use hyperscale_storage::{
     CrossingLeaves, is_crossing_answer_cell, is_crossing_obligation_cell, is_record_cell,
 };
 use hyperscale_types::{
-    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
-    Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells, RETENTION_HORIZON, SettledTxSet,
-    ShardId, ShardTrie, Spoken, StateClaim, SubstateKey, TerminalEvidence, TopologySchedule,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight,
+    CROSSING_BUNDLE_WINDOW, CounterpartMirror, Deadline, ExecutionCertificate, Inclusion,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells,
+    SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey, TerminalEvidence,
+    TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{
-    CrossingAnswer, CrossingCell, CrossingObligation, ProtocolHasher, crossing_decline_key,
+    CrossingAnswer, CrossingCell, CrossingObligation, ProtocolHasher, Terms, crossing_decline_key,
 };
 
 use crate::ledger::{Ledger, Question, Unanswerable};
@@ -258,7 +258,7 @@ impl AnsweredCrossing {
     /// The answer as the leaves give it: unasked, with nothing yet read
     /// of the record it names.
     #[must_use]
-    const fn of(claim: &CrossingAnswer) -> Self {
+    pub(crate) const fn of(claim: &CrossingAnswer) -> Self {
         Self {
             record: claim.record,
             asked_at: None,
@@ -295,11 +295,18 @@ pub enum Cleanup {
     /// carries again, for every voter to verify against its own proven
     /// cells.
     Standing(Option<Anchor>),
-    /// Read absent once, at this anchor of the producer.
-    Once(Anchor),
-    /// Read absent at two anchors of the producer far enough apart that
-    /// nothing it once promised is servable any more.
-    Twice(Anchor, Anchor),
+    /// Read absent, at this anchor of the producer — and that is the
+    /// whole of the licence.
+    ///
+    /// **One reading, because the producer dated the going of it.** A
+    /// record is not removed at its disposal: it stands on as a
+    /// tombstone that its producer takes away one
+    /// [`CROSSING_TOMBSTONE_GRACE_MS`](hyperscale_vm_types::CROSSING_TOMBSTONE_GRACE_MS)
+    /// later. So a record read absent is one whose disposal is already
+    /// that far behind, and no bundle carrying it can still be admitted
+    /// — which is what the answer cell was defending against and the
+    /// only thing it was.
+    Gone(Anchor),
 }
 
 impl Cleanup {
@@ -327,10 +334,7 @@ impl Cleanup {
     #[must_use]
     fn read(self, anchor: Anchor, inclusion: Inclusion) -> Self {
         match (self, inclusion) {
-            (Self::Standing(_), Inclusion::Absent) => Self::Once(anchor),
-            (Self::Once(first), Inclusion::Absent) if Self::spans(first, anchor) => {
-                Self::Twice(first, anchor)
-            }
+            (Self::Standing(_), Inclusion::Absent) => Self::Gone(anchor),
             // The record is still there, so what this reading gives is
             // the anchor it was read at: the question is worth putting
             // again, and not at any header this one already answered
@@ -342,14 +346,6 @@ impl Cleanup {
             }
             (other, _) => other,
         }
-    }
-
-    /// Whether `second` stands far enough past `first` on the
-    /// producer's clock that nothing the producer promised below
-    /// `first` is servable at `second`.
-    #[must_use]
-    fn spans(first: Anchor, second: Anchor) -> bool {
-        second.ts > first.ts.plus(RETENTION_HORIZON)
     }
 
     /// Whether a reading taken at `anchor` could still advance this.
@@ -364,8 +360,7 @@ impl Cleanup {
     fn wants(self, anchor: Anchor) -> bool {
         match self {
             Self::Standing(seen) => seen.is_none_or(|seen| anchor.height > seen.height),
-            Self::Once(first) => Self::spans(first, anchor),
-            Self::Twice(..) => false,
+            Self::Gone(_) => false,
         }
     }
 }
@@ -472,6 +467,27 @@ pub struct Committed {
     /// The transactions let go of because every counterpart has fallen
     /// silent — the tick machine's to discard.
     pub(crate) unanswerable: Vec<Unanswerable>,
+    /// The answers whose record **this commit's own claims** read
+    /// absent, with the producer anchor each was read at.
+    ///
+    /// Read off the block and not off the fold, because it is the whole
+    /// of a deletion's licence: a pair of these more than a span apart
+    /// is what licenses one. A fold would make the licence node-local,
+    /// and a replica that had folded fewer readings would compose fewer
+    /// members and vote a different root — a divergence rather than a
+    /// lag.
+    pub(crate) gone: Vec<(SubstateKey, Anchor)>,
+    /// The records whose answers this block removed — arrivals the
+    /// tick machine is done with.
+    ///
+    /// An arrival is an execution input and nothing composes a verdict
+    /// off one any more, so dropping it is housekeeping rather than a
+    /// licence. Dropping it is not optional: the question
+    /// `ask_arrived_crossings` puts is gated on this shard holding an
+    /// answer, and a removal takes that gate away — so an arrival left
+    /// behind is a probe put at every header of the producer, for
+    /// every crossing this shard ever cleaned up.
+    pub(crate) cleaned: Vec<SubstateKey>,
 }
 
 /// What this validator holds to offer in a block it proposes.
@@ -550,6 +566,25 @@ pub struct Counterparts {
     /// question in this file.
     pub(crate) held: BTreeMap<SubstateKey, HeldRecord>,
 
+    /// The retired records this shard still holds, each with the clock
+    /// it stamped the cell to be removed at.
+    ///
+    /// **A tombstone is a record kept past its disposal so its consumer
+    /// can date the going of it.** The consumer deletes its answer once
+    /// no bundle carrying the record can still be admitted, and it
+    /// cannot read *when* the disposal was: a state proof carries a
+    /// value hash and never a value. An absence it can read. So the
+    /// producer holds the key one grace past the disposal and then
+    /// takes it away, and the going of it is the date.
+    ///
+    /// Seeded from the leaves like every other family here, so a reseat
+    /// and a restart both know what they are still holding open.
+    pub(crate) tombstones: BTreeMap<SubstateKey, u64>,
+
+    /// The records whose answers the block being folded removed,
+    /// gathered for the commit that carries them out.
+    cleaned: Vec<SubstateKey>,
+
     /// The owed claims this shard has written under its prefix, each
     /// still undeleted, by cell key.
     ///
@@ -613,11 +648,24 @@ impl Counterparts {
             proven_anchors,
             proven_cells,
             fetched: BTreeMap::new(),
+            // Tombstones are passed over: a retired record asks its
+            // consumer nothing, and what is left of it is a clock its
+            // own producer reads.
             held: leaves
                 .records
                 .iter()
                 .filter_map(|(key, value)| {
-                    Some((*key, HeldRecord::of(CrossingCell::from_bytes(value)?)))
+                    let cell = CrossingCell::from_bytes(value)?;
+                    (cell.terms != Terms::Retired).then(|| (*key, HeldRecord::of(cell)))
+                })
+                .collect(),
+            cleaned: Vec::new(),
+            tombstones: leaves
+                .records
+                .iter()
+                .filter_map(|(key, value)| {
+                    let cell = CrossingCell::from_bytes(value)?;
+                    (cell.terms == Terms::Retired).then_some((*key, cell.expiry_ms))
                 })
                 .collect(),
             answered: leaves
@@ -663,7 +711,9 @@ impl Counterparts {
         for claim in block.state_claims() {
             self.fetched.remove(claim);
         }
-        let mut actions = self.fold_state_claims(trie, block);
+        let mut gone = Vec::new();
+        self.cleaned.clear();
+        let mut actions = self.fold_state_claims(trie, block, &mut gone);
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -688,6 +738,8 @@ impl Counterparts {
         Committed {
             actions,
             unanswerable,
+            gone,
+            cleaned: std::mem::take(&mut self.cleaned),
         }
     }
 
@@ -1022,7 +1074,7 @@ impl Counterparts {
             };
             if !answer.cleanup.wants(anchor)
                 || answer.asked_at.is_some_and(|(asked, when)| {
-                    asked >= anchor.height || now.elapsed_since(when) < RETENTION_HORIZON
+                    asked >= anchor.height || now.elapsed_since(when) < CROSSING_BUNDLE_WINDOW
                 })
                 || self.fetched.keys().any(|claim| {
                     claim.anchor.shard == shard
@@ -1189,7 +1241,12 @@ impl Counterparts {
     /// nothing. The hand-off is a continuation emitted here rather than
     /// a map the fence reads later, so an answer is never collected
     /// before it is drained.
-    fn fold_state_claims(&mut self, trie: &ShardTrie, block: &Block) -> Vec<Action> {
+    fn fold_state_claims(
+        &mut self,
+        trie: &ShardTrie,
+        block: &Block,
+        gone: &mut Vec<(SubstateKey, Anchor)>,
+    ) -> Vec<Action> {
         if block.state_claims().is_empty() {
             return Vec::new();
         }
@@ -1198,7 +1255,7 @@ impl Counterparts {
         for claim in block.state_claims() {
             actions.extend(self.fold_cells(claim, &questions));
             self.fold_held(claim, trie);
-            self.fold_answered(claim, trie);
+            gone.extend(self.fold_answered(claim, trie));
         }
         actions
     }
@@ -1270,15 +1327,26 @@ impl Counterparts {
     /// What a fact *licenses* is a separate question, and
     /// [`Probed::read`] is where it is answered. Nothing licenses
     /// anything off an absence here yet.
-    fn fold_answered(&mut self, stated: &StateClaim, trie: &ShardTrie) {
-        for answer in self.answered.values_mut() {
+    /// Returns the answers this claim reads gone, which is the licence
+    /// a deletion is composed from.
+    fn fold_answered(
+        &mut self,
+        stated: &StateClaim,
+        trie: &ShardTrie,
+    ) -> Vec<(SubstateKey, Anchor)> {
+        let mut gone = Vec::new();
+        for (&key, answer) in &mut self.answered {
             if trie.shard_for_prefix(answer.record.owner) != stated.anchor.shard {
                 continue;
             }
             if let Some(inclusion) = stated.reading(answer.record) {
                 answer.cleanup = answer.cleanup.read(stated.anchor, inclusion);
+                if inclusion == Inclusion::Absent {
+                    gone.push((key, stated.anchor));
+                }
             }
         }
+        gone
     }
 
     /// Fold one claim's answers into the questions the ledger is
@@ -1391,9 +1459,20 @@ impl Counterparts {
                     match value {
                         Some(bytes) if is_record_cell(*key, bytes) => {
                             if let Some(cell) = CrossingCell::from_bytes(bytes) {
-                                self.held
-                                    .entry(*key)
-                                    .or_insert_with(|| HeldRecord::of(cell));
+                                // A disposal rewrites the record where it
+                                // stood, so the write that retires one is
+                                // the write that ends its question: the
+                                // held entry goes and a tombstone takes
+                                // its place, due for removal at the
+                                // expiry the producer stamped.
+                                if cell.terms == Terms::Retired {
+                                    self.held.remove(key);
+                                    self.tombstones.insert(*key, cell.expiry_ms);
+                                } else {
+                                    self.held
+                                        .entry(*key)
+                                        .or_insert_with(|| HeldRecord::of(cell));
+                                }
                             }
                         }
                         Some(bytes) if is_crossing_answer_cell(*key, bytes) => {
@@ -1410,8 +1489,17 @@ impl Counterparts {
                         }
                         None => {
                             self.held.remove(key);
-                            self.answered.remove(key);
+                            // An answer removed is a crossing over at both
+                            // ends: its record is gone, which is what
+                            // licensed the removal. The arrival the bundle
+                            // left behind is stale evidence from here on,
+                            // and the question it would otherwise re-open
+                            // is the one this cell was answering.
+                            if let Some(answer) = self.answered.remove(key) {
+                                self.cleaned.push(answer.record);
+                            }
                             self.owed.remove(key);
+                            self.tombstones.remove(key);
                         }
                         Some(_) => {}
                     }
@@ -1720,7 +1808,7 @@ mod tests {
     use hyperscale_types::test_utils::state_and_proof;
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, BlockHeight, CLAIM_WINDOW, CommittedAt, Hash, LocalKey,
-        ResourceAddr, RoutePrefix, StateRoot, evidence_admits_block,
+        RETENTION_HORIZON, ResourceAddr, RoutePrefix, StateRoot, evidence_admits_block,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash, Terms};
 
@@ -1900,7 +1988,7 @@ mod tests {
         });
         assert!(
             counterparts.probe(&trie, now, &BTreeMap::new()).is_empty(),
-            "no anchor short of the span could tell this shard anything it does not know",
+            "nothing more is worth asking: the absence is the licence, whole",
         );
         assert_eq!(
             counterparts
@@ -1908,8 +1996,8 @@ mod tests {
                 .values()
                 .next()
                 .map(|answer| answer.cleanup),
-            Some(Cleanup::Once(anchor)),
-            "and the one absence is held, with the anchor it was read at",
+            Some(Cleanup::Gone(anchor)),
+            "and the one absence is the licence, held with the anchor it was read at",
         );
     }
 
@@ -1993,119 +2081,54 @@ mod tests {
         assert_eq!(
             counterparts.probe(&trie, later.ts, &BTreeMap::new()).len(),
             1,
-            "a span later it is: nothing else would ever learn the record had gone",
+            "a span later it is: the record still stands, and nothing else would \
+             ever learn it had gone",
         );
     }
 
-    /// A second absence, past the span, closes the question — and what
-    /// the answer then holds is the pair a deletion is composed
-    /// against.
-    #[test]
-    fn a_second_absence_past_the_span_closes_the_question() {
-        let record = producer_record(0x42);
-        let (mut counterparts, trie, anchors) = answering(record);
-        let now = WeightedTimestamp::from_millis(60_000);
-        let anchor = Anchor {
-            shard: PRODUCER,
-            height: BlockHeight::new(7),
-            state_root: StateRoot::from_raw(Hash::ZERO),
-            ts: now,
-        };
-        let read_absent = |counterparts: &mut Counterparts, at: Anchor| {
-            counterparts.fold_answered(
-                &StateClaim {
-                    anchor: at,
-                    cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
-                },
-                &trie,
-            );
-        };
-        read_absent(&mut counterparts, anchor);
-
-        let far = Anchor {
-            height: BlockHeight::new(9),
-            ts: now.plus(RETENTION_HORIZON).plus(Duration::from_secs(1)),
-            ..anchor
-        };
-        anchors.record(far);
-        assert_eq!(
-            counterparts.probe(&trie, far.ts, &BTreeMap::new()).len(),
-            1,
-            "an anchor far enough past the first is one a second reading can come from",
-        );
-        read_absent(&mut counterparts, far);
-        assert_eq!(
-            counterparts
-                .answered
-                .values()
-                .next()
-                .map(|answer| answer.cleanup),
-            Some(Cleanup::Twice(anchor, far)),
-            "two absences far enough apart are the licence, and they are what it carries",
-        );
-        anchors.record(Anchor {
-            height: BlockHeight::new(10),
-            ..far
-        });
-        assert!(
-            counterparts
-                .probe(&trie, far.ts, &BTreeMap::new())
-                .is_empty(),
-            "and the question is closed: nothing more is worth asking of this record",
-        );
-    }
-
-    /// Two absences license a deletion only at two anchors of the
-    /// producer a retention span apart.
+    /// One absence of the record is the whole licence, because the
+    /// producer dated the going of it.
     ///
-    /// The span is the whole of the rule, and it is measured on the
-    /// **producer's** clock. A retention floor moves inside the
-    /// producer's own commit, so a halted producer's floor freezes with
-    /// its tip and it serves every block at or below the absence anchor
-    /// indefinitely — while this chain's clock runs on. A pair read too
-    /// close together names a producer that may still be serving the
-    /// bundle a replay needs, and a replay needs no stale evidence: the
-    /// bundle is fresh and the record-present proof sits below the
-    /// disposal.
+    /// **Why one reading is now enough, where it never was before.** A
+    /// disposed record is not removed at its disposal: it stands on as
+    /// a tombstone its producer takes away one tombstone grace later.
+    /// So a record read absent is one whose disposal is already that
+    /// far behind, and no bundle carrying it can still be admitted —
+    /// which is the only thing the answer cell was defending against. A
+    /// consumer needs no memory, no second reading and no span of its
+    /// own; the clock is the producer's, kept where the producer can
+    /// read it without asking anyone.
     #[test]
-    fn two_absences_license_nothing_until_a_retention_span_separates_them() {
+    fn one_absence_of_a_dated_record_is_the_licence() {
         let at = |secs: u64| Anchor {
             shard: PRODUCER,
             height: BlockHeight::new(secs),
             state_root: StateRoot::from_raw(Hash::ZERO),
             ts: WeightedTimestamp::from_millis(secs * 1_000),
         };
+        let standing = Cleanup::Standing(None);
         let first = at(1_000);
-        let one = Cleanup::Standing(None).read(first, Inclusion::Absent);
-        assert_eq!(one, Cleanup::Once(first));
-        assert!(
-            !matches!(one, Cleanup::Twice(..)),
-            "one absence licenses nothing",
-        );
 
-        let close = at(1_000 + RETENTION_HORIZON.as_secs());
+        // A presence is the question put again, never an answer to it.
+        let seen = standing.read(first, Inclusion::Present([7; 32]));
+        assert_eq!(seen, Cleanup::Standing(Some(first)));
         assert!(
-            !one.wants(close),
-            "an anchor at exactly the span is not past it, so it is not worth asking at",
+            !seen.wants(first),
+            "and not asked again at the header it was already read at",
         );
-        assert_eq!(
-            one.read(close, Inclusion::Absent),
-            one,
-            "and a reading taken there advances nothing",
-        );
+        assert!(seen.wants(at(1_001)), "but at the next one it is");
 
-        let far = at(1_001 + RETENTION_HORIZON.as_secs());
-        assert!(one.wants(far), "past the span it is worth asking at");
-        let two = one.read(far, Inclusion::Absent);
-        assert_eq!(two, Cleanup::Twice(first, far));
+        // The absence licenses outright.
+        let gone = seen.read(at(1_001), Inclusion::Absent);
+        assert_eq!(gone, Cleanup::Gone(at(1_001)));
         assert!(
-            !two.wants(at(9_999)),
+            !gone.wants(at(9_999)),
             "and nothing further is worth asking: the answer is cleanable",
         );
         assert_eq!(
-            two.read(at(9_999), Inclusion::Absent),
-            two,
-            "the pair a deletion is composed against does not drift to newer anchors",
+            gone.read(at(9_999), Inclusion::Absent),
+            gone,
+            "the reading a deletion is composed against does not drift to newer anchors",
         );
     }
 
@@ -2200,10 +2223,15 @@ mod tests {
             "before it is folded the reading is still what the question wants",
         );
 
+        // Folded as a **presence**, which is the reading that still has
+        // a successor: the record stands, so the question is put again
+        // at the producer's next header. An absence has no successor —
+        // it is the licence itself — so it could not tell a spent
+        // reading from a held-down one.
         counterparts.fold_answered(
             &StateClaim {
                 anchor,
-                cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
+                cells: Capped::new(vec![(record, Inclusion::Present([9; 32]))]).expect("one cell"),
             },
             &trie,
         );
@@ -2216,16 +2244,19 @@ mod tests {
             "and once folded it is spent: no later reading of this record comes from here",
         );
 
-        let far = Anchor {
+        let next = Anchor {
             height: BlockHeight::new(8),
-            ts: now.plus(RETENTION_HORIZON).plus(Duration::from_secs(1)),
+            ts: now
+                .plus(CROSSING_BUNDLE_WINDOW)
+                .plus(Duration::from_secs(1)),
             ..anchor
         };
-        anchors.record(far);
+        anchors.record(next);
         assert_eq!(
-            counterparts.probe(&trie, far.ts, &BTreeMap::new()).len(),
+            counterparts.probe(&trie, next.ts, &BTreeMap::new()).len(),
             1,
-            "so the question for the second absence is put",
+            "so the question is put again once the pacing lets it, and the spent \
+             reading is not what stands it down",
         );
     }
 

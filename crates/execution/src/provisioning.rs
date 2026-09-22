@@ -24,7 +24,7 @@ use hyperscale_types::{
     Deadline, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
     WeightedTimestamp,
 };
-use hyperscale_vm_effects::CrossingCell;
+use hyperscale_vm_effects::{CrossingCell, Terms};
 use hyperscale_vm_types::{AddressClass, LegShape};
 
 /// One thing a cross-shard member waits for before it can run.
@@ -460,11 +460,34 @@ impl ProvisioningTracker {
                 let Some(cell) = CrossingCell::from_bytes(bytes) else {
                     continue;
                 };
+                // A tombstone is not an arrival. Its producer disposed
+                // of the crossing and keeps the key standing only so a
+                // consumer can date the going of it, so there is no
+                // value here to run a delivery against — and its
+                // `expiry_ms` names the removal rather than the
+                // crossing's deadline, which every reader below would
+                // take for one.
+                if cell.terms == Terms::Retired {
+                    continue;
+                }
                 self.arrived.insert(entry.key, Arrival { cell });
             }
             touched.push(tx_hash);
         }
         touched
+    }
+
+    /// Forget the arrival a crossing left behind, once this shard's
+    /// answer to it has been removed.
+    ///
+    /// An arrival is an execution input and no verdict is composed off
+    /// one, so this decides nothing — but it is not optional. The
+    /// question `ask_arrived_crossings` puts is gated on this shard
+    /// holding an answer, and the removal takes that gate away, so an
+    /// arrival left behind is a probe put at every header of the
+    /// producer for as long as the bundle is retained.
+    pub(crate) fn forget_arrival(&mut self, record: SubstateKey) {
+        self.arrived.remove(&record);
     }
 
     // ─── Retention ──────────────────────────────────────────────────────

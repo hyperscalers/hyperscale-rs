@@ -35,7 +35,8 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, CrossingCell, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree,
-    PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
+    PackageHash, PackageMetadata, ResourceKind, Terms as CrossingTerms, Totality, Value,
+    issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
@@ -1572,7 +1573,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
 /// record deleted. A second retirement finds nothing and is refused
 /// before the kernel runs.
 #[test]
-fn a_retirement_deletes_the_record_and_moves_nothing() {
+fn a_retirement_retires_the_record_and_moves_nothing() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
@@ -1643,8 +1644,12 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
     assert!(retired.fee_receipt.is_none(), "and charges nothing");
     store.apply(writes);
     assert!(
-        store.cell(edge.record.key()).is_none(),
-        "the record is gone"
+        store
+            .cell(edge.record.key())
+            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+            .is_some_and(|tomb| tomb.terms == CrossingTerms::Retired && tomb.amount == 0),
+        "the record's value is gone and its key stands on as a tombstone, so the \
+         consumer can date the disposal by reading the key absent later"
     );
     assert_eq!(
         store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
@@ -1800,8 +1805,10 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     };
     claimed.apply(writes);
     assert!(
-        Substates::cell(&claimed, edge.record.key()).is_none(),
-        "a claimed crossing's record is deleted"
+        Substates::cell(&claimed, edge.record.key())
+            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+            .is_some_and(|tomb| tomb.terms == CrossingTerms::Retired && tomb.amount == 0),
+        "a claimed crossing's record is retired to a tombstone, not removed"
     );
     assert_eq!(
         Substates::cell(&claimed, vault_key(alice(), *PROTOCOL_RESOURCE)),

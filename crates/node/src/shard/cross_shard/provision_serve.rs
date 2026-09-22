@@ -9,7 +9,7 @@ use hyperscale_provisions::build_provisions;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::{Anchored, GetProvisionsRequest};
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{BlockHeight, ShardId, ShardTrie, SubstateKey};
+use hyperscale_types::{BlockHeight, CROSSING_BUNDLE_WINDOW, ShardId, ShardTrie, SubstateKey};
 use tracing::warn;
 
 /// Serve an inbound provision request from a target shard needing our state.
@@ -66,7 +66,25 @@ pub fn serve_provision_request<S: ShardStorage>(
     }
     // The crossings the block's certificates commit, after its
     // transactions — the order the block's roots bucket them in.
-    for mut request in crossing_requests(block.certificates(), local_shard) {
+    //
+    // **Only while the block is inside the crossing-bundle window.** Past
+    // it this path would serve a record from the height that issued it
+    // however long ago its producer disposed of it, which is the one
+    // channel that would still feed a replay — so a crossing wanted
+    // later is pulled at a fresh anchor instead, where disposal has
+    // already closed the serving. The whole request goes rather than the
+    // crossing entries alone: a bundle short of what the block's
+    // `provision_tx_roots` promised fails its own completeness check,
+    // and a peer is better told there is nothing here.
+    let block_ts = block.header().parent_qc().weighted_timestamp();
+    let tip_ts = pending_chain
+        .latest_qc()
+        .map_or(block_ts, |qc| qc.weighted_timestamp());
+    let crossings = crossing_requests(block.certificates(), local_shard);
+    if !crossings.is_empty() && tip_ts.elapsed_since(block_ts) > CROSSING_BUNDLE_WINDOW {
+        return GetProvisionResponse { provisions: None };
+    }
+    for mut request in crossings {
         if !request.targets.contains(&req.target_shard) {
             continue;
         }
@@ -126,6 +144,41 @@ fn serve_records<S: ShardStorage>(
         return GetProvisionResponse { provisions: None };
     };
     let view = pending_chain.view_at_committed_tip();
+    // **The store's own floor first, which is a depth and not a
+    // clock.** A height this chain no longer keeps versions for is one
+    // the read below would panic on rather than miss, and the two
+    // floors do not imply each other: a successor seated at a cut has a
+    // young store and a full clock, so an anchor fresh by every measure
+    // below can still sit under everything it retains. Asked rather
+    // than inferred, on the terms the state-proof server asks it.
+    if !view.serves_at(height) {
+        warn!(
+            height = height.inner(),
+            "Provision pull: the height asked is below this chain's retention floor"
+        );
+        return GetProvisionResponse { provisions: None };
+    }
+    // **A bundle is an execution input, so it is served fresh.** The
+    // asker names a height it has commit-proven, which lags this tip by
+    // a commit proof's depth and no more; anything older is a question
+    // about the past, and the one thing that would ask it is a replay
+    // of a delivery whose record this chain has since disposed of.
+    //
+    // A window rather than the horizon, and the difference is what the
+    // consumer's answer cell has to outlive: past this no bundle
+    // carrying the record can be admitted, so a record read gone is one
+    // no replay can be fed, and one reading of it is the whole licence.
+    let asked_ts = anchor.header().parent_qc().weighted_timestamp();
+    let tip_ts = pending_chain
+        .latest_qc()
+        .map_or(asked_ts, |qc| qc.weighted_timestamp());
+    if tip_ts.elapsed_since(asked_ts) > CROSSING_BUNDLE_WINDOW {
+        warn!(
+            height = height.inner(),
+            "Provision pull: the height asked is past the crossing-bundle window"
+        );
+        return GetProvisionResponse { provisions: None };
+    }
 
     let held: Vec<(SubstateKey, Vec<u8>)> = records
         .iter()

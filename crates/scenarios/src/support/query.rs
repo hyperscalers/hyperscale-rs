@@ -191,7 +191,7 @@ pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
         .is_some_and(|record| {
             let deadline = Deadline::from_expiry(record.expiry_ms);
             match record.terms {
-                Terms::Owed => false,
+                Terms::Owed | Terms::Retired => false,
                 Terms::Escrowed { .. } => Window::LegEntry.of(deadline).end <= clock(c),
             }
         });

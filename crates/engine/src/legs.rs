@@ -30,7 +30,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{CrossingEdge as StarEdge, Kind, Star, running_at, star_at};
 use hyperscale_vm_kernel::{
-    Crossed, Departure, LegPlan, Obligations, OwnerSet, PlanFault, Refusal,
+    Crossed, Deletion, Departure, LegPlan, Obligations, OwnerSet, PlanFault, Refusal,
 };
 use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
@@ -922,6 +922,38 @@ pub enum Runs {
         /// What to write down and what to let go of.
         work: Obligations,
     },
+    /// No node at all: this shard's own answers to crossings whose
+    /// records their producers have since disposed of, taken away.
+    ///
+    /// Housekeeping on cells nobody outside this shard reads. An answer
+    /// is what makes a replayed delivery abort, and a replay needs a
+    /// bundle to run at all — so once no bundle for the record can be
+    /// served the answer defends nothing and goes.
+    Clean {
+        /// The member the cleanup runs as: whole, on its own shard,
+        /// reaching nobody else.
+        member: Member,
+        /// The answer cells to remove, each naming the record its
+        /// licence was established against.
+        answers: Vec<Deletion>,
+    },
+    /// No node either: the retired records this shard holds whose grace
+    /// its own clock has passed, taken away.
+    ///
+    /// [`Self::Clean`]'s counterpart on the producing side. A disposed
+    /// record stands on as a tombstone so its consumer can date the
+    /// going of it by reading the key absent; this is what finally
+    /// takes it away. The whole licence is the cell's own expiry
+    /// against the block's clock, and the kernel checks it — so a
+    /// member naming a tombstone early traps rather than shortening a
+    /// consumer's defence.
+    Sweep {
+        /// The member the sweep runs as: whole, on its own shard,
+        /// reaching nobody else.
+        member: Member,
+        /// The tombstone cells to remove.
+        tombstones: Vec<SubstateKey>,
+    },
 }
 
 impl Runs {
@@ -932,7 +964,9 @@ impl Runs {
             Self::Shape(member)
             | Self::Settle { member, .. }
             | Self::Refuse { member, .. }
-            | Self::Owe { member, .. } => member,
+            | Self::Owe { member, .. }
+            | Self::Clean { member, .. }
+            | Self::Sweep { member, .. } => member,
         }
     }
 
@@ -943,7 +977,11 @@ impl Runs {
     pub fn reaches_beyond(&self) -> bool {
         match self {
             Self::Shape(member) => member.reaches_beyond(),
-            Self::Settle { .. } | Self::Refuse { .. } | Self::Owe { .. } => false,
+            Self::Settle { .. }
+            | Self::Refuse { .. }
+            | Self::Owe { .. }
+            | Self::Clean { .. }
+            | Self::Sweep { .. } => false,
         }
     }
 
@@ -953,7 +991,11 @@ impl Runs {
     pub fn abortable(&self) -> bool {
         match self {
             Self::Shape(member) => member.abortable(),
-            Self::Settle { .. } | Self::Refuse { .. } | Self::Owe { .. } => false,
+            Self::Settle { .. }
+            | Self::Refuse { .. }
+            | Self::Owe { .. }
+            | Self::Clean { .. }
+            | Self::Sweep { .. } => false,
         }
     }
 
@@ -979,7 +1021,9 @@ impl Runs {
                 ..
             }
             | Self::Refuse { .. }
-            | Self::Owe { .. } => true,
+            | Self::Owe { .. }
+            | Self::Clean { .. }
+            | Self::Sweep { .. } => true,
         }
     }
 }

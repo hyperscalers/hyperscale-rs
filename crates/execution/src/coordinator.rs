@@ -51,7 +51,8 @@ use hyperscale_core::{
 };
 use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
 use hyperscale_engine::{
-    CodeAvailability, Obligations, PROTOCOL_RESOURCE, Refusal, TickEnvironment, build_fee_receipt,
+    CodeAvailability, Deletion, Obligations, PROTOCOL_RESOURCE, Refusal, TickEnvironment,
+    build_fee_receipt,
 };
 use hyperscale_metrics::{
     record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
@@ -339,6 +340,32 @@ fn obligation_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash 
     TxHash::from(Hash::from_parts(&parts))
 }
 
+/// The name a housekeeping member over this shard's own answer cells
+/// takes.
+///
+/// [`disposal_member_name`]'s neighbour under its own domain, and named
+/// by the cells it removes rather than by a transaction: a cleanup's
+/// answers belong to as many transactions as there are crossings, and
+/// what has to be one member is one block's worth of them.
+fn sweep_member_name(tombstones: &[SubstateKey]) -> TxHash {
+    let keys: Vec<Vec<u8>> = tombstones
+        .iter()
+        .map(|key| key.to_bytes().to_vec())
+        .collect();
+    let mut parts: Vec<&[u8]> = vec![b"hyperscale.crossing.tombstone"];
+    parts.extend(keys.iter().map(Vec::as_slice));
+    TxHash::from(Hash::from_parts(&parts))
+}
+
+/// The name a housekeeping member over this shard's own answer cells
+/// takes.
+fn deletion_member_name(answers: &[SubstateKey]) -> TxHash {
+    let keys: Vec<Vec<u8>> = answers.iter().map(|key| key.to_bytes().to_vec()).collect();
+    let mut parts: Vec<&[u8]> = vec![b"hyperscale.crossing.deletion"];
+    parts.extend(keys.iter().map(Vec::as_slice));
+    TxHash::from(Hash::from_parts(&parts))
+}
+
 /// Whether this shard owes an answer for the crossing a bundle handed
 /// it at `record`.
 ///
@@ -434,6 +461,14 @@ pub struct ExecutionCoordinator {
     /// commit after it, so without the latch a candidate unblocked past
     /// the terminal would compose into a tick nothing can certify.
     terminated: bool,
+
+    /// The answers the committing block's own claims read gone, with
+    /// the producer anchor each was read at.
+    ///
+    /// Set where the commit folds and read where the tick composes, in
+    /// the same call — so a deletion's licence is the block's reading
+    /// and never a fold's.
+    gone_this_commit: Vec<(SubstateKey, Anchor)>,
 
     /// What this node can run, asked where a tick dispatches.
     ///
@@ -677,6 +712,7 @@ impl ExecutionCoordinator {
             code,
             tick_in_flight: false,
             terminated: false,
+            gone_this_commit: Vec::new(),
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
             replay_blocks: recovered.replay.blocks.clone(),
@@ -1376,6 +1412,10 @@ impl ExecutionCoordinator {
                 // presence decides it, and what it licenses is the
                 // deletion.
                 Terms::Owed => claimed.then_some(Licence::Claimed),
+                // A tombstone is already disposed of. Nothing licenses
+                // a second settlement of one, and the member that takes
+                // it away reads its own clock rather than a counterpart.
+                Terms::Retired => None,
                 Terms::Escrowed { .. } => {
                     if self.counterparts.ledger.settles_records(record.cell.tx) {
                         continue;
@@ -1551,6 +1591,201 @@ impl ExecutionCoordinator {
                 arrivals: Vec::new(),
             });
         }
+    }
+
+    /// Admit into the tick being composed the removal of every answer
+    /// this block's own claims read the record gone at, twice, a span
+    /// apart.
+    ///
+    /// **What the answer defends, and when it stops.** An answer cell is
+    /// what makes a replayed delivery abort, and a replay needs a bundle
+    /// to run at all — `is_fully_provisioned` gates dispatch, so a stale
+    /// presence proof gets a transaction admitted and can never
+    /// dispatch it. A producer serves a bundle for a crossing record
+    /// only inside `CROSSING_BUNDLE_WINDOW` of its own tip, on both
+    /// bundle paths. So an absence read that far apart twice says no
+    /// bundle for the record can be served, and the answer defends
+    /// nothing.
+    ///
+    /// **The licence is the block's, whole.** Both readings are claims
+    /// the committing block carries, so a fresh seat and a replica
+    /// running since the crossing was answered compose the same members
+    /// off the same block. Nothing is remembered between them, which is
+    /// what lets the span be smaller than the life of the evidence
+    /// rather than equal to it.
+    ///
+    /// **What stops the member being composed again**: its own name,
+    /// read where the refusal reads it. The removal's write *is* the
+    /// cell going, so until it lands every later block carrying the pair
+    /// composes it again — including blocks other proposers built from
+    /// their own fetches, which no local pacing reaches.
+    fn admit_answer_deletions(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        prices: PriceTable,
+        state: &mut TickState,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+    ) {
+        let Some(window) = topology_schedule.at(tick_ts) else {
+            return;
+        };
+        let trie = window.shard_trie();
+        let local_shard = self.local_shard;
+        let mut due: Vec<Deletion> = Vec::new();
+        for &(answer, _) in &self.gone_this_commit {
+            // A cut can move the prefix the answer sits under, and a
+            // session writes a crossing cell only where the member's
+            // shard applies its owner — so a deletion composed for a
+            // cell this shard no longer holds would run, succeed and
+            // write nothing, and be composed again at every commit
+            // forever, because the write that would turn the guard over
+            // is the one being dropped.
+            if trie.shard_for_prefix(answer.owner) != local_shard {
+                continue;
+            }
+            let Some(held) = self.counterparts.answered.get(&answer) else {
+                continue;
+            };
+            let deletion = Deletion {
+                answer,
+                record: held.record,
+            };
+            if !due.contains(&deletion) {
+                due.push(deletion);
+            }
+        }
+        due.sort_unstable_by_key(|deletion| deletion.answer);
+        if due.is_empty() {
+            return;
+        }
+        let answers: Vec<SubstateKey> = due.iter().map(|deletion| deletion.answer).collect();
+        let tx_hash = deletion_member_name(&answers);
+        if self.holds_member_for(tx_hash) {
+            return;
+        }
+        state.admit(
+            tx_hash,
+            Membership::whole(BTreeSet::from([local_shard])).settling(),
+            None,
+            Admission::Executes,
+        );
+        self.ticks.assign_tx(tx_hash, tick_id);
+        requests.push(CrossShardExecutionRequest {
+            tx_hash,
+            transaction: None,
+            provisions: Vec::new(),
+            clock: tick_ts,
+            prices,
+            runs: Runs::Clean {
+                member: Member::whole(local_shard),
+                answers: due,
+            },
+            arrivals: Vec::new(),
+        });
+    }
+
+    /// Admit the housekeeping this shard's own crossing cells need: the
+    /// notes it owes, the answers it may let go of, and the tombstones
+    /// its grace has run out on.
+    ///
+    /// Three admitters and one question — what does this shard's
+    /// crossing ledger say, and what does the block in hand change
+    /// about it — so they are put in one place rather than three lines
+    /// of the tick's own composition.
+    fn admit_crossing_ledger_work(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        prices: PriceTable,
+        state: &mut TickState,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+    ) {
+        self.admit_obligations(topology_schedule, tick_id, tick_ts, prices, state, requests);
+        self.admit_answer_deletions(topology_schedule, tick_id, tick_ts, prices, state, requests);
+        self.admit_tombstone_sweeps(topology_schedule, tick_id, tick_ts, prices, state, requests);
+    }
+
+    /// Admit into the tick being composed the removal of every retired
+    /// record this shard holds whose grace its own clock has passed.
+    ///
+    /// **The producing side of a crossing's end, and the only member in
+    /// this family that asks nothing of anyone.** A disposal does not
+    /// remove the record: it rewrites it as a tombstone so the consumer
+    /// can date the going of it by reading the key absent, which is the
+    /// one thing a state proof says plainly. This is what finally takes
+    /// it away, one
+    /// [`CROSSING_TOMBSTONE_GRACE_MS`](hyperscale_vm_types::CROSSING_TOMBSTONE_GRACE_MS)
+    /// on.
+    ///
+    /// **What evidence this needs, and what bounds it.** Only the
+    /// cell's own expiry and the block's clock, both committed content
+    /// every replica holds alike — so no reading, no anchor, no proof,
+    /// and nothing here can be measured in a constant that also bounds
+    /// its own evidence. The kernel re-reads both, so a member naming a
+    /// tombstone early traps rather than shortening a consumer's
+    /// defence.
+    ///
+    /// **What stops it being composed again**: its own member's name,
+    /// read where the refusal reads it. The removal's write *is* the
+    /// cell going, which is blocks away.
+    fn admit_tombstone_sweeps(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        prices: PriceTable,
+        state: &mut TickState,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+    ) {
+        let Some(window) = topology_schedule.at(tick_ts) else {
+            return;
+        };
+        let trie = window.shard_trie();
+        let local_shard = self.local_shard;
+        let now = tick_ts.as_millis();
+        // A cut can move the prefix a tombstone sits under, and a
+        // session writes only where the member's shard applies the
+        // owner — so a sweep composed for a key this shard no longer
+        // holds would run, succeed and write nothing, and be composed
+        // again at every commit.
+        let due: Vec<SubstateKey> = self
+            .counterparts
+            .tombstones
+            .iter()
+            .filter(|(key, expiry)| {
+                **expiry <= now && trie.shard_for_prefix(key.owner) == local_shard
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let tx_hash = sweep_member_name(&due);
+        if self.holds_member_for(tx_hash) {
+            return;
+        }
+        state.admit(
+            tx_hash,
+            Membership::whole(BTreeSet::from([local_shard])).settling(),
+            None,
+            Admission::Executes,
+        );
+        self.ticks.assign_tx(tx_hash, tick_id);
+        requests.push(CrossShardExecutionRequest {
+            tx_hash,
+            transaction: None,
+            provisions: Vec::new(),
+            clock: tick_ts,
+            prices,
+            runs: Runs::Sweep {
+                member: Member::whole(local_shard),
+                tombstones: due,
+            },
+            arrivals: Vec::new(),
+        });
     }
 
     /// Admit into the tick being composed the ledger work this shard's
@@ -1916,7 +2151,7 @@ impl ExecutionCoordinator {
             &mut state,
             &mut requests,
         );
-        self.admit_obligations(
+        self.admit_crossing_ledger_work(
             topology_schedule,
             tick_id,
             block.ts,
@@ -3298,6 +3533,13 @@ impl ExecutionCoordinator {
             self.committed_ts,
             self.provisioning.arrived(),
         );
+        self.gone_this_commit = committed.gone;
+        // The arrivals whose crossings this block finished with. Left
+        // in place they would re-open the very question the answer
+        // removed was suppressing, at every header of the producer.
+        for record in committed.cleaned {
+            self.provisioning.forget_arrival(record);
+        }
         let mut actions = committed.actions;
         // The crossings a delivery here waits on that no push can still
         // serve, asked of whoever holds each record now.
@@ -4668,14 +4910,14 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, CLAIM_VISIBILITY_LAG, ConsensusPublicKey, ConsensusReceipt,
-        ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome,
-        GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
-        MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate, RETENTION_HORIZON,
-        Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer,
-        SignerBitfield, StateClaim, StateRoot, StoredReceipt, SubstateKey, TickHalf,
-        TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet,
-        Window,
+        BeaconWitnessLeafCount, CLAIM_VISIBILITY_LAG, CROSSING_BUNDLE_WINDOW, ConsensusPublicKey,
+        ConsensusReceipt, ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows,
+        ExecutionOutcome, GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY,
+        MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate,
+        RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
+        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, StoredReceipt, SubstateKey,
+        TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo,
+        ValidatorSet, Window,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingAnswer, CrossingCell, CrossingObligation, Hash32, IntentHash,
@@ -4684,7 +4926,7 @@ mod tests {
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
     use super::*;
-    use crate::counterparts::HeldRecord;
+    use crate::counterparts::{AnsweredCrossing, HeldRecord};
     use crate::ledger::{Kept, Part};
 
     fn make_test_topology() -> TopologySchedule {
@@ -10990,7 +11232,7 @@ mod tests {
             "and is not repeated at the same anchor",
         );
 
-        let later = at.plus(MAX_FINALIZATION_DELAY);
+        let later = at.plus(CROSSING_BUNDLE_WINDOW);
         assert!(
             state
                 .counterparts
@@ -11129,6 +11371,140 @@ mod tests {
             vec![record_key],
             "the note carries the producer's own cell, so the refusal needs no bundle",
         );
+    }
+
+    /// An answer goes on one reading of its record gone, because the
+    /// producer dated the going of it.
+    ///
+    /// **Why one reading is enough here, where nothing else would be.**
+    /// The answer is what makes a replayed delivery abort, and a replay
+    /// needs a bundle to dispatch at all — a stale presence proof gets a
+    /// transaction admitted and can never run it. A bundle carrying a
+    /// record is admitted only inside [`CROSSING_BUNDLE_WINDOW`] of the
+    /// admitting block's own clock, so a replay is dead one window past
+    /// the disposal whatever any cell says. And a disposed record is not
+    /// removed at its disposal: it stands on as a tombstone its producer
+    /// takes away exactly that long afterwards. So a record read absent
+    /// is one whose disposal is already a window behind, and the answer
+    /// defends nothing.
+    ///
+    /// The consumer therefore remembers nothing, carries no pair, and
+    /// asks at one anchor — the newest, which is the only one a
+    /// committee converges on.
+    #[test]
+    fn an_answer_goes_on_one_reading_of_a_dated_record() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, answer_key) = answered_crossing(&mut state, 0x7A);
+        let at = WeightedTimestamp::from_millis(10_000);
+
+        // Nothing read, nothing licensed.
+        state.gone_this_commit = Vec::new();
+        assert!(
+            compose_deletions(&mut state, at).is_empty(),
+            "an answer whose record nothing has read gone stands",
+        );
+
+        // One absence is the whole of it.
+        state.gone_this_commit = vec![(answer_key, anchor_at(at))];
+        assert_eq!(
+            compose_deletions(&mut state, at),
+            vec![Deletion {
+                answer: answer_key,
+                record: record_key,
+            }],
+            "the record is gone, so its tombstone was swept, so no bundle for it \
+             can still be admitted",
+        );
+
+        // And the same cell read gone twice in one block is one
+        // removal, not two — asserted on its own state, since the
+        // member the first composition put in flight is what stops a
+        // second of the same name.
+        let mut again = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (_, twice) = answered_crossing(&mut again, 0x7A);
+        again.gone_this_commit = vec![(twice, anchor_at(at)), (twice, anchor_at(at))];
+        assert_eq!(
+            compose_deletions(&mut again, at).len(),
+            1,
+            "a cell is removed once however many readings the block carries",
+        );
+    }
+
+    /// An answer whose cell this shard no longer holds is not composed
+    /// for, however plainly its record is gone.
+    ///
+    /// A cut moves the prefix, and a session writes a crossing cell only
+    /// where the member's shard applies its owner — so a deletion
+    /// composed here would run, succeed and write nothing, and be
+    /// composed again at every commit forever, because the write that
+    /// would turn the guard over is the one being dropped.
+    #[test]
+    fn a_deletion_is_not_composed_where_the_cell_is_not_held() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), PEER);
+        let (_, answer_key) = answered_crossing(&mut state, 0x7B);
+        let at = WeightedTimestamp::from_millis(10_000);
+
+        state.gone_this_commit = vec![(answer_key, anchor_at(at))];
+        assert!(
+            compose_deletions(&mut state, at).is_empty(),
+            "the answer sits under a prefix this shard does not hold",
+        );
+    }
+
+    /// Seat an answered crossing, returning the record and the answer
+    /// cell's key.
+    fn answered_crossing(state: &mut ExecutionCoordinator, seed: u8) -> (SubstateKey, SubstateKey) {
+        let (record_key, _, cell) = arrived_record(seed, REFUSED_EXPIRY_MS);
+        let answer_key = cell.consumer_claim;
+        state.counterparts.answered.insert(
+            answer_key,
+            AnsweredCrossing::of(&CrossingAnswer {
+                tx: cell.tx,
+                intent: cell.intent,
+                local: cell.local,
+                output: cell.output,
+                record: record_key,
+                answered: Answered::Taken,
+            }),
+        );
+        (record_key, answer_key)
+    }
+
+    /// A producer anchor whose clock is `ts`.
+    fn anchor_at(ts: WeightedTimestamp) -> Anchor {
+        Anchor {
+            shard: PEER,
+            height: BlockHeight::new(9),
+            state_root: StateRoot::ZERO,
+            ts,
+        }
+    }
+
+    /// Run the deletion admitter and hand back what it composed.
+    fn compose_deletions(state: &mut ExecutionCoordinator, at: WeightedTimestamp) -> Vec<Deletion> {
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
+        let mut requests = Vec::new();
+        // A trie with both shards in it, because the guard this walks
+        // through asks which one holds the answer's prefix — and a
+        // one-shard schedule answers `ROOT` for every key, which is
+        // neither of them.
+        state.admit_answer_deletions(
+            &two_shard_topology(),
+            tick_id,
+            at,
+            PriceTable::GENESIS,
+            &mut tick,
+            &mut requests,
+        );
+        requests
+            .into_iter()
+            .filter_map(|request| match request.runs {
+                Runs::Clean { answers, .. } => Some(answers),
+                _ => None,
+            })
+            .flatten()
+            .collect()
     }
 
     /// A crossing whose consumer sits on another shard is neither

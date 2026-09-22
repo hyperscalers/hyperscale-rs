@@ -40,8 +40,9 @@ use hyperscale_vm_effects::{
     PackageHash, Terms, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
-    LegPlan, ManifestWalk, Obligations, OwnerSet, Receipt, Refusal, Substates, execute_batch,
+    Baseline, BatchError, BatchTx, Deletion, Disposal, Disposition, EnvInputs, ExecutionMode,
+    FeeBurn, Job, LegPlan, ManifestWalk, Obligations, OwnerSet, Receipt, Refusal, Substates,
+    execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -657,6 +658,12 @@ impl Executor {
             if takes_back && record.terms == Terms::Owed {
                 continue;
             }
+            // A tombstone has nothing to settle: its crossing was
+            // disposed of and the key stands only until its producer
+            // removes it, which is a different member's work.
+            if record.terms == Terms::Retired {
+                continue;
+            }
             let mut declare_here = |effect, holds| {
                 declare(&mut declaration, effect, holds).map_err(|conflict| {
                     format!("settled cell contradicts the declaration: {conflict}")
@@ -694,6 +701,9 @@ impl Executor {
                 // A claim that happened: the value moved where the
                 // consumer ran and what is left is a cell saying so.
                 Terms::Escrowed { .. } | Terms::Owed => Disposition::Retire,
+                // Skipped above, and unreachable rather than handled:
+                // a tombstone is not a balance to dispose of.
+                Terms::Retired => continue,
             };
             disposals.push(Disposal {
                 record: *key,
@@ -784,6 +794,99 @@ impl Executor {
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
             // A refusal invokes no node, so nothing of it emits.
+            event_bytes: Vec::new(),
+            work: DeclaredWork::ZERO,
+            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
+        })
+    }
+
+    /// Lower an answer cleanup: the cells it removes, declared, and
+    /// nothing read.
+    ///
+    /// [`Self::prepare_owe`]'s neighbour and the same shape. A removal
+    /// is a write on the cell, so it wants one exclusive declaration and
+    /// the batch screen puts every writer of that cell in one conflict
+    /// group. Nothing is read: the licence was read by the composer off
+    /// the committing block's own claims, and there is nothing in the
+    /// answer to hold it to beyond naming the record it answers for,
+    /// which the kernel checks itself.
+    ///
+    /// # Errors
+    ///
+    /// Work naming nothing, or a declaration two of its cells
+    /// contradict.
+    fn prepare_clean(
+        answers: &[Deletion],
+        ctx: &TickBatchContext<'_>,
+    ) -> Result<PreparedTx, String> {
+        if answers.is_empty() {
+            return Err("this shard has no answer to clean up".to_string());
+        }
+        let mut declaration = Declaration::default();
+        for deletion in answers {
+            declare(
+                &mut declaration,
+                Effect {
+                    target: EffectTarget::Point(deletion.answer),
+                    mode: Mode::Write { moves: Moves::Both },
+                },
+                None,
+            )
+            .map_err(|conflict| format!("cleaned cell contradicts the declaration: {conflict}"))?;
+        }
+        let trie = ctx.shard_trie.clone();
+        let local = ctx.local_shard;
+        Ok(PreparedTx {
+            job: Job::Deletions(answers.to_vec()),
+            declaration,
+            nullifiers: Vec::new(),
+            gas_limits: Vec::new(),
+            // A cleanup invokes no node, so nothing of it emits.
+            event_bytes: Vec::new(),
+            work: DeclaredWork::ZERO,
+            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
+        })
+    }
+
+    /// Lower a tombstone sweep: the retired records it removes,
+    /// declared, and nothing read.
+    ///
+    /// [`Self::prepare_clean`]'s counterpart on the producing side and
+    /// the same shape. What licenses the removal is the cell's own
+    /// expiry against this tick's clock, and the kernel reads both — so
+    /// nothing rides with the member beyond the keys it names.
+    ///
+    /// # Errors
+    ///
+    /// Work naming nothing, or a declaration two of its cells
+    /// contradict.
+    fn prepare_sweep(
+        tombstones: &[SubstateKey],
+        ctx: &TickBatchContext<'_>,
+    ) -> Result<PreparedTx, String> {
+        if tombstones.is_empty() {
+            return Err("this shard has no tombstone to sweep".to_string());
+        }
+        let mut declaration = Declaration::default();
+        for key in tombstones {
+            declare(
+                &mut declaration,
+                Effect {
+                    target: EffectTarget::Point(*key),
+                    mode: Mode::Write { moves: Moves::Both },
+                },
+                None,
+            )
+            .map_err(|conflict| format!("swept cell contradicts the declaration: {conflict}"))?;
+        }
+        let trie = ctx.shard_trie.clone();
+        let local = ctx.local_shard;
+        Ok(PreparedTx {
+            job: Job::Tombstones(tombstones.to_vec()),
+            declaration,
+            nullifiers: Vec::new(),
+            gas_limits: Vec::new(),
+            // A sweep invokes no node, so nothing of it emits.
             event_bytes: Vec::new(),
             work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
@@ -1627,6 +1730,8 @@ impl Executor {
                 }
                 Runs::Refuse { crossings, .. } => Self::prepare_refuse(crossings, ctx),
                 Runs::Owe { work, .. } => Self::prepare_owe(work, ctx),
+                Runs::Clean { answers, .. } => Self::prepare_clean(answers, ctx),
+                Runs::Sweep { tombstones, .. } => Self::prepare_sweep(tombstones, ctx),
                 Runs::Shape(shape) => input
                     .transaction
                     .ok_or_else(|| "a member running a shape holds no body".to_string())

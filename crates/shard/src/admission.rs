@@ -24,13 +24,14 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
+use hyperscale_storage::is_record_cell;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, BlockHeight, DeclaredWork, Finalization, FinalizationHash,
-    Inclusion, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Probed, ProvisionHash, Provisions, ShardId,
-    StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable,
-    WeightedTimestamp, budget_admits_block, caps_admit_transaction, evidence_admits_block,
-    sweep_admits_block,
+    AbandonmentRecord, BlockHash, BlockHeight, CROSSING_BUNDLE_WINDOW, DeclaredWork, Finalization,
+    FinalizationHash, Inclusion, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Probed, ProvisionHash,
+    Provisions, ShardId, StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, Verifiable, WeightedTimestamp, budget_admits_block, caps_admit_transaction,
+    evidence_admits_block, sweep_admits_block,
 };
 
 use crate::chain_view::ChainView;
@@ -202,6 +203,35 @@ impl Section for ProvisionsSection {
             return Err(format!(
                 "provisions batch {provision_hash:?} from recovering shard {source_shard:?} above \
                  the attested frontier"
+            ));
+        }
+        // **A bundle carrying a crossing record is admitted fresh, and
+        // that is what bounds an answer cell's life.** A consumer's
+        // answer is what makes a replayed delivery abort, and a replay
+        // needs a bundle to dispatch at all — so the answer may be
+        // deleted once no bundle for its record can be committed. The
+        // serving floor alone does not say that: a proof is valid
+        // whoever serves it, so a peer ignoring the floor could hand a
+        // proposer a good bundle at an old height. Here every voter
+        // reads the same two figures off the block and reaches the same
+        // verdict.
+        //
+        // Only a bundle carrying a record, because only a record is
+        // permanent. Every other cell a bundle carries is a mutable read
+        // whose whole meaning is the height it was taken at, and the
+        // paths that fetch one are prompt by construction.
+        if ctx.anchor.elapsed_since(batch.source_block_ts()) > CROSSING_BUNDLE_WINDOW
+            && batch.transactions().iter().any(|entry| {
+                entry.entries.iter().any(|cell| {
+                    cell.value
+                        .as_ref()
+                        .is_some_and(|bytes| is_record_cell(cell.key, bytes))
+                })
+            })
+        {
+            return Err(format!(
+                "provisions batch {provision_hash:?} carries a crossing record from outside the \
+                 bundle window"
             ));
         }
         let tx_count = fold.tx_count.saturating_add(batch.transactions().len());

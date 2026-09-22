@@ -196,6 +196,29 @@ const _: () = assert!(
 /// walks. Half an epoch is the working margin, not the hard bound.
 const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
 
+/// How far back a producer answers with a bundle for a crossing record,
+/// and so how long a consumer's answer cell has to outlive its record.
+///
+/// **The figure is the horizon less one finalization delay, and the
+/// subtraction is the point.** A consumer deletes its answer on two
+/// absences of the record this far apart, because past that no bundle
+/// for it can reach any block and a replayed delivery could never
+/// dispatch. Both readings have to ride in the deleting block, so the
+/// first must still be provable when the second is taken — and a proof
+/// stands for [`RETENTION_HORIZON`]. Subtracting
+/// [`MAX_FINALIZATION_DELAY`] leaves exactly the round trip a fetch of
+/// the pair takes.
+///
+/// Measured in a smaller constant than the one bounding its own
+/// evidence, which is what the horizon itself could never be: a span of
+/// a full horizon expires its own near end at the instant the far end
+/// arrives, and then the near end has to be remembered in committed
+/// state.
+pub const CROSSING_BUNDLE_WINDOW: Duration =
+    Duration::from_secs(RETENTION_HORIZON.as_secs() - MAX_FINALIZATION_DELAY.as_secs());
+
+const _: () = assert!(CROSSING_BUNDLE_WINDOW.as_secs() < RETENTION_HORIZON.as_secs());
+
 /// A skipped epoch and its recovery must not expire the transactions a
 /// shard is holding. `SKIP_TIMEOUT` bounds the wait before the pool
 /// prevotes a skip, and ratification rounds follow it; a validity window
