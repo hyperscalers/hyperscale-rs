@@ -3,13 +3,15 @@
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
-use hyperscale_execution::{crossing_requests, provision_request, reoffer_requests};
+use hyperscale_execution::{
+    crossing_requests, provision_request, record_requests, reoffer_requests,
+};
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_provisions::build_provisions;
 use hyperscale_storage::{PendingChain, ShardStorage};
-use hyperscale_types::network::request::GetProvisionsRequest;
+use hyperscale_types::network::request::{Anchored, GetProvisionsRequest};
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{ShardId, ShardTrie};
+use hyperscale_types::{ShardId, ShardTrie, SubstateKey};
 use tracing::warn;
 
 /// Serve an inbound provision request from a target shard needing our state.
@@ -35,9 +37,15 @@ pub fn serve_provision_request<S: ShardStorage>(
     shard_trie: &ShardTrie,
     req: &GetProvisionsRequest,
 ) -> GetProvisionResponse {
-    let Some(certified) = pending_chain.certified_block(req.block_height) else {
+    let height = match &req.asks {
+        Anchored::Block(height) => *height,
+        Anchored::Records(records) => {
+            return serve_records(pending_chain, local_shard, shard_trie, req, records);
+        }
+    };
+    let Some(certified) = pending_chain.certified_block(height) else {
         warn!(
-            block_height = req.block_height.inner(),
+            block_height = height.inner(),
             "Provision request: block not found"
         );
         return GetProvisionResponse { provisions: None };
@@ -77,11 +85,72 @@ pub fn serve_provision_request<S: ShardStorage>(
         &view,
         local_shard,
         req.target_shard,
-        req.block_height,
+        height,
         block.header().parent_qc().weighted_timestamp(),
         &requests,
     );
 
+    if let Some(p) = &provisions {
+        record_fetch_response_sent("provision", p.transactions().len());
+    }
+    GetProvisionResponse { provisions }
+}
+
+/// Serve a pull: the record cells named, read at this shard's own
+/// committed tip.
+///
+/// **No height is named and none is needed.** A record stands until its
+/// producer disposes of it, so there is always a tip that holds one —
+/// and once disposed there is no tip that does, so a bundle for it comes
+/// back empty. That is what makes disposal stop the serving, where a
+/// height-pinned read goes on serving a disposed record out of an old
+/// version until its retention runs out.
+///
+/// The transaction each cell belongs to is read off the cell rather than
+/// taken from the asker: a record names its own issuing transaction, and
+/// a bundle is staged per transaction. An asker that named the wrong one
+/// would have its entries filed under it.
+///
+/// Keys this shard does not hold the prefix for are passed over. They
+/// are not this shard's records to answer for, and a bundle built from
+/// one would prove nothing against this chain's root.
+fn serve_records<S: ShardStorage>(
+    pending_chain: &Arc<PendingChain<S>>,
+    local_shard: ShardId,
+    shard_trie: &ShardTrie,
+    req: &GetProvisionsRequest,
+    records: &[SubstateKey],
+) -> GetProvisionResponse {
+    let view = pending_chain.view_at_committed_tip();
+    let height = view.base().committed_height();
+    let Some(anchor) = pending_chain.certified_header(height) else {
+        warn!(
+            height = height.inner(),
+            "Provision pull: no certified header for our own tip"
+        );
+        return GetProvisionResponse { provisions: None };
+    };
+
+    let held: Vec<(SubstateKey, Vec<u8>)> = records
+        .iter()
+        .filter(|key| shard_trie.shard_for_prefix(key.owner) == local_shard)
+        .filter_map(|&key| {
+            view.base()
+                .get_substate_at_height(key, height)
+                .flatten()
+                .map(|bytes| (key, bytes))
+        })
+        .collect();
+    let requests = record_requests(&held, req.target_shard);
+
+    let provisions = build_provisions(
+        &view,
+        local_shard,
+        req.target_shard,
+        height,
+        anchor.header().parent_qc().weighted_timestamp(),
+        &requests,
+    );
     if let Some(p) = &provisions {
         record_fetch_response_sent("provision", p.transactions().len());
     }

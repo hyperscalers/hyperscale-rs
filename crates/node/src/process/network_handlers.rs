@@ -788,10 +788,11 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     use hyperscale_engine::Executor;
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetCellsRequest, GetCommittedTxsRequest, GetInstanceRecordsRequest,
-        GetPackageArtifactsRequest, GetProvisionsRequest, GetRelayedStateProofRequest,
-        GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest, GetStateRangeRequest,
-        GetTransactionsRequest, GetWitnessHistoryRequest,
+        Anchored, GetBlockRequest, GetCellsRequest, GetCommittedTxsRequest,
+        GetInstanceRecordsRequest, GetPackageArtifactsRequest, GetProvisionsRequest,
+        GetRelayedStateProofRequest, GetRemoteHeadersRequest, GetSettledTxsRequest,
+        GetStateProofRequest, GetStateRangeRequest, GetTransactionsRequest,
+        GetWitnessHistoryRequest,
     };
     use hyperscale_types::network::response::{
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
@@ -990,15 +991,25 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetProvisionsRequest>(
             shard,
             move |req: GetProvisionsRequest| {
-                let cache_key = (req.block_height.inner(), req.target_shard.inner());
+                // A pull is anchored at whatever the tip is when it is
+                // answered, so neither cache below can hold its answer:
+                // both are keyed by a source height, and the height a
+                // pull reads at moves. Served straight through.
+                let Anchored::Block(height) = req.asks else {
+                    return serve_provision_request(
+                        &pending_chain,
+                        shard,
+                        topology_snapshot.load().shard_trie(),
+                        &req,
+                    );
+                };
+                let cache_key = (height.inner(), req.target_shard.inner());
 
                 // Outbound fast path: if we still hold the exact batch we
                 // generated for this (source_block_height, target_shard),
                 // rebuild the response from memory — no RocksDB regeneration,
                 // no merkle-proof recomputation.
-                if let Some(provisions) =
-                    outbound_cache.get_outbound(req.block_height, req.target_shard)
-                {
+                if let Some(provisions) = outbound_cache.get_outbound(height, req.target_shard) {
                     record_fetch_response_sent("provision", provisions.transactions().len().max(1));
                     return GetProvisionResponse {
                         provisions: Some(provisions),

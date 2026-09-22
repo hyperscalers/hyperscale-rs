@@ -700,10 +700,7 @@ impl FetchBinding for ProvisionBinding {
         // `target_shard` (the requester's shard) is the body field: the
         // source filters provisions by which shard is asking. Routing
         // shard `shard = source_shard` picks the responding committee.
-        let request = GetProvisionsRequest {
-            block_height,
-            target_shard,
-        };
+        let request = GetProvisionsRequest::at_block(block_height, target_shard);
         let es = sender.clone();
         network.request(
             shard,

@@ -29,7 +29,7 @@ pub use finalization::GetFinalizationsRequest;
 pub use instance_record::{GetInstanceRecordsRequest, MAX_INSTANCE_RECORDS_PER_REQUEST};
 pub use local_provision::GetLocalProvisionsRequest;
 pub use package_artifact::{GetPackageArtifactsRequest, MAX_PACKAGE_ARTIFACTS_PER_REQUEST};
-pub use provision::GetProvisionsRequest;
+pub use provision::{Anchored, GetProvisionsRequest};
 pub use remote_header::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
 pub use settled_txs::GetSettledTxsRequest;
 pub use state_proof::{GetRelayedStateProofRequest, GetStateProofRequest};

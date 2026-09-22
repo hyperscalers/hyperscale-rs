@@ -5,7 +5,7 @@
 //! the coordinator so the topology-only parts are unit-testable without a
 //! full driver fixture.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
@@ -15,6 +15,7 @@ use hyperscale_types::{
     TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, VoteCount, WeightedTimestamp,
     committed_crossings,
 };
+use hyperscale_vm_effects::CrossingCell;
 
 /// Per-shard recipient lists for provision broadcasting.
 pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
@@ -239,6 +240,41 @@ pub fn crossing_requests(
     requests
 }
 
+/// The bundle a pull asks for: the record cells named, grouped by the
+/// transaction each one says issued it.
+///
+/// `cells` is what the producer read at its own tip, so a key absent
+/// there is simply not among them — which is how a disposed record
+/// yields nothing without any span deciding it had.
+///
+/// **The transaction is read off the cell and never taken from the
+/// asker.** A bundle is staged per transaction and absorbed under that
+/// key, so an asker naming the wrong one would have a producer's own
+/// bytes filed against a transaction they say nothing about. The record
+/// names its issuer; that is the only thing this trusts.
+#[must_use]
+pub fn record_requests(
+    cells: &[(SubstateKey, Vec<u8>)],
+    target: ShardId,
+) -> Vec<ProvisionsRequest> {
+    let mut by_tx: BTreeMap<TxHash, Vec<SubstateKey>> = BTreeMap::new();
+    for (key, bytes) in cells {
+        let Some(cell) = CrossingCell::from_bytes(bytes) else {
+            continue;
+        };
+        by_tx.entry(cell.tx).or_default().push(*key);
+    }
+    by_tx
+        .into_iter()
+        .map(|(tx_hash, local_keys)| ProvisionsRequest {
+            tx_hash,
+            targets: vec![target],
+            local_keys,
+            local_ranges: Vec::new(),
+        })
+        .collect()
+}
+
 /// The crossing bundles a block's re-offers promise: one request per
 /// offer, naming the record cells it carries and the single shard owed
 /// them.
@@ -319,6 +355,7 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet};
+    use hyperscale_vm_effects::Hash32;
 
     use super::*;
 
@@ -331,6 +368,62 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set)
+    }
+
+    // ─── record_requests ────────────────────────────────────────────────
+
+    fn record_cell(tx: u8, local: u8) -> (SubstateKey, Vec<u8>) {
+        use hyperscale_types::{Address, AddressClass, LocalKey};
+        use hyperscale_vm_effects::{Hash32, IntentHash, Terms};
+        use hyperscale_vm_types::ResourceAddr;
+
+        let key = SubstateKey {
+            owner: Address::new([local; 31], AddressClass::Component),
+            local: LocalKey([local; 16]),
+        };
+        let cell = CrossingCell {
+            resource: ResourceAddr::new([0xE1; 31]),
+            amount: 1,
+            intent: IntentHash(Hash32([local; 32])),
+            local: 0,
+            output: 0,
+            expiry_ms: 1,
+            tx: TxHash(Hash32([tx; 32])),
+            consumer_claim: key,
+            terms: Terms::Escrowed { credit: key },
+        };
+        (key, cell.to_bytes())
+    }
+
+    /// A pull's cells are bucketed by the transaction each record names,
+    /// not by anything the asker said — a bundle is absorbed per
+    /// transaction, so a record filed under another's would put a
+    /// producer's bytes against a transaction they say nothing about.
+    #[test]
+    fn a_pull_buckets_records_by_the_transaction_each_one_names() {
+        let (one, one_bytes) = record_cell(0xA1, 1);
+        let (two, two_bytes) = record_cell(0xA1, 2);
+        let (other, other_bytes) = record_cell(0xB2, 3);
+        let requests = record_requests(
+            &[(one, one_bytes), (other, other_bytes), (two, two_bytes)],
+            ShardId::ROOT,
+        );
+        assert_eq!(requests.len(), 2, "two transactions, two bundles");
+        let shared = requests
+            .iter()
+            .find(|r| r.tx_hash == TxHash(Hash32([0xA1; 32])))
+            .expect("the transaction two records name");
+        assert_eq!(shared.local_keys, vec![one, two]);
+        assert_eq!(shared.targets, vec![ShardId::ROOT]);
+    }
+
+    /// A key whose bytes are not a record is passed over rather than
+    /// served: the producer read it at its tip and it is not a crossing,
+    /// so there is nothing about it to prove.
+    #[test]
+    fn a_pull_serves_nothing_for_a_key_that_is_not_a_record() {
+        let (key, _) = record_cell(0xA1, 1);
+        assert!(record_requests(&[(key, vec![0xDE, 0xAD])], ShardId::ROOT).is_empty());
     }
 
     // ─── peers_excluding_self ───────────────────────────────────────────
