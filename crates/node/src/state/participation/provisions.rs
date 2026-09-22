@@ -32,14 +32,9 @@ impl ShardParticipation {
             ProtocolEvent::VerifiedProvisionsReceived { provisions } => self
                 .provisions_coordinator
                 .on_verified_state_provisions_received(sched, provisions, self.now),
-            ProtocolEvent::StateProvisionsVerified {
-                result,
-                certified_header,
-            } => self.provisions_coordinator.on_state_provisions_verified(
-                result,
-                &certified_header,
-                self.now,
-            ),
+            ProtocolEvent::StateProvisionsVerified { result, anchor } => self
+                .provisions_coordinator
+                .on_state_provisions_verified(result, anchor, self.now),
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
                 // A verified bundle is engagement evidence: promote any
                 // parked cross-shard transaction it names, before the

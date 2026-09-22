@@ -46,20 +46,21 @@
 //! and drops entries past `RETENTION_HORIZON`.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, CrossingPulls, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::{
     record_expected_tx_dropped, record_transaction_aborted, record_transaction_rejected,
 };
 use hyperscale_types::{
     BUNDLE_WAIT, BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
-    LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId,
-    ShardTrie, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    TxResolution, Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
+    LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, ProvenAnchors,
+    RETENTION_HORIZON, ShardId, ShardTrie, SubstateKey, TopologySnapshot, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxResolution, Verified, WeightedTimestamp,
+    Window, budget_admits_block, caps_admit_transaction,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -271,7 +272,19 @@ pub struct MempoolCoordinator {
     /// that held it then. The question is asked where it is answered, in
     /// [`Self::on_engagement_evidence`], off the trie of the moment the
     /// evidence arrives.
-    parked_engagement: HashSet<TxHash>,
+    ///
+    /// What *is* stored is when the wait began, which is the floor
+    /// [`Self::pull_parked_records`] measures against.
+    parked_engagement: HashMap<TxHash, WeightedTimestamp>,
+
+    /// The record pulls this node has put for parked bodies, with their
+    /// pacing.
+    crossing_pulls: CrossingPulls,
+
+    /// The producer anchors this node has commit-proven, which a pull
+    /// reads at. Empty until wired, which composes no pulls and is the
+    /// honest reading of a node that has proven nothing.
+    proven_anchors: Arc<ProvenAnchors>,
 
     /// Engagement evidence observed before its transaction arrived —
     /// `tx → (payer shard, deadline)`. Consulted at admission so the
@@ -343,13 +356,27 @@ impl MempoolCoordinator {
             current_height: BlockHeight::new(0),
             current_ts: WeightedTimestamp::ZERO,
             expected_txs: ExpectedTxs::new(),
-            parked_engagement: HashSet::new(),
+            parked_engagement: HashMap::new(),
+            crossing_pulls: CrossingPulls::new(),
+            proven_anchors: Arc::new(ProvenAnchors::new()),
             engagement_seen: HashMap::new(),
             config,
             local_shard,
             fork_fence: ForkFence::new(),
             now: LocalTimestamp::ZERO,
         }
+    }
+
+    /// Read pulls at the anchors this node has commit-proven.
+    ///
+    /// A builder step rather than a constructor argument because an
+    /// empty mirror is a real state and a safe one — a node that has
+    /// proven no anchor of a producer has none to ask at, and composes
+    /// no pull.
+    #[must_use]
+    pub fn with_proven_anchors(mut self, proven_anchors: Arc<ProvenAnchors>) -> Self {
+        self.proven_anchors = proven_anchors;
+        self
     }
 
     /// Push the dispatch seam's clock reading, before any handler runs.
@@ -473,7 +500,7 @@ impl MempoolCoordinator {
         // A cross-shard transaction at a non-payer shard enters
         // contention only once its engagement evidence exists.
         if self.parks_for_engagement(topology_snapshot, tx, cross_shard) {
-            self.parked_engagement.insert(hash);
+            self.parked_engagement.insert(hash, self.current_ts);
         }
         self.tx_store.insert(Arc::clone(tx));
         self.pool.insert(
@@ -762,6 +789,12 @@ impl MempoolCoordinator {
         self.current_ts = self
             .current_ts
             .advanced_by_commit(block.header().parent_qc().weighted_timestamp());
+
+        // The records a parked delivery still needs, asked of whoever
+        // holds each one now. Nothing here is on this transaction's own
+        // clock: the pool holds a delivering body measured from now, and
+        // the pull's floor is measured from when the wait began.
+        actions.extend(self.pull_parked_records(topology_snapshot));
 
         // A gossip-timed fork fence holds until the attested recovery for
         // its shard completes — clearing on the fold would reopen admission
@@ -1094,6 +1127,57 @@ impl MempoolCoordinator {
         true
     }
 
+    /// Ask each producer for the records a parked delivery needs, once
+    /// no push can still bring them.
+    ///
+    /// **The one thing a consumer in the dark can still do.** A
+    /// cross-shard transaction is admissible on a non-payer shard only
+    /// against a bundle from the payer naming it, so a body whose bundle
+    /// never came cannot be admitted, cannot commit, and leaves no
+    /// ledger entry, no member and no provisioning requirement behind —
+    /// every later mechanism is downstream of the bundle it is missing.
+    /// What the shard does have is the body, and that is enough:
+    /// `crossings_consumed` derives the record cells and the shard
+    /// holding each one from the transaction and the placement alone.
+    ///
+    /// **The floor is one `RETENTION_HORIZON` of waiting**, for the same
+    /// reason it is on the admitted side. Short of it the push and its
+    /// height-keyed fallback still own the case —
+    /// `ExpectedProvisionTracker` fetches the block that promised the
+    /// bundle — and a pull put then only races them. Past it that block
+    /// is older than the horizon and no longer servable, so nothing else
+    /// is coming.
+    ///
+    /// Only where this shard **only delivers**, which is the same test
+    /// [`Self::admissible_until`] already makes of a parked body. A shard
+    /// waiting on an ordinary payer bundle is waiting on the payer's
+    /// declared reads at the height the payer committed, and those are
+    /// mutable: read at a later anchor they are values no block
+    /// committed. A record cell is permanent, which is what lets it be
+    /// asked for again at all.
+    fn pull_parked_records(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
+        let trie = topology_snapshot.shard_trie();
+        let local = self.local_shard;
+        let now = self.current_ts;
+        let pool = &self.pool;
+        let wanted: Vec<(ShardId, SubstateKey)> = self
+            .parked_engagement
+            .iter()
+            .filter(|(_, since)| now >= since.plus(RETENTION_HORIZON))
+            .filter_map(|(hash, _)| pool.get(hash))
+            .flat_map(|entry| {
+                let tx = &entry.tx;
+                let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
+                if classified.only_delivers_at(local) {
+                    classified.crossings_consumed(local)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        self.crossing_pulls.ask(&self.proven_anchors, now, wanted)
+    }
+
     /// The shard whose bundle is `tx`'s engagement evidence under
     /// `trie`, or `None` where this shard is the payer's and there is
     /// nothing to wait for.
@@ -1123,7 +1207,7 @@ impl MempoolCoordinator {
     ) {
         let deadline = self.current_ts.plus(RETENTION_HORIZON);
         for hash in tx_hashes {
-            if self.parked_engagement.contains(&hash) {
+            if self.parked_engagement.contains_key(&hash) {
                 let waits_on = self
                     .pool
                     .get(&hash)
@@ -1151,7 +1235,7 @@ impl MempoolCoordinator {
     /// evidence past its deadline.
     fn prune_engagement_state(&mut self) {
         let pool = &self.pool;
-        self.parked_engagement.retain(|hash| {
+        self.parked_engagement.retain(|hash, _| {
             pool.get(hash)
                 .is_some_and(|entry| entry.status == TransactionStatus::Pending)
         });
@@ -1225,7 +1309,7 @@ impl MempoolCoordinator {
             .iter()
             .filter(|(hash, entry)| {
                 matches!(entry.status, TransactionStatus::Pending)
-                    && !self.parked_engagement.contains(*hash)
+                    && !self.parked_engagement.contains_key(*hash)
                     && now.saturating_sub(entry.admitted_at) >= min_dwell
                     && engaged(&entry.tx)
             })

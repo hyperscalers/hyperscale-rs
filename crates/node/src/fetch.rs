@@ -464,8 +464,13 @@ pub trait ScopedAnswer: FetchBinding {
     /// The id a scope and key name.
     fn join(scope: Self::Scope, key: Self::Key) -> Self::Id;
 
-    /// One request for `keys` under `scope`.
-    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request;
+    /// One request for `keys` under `scope`, asked by `asker`.
+    ///
+    /// Most answers do not depend on who is asking, and those ignore it.
+    /// A bundle does: it is built for one target and carries that target
+    /// in its own body, so a request that did not name the asker would
+    /// be answered with something the asker must then refuse.
+    fn request(scope: Self::Scope, keys: &[Self::Key], asker: ShardId) -> Self::Request;
 
     /// Check a peer's answer against the scope and turn it into the
     /// event that carries it, or say why it is refused. The event is
@@ -552,7 +557,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
         network.request(
             shard,
             preferred,
-            B::request(scope, &keys),
+            B::request(scope, &keys, local_shard),
             class,
             Box::new(move |result| {
                 let response = match result {

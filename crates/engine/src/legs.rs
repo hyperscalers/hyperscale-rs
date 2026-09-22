@@ -480,10 +480,29 @@ impl Classified {
     /// producer, so a member holding both ends reads the cell itself.
     #[must_use]
     pub fn records_consumed(&self, local: ShardId) -> Vec<SubstateKey> {
+        self.crossings_consumed(local)
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect()
+    }
+
+    /// The same cells with the shard that writes each one, for a
+    /// consumer that has to ask somebody for them.
+    ///
+    /// [`Self::records_consumed`] answers where the producer is already
+    /// settled — a bundle names its own source, and a member reading an
+    /// arrival has one in hand. A consumer with no bundle at all has
+    /// neither, and the edge is where both live.
+    ///
+    /// Derived from the transaction and the placement alone, so a shard
+    /// holding only the body can name what it is missing and who holds
+    /// it, without having been told anything.
+    #[must_use]
+    pub fn crossings_consumed(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
         self.edges()
             .iter()
             .filter(|edge| edge.delivers && edge.to.contains(&local))
-            .map(|edge| edge.record.key())
+            .map(|edge| (edge.from, edge.record.key()))
             .collect()
     }
 

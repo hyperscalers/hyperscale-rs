@@ -408,7 +408,7 @@ impl ScopedAnswer for CommittedTxBinding {
         (scope, key)
     }
 
-    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+    fn request(scope: Self::Scope, keys: &[Self::Key], _asker: ShardId) -> Self::Request {
         GetCommittedTxsRequest::new(
             scope.height,
             scope.block_hash,
@@ -482,7 +482,7 @@ impl ScopedAnswer for StateProofBinding {
         (scope, key)
     }
 
-    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+    fn request(scope: Self::Scope, keys: &[Self::Key], _asker: ShardId) -> Self::Request {
         GetStateProofRequest::new(
             scope.height,
             Capped::new(keys.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
@@ -562,11 +562,16 @@ impl ScopedAnswer for CrossingPullBinding {
         (scope, key)
     }
 
-    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+    /// **The asker names itself, because a bundle is built for one
+    /// target and carries that target in its own body.** The scope's
+    /// shard is the producer being asked; naming it here would have the
+    /// producer build a bundle addressed to itself, which the asker then
+    /// drops as not its to absorb.
+    fn request(scope: Self::Scope, keys: &[Self::Key], asker: ShardId) -> Self::Request {
         GetProvisionsRequest::for_records(
             scope.height,
             Capped::new(keys.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
-            scope.shard,
+            asker,
         )
     }
 
@@ -657,7 +662,7 @@ impl ScopedAnswer for StateProofRelayBinding {
     /// The anchor's shard rides in the body: the request goes to this
     /// shard's committee, and what it asks about is another shard's
     /// state.
-    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+    fn request(scope: Self::Scope, keys: &[Self::Key], _asker: ShardId) -> Self::Request {
         GetRelayedStateProofRequest::new(
             scope.shard,
             scope.height,
@@ -733,7 +738,7 @@ impl ScopedAnswer for SettledTxsBinding {
         scope
     }
 
-    fn request(scope: Self::Scope, _keys: &[Self::Key]) -> Self::Request {
+    fn request(scope: Self::Scope, _keys: &[Self::Key], _asker: ShardId) -> Self::Request {
         GetSettledTxsRequest::new(scope.height, scope.block_hash)
     }
 
@@ -1111,7 +1116,7 @@ mod settled_txs_tests {
             &pending_chain,
             &SettledTxsCache::default(),
             None,
-            &SettledTxsBinding::request(scope, &[]),
+            &SettledTxsBinding::request(scope, &[], ShardId::ROOT),
         );
         match SettledTxsBinding::answer(scope, vec![()], response) {
             Ok(ProtocolEvent::SettledTxsReconstructed {
@@ -1141,7 +1146,7 @@ mod settled_txs_tests {
             &pending_chain,
             &SettledTxsCache::default(),
             None,
-            &SettledTxsBinding::request(scope, &[]),
+            &SettledTxsBinding::request(scope, &[], ShardId::ROOT),
         );
         assert_eq!(
             SettledTxsBinding::answer(scope, vec![()], response).err(),

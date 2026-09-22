@@ -643,7 +643,7 @@ impl ProvisionCoordinator {
                 actions.extend(build_verify_action(
                     self.local_shard,
                     provisions,
-                    Arc::clone(certified_header),
+                    certified_header,
                 ));
             }
         }
@@ -731,7 +731,7 @@ impl ProvisionCoordinator {
             // Admit directly via the verified path; reuses the
             // tombstone, queue, and `ProvisionsAdmitted` emission logic.
             let header = Arc::clone(&verified_header);
-            return self.on_state_provisions_verified(Ok(provisions), &header, now);
+            return self.on_state_provisions_verified(Ok(provisions), Anchor::of(&header), now);
         }
 
         // Header not yet verified — fall back to the raw buffer; the
@@ -849,7 +849,7 @@ impl ProvisionCoordinator {
                 );
                 return vec![];
             }
-            return build_verify_action(self.local_shard, provisions, verified_header)
+            return build_verify_action(self.local_shard, provisions, &verified_header)
                 .into_iter()
                 .collect();
         }
@@ -914,21 +914,7 @@ impl ProvisionCoordinator {
             );
             return actions;
         }
-        let Some(verified_header) = self.headers.get((anchor.shard, anchor.height)) else {
-            // The anchor was commit-proven when the pull was composed.
-            // A header gone since is a retirement racing the answer, and
-            // the pull is re-composed against a newer one.
-            debug!(
-                shard = anchor.shard.inner(),
-                height = anchor.height.inner(),
-                "Dropping pulled provisions: the anchor's header is no longer held"
-            );
-            return actions;
-        };
-        actions.push(Action::VerifyProvisions {
-            provisions,
-            certified_header: verified_header,
-        });
+        actions.push(Action::VerifyProvisions { provisions, anchor });
         actions
     }
 
@@ -939,7 +925,7 @@ impl ProvisionCoordinator {
     pub fn on_state_provisions_verified(
         &mut self,
         result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        anchor: Anchor,
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
@@ -962,7 +948,7 @@ impl ProvisionCoordinator {
         // distinct batch verify against it, so the pending-block lookup
         // can find whichever hash the proposer committed.
         self.expected
-            .on_provisions_verified(certified_header.shard_id(), certified_header.height());
+            .on_provisions_verified(anchor.shard, anchor.height);
 
         let verified = match result {
             Ok(v) => v,
@@ -976,7 +962,7 @@ impl ProvisionCoordinator {
                 return actions;
             }
         };
-        let source_block_ts = certified_header.header().parent_qc().weighted_timestamp();
+        let source_block_ts = anchor.ts;
         let provisions_hash = verified.hash();
         let source_shard = verified.source_shard();
 
@@ -1756,7 +1742,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -1802,7 +1788,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -1834,7 +1820,7 @@ mod tests {
         // Verification fails — no certified_header returned
         let actions = coordinator.on_state_provisions_verified(
             Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -1915,8 +1901,8 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { certified_header, .. }
-                if certified_header.height() == BlockHeight::new(10)
+            Action::VerifyProvisions { anchor, .. }
+                if anchor.height == BlockHeight::new(10)
         ));
     }
 
@@ -1947,8 +1933,8 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { certified_header, .. }
-                if certified_header.height() == BlockHeight::new(10)
+            Action::VerifyProvisions { anchor, .. }
+                if anchor.height == BlockHeight::new(10)
         ));
     }
 
@@ -2041,7 +2027,7 @@ mod tests {
         // Entire provisions fails verification
         let actions = coordinator.on_state_provisions_verified(
             Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2294,7 +2280,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2474,7 +2460,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2518,7 +2504,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2631,7 +2617,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions.clone(),
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
         assert_eq!(coordinator.queue.queue_len(), 1);
@@ -2722,7 +2708,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions.clone(),
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
         let committing_block =
@@ -2859,7 +2845,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2940,7 +2926,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
         assert_eq!(coordinator.queue.queue_len(), 1);
@@ -3088,7 +3074,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             now,
         );
     }
@@ -3236,7 +3222,7 @@ mod tests {
                         Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                             provisions,
                         ))),
-                        &header,
+                        Anchor::of(&header),
                         LocalTimestamp::ZERO,
                     );
                 } else {

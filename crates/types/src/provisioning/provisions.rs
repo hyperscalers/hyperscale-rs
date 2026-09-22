@@ -12,9 +12,9 @@ use thiserror::Error;
 
 use crate::state_key::jmt_value_hash;
 use crate::{
-    BlockHeight, CertifiedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
-    ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardId, StateProofError, SubstateEntry,
-    SubstateKey, TxHash, Verified, Verify, WeightedTimestamp,
+    Anchor, BlockHeight, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof, ProvisionEntry,
+    ProvisionHash, RETENTION_HORIZON, ShardId, StateProofError, SubstateEntry, SubstateKey, TxHash,
+    Verified, Verify, WeightedTimestamp,
 };
 
 /// All provisions from a single source block, scoped to a single target shard.
@@ -258,11 +258,16 @@ impl Provisions {
 
 /// Inputs the [`Provisions`] verifier reads against.
 #[derive(Debug, Clone, Copy)]
-pub struct ProvisionsContext<'a> {
-    /// The committed source-block header whose `state_root` the merkle
-    /// proof must validate against. Carrying the verified marker means
-    /// the QC over the source header has already cleared.
-    pub certified_header: &'a Verified<CertifiedBlockHeader>,
+pub struct ProvisionsContext {
+    /// The source anchor whose `state_root` the merkle proof must
+    /// validate against — a height this node has commit-proven.
+    ///
+    /// The anchor and not the header it was taken from, because the root
+    /// is the whole of what a proof is checked against and a header is
+    /// only one way to name one. A pushed bundle's anchor comes off the
+    /// producing header; a pulled one's off this node's own mirror of
+    /// what it has proven, which no promise gates.
+    pub anchor: Anchor,
 }
 
 /// Failure modes of [`Provisions`] verification.
@@ -276,7 +281,7 @@ pub enum ProvisionsVerifyError {
     #[error("empty merkle proof with non-empty entry set")]
     EmptyProofWithEntries,
     /// The decoded multiproof did not validate against
-    /// `ctx.certified_header.state_root()` for the bundle's claimed
+    /// `ctx.anchor.state_root` for the bundle's claimed
     /// entries.
     #[error("merkle inclusion verification failed against committed state root")]
     BadInclusion,
@@ -300,7 +305,7 @@ pub enum ProvisionsVerifyError {
 
 /// Construction asserts: the aggregated merkle multiproof in
 /// `provisions.proof()` validates every entry under
-/// `ctx.certified_header.state_root()`.
+/// `ctx.anchor.state_root`.
 ///
 /// Construction goes through one of three gates:
 ///
@@ -315,29 +320,23 @@ pub enum ProvisionsVerifyError {
 ///   source committee's QC BFT-transitively attests the inclusion claim.
 ///
 /// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
-impl Verify<&ProvisionsContext<'_>> for Provisions {
+impl Verify<&ProvisionsContext> for Provisions {
     type Error = ProvisionsVerifyError;
 
-    fn verify(&self, ctx: &ProvisionsContext<'_>) -> Result<Verified<Self>, Self::Error> {
+    fn verify(&self, ctx: &ProvisionsContext) -> Result<Verified<Self>, Self::Error> {
         // The bundle's own account of who is answering must be the shard
-        // whose root it is checked against. Only the header is trusted,
+        // whose root it is checked against. Only the anchor is trusted,
         // and consumers key what they absorb — the source of every entry,
         // and which requirement it satisfies — off the bundle's field.
-        let source_shard = ctx.certified_header.shard_id();
+        let source_shard = ctx.anchor.shard;
         if self.source_shard != source_shard {
             return Err(ProvisionsVerifyError::SourceShardMismatch);
         }
 
-        // The carried source-block timestamp must be the header's own
-        // parent-QC anchor: receivers consume it as the transaction
+        // The carried source-block timestamp must be the anchor's own
+        // parent-QC reading: receivers consume it as the transaction
         // clock, so it clears verification or the bundle does not.
-        if self.source_block_ts
-            != ctx
-                .certified_header
-                .header()
-                .parent_qc()
-                .weighted_timestamp()
-        {
+        if self.source_block_ts != ctx.anchor.ts {
             return Err(ProvisionsVerifyError::SourceBlockTsMismatch);
         }
 
@@ -359,7 +358,7 @@ impl Verify<&ProvisionsContext<'_>> for Provisions {
         let keys: Vec<SubstateKey> = entries.iter().map(|entry| entry.key).collect();
         let attested = self
             .proof
-            .inclusions(ctx.certified_header.state_root(), source_shard, &keys)
+            .inclusions(ctx.anchor.state_root, source_shard, &keys)
             .map_err(|error| match error {
                 StateProofError::Malformed => ProvisionsVerifyError::MalformedProof,
                 StateProofError::MissingClaim | StateProofError::RootMismatch => {
@@ -414,6 +413,7 @@ mod tests {
     use hyperscale_vm_types::{LocalKey, SubstateKey};
 
     use super::*;
+    use crate::CertifiedBlockHeader;
     use crate::test_utils::test_prefix;
 
     fn cell(owner: u8, local: u8) -> SubstateKey {
@@ -606,7 +606,7 @@ mod tests {
             let verified_header = header_with_state_root(state_root);
             let provisions = provisions_with(proof, items);
             let ctx = ProvisionsContext {
-                certified_header: &verified_header,
+                anchor: Anchor::of(&verified_header),
             };
             provisions
                 .verify(&ctx)
@@ -627,7 +627,7 @@ mod tests {
             let provisions = provisions_with(tampered, items);
 
             let ctx = ProvisionsContext {
-                certified_header: &verified_header,
+                anchor: Anchor::of(&verified_header),
             };
             let err = provisions
                 .verify(&ctx)
@@ -654,7 +654,7 @@ mod tests {
                 Capped::empty(),
             );
             let ctx = ProvisionsContext {
-                certified_header: &verified_header,
+                anchor: Anchor::of(&verified_header),
             };
             provisions
                 .verify(&ctx)
@@ -667,7 +667,7 @@ mod tests {
             let verified_header = header_with_state_root(state_root);
             let provisions = provisions_with(MerkleInclusionProof::new(vec![]), vec![entry(1)]);
             let ctx = ProvisionsContext {
-                certified_header: &verified_header,
+                anchor: Anchor::of(&verified_header),
             };
             assert_eq!(
                 provisions.verify(&ctx),
@@ -685,7 +685,7 @@ mod tests {
             let mut provisions = provisions_with(proof, items);
             provisions.source_shard = ShardId::leaf(1, 1);
             let ctx = ProvisionsContext {
-                certified_header: &verified_header,
+                anchor: Anchor::of(&verified_header),
             };
             assert_eq!(
                 provisions.verify(&ctx),
@@ -759,7 +759,7 @@ mod tests {
                 )]),
             );
             let ctx = ProvisionsContext {
-                certified_header: &verified_header,
+                anchor: Anchor::of(&verified_header),
             };
             assert_eq!(
                 provisions.verify(&ctx),
@@ -781,7 +781,7 @@ mod tests {
             let (state_root, proof) = build_jmt(&items);
             let verified_header = header_with_state_root(state_root);
             let ctx = ProvisionsContext {
-                certified_header: &verified_header,
+                anchor: Anchor::of(&verified_header),
             };
 
             // The honest bundle clears.
@@ -851,7 +851,7 @@ mod tests {
                 )]),
             );
             let ctx = ProvisionsContext {
-                certified_header: &verified_header,
+                anchor: Anchor::of(&verified_header),
             };
             assert_eq!(
                 provisions.verify(&ctx),

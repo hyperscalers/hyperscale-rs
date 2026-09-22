@@ -119,7 +119,7 @@ impl ScopedAnswer for ShardWitnessBinding {
         scope
     }
 
-    fn request(scope: Self::Scope, _keys: &[Self::Key]) -> Self::Request {
+    fn request(scope: Self::Scope, _keys: &[Self::Key], _asker: ShardId) -> Self::Request {
         let (source_shard, block_height, committed_block_hash, lo, hi) = scope;
         GetShardWitnessesRequest::new(source_shard, block_height, committed_block_hash, lo, hi)
     }
@@ -187,7 +187,11 @@ impl ScopedAnswer for BeaconProposalBinding {
         scope
     }
 
-    fn request((epoch, validator): Self::Scope, _keys: &[Self::Key]) -> Self::Request {
+    fn request(
+        (epoch, validator): Self::Scope,
+        _keys: &[Self::Key],
+        _asker: ShardId,
+    ) -> Self::Request {
         GetBeaconProposalRequest::new(epoch, validator)
     }
 

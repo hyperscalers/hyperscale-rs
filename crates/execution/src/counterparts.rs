@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, CrossingPulls, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
@@ -625,13 +625,8 @@ pub struct Counterparts {
     /// slot.
     probes: BTreeMap<(ShardId, SubstateKey), Probe>,
 
-    /// The anchor height each record was last pulled at, and when.
-    ///
-    /// What paces [`pull_unpushed_crossings`](Self::pull_unpushed_crossings),
-    /// and the only thing that does: a pull's fetch id is released the
-    /// moment its answer arrives, so nothing else remembers that the
-    /// question was already put. Node-local, like the asking itself.
-    pulled: BTreeMap<SubstateKey, (BlockHeight, WeightedTimestamp)>,
+    /// The record pulls this validator has put, with their pacing.
+    pulled: CrossingPulls,
 }
 
 impl Counterparts {
@@ -679,7 +674,7 @@ impl Counterparts {
             arrivals: BTreeMap::new(),
             offer_cursor: None,
             probes: BTreeMap::new(),
-            pulled: BTreeMap::new(),
+            pulled: CrossingPulls::new(),
         }
     }
 
@@ -734,21 +729,9 @@ impl Counterparts {
         }
     }
 
-    /// Ask each producer for the records a delivery here waits on that
-    /// no push can still serve.
-    ///
-    /// **The consumer's half of `reoffers`, and paced the same way.**
-    /// That one promises a bundle from the producer's side and gates on
-    /// the record's own deadline; this asks for one from the consumer's
-    /// and gates on how long the candidate has waited
-    /// ([`ProvisioningTracker::unpushed_crossings`]). What both need
-    /// past the floor is a bound on repetition, and it is the same
-    /// bound: a producer whose proven anchor has not advanced past the
-    /// one last asked is asked once, because the answer would be the
-    /// same reading; and one that has advanced is still not asked again
-    /// inside `MAX_FINALIZATION_DELAY`, because a chain that is running
-    /// lands anchors here far faster than a round trip resolves and
-    /// paced on those alone the same question goes out many times over.
+    /// Ask each producer for the records a delivery admitted here still
+    /// waits on, which [`ProvisioningTracker::unpushed_crossings`] has
+    /// already held to its floor.
     ///
     /// **Asked of whoever holds the record's prefix now.** The
     /// requirement names the shard the producer sat on when the
@@ -756,48 +739,20 @@ impl Counterparts {
     /// that shard is asking somebody who cannot answer, for as long as
     /// the crossing stands.
     ///
-    /// Node-local, like every other fetch: what a validator asks for is
-    /// its own business, and what the answer licenses is the bundle
-    /// riding into a block where every replica absorbs the same bytes.
+    /// The pacing is [`CrossingPulls`]', shared with the parked bodies
+    /// the pool asks for before admission.
     pub(crate) fn pull_unpushed_crossings(
         &mut self,
         trie: &ShardTrie,
         now: WeightedTimestamp,
         unpushed: &BTreeSet<SubstateKey>,
     ) -> Vec<Action> {
-        // A record carried since is one nothing is owed for, and its
-        // stamp would otherwise outlive every reader of it.
-        self.pulled.retain(|key, _| unpushed.contains(key));
         let local = self.ledger.local();
-        let mut asks: BTreeMap<(ShardId, Anchor), Vec<SubstateKey>> = BTreeMap::new();
-        for &key in unpushed {
+        let wanted = unpushed.iter().filter_map(|&key| {
             let shard = trie.shard_for_prefix(key.owner);
-            if shard == local {
-                continue;
-            }
-            let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
-                continue;
-            };
-            if self.pulled.get(&key).is_some_and(|&(at, when)| {
-                at >= anchor.height || now.elapsed_since(when) < MAX_FINALIZATION_DELAY
-            }) {
-                continue;
-            }
-            self.pulled.insert(key, (anchor.height, now));
-            asks.entry((shard, anchor)).or_default().push(key);
-        }
-        asks.into_iter()
-            .map(|((shard, anchor), keys)| {
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::CrossingPulls(
-                        keys.into_iter().map(|key| (anchor, key)).collect(),
-                    ),
-                    shard,
-                    preferred: None,
-                    class: None,
-                })
-            })
-            .collect()
+            (shard != local).then_some((shard, key))
+        });
+        self.pulled.ask(&self.proven_anchors, now, wanted)
     }
 
     /// Record a departed shard's settled set where the fence reads it.

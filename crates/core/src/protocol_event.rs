@@ -459,9 +459,9 @@ pub enum ProtocolEvent {
         /// Verified provisions on success; the raw bundle paired with
         /// its error on failure.
         result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
-        /// The certified header whose `state_root` the merkle proof was
+        /// The source anchor whose `state_root` the merkle proof was
         /// checked against.
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        anchor: Anchor,
     },
 
     /// A provisions has been verified — ready for downstream consumption.

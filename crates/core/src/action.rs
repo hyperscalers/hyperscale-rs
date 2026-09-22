@@ -9,9 +9,9 @@ use hyperscale_engine::TickEnvironment;
 use hyperscale_engine::legs::{Member, Runs};
 use hyperscale_storage::TickResolution;
 use hyperscale_types::{
-    AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
-    CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
+    AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
+    BlockVote, CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, CrossingReoffer, DeclaredRange, Epoch, EpochWindows,
     EscrowedValue, ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash,
     HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
@@ -518,8 +518,11 @@ pub enum Action {
     VerifyProvisions {
         /// The provisions to verify (all from the same source block).
         provisions: Provisions,
-        /// The QC-verified committed block header from `RemoteHeaderCoordinator`.
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        /// The source anchor whose `state_root` the proof is checked
+        /// against — off the producing header for a pushed bundle, off
+        /// this node's own mirror of what it has commit-proven for a
+        /// pulled one.
+        anchor: Anchor,
     },
 
     /// Aggregate execution votes into an `ExecutionCertificate` (quorum reached).
