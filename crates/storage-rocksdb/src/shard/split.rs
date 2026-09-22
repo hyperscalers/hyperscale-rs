@@ -17,6 +17,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::Jmt;
@@ -219,7 +220,10 @@ impl RocksDbShardStorage {
         let pair = Verified::<CertifiedBlock>::genesis_certified(genesis.clone());
         // A child's history begins here, and its genesis QC carries the
         // chain origin's anchor: dating it is what puts the floor at the
-        // adoption rather than below everything the parent held.
+        // adoption rather than below everything the parent held. The hold
+        // goes with it — every reader that named a version beneath the
+        // adoption belonged to the chain this one replaces.
+        self.retention_hold.store(u64::MAX, Ordering::Relaxed);
         let floor = self.advance_retention_floor(
             batch,
             genesis.height().inner(),

@@ -1459,6 +1459,8 @@ mod tests {
         fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
             None
         }
+
+        fn hold_retention_at(&self, _height: BlockHeight) {}
     }
 
     impl TreeReader for StubStore {

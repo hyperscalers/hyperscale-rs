@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-use hyperscale_storage::lock_recover::read_or_recover;
+use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::{
     PackageArtifactStore, SubstateStore, Substates, SweepIndex, SweepRows, VersionedStore,
 };
@@ -101,6 +101,10 @@ impl VersionedStore for SimShardStorage {
             .substate_bytes
             .get(&height.inner())
             .copied()
+    }
+
+    fn hold_retention_at(&self, height: BlockHeight) {
+        write_or_recover(&self.state).retention_hold = height.inner();
     }
 }
 

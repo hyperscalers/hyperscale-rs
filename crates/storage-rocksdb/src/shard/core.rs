@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -98,6 +99,11 @@ pub struct RocksDbShardStorage {
     /// and letting a write that raises nothing (e.g. a timeout
     /// retransmit) skip the fsync entirely.
     pub(crate) vote_registers: Arc<Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>>,
+
+    /// The oldest version this node's own readers still name; `u64::MAX`
+    /// until one holds. Process-local rather than a column: a restarted
+    /// node's readers start where its store does.
+    pub(crate) retention_hold: Arc<AtomicU64>,
 }
 
 /// Fold what a batch `moved` in the sweep index into the rows it holds.
@@ -286,6 +292,7 @@ impl RocksDbShardStorage {
             root_path,
             checkpoints,
             vote_registers: Arc::new(Mutex::new(HashMap::new())),
+            retention_hold: Arc::new(AtomicU64::new(u64::MAX)),
         })
     }
 

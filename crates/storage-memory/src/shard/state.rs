@@ -69,6 +69,9 @@ pub struct SharedState {
     pub(crate) version_time: BTreeMap<u64, u64>,
     /// The oldest version historical reads are answered at.
     pub(crate) retention_floor: u64,
+    /// The oldest version this node's own readers still name;
+    /// `u64::MAX` until one holds. The floor never passes it.
+    pub(crate) retention_hold: u64,
     /// Committed substate byte total per version, written in
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
@@ -97,6 +100,7 @@ impl SharedState {
         let retired = retire_dated(
             self.retention_floor,
             version,
+            self.retention_hold,
             tip_ts,
             self.version_time
                 .range(self.retention_floor..)
@@ -124,6 +128,7 @@ impl SharedState {
             entries_history: OrdMap::new(),
             version_time: BTreeMap::new(),
             retention_floor: 0,
+            retention_hold: u64::MAX,
             substate_bytes: BTreeMap::new(),
             package_artifacts: BTreeMap::new(),
             sweep_index: SweepRows::default(),

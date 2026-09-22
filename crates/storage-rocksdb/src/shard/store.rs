@@ -1,5 +1,6 @@
 //! `SubstateStore` implementation for `RocksDbShardStorage`.
 
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use hex::encode as hex_encode;
@@ -114,6 +115,10 @@ impl VersionedStore for RocksDbShardStorage {
 
     fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64> {
         self.substate_bytes_at_version(height.inner())
+    }
+
+    fn hold_retention_at(&self, height: BlockHeight) {
+        self.retention_hold.store(height.inner(), Ordering::Relaxed);
     }
 
     fn retention_floor(&self) -> u64 {

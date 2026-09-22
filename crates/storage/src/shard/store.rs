@@ -149,6 +149,23 @@ pub trait VersionedStore: SubstateStore {
     /// If `height` is below the retention floor.
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_>;
 
+    /// Hold history at `height`: the oldest version this node's own
+    /// readers still name, which the retention floor may not pass.
+    ///
+    /// The horizon answers what a *counterpart* is licensed to ask for,
+    /// and it is measured against the tip's clock — which a halted
+    /// shard's recovery commit moves by the whole halt, retiring
+    /// everything beneath it in one step. This node's readers are not
+    /// licensed by that clock: they trail the commit by an event, and
+    /// execution by however far its tick queue is behind. The hold is
+    /// what they name, and there is one publisher — the tick chain,
+    /// which already refuses to evict a fold below the same number.
+    ///
+    /// Not persisted: a restarted node's readers start where its store
+    /// does, and a hold outliving the reader that took it would retain
+    /// history nothing reads.
+    fn hold_retention_at(&self, height: BlockHeight);
+
     /// Committed substate byte total after the commit at `height`,
     /// or `None` if no commit at that height recorded one (never
     /// committed, or pruned past the retention horizon).

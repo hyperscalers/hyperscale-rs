@@ -187,6 +187,8 @@ impl VersionedStore for MapDb {
     fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
         None
     }
+
+    fn hold_retention_at(&self, _height: BlockHeight) {}
 }
 
 /// The genesis package set this binary runs on.

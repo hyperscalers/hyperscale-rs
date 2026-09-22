@@ -81,7 +81,10 @@ impl SimShardStorage {
         let pair = Verified::<CertifiedBlock>::genesis_certified(genesis.clone());
         // A child's history begins here, and its genesis QC carries the
         // chain origin's anchor: dating it is what puts the floor at the
-        // adoption rather than below everything the parent held.
+        // adoption rather than below everything the parent held. The hold
+        // goes with it — every reader that named a version beneath the
+        // adoption belonged to the chain this one replaces.
+        shared.retention_hold = u64::MAX;
         shared.advance_retention_floor(
             origin.genesis_height.inner(),
             pair.qc_verified().weighted_timestamp(),
