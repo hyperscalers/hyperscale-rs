@@ -10879,15 +10879,15 @@ mod tests {
         })
     }
 
-    /// A decline read present credits the value back, and does it
-    /// before the window an absence answers in has opened.
+    /// A decline read present credits the value back from the deadline,
+    /// which is earlier than any silence ever answered.
     ///
     /// The instant is the whole assertion. A refusal is composable from
-    /// the deadline, and [`held_absence_answers`] does not begin until
-    /// the close of [`Window::Core`] — two validity ranges and a
-    /// finalization delay later. So a reclaim at the deadline is one no
-    /// silence could have licensed, which is what tells the consumer's
-    /// own word apart from an inference about it.
+    /// the deadline, while a shard holding a member of the crossing's
+    /// own transaction waits out the close of [`Window::Core`] — two
+    /// validity ranges and a finalization delay later. So a reclaim at
+    /// the deadline is one nothing but the consumer's own word could
+    /// have licensed.
     #[test]
     fn a_decline_read_present_credits_back_before_any_silence_answers() {
         let deadline = Deadline::from_expiry(400_000);

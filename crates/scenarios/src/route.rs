@@ -346,13 +346,15 @@ fn assert_venues_gave_back<C: Cluster>(
 /// `release_wedged_ticks` will never release it — its only reader is
 /// gated on a determined half and such a member has none.
 ///
-/// **And the decline is the interlock, not just the evidence.** A
-/// producer crediting back on silence leaves the consumer free to claim
-/// afterwards, and the input pays twice: credited to the trader, then
-/// banked by a core that returned. A decline *written* forecloses that —
-/// the crossing carrying both cells is a refusal the consumer's own
-/// licence makes impossible — so what used to rest on the core's tick
-/// expiring with the entries now rests on a cell.
+/// **What the decline changes is the evidence, not the guarantee.** The
+/// producer acts on the consumer's own statement rather than on an
+/// inference from its silence, and both are taken at the same instant.
+/// What still holds the other side is unchanged and is what this pins:
+/// the core's tick goes with the entries at the same close, so no claim
+/// is coming. Nothing forecloses one — the claim and the decline are
+/// different keys and the kernel checks neither against the other — so
+/// break that and the input pays twice: credited to the trader, then
+/// banked by a core that returned.
 ///
 /// Requires disjoint committees, as its neighbour does.
 ///
@@ -454,9 +456,7 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
     // And one of them said so. The crossing the trader staged lands on
     // one venue's prefix, so one decline is the whole verdict — written
     // by a venue still holding a member it can never run, which is the
-    // case this scenario exists for. The claim beside it was never
-    // written: a crossing carrying both cells is what the decline
-    // forecloses.
+    // case this scenario exists for.
     assert!(
         [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
             .iter()

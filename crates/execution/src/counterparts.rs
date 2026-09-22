@@ -228,13 +228,12 @@ pub struct AnsweredCrossing {
     /// itself.
     ///
     /// **The clock is [`RETENTION_HORIZON`], and asking faster buys
-    /// nothing.** Two absences license a deletion only a span apart, so
-    /// the shortest path from a standing record to a cleanable answer
-    /// is one span whatever the polling rate — and a deletion is
-    /// housekeeping with no deadline behind it. Paced here the whole
-    /// loop costs one question per answer cell per span; paced at a
-    /// round it costs six times that and buys back at most one span on
-    /// a path nothing waits on.
+    /// little.** One absence licenses a deletion, so a faster question
+    /// would find the record gone sooner — but a record goes only when
+    /// its producer disposes of it, and a deletion is housekeeping with
+    /// no deadline behind it. Paced here the whole loop costs one
+    /// question per answer cell per span; paced at a round it costs six
+    /// times that, on a path nothing waits on.
     asked_at: Option<(BlockHeight, WeightedTimestamp)>,
     /// How far the record has been read gone.
     pub cleanup: Cleanup,
@@ -457,11 +456,10 @@ pub struct Committed {
     /// absent, with the producer anchor each was read at.
     ///
     /// Read off the block and not off the fold, because it is the whole
-    /// of a deletion's licence: a pair of these more than a span apart
-    /// is what licenses one. A fold would make the licence node-local,
-    /// and a replica that had folded fewer readings would compose fewer
-    /// members and vote a different root — a divergence rather than a
-    /// lag.
+    /// of a deletion's licence: one of these licenses one. A fold would
+    /// make the licence node-local, and a replica that had folded fewer
+    /// readings would compose fewer members and vote a different root —
+    /// a divergence rather than a lag.
     pub(crate) gone: Vec<(SubstateKey, Anchor)>,
     /// The records whose answers this block removed — arrivals the
     /// tick machine is done with.

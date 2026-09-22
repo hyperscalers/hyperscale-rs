@@ -269,8 +269,8 @@ pub enum Resolutions {
     Wrong(TxHash),
     /// A finalization decides this transaction with success, by its own
     /// execution, at an anchor at or past its deadline, where a leg that
-    /// issued for it may already have read the claim absent and taken
-    /// the crossing back.
+    /// issued for it may already have taken the crossing back against
+    /// the consumer's decline.
     /// Only a member that awaits nobody is held to it: one with a sibling
     /// to stay atomic with settles on the sibling's clock. The block is
     /// refused.

@@ -25,14 +25,18 @@ use crate::{
 ///
 /// Two validity ranges is the floor — the span a core's absence answers
 /// in, which a leg entry has to outlive or the reclaim that absence
-/// licenses can never be composed. A record
-/// written near a reshape cut is inherited by a successor that decides
-/// it against a claim cell now on some other chain, so the window has to
-/// be the one every other bound on reshape evidence is:
-/// [`TERMINAL_EVIDENCE_EPOCHS`] windows, less the deadline the cell's
-/// expiry is measured from. Shorter and the record is one nobody can
-/// dispose of, its value stranded where presence and absence are both
-/// unprovable.
+/// licenses can never be composed.
+///
+/// The figure itself is the record's own encoding. A record's expiry is
+/// stated as the producing intent's validity end plus
+/// [`MAX_FINALIZATION_DELAY`] plus this window, and a reader holding
+/// nothing but the leaf recovers the deadline by taking this window
+/// back off it — so the sum is pinned to
+/// [`TERMINAL_EVIDENCE_EPOCHS`] windows, making a record a successor
+/// inherits across a cut state a deadline as readable as any other
+/// reshape evidence. What a successor does not need it for is deciding
+/// that record: it reads its consumer's answer, present, at whatever
+/// anchor the answer was taken.
 pub const CLAIM_WINDOW: Duration = Duration::from_secs(
     EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS - MAX_FINALIZATION_DELAY.as_secs(),
 );
@@ -143,10 +147,12 @@ pub enum Window {
     /// [`CLAIM_WINDOW`] on, past which no evidence that could decide the
     /// leg can still be taken.
     ///
-    /// [`CLAIM_WINDOW`] is this window's figure, derived for it: the
-    /// span an absence has to be provable in, floored so a reclaim can
-    /// be composed at all and so a reshape successor can decide a record
-    /// it inherited.
+    /// A liveness bound rather than a soundness one, and the only
+    /// crossing rule left that is a span at all: every verdict is a
+    /// presence, which answers at whatever anchor it was taken. What
+    /// this sizes is how long the chain keeps asking — floored at the
+    /// span a core's absence has to be provable in, so a reclaim can be
+    /// composed at all.
     LegEntry,
 }
 
