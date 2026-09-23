@@ -35,6 +35,41 @@ jobs:
             exit 1
           fi
 
+  vm-tests:
+    name: VM Tests
+    # The root workspace excludes `vm`, so the test archive never sees it:
+    # the kernel's crossing tests run here, at the submodule's pinned
+    # commit, on the toolchain `vm/rust-toolchain.toml` governs.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          targets: wasm32-unknown-unknown
+      # The guest fixtures pin their own toolchain and build with
+      # -Zbuild-std, so that channel and rust-src are present before any
+      # test that calls build_guest runs.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-08
+          targets: wasm32-unknown-unknown
+          components: rust-src
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            vm
+            vm/guests
+          key: vm
+      - uses: taiki-e/install-action@nextest
+      - name: Cargo Nextest
+        run: cargo nextest run --release
+
   build-tests:
     name: Build Test Archive
     # The archive is a native binary, so it is built on the same arm64
