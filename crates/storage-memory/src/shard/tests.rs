@@ -401,9 +401,9 @@ fn a_retained_bundle_drops_below_the_history_floor() {
 }
 
 #[test]
-fn the_widest_copy_of_a_tick_holds_the_slot() {
+fn every_copy_of_a_tick_answers_for_what_it_carries() {
     let storage = SimShardStorage::default();
-    test_helpers::test_widest_tick_copy_holds_the_slot(&storage);
+    test_helpers::test_every_copy_of_a_tick_answers_for_what_it_carries(&storage);
 }
 
 #[test]

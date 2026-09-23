@@ -107,13 +107,11 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Retrieve the consensus-bound receipt portion for a transaction.
     fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>>;
 
-    /// Retrieve a single execution certificate by [`TickId`].
-    fn get_execution_certificate(&self, tick_id: &TickId)
-    -> Option<Verified<ExecutionCertificate>>;
-
-    /// Retrieve multiple execution certificates by [`TickId`] (batch read).
+    /// Retrieve every held copy of the execution certificates of
+    /// `tick_ids` (batch read).
     ///
-    /// Returns only certificates that were found (missing ids are skipped).
+    /// A tick is held as every copy no other copy carries, so one id can
+    /// return more than one certificate; missing ids are skipped.
     fn get_execution_certificates_batch(
         &self,
         tick_ids: &[TickId],
@@ -122,7 +120,8 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Retrieve the execution certificates carrying outcomes for
     /// `tx_hashes`, deduplicated — one certificate covers every
     /// transaction of its batch, so several requested transactions
-    /// commonly resolve to the same certificate.
+    /// commonly resolve to the same certificate. Only the copies that
+    /// carry an asked transaction are returned.
     ///
     /// This is the key a counterpart shard asks by: it knows the
     /// transaction from our committed header and cannot know which

@@ -1,6 +1,5 @@
 //! `ShardChainWriter` implementation for `SimShardStorage`.
 
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
@@ -8,8 +7,8 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, covers_strictly_more,
-    holds_this_block_at, settled_writes_at, widest_tick_copies,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, fold_tick_copy,
+    holds_this_block_at, settled_writes_at, tick_copies,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
@@ -221,46 +220,40 @@ impl SimShardStorage {
 }
 
 /// Fold a block's execution certificates into the consensus map, keeping
-/// the widest copy of each tick and indexing the transactions that copy
-/// attests.
+/// every copy of a tick no other copy carries and indexing the
+/// transactions this shard's own copies attest.
 ///
-/// Only an accepted copy of this shard's own certificate is indexed. A
-/// settled cross-shard transaction lands here under both sides'
-/// certificates, and the index answers "what did THIS shard attest for
-/// the transaction" — the question a counterpart's fallback fetch asks
-/// this shard. A remote copy in there serves the requester its own
-/// certificate back, which it rightly refuses as unsolicited, and the
-/// fetch loops forever.
+/// Only this shard's own certificates are indexed. A settled cross-shard
+/// transaction lands here under both sides' certificates, and the index
+/// answers "what did THIS shard attest for the transaction" — the
+/// question a counterpart's fallback fetch asks this shard. A remote copy
+/// in there serves the requester its own certificate back, which it
+/// rightly refuses as unsolicited, and the fetch loops forever.
 ///
 /// Every one of this shard's is indexed, not the newest: the verdict and
 /// whatever settles what it left both name the transaction, and only the
-/// asker can tell which answers the question its tick waits on.
+/// asker can tell which answers the question its tick waits on. And
+/// indexed whether or not the copy was kept, since a copy the fold turns
+/// away is one a held copy of the same tick already carries.
 fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
     let local_shard = block
         .certificates()
         .first()
         .map(|finalization| finalization.tick_id().shard_id());
-    for cert in widest_tick_copies(block).into_values() {
-        match consensus.execution_certs.entry(*cert.tick_id()) {
-            Entry::Occupied(mut held) => {
-                if !covers_strictly_more(cert, held.get()) {
-                    continue;
-                }
-                held.insert(cert.clone());
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(cert.clone());
-            }
+    for (tick_id, copies) in tick_copies(block) {
+        let held = consensus.execution_certs.entry(tick_id).or_default();
+        for cert in &copies {
+            fold_tick_copy(held, (*cert).clone());
         }
-        if Some(cert.tick_id().shard_id()) != local_shard {
+        if Some(tick_id.shard_id()) != local_shard {
             continue;
         }
-        for outcome in cert.tx_outcomes() {
+        for outcome in copies.iter().flat_map(|cert| cert.tx_outcomes()) {
             consensus
                 .tx_cert_index
                 .entry(outcome.tx_hash())
                 .or_default()
-                .insert(*cert.tick_id());
+                .insert(tick_id);
         }
     }
 }

@@ -108,17 +108,6 @@ impl ShardChainReader for SimShardStorage {
             .cloned()
     }
 
-    fn get_execution_certificate(
-        &self,
-        tick_id: &TickId,
-    ) -> Option<Verified<ExecutionCertificate>> {
-        read_or_recover(&self.consensus)
-            .execution_certs
-            .get(tick_id)
-            .cloned()
-            .map(Verified::<ExecutionCertificate>::from_persisted)
-    }
-
     fn get_execution_certificates_batch(
         &self,
         tick_ids: &[TickId],
@@ -126,7 +115,9 @@ impl ShardChainReader for SimShardStorage {
         let c = read_or_recover(&self.consensus);
         tick_ids
             .iter()
-            .filter_map(|wid| c.execution_certs.get(wid).cloned())
+            .filter_map(|wid| c.execution_certs.get(wid))
+            .flatten()
+            .cloned()
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }
@@ -142,7 +133,10 @@ impl ShardChainReader for SimShardStorage {
             .filter_map(|tx| c.tx_cert_index.get(tx))
             .flatten()
             .filter(|tick_id| seen.insert(tick_id))
-            .filter_map(|tick_id| c.execution_certs.get(tick_id).cloned())
+            .filter_map(|tick_id| c.execution_certs.get(tick_id))
+            .flatten()
+            .filter(|copy| tx_hashes.iter().any(|tx| copy.covers(tx)))
+            .cloned()
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }

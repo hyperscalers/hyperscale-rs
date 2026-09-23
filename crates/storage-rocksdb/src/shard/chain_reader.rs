@@ -96,16 +96,6 @@ impl ShardChainReader for RocksDbShardStorage {
         Self::get_consensus_receipt(self, tx_hash)
     }
 
-    fn get_execution_certificate(
-        &self,
-        tick_id: &TickId,
-    ) -> Option<Verified<ExecutionCertificate>> {
-        let cfs = self.cf();
-        let certs_cf = ExecutionCertsCf::handle(&cfs);
-        get::<ExecutionCertsCf>(&*self.db, certs_cf, tick_id)
-            .map(Verified::<ExecutionCertificate>::from_persisted)
-    }
-
     fn get_execution_certificates_batch(
         &self,
         tick_ids: &[TickId],
@@ -115,6 +105,7 @@ impl ShardChainReader for RocksDbShardStorage {
         tick_ids
             .iter()
             .filter_map(|wid| get::<ExecutionCertsCf>(&*self.db, certs_cf, wid))
+            .flatten()
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }
@@ -133,6 +124,8 @@ impl ShardChainReader for RocksDbShardStorage {
             .flatten()
             .filter(|tick_id| seen.insert(*tick_id))
             .filter_map(|tick_id| get::<ExecutionCertsCf>(&*self.db, certs_cf, &tick_id))
+            .flatten()
+            .filter(|copy| tx_hashes.iter().any(|tx| copy.covers(tx)))
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }

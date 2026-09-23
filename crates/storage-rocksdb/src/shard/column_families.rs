@@ -681,9 +681,12 @@ pub struct ExecutionCertsCf;
 impl TypedCf for ExecutionCertsCf {
     const NAME: &'static str = EXECUTION_CERTS_CF;
     type Key = TickId;
-    type Value = ExecutionCertificate;
+    /// Every copy of the tick no other copy carries: a shard's own tick
+    /// finalizes in two halves, each carrying the members it settles, and
+    /// the two copies are disjoint answers rather than one wide one.
+    type Value = Vec<ExecutionCertificate>;
     type KeyCodec = HborCodec<TickId>;
-    type ValueCodec = HborCodec<ExecutionCertificate>;
+    type ValueCodec = HborCodec<Vec<ExecutionCertificate>>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.execution_certs

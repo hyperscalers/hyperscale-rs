@@ -976,18 +976,21 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ShardChainReader + TestStore)) 
     let tick_id = *ec.tick_id();
 
     // Initially absent.
-    assert!(storage.get_execution_certificate(&tick_id).is_none());
+    assert!(
+        storage
+            .get_execution_certificates_batch(&[tick_id])
+            .is_empty()
+    );
 
     commit_empty_blocks_below(storage, BlockHeight::new(10));
     let block = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec)]);
     let certified = make_test_certified(block);
     commit_settled_at(storage, &certified, &[], &[], &empty_witness());
 
-    let direct = storage
-        .get_execution_certificate(&tick_id)
-        .expect("EC must be retrievable by tick_id");
-    assert_eq!(direct.tick_id(), &tick_id);
-    assert_eq!(direct.block_height(), BlockHeight::new(10));
+    let direct = storage.get_execution_certificates_batch(&[tick_id]);
+    assert_eq!(direct.len(), 1, "EC must be retrievable by tick_id");
+    assert_eq!(direct[0].tick_id(), &tick_id);
+    assert_eq!(direct[0].block_height(), BlockHeight::new(10));
 }
 
 /// Shared EC batch test: commit two ECs at one height plus one at another,
@@ -1739,18 +1742,21 @@ fn execution_certificate_over(
     )
 }
 
-/// Shared coverage test for the tick slot: a store keeps the widest copy
-/// of a tick it has seen, and answers a by-transaction lookup only for
-/// what that copy carries.
+/// Shared coverage test for a tick's copies: a store keeps every copy of
+/// a tick no other copy carries, and answers a by-transaction lookup with
+/// whichever copy carries the transaction.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + TestStore)) {
+pub fn test_every_copy_of_a_tick_answers_for_what_it_carries(
+    storage: &(impl ShardChainReader + TestStore),
+) {
     let txs: Vec<TxHash> = (1u8..=3)
         .map(|seed| TxHash::from(Hash::from_bytes(&[seed; 32])))
         .collect();
     let complete = execution_certificate_over(BlockHeight::new(1), &txs);
+    let tick_id = *complete.tick_id();
     let leg = |tx: TxHash| {
         complete
             .project_to(&HashSet::from([tx]))
@@ -1771,8 +1777,10 @@ pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + T
     assert_eq!(served.len(), 1, "the transaction its copy carries");
     assert!(served[0].covers(&txs[0]));
 
-    // A disjoint leg does not take the slot from it — the transaction
-    // only that leg covered is served from its own shard instead.
+    // A disjoint leg is a second answer, not a narrower one: the two
+    // halves of one tick each carry what the other does not, and nobody
+    // else holds a shard's own tick. Both stay, and each answers for its
+    // own transaction.
     let second = make_test_block_with_ecs(BlockHeight::new(2), vec![Arc::new(leg(txs[1]))]);
     commit_settled_at(
         storage,
@@ -1781,26 +1789,43 @@ pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + T
         &[],
         &empty_witness(),
     );
-    assert!(
-        storage.get_execution_certificates_for_txs(&[txs[0]])[0].covers(&txs[0]),
-        "the copy already held keeps the slot",
+    assert_eq!(
+        storage.get_execution_certificates_batch(&[tick_id]).len(),
+        2
     );
-    assert!(
-        storage
-            .get_execution_certificates_for_txs(&[txs[1]])
-            .is_empty(),
-        "and nothing points at a copy that lost",
-    );
+    for tx in &txs[..2] {
+        let served = storage.get_execution_certificates_for_txs(from_ref(tx));
+        assert_eq!(served.len(), 1, "one copy carries it");
+        assert!(served[0].covers(tx), "and that copy answers for it");
+    }
 
-    // The complete copy carries everything the slot held and more, so it
-    // takes it, and the index reaches every transaction of the tick.
-    let third = make_test_block_with_ecs(BlockHeight::new(3), vec![Arc::new(complete.clone())]);
+    // A copy something held already carries adds nothing.
+    let repeat = make_test_block_with_ecs(BlockHeight::new(3), vec![Arc::new(leg(txs[0]))]);
     commit_settled_at(
         storage,
-        &make_test_certified(third),
+        &make_test_certified(repeat),
         &[],
         &[],
         &empty_witness(),
+    );
+    assert_eq!(
+        storage.get_execution_certificates_batch(&[tick_id]).len(),
+        2
+    );
+
+    // The complete copy carries everything both held and more, so it
+    // replaces them, and the index reaches every transaction of the tick.
+    let fourth = make_test_block_with_ecs(BlockHeight::new(4), vec![Arc::new(complete.clone())]);
+    commit_settled_at(
+        storage,
+        &make_test_certified(fourth),
+        &[],
+        &[],
+        &empty_witness(),
+    );
+    assert_eq!(
+        storage.get_execution_certificates_batch(&[tick_id]).len(),
+        1
     );
     for tx in &txs {
         let served = storage.get_execution_certificates_for_txs(from_ref(tx));

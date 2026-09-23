@@ -15,8 +15,9 @@ use hyperscale_storage::test_helpers::{
     test_committed_bundle_outlives_sealing, test_committed_receipts_reach_state,
     test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
-    test_entries_commit_serve_and_history, test_historical_reads_resolve_per_version,
-    test_historical_reads_respect_retention, test_history_reads_through_create_delete_create,
+    test_entries_commit_serve_and_history, test_every_copy_of_a_tick_answers_for_what_it_carries,
+    test_historical_reads_resolve_per_version, test_historical_reads_respect_retention,
+    test_history_reads_through_create_delete_create,
     test_prepared_commit_for_a_committed_block_applies_nothing,
     test_prepared_commit_refuses_a_different_block_at_one_height,
     test_prepared_commit_writes_committed_cells, test_recovery_carries_the_tip_drain_total,
@@ -29,7 +30,6 @@ use hyperscale_storage::test_helpers::{
     test_the_tx_index_answers_with_every_certificate_of_this_shards,
     test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
-    test_widest_tick_copy_holds_the_slot,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads,
     test_witness_window_retention_and_recovery, with_provisions,
 };
@@ -900,10 +900,9 @@ fn test_ec_survives_reopen() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        let cert = storage
-            .get_execution_certificate(&tick_id)
-            .expect("EC must survive reopen");
-        assert_eq!(cert.block_height(), BlockHeight::new(1));
+        let certs = storage.get_execution_certificates_batch(&[tick_id]);
+        assert_eq!(certs.len(), 1, "EC must survive reopen");
+        assert_eq!(certs[0].block_height(), BlockHeight::new(1));
     }
 }
 
@@ -936,10 +935,9 @@ fn test_ec_atomic_with_block_commit() {
         &no_witness(),
     );
 
-    let cert = storage
-        .get_execution_certificate(&tick_id)
-        .expect("EC must be retrievable after commit");
-    assert_eq!(cert.block_height(), BlockHeight::new(1));
+    let certs = storage.get_execution_certificates_batch(&[tick_id]);
+    assert_eq!(certs.len(), 1, "EC must be retrievable after commit");
+    assert_eq!(certs[0].block_height(), BlockHeight::new(1));
 }
 
 // ─── State-history semantics (parity with storage-memory tests) ─────────────
@@ -1149,10 +1147,10 @@ fn a_retained_bundle_drops_below_the_history_floor() {
 }
 
 #[test]
-fn the_widest_copy_of_a_tick_holds_the_slot() {
+fn every_copy_of_a_tick_answers_for_what_it_carries() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_widest_tick_copy_holds_the_slot(&storage);
+    test_every_copy_of_a_tick_answers_for_what_it_carries(&storage);
 }
 
 #[test]

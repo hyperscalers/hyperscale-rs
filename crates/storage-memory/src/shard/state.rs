@@ -240,8 +240,9 @@ pub struct ConsensusState {
     pub(crate) execution_metadata: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub(crate) receipt_heights: HashMap<TxHash, BlockHeight>,
-    /// Execution certificates keyed by [`TickId`].
-    pub(crate) execution_certs: HashMap<TickId, ExecutionCertificate>,
+    /// Execution certificates keyed by [`TickId`]: every copy of the
+    /// tick no other copy carries.
+    pub(crate) execution_certs: HashMap<TickId, Vec<ExecutionCertificate>>,
     /// Index: attested transaction → every certificate of this shard's
     /// carrying an outcome for it. Mirrors the production
     /// `tx_cert_index` CF so simulation integration tests serve the

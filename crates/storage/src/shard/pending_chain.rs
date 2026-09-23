@@ -1535,12 +1535,6 @@ mod tests {
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
             None
         }
-        fn get_execution_certificate(
-            &self,
-            _tick_id: &TickId,
-        ) -> Option<Verified<ExecutionCertificate>> {
-            None
-        }
         fn get_execution_certificates_batch(
             &self,
             _tick_ids: &[TickId],
