@@ -360,6 +360,27 @@ impl Harness {
         })
     }
 
+    /// The committed value of `key` on `shard`, read off the furthest-along
+    /// live store any host holds for it, at that store's own JMT height.
+    /// The greatest height rather than the first host: a reseated or
+    /// merged host holds a frozen predecessor under the same id, and only
+    /// the live copy has committed past the cut. `None` when no host
+    /// serves `shard`, the height is unavailable, or the cell is absent.
+    pub fn substate(&self, shard: ShardId, key: SubstateKey) -> Option<Vec<u8>> {
+        let store = self
+            .hosts
+            .iter()
+            .filter_map(|h| {
+                h.stores
+                    .lock()
+                    .expect("store registry")
+                    .get(&shard)
+                    .and_then(Weak::upgrade)
+            })
+            .max_by_key(|store| store.jmt_height())?;
+        store.get_substate_at_height(key, store.jmt_height())?
+    }
+
     /// A live handle to host `host`'s `RocksDbShardStorage` for `shard`, or
     /// `None` if that host does not currently hold one there.
     fn host_store(&self, host: usize, shard: ShardId) -> Option<Arc<RocksDbShardStorage>> {

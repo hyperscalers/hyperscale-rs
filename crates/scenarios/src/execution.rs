@@ -32,7 +32,9 @@ use hyperscale_vm_types::{ARTIFACT_GRACE_MS, SEAL_MATURITY_EPOCHS};
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::FaultableCluster;
-use crate::support::query::{beacon_epoch, clock, declared_price, owning_shard, vault_balance};
+use crate::support::query::{
+    beacon_epoch, clock, committee_size, declared_price, owning_shard, vault_balance,
+};
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
     build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
@@ -1478,6 +1480,7 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     // alike, so dropping the response id would never match.
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
+    let reclaimed = c.metric("reclaims_admitted", None);
 
     let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity_around(c.now()));
     let price = declared_price(c, &tx);
@@ -1546,6 +1549,17 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
          before = {before}, after = {after}, price = {price}",
     );
     world.assert_settled(c, charges.burned(c), "a leg refused at its deadline");
+    // Every member of the payer's shard composes the tick that admits the
+    // reclaim, and the counter is read cluster-wide, so the refusal shows
+    // as one admission per member: none would be a refusal that never
+    // composed, and more a reclaim composed twice.
+    let members = committee_size(c, payer_shard).expect("the payer's shard is seated") as u64;
+    assert_eq!(
+        c.metric("reclaims_admitted", None),
+        reclaimed + members,
+        "the refusal at the deadline must be admitted exactly once on each of the payer \
+         shard's {members} members",
+    );
 }
 
 /// A leg whose core cannot be read inside the window its absence answers
@@ -1714,7 +1728,7 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
     let recipient_shard = ShardId::leaf(1, 1);
     let before = vault_balance(c, payer_shard, from);
     let recipient_before = vault_balance(c, recipient_shard, to);
-    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
+    let mut world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
     let broadcast_dropped = c.drop_type("provisions.broadcast");
@@ -1723,6 +1737,13 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
     let price = declared_price(c, &tx);
+    // The record the leg's crossing writes is value the world still holds
+    // while it stands, owed to the recipient.
+    world.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    ));
     let hash = charges.submit(c, tx);
 
     let verdict = await_tx_terminal(c, hash, epochs(8));
@@ -1776,7 +1797,7 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
         "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    let _ = world;
+    world.assert_settled(c, charges.burned(c), "a delivery cut off past its window");
 }
 
 /// A recipient whose network heals past the old delivery window is paid.

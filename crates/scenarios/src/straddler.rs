@@ -380,6 +380,9 @@ struct CutLeg {
     /// Past every instant the delivery window used to close at, which
     /// is where a cut-off crossing used to be taken back.
     past_window: WeightedTimestamp,
+    /// The record cells the leg's crossings write: value the world still
+    /// holds while they stand.
+    records: Vec<SubstateKey>,
     broadcast_dropped: FaultHandle,
     fetch_dropped: FaultHandle,
 }
@@ -419,11 +422,17 @@ fn issue_a_leg_under_a_cut_bundle<C: FaultableCluster>(
     let tx = build_transfer_tx(payer_key, payer, recipient, STRADDLER_PAYMENT, validity);
     let price = declared_price(c, &tx);
     let past_window = Deadline::of_transaction(&tx).at().plus(MAX_VALIDITY_RANGE);
+    let records = crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    );
     let hash = charges.submit(c, tx);
     CutLeg {
         hash,
         price,
         past_window,
+        records,
         broadcast_dropped,
         fetch_dropped,
     }
@@ -454,7 +463,7 @@ pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut
     let (payer_key, payer, recipient) = &setup.straddlers[0];
 
     split_lifecycle(c);
-    let world = World::open(
+    let mut world = World::open(
         c,
         *PROTOCOL_RESOURCE,
         [payer.address(), recipient.address()],
@@ -468,9 +477,11 @@ pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut
         hash,
         price,
         past_window,
+        records,
         broadcast_dropped,
         fetch_dropped,
     } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
+    world.owing(records);
     assert!(
         c.run_until(epochs(2), |c| c.chain_fate(survivor, hash).0.is_some()),
         "the survivor must commit the leg while the splitter is live",
@@ -552,7 +563,7 @@ pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut
         "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    let _ = world;
+    world.assert_settled(c, charges.burned(c), "a delivery owed across a split");
 }
 
 /// A record inherited across its issuer's split still owes its
@@ -585,7 +596,7 @@ pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableClus
     let (payer_key, payer, recipient) = &setup.straddlers[0];
 
     split_lifecycle(c);
-    let world = World::open(
+    let mut world = World::open(
         c,
         *PROTOCOL_RESOURCE,
         [payer.address(), recipient.address()],
@@ -599,9 +610,11 @@ pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableClus
         hash,
         price,
         past_window,
+        records,
         broadcast_dropped,
         fetch_dropped,
     } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
+    world.owing(records);
     assert!(
         c.run_until(epochs(2), |c| c.chain_fate(splitter, hash).0.is_some()),
         "the splitter must commit the leg while it still owns the payer's prefix",
@@ -686,7 +699,7 @@ pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableClus
         "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    let _ = world;
+    world.assert_settled(c, charges.burned(c), "a record owed by the successor");
 }
 
 /// Verify a surviving sibling's second-generation split seats correctly.

@@ -9,7 +9,7 @@
 //! transaction a receipt committed for burned its declared price, once,
 //! whatever the verdict was. [`Charges`] keeps that sum.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +62,23 @@ pub struct World {
     /// still balance.
     owed: Vec<SubstateKey>,
     before: u128,
+    /// Whether anything has read the world since it was opened. A world
+    /// nobody read asserted nothing, so one that drops unread fails its
+    /// scenario.
+    read: Cell<bool>,
+}
+
+/// Refused here rather than by `#[must_use]`, which a binding satisfies
+/// without a read. Silent while a panic is already unwinding, so the
+/// scenario's own failure is the one reported.
+impl Drop for World {
+    fn drop(&mut self) {
+        assert!(
+            self.read.get() || std::thread::panicking(),
+            "{:?}: a conservation world was opened and never read",
+            self.resource,
+        );
+    }
 }
 
 impl World {
@@ -85,6 +102,7 @@ impl World {
             cells: cells.into_iter().collect(),
             owed: Vec::new(),
             before: 0,
+            read: Cell::new(false),
         };
         world.before = world.held(c);
         assert!(
@@ -92,12 +110,14 @@ impl World {
             "the conservation check has to be reading something, or it holds \
              trivially at zero",
         );
+        world.read.set(false);
         world
     }
 
     /// What the world summed to when it was opened.
     #[must_use]
-    pub const fn before(&self) -> u128 {
+    pub fn before(&self) -> u128 {
+        self.read.set(true);
         self.before
     }
 
@@ -116,6 +136,7 @@ impl World {
     /// What the world sums to now.
     #[must_use]
     pub fn held<C: Cluster + ?Sized>(&self, c: &C) -> u128 {
+        self.read.set(true);
         let vaults = self
             .holders
             .iter()
@@ -134,10 +155,30 @@ impl World {
     /// own delivery window.
     #[must_use]
     pub fn stranded<C: Cluster + ?Sized>(&self, c: &C) -> Vec<(SubstateKey, u128)> {
+        self.read.set(true);
         self.owed
             .iter()
             .filter_map(|cell| {
                 let amount = unclaimable_at(c, *cell, self.resource);
+                (amount > 0).then_some((*cell, amount))
+            })
+            .collect()
+    }
+
+    /// Every record this world registered that still holds value:
+    /// standing, with no claim answering it, whatever its window says.
+    ///
+    /// [`stranded`](Self::stranded) without the window. A record inside
+    /// its window is in flight and one past it is stranded; both stand
+    /// here, which is what a scenario that expects a delivery to be
+    /// owed reads.
+    #[must_use]
+    pub fn standing<C: Cluster + ?Sized>(&self, c: &C) -> Vec<(SubstateKey, u128)> {
+        self.read.set(true);
+        self.owed
+            .iter()
+            .filter_map(|cell| {
+                let amount = owed_at(c, *cell, self.resource);
                 (amount > 0).then_some((*cell, amount))
             })
             .collect()
@@ -360,4 +401,122 @@ impl Charges {
 /// depth no chain ever existed at answers nothing, so asking is inert.
 fn covering_chains(payer: Address) -> impl Iterator<Item = ShardId> {
     (0..=MAX_SEARCHED_DEPTH).map(move |depth| ShardTrie::uniform(depth).shard_for_prefix(payer))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use hyperscale_types::{
+        BeaconState, BlockHeight, Derivation, StateRoot, TxsInFlight, WeightedTimestamp,
+    };
+
+    use super::*;
+    use crate::support::query::RanAs;
+
+    /// A cluster serving nothing: every observation answers absent, and
+    /// nothing a conservation read reaches drives it.
+    struct Nowhere;
+
+    impl Cluster for Nowhere {
+        fn submit(&mut self, _: Arc<Transaction>) {
+            unreachable!()
+        }
+
+        fn submit_to(&mut self, _: ShardId, _: Arc<Transaction>) {
+            unreachable!()
+        }
+
+        fn derivation(&self) -> Arc<dyn Derivation> {
+            unreachable!()
+        }
+
+        fn run_until(&mut self, _: Budget, _: impl Fn(&Self) -> bool) -> bool {
+            unreachable!()
+        }
+
+        fn now(&self) -> Duration {
+            unreachable!()
+        }
+
+        fn committed_height(&self, _: ShardId) -> Option<BlockHeight> {
+            None
+        }
+
+        fn committed_state_root(&self, _: ShardId) -> Option<StateRoot> {
+            None
+        }
+
+        fn serves_shard(&self, _: ShardId) -> bool {
+            false
+        }
+
+        fn beacon_state(&self) -> Option<Arc<BeaconState>> {
+            None
+        }
+
+        fn chain_origin_anchor(&self, _: ShardId) -> Option<WeightedTimestamp> {
+            None
+        }
+
+        fn committed_txs_in_flight(&self, _: ShardId) -> Option<TxsInFlight> {
+            None
+        }
+
+        fn tx_status(&self, _: TxHash) -> Option<TransactionStatus> {
+            None
+        }
+
+        fn ran(&self, _: ShardId, _: TxHash) -> Vec<RanAs> {
+            Vec::new()
+        }
+
+        fn named_unsettled(&self, _: ShardId, _: TxHash) -> Vec<(BlockHeight, ShardId)> {
+            Vec::new()
+        }
+
+        fn declined(&self, _: ShardId, _: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
+            Vec::new()
+        }
+
+        fn chain_fate(
+            &self,
+            _: ShardId,
+            _: TxHash,
+        ) -> (
+            Option<BlockHeight>,
+            Option<(BlockHeight, TransactionDecision)>,
+        ) {
+            (None, None)
+        }
+    }
+
+    /// A world as [`World::open`] leaves it: sampled, and not yet read.
+    fn unread_world() -> World {
+        World {
+            resource: *PROTOCOL_RESOURCE,
+            holders: Vec::new(),
+            cells: Vec::new(),
+            owed: Vec::new(),
+            before: 1,
+            read: Cell::new(false),
+        }
+    }
+
+    #[test]
+    fn a_world_opened_and_never_read_panics() {
+        let dropped = catch_unwind(AssertUnwindSafe(|| drop(unread_world())));
+        let message = dropped.expect_err("an unread world must refuse to drop");
+        let message = message
+            .downcast_ref::<String>()
+            .expect("the refusal is a formatted message");
+        assert!(
+            message.contains("a conservation world was opened and never read"),
+            "{message}",
+        );
+
+        let read = unread_world();
+        assert_eq!(read.held(&Nowhere), 0);
+        drop(read);
+    }
 }

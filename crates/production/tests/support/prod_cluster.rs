@@ -23,9 +23,9 @@ use hyperscale_scenarios::{
     vote_reshape_threshold,
 };
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHeight, Derivation, NetworkDefinition, PrincipalAddr,
-    ReshapeThresholds, ShardId, StateRoot, SubstateKey, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
+    Address, BeaconChainConfig, BeaconState, BlockHeight, Derivation, LocalKey, NetworkDefinition,
+    PrincipalAddr, ReshapeThresholds, ShardId, StateRoot, SubstateKey, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
@@ -303,6 +303,16 @@ impl Cluster for ProdCluster {
 
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {
         self.inner.committed_txs_in_flight(shard)
+    }
+
+    fn substate(&self, shard: ShardId, owner: Address, local: [u8; 16]) -> Option<Vec<u8>> {
+        self.inner.substate(
+            shard,
+            SubstateKey {
+                owner,
+                local: LocalKey(local),
+            },
+        )
     }
 
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {

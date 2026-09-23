@@ -374,7 +374,7 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
         isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
         isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
     ];
-    let (protocol_resource, _units) = route_worlds(c, &first, &second, &traders);
+    let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
 
     let mut charges = Charges::default();
     let validity = validity_around(c.now());
@@ -475,6 +475,8 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
         protocol_resource.settles(c, charges.burned(c)),
         "and the resource is conserved: the input paid once and came back once",
     );
+    // The core never combined, so no unit moved.
+    units.assert_settled(c, 0, "a route whose core never combines");
 }
 
 /// A crossing whose consumer has refused it, and whose producer has not
