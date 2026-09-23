@@ -490,10 +490,12 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
 /// crossing's only answer.
 ///
 /// Its pair is [`a_route_whose_core_never_combines_is_reclaimed_once`],
-/// where a venue *does* hold a member and refuses nothing however late.
-/// The two together are the decline's third conjunct read from both
-/// ends: the same cell, the same clock, and what tells them apart is
-/// whether an execution here could still write a claim.
+/// where a venue *does* hold a member and so waits out the close of
+/// [`Window::Core`] before refusing. The two together are the decline's
+/// held-member conjunct read from both ends: the same cell and the same
+/// question — could an execution here still write the claim — answered
+/// at the deadline where nothing holds one, and at that close where
+/// something does and can never run it.
 ///
 /// **What this pins is the write and the conservation across it, not
 /// which road the value comes home by.** A refusal and the producer's

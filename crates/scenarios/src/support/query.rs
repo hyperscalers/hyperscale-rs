@@ -176,9 +176,20 @@ pub(crate) fn owed_at<C: Cluster + ?Sized>(
 ///   is in flight for as long as the record stands and this arm never
 ///   reports it stranded;
 /// - an **escrowed** one is taken by a core or credited back to the cell
-///   it names, and past [`Window::LegEntry`] neither can be composed:
-///   the core is long past its deadline and no absence of the claim
-///   answers any more.
+///   it names, and past [`Window::LegEntry`] the leg entry that composes
+///   either is gone — which is the last road that needs nothing of the
+///   consumer.
+///
+/// **The escrowed arm is a net rather than a proof, and says so.** Every
+/// crossing verdict is a presence, and a presence answers at whatever
+/// anchor it was taken: the record stands in the producer's `held`,
+/// which no clock prunes, so a consumer's decline arriving later still
+/// settles it. What the window bounds is how long the producer can
+/// settle without the consumer speaking at all. So a record still
+/// standing past it is one whose consumer has not been heard from — cut
+/// off, or never handed the crossing — and reporting it is how a
+/// scenario notices; a scenario whose cut later lifts must drive to
+/// settlement rather than read this at an instant.
 pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
     c: &C,
     cell: SubstateKey,

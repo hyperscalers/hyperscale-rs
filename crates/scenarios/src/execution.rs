@@ -1558,21 +1558,19 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
 ///
 /// Value is staged only once the core *does* engage — the leg composes,
 /// runs, and its finalization writes the record the crossing sits in.
-/// From then the record is decided by one reading: the consumer's claim
-/// cell, read absent at an anchor of the core's chain inside the span
-/// from the close of [`Window::Core`] to the close of
-/// [`Window::LegEntry`]. Before that span the core may still claim; past
-/// it the cell is swept, so an absence is a swept cell rather than a
-/// claim that never happened.
+/// From then the record is decided by a reading of the core's chain, and
+/// every one of them is a **presence**: the core's claim cell, saying it
+/// took the crossing; its decline, saying it never will; or its
+/// committed cell read absent, which is the one negative cell there is
+/// and reaches the leg entry rather than the record.
 ///
-/// That reading is a probe, and a probe is taken at an anchor of the
-/// core's chain that the producer has commit-proven. A core that halts
-/// inside the span leaves none there — its chain freezes below the span
-/// and produces nothing inside it — so the absence is never readable, the
-/// presence never exists, and the record stands with the stake in it.
-/// Cutting both roads a header travels reaches the same state from the
-/// producer's side, and reaches it on a cluster that needs no committee
-/// to fail.
+/// Every one of them is a probe, and a probe is taken at an anchor of
+/// the core's chain that the producer has commit-proven. A core that
+/// halts leaves none to take — its chain freezes and produces nothing
+/// the producer can prove against — so no reading of any kind is
+/// readable, and the record stands with the stake in it. Cutting both
+/// roads a header travels reaches the same state from the producer's
+/// side, and reaches it on a cluster that needs no committee to fail.
 ///
 /// **The cut is never lifted, and that is what makes the proxy
 /// faithful.** A cut core goes on committing, so it has an in-window

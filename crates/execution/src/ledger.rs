@@ -138,11 +138,14 @@ impl Owed {
     /// What the evidence covering the entry established of the
     /// transaction, where it established a verdict at all: a departure
     /// or a core's committed cell absent says the core never took it,
-    /// which aborts the transaction. No other absence answers, so no
-    /// other reading reaches here.
+    /// which aborts the transaction.
+    ///
+    /// Every way of being covered is one of those two, so this is
+    /// [`Self::covered`] with the verdict said out loud rather than a
+    /// second reading of the same rows: an absence that answers nothing
+    /// never reaches `readings` at all.
     fn abandoned_verdict(&self) -> Option<TransactionDecision> {
-        (self.departed_by.is_some() || self.absences().any(|probed| matches!(probed, Probed::Core)))
-            .then_some(TransactionDecision::Aborted)
+        self.covered().then_some(TransactionDecision::Aborted)
     }
 
     /// The moment the entry stops being settleable and becomes the
@@ -810,8 +813,18 @@ impl Ledger {
 
     /// Record what the chain read of `key` on `shard` for `tx_hash`,
     /// the question `probed` asks. First reading wins: `false` says the
-    /// cell was already read, or the transaction is not held here, and
-    /// a later claim adds nothing.
+    /// cell was already read, the transaction is not held here, or the
+    /// reading answers nothing — and a later claim adds nothing.
+    ///
+    /// A reading [`Probed::read`] does not admit is refused here rather
+    /// than only at the fold that fetches one, because what it would
+    /// leave behind is not a spare row: [`Self::covered`] counts any
+    /// absence, so an absence that answers nothing would license a
+    /// reclaim. Capped at the store, the set of absences an entry can
+    /// hold is exactly the one `Probed::read` admits — the committed
+    /// cell's — which is what lets
+    /// [`Self::abandoned_verdict`] read it off `covered` rather than
+    /// filtering for it a second time.
     pub(crate) fn record_reading(
         &mut self,
         tx_hash: TxHash,
@@ -820,6 +833,9 @@ impl Ledger {
         probed: Probed,
         inclusion: Inclusion,
     ) -> bool {
+        if probed.read(inclusion).is_none() {
+            return false;
+        }
         let Some(owed) = self.owed.get_mut(&tx_hash) else {
             return false;
         };
@@ -1477,16 +1493,19 @@ impl Ledger {
     /// can be composed for the transaction at all.
     ///
     /// A leg entry has a clock of its own, and it is the transaction's:
-    /// `deadline + 2 * MAX_VALIDITY_RANGE`, which is the validity end plus
-    /// the escrow grace — the moment the claim cell both its members are
-    /// proved against sweeps, one validity range past the lapse a
-    /// delivery's absence is proved at, so a lapse proved at the earliest
-    /// has a validity range to become a committed reclaim. Past it there is nothing to take
-    /// back, whatever evidence arrives, so the entry goes on that reading
-    /// alone. Dropping gives a reclaim up; it never licenses one. A
-    /// record's evidence does not extend it, and no counterpart's silence
-    /// shortens it: a reclaim waits on a record, and the record's arms
-    /// are the evidence, not the counterpart's answerability.
+    /// the close of [`Window::LegEntry`]. Not a sweep — no crossing cell
+    /// sweeps — but the end of the room this entry has to turn evidence
+    /// into a committed reclaim, floored at the span a core's committed
+    /// cell has to be provable absent in so a reading taken at the
+    /// latest still has room to become one.
+    ///
+    /// Past it the **entry** composes nothing, whatever evidence
+    /// arrives, and it goes on that reading alone. What it does not end
+    /// is the crossing: the record stands in `held`, which no clock
+    /// prunes, and a consumer's answer reaching the producer later
+    /// settles it from the leaf. Dropping gives this road up; it never
+    /// licenses a reclaim. A record's evidence does not extend it, and
+    /// no counterpart's silence shortens it.
     ///
     /// Returns the transactions dropped because every counterpart has
     /// fallen silent. Each carries whether a committed record had covered
@@ -1509,10 +1528,10 @@ impl Ledger {
             if owed.part.is_delivery() {
                 return owed.figures.committed.anchor.plus(BUNDLE_WAIT) > now;
             }
-            // A leg entry goes at its horizon, where the claim
-            // cell both its members are proved against is swept:
-            // past it neither the reclaim nor the retirement can
-            // be composed, whatever evidence lands. Short of it
+            // A leg entry goes at its horizon: past it neither the
+            // reclaim nor the retirement can be composed *here*,
+            // whatever evidence lands, because this is the road that
+            // reads an entry. The leaf's road stays open. Short of it
             // only the finalization that decides it ends it.
             if owed.part.is_leg() || owed.absences().next().is_some() {
                 return Window::LegEntry.of(owed.figures.deadline).end > now;
@@ -2513,9 +2532,18 @@ mod tests {
     }
 
     /// A leg whose counterpart is a delivery is probeable past the
-    /// deadline like any other, and carries the claim cells the probe
-    /// asks about; a record over the lapse covers it and licenses the
-    /// reclaim.
+    /// deadline like any other and carries the claim cells the probe
+    /// asks about; what covers it is the core's committed cell read
+    /// absent, and a claim read absent covers nothing.
+    ///
+    /// The two readings are not interchangeable and only one of them is
+    /// evidence: a committed cell is written at inclusion and retracted
+    /// by a refusal, so its absence says the core never took the
+    /// transaction; a claim is written by the execution that takes the
+    /// crossing, so its absence says only that nobody has taken it yet.
+    /// [`Probed::read`] admits the first and refuses the second, and
+    /// [`Ledger::record_reading`] is held to the same rule so an entry
+    /// cannot hold an absence that answers nothing.
     #[test]
     fn a_leg_delivered_elsewhere_is_probeable_with_its_claims() {
         let mut ledger = Ledger::new(LOCAL);
@@ -2540,29 +2568,57 @@ mod tests {
                 question(DELIVERER, claim, Probed::Claim),
             ],
         );
-        ledger.record_reading(
-            leg.hash(),
-            DELIVERER,
-            claim,
-            Probed::Claim,
-            Inclusion::Absent,
+        assert!(
+            !ledger.record_reading(
+                leg.hash(),
+                DELIVERER,
+                claim,
+                Probed::Claim,
+                Inclusion::Absent,
+            ),
+            "a claim read absent answers nothing, so the entry does not hold it",
+        );
+        assert_eq!(
+            ledger.questions(&delivery_trie()).len(),
+            2,
+            "and the questions both stand, because neither was answered",
+        );
+        assert!(
+            ledger.reclaimable().is_empty(),
+            "nothing licenses the reclaim on a silence",
+        );
+
+        assert!(
+            ledger.record_reading(
+                leg.hash(),
+                BEARER,
+                core_cell(BEARER, &leg),
+                Probed::Core,
+                Inclusion::Absent,
+            ),
+            "the core's committed cell absent is the reading that answers",
         );
         assert!(
             ledger.questions(&delivery_trie()).is_empty(),
             "covered once"
         );
-        assert_eq!(
-            ledger.reclaimable().len(),
-            1,
-            "and the lapse licenses the reclaim"
-        );
+        assert_eq!(ledger.reclaimable().len(), 1, "and it licenses the reclaim");
     }
 
     /// An issuer in the core is released by its own verdict like any
     /// entry — unless it accepted with deliveries owed, when it stays on
     /// as a remainder: never abandoned, named by no departure, probed
-    /// past the deadline for its claims, reclaimed on a claim read
-    /// absent past the lapse, and released by the reclaim's finalization.
+    /// past the deadline for its claims, and released by the reclaim's
+    /// finalization.
+    ///
+    /// **A remainder asks one question and a silence never answers it.**
+    /// Its only question is its delivery's claim, whose absence says
+    /// nothing at any anchor — so nothing a clock reaches covers it, and
+    /// the one thing that does is a departure naming the transaction:
+    /// the chain that was to deliver is gone, so no claim is coming from
+    /// anywhere. The crossing behind it is owed, and an owed crossing is
+    /// never credited back — the reclaim this licenses releases the
+    /// entry and leaves the record standing.
     #[test]
     fn an_issuer_that_accepted_stays_on_as_a_remainder_for_its_deliveries() {
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
@@ -2599,9 +2655,34 @@ mod tests {
             }],
             "a remainder asks about its deliveries, and never about itself"
         );
-        ledger.record_reading(tx.hash(), PARTNER, claim, Probed::Claim, Inclusion::Absent);
+        assert!(
+            !ledger.record_reading(
+                tx.hash(),
+                delivered_by,
+                claim,
+                Probed::Claim,
+                Inclusion::Absent
+            ),
+            "the delivery's silence answers nothing, so the entry does not hold it",
+        );
+        assert!(
+            ledger.reclaimable().is_empty(),
+            "and a remainder is never reclaimed on a delivery that has not spoken",
+        );
+
+        let cut = ms(500_000);
+        ledger.record_terminal(delivered_by, cut, Some(expiry(cut)));
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
+            delivered_by,
+            cut,
+            [names(&tx)],
+        )]);
         let reclaims = ledger.reclaimable();
-        assert_eq!(reclaims.len(), 1);
+        assert_eq!(
+            reclaims.len(),
+            1,
+            "the departure of the chain that was to deliver is what covers it",
+        );
         assert!(
             reclaims[0].charged,
             "the issuer ran, so its reclaim is charged nothing"
