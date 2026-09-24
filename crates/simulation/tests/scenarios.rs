@@ -41,6 +41,7 @@ use hyperscale_scenarios::{
     a_priority_is_charged_over_the_table_price,
     a_published_package_runs_where_it_was_never_committed,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
+    a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
@@ -1666,6 +1667,18 @@ fn a_venue_sealed_on_a_fresh_split_child_runs_sim() {
 fn a_route_committed_before_its_departure_was_voted_still_resolves_sim() {
     let mut cluster = late_departing_route_cluster();
     cluster.run_faultable(a_route_committed_before_its_departure_was_voted_still_resolves);
+}
+
+/// The pre-boundary hold in the settled-set fence cannot reach an accept
+/// that landed before the hold armed: the survivor settles the route on
+/// the departing venue's certificate, the departing venue never receives
+/// the survivor's and reaches its terminal with the route unsettled, and
+/// its side applies nowhere.
+#[test]
+#[ignore = "a route accepted before its sibling's split is projected tears"]
+fn a_route_accepted_before_its_venues_split_is_projected_is_not_torn_sim() {
+    let mut cluster = late_departing_route_cluster();
+    cluster.run_faultable(a_route_accepted_before_its_venues_split_is_projected_is_not_torn);
 }
 
 /// The route topology grown to four shards on dedicated pool hosts, with

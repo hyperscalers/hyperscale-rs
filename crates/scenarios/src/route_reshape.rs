@@ -1431,6 +1431,137 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
     );
 }
 
+/// A route the surviving venue accepted before its counterpart's split
+/// was projected is not torn: if the survivor settled it, the departing
+/// venue's side applied too, on it or on its successor.
+///
+/// [`a_route_committed_before_its_departure_was_voted_still_resolves`]
+/// with the certificate channel cut one way. The survivor still receives
+/// the departing venue's certificate and finalizes the route at an
+/// anchor where the departure is not yet scheduled, so the fence holds
+/// nothing; the departing venue never receives the survivor's, and
+/// reaches its terminal with the route unsettled. What the pre-boundary
+/// hold in the settled-set fence cannot see is an accept that landed
+/// before the hold armed.
+///
+/// Two things make the result trustworthy: the cut fired, and the
+/// survivor's finalization landed before the departure was admitted —
+/// without both the scenario proves nothing. The oracle is the
+/// departing venue's reserve, which moves exactly when its side applied,
+/// and the conservation of the trader and both reserves.
+///
+/// # Panics
+///
+/// Panics as the scenario it follows does, if the positive control does
+/// not hold, and if the route is torn: the survivor accepted and the
+/// departing venue's side applied nowhere, or the world does not
+/// balance.
+pub fn a_route_accepted_before_its_venues_split_is_projected_is_not_torn<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
+    let mut taken = Vec::new();
+    let leaving = stand_up_venue(c, departing, &mut taken);
+    let (grown_left, grown_right) = LATE_MERGED_PARENT.children();
+    assert!(
+        await_serves(c, grown_left, epochs(28)) && await_serves(c, grown_right, epochs(28)),
+        "the grow's own split must have run before the route commits",
+    );
+    let staying = stand_up_venue(c, survivor, &mut taken);
+    let (key, trader) = grind_onto(LATE_TRADER_SHARD, &mut taken);
+    let leaving_reserve = reserve_cell(&leaving.meta, *PROTOCOL_RESOURCE);
+    let reserves = [
+        leaving_reserve,
+        reserve_cell(&staying.meta, *PROTOCOL_RESOURCE),
+    ];
+    let mut protocol_resource = World::open(c, *PROTOCOL_RESOURCE, [trader.address()], reserves);
+    let leaving_held = held_at(c, leaving_reserve);
+
+    let activates_at = cast_late_threshold_vote(c, LATE_SPLIT_BYTES, LATE_VOTE_LEAD_EPOCHS);
+
+    // One way only: the departing venue never holds the survivor's
+    // certificate, while the survivor holds the departing venue's and
+    // settles the route on it.
+    let cut = isolate_ec_intake(c, departing, survivor);
+    let mut charges = Charges::default();
+    let tx = build_route_tx(
+        &key,
+        trader,
+        (&leaving.meta, &staying.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    protocol_resource.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario route derives")
+            .legs,
+    ));
+    let hash = charges.submit(c, tx);
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
+            && c.chain_fate(departing, hash).0.is_some()),
+        "both shards must commit the route while both are live",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).1.is_some()),
+        "the survivor must finalize the route on the departing venue's certificate",
+    );
+    // The positive control: the finalization landed before the departure
+    // was admitted, where the fence's pre-boundary hold could not have
+    // deferred it, and the cut is what kept the departing venue from the
+    // survivor's certificate.
+    assert!(
+        merge_keeper_count(c, LATE_MERGED_PARENT).is_none(),
+        "the survivor's finalization must land before the departure is admitted; the vote \
+         activates at {activates_at:?}",
+    );
+    assert!(
+        cut.fired() > 0,
+        "the cut must have dropped something, or the departing venue was never kept from the \
+         survivor's certificate",
+    );
+    let survivor_fate = c.chain_fate(survivor, hash).1.map(|(_, decision)| decision);
+
+    assert!(
+        c.run_until(epochs(28), |c| c.beacon_state().is_some_and(|s| s
+            .params
+            .reshape_thresholds
+            .split_bytes
+            == LATE_SPLIT_BYTES)),
+        "the late vote must activate at {activates_at:?}",
+    );
+    assert!(
+        await_merge_keeper_count(c, LATE_MERGED_PARENT, 3, epochs(28)),
+        "the activated threshold must pair the departing venue's shard with its sibling",
+    );
+    assert!(
+        await_serves(c, LATE_MERGED_PARENT, epochs(28)),
+        "the merged parent must be served within budget",
+    );
+    c.clear_drops();
+
+    // The oracle: an accept on the survivor is an accept on both sides,
+    // or the route is torn. The departing venue's reserve moves exactly
+    // when its leg applied — on the venue itself, or carried into the
+    // successor that inherited its keyspace.
+    if survivor_fate == Some(TransactionDecision::Accept) {
+        assert!(
+            c.run_until(epochs(12), |c| held_at(c, leaving_reserve) != leaving_held),
+            "the survivor accepted the route and the departing venue's side applied nowhere: \
+             the route is torn; the departing venue reached {:?}",
+            c.chain_fate(departing, hash).1,
+        );
+    }
+    protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(12),
+        "a route accepted before its venue's split was projected",
+    );
+}
+
 /// A route through a departing venue releases the surviving venue's
 /// hold at the terminal and gives the trader its input back.
 ///
