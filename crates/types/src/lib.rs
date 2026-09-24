@@ -184,6 +184,9 @@ pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad};
 pub use shard::manifest::{BlockManifest, BlockMetadata};
 pub use shard::proven_anchors::ProvenAnchors;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
+pub use shard::read_frontier::{
+    FrontierInputs, FrontierRefusal, ReadFence, ReadFrontier, ReadMark, Reading, Refused,
+};
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CommittedTxAbsence, LeafRoot,
@@ -224,11 +227,10 @@ pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_INTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
-    BUNDLE_WAIT, CLAIM_VISIBILITY_LAG, CROSSING_BUNDLE_WINDOW, DEDUP_WINDOW, EPOCH_DURATION,
-    FEE_HOLD_WINDOW, HALT_HARVEST_WAIT, MAX_FINALIZATION_DELAY, PROGRESS_WAIT_MULTIPLIER,
-    RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT,
-    VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX,
-    VIEW_CHANGE_TIMEOUT_MIN,
+    BUNDLE_WAIT, CLAIM_VISIBILITY_LAG, DEDUP_WINDOW, EPOCH_DURATION, FEE_HOLD_WINDOW,
+    HALT_HARVEST_WAIT, MAX_FINALIZATION_DELAY, PROGRESS_WAIT_MULTIPLIER, RATIFY_ROUND_TIMEOUT,
+    REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_DELAY_MULTIPLIER,
+    VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, VIEW_CHANGE_TIMEOUT_MIN,
 };
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::genesis::GenesisValidators;

@@ -784,23 +784,6 @@ pub enum Runs {
         /// licence was established against.
         answers: Vec<Deletion>,
     },
-    /// No node either: the retired records this shard holds whose grace
-    /// its own clock has passed, taken away.
-    ///
-    /// [`Self::Clean`]'s counterpart on the producing side. A disposed
-    /// record stands on as a tombstone so its consumer can date the
-    /// going of it by reading the key absent; this is what finally
-    /// takes it away. The whole licence is the cell's own expiry
-    /// against the block's clock, and the kernel checks it — so a
-    /// member naming a tombstone early traps rather than shortening a
-    /// consumer's defence.
-    Sweep {
-        /// The member the sweep runs as: whole, on its own shard,
-        /// reaching nobody else.
-        member: Member,
-        /// The tombstone cells to remove.
-        tombstones: Vec<SubstateKey>,
-    },
 }
 
 impl Runs {
@@ -808,10 +791,9 @@ impl Runs {
     #[must_use]
     pub const fn member(&self) -> &Member {
         match self {
-            Self::Shape(member)
-            | Self::Settle { member, .. }
-            | Self::Clean { member, .. }
-            | Self::Sweep { member, .. } => member,
+            Self::Shape(member) | Self::Settle { member, .. } | Self::Clean { member, .. } => {
+                member
+            }
         }
     }
 
@@ -822,7 +804,7 @@ impl Runs {
     pub fn reaches_beyond(&self) -> bool {
         match self {
             Self::Shape(member) => member.reaches_beyond(),
-            Self::Settle { .. } | Self::Clean { .. } | Self::Sweep { .. } => false,
+            Self::Settle { .. } | Self::Clean { .. } => false,
         }
     }
 
@@ -832,7 +814,7 @@ impl Runs {
     pub fn abortable(&self) -> bool {
         match self {
             Self::Shape(member) => member.abortable(),
-            Self::Settle { .. } | Self::Clean { .. } | Self::Sweep { .. } => false,
+            Self::Settle { .. } | Self::Clean { .. } => false,
         }
     }
 
@@ -857,8 +839,7 @@ impl Runs {
                 on: Licence::Claimed,
                 ..
             }
-            | Self::Clean { .. }
-            | Self::Sweep { .. } => true,
+            | Self::Clean { .. } => true,
         }
     }
 }
@@ -934,9 +915,9 @@ pub enum PlanDefect {
 ///
 /// Among the held readings of the key the block carries, the one at
 /// the newest anchor by weighted time, decoded as a crossing leaf.
-/// `Some` only for a record, never for a tombstone, and a bare presence
-/// of the key licenses nothing — a reading that carries no value says
-/// nothing a delivery can be composed from.
+/// `Some` only for a record, and a bare presence of the key licenses
+/// nothing — a reading that carries no value says nothing a delivery
+/// can be composed from.
 ///
 /// One statement of it, because the licence to engage a delivery, the
 /// licence to carry one past its validity end and the arrival a
@@ -955,7 +936,7 @@ pub fn live_record(
         .and_then(
             |(_, bytes)| match CrossingLeaf::read(&ProtocolHasher, key, bytes)? {
                 CrossingLeaf::Record { crossing, cell } => Some((crossing, cell)),
-                CrossingLeaf::Tombstone { .. } | CrossingLeaf::Answer { .. } => None,
+                CrossingLeaf::Answer { .. } => None,
             },
         )
 }

@@ -25,13 +25,13 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, BlockHeight, CROSSING_BUNDLE_WINDOW, DeclaredWork,
-    Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
+    AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Finalization,
+    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, ShardId, StateClaim, SubstateKey,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
-    budget_admits_block, caps_admit_transaction, evidence_admits_block, state_claims_admit_block,
-    sweep_admits_block,
+    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, StateClaim,
+    SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable,
+    WeightedTimestamp, budget_admits_block, caps_admit_transaction, evidence_admits_block,
+    state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::CROSSING_CELL_BYTES;
 
@@ -761,10 +761,11 @@ impl Section for StateClaimsSection {
     type Fold = StateClaimsFold;
 
     /// A well-formed claim whose proof bears out every reading, at an
-    /// anchor no recovery fences, in its place in the section's order,
-    /// within the section's budget — and, where it carries a value, at
-    /// an anchor inside the reading window of the block's own clock and
-    /// on the shard that owned the cell at the anchor's clock.
+    /// anchor no recovery fences and no older than one retention
+    /// horizon before the block's own clock, in its place in the
+    /// section's order, within the section's budget — and, where it
+    /// carries a value, on the shard that owned the cell at the
+    /// anchor's clock.
     ///
     /// The proof is walked here, so a bad one refuses the block on
     /// every replica alike: every rule is a pure function of the block
@@ -774,12 +775,16 @@ impl Section for StateClaimsSection {
     /// encoding, and the budget is spent by the byte, proof and values
     /// included, so the decode cap on the count never binds first.
     ///
-    /// The reading window binds readings that carry value: a replayed
-    /// delivery needs one to dispatch at all, so past the window no
-    /// replay can be fed, which is what bounds an answer cell's life.
-    /// The owner is read off the global schedule at the anchor's own
-    /// clock, never the head, so a split parent's coast anchor owns
-    /// nothing; the fold reads the committed fact and never re-resolves.
+    /// The age bound is the one any voter can still prove: a proof
+    /// stands for a horizon, so a claim older than that is one no
+    /// voter could check. Stated at the block's own clock, it is the
+    /// exact complement of the read frontier's prune, which drops an
+    /// entry once every presence it could refuse is one this bound
+    /// refuses. Which presences the frontier itself refuses is judged
+    /// where the parent state is read. The owner is read off the global
+    /// schedule at the anchor's own clock, never the head, so a split
+    /// parent's coast anchor owns nothing; the fold reads the committed
+    /// fact and never re-resolves.
     fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, claim: &StateClaim) -> Result<(), String> {
         let at = || {
             format!(
@@ -803,13 +808,13 @@ impl Section for StateClaimsSection {
                 at()
             ));
         }
+        if ctx.anchor.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
+            return Err(format!(
+                "{} is anchored more than a retention horizon before the block",
+                at()
+            ));
+        }
         if claim.holds_a_value() {
-            if ctx.anchor.elapsed_since(claim.anchor.ts) > CROSSING_BUNDLE_WINDOW {
-                return Err(format!(
-                    "{} carries a value read outside the reading window",
-                    at()
-                ));
-            }
             let Some(window) = ctx.schedule.at(claim.anchor.ts) else {
                 return Err(format!(
                     "{} carries a value at an anchor no schedule window covers",
@@ -1030,7 +1035,7 @@ mod state_claim_tests {
     use hyperscale_hbor::Bytes;
     use hyperscale_types::test_utils::{proven_claim, state_and_proof, test_key};
     use hyperscale_types::{
-        Anchor, BlockHeight, CROSSING_BUNDLE_WINDOW, ShardId, StateClaim, Stated, SubstateKey,
+        Anchor, BlockHeight, RETENTION_HORIZON, ShardId, StateClaim, Stated, SubstateKey,
         WeightedTimestamp,
     };
 
@@ -1079,16 +1084,20 @@ mod state_claim_tests {
         StateClaimsSection::admit(&against.ctx(), &mut fold, claim)
     }
 
+    /// A claim is admitted at exactly one retention horizon before the
+    /// block and refused a millisecond past it, whether or not it
+    /// carries a value: the bound is the proof's life, not the
+    /// reading's.
     #[test]
-    fn a_held_reading_is_admitted_inside_the_reading_window_and_refused_past_it() {
+    fn a_claim_older_than_the_horizon_is_refused() {
         let read_at = WeightedTimestamp::from_millis(500);
         let claim = held(PRODUCER, read_at, producer_key());
-        let at_the_window = read_at.plus(CROSSING_BUNDLE_WINDOW);
-        assert_eq!(admit(&against(at_the_window), &claim), Ok(()));
-        let past = at_the_window.plus(Duration::from_millis(1));
+        let at_the_horizon = read_at.plus(RETENTION_HORIZON);
+        assert_eq!(admit(&against(at_the_horizon), &claim), Ok(()));
+        let past = at_the_horizon.plus(Duration::from_millis(1));
         assert!(
             admit(&against(past), &claim)
-                .is_err_and(|err| err.contains("outside the reading window")),
+                .is_err_and(|err| err.contains("more than a retention horizon")),
         );
         let bare = proven_claim(PRODUCER, 9, &[producer_key()], &[producer_key()]);
         let bare = StateClaim::new(
@@ -1099,10 +1108,11 @@ mod state_claim_tests {
             bare.cells.iter().cloned(),
             bare.proof.clone(),
         );
-        assert_eq!(
-            admit(&against(past), &bare),
-            Ok(()),
-            "the window binds readings that carry value",
+        assert_eq!(admit(&against(at_the_horizon), &bare), Ok(()));
+        assert!(
+            admit(&against(past), &bare)
+                .is_err_and(|err| err.contains("more than a retention horizon")),
+            "the bound binds a bare reading too",
         );
     }
 

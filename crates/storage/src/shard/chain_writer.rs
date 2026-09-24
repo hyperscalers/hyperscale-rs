@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, Finalization, PreparedCommit, StateRoot, SubstateKey, Verifiable,
+    BlockHeight, Finalization, FrontierInputs, PreparedCommit, StateRoot, SubstateKey, Verifiable,
 };
 
 use crate::{Anchored, BaseReadCache, JmtSnapshot};
@@ -83,8 +83,9 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     ///
     /// `creations` is what the chain itself writes for the block — the
     /// committed-transaction cells, one per transaction it carries — and
-    /// `removals` is what its sweep retires; both fold with the
-    /// receipts' writes under the root this returns.
+    /// `removals` is what its sweep retires; `frontier` is what its
+    /// claims do to the read frontier. All three fold with the receipts'
+    /// writes under the root this returns.
     ///
     /// `block_height` is the height of the block being prepared (used as
     /// the JMT new version).
@@ -96,6 +97,7 @@ pub trait ShardChainWriter: Send + Sync + 'static {
         finalizations: &[Arc<Verifiable<Finalization>>],
         creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
+        frontier: &FrontierInputs,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit);
 }

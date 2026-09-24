@@ -90,6 +90,7 @@ mod lookups;
 mod pending;
 mod precut;
 mod proposal;
+mod read_fence;
 mod timeout_keeper;
 mod validation;
 mod verification;

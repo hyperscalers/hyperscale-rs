@@ -166,6 +166,11 @@ pub struct Metrics {
     pub state_claims_weight: Histogram,
     /// Consumers' asks for crossing records: the fallback reads.
     pub record_asks: Counter,
+    /// Fenced claims committed blocks carried, by what they read.
+    pub fenced_claims_carried: CounterVec,
+    /// Fenced claims the read frontier refused from what a validator
+    /// held to offer, by what they read.
+    pub fenced_claims_refused: CounterVec,
     /// Pushed crossing readings the consumer dropped, by reason.
     pub crossing_pushes_dropped: CounterVec,
     /// Fetch responses a requester's own check refused, by fetch kind and
@@ -788,6 +793,20 @@ impl Metrics {
             )
             .unwrap(),
 
+            fenced_claims_carried: register_counter_vec!(
+                "hyperscale_fenced_claims_carried_total",
+                "Fenced claims committed blocks carried, by what they read",
+                &["reading"]
+            )
+            .unwrap(),
+
+            fenced_claims_refused: register_counter_vec!(
+                "hyperscale_fenced_claims_refused_total",
+                "Fenced claims the read frontier refused from what a validator held to offer",
+                &["reading"]
+            )
+            .unwrap(),
+
             crossing_pushes_dropped: register_counter_vec!(
                 "hyperscale_crossing_pushes_dropped_total",
                 "Pushed crossing readings the consumer dropped, by reason",
@@ -1140,6 +1159,15 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_record_ask(&self) {
         self.metrics.record_asks.inc();
+    }
+
+    fn record_fenced_claim(&self, reading: &str, carried: bool) {
+        let counter = if carried {
+            &self.metrics.fenced_claims_carried
+        } else {
+            &self.metrics.fenced_claims_refused
+        };
+        counter.with_label_values(&[reading]).inc();
     }
 
     fn record_crossing_push_dropped(&self, reason: &str) {

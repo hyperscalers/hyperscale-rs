@@ -1116,6 +1116,8 @@ impl ShardCoordinatorSim {
                 settled_txs_window_floor: ready.settled_txs_window_floor,
                 parent_sweep_frontier: ready.parent_sweep_frontier,
                 claimed_sweep_frontier: ready.claimed_sweep_frontier,
+                frontier: ready.frontier,
+                fence: ready.fence,
             });
         }
         if self.coordinators[to_idx].take_ready_proposal() {
@@ -1450,6 +1452,9 @@ impl ShardCoordinatorSim {
                 carry_terminal_roots,
                 settled_txs_window_floor,
                 classification_topology_snapshot: classification_topology,
+                frontier,
+                fence: _,
+                record_licences: _,
             } => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
                 // whose QC round sits below the honest lock, so honest
@@ -1582,6 +1587,7 @@ impl ShardCoordinatorSim {
                     committee_anchor_epoch,
                     carry_split_child_roots,
                     terminal_roots,
+                    &frontier,
                 );
                 let block_hash = result.block_hash;
                 let bytes_delta = result.jmt_snapshot.bytes_delta;
@@ -1833,6 +1839,8 @@ impl ShardCoordinatorSim {
                 settled_txs_window_floor,
                 parent_sweep_frontier,
                 claimed_sweep_frontier,
+                frontier,
+                fence: _,
             } => {
                 // Mirrors the production handler: receipt-root
                 // pre-flight first, then JMT prep on success.
@@ -1894,6 +1902,7 @@ impl ShardCoordinatorSim {
                     &finalizations,
                     &creations,
                     &removals,
+                    &frontier,
                     block_height,
                 );
                 let verify_result = expected_root.verify(&StateRootContext {
@@ -1977,6 +1986,7 @@ impl ShardCoordinatorSim {
                 parent_block_height: _,
                 parent_sweep_frontier: _,
                 creations: _,
+                frontier: _,
                 source: _,
                 witness,
             } => {

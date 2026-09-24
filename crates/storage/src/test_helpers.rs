@@ -22,15 +22,16 @@ use hyperscale_types::{
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
     CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, Event,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel, MerkleInclusionProof, PcQc2,
-    PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher,
-    ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness,
-    RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor,
-    ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
-    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
-    UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
+    MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable,
+    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
+    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, Round,
+    SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload,
+    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
+    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
+    TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
+    Verified, VotePosition, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
+    compute_merkle_root, entry_leaf_key,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -636,6 +637,7 @@ pub fn commit_settled_at<S: TestStore>(
         &block.certificates()[..],
         creations,
         removals,
+        &FrontierInputs::still(ShardId::ROOT),
         block.height(),
     );
     commit(SyncHint::FlushNow, certified, witness)
@@ -1398,6 +1400,7 @@ where
         &block_one.certificates()[..],
         &[],
         &[],
+        &FrontierInputs::still(ShardId::ROOT),
         one,
     );
 
@@ -1418,6 +1421,7 @@ where
         &block_two.certificates()[..],
         &[],
         &[],
+        &FrontierInputs::still(ShardId::ROOT),
         two,
     );
 
@@ -2161,6 +2165,7 @@ where
         &[],
         &creations,
         &[],
+        &FrontierInputs::still(ShardId::ROOT),
         BlockHeight::new(1),
     );
     let certified = make_test_certified(block);
@@ -2204,6 +2209,7 @@ where
             &[],
             &[],
             &[],
+            &FrontierInputs::still(ShardId::ROOT),
             BlockHeight::new(1),
         );
         commit(
@@ -2257,6 +2263,7 @@ where
         &[],
         &creations,
         &[],
+        &FrontierInputs::still(ShardId::ROOT),
         BlockHeight::new(1),
     );
 

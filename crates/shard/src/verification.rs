@@ -15,11 +15,11 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
-    ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
-    ReshapeThresholds, RevealChain, ShardId, SplitChildRoots, StateRoot, SubstateKey,
-    SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TxHash, TxsInFlight,
-    UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
-    WeightedTimestamp,
+    ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
+    QuorumCertificate, ReadFence, ReshapeThresholds, RevealChain, ShardId, SplitChildRoots,
+    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot,
+    TxHash, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
+    VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -27,7 +27,8 @@ use tracing::{debug, trace, warn};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
-use crate::proposal::late_deliveries;
+use crate::proposal::{late_answers, late_deliveries};
+use crate::read_fence::read_fence;
 
 /// The cells `block` writes of the chain's own accord.
 ///
@@ -132,6 +133,12 @@ pub struct ReadyStateRootVerification {
     /// The header's own `sweep_frontier` claim, recomputed beside the
     /// state root.
     pub claimed_sweep_frontier: SweepFrontier,
+    /// What the block's claims do to the read frontier, folded under
+    /// the root being verified.
+    pub frontier: FrontierInputs,
+    /// What the read frontier judges of the block against the parent
+    /// state.
+    pub fence: ReadFence,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -163,6 +170,8 @@ pub struct PendingStateRootVerification {
     pub(crate) claimed_terminal_roots: Option<TerminalRoots>,
     pub(crate) parent_weighted_timestamp: WeightedTimestamp,
     pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
+    pub(crate) frontier: FrontierInputs,
+    pub(crate) fence: ReadFence,
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
@@ -800,6 +809,8 @@ impl VerificationPipeline {
         split_child_roots_required: bool,
         terminal_roots_required: bool,
         settled_txs_window_floor: Option<WeightedTimestamp>,
+        frontier: FrontierInputs,
+        fence: ReadFence,
     ) {
         let parent_block_hash = block.header().parent_block_hash();
         let ready = PendingStateRootVerification {
@@ -815,6 +826,8 @@ impl VerificationPipeline {
             claimed_terminal_roots: block.header().terminal_roots(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor,
+            frontier,
+            fence,
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -1587,6 +1600,17 @@ impl VerificationPipeline {
             .into_iter()
             .filter(|&kind| !self.is_root_in_flight(block_hash, kind))
             .collect();
+        // The late deliveries the block carries, read off its claims
+        // and its transactions: the transaction root admits them past
+        // their validity end, and the state root refuses one whose
+        // crossing this shard has already answered.
+        let late = late_deliveries(
+            block.transactions(),
+            block.state_claims(),
+            schedule,
+            anchor,
+            local_shard,
+        );
 
         for kind in wanted {
             match kind {
@@ -1594,6 +1618,18 @@ impl VerificationPipeline {
                 // place it may already be waiting.
                 VerificationKind::StateRoot => {
                     if self.needs_state_root_verification(block) {
+                        let windows = schedule.windows();
+                        let fence = read_fence(
+                            block.state_claims(),
+                            windows,
+                            late_answers(
+                                block.transactions(),
+                                &late,
+                                schedule,
+                                anchor,
+                                local_shard,
+                            ),
+                        );
                         self.initiate_state_root_verification(
                             block_hash,
                             block,
@@ -1601,20 +1637,17 @@ impl VerificationPipeline {
                             split_child_roots_required,
                             terminal_roots_required,
                             schedule.settled_window_floor(local_shard, anchor),
+                            FrontierInputs::of_block(block, windows),
+                            fence,
                         );
                     }
                 }
                 VerificationKind::TransactionRoot => {
-                    let late = late_deliveries(
-                        block.transactions(),
-                        block.state_claims(),
-                        schedule,
-                        anchor,
-                        local_shard,
-                    );
-                    actions.extend(
-                        self.initiate_transaction_root_verification(block_hash, block, late),
-                    );
+                    actions.extend(self.initiate_transaction_root_verification(
+                        block_hash,
+                        block,
+                        late.clone(),
+                    ));
                 }
                 VerificationKind::ProvisionRoot => {
                     if let Some(pending) = pending_blocks.get(block_hash) {
@@ -1866,6 +1899,8 @@ impl VerificationPipeline {
             settled_txs_window_floor: pending.settled_txs_window_floor,
             parent_sweep_frontier: chain.parent_sweep_frontier(pending.parent_block_hash),
             claimed_sweep_frontier: block.header().sweep_frontier(),
+            frontier: pending.frontier.clone(),
+            fence: pending.fence.clone(),
         })
     }
 
@@ -2575,6 +2610,8 @@ mod tests {
             false,
             false,
             None,
+            FrontierInputs::still(ShardId::ROOT),
+            ReadFence::default(),
         );
 
         let mut pb =
@@ -2637,6 +2674,8 @@ mod tests {
             false,
             false,
             None,
+            FrontierInputs::still(ShardId::ROOT),
+            ReadFence::default(),
         );
 
         let pending = PendingBlocks::new();
@@ -2685,6 +2724,8 @@ mod tests {
             false,
             false,
             None,
+            FrontierInputs::still(ShardId::ROOT),
+            ReadFence::default(),
         );
 
         let empty_pending = PendingBlocks::new();

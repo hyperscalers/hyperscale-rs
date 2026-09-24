@@ -17,12 +17,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
-    FinalizationHash, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr,
-    ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
+    FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
+    PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
     ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
     SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, derive_reshape_trigger,
     ready_signal_window,
 };
+
+/// What a proposal's claims license, and what the read frontier judges.
+struct Licensed {
+    /// The delivery-only transactions engaged by a live reading.
+    readable: HashSet<TxHash>,
+    /// Those past their validity end.
+    late: HashSet<TxHash>,
+    /// What the fence judges of the claims and the late deliveries.
+    fence: ReadFence,
+    /// The record keys each readable delivery leaned on.
+    record_licences: BTreeMap<TxHash, Vec<SubstateKey>>,
+}
 
 /// Shard consensus statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -143,7 +155,7 @@ impl ShardMemoryStats {
     }
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,9 +165,9 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
     HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, PredecessorTerminal, Provisions,
-    QcContext, QcVerifyError, QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters,
-    StateRoot, Timeout, TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId,
-    Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
+    QcContext, QcVerifyError, QuorumCertificate, ReadFence, RecoveryCause, Round,
+    SafeVoteRegisters, StateRoot, Timeout, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
     missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
@@ -181,9 +193,11 @@ use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::Precut;
 use crate::proposal::{
     Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
-    dispatch_or_defer, late_deliveries, readable_deliveries, select_abandonment_records,
-    select_finalizations, select_provisions, select_state_claims, select_transactions,
+    dispatch_or_defer, late_answers, late_deliveries, readable_deliveries, record_licences,
+    select_abandonment_records, select_finalizations, select_provisions, select_state_claims,
+    select_transactions,
 };
+use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
 use crate::validation::{
@@ -1979,6 +1993,43 @@ impl ShardCoordinator {
         self.owed_determined = owed;
     }
 
+    /// What the claims a block will carry license among `ready_txs`,
+    /// and what the read frontier judges of both.
+    ///
+    /// A delivery past its validity end is admissible only against a
+    /// proof the record it consumes still stands, so the licence is
+    /// read off the claims this block will carry rather than off the
+    /// ones offered: a claim the cap dropped licenses nothing, and the
+    /// voter recomputes the set from the block alone. The fence is for
+    /// the builder to drop against the parent state it alone reads, and
+    /// the record keys each delivery leaned on go with it, so a dropped
+    /// presence takes its transaction along.
+    fn licences_of(
+        &self,
+        topology_schedule: &TopologySchedule,
+        ready_txs: &[Arc<Verified<Transaction>>],
+        state_claims: &[StateClaim],
+        anchor: WeightedTimestamp,
+    ) -> Licensed {
+        let local = self.local_shard;
+        let readable =
+            readable_deliveries(ready_txs, state_claims, topology_schedule, anchor, local);
+        let late = late_deliveries(ready_txs, state_claims, topology_schedule, anchor, local);
+        let fence = read_fence(
+            state_claims,
+            topology_schedule.windows(),
+            late_answers(ready_txs, &late, topology_schedule, anchor, local),
+        );
+        let record_licences =
+            record_licences(ready_txs, &readable, topology_schedule, anchor, local);
+        Licensed {
+            readable,
+            late,
+            fence,
+            record_licences,
+        }
+    }
+
     /// Try to build and broadcast a new block proposal.
     ///
     /// This is the unified proposal entry point, called from:
@@ -2046,7 +2097,7 @@ impl ShardCoordinator {
                 topology_schedule,
                 next_height,
                 round,
-                ProposalKind::Normal(ProposalPayload::default()),
+                ProposalKind::Normal(Box::default()),
             );
         }
 
@@ -2066,7 +2117,7 @@ impl ShardCoordinator {
                 topology_schedule,
                 next_height,
                 round,
-                ProposalKind::Normal(ProposalPayload::default()),
+                ProposalKind::Normal(Box::default()),
             );
         }
 
@@ -2105,25 +2156,12 @@ impl ShardCoordinator {
         let mut provision_fold = ProvisionsFold::default();
         let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
         let state_claims = select_state_claims(&ctx, &mut StateClaimsFold::default(), state_claims);
-        // A delivery past its validity end is admissible only against a
-        // proof the record it consumes still stands, so the licence is
-        // read off the claims this block will carry rather than off the
-        // ones offered: a claim the cap dropped licenses nothing, and
-        // the voter recomputes the set from the block alone.
-        let readable = readable_deliveries(
-            ready_txs,
-            &state_claims,
-            topology_schedule,
-            validity_anchor,
-            self.local_shard,
-        );
-        let late = late_deliveries(
-            ready_txs,
-            &state_claims,
-            topology_schedule,
-            validity_anchor,
-            self.local_shard,
-        );
+        let Licensed {
+            readable,
+            late,
+            fence,
+            record_licences,
+        } = self.licences_of(topology_schedule, ready_txs, &state_claims, validity_anchor);
         let transactions = select_transactions(
             &ctx,
             &Prefilter {
@@ -2145,13 +2183,15 @@ impl ShardCoordinator {
             topology_schedule,
             next_height,
             round,
-            ProposalKind::Normal(ProposalPayload {
+            ProposalKind::Normal(Box::new(ProposalPayload {
                 transactions,
                 finalizations,
                 provisions,
                 abandonment_records,
                 state_claims,
-            }),
+                fence,
+                record_licences,
+            })),
         )
     }
 
@@ -2587,10 +2627,10 @@ impl ShardCoordinator {
         // uncommitted window. The builder adds candidate ceilings on
         // top and drops what a payer cannot cover.
         let fee_checks = match &kind {
-            ProposalKind::Normal(ProposalPayload { transactions, .. }) => {
+            ProposalKind::Normal(payload) => {
                 let payer_seeds = self.local_payer_fees(
                     committee,
-                    transactions.iter().map(|tx| PayerFee {
+                    payload.transactions.iter().map(|tx| PayerFee {
                         vault: tx.fee_vault(),
                         auth_cell: tx.auth_cell(),
                         max_fee: 0,
@@ -2624,6 +2664,7 @@ impl ShardCoordinator {
             fee_checks,
             self.ancestry_committed_height(&parent_qc),
             substate_bytes,
+            topology_schedule.windows(),
         );
 
         info!(
@@ -5400,6 +5441,7 @@ impl ShardCoordinator {
                 parent_block_height,
                 parent_sweep_frontier,
                 creations: committed_cells_for(certified.block()),
+                frontier: FrontierInputs::of_block(certified.block(), topology_schedule.windows()),
                 source,
                 witness,
             }
@@ -5774,6 +5816,9 @@ impl ShardCoordinator {
         };
         let settled_txs_window_floor =
             topology_schedule.settled_window_floor(self.local_shard, anchor_wt);
+        // A certified block passed its voters' read fence, and its
+        // transactions are not derived on this path, so the fence has
+        // nothing to judge here; the frontier's fold still runs.
         self.verification.initiate_state_root_verification(
             block.hash(),
             block,
@@ -5781,6 +5826,8 @@ impl ShardCoordinator {
             split_child_roots_required,
             terminal_roots_required,
             settled_txs_window_floor,
+            FrontierInputs::of_block(block, topology_schedule.windows()),
+            ReadFence::default(),
         );
     }
 
@@ -12797,7 +12844,7 @@ mod tests {
             let provisions = ProvisionsFold::default();
             admit_all::<TransactionsSection<'_>>(
                 &ctx,
-                &mut TransactionsFold::beside(&provisions, &std::collections::HashSet::new()),
+                &mut TransactionsFold::beside(&provisions, &HashSet::new()),
                 block.transactions().iter().map(unwrapped),
             )
         }

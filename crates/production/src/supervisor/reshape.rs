@@ -29,8 +29,8 @@ use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, PredecessorTerminal, ReshapeSeat, ShardAnchor, ShardId,
-    StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
+    Block, BlockHeight, ChainOrigin, FrontierInputs, PredecessorTerminal, ReshapeSeat, ShardAnchor,
+    ShardId, StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -221,7 +221,8 @@ impl ShardSupervisor {
                 shard,
                 block,
                 creations,
-            } => self.reshape_apply(shard, block, creations),
+                frontier,
+            } => self.reshape_apply(shard, block, creations, frontier),
             ReshapeRequest::BroadcastReady {
                 validator,
                 child,
@@ -581,6 +582,7 @@ impl ShardSupervisor {
         shard: ShardId,
         block: Arc<Block>,
         creations: Vec<(SubstateKey, Vec<u8>)>,
+        frontier: FrontierInputs,
     ) {
         let Some(storage) = self
             .reshape_stores
@@ -592,7 +594,7 @@ impl ShardSupervisor {
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match storage.follow_block_writes(&block, &creations) {
+            match storage.follow_block_writes(&block, &creations, &frontier) {
                 Ok(root) => {
                     let _ =
                         events.send(SupervisorEvent::Reshape(ReshapeIo::Applied { shard, root }));

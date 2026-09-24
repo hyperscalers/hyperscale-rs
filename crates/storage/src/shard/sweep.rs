@@ -13,12 +13,13 @@ use std::sync::Arc;
 use hyperscale_hbor::Capped;
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    Address, Block, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites, ShardId,
-    ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash,
-    Verified, WeightedTimestamp, protocol_statics, protocol_statics_installed,
+    Address, Block, FrontierInputs, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES,
+    SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier,
+    Transaction, TxHash, Verified, WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
+use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
 use crate::tree::JmtSnapshot;
 use crate::{
     Anchored, Substates, filter_state_writes_to_prefix, filter_writes_to_prefix, key_under_prefix,
@@ -472,20 +473,24 @@ pub fn sweep_through(
 /// composed it.
 ///
 /// The receipts its ticks settled, the committed cells its committer
-/// derived, and the sweep its header names.
+/// derived, the sweep its header names, and the read frontier its
+/// claims raise.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
 /// every live cell at or below the header's frontier is one the block
 /// removed, and one the block created sits far above it. The creations
 /// are the caller's, derived under the block's own window as the
-/// committer derived them.
+/// committer derived them. The frontier's writes read the copy of the
+/// table this half holds, which is the whole table, and are written for
+/// both halves before the prefix keeps this one's.
 #[must_use]
 pub fn followed_block_writes(
     store: &(impl SweepIndex + ?Sized),
     prior: &dyn Anchored,
     block: &Block,
     creations: &[(SubstateKey, Vec<u8>)],
+    frontier: &FrontierInputs,
     prefix: &NibblePath,
 ) -> SettledWrites {
     let settling: Vec<StoredReceipt> = block
@@ -502,7 +507,11 @@ pub fn followed_block_writes(
     );
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
     let removals = removals_of(&swept);
-    filter_writes_to_prefix(&with_sweep(merged, creations, &removals), prefix)
+    let raised = read_frontier_writes(prior, frontier);
+    filter_writes_to_prefix(
+        &with_frontier(with_sweep(merged, creations, &removals), raised),
+        prefix,
+    )
 }
 
 /// The committed-transaction cells `local_shard` writes for

@@ -40,9 +40,9 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash, GlobalReceiptHash,
-    Hash, QuorumCertificate, Round, ShardId, StateWrites, StoredReceipt, SyncHint, TickHalf,
-    TickId, TxHash, ValidatorId, Verifiable, WeightedTimestamp, WitnessSources,
+    ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash, FrontierInputs,
+    GlobalReceiptHash, Hash, QuorumCertificate, Round, ShardId, StateWrites, StoredReceipt,
+    SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -550,6 +550,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         )],
         &[],
         &[],
+        &FrontierInputs::still(ShardId::ROOT),
         BlockHeight::new(1),
     );
     prepared1(
@@ -574,6 +575,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         &[finalization_with_writes(BlockHeight::new(2), tombstones)],
         &[],
         &[],
+        &FrontierInputs::still(ShardId::ROOT),
         BlockHeight::new(2),
     );
     let (_root3, _snap3, prepared3) = storage.prepare_block_commit(
@@ -595,6 +597,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         &[finalization_with_writes(BlockHeight::new(3), writes)],
         &[],
         &[],
+        &FrontierInputs::still(ShardId::ROOT),
         BlockHeight::new(3),
     );
     prepared2(

@@ -40,8 +40,8 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::{
     BlockHeader, BlockHeight, CertifiedBlockHeader, Hash, MAX_WITNESSES_PER_FETCH,
-    QuorumCertificate, ShardAnchor, ShardId, ShardWitnessPayload, StateRoot, WeightedTimestamp,
-    shard_prefix_path,
+    QuorumCertificate, ReadFrontier, ShardAnchor, ShardId, ShardWitnessPayload, StateRoot,
+    WeightedTimestamp, shard_prefix_path,
 };
 
 use self::history::{HistoryBackfill, HistoryOutcome};
@@ -497,13 +497,14 @@ impl ShardBootstrap {
 
     /// The [`RecoveredState`] a snap-synced joiner boots from: tip at
     /// the anchor, committee anchor from the boundary header, witness
-    /// accumulator seeded with the verified history.
+    /// accumulator seeded with the verified history, and
+    /// `read_frontier` the table the store it imported into holds.
     ///
     /// # Panics
     ///
     /// Panics unless [`Self::is_complete`].
     #[must_use]
-    pub fn into_recovered_state(self) -> RecoveredState {
+    pub fn into_recovered_state(self, read_frontier: ReadFrontier) -> RecoveredState {
         assert!(
             matches!(self.phase, Phase::Complete),
             "bootstrap recovery taken before completion",
@@ -517,6 +518,7 @@ impl ShardBootstrap {
             *window.qc,
             window.hashes,
             self.imported_substate_bytes,
+            read_frontier,
         )
     }
 }
@@ -669,7 +671,7 @@ mod tests {
             &PendingChain::new(Arc::clone(&first), ChainOrigin::ROOT),
             &second,
         );
-        let recovered = bootstrap.into_recovered_state();
+        let recovered = bootstrap.into_recovered_state(ReadFrontier::default());
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(second.state_root(), anchor.state_root);
         assert_eq!(
@@ -691,7 +693,7 @@ mod tests {
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
         drive(&mut bootstrap, &serving, &pending_chain, &fresh);
 
-        let recovered = bootstrap.into_recovered_state();
+        let recovered = bootstrap.into_recovered_state(ReadFrontier::default());
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
@@ -801,7 +803,7 @@ mod tests {
         resumed.on_imported(root).unwrap();
         finish_history(&mut resumed, &pending_chain, &fresh);
 
-        let recovered = resumed.into_recovered_state();
+        let recovered = resumed.into_recovered_state(ReadFrontier::default());
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
         assert_eq!(fresh.state_root(), anchor.state_root);
         // The byte frontier covers the pre-crash chunks too.

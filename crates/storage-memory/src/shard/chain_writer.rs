@@ -8,11 +8,11 @@ use hyperscale_storage::tree::{
 };
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, holds_this_block_at,
-    settled_writes_at,
+    read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
-    StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, FrontierInputs, PreparedCommit,
+    SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -25,6 +25,7 @@ impl ShardChainWriter for SimShardStorage {
         finalizations: &[Arc<Verifiable<Finalization>>],
         creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
+        frontier: &FrontierInputs,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         // Everything the ticks carried, for storage; only what they
@@ -33,13 +34,15 @@ impl ShardChainWriter for SimShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
+        let frontier = read_frontier_writes(parent.state, frontier);
         // Nothing to write → state root is unchanged. Build a no-op
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet. A block's
-        // sweep and its committed cells are writes like any other, so a
-        // block that removes or creates something is not one of these
-        // however few receipts it carries.
-        if receipts.is_empty() && creations.is_empty() && removals.is_empty() {
+        // sweep, its committed cells and its read frontier are writes
+        // like any other, so a block that removes, creates or raises
+        // something is not one of these however few receipts it carries.
+        if receipts.is_empty() && creations.is_empty() && removals.is_empty() && frontier.is_empty()
+        {
             let s = read_or_recover(&self.state);
             let snapshot = Arc::new(noop_jmt_snapshot(
                 &s.tree_store,
@@ -78,6 +81,7 @@ impl ShardChainWriter for SimShardStorage {
             parent.height,
             creations,
             removals,
+            frontier,
         );
 
         let (result_root, collected) = if parent.pending.is_empty() {

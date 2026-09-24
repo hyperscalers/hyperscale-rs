@@ -346,23 +346,6 @@ fn issued_records(classified: &Classified, local: ShardId, kind: Option<Kind>) -
         .collect()
 }
 
-/// The name a housekeeping member over this shard's own tombstones
-/// takes.
-///
-/// [`disposal_member_name`]'s neighbour under its own domain, and named
-/// by the cells it removes rather than by a transaction: a sweep's
-/// tombstones belong to as many transactions as there are crossings, and
-/// what has to be one member is one block's worth of them.
-fn sweep_member_name(tombstones: &[SubstateKey]) -> TxHash {
-    let keys: Vec<Vec<u8>> = tombstones
-        .iter()
-        .map(|key| key.to_bytes().to_vec())
-        .collect();
-    let mut parts: Vec<&[u8]> = vec![b"hyperscale.crossing.tombstone"];
-    parts.extend(keys.iter().map(Vec::as_slice));
-    TxHash::from(Hash::from_parts(&parts))
-}
-
 /// The name a housekeeping member over this shard's own answer cells
 /// takes.
 fn deletion_member_name(answers: &[SubstateKey]) -> TxHash {
@@ -669,6 +652,7 @@ impl ExecutionCoordinator {
                 proven_anchors,
                 mirror,
                 &recovered.crossing_leaves,
+                recovered.read_frontier.clone(),
             ),
             finalized,
             committed_height,
@@ -1388,10 +1372,6 @@ impl ExecutionCoordinator {
                 // presence decides it, and what it licenses is the
                 // deletion.
                 Terms::Owed => claimed.then_some(Licence::Claimed),
-                // A tombstone is already disposed of. Nothing licenses
-                // a second settlement of one, and the member that takes
-                // it away reads its own clock rather than a counterpart.
-                Terms::Retired => None,
                 Terms::Escrowed { .. } => {
                     if self.counterparts.ledger.settles_records(record.cell.tx) {
                         continue;
@@ -1439,25 +1419,21 @@ impl ExecutionCoordinator {
     }
 
     /// Admit into the tick being composed the removal of every answer
-    /// this block's own claims read the record gone at, twice, a span
-    /// apart.
+    /// this block's own claims read the record gone at, at an anchor at
+    /// or above the read frontier's floor for its producer.
     ///
     /// **What the answer defends, and when it stops.** An answer cell is
-    /// what makes a replayed delivery abort, and a replay needs a bundle
-    /// to run at all — `is_fully_provisioned` gates dispatch, so a stale
-    /// presence proof gets a transaction admitted and can never
-    /// dispatch it. A producer serves a bundle for a crossing record
-    /// only inside `CROSSING_BUNDLE_WINDOW` of its own tip, on both
-    /// bundle paths. So an absence read that far apart twice says no
-    /// bundle for the record can be served, and the answer defends
-    /// nothing.
+    /// what makes a replayed delivery abort, and a replay is licensed by
+    /// a presence of the record, which a block may carry only at or
+    /// above the floor its chain has read the producer to. An absence
+    /// at or above the floor comes after every presence the chain ever
+    /// carried, so no presence can license a replay again and the
+    /// answer defends nothing.
     ///
-    /// **The licence is the block's, whole.** Both readings are claims
-    /// the committing block carries, so a fresh seat and a replica
-    /// running since the crossing was answered compose the same members
-    /// off the same block. Nothing is remembered between them, which is
-    /// what lets the span be smaller than the life of the evidence
-    /// rather than equal to it.
+    /// **The licence is the block's, whole.** The absence is a claim the
+    /// committing block carries and the floor is committed state, so a
+    /// fresh seat and a replica running since the crossing was answered
+    /// compose the same member off the same block.
     ///
     /// **What stops the member being composed again**: its own name,
     /// read where the refusal reads it. The removal's write *is* the
@@ -1526,107 +1502,6 @@ impl ExecutionCoordinator {
             runs: Runs::Clean {
                 member: Member::whole(local_shard),
                 answers: due,
-            },
-            arrivals: Vec::new(),
-        });
-    }
-
-    /// Admit the housekeeping this shard's own crossing cells need: the
-    /// answers it may let go of, and the tombstones its grace has run
-    /// out on.
-    ///
-    /// Two admitters and one question — what does this shard's crossing
-    /// ledger say, and what does the block in hand change about it — so
-    /// they are put in one place rather than two lines of the tick's
-    /// own composition.
-    fn admit_crossing_ledger_work(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        tick_id: TickId,
-        tick_ts: WeightedTimestamp,
-        prices: PriceTable,
-        state: &mut TickState,
-        requests: &mut Vec<CrossShardExecutionRequest>,
-    ) {
-        self.admit_answer_deletions(topology_schedule, tick_id, tick_ts, prices, state, requests);
-        self.admit_tombstone_sweeps(topology_schedule, tick_id, tick_ts, prices, state, requests);
-    }
-
-    /// Admit into the tick being composed the removal of every retired
-    /// record this shard holds whose grace its own clock has passed.
-    ///
-    /// **The producing side of a crossing's end, and the only member in
-    /// this family that asks nothing of anyone.** A disposal does not
-    /// remove the record: it rewrites it as a tombstone so the consumer
-    /// can date the going of it by reading the key absent, which is the
-    /// one thing a state proof says plainly. This is what finally takes
-    /// it away, one
-    /// [`CROSSING_TOMBSTONE_GRACE_MS`](hyperscale_vm_types::CROSSING_TOMBSTONE_GRACE_MS)
-    /// on.
-    ///
-    /// **What evidence this needs, and what bounds it.** Only the
-    /// cell's own expiry and the block's clock, both committed content
-    /// every replica holds alike — so no reading, no anchor, no proof,
-    /// and nothing here can be measured in a constant that also bounds
-    /// its own evidence. The kernel re-reads both, so a member naming a
-    /// tombstone early traps rather than shortening a consumer's
-    /// defence.
-    ///
-    /// **What stops it being composed again**: its own member's name,
-    /// read where the refusal reads it. The removal's write *is* the
-    /// cell going, which is blocks away.
-    fn admit_tombstone_sweeps(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        tick_id: TickId,
-        tick_ts: WeightedTimestamp,
-        prices: PriceTable,
-        state: &mut TickState,
-        requests: &mut Vec<CrossShardExecutionRequest>,
-    ) {
-        let Some(window) = topology_schedule.at(tick_ts) else {
-            return;
-        };
-        let trie = window.shard_trie();
-        let local_shard = self.local_shard;
-        let now = tick_ts.as_millis();
-        // A cut can move the prefix a tombstone sits under, and a
-        // session writes only where the member's shard applies the
-        // owner — so a sweep composed for a key this shard no longer
-        // holds would run, succeed and write nothing, and be composed
-        // again at every commit.
-        let due: Vec<SubstateKey> = self
-            .counterparts
-            .tombstones
-            .iter()
-            .filter(|(key, expiry)| {
-                **expiry <= now && trie.shard_for_prefix(key.owner) == local_shard
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        if due.is_empty() {
-            return;
-        }
-        let tx_hash = sweep_member_name(&due);
-        if self.holds_member_for(tx_hash) {
-            return;
-        }
-        state.admit(
-            tx_hash,
-            Membership::whole(BTreeSet::from([local_shard])).settling(),
-            None,
-            Admission::Executes,
-        );
-        self.ticks.assign_tx(tx_hash, tick_id);
-        requests.push(CrossShardExecutionRequest {
-            tx_hash,
-            transaction: None,
-            provisions: Vec::new(),
-            clock: tick_ts,
-            prices,
-            runs: Runs::Sweep {
-                member: Member::whole(local_shard),
-                tombstones: due,
             },
             arrivals: Vec::new(),
         });
@@ -1871,7 +1746,7 @@ impl ExecutionCoordinator {
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_record_disposals(tick_id, block.ts, tick_prices, &mut state, &mut requests);
-        self.admit_crossing_ledger_work(
+        self.admit_answer_deletions(
             topology_schedule,
             tick_id,
             block.ts,
@@ -2941,7 +2816,12 @@ impl ExecutionCoordinator {
     fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let trie = self.counterpart_trie(topology_schedule);
         let wanted = self.wanted_records();
-        self.counterparts.probe(trie, self.committed_ts, &wanted)
+        self.counterparts.probe(
+            trie,
+            self.committed_ts,
+            &wanted,
+            topology_schedule.windows(),
+        )
     }
 
     /// The crossing records consumers here wait on with no arrival for:
@@ -3098,6 +2978,16 @@ impl ExecutionCoordinator {
         let anchor = claim.anchor;
         if topology_schedule.recovery_fences(anchor.shard, anchor.height) {
             record_crossing_push_dropped("fenced");
+            return vec![];
+        }
+        // Below the read frontier's floor every voter refuses it, and
+        // the fallback read covers a push lost or delayed past one
+        // producer block.
+        if self
+            .counterparts
+            .refuses_pushed(&claim, topology_schedule.windows())
+        {
+            record_crossing_push_dropped("below_floor");
             return vec![];
         }
         match self
@@ -4833,8 +4723,8 @@ mod tests {
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
         make_finalization_leaving, make_finalization_uncovered, make_leg_finalization,
-        make_live_block as helpers_make_live_block, state_and_proof, test_prefix, test_transaction,
-        test_transaction_running, test_transaction_with_prefixes,
+        make_live_block as helpers_make_live_block, proven_claim, state_and_proof, test_prefix,
+        test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
@@ -10960,7 +10850,9 @@ mod tests {
         assert_eq!(wanted.len(), 1);
         assert!(
             record_asks(
-                &state.counterparts.probe(&trie, before, &wanted),
+                &state
+                    .counterparts
+                    .probe(&trie, before, &wanted, EpochWindows::new(0)),
                 record_key
             )
             .is_empty(),
@@ -10970,12 +10862,23 @@ mod tests {
         let first = proven_anchor_of(PEER, 10, armed);
         state.counterparts.proven_anchors.record(first);
         assert_eq!(
-            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key),
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            ),
             vec![first],
             "one ask at the holder's newest proven anchor",
         );
         assert!(
-            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key).is_empty(),
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            )
+            .is_empty(),
             "and not again at the same anchor",
         );
         state
@@ -10983,13 +10886,24 @@ mod tests {
             .proven_anchors
             .record(proven_anchor_of(PEER, 11, armed));
         assert!(
-            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key).is_empty(),
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            )
+            .is_empty(),
             "the second ask waits two heights",
         );
         let third = proven_anchor_of(PEER, 12, armed);
         state.counterparts.proven_anchors.record(third);
         assert_eq!(
-            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key),
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            ),
             vec![third],
         );
 
@@ -11001,7 +10915,13 @@ mod tests {
             .proven_anchors
             .record(proven_anchor_of(PEER, 20, armed));
         assert!(
-            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key).is_empty(),
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            )
+            .is_empty(),
         );
     }
 
@@ -11029,14 +10949,27 @@ mod tests {
         state.counterparts.proven_anchors.record(anchor);
         let wanted = state.wanted_records();
         assert_eq!(wanted.len(), 1);
-        assert!(record_asks(&state.counterparts.probe(&trie, now, &wanted), record_key).is_empty());
+        assert!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, now, &wanted, EpochWindows::new(0)),
+                record_key
+            )
+            .is_empty()
+        );
         assert!(state.readable_deliveries().is_empty());
 
         // Past it the read arms at once.
         state.want_records(vec![(cell.tx, vec![record_key], true)]);
         let wanted = state.wanted_records();
         assert_eq!(
-            record_asks(&state.counterparts.probe(&trie, now, &wanted), record_key),
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, now, &wanted, EpochWindows::new(0)),
+                record_key
+            ),
             vec![anchor],
         );
 
@@ -11129,7 +11062,13 @@ mod tests {
                 .proven_anchors
                 .record(proven_anchor_of(PEER, height, now));
             assert!(
-                record_asks(&state.counterparts.probe(&trie, now, &wanted), record_key).is_empty(),
+                record_asks(
+                    &state
+                        .counterparts
+                        .probe(&trie, now, &wanted, EpochWindows::new(0)),
+                    record_key
+                )
+                .is_empty(),
                 "no ask at height {height} while the pushed reading is held",
             );
         }
@@ -11205,6 +11144,55 @@ mod tests {
         assert_eq!(state.readable_deliveries(), vec![cell.tx]);
     }
 
+    /// A pushed presence held when another proposer's block raises its
+    /// producer's entry above it is dropped at that commit, its read
+    /// starts over, the next proven anchor at or above the floor is
+    /// asked at once, and a push at the old anchor arriving afterwards
+    /// is dropped where it lands.
+    #[test]
+    fn a_held_presence_below_a_raised_floor_is_dropped_and_read_again() {
+        let (mut state, schedule, trie, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.counterparts.proven_anchors.record(anchor);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim.clone()])
+                .is_empty()
+        );
+        assert_eq!(state.readable_deliveries(), vec![cell.tx]);
+
+        let now = anchor.ts;
+        let mut above = proven_claim(PEER, 10, &[], &[record_key]);
+        above.anchor.ts = now.plus(Duration::from_secs(1));
+        commit_carrying(&mut state, &schedule, 1, now.as_millis(), vec![above]);
+        assert!(
+            state.readable_deliveries().is_empty(),
+            "the held presence sits below the raised floor and is dropped",
+        );
+
+        let next = proven_anchor_of(PEER, 11, now.plus(Duration::from_secs(2)));
+        state.counterparts.proven_anchors.record(next);
+        let wanted = state.wanted_records();
+        assert_eq!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, next.ts, &wanted, schedule.windows()),
+                record_key
+            ),
+            vec![next],
+            "the read starts over and asks at the next anchor above the floor",
+        );
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert!(
+            state.readable_deliveries().is_empty(),
+            "a push at the old anchor is dropped below the floor",
+        );
+    }
+
     #[test]
     fn held_claims_are_offered_oldest_anchor_first() {
         let (mut state, schedule, _, record_key, cell, anchor, later) = a_body_awaiting_a_push();
@@ -11247,24 +11235,16 @@ mod tests {
         }
     }
 
-    /// An answer goes on one reading of its record gone, because the
-    /// producer dated the going of it.
+    /// An answer goes on one reading of its record gone at or above the
+    /// read frontier's floor.
     ///
-    /// **Why one reading is enough here, where nothing else would be.**
     /// The answer is what makes a replayed delivery abort, and a replay
-    /// needs a bundle to dispatch at all — a stale presence proof gets a
-    /// transaction admitted and can never run it. A bundle carrying a
-    /// record is admitted only inside [`CROSSING_BUNDLE_WINDOW`] of the
-    /// admitting block's own clock, so a replay is dead one window past
-    /// the disposal whatever any cell says. And a disposed record is not
-    /// removed at its disposal: it stands on as a tombstone its producer
-    /// takes away exactly that long afterwards. So a record read absent
-    /// is one whose disposal is already a window behind, and the answer
-    /// defends nothing.
-    ///
-    /// The consumer therefore remembers nothing, carries no pair, and
-    /// asks at one anchor — the newest, which is the only one a
-    /// committee converges on.
+    /// is licensed by a presence of the record, which a block may carry
+    /// only at or above the floor its chain has read the producer to.
+    /// An absence at or above the floor comes after every presence the
+    /// chain ever carried, so no presence can license a replay again
+    /// and the answer defends nothing. The consumer therefore remembers
+    /// nothing, carries no pair, and asks at one anchor.
     #[test]
     fn an_answer_goes_on_one_reading_of_a_dated_record() {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
@@ -11286,8 +11266,8 @@ mod tests {
                 answer: answer_key,
                 producer: record_key.owner,
             }],
-            "the record is gone, so its tombstone was swept, so no bundle for it \
-             can still be admitted",
+            "the record is read gone at or above the floor, so no presence of it \
+             can license a replay",
         );
 
         // And the same cell read gone twice in one block is one

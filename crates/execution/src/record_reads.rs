@@ -84,14 +84,36 @@ impl RecordReads {
         }
     }
 
-    /// Drop the reads of keys `wanted` no longer names, which have been
+    /// Drop the reads of keys `live` no longer names, which have been
     /// answered or are nobody's to ask about, and the certificates
     /// remembered past one horizon of `now`.
-    pub fn sweep(&mut self, now: WeightedTimestamp, wanted: &[WantedRecord]) {
-        let live: BTreeSet<SubstateKey> = wanted.iter().map(|wanted| wanted.key).collect();
+    pub fn sweep(&mut self, now: WeightedTimestamp, live: &BTreeSet<SubstateKey>) {
         self.reads.retain(|key, _| live.contains(key));
         let floor = now.minus(RETENTION_HORIZON);
         self.certified.retain(|_, (_, heard)| *heard >= floor);
+    }
+
+    /// Arm the read of `key` on the clock alone, at once: what an
+    /// answer this shard wrote asks of the record it names, which no
+    /// want files and no certificate arms. A read already armed keeps
+    /// its evidence and its backoff.
+    pub fn arm_now(&mut self, key: SubstateKey) {
+        let read = self.reads.entry(key).or_default();
+        if read.armed.is_none() {
+            read.armed = Some(Evidence::Clock);
+            read.step = 0;
+        }
+    }
+
+    /// Start `key`'s backoff over with no last anchor, so the next
+    /// proven anchor of its holder is asked at once: what a held
+    /// reading dropped below the read frontier's floor is read again
+    /// as.
+    pub fn reset(&mut self, key: SubstateKey) {
+        if let Some(read) = self.reads.get_mut(&key) {
+            read.step = 0;
+            read.last = None;
+        }
     }
 
     /// Arm the read of `wanted` where its evidence is in: the clock it
@@ -283,7 +305,7 @@ mod tests {
         // horizon and no longer.
         let mut early = RecordReads::new();
         early.certified(HOLDER, [want.tx], now);
-        early.sweep(now.plus(RETENTION_HORIZON), &[]);
+        early.sweep(now.plus(RETENTION_HORIZON), &BTreeSet::new());
         early.arm(&want, HOLDER, now.plus(RETENTION_HORIZON));
         assert!(early.is_armed(key), "still remembered at the horizon");
         let mut late = RecordReads::new();
@@ -291,7 +313,7 @@ mod tests {
         late.sweep(
             now.plus(RETENTION_HORIZON)
                 .plus(std::time::Duration::from_millis(1)),
-            &[],
+            &BTreeSet::new(),
         );
         late.arm(&want, HOLDER, now);
         assert!(!late.is_armed(key), "and forgotten past it");
@@ -306,9 +328,42 @@ mod tests {
         let now = WeightedTimestamp::from_millis(1);
         reads.arm(&want, HOLDER, now);
         assert!(reads.due(want.key, anchor(1, 1)));
-        reads.sweep(now, &[]);
+        reads.sweep(now, &BTreeSet::new());
         assert!(!reads.is_armed(want.key));
         assert!(!reads.due(want.key, anchor(9, 9)));
+    }
+
+    /// A read the frontier reset asks at the very next holder anchor
+    /// and backs off from there; one armed on the clock alone asks at
+    /// once and is kept while the answer that arms it stands.
+    #[test]
+    fn a_reset_read_asks_at_the_next_anchor_and_an_answer_arms_on_the_clock() {
+        let mut reads = RecordReads::new();
+        let want = wanted(Some(0));
+        let key = want.key;
+        let now = WeightedTimestamp::from_millis(1);
+        reads.arm(&want, HOLDER, now);
+        assert!(reads.due(key, anchor(1, 1)));
+        assert!(reads.due(key, anchor(3, 2)));
+        assert!(!reads.due(key, anchor(5, 3)), "the third waits four");
+        reads.reset(key);
+        assert!(
+            reads.due(key, anchor(5, 3)),
+            "reset, the next anchor is asked at once"
+        );
+        assert!(!reads.due(key, anchor(6, 4)), "and the backoff starts over");
+
+        let answer = test_key(2);
+        reads.arm_now(answer);
+        assert!(reads.is_armed(answer));
+        assert!(reads.due(answer, anchor(1, 1)));
+        reads.arm_now(answer);
+        assert!(
+            !reads.due(answer, anchor(2, 2)),
+            "arming again keeps the backoff"
+        );
+        reads.sweep(now, &BTreeSet::from([answer]));
+        assert!(reads.is_armed(answer), "kept while named live");
     }
 
     #[test]

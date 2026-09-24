@@ -14,20 +14,20 @@
 //! emit — full content, empty fallback, empty sync — so a single
 //! build-and-dispatch helper can drive them uniformly.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::{Classified, live_record};
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
-    LocalTimestamp, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadySignal,
-    ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    state_claims_admit_block,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
+    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_STATE_CLAIMS_PER_BLOCK,
+    ProposerTimestamp, Provisions, ReadFence, ReadySignal, ReshapeTrigger, RevealChain, Round,
+    ShardId, StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
 };
-use hyperscale_vm_effects::Kind;
+use hyperscale_vm_effects::{Answered, CrossingId, Kind};
 use hyperscale_vm_types::ProtocolHasher;
 use tracing::debug;
 
@@ -48,7 +48,7 @@ use crate::verification::VerificationPipeline;
 #[derive(Debug)]
 pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
-    Normal(ProposalPayload),
+    Normal(Box<ProposalPayload>),
     /// View-change fallback: empty payload, parent's weighted timestamp
     /// (prevents Byzantine proposers from manipulating consensus time on
     /// timeout), `is_fallback = true`.
@@ -67,6 +67,12 @@ pub struct ProposalPayload {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
+    /// What the read frontier judges of the claims and transactions
+    /// selected, for the builder to drop against the parent state.
+    pub(crate) fence: ReadFence,
+    /// The record keys each transaction admitted on a record presence
+    /// leaned on.
+    pub(crate) record_licences: BTreeMap<TxHash, Vec<SubstateKey>>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +248,33 @@ pub fn select_transactions(
     selected
 }
 
+/// The owed crossings `tx` consumes on `local_shard` where it only
+/// delivers there, or `None` where it is not such a transaction or
+/// consumes none.
+fn consumed_here(
+    tx: &Transaction,
+    topology_schedule: &TopologySchedule,
+    anchor: WeightedTimestamp,
+    local_shard: ShardId,
+) -> Option<Vec<CrossingId>> {
+    let window = topology_schedule.at(anchor)?;
+    let classified = Classified::freeze(
+        tx.legs(),
+        tx.fee_payer(),
+        tx.accounts(),
+        window.shard_trie(),
+    );
+    if !classified.only_delivers_at(local_shard) {
+        return None;
+    }
+    let consumed: Vec<CrossingId> = classified
+        .crossings()
+        .filter(|(edge, _)| edge.crossing.kind == Kind::Owed && edge.to.contains(&local_shard))
+        .map(|(edge, _)| edge.crossing.id)
+        .collect();
+    (!consumed.is_empty()).then_some(consumed)
+}
+
 /// The transactions in `txs` that only deliver here and whose every
 /// record consumed here the block's claims read live under the
 /// transaction's own name: what a live held reading engages in place of
@@ -250,9 +283,9 @@ pub fn select_transactions(
 ///
 /// Computed against the block's own anchor and the block's own claims,
 /// so proposer and voters derive one set. The licence is the record
-/// read live, in a claim the block carries; the reading window is the
-/// recency rule on it, applied where the claim is admitted, and a claim
-/// the budget dropped licenses nothing.
+/// read live, in a claim the block carries; the read frontier fences
+/// the presence where the parent state is read, and a claim the budget
+/// dropped licenses nothing.
 #[must_use]
 pub fn readable_deliveries<T: Deref<Target = Transaction>>(
     txs: &[Arc<T>],
@@ -264,40 +297,90 @@ pub fn readable_deliveries<T: Deref<Target = Transaction>>(
     if state_claims.iter().all(|claim| !claim.holds_a_value()) {
         return HashSet::new();
     }
-    let Some(window) = topology_schedule.at(anchor) else {
-        return HashSet::new();
-    };
-    let trie = window.shard_trie();
     txs.iter()
         .filter(|tx| {
-            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-            if !classified.only_delivers_at(local_shard) {
-                return false;
-            }
-            let mut consumed = classified
-                .crossings()
-                .filter(|(edge, _)| {
-                    edge.crossing.kind == Kind::Owed && edge.to.contains(&local_shard)
-                })
-                .peekable();
-            consumed.peek().is_some()
-                && consumed.all(|(edge, _)| {
-                    live_record(state_claims, edge.crossing.id.record_key(&ProtocolHasher))
+            consumed_here(tx, topology_schedule, anchor, local_shard).is_some_and(|consumed| {
+                consumed.iter().all(|id| {
+                    live_record(state_claims, id.record_key(&ProtocolHasher))
                         .is_some_and(|(_, cell)| cell.tx == tx.hash())
                 })
+            })
         })
         .map(|tx| tx.hash())
         .collect()
+}
+
+/// For each transaction of `txs` that `named` names, the cells `keys`
+/// derives from each owed crossing it consumes here.
+fn licences_of<T: Deref<Target = Transaction>>(
+    txs: &[Arc<T>],
+    named: &HashSet<TxHash>,
+    topology_schedule: &TopologySchedule,
+    anchor: WeightedTimestamp,
+    local_shard: ShardId,
+    keys: impl Fn(&CrossingId) -> Vec<SubstateKey>,
+) -> BTreeMap<TxHash, Vec<SubstateKey>> {
+    txs.iter()
+        .filter(|tx| named.contains(&tx.hash()))
+        .filter_map(|tx| {
+            let consumed = consumed_here(tx, topology_schedule, anchor, local_shard)?;
+            Some((tx.hash(), consumed.iter().flat_map(&keys).collect()))
+        })
+        .collect()
+}
+
+/// The record keys each readable delivery in `txs` leaned on: what the
+/// builder drops the transaction for losing among the claims it keeps.
+#[must_use]
+pub fn record_licences<T: Deref<Target = Transaction>>(
+    txs: &[Arc<T>],
+    readable: &HashSet<TxHash>,
+    topology_schedule: &TopologySchedule,
+    anchor: WeightedTimestamp,
+    local_shard: ShardId,
+) -> BTreeMap<TxHash, Vec<SubstateKey>> {
+    licences_of(
+        txs,
+        readable,
+        topology_schedule,
+        anchor,
+        local_shard,
+        |id| vec![id.record_key(&ProtocolHasher)],
+    )
+}
+
+/// Both answer cells of every crossing each late delivery in `txs`
+/// consumes here. While either stands the delivery is a replay of a
+/// crossing this shard already answered: a re-commit deferred past the
+/// deletion of `Never` would take a record the producer has already
+/// reclaimed, so both count.
+#[must_use]
+pub fn late_answers<T: Deref<Target = Transaction>>(
+    txs: &[Arc<T>],
+    late: &HashSet<TxHash>,
+    topology_schedule: &TopologySchedule,
+    anchor: WeightedTimestamp,
+    local_shard: ShardId,
+) -> BTreeMap<TxHash, Vec<SubstateKey>> {
+    licences_of(txs, late, topology_schedule, anchor, local_shard, |id| {
+        vec![
+            id.answer_key(&ProtocolHasher, Answered::Taken),
+            id.answer_key(&ProtocolHasher, Answered::Never),
+        ]
+    })
 }
 
 /// The readable deliveries in `txs` past their validity end at
 /// `anchor`: admissible on the licence the live reading is, not on the
 /// clock.
 ///
-/// A presence answers wherever it was taken, and a claim at an old
-/// anchor inside the reading window is admitted on purpose: there is no
-/// recency rule here beyond the window, since which anchor is newest is
-/// a question each validator answers from its own fetches.
+/// A presence answers wherever it was taken, and no recency rule beyond
+/// the claim's age bound is read here: which anchor is newest is a
+/// question each validator answers from its own fetches. What bounds a
+/// late delivery instead is the read frontier, which refuses a presence
+/// below the floor this chain has already read the producer at, and the
+/// answer cells of the crossing it consumes, either of which standing
+/// refuses it as a replay of one this shard already answered.
 #[must_use]
 pub fn late_deliveries<T: Deref<Target = Transaction>>(
     txs: &[Arc<T>],
@@ -385,9 +468,10 @@ pub fn select_abandonment_records(
 /// spent against the section's byte budget in the order the composer
 /// offers them.
 ///
-/// The budget is spent in the offered order, oldest anchors first, so
-/// the claim closest to aging out of its window goes before a younger
-/// one and one busy producer cannot starve another. The first claim
+/// The budget is spent in the offered order, one producer's claims
+/// together in anchor order and the producers by their oldest anchor,
+/// so no claim of a producer rides while an older one of it is held
+/// back and one busy producer cannot starve another. The first claim
 /// that does not fit is cut to the longest key prefix whose piece fits,
 /// that piece is kept and the spending ends there: a claim is split by
 /// key, never dropped whole, and the composer offers the remainder at
@@ -498,6 +582,7 @@ pub fn assemble_build_action(
     fee_checks: Vec<FeeDemand>,
     fee_read_height: BlockHeight,
     substate_bytes: Option<u64>,
+    windows: EpochWindows,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
@@ -511,7 +596,7 @@ pub fn assemble_build_action(
         ProposalKind::Normal(payload) => (
             ProposerTimestamp::from_local(now),
             false,
-            payload,
+            *payload,
             "Requesting block build for proposal",
             false,
         ),
@@ -536,7 +621,15 @@ pub fn assemble_build_action(
         provisions,
         abandonment_records,
         state_claims,
+        fence,
+        record_licences,
     } = payload;
+    let frontier = FrontierInputs::for_block(
+        &state_claims,
+        windows,
+        parent_qc.weighted_timestamp(),
+        local_shard,
+    );
 
     // The proposer's new BlockHeader will carry parent_qc in its wire
     // form; HBOR encoding is byte-identical between the raw and
@@ -576,6 +669,9 @@ pub fn assemble_build_action(
         carry_terminal_roots,
         settled_txs_window_floor,
         classification_topology_snapshot,
+        frontier,
+        fence,
+        record_licences,
     };
 
     BuildActionPlan {
@@ -1310,9 +1406,8 @@ mod tests {
         );
     }
 
-    /// A live record read off a held reading licenses a delivery:
-    /// tombstones license nothing, in either order beside a live
-    /// reading, and neither does a bare presence of the key.
+    /// A live record read off a held reading licenses a delivery, and a
+    /// bare presence of the key does not.
     #[test]
     fn a_live_record_is_the_one_licence_and_nothing_else_is() {
         use hyperscale_hbor::Bytes;
@@ -1350,26 +1445,9 @@ mod tests {
             Some(tx),
             "the record read live is the whole licence",
         );
-        assert!(live_record(&[claim(7, held(Terms::Retired))], record).is_none());
         assert!(
             live_record(&[claim(7, Inclusion::Present([0xAB; 32]).into())], record).is_none(),
             "a bare presence licenses nothing",
-        );
-        assert!(
-            live_record(
-                &[claim(3, held(Terms::Owed)), claim(7, held(Terms::Retired))],
-                record
-            )
-            .is_none(),
-            "the newest reading is a tombstone",
-        );
-        assert!(
-            live_record(
-                &[claim(7, held(Terms::Retired)), claim(3, held(Terms::Owed))],
-                record
-            )
-            .is_none(),
-            "in either order",
         );
     }
 

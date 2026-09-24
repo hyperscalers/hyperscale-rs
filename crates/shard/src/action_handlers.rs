@@ -14,8 +14,8 @@ use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore,
-    SubstateView, SweepIndex, TerminalWindow, VersionedStore, colliding_committed_cell,
-    committed_tx_cells, sweep_for_block, without_colliding_committed_cells,
+    SubstateView, Substates, SweepIndex, TerminalWindow, VersionedStore, colliding_committed_cell,
+    committed_tx_cells, load_read_frontier, sweep_for_block, without_colliding_committed_cells,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -28,21 +28,24 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
-    Deadline, DeferOn, Derivation, Epoch, EpochWindows, Finalization, Hash, LocalReceiptRoot,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition,
-    PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
-    ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
-    Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
-    UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
-    derive_leaves, fees_over_certificates, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
-    signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
+    Deadline, DeferOn, Derivation, Epoch, EpochWindows, Finalization, FrontierInputs, Hash,
+    LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions,
+    RevealChain, Round, ShardId, ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot,
+    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey, SweepFrontier,
+    TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
+    TransactionRootContext, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
+    VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
+    WitnessSources, absorb_committed_cells, commit_witness_window, derive_leaves,
+    fees_over_certificates, local_settled_tx_hashes, missed_proposals_since_prev_commit,
+    next_reveal_chain, protocol_statics, shard_reveal_sign, signed_bytes,
+    verify_shard_vote_equivocation, vrf_output_from_proof,
 };
+
+use crate::read_fence::{Dropped, drop_refused, written_by};
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -237,6 +240,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     committee_anchor_epoch: Epoch,
     carry_split_child_roots: bool,
     terminal_roots: Option<TerminalRoots>,
+    frontier: &FrontierInputs,
 ) -> ProposalResult {
     // The proposer builds on an anchored view of its parent — the state
     // this block's settling movements land on, the pending chain its
@@ -286,6 +290,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         &certificates,
         &creations,
         &removals,
+        frontier,
         height,
     );
 
@@ -1019,6 +1024,8 @@ where
             settled_txs_window_floor,
             parent_sweep_frontier,
             claimed_sweep_frontier,
+            frontier,
+            fence,
         } => {
             // Pre-flight: hash the receipts and compare to the QC'd
             // `local_receipt_root`. If they diverge, JMT recomputation
@@ -1105,6 +1112,31 @@ where
                 });
                 return;
             }
+            // The read frontier's fence, judged against the parent
+            // state: a record presence below the floor its producer's
+            // lineage has been read to, one below a same-block absence
+            // of its key, or a late delivery whose crossing this shard
+            // already answered. A validity rule at vote time, like the
+            // collision above: a replica following a certified block
+            // never evaluates it.
+            let parent_frontier = load_read_frontier(&anchored, ctx.shard);
+            let written = written_by(&finalizations);
+            if let Err(refusal) = fence.check(&parent_frontier, |key| {
+                written.contains(&key) || anchored.cell(key).is_some()
+            }) {
+                tracing::warn!(
+                    ?block_hash,
+                    height = block_height.inner(),
+                    %refusal,
+                    "Rejecting block the read frontier refuses"
+                );
+                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                    block_hash,
+                    kind: VerificationKind::StateRoot,
+                    outcome: CheckOutcome::Refused,
+                });
+                return;
+            }
             let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                 ParentAnchor {
                     state_root: parent_state_root,
@@ -1116,6 +1148,7 @@ where
                 &finalizations,
                 &creations,
                 &removals,
+                &frontier,
                 block_height,
             );
             // A terminating shard's boundary header carries what it leaves
@@ -1236,6 +1269,9 @@ where
             carry_terminal_roots,
             settled_txs_window_floor,
             classification_topology_snapshot: classification_topology,
+            frontier,
+            fence,
+            record_licences,
         } => {
             // Sign the block's randomness reveal here — off the main loop, on
             // the dispatch pool — so the sans-io coordinator holds no key. Its
@@ -1257,6 +1293,45 @@ where
             let view = ctx
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
+            // What the read frontier would refuse, dropped before the
+            // block is built so a proposal never refuses itself: every
+            // refused presence is cut from its claim, every refused late
+            // delivery goes, and so does every transaction whose licence
+            // rode a dropped presence. The frontier's inputs are then
+            // recomputed over the claims kept.
+            let (state_claims, transactions, frontier) = {
+                let anchored = view.snapshot();
+                let parent_frontier = load_read_frontier(&anchored, shard_id);
+                let written = written_by(&finalizations);
+                let Dropped {
+                    claims,
+                    transactions,
+                    refused,
+                } = drop_refused(
+                    state_claims,
+                    transactions,
+                    &fence,
+                    &record_licences,
+                    frontier.windows,
+                    &parent_frontier,
+                    |key| written.contains(&key) || anchored.cell(key).is_some(),
+                );
+                if refused > 0 {
+                    tracing::debug!(
+                        ?shard_id,
+                        height = height.inner(),
+                        refused,
+                        "Dropped what the read frontier refuses from the proposal"
+                    );
+                }
+                let frontier = FrontierInputs::for_block(
+                    &claims,
+                    frontier.windows,
+                    frontier.anchor,
+                    frontier.local,
+                );
+                (claims, transactions, frontier)
+            };
             // Drop transactions whose payer cannot cover its cumulative
             // reservation demand — the builder-side form of the voters'
             // reservation verification, reading the same
@@ -1431,6 +1506,7 @@ where
                 committee_anchor_epoch,
                 carry_split_child_roots,
                 terminal_roots,
+                &frontier,
             );
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;

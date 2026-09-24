@@ -9,7 +9,7 @@
 
 use hyperscale_hbor::Capped;
 use hyperscale_storage::committed_tx_cells;
-use hyperscale_types::{AddressClass, ShardId};
+use hyperscale_types::{AddressClass, FrontierInputs, ShardId};
 use hyperscale_vm_effects::Hash32;
 use hyperscale_vm_types::{Address, IntentHash, LegRole, LegShape, ValueEdge};
 
@@ -139,14 +139,14 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
     };
 
     let parent_root = SimShardStorage::new(shard_prefix_path(parent))
-        .follow_block_writes(&block, &committed)
+        .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
         .expect("the parent commits its block");
     let children = SplitChildRoots {
         left: SimShardStorage::new(shard_prefix_path(left))
-            .follow_block_writes(&block, &committed)
+            .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
             .expect("a child follows"),
         right: SimShardStorage::new(shard_prefix_path(right))
-            .follow_block_writes(&block, &committed)
+            .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
             .expect("a child follows"),
     };
     assert!(children.composes_to(parent_root));

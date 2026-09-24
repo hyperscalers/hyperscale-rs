@@ -12,7 +12,8 @@
 use hyperscale_jmt::{Key, NibblePath, TreeReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-    ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
+    FrontierInputs, ReadFrontier, ShardId, ShardWitnessPayload, StateRoot, SubstateKey,
+    SubstateLeaf,
 };
 
 use crate::Substates;
@@ -403,6 +404,7 @@ pub trait BoundaryStore {
         &self,
         block: &Block,
         creations: &[(SubstateKey, Vec<u8>)],
+        frontier: &FrontierInputs,
     ) -> Result<StateRoot, String>;
 
     /// Install a reshape successor's derived `genesis` as this store's
@@ -443,6 +445,12 @@ pub trait BoundaryStore {
     /// this seat's to take. The keyspace is owner-major, so the prefix is
     /// a contiguous run and the scan is that run and nothing else.
     fn crossing_leaves(&self, shard: ShardId) -> CrossingLeaves;
+
+    /// The read frontier `shard`'s slice of the committed state holds:
+    /// [`load_read_frontier`](crate::load_read_frontier) over the store,
+    /// read the same way however the store was reached, since the table
+    /// is state and the state is what every seat imports.
+    fn read_frontier(&self, shard: ShardId) -> ReadFrontier;
 }
 
 /// The crossing leaves under one shard's prefix, by the side of a

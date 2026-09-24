@@ -215,6 +215,7 @@ where
                 parent_block_height,
                 parent_sweep_frontier,
                 creations,
+                frontier,
                 source,
                 witness,
             } => {
@@ -224,6 +225,7 @@ where
                     parent_block_height,
                     parent_sweep_frontier,
                     creations,
+                    frontier,
                     source,
                     witness,
                 });
@@ -390,6 +392,7 @@ where
             parent_block_height,
             parent_sweep_frontier,
             creations,
+            frontier,
             source,
             witness,
         } = commit;
@@ -415,6 +418,7 @@ where
             parent_block_height,
             parent_sweep_frontier,
             creations,
+            frontier,
             source,
             kind,
             witness,

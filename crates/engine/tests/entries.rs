@@ -19,10 +19,10 @@ use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates}
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, MAX_INTENT_VALIDITY_RANGE,
-    NetworkId, PriceTable, PrincipalAddr, ProtocolHasher, ProvisionalHolds, ResourceAddr,
-    SettledWrites, ShardId, ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified,
-    WeightedTimestamp,
+    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, FrontierInputs,
+    MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProtocolHasher,
+    ProvisionalHolds, ResourceAddr, SettledWrites, ShardId, ShardTrie, StoredReceipt,
+    TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::holdings_collection;
 use hyperscale_vm_stdlib::account;
@@ -179,7 +179,11 @@ fn run_tick(
         receipts.push(StoredReceipt::from(tx));
     }
     let after = storage
-        .follow_block_writes(&block_settling(BlockHeight::new(height), receipts), &[])
+        .follow_block_writes(
+            &block_settling(BlockHeight::new(height), receipts),
+            &[],
+            &FrontierInputs::still(ShardId::ROOT),
+        )
         .expect("committed receipts apply");
     assert_ne!(before, after, "a settling tick moves the state root");
     executed

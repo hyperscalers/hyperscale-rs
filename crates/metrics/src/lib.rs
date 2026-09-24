@@ -263,6 +263,14 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
 
+    /// A fenced claim, one carrying a record presence (`"record"`) or a
+    /// deleting absence (`"removed"`), either carried by a committed
+    /// block or dropped from what a validator held to offer because the
+    /// block raised its producer's read frontier above it.
+    fn record_fenced_claim(&self, reading: &str, carried: bool) {
+        let _ = (reading, carried);
+    }
+
     /// A pushed crossing reading dropped on the consumer's side, by the
     /// check that dropped it: at ingress, at the anchor, or at the
     /// park. Each drop is one the fallback read has to make up.
@@ -787,6 +795,13 @@ pub fn record_state_claims_weight(bytes: usize) {
 #[inline]
 pub fn record_record_ask() {
     recorder().record_record_ask();
+}
+
+/// Record a fenced claim carried by a block or refused by the read
+/// frontier, by what it read.
+#[inline]
+pub fn record_fenced_claim(reading: &str, carried: bool) {
+    recorder().record_fenced_claim(reading, carried);
 }
 
 /// Record a pushed crossing reading dropped by the consumer, by reason.

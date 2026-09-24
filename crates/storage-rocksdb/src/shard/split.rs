@@ -293,8 +293,8 @@ mod tests {
     use hyperscale_storage::{AdoptSource, BoundaryStore, SweepIndex, WitnessSeed};
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
-        AddressClass, BlockHash, BlockHeight, SWEEP_BUCKET_MS, ShardId, SubstateKey, SubstateLeaf,
-        SweepBucket, SweepFrontier, ValidatorId, WeightedTimestamp,
+        AddressClass, BlockHash, BlockHeight, FrontierInputs, SWEEP_BUCKET_MS, ShardId,
+        SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, ValidatorId, WeightedTimestamp,
     };
     use tempfile::TempDir;
 
@@ -733,9 +733,14 @@ mod tests {
             )];
             let block = block_settling(BlockHeight::new(u64::from(seed)), receipts.to_vec());
             roots = (
-                whole.follow_block_writes(&block, &[]).unwrap(),
-                left.follow_block_writes(&block, &[]).unwrap(),
-                right.follow_block_writes(&block, &[]).unwrap(),
+                whole
+                    .follow_block_writes(&block, &[], &FrontierInputs::still(ShardId::ROOT))
+                    .unwrap(),
+                left.follow_block_writes(&block, &[], &FrontierInputs::still(ShardId::ROOT))
+                    .unwrap(),
+                right
+                    .follow_block_writes(&block, &[], &FrontierInputs::still(ShardId::ROOT))
+                    .unwrap(),
             );
             // The leaf key is the owner prefix by identity, so the side a
             // write lands on is that prefix's leading bit.

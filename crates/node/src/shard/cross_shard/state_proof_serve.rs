@@ -557,7 +557,7 @@ mod tests {
     }
 
     /// A record cell the proof shows present is served with its value,
-    /// live or retired; an ordinary cell is proved and not served; and
+    /// each a record; an ordinary cell is proved and not served; and
     /// the fetch binding accepts what the server built.
     #[test]
     fn a_record_cells_value_rides_beside_its_proof() {
@@ -579,13 +579,13 @@ mod tests {
         let live = id(0x5A)
             .cell(tx, ResourceAddr::new([0xE0; 31]), 500, 1_000, Terms::Owed)
             .to_bytes();
-        let retired_key = id(0x5B).record_key(&ProtocolHasher);
-        let retired = id(0x5B)
-            .cell(tx, ResourceAddr::new([0xE0; 31]), 0, 2_000, Terms::Retired)
+        let second_key = id(0x5B).record_key(&ProtocolHasher);
+        let second = id(0x5B)
+            .cell(tx, ResourceAddr::new([0xE0; 31]), 7, 2_000, Terms::Owed)
             .to_bytes();
         let (chain, root) = chain_holding(
             &[1_000],
-            &[(live_key, live.clone()), (retired_key, retired.clone())],
+            &[(live_key, live.clone()), (second_key, second.clone())],
         );
         let committed = committed_tx_cell_key(
             SHARD,
@@ -593,7 +593,7 @@ mod tests {
             test_transaction(1).validity_range().end_timestamp_exclusive,
         );
         let absent = id(0x5D).record_key(&ProtocolHasher);
-        let keys = vec![live_key, retired_key, committed, absent];
+        let keys = vec![live_key, second_key, committed, absent];
 
         let response = serve_state_proof_request(
             &chain,
@@ -609,7 +609,7 @@ mod tests {
             .collect();
         assert_eq!(
             served,
-            vec![(live_key, live), (retired_key, retired)],
+            vec![(live_key, live), (second_key, second)],
             "the two record cells, in the order asked, and nothing else",
         );
 

@@ -116,6 +116,7 @@ impl RocksDbShardStorage {
             chain_origin,
             safe_vote_registers: self.load_safe_vote_registers(chain_origin),
             crossing_leaves: self.crossing_leaves(shard),
+            read_frontier: self.read_frontier(shard),
             voted_blocks: self.voted_blocks_above(committed_height),
         }
     }

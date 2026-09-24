@@ -417,16 +417,15 @@ mod tests {
     };
 
     /// A settling receipt writing a live record under its own
-    /// transaction yields that key; a deletion, a retired rewrite, a
-    /// settling member's receipt and a record-shaped write naming
-    /// another transaction in the same finalization yield nothing.
+    /// transaction yields that key; a deletion, a settling member's
+    /// receipt and a record-shaped write naming another transaction in
+    /// the same finalization yield nothing.
     #[test]
     fn records_written_names_what_the_block_issued() {
         let local = ShardId::leaf(1, 0);
         let tick = TickId::new(local, BlockHeight::new(3));
         let (issued, issued_key) = crossing(1, 0x11, 0x21);
         let (deleted, deleted_key) = crossing(2, 0x12, 0x22);
-        let (retired, retired_key) = crossing(3, 0x13, 0x23);
         let (others, others_key) = crossing(4, 0x14, 0x24);
         let (settled, settled_key) = crossing(5, 0x15, 0x25);
         let resource = ResourceAddr::new([0xE1; 31]);
@@ -447,14 +446,6 @@ mod tests {
                     vec![
                         (issued_key, Some(live(issued, tx(0xA1)).to_bytes())),
                         (deleted_key, None),
-                        (
-                            retired_key,
-                            Some(
-                                retired
-                                    .cell(tx(0xA1), resource, 0, 9_000, Terms::Retired)
-                                    .to_bytes(),
-                            ),
-                        ),
                         (others_key, Some(live(others, tx(0xB0)).to_bytes())),
                     ],
                 ),

@@ -704,17 +704,12 @@ mod tests {
         assert!(!early.is_fully_provisioned(tx));
         assert_eq!(early.wanted_records().len(), 1, "and the key stays wanted");
 
-        // Another transaction's record, a tombstone and a bare presence
-        // answer nothing.
+        // Another transaction's record and a bare presence answer
+        // nothing.
         let mut wrong = ProvisioningTracker::new();
         wrong.record_required(tx, BTreeSet::from([requirement]));
         wrong.fold_record_readings(&[claim_of(3, held(cell_of(other_tx, Terms::Owed)))]);
         assert!(!wrong.is_fully_provisioned(tx));
-        wrong.fold_record_readings(&[claim_of(4, held(cell_of(tx, Terms::Retired)))]);
-        assert!(
-            !wrong.is_fully_provisioned(tx),
-            "a tombstone is not an arrival"
-        );
         wrong.fold_record_readings(&[claim_of(5, Inclusion::Present([7; 32]).into())]);
         assert!(
             !wrong.is_fully_provisioned(tx),

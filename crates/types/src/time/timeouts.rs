@@ -196,34 +196,6 @@ const _: () = assert!(
 /// walks. Half an epoch is the working margin, not the hard bound.
 const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
 
-/// How old the anchor of a held reading may be for a block to admit
-/// it, and so how long a consumer's answer cell has to outlive its
-/// record.
-///
-/// A crossing record reaches its consumer as a state claim carrying
-/// the record's value, and a claim carrying a value is admitted only
-/// while its anchor sits inside this window of the admitting block's
-/// own clock. A replayed delivery needs such a reading to dispatch at
-/// all, so past the window no replay can be fed whatever any cell
-/// says, and one reading of the record gone is the whole licence to
-/// delete the answer.
-///
-/// **The figure is the horizon less one finalization delay, and the
-/// subtraction is the point.** The reading has to be provable when it
-/// is admitted, and a proof stands for [`RETENTION_HORIZON`];
-/// subtracting [`MAX_FINALIZATION_DELAY`] leaves exactly the round
-/// trip a fetch of it takes.
-///
-/// Measured in a smaller constant than the one bounding its own
-/// evidence, which is what the horizon itself could never be: a span of
-/// a full horizon expires its own near end at the instant the far end
-/// arrives, and then the near end has to be remembered in committed
-/// state.
-pub const CROSSING_BUNDLE_WINDOW: Duration =
-    Duration::from_secs(RETENTION_HORIZON.as_secs() - MAX_FINALIZATION_DELAY.as_secs());
-
-const _: () = assert!(CROSSING_BUNDLE_WINDOW.as_secs() < RETENTION_HORIZON.as_secs());
-
 /// A skipped epoch and its recovery must not expire the transactions a
 /// shard is holding. `SKIP_TIMEOUT` bounds the wait before the pool
 /// prevotes a skip, and ratification rounds follow it; a validity window

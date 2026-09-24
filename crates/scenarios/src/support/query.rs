@@ -204,7 +204,7 @@ pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
         .is_some_and(|record| {
             let deadline = Deadline::from_expiry(record.expiry_ms);
             match record.terms {
-                Terms::Owed | Terms::Retired => false,
+                Terms::Owed => false,
                 Terms::Escrowed { .. } => Window::LegEntry.of(deadline).end <= clock(c),
             }
         });
@@ -233,14 +233,14 @@ pub struct Locked {
 
 /// The record standing at `cell` that nothing has answered: an escrowed
 /// or owed record whose claim key and decline key are both absent.
-/// `None` for an absent key, a retired record, or one either answer
-/// stands beside — a record in flight at the instant of the read looks
+/// `None` for an absent key or a record either answer stands beside —
+/// a record in flight at the instant of the read looks
 /// the same, so this reports and asserts nothing.
 #[must_use]
 pub(crate) fn locked_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> Option<Locked> {
     let shard = owning_shard(c, cell.owner);
     let record = CrossingCell::from_bytes(&c.substate(shard, cell.owner, cell.local.0)?)?;
-    let kind = record.terms.kind()?;
+    let kind = record.terms.kind();
     let id = CrossingId::of_record(cell.owner, &record);
     let claim = id.answer_key(&ProtocolHasher, Answered::Taken);
     let decline = id.answer_key(&ProtocolHasher, Answered::Never);

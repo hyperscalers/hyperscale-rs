@@ -35,8 +35,8 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent, IntentHeader,
-    IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Terms as CrossingTerms, Totality,
-    Value, issued_resource, package_hash,
+    IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource,
+    package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
@@ -1683,10 +1683,9 @@ fn a_retirement_retires_the_record_and_moves_nothing() {
     assert!(
         store
             .cell(edge.crossing.id.record_key(&ProtocolHasher))
-            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
-            .is_some_and(|tomb| tomb.terms == CrossingTerms::Retired && tomb.amount == 0),
-        "the record's value is gone and its key stands on as a tombstone, so the \
-         consumer can date the disposal by reading the key absent later"
+            .is_none(),
+        "the record is removed where it is retired; its consumer reads it gone at an \
+         anchor at or above its read frontier"
     );
     assert_eq!(
         store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
@@ -1805,8 +1804,7 @@ fn settle_inherited(held: &Inherited, on: Licence) -> ExecutedTx {
 }
 
 /// A record a shard inherited with a prefix, settled where its consumer
-/// claimed: retired to a tombstone, with the value left where the claim
-/// took it.
+/// claimed: removed, with the value left where the claim took it.
 ///
 /// The member runs with no body at all, which is the point — a merge
 /// successor's store arrives as a prefix of leaves and its ledger begins
@@ -1823,10 +1821,8 @@ fn an_inherited_record_is_retired_where_its_consumer_claimed() {
     };
     held.store.apply(writes);
     assert!(
-        Substates::cell(&held.store, held.record)
-            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
-            .is_some_and(|tomb| tomb.terms == CrossingTerms::Retired && tomb.amount == 0),
-        "a claimed crossing's record is retired to a tombstone, not removed"
+        Substates::cell(&held.store, held.record).is_none(),
+        "a claimed crossing's record is removed"
     );
     assert_eq!(
         Substates::cell(&held.store, vault_key(alice(), *PROTOCOL_RESOURCE)),

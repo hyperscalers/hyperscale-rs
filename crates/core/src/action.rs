@@ -13,17 +13,18 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
-    ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
-    LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
-    PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, ShardForkProof,
-    ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
-    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
-    SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateEntry, SubstateKey, SweepFrontier,
-    TerminalRoots, TickId, Timeout, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId,
-    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
+    ExecutionCertificate, ExecutionVote, Finalization, FrontierInputs, GlobalReceiptRoot, Hash,
+    HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
+    PcVoteEquivocation, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
+    RatifyVote, ReadFence, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee,
+    RevealChain, Round, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
+    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
+    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot,
+    SubstateEntry, SubstateKey, SweepFrontier, TerminalRoots, TickId, Timeout, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
+    WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
@@ -783,6 +784,13 @@ pub enum Action {
         /// still hold a straddler against. `None` when no retained window
         /// records one.
         settled_txs_window_floor: Option<WeightedTimestamp>,
+        /// What the block's claims do to the read frontier, folded under
+        /// the root being verified.
+        frontier: FrontierInputs,
+        /// What the read frontier judges of the block against the parent
+        /// state: its record presences, its absences and its late
+        /// deliveries' answers. A refusal refuses the state root.
+        fence: ReadFence,
     },
 
     /// Verify a block's beacon-witness root + leaf count.
@@ -1109,6 +1117,17 @@ pub enum Action {
         /// head, so a head-flipped proposer at a reshape boundary produces
         /// a header that resolves identically on every replica.
         classification_topology_snapshot: Arc<TopologySnapshot>,
+        /// What the offered claims do to the read frontier; the handler
+        /// recomputes it over the claims it keeps.
+        frontier: FrontierInputs,
+        /// What the read frontier judges of the offered content. The
+        /// handler drops whatever it refuses against the parent state.
+        fence: ReadFence,
+        /// For each transaction admitted on a record presence rather
+        /// than a payer bundle, the record keys it leaned on: one whose
+        /// keys lose their live reading among the kept claims is dropped
+        /// with them.
+        record_licences: BTreeMap<TxHash, Vec<SubstateKey>>,
     },
 
     /// Execute one tick's whole batch: the committing block's
@@ -1203,6 +1222,9 @@ pub enum Action {
         /// fact the recomputation reads beyond the block, resolved where
         /// the schedule is.
         creations: Vec<(SubstateKey, Vec<u8>)>,
+        /// What the block's claims do to the read frontier, folded under
+        /// the root the recomputation checks.
+        frontier: FrontierInputs,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
         /// Beacon-witness leaves to persist alongside the block in the

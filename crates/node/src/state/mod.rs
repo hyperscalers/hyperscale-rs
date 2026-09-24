@@ -535,6 +535,8 @@ impl StateMachine for NodeStateMachine {
                     settled_txs_window_floor: ready.settled_txs_window_floor,
                     parent_sweep_frontier: ready.parent_sweep_frontier,
                     claimed_sweep_frontier: ready.claimed_sweep_frontier,
+                    frontier: ready.frontier,
+                    fence: ready.fence,
                 });
             }
 

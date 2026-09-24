@@ -15,6 +15,8 @@
 //!   emission by.
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
+//! - [`read_frontier`]: [`ReadFrontier`](read_frontier::ReadFrontier), how far
+//!   along each producer this shard has read, committed as state.
 //! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
 //! - [`storage_commit`]: type-erased [`PreparedCommit`](storage_commit::PreparedCommit)
 //!   closure, [`SyncHint`](storage_commit::SyncHint), and
@@ -46,6 +48,7 @@ pub mod load;
 pub mod manifest;
 pub mod proven_anchors;
 pub mod quorum_certificate;
+pub mod read_frontier;
 pub mod reshape;
 pub mod roots;
 pub mod state_claim;

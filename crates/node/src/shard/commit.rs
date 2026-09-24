@@ -28,9 +28,9 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
-    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SubstateKey,
-    SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
-    local_settled_tx_hashes,
+    EpochWindows, Finalization, FrontierInputs, LocalTimestamp, PreparedCommit, ShardId, StateRoot,
+    SubstateKey, SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp,
+    absorb_committed_cells, local_settled_tx_hashes,
 };
 use tracing::debug;
 
@@ -76,6 +76,8 @@ pub struct QcOnlyCommit {
     pub(crate) parent_sweep_frontier: SweepFrontier,
     /// The committed cells the block writes, derived under its window.
     pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
+    /// What the block's claims do to the read frontier.
+    pub(crate) frontier: FrontierInputs,
     /// How this node learned the certifying QC.
     pub(crate) source: CommitSource,
     /// Beacon-witness leaves to fold into the commit.
@@ -106,6 +108,9 @@ pub struct QcOnlyPending {
     /// under the block's own window. Unused when
     /// `kind == AlreadyPrepared`.
     pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
+    /// What the block's claims do to the read frontier. Unused when
+    /// `kind == AlreadyPrepared`.
+    pub(crate) frontier: FrontierInputs,
     /// How this node learned the certifying QC.
     pub(crate) source: CommitSource,
     /// Whether this entry needs the pool to run JMT prep or can
@@ -222,6 +227,7 @@ where
         &finalizations,
         creations,
         &removals,
+        &pending.frontier,
         height,
     );
 

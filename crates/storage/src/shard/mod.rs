@@ -16,6 +16,7 @@ pub mod derived;
 pub mod genesis;
 pub mod packages;
 pub mod pending_chain;
+pub mod read_frontier;
 pub mod recovered_state;
 pub mod retention;
 pub mod store;

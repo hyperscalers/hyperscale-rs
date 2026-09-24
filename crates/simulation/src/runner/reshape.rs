@@ -160,12 +160,13 @@ impl SimulationRunner {
                 shard,
                 block,
                 creations,
+                frontier,
             } => {
                 let root = self
                     .reshape_stores
                     .get(&(host, shard))?
                     .storage
-                    .follow_block_writes(&block, &creations)
+                    .follow_block_writes(&block, &creations, &frontier)
                     .expect("reshape follow apply into the opened store");
                 Some(ReshapeEvent::Applied { shard, root })
             }

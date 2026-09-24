@@ -27,9 +27,9 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, DEDUP_WINDOW, FEE_HOLD_WINDOW, Hash, LegRole, LocalKey, RETENTION_HORIZON,
-    SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction,
-    TransactionDecision, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
+    ChainOrigin, DEDUP_WINDOW, FEE_HOLD_WINDOW, FrontierInputs, Hash, LegRole, LocalKey,
+    RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange,
+    Transaction, TransactionDecision, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -297,6 +297,7 @@ fn test_prepare_commit_state_root_matches() {
         &[],
         &[],
         &[],
+        &FrontierInputs::still(ShardId::ROOT),
         BlockHeight::new(1),
     );
     let certified = make_test_certified(block);

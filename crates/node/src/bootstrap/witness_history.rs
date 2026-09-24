@@ -224,8 +224,8 @@ mod tests {
     use hyperscale_storage::{PendingChain, RecoveredState};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, ChainOrigin, ShardWitnessPayload,
-        StateRoot, WeightedTimestamp,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, ChainOrigin, ReadFrontier,
+        ShardWitnessPayload, StateRoot, WeightedTimestamp,
     };
 
     use super::*;
@@ -286,8 +286,14 @@ mod tests {
             .iter()
             .map(ShardWitnessPayload::leaf_hash)
             .collect();
-        let recovered =
-            RecoveredState::from_snap_synced_boundary(&anchor, &header, qc.clone(), hashes, 0);
+        let recovered = RecoveredState::from_snap_synced_boundary(
+            &anchor,
+            &header,
+            qc.clone(),
+            hashes,
+            0,
+            ReadFrontier::default(),
+        );
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
@@ -352,7 +358,14 @@ mod tests {
             .iter()
             .map(ShardWitnessPayload::leaf_hash)
             .collect();
-        let recovered = RecoveredState::from_snap_synced_boundary(&anchor, &header, qc, hashes, 0);
+        let recovered = RecoveredState::from_snap_synced_boundary(
+            &anchor,
+            &header,
+            qc,
+            hashes,
+            0,
+            ReadFrontier::default(),
+        );
         assert_eq!(
             recovered.beacon_witness_start,
             BeaconWitnessLeafCount::new(3)

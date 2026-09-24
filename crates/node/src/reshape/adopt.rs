@@ -10,7 +10,7 @@
 //! rather than re-deriving any part of it.
 
 use hyperscale_storage::{AdoptSource, BoundaryStore, CrossingLeaves, RecoveredState};
-use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, ShardId, StateRoot};
+use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, ReadFrontier, ShardId, StateRoot};
 
 use super::orchestrator::AdoptKind;
 
@@ -65,6 +65,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     // twice on top of this: the replay walk stops at this chain's own
     // origin, so it never reaches a block the predecessor committed.
     let crossing_leaves = storage.crossing_leaves(shard);
+    let read_frontier = storage.read_frontier(shard);
     verified_recovered_state(
         adopted,
         genesis.header().state_root(),
@@ -72,6 +73,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
         substate_bytes,
         predecessors,
         crossing_leaves,
+        read_frontier,
     )
 }
 
@@ -87,6 +89,7 @@ fn verified_recovered_state(
     substate_bytes: u64,
     predecessors: Vec<PredecessorTerminal>,
     crossing_leaves: CrossingLeaves,
+    read_frontier: ReadFrontier,
 ) -> Result<RecoveredState, String> {
     if adopted != expected {
         return Err(format!(
@@ -98,6 +101,7 @@ fn verified_recovered_state(
         chain_origin: origin,
         predecessors,
         crossing_leaves,
+        read_frontier,
         ..RecoveredState::default()
     })
 }
@@ -105,7 +109,9 @@ fn verified_recovered_state(
 #[cfg(test)]
 mod tests {
     use hyperscale_storage::CrossingLeaves;
-    use hyperscale_types::{BlockHeight, ChainOrigin, Hash, StateRoot, WeightedTimestamp};
+    use hyperscale_types::{
+        BlockHeight, ChainOrigin, Hash, ReadFrontier, StateRoot, WeightedTimestamp,
+    };
 
     use super::verified_recovered_state;
 
@@ -126,6 +132,7 @@ mod tests {
             4_096,
             Vec::new(),
             CrossingLeaves::default(),
+            ReadFrontier::default(),
         )
         .expect("matches");
         assert_eq!(recovered.substate_bytes, 4_096);
@@ -143,7 +150,8 @@ mod tests {
                 origin(),
                 0,
                 Vec::new(),
-                CrossingLeaves::default()
+                CrossingLeaves::default(),
+                ReadFrontier::default(),
             )
             .is_err()
         );

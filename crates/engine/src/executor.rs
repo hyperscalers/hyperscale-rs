@@ -656,12 +656,6 @@ impl Executor {
             if takes_back && record.terms == Terms::Owed {
                 continue;
             }
-            // A tombstone has nothing to settle: its crossing was
-            // disposed of and the key stands only until its producer
-            // removes it, which is a different member's work.
-            if record.terms == Terms::Retired {
-                continue;
-            }
             let mut declare_here = |effect, holds| {
                 declare(&mut declaration, effect, holds).map_err(|conflict| {
                     format!("settled cell contradicts the declaration: {conflict}")
@@ -691,9 +685,6 @@ impl Executor {
                 // A claim that happened: the value moved where the
                 // consumer ran and what is left is a cell saying so.
                 Terms::Escrowed { .. } | Terms::Owed => Disposition::Retire,
-                // Skipped above, and unreachable rather than handled:
-                // a tombstone is not a balance to dispose of.
-                Terms::Retired => continue,
             };
             disposals.push(Disposal {
                 record: *key,
@@ -759,51 +750,6 @@ impl Executor {
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
             // A cleanup invokes no node, so nothing of it emits.
-            event_bytes: Vec::new(),
-            work: DeclaredWork::ZERO,
-            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
-        })
-    }
-
-    /// Lower a tombstone sweep: the retired records it removes,
-    /// declared, and nothing read.
-    ///
-    /// [`Self::prepare_clean`]'s counterpart on the producing side and
-    /// the same shape. What licenses the removal is the cell's own
-    /// expiry against this tick's clock, and the kernel reads both — so
-    /// nothing rides with the member beyond the keys it names.
-    ///
-    /// # Errors
-    ///
-    /// Work naming nothing, or a declaration two of its cells
-    /// contradict.
-    fn prepare_sweep(
-        tombstones: &[SubstateKey],
-        ctx: &TickBatchContext<'_>,
-    ) -> Result<PreparedTx, String> {
-        if tombstones.is_empty() {
-            return Err("this shard has no tombstone to sweep".to_string());
-        }
-        let mut declaration = Declaration::default();
-        for key in tombstones {
-            declare(
-                &mut declaration,
-                Effect {
-                    target: EffectTarget::Point(*key),
-                    mode: Mode::Write { moves: Moves::Both },
-                },
-                None,
-            )
-            .map_err(|conflict| format!("swept cell contradicts the declaration: {conflict}"))?;
-        }
-        let trie = ctx.shard_trie.clone();
-        let local = ctx.local_shard;
-        Ok(PreparedTx {
-            job: Job::Tombstones(tombstones.to_vec()),
-            declaration,
-            nullifiers: Vec::new(),
-            gas_limits: Vec::new(),
-            // A sweep invokes no node, so nothing of it emits.
             event_bytes: Vec::new(),
             work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
@@ -1646,7 +1592,6 @@ impl Executor {
                     Self::prepare_settle(records, *on, ctx, snapshot)
                 }
                 Runs::Clean { answers, .. } => Self::prepare_clean(answers, ctx),
-                Runs::Sweep { tombstones, .. } => Self::prepare_sweep(tombstones, ctx),
                 Runs::Shape(shape) => input
                     .transaction
                     .ok_or_else(|| "a member running a shape holds no body".to_string())

@@ -21,11 +21,11 @@ use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_ve
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, CrossingLeaves, ImportProgress, JmtSnapshot, LeafRows,
     SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
-    key_under_prefix, prefix_low_key,
+    key_under_prefix, load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, StateRoot, SubstateKey, SubstateLeaf,
-    shard_prefix_path,
+    Block, BlockHeight, CertifiedBlock, ChainOrigin, FrontierInputs, ReadFrontier, ShardId,
+    StateRoot, SubstateKey, SubstateLeaf, shard_prefix_path,
 };
 use hyperscale_vm_effects::CrossingLeaf;
 use hyperscale_vm_types::{Address, CollectionId, ProtocolHasher};
@@ -526,7 +526,7 @@ impl BoundaryStore for RocksDbShardStorage {
                 .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
         {
             match CrossingLeaf::read(&ProtocolHasher, key, &value) {
-                Some(CrossingLeaf::Record { .. } | CrossingLeaf::Tombstone { .. }) => {
+                Some(CrossingLeaf::Record { .. }) => {
                     leaves.records.push((key, value));
                 }
                 Some(CrossingLeaf::Answer { .. }) => leaves.claims.push((key, value)),
@@ -534,6 +534,10 @@ impl BoundaryStore for RocksDbShardStorage {
             }
         }
         leaves
+    }
+
+    fn read_frontier(&self, shard: ShardId) -> ReadFrontier {
+        load_read_frontier(self, shard)
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
@@ -641,6 +645,7 @@ impl BoundaryStore for RocksDbShardStorage {
         &self,
         block: &Block,
         creations: &[(SubstateKey, Vec<u8>)],
+        frontier: &FrontierInputs,
     ) -> Result<StateRoot, String> {
         let height = block.height();
         let _commit_guard = self
@@ -660,8 +665,14 @@ impl BoundaryStore for RocksDbShardStorage {
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let filtered =
-            followed_block_writes(self, &self.snapshot(), block, creations, &self.root_path);
+        let filtered = followed_block_writes(
+            self,
+            &self.snapshot(),
+            block,
+            creations,
+            frontier,
+            &self.root_path,
+        );
         if filtered.is_empty() {
             return Ok(base_root);
         }

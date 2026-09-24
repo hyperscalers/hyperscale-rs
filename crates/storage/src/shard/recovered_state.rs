@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip,
-    Hash, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor,
-    StateRoot, ValidatorId, Verified, WeightedTimestamp,
+    Hash, PredecessorTerminal, Provisions, QuorumCertificate, ReadFrontier, SafeVoteRegisters,
+    ShardAnchor, StateRoot, ValidatorId, Verified, WeightedTimestamp,
 };
 
 use super::boundary::CrossingLeaves;
@@ -206,6 +206,14 @@ pub struct RecoveredState {
     /// from.
     pub crossing_leaves: CrossingLeaves,
 
+    /// The read frontier the committed state holds: how far along each
+    /// producer this shard has read, which bounds the record presences
+    /// a block may carry and licenses the deletion of an answer. Read
+    /// off the state on every path that builds one, since it is state
+    /// and every seat holds it; the execution coordinator advances its
+    /// copy from here with the same rule the fold writes it by.
+    pub read_frontier: ReadFrontier,
+
     /// The uncommitted blocks the store kept beside the safe-vote
     /// registers, above the committed tip and in height order.
     ///
@@ -234,7 +242,8 @@ impl RecoveredState {
     /// against `anchor.block_hash` by the fetch path; its `parent_qc`
     /// weighted timestamp is the tip's committee anchor, and
     /// `witness_leaf_hashes` is its verified accumulator window —
-    /// starting at the header's `beacon_witness_base`. `latest_qc`
+    /// starting at the header's `beacon_witness_base`. `read_frontier`
+    /// is the table the imported state holds. `latest_qc`
     /// stays `None` — the boundary block's own QC arrives structurally
     /// bound in [`anchor_qc`](Self::anchor_qc), and the coordinator
     /// adopts it only after verifying it against the anchor's resolved
@@ -247,6 +256,7 @@ impl RecoveredState {
         anchor_qc: QuorumCertificate,
         witness_leaf_hashes: Vec<Hash>,
         substate_bytes: u64,
+        read_frontier: ReadFrontier,
     ) -> Self {
         Self {
             committed_height: anchor.height,
@@ -291,6 +301,7 @@ impl RecoveredState {
             },
             safe_vote_registers: BTreeMap::new(),
             crossing_leaves: CrossingLeaves::default(),
+            read_frontier,
             voted_blocks: Vec::new(),
             recent_headers: Vec::new(),
         }

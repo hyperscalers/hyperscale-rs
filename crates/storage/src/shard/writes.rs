@@ -12,6 +12,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_kernel::Substates;
 
+use crate::shard::read_frontier::with_frontier;
 use crate::shard::store::Anchored;
 use crate::shard::sweep::{removals_of, with_sweep};
 use crate::tree::JmtSnapshot;
@@ -63,7 +64,7 @@ pub fn merge_writes_from_receipts(
 
 /// Everything a prepared commit lands: the receipts `finalizations`
 /// settle, resolved against the parent's baseline, plus the block's own
-/// creations and the sweep's removals.
+/// creations, the sweep's removals and the read frontier's entries.
 ///
 /// One resolution, feeding both the tree and the substate store — they
 /// commit the same values or they disagree about state. It happens once
@@ -87,6 +88,7 @@ pub fn settled_writes_at(
     parent_height: BlockHeight,
     creations: &[(SubstateKey, Vec<u8>)],
     swept: &[SubstateKey],
+    frontier: SettledEntries,
 ) -> SettledWrites {
     assert_eq!(
         baseline.anchor(),
@@ -97,10 +99,13 @@ pub fn settled_writes_at(
         .iter()
         .flat_map(|fw| fw.settling_receipts())
         .collect();
-    with_sweep(
-        merge_writes_from_receipts(&settling, baseline),
-        creations,
-        &removals_of(swept),
+    with_frontier(
+        with_sweep(
+            merge_writes_from_receipts(&settling, baseline),
+            creations,
+            &removals_of(swept),
+        ),
+        frontier,
     )
 }
 

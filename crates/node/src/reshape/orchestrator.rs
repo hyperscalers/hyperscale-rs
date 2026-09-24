@@ -32,9 +32,9 @@ use hyperscale_types::network::response::{
     GetBlockResponse, GetRemoteHeadersResponse, GetStateRangeResponse,
 };
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, LocalTimestamp, NetworkDefinition,
-    PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateKey,
-    SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
+    Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, FrontierInputs, LocalTimestamp,
+    NetworkDefinition, PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot,
+    SubstateKey, SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
@@ -150,6 +150,8 @@ pub enum ReshapeRequest {
         /// The committed cells the block wrote, classified under its own
         /// window.
         creations: Vec<(SubstateKey, Vec<u8>)>,
+        /// What the block's claims did to the read frontier.
+        frontier: FrontierInputs,
     },
     /// Sign a ready signal for `validator` attesting the sync of `child`,
     /// anchored at `anchor`, and notify `recipients` — the target committee
@@ -1230,10 +1232,12 @@ impl ReshapeOrchestrator {
                 }
                 if let Some(block) = tail.take_apply() {
                     let creations = committed_cells_for(&block);
+                    let frontier = FrontierInputs::of_block(&block, view.schedule().windows());
                     out.push(ReshapeRequest::ApplyFollow {
                         shard: child,
                         block,
                         creations,
+                        frontier,
                     });
                 }
             }

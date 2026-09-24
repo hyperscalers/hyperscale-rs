@@ -302,6 +302,15 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("record_asks", None, 1);
     }
 
+    fn record_fenced_claim(&self, reading: &str, carried: bool) {
+        let name = if carried {
+            "fenced_claims_carried"
+        } else {
+            "fenced_claims_refused"
+        };
+        self.inc(name, Some(reading), 1);
+    }
+
     fn record_crossing_push_dropped(&self, reason: &str) {
         self.inc("crossing_pushes_dropped", None, 1);
         self.inc("crossing_pushes_dropped", Some(reason), 1);

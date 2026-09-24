@@ -6,11 +6,11 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, settled_writes_at,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
-    StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, FrontierInputs, PreparedCommit,
+    StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
 };
 use rocksdb::WriteBatch;
 
@@ -27,6 +27,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         finalizations: &[Arc<Verifiable<Finalization>>],
         creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
+        frontier: &FrontierInputs,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         // Everything the ticks carried, for storage; only what they
@@ -35,14 +36,17 @@ impl ShardChainWriter for RocksDbShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter())
             .collect();
+        let frontier = read_frontier_writes(parent.state, frontier);
         // Nothing to write → state root is unchanged. Build a no-op
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet (e.g.,
         // proposer just exited sync and BlockPersisted hasn't fired).
-        // A block's sweep and its committed cells are writes like any
-        // other, so a block that removes or creates something is not one
-        // of these however few receipts it carries.
-        if receipts.is_empty() && creations.is_empty() && removals.is_empty() {
+        // A block's sweep, its committed cells and its read frontier are
+        // writes like any other, so a block that removes, creates or
+        // raises something is not one of these however few receipts it
+        // carries.
+        if receipts.is_empty() && creations.is_empty() && removals.is_empty() && frontier.is_empty()
+        {
             let jmt_snapshot = Arc::new(noop_jmt_snapshot(
                 &SnapshotTreeStore::new(&self.db, self.root_path.clone()),
                 parent.pending,
@@ -79,6 +83,7 @@ impl ShardChainWriter for RocksDbShardStorage {
             parent.height,
             creations,
             removals,
+            frontier,
         );
 
         let (computed_root, collected) = if parent.pending.is_empty() {
