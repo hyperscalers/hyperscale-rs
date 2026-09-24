@@ -33,7 +33,6 @@
 
 mod action;
 mod action_context;
-mod crossing_pulls;
 mod fetch_ids;
 mod fetch_request;
 mod protocol_event;
@@ -45,7 +44,6 @@ pub use action::{
     ParticipationChange, ProvisionsRequest,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock};
-pub use crossing_pulls::CrossingPulls;
 pub use fetch_ids::FetchIds;
 pub use fetch_request::FetchRequest;
 pub use hyperscale_dispatch::Parallelism;

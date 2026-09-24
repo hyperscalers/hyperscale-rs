@@ -413,31 +413,6 @@ pub enum ProtocolEvent {
         provisions: Arc<Provisions>,
     },
 
-    /// What a producer answered for records this shard named, at an
-    /// anchor it had already commit-proven.
-    ///
-    /// Its own event rather than [`Self::UnverifiedProvisionsReceived`]
-    /// for two reasons. A pushed bundle is held to the producing
-    /// header's `provision_tx_roots`, a promise that catches a proposer
-    /// dropping transactions on the broadcast path; no block promised a
-    /// pull, so there is no root to check and nothing that needs to
-    /// stand in its place — what comes back is absorbed for what it
-    /// carries. And a pull's fetch ids are drained by nothing else:
-    /// `ProvisionsAdmitted` releases `ProvisionBinding`'s by
-    /// `(source, target, height)`, which no pull id matches, so this
-    /// fires even for an empty answer and the handler releases them.
-    PulledProvisionsReceived {
-        /// The bundle, or nothing where the producer held none of the
-        /// records at that anchor.
-        provisions: Option<Arc<Provisions>>,
-        /// The producer anchor it was read at, which the asker holds a
-        /// commit proof for.
-        anchor: Anchor,
-        /// The records that were asked for, which name the fetch ids to
-        /// release.
-        records: Vec<SubstateKey>,
-    },
-
     /// Received provisions whose merkle proof predicate already holds —
     /// produced only by the local-dispatch fast path when a colocated
     /// source-shard vnode emits a notification carrying

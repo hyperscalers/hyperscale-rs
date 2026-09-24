@@ -164,6 +164,8 @@ pub struct Metrics {
     /// The bytes a committed block's state claims weigh, proofs
     /// included.
     pub state_claims_weight: Histogram,
+    /// Consumers' asks for crossing records: the fallback reads.
+    pub record_asks: Counter,
     /// Fetch responses a requester's own check refused, by fetch kind and
     /// the check that refused them.
     pub fetch_responses_refused: CounterVec,
@@ -778,6 +780,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            record_asks: register_counter!(
+                "hyperscale_record_asks_total",
+                "Asks a consumer put to a producer's chain for a crossing record it waits on"
+            )
+            .unwrap(),
+
             state_claims_weight: register_histogram!(
                 "hyperscale_state_claims_weight_bytes",
                 "Bytes a committed block's state claims weigh, proofs included",
@@ -1119,6 +1127,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_state_claims_weight(&self, bytes: usize) {
         self.metrics.state_claims_weight.observe(bytes as f64);
+    }
+
+    fn record_record_ask(&self) {
+        self.metrics.record_asks.inc();
     }
 
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {

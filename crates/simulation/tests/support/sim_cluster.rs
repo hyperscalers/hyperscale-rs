@@ -268,6 +268,18 @@ impl SimCluster {
         Self::grown(config, seed, accounts, packages, false)
     }
 
+    /// [`Self::with_grown_accounts`] with every validator on a host of
+    /// its own, so the two shards' committees share no host and a fault
+    /// keyed by host pair cuts exactly one committee's traffic.
+    #[must_use]
+    pub fn with_grown_accounts_on_dedicated_pool_hosts(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+    ) -> Self {
+        Self::grown(config, seed, accounts, GenesisPackages::protocol(), true)
+    }
+
     /// [`Self::with_grown_packages`] with every pool extra on its own
     /// host, so the committees the grow seats share no host — what a
     /// fault rule keyed on committee hosts needs to cut one shard's

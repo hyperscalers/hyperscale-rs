@@ -845,7 +845,7 @@ fn a_delivery_lands_past_every_window_once_the_bundle_arrives_sim() {
 
 #[test]
 fn a_leg_whose_core_never_answers_inside_its_window_sim() {
-    let mut cluster = SimCluster::with_grown_accounts(
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &cross_shard_config(),
         42,
         &[(remote_delegator().1, 1_000_000)],

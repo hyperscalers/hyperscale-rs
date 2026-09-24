@@ -909,9 +909,6 @@ pub enum Action {
         expected: ProvisionTxRootsMap,
         /// Transactions in the block.
         transactions: SharedTransactions,
-        /// Certificates in the block, whose committed outcomes promise
-        /// crossing bundles.
-        certificates: SharedCertificates,
         /// Topology snapshot used to route txs to target shards.
         topology_snapshot: TopologySnapshot,
     },

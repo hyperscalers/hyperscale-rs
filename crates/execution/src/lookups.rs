@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
-    BlockHeight, ConsensusPublicKey, DeclaredKey, DeclaredRange, ExecutionCertificate,
-    Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, ValidatorId, Verifiable, VoteCount, WeightedTimestamp, committed_crossings,
+    BlockHeight, ConsensusPublicKey, ConsensusReceipt, DeclaredKey, DeclaredRange,
+    ExecutionCertificate, Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, VoteCount,
+    WeightedTimestamp,
 };
-use hyperscale_vm_effects::CrossingCell;
+use hyperscale_vm_effects::{CrossingCell, CrossingLeaf};
+use hyperscale_vm_types::ProtocolHasher;
 
 /// Per-shard recipient lists for provision broadcasting.
 pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
@@ -193,95 +195,94 @@ pub fn provision_request(
     })
 }
 
-/// The crossing bundles a block's committed certificates promise: one
-/// request per accepted outcome that escrowed something, naming the
-/// record cells its execution wrote and the shards that claim them.
+/// The crossing records a finalization issued: every live record an
+/// executing member's settling receipt wrote under its own transaction,
+/// with that transaction, in certificate order.
 ///
-/// Read off the certificate alone — every record cell rides its
-/// escrowed entry — so a validator holding the block and not the
-/// transactions builds the same requests, and in the same order the
-/// block's provision roots bucket them.
+/// The one derivation of what a block issued. It walks
+/// [`Finalization::settling_receipts`], never the raw receipt list or
+/// the node's execution cache, and keeps a cell write only when the
+/// value is present, `CrossingLeaf::read` reads it as a record naming
+/// the receipt's own transaction, and the local certificate's outcome
+/// for that transaction is the transaction's own execution. A retired
+/// rewrite reads as a tombstone, and a deletion, a settling member's
+/// write and a write under another transaction's name are not record
+/// writes of an executing member, so none of them is named. Read off
+/// inline block content only, so a replica holding a sealed block and
+/// no transaction bodies derives the same list.
 #[must_use]
-pub fn crossing_requests(
-    certificates: &[Arc<Verifiable<Finalization>>],
-    local_shard: ShardId,
-) -> Vec<ProvisionsRequest> {
-    let mut requests: Vec<ProvisionsRequest> = Vec::new();
-    for finalization in certificates {
-        let finalization = finalization.as_unverified();
-        let promised: BTreeSet<TxHash> = committed_crossings(finalization, local_shard)
-            .map(|(_, tx_hash)| tx_hash)
-            .collect();
-        let Some(ec) = finalization
-            .execution_certificates()
-            .iter()
-            .find(|ec| ec.tick_id() == finalization.tick_id())
-        else {
+pub fn records_written(finalization: &Finalization) -> Vec<(TxHash, SubstateKey, CrossingCell)> {
+    let Some(local) = finalization
+        .execution_certificates()
+        .iter()
+        .find(|ec| ec.tick_id() == finalization.tick_id())
+    else {
+        return Vec::new();
+    };
+    let executing: BTreeSet<TxHash> = local
+        .tx_outcomes()
+        .iter()
+        .filter(|outcome| outcome.executes())
+        .map(TxOutcome::tx_hash)
+        .collect();
+    let mut written = Vec::new();
+    for receipt in finalization.settling_receipts() {
+        if !executing.contains(&receipt.tx_hash) {
+            continue;
+        }
+        let ConsensusReceipt::Succeeded { writes, .. } = receipt.consensus.as_ref() else {
             continue;
         };
-        for outcome in ec.tx_outcomes() {
-            if !promised.contains(&outcome.tx_hash()) {
+        for (key, change) in &writes.cells {
+            let Some(value) = change else {
                 continue;
+            };
+            if let Some(CrossingLeaf::Record { cell, .. }) =
+                CrossingLeaf::read(&ProtocolHasher, *key, value)
+                && cell.tx == receipt.tx_hash
+            {
+                written.push((receipt.tx_hash, *key, cell));
             }
-            requests.push(ProvisionsRequest {
-                tx_hash: outcome.tx_hash(),
-                targets: outcome
-                    .crossing_targets()
-                    .iter()
-                    .copied()
-                    .filter(|&target| target != local_shard)
-                    .collect(),
-                local_keys: outcome.escrowed().to_vec(),
-                local_ranges: Vec::new(),
-            });
         }
     }
-    requests
+    written
 }
 
-/// The bundle a pull asks for: the record cells named, grouped by the
-/// transaction each one says issued it.
+/// Where each record a block's finalizations issued goes: the records
+/// grouped by the shard owning each one's consumer under `trie`, in
+/// certificate order, leaving out `local`.
 ///
-/// `cells` is what the producer read at its own tip, so a key absent
-/// there is simply not among them — which is how a disposed record
-/// yields nothing without any span deciding it had.
-///
-/// **The transaction is read off the cell and never taken from the
-/// asker.** A bundle is staged per transaction and absorbed under that
-/// key, so an asker naming the wrong one would have a producer's own
-/// bytes filed against a transaction they say nothing about. The record
-/// names its issuer; that is the only thing this trusts.
+/// The recipients are not a target set. A consumer inside a multi-shard
+/// core has one owner among its shards; the other core shards are not
+/// pushed to and read the record through their own asks. Sound only
+/// because nothing waits on a push: a missed core shard costs one read,
+/// never a promise, and no consensus-visible set is derived from the
+/// consumer and the trie.
 #[must_use]
-pub fn record_requests(
-    cells: &[(SubstateKey, Vec<u8>)],
-    target: ShardId,
-) -> Vec<ProvisionsRequest> {
-    let mut by_tx: BTreeMap<TxHash, Vec<SubstateKey>> = BTreeMap::new();
-    for (key, bytes) in cells {
-        let Some(cell) = CrossingCell::from_bytes(bytes) else {
-            continue;
-        };
-        by_tx.entry(cell.tx).or_default().push(*key);
+pub fn record_pushes(
+    finalizations: &[Arc<Verifiable<Finalization>>],
+    trie: &ShardTrie,
+    local: ShardId,
+) -> BTreeMap<ShardId, Vec<SubstateKey>> {
+    let mut pushes: BTreeMap<ShardId, Vec<SubstateKey>> = BTreeMap::new();
+    for finalization in finalizations {
+        for (_, key, cell) in records_written(finalization.as_unverified()) {
+            let owner = trie.shard_for_prefix(cell.consumer);
+            if owner != local {
+                pushes.entry(owner).or_default().push(key);
+            }
+        }
     }
-    by_tx
-        .into_iter()
-        .map(|(tx_hash, local_keys)| ProvisionsRequest {
-            tx_hash,
-            targets: vec![target],
-            local_keys,
-            local_ranges: Vec::new(),
-        })
-        .collect()
+    pushes
 }
 
-/// Build provision requests and shard recipients for cross-shard
-/// transactions and for the crossings the block's certificates commit.
+/// Build provision requests and shard recipients for the block's
+/// cross-shard transactions: read sets only.
 ///
 /// Returns `None` if nothing in the block owes anyone a bundle.
 pub fn build_provision_requests(
     topology_snapshot: &TopologySnapshot,
     transactions: &[Arc<Verifiable<Transaction>>],
-    certificates: &[Arc<Verifiable<Finalization>>],
     me: ValidatorId,
     local_shard: ShardId,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
@@ -296,9 +297,6 @@ pub fn build_provision_requests(
             provision_requests.push(request);
         }
     }
-    // After the transactions, as the block's roots bucket them.
-    provision_requests.extend(crossing_requests(certificates, local_shard));
-
     if provision_requests.is_empty() {
         return None;
     }
@@ -325,7 +323,6 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet};
-    use hyperscale_vm_effects::Hash32;
 
     use super::*;
 
@@ -340,60 +337,224 @@ mod tests {
         TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set)
     }
 
-    // ─── record_requests ────────────────────────────────────────────────
+    // ─── records_written ───────────────────────────────────────────────
 
-    fn record_cell(tx: u8, local: u8) -> (SubstateKey, Vec<u8>) {
-        use hyperscale_types::{Address, AddressClass, LocalKey};
-        use hyperscale_vm_effects::{Hash32, IntentHash, Terms};
-        use hyperscale_vm_types::ResourceAddr;
+    use std::sync::Arc as StdArc;
 
-        let key = SubstateKey {
-            owner: Address::new([local; 31], AddressClass::Component),
-            local: LocalKey([local; 16]),
-        };
-        let cell = CrossingCell {
-            resource: ResourceAddr::new([0xE1; 31]),
-            amount: 1,
-            intent: IntentHash(Hash32([local; 32])),
+    use hyperscale_types::{
+        AggregateSignature, BlockHeight, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash,
+        GlobalReceiptRoot, Role, SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId,
+        TxOutcome, WeightedTimestamp,
+    };
+    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms};
+    use hyperscale_vm_types::{Address, AddressClass, ProtocolHasher as Hasher, ResourceAddr};
+
+    /// A crossing produced under `producer`'s target and consumed under
+    /// `consumer`'s, and its record key.
+    fn crossing(seed: u8, producer: u8, consumer: u8) -> (CrossingId, SubstateKey) {
+        let id = CrossingId {
+            producer: Address::new([producer; 31], AddressClass::Component),
+            consumer: Address::new([consumer; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([seed; 32])),
             local: 0,
             output: 0,
-            expiry_ms: 1,
-            tx: TxHash(Hash32([tx; 32])),
-            consumer: key.owner,
-            terms: Terms::Escrowed { credit: key },
         };
-        (key, cell.to_bytes())
+        let key = id.record_key(&Hasher);
+        (id, key)
     }
 
-    /// A pull's cells are bucketed by the transaction each record names,
-    /// not by anything the asker said — a bundle is absorbed per
-    /// transaction, so a record filed under another's would put a
-    /// producer's bytes against a transaction they say nothing about.
+    fn tx(seed: u8) -> TxHash {
+        TxHash(Hash32([seed; 32]))
+    }
+
+    /// A succeeded receipt of `tx` writing `cells`.
+    fn receipt(tx: TxHash, cells: Vec<(SubstateKey, Option<Vec<u8>>)>) -> StoredReceipt {
+        StoredReceipt {
+            tx_hash: tx,
+            consensus: StdArc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: StateWrites {
+                    cells: cells.into_iter().collect(),
+                    ..StateWrites::default()
+                },
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+            metadata: None,
+        }
+    }
+
+    /// A certificate of `tick` carrying `outcomes`.
+    fn certificate(tick: TickId, outcomes: Vec<TxOutcome>) -> StdArc<ExecutionCertificate> {
+        StdArc::new(ExecutionCertificate::new(
+            tick,
+            WeightedTimestamp::from_millis(3),
+            GlobalReceiptRoot::ZERO,
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        ))
+    }
+
+    /// A finalization of `local`'s tick at height 3 carrying `certificates`
+    /// and `receipts`.
+    fn finalization(
+        local: ShardId,
+        certificates: Vec<StdArc<ExecutionCertificate>>,
+        receipts: Vec<StoredReceipt>,
+    ) -> Finalization {
+        Finalization::new(
+            TickId::new(local, BlockHeight::new(3)),
+            TickHalf::Legs,
+            &Capped::new(certificates).expect("a list written out in a test"),
+            Capped::from_array([]),
+        )
+        .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
+    }
+
+    const SUCCEEDED: ExecutionOutcome = ExecutionOutcome::Succeeded {
+        receipt_hash: GlobalReceiptHash::ZERO,
+    };
+
+    /// A settling receipt writing a live record under its own
+    /// transaction yields that key; a deletion, a retired rewrite, a
+    /// settling member's receipt and a record-shaped write naming
+    /// another transaction in the same finalization yield nothing.
     #[test]
-    fn a_pull_buckets_records_by_the_transaction_each_one_names() {
-        let (one, one_bytes) = record_cell(0xA1, 1);
-        let (two, two_bytes) = record_cell(0xA1, 2);
-        let (other, other_bytes) = record_cell(0xB2, 3);
-        let requests = record_requests(
-            &[(one, one_bytes), (other, other_bytes), (two, two_bytes)],
-            ShardId::ROOT,
+    fn records_written_names_what_the_block_issued() {
+        let local = ShardId::leaf(1, 0);
+        let tick = TickId::new(local, BlockHeight::new(3));
+        let (issued, issued_key) = crossing(1, 0x11, 0x21);
+        let (deleted, deleted_key) = crossing(2, 0x12, 0x22);
+        let (retired, retired_key) = crossing(3, 0x13, 0x23);
+        let (others, others_key) = crossing(4, 0x14, 0x24);
+        let (settled, settled_key) = crossing(5, 0x15, 0x25);
+        let resource = ResourceAddr::new([0xE1; 31]);
+        let live = |id: CrossingId, tx: TxHash| id.cell(tx, resource, 7, 9_000, Terms::Owed);
+
+        let finalization = finalization(
+            local,
+            vec![certificate(
+                tick,
+                vec![
+                    TxOutcome::new(tx(0xA1), SUCCEEDED.clone()),
+                    TxOutcome::new(tx(0xA5), SUCCEEDED.clone()).as_role(Role::Settling),
+                ],
+            )],
+            vec![
+                receipt(
+                    tx(0xA1),
+                    vec![
+                        (issued_key, Some(live(issued, tx(0xA1)).to_bytes())),
+                        (deleted_key, None),
+                        (
+                            retired_key,
+                            Some(
+                                retired
+                                    .cell(tx(0xA1), resource, 0, 9_000, Terms::Retired)
+                                    .to_bytes(),
+                            ),
+                        ),
+                        (others_key, Some(live(others, tx(0xB0)).to_bytes())),
+                    ],
+                ),
+                receipt(
+                    tx(0xA5),
+                    vec![(settled_key, Some(live(settled, tx(0xA5)).to_bytes()))],
+                ),
+            ],
         );
-        assert_eq!(requests.len(), 2, "two transactions, two bundles");
-        let shared = requests
-            .iter()
-            .find(|r| r.tx_hash == TxHash(Hash32([0xA1; 32])))
-            .expect("the transaction two records name");
-        assert_eq!(shared.local_keys, vec![one, two]);
-        assert_eq!(shared.targets, vec![ShardId::ROOT]);
+        let written = records_written(&finalization);
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(written[0].0, tx(0xA1));
+        assert_eq!(written[0].1, issued_key);
+        assert_eq!(written[0].2, live(issued, tx(0xA1)));
+        let _ = deleted;
     }
 
-    /// A key whose bytes are not a record is passed over rather than
-    /// served: the producer read it at its tip and it is not a crossing,
-    /// so there is nothing about it to prove.
+    /// A member refused by a counterpart certificate and one left
+    /// uncovered both carry succeeded writes with a record, and neither
+    /// is named.
     #[test]
-    fn a_pull_serves_nothing_for_a_key_that_is_not_a_record() {
-        let (key, _) = record_cell(0xA1, 1);
-        assert!(record_requests(&[(key, vec![0xDE, 0xAD])], ShardId::ROOT).is_empty());
+    fn records_written_skips_what_the_certificates_do_not_settle() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let tick = TickId::new(local, BlockHeight::new(3));
+        let (refused, refused_key) = crossing(6, 0x16, 0x26);
+        let (uncovered, uncovered_key) = crossing(7, 0x17, 0x27);
+        let resource = ResourceAddr::new([0xE1; 31]);
+        let live = |id: CrossingId, tx: TxHash| id.cell(tx, resource, 7, 9_000, Terms::Owed);
+
+        let finalization = finalization(
+            local,
+            vec![
+                certificate(
+                    tick,
+                    vec![
+                        TxOutcome::new(tx(0xC1), SUCCEEDED.clone()).awaiting([remote]),
+                        TxOutcome::new(tx(0xC2), SUCCEEDED.clone()).awaiting([remote]),
+                    ],
+                ),
+                certificate(
+                    TickId::new(remote, BlockHeight::new(5)),
+                    vec![TxOutcome::new(tx(0xC1), ExecutionOutcome::Failed)],
+                ),
+            ],
+            vec![
+                receipt(
+                    tx(0xC1),
+                    vec![(refused_key, Some(live(refused, tx(0xC1)).to_bytes()))],
+                ),
+                receipt(
+                    tx(0xC2),
+                    vec![(uncovered_key, Some(live(uncovered, tx(0xC2)).to_bytes()))],
+                ),
+            ],
+        );
+        assert!(
+            records_written(&finalization).is_empty(),
+            "the refused member and the uncovered one issue nothing"
+        );
+    }
+
+    /// Each record goes to the shard owning its consumer in the given
+    /// trie, in certificate order, and never to the local shard.
+    #[test]
+    fn a_record_is_pushed_to_its_consumers_owner() {
+        let local = ShardId::leaf(1, 0);
+        let other = ShardId::leaf(1, 1);
+        let trie = ShardTrie::from_leaves([local, other]);
+        let resource = ResourceAddr::new([0xE1; 31]);
+        // Consumers under prefixes the trie routes to `other` and to
+        // `local`: the high bit of the owner decides under a one-bit
+        // trie.
+        let (away, away_key) = crossing(8, 0x18, 0xC8);
+        let (home, home_key) = crossing(9, 0x19, 0x19);
+        assert_eq!(trie.shard_for_prefix(away.consumer), other);
+        assert_eq!(trie.shard_for_prefix(home.consumer), local);
+        let cell = |id: CrossingId, tx: TxHash| id.cell(tx, resource, 7, 9_000, Terms::Owed);
+        let finalization = |seed: u8, id: CrossingId, key: SubstateKey| {
+            StdArc::new(Verifiable::from(finalization(
+                local,
+                vec![certificate(
+                    TickId::new(local, BlockHeight::new(3)),
+                    vec![TxOutcome::new(tx(seed), SUCCEEDED.clone())],
+                )],
+                vec![receipt(
+                    tx(seed),
+                    vec![(key, Some(cell(id, tx(seed)).to_bytes()))],
+                )],
+            )))
+        };
+        let pushes = record_pushes(
+            &[
+                finalization(0xD1, home, home_key),
+                finalization(0xD2, away, away_key),
+            ],
+            &trie,
+            local,
+        );
+        assert_eq!(pushes, BTreeMap::from([(other, vec![away_key])]));
     }
 
     // ─── peers_excluding_self ───────────────────────────────────────────
@@ -461,61 +622,5 @@ mod tests {
         let keys = committee_public_keys_for_shard(&topology_snapshot, ShardId::leaf(8, 99))
             .expect("empty committee is not corruption");
         assert!(keys.is_empty());
-    }
-
-    /// A crossing request names exactly what a committed outcome
-    /// escrowed — the record cells, toward the shards that claim them —
-    /// and a refused outcome yields none.
-    #[test]
-    fn crossing_requests_name_the_record_cells_the_outcome_escrowed() {
-        use hyperscale_types::{
-            AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-            GlobalReceiptHash, GlobalReceiptRoot, Hash, SignerBitfield, TickHalf, TickId,
-            TxOutcome, WeightedTimestamp,
-        };
-        use hyperscale_vm_types::{Address, AddressClass, LocalKey};
-
-        let local = ShardId::leaf(1, 0);
-        let target = ShardId::leaf(1, 1);
-        let record = SubstateKey {
-            owner: Address::new([0xC1; 31], AddressClass::Component),
-            local: LocalKey([1; 16]),
-        };
-        let accepted = TxHash::from(Hash::from_bytes(&[1; 32]));
-        let refused = TxHash::from(Hash::from_bytes(&[2; 32]));
-        let tick = TickId::new(local, BlockHeight::new(3));
-        let ec = ExecutionCertificate::new(
-            tick,
-            WeightedTimestamp::from_millis(3),
-            GlobalReceiptRoot::ZERO,
-            Capped::from_array([
-                TxOutcome::new(
-                    accepted,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .escrowing([record])
-                .crossing_to([target]),
-                TxOutcome::new(refused, ExecutionOutcome::Failed)
-                    .escrowing([record])
-                    .crossing_to([target]),
-            ]),
-            AggregateSignature::ZERO,
-            SignerBitfield::new(4),
-        );
-        let finalization = Arc::new(Verifiable::from(Finalization::new(
-            tick,
-            TickHalf::Legs,
-            &Capped::from_array([Arc::new(ec)]),
-            Capped::from_array([]),
-        )));
-
-        let requests = crossing_requests(std::slice::from_ref(&finalization), local);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].tx_hash, accepted);
-        assert_eq!(requests[0].targets, vec![target]);
-        assert_eq!(requests[0].local_keys, vec![record]);
-        assert!(requests[0].local_ranges.is_empty());
     }
 }

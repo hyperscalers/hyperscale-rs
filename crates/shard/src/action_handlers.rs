@@ -352,13 +352,9 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     let local_receipt_root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     let provision_root = Verified::<ProvisionsRoot>::compute(&raw_provision_hashes).into_inner();
-    let provision_tx_roots = Verified::<ProvisionTxRootsMap>::compute(
-        local_shard,
-        topology_snapshot,
-        &transactions,
-        &certificates,
-    )
-    .into_inner();
+    let provision_tx_roots =
+        Verified::<ProvisionTxRootsMap>::compute(local_shard, topology_snapshot, &transactions)
+            .into_inner();
 
     // The drain is deterministic from the block's own content: the
     // places its transactions take, less those its certificates give
@@ -719,7 +715,6 @@ where
             block_hash,
             expected,
             transactions,
-            certificates,
             topology_snapshot,
         } => {
             let start = Stopwatch::start();
@@ -727,7 +722,6 @@ where
                 local_shard: ctx.shard,
                 topology_snapshot: &topology_snapshot,
                 transactions: &transactions,
-                certificates: &certificates,
             };
             let result = expected.verify(&ptx_ctx);
             record_signature_verification_latency(

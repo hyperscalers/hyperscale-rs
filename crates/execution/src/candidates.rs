@@ -20,7 +20,7 @@ use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_types::{
     EscrowedValue, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{CrossingCell, Kind};
+use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
 
 use crate::provisional::ProvisionalCells;
@@ -69,19 +69,17 @@ impl Candidate {
     }
 }
 
-/// What committed bundles attested for the edges `tx`'s legs on `local`
+/// What committed claims attested for the edges `tx`'s legs on `local`
 /// consume: each crossing landing here, with the value its record cell
 /// says left.
 ///
 /// A divided member only. The cell was proven against the producer's
-/// committed root when its bundle was absorbed, and its bytes are the
+/// committed root by the claim that carried it, and its bytes are the
 /// kernel's own record, so what it says left is what the consumer
-/// claims — read from that bundle and no other, since a bundle from any
-/// other shard carrying the key proves nothing about a cell it does not
-/// own. An edge whose cell is missing or unreadable is left out, and
-/// the planner refuses the member for it rather than running short.
+/// claims, read off the arrival the fold indexed by the record's key.
+/// An edge whose record has not arrived is left out, and the planner
+/// refuses the member for it rather than running short.
 fn arrivals_for(
-    tx: &Transaction,
     classified: &Classified,
     provisioning: &ProvisioningTracker,
     local: ShardId,
@@ -99,8 +97,7 @@ fn arrivals_for(
         })
         .filter_map(|edge| {
             let key = edge.crossing.id.record_key(&ProtocolHasher);
-            let bytes = provisioning.present_cell(tx.hash(), edge.from, key)?;
-            let record = CrossingCell::from_bytes(bytes)?;
+            let record = provisioning.arrived().get(&key)?.cell;
             Some(EscrowedValue {
                 node: edge.producer,
                 output: edge.output,
@@ -292,10 +289,9 @@ impl TickCandidates {
             }
 
             // What arrived for the edges this member's legs consume, read
-            // off the record cells the committed bundles proved. Every
+            // off the record cells the committed claims proved. Every
             // requirement is met, so every edge has its cell.
             let arrivals = arrivals_for(
-                &candidate.tx,
                 candidate.member.classified(),
                 provisioning,
                 local,

@@ -26,15 +26,14 @@ use std::sync::Arc;
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, CROSSING_BUNDLE_WINDOW, DeclaredWork,
-    Finalization, FinalizationHash, Inclusion, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
+    Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, Probed, ProvisionHash, Provisions, ShardId, StateClaim, SubstateKey,
+    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, ShardId, StateClaim, SubstateKey,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
     budget_admits_block, caps_admit_transaction, evidence_admits_block, state_claims_admit_block,
     sweep_admits_block,
 };
-use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf};
-use hyperscale_vm_types::ProtocolHasher;
+use hyperscale_vm_effects::CROSSING_CELL_BYTES;
 
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
@@ -158,23 +157,6 @@ pub(crate) trait Section {
     fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, item: &Self::Item) -> Result<(), String>;
 }
 
-/// Whether `batch` carries a crossing record, live or retired: the one
-/// permanent cell a bundle can carry, and so the one the bundle window
-/// is measured against. Read off each leaf by derivation, so every
-/// replica reaches the same verdict whatever it has installed.
-fn carries_a_record(batch: &Provisions) -> bool {
-    batch.transactions().iter().any(|entry| {
-        entry.entries.iter().any(|cell| {
-            cell.value.as_ref().is_some_and(|bytes| {
-                matches!(
-                    CrossingLeaf::read(&ProtocolHasher, cell.key, bytes),
-                    Some(CrossingLeaf::Record { .. } | CrossingLeaf::Tombstone { .. })
-                )
-            })
-        })
-    })
-}
-
 /// The block's provisions.
 pub(crate) struct ProvisionsSection;
 
@@ -224,29 +206,6 @@ impl Section for ProvisionsSection {
                  the attested frontier"
             ));
         }
-        // **A bundle carrying a crossing record is admitted fresh, and
-        // that is what bounds an answer cell's life.** A consumer's
-        // answer is what makes a replayed delivery abort, and a replay
-        // needs a bundle to dispatch at all — so the answer may be
-        // deleted once no bundle for its record can be committed. The
-        // serving floor alone does not say that: a proof is valid
-        // whoever serves it, so a peer ignoring the floor could hand a
-        // proposer a good bundle at an old height. Here every voter
-        // reads the same two figures off the block and reaches the same
-        // verdict.
-        //
-        // Only a bundle carrying a record, live or retired, because only
-        // a record is permanent. Every other cell a bundle carries is a
-        // mutable read whose whole meaning is the height it was taken
-        // at, and the paths that fetch one are prompt by construction.
-        if ctx.anchor.elapsed_since(batch.source_block_ts()) > CROSSING_BUNDLE_WINDOW
-            && carries_a_record(batch)
-        {
-            return Err(format!(
-                "provisions batch {provision_hash:?} carries a crossing record from outside the \
-                 bundle window"
-            ));
-        }
         let tx_count = fold.tx_count.saturating_add(batch.transactions().len());
         if tx_count > MAX_TXS_PER_BLOCK {
             return Err(format!(
@@ -282,16 +241,26 @@ pub(crate) struct TransactionsFold<'a> {
     /// The provisions admitted beside them, which engage a cross-shard
     /// transaction's payer.
     pub(crate) provisions: &'a ProvisionsFold,
+    /// The transactions that only deliver here and whose every record
+    /// the block's claims read live under its own name, which engages
+    /// them in place of a payer bundle: a settled record implies that
+    /// the transaction's core committed, and so that its payer engaged.
+    pub(crate) readable: &'a HashSet<TxHash>,
 }
 
 impl<'a> TransactionsFold<'a> {
-    /// A fold beside the admitted `provisions`.
+    /// A fold beside the admitted `provisions` and the block's
+    /// `readable` deliveries.
     #[must_use]
-    pub(crate) const fn beside(provisions: &'a ProvisionsFold) -> Self {
+    pub(crate) const fn beside(
+        provisions: &'a ProvisionsFold,
+        readable: &'a HashSet<TxHash>,
+    ) -> Self {
         Self {
             sweepable: 0,
             budget: DeclaredWork::ZERO,
             provisions,
+            readable,
         }
     }
 }
@@ -309,10 +278,11 @@ impl<'p> Section for TransactionsSection<'p> {
     /// cannot resolve a package never derives the transaction at all, so
     /// it never reaches this gate — and one that did derive it holds the
     /// metadata, which is what admission reads. Engagement demands the
-    /// transaction commit proof
-    /// — the payer bundle — ride in the same block or a committed one,
-    /// which closes the Byzantine-proposer path to engaging counterpart
-    /// locks before the payer shard commits. The sweep cap bounds how
+    /// transaction commit proof — the payer bundle — ride in the same
+    /// block or a committed one, or a live reading of every record a
+    /// delivery-only transaction consumes ride in the same block, which
+    /// closes the Byzantine-proposer path to engaging counterpart locks
+    /// before the payer shard commits. The sweep cap bounds how
     /// fast a shard can be made to owe cells, counted off the
     /// derivations for this shard plus the one committed cell the chain
     /// writes for every transaction it carries; a transaction that does
@@ -339,6 +309,7 @@ impl<'p> Section for TransactionsSection<'p> {
                 .provisioned
                 .contains(&(payer_shard, tx_hash))
             && !ctx.dedup.contains_provision_tx(payer_shard, tx_hash)
+            && !fold.readable.contains(&tx_hash)
         {
             return Err(format!(
                 "cross-shard VM transaction {tx_hash} lacks its payer bundle from \
@@ -753,24 +724,6 @@ impl<'f> Section for RecordsSection<'f> {
     }
 }
 
-/// What some claim the block carries says about `record`, by
-/// [`Probed::Record`]'s own rule: a presence at whatever anchor the
-/// claim names, since a record is written by the one execution that
-/// issues the crossing and is swept by nothing.
-///
-/// One statement of it, because two sections read it — a late delivery
-/// is licensed by the record it consumes standing, and nothing else
-/// reads a record off a block.
-pub(crate) fn record_reading(
-    state_claims: &[StateClaim],
-    record: SubstateKey,
-) -> Option<Inclusion> {
-    state_claims
-        .iter()
-        .filter_map(|claim| claim.reading(record))
-        .find_map(|inclusion| Probed::Record.read(inclusion))
-}
-
 /// The block's state claims.
 pub(crate) struct StateClaimsSection;
 
@@ -812,21 +765,27 @@ impl Section for StateClaimsSection {
     type Item = StateClaim;
     type Fold = StateClaimsFold;
 
-    /// A well-formed claim whose proof bears out every reading, in its
-    /// place in the section's order, within the section's budget.
+    /// A well-formed claim whose proof bears out every reading, at an
+    /// anchor no recovery fences, in its place in the section's order,
+    /// within the section's budget — and, where it carries a value, at
+    /// an anchor inside the reading window of the block's own clock and
+    /// on the shard that owned the cell at the anchor's clock.
     ///
     /// The proof is walked here, so a bad one refuses the block on
-    /// every replica alike: the check is over the block's content and
-    /// the anchor the claim names, nothing this validator fetched.
-    /// Whether that anchor is a header this validator commit-proved is
-    /// the vote fence's question. The order rule gives one set of
-    /// answers one encoding, and the budget is spent by the byte, proof
+    /// every replica alike: every rule is a pure function of the block
+    /// and its anchor, nothing this validator fetched. Whether the
+    /// anchor is a header this validator commit-proved is the vote
+    /// fence's question. The order rule gives one set of answers one
+    /// encoding, and the budget is spent by the byte, proof and values
     /// included, so the decode cap on the count never binds first.
-    fn admit(
-        _ctx: &Admission<'_>,
-        fold: &mut Self::Fold,
-        claim: &StateClaim,
-    ) -> Result<(), String> {
+    ///
+    /// The reading window binds readings that carry value: a replayed
+    /// delivery needs one to dispatch at all, so past the window no
+    /// replay can be fed, which is what bounds an answer cell's life.
+    /// The owner is read off the global schedule at the anchor's own
+    /// clock, never the head, so a split parent's coast anchor owns
+    /// nothing; the fold reads the committed fact and never re-resolves.
+    fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, claim: &StateClaim) -> Result<(), String> {
         let at = || {
             format!(
                 "state claim on {:?} at height {}",
@@ -840,6 +799,42 @@ impl Section for StateClaimsSection {
         claim
             .verify()
             .map_err(|err| format!("{} does not prove its readings: {err}", at()))?;
+        if ctx
+            .snapshot
+            .recovery_fences(claim.anchor.shard, claim.anchor.height)
+        {
+            return Err(format!(
+                "{} is at a height the shard's recovery fences",
+                at()
+            ));
+        }
+        if claim.holds_a_value() {
+            if ctx.anchor.elapsed_since(claim.anchor.ts) > CROSSING_BUNDLE_WINDOW {
+                return Err(format!(
+                    "{} carries a value read outside the reading window",
+                    at()
+                ));
+            }
+            let Some(window) = ctx.schedule.at(claim.anchor.ts) else {
+                return Err(format!(
+                    "{} carries a value at an anchor no schedule window covers",
+                    at()
+                ));
+            };
+            let trie = window.shard_trie();
+            if claim
+                .cells
+                .iter()
+                .filter(|(_, stated)| stated.held().is_some())
+                .any(|(key, _)| trie.shard_for_prefix(key.owner) != claim.anchor.shard)
+            {
+                return Err(format!(
+                    "{} carries the value of a cell its anchor's shard did not own at the \
+                     anchor's clock",
+                    at()
+                ));
+            }
+        }
         if !fold.in_order(claim) {
             return Err(format!("{} repeats or precedes the one before it", at()));
         }
@@ -1030,75 +1025,5 @@ pub(crate) mod fixtures {
         }
         sched.set_head(after);
         sched
-    }
-}
-
-#[cfg(test)]
-mod record_window_tests {
-    use hyperscale_hbor::{Bytes, Capped};
-    use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
-        SubstateEntry, SubstateKey, TxHash, WeightedTimestamp,
-    };
-    use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, Terms};
-    use hyperscale_vm_types::{
-        Address, AddressClass, ProtocolHasher, ResourceAddr, TxHash as VmTxHash,
-    };
-
-    use super::carries_a_record;
-
-    /// A batch provisioning one transaction with one cell.
-    fn batch(key: SubstateKey, value: Vec<u8>) -> Provisions {
-        Provisions::new(
-            ShardId::leaf(1, 0),
-            ShardId::leaf(1, 1),
-            BlockHeight::new(1),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"provisioned")),
-                Capped::from_array([SubstateEntry::new(
-                    key,
-                    Some(Bytes::new(value).expect("a cell fits")),
-                )]),
-            )]),
-        )
-    }
-
-    /// The bundle window counts a live record and a retired one alike:
-    /// both are permanent, and a tombstone carried late is a tombstone
-    /// a consumer would date its answer's deletion by. An answer, or an
-    /// ordinary cell, is not a record.
-    #[test]
-    fn a_live_record_and_a_tombstone_both_count_as_a_record() {
-        let id = CrossingId {
-            producer: Address::new([0x5A; 31], AddressClass::Component),
-            consumer: Address::new([0x5C; 31], AddressClass::Component),
-            intent: IntentHash(Hash32([0xB0; 32])),
-            local: 1,
-            output: 0,
-        };
-        let record_key = id.record_key(&ProtocolHasher);
-        let tx = VmTxHash(Hash32([0xC0; 32]));
-        let live = id
-            .cell(tx, ResourceAddr::new([0xE0; 31]), 500, 1_000, Terms::Owed)
-            .to_bytes();
-        let retired = id
-            .cell(tx, ResourceAddr::new([0xE0; 31]), 0, 2_000, Terms::Retired)
-            .to_bytes();
-
-        assert!(carries_a_record(&batch(record_key, live)));
-        assert!(carries_a_record(&batch(record_key, retired)));
-        assert!(
-            !carries_a_record(&batch(
-                id.answer_key(&ProtocolHasher, Answered::Taken),
-                id.answer(tx, Answered::Taken).to_bytes(),
-            )),
-            "an answer is not a record",
-        );
-        assert!(
-            !carries_a_record(&batch(record_key, vec![1, 2, 3])),
-            "nor is an ordinary cell",
-        );
     }
 }

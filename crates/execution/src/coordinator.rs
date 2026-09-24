@@ -64,9 +64,9 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
     FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, MerkleInclusionProof, Mode,
     Movement, PriceTable, ProvenAnchors, Provisions, SettledSetVerdict, SettledTxSet, ShardId,
-    ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
+    ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
     derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::{Kind, ProtocolHasher, Terms};
@@ -87,7 +87,7 @@ use crate::lookups::{
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
 use crate::provisional::ProvisionalCells;
-use crate::provisioning::{ProvisioningTracker, Requirement, requirements_of};
+use crate::provisioning::{ProvisioningTracker, Requirement, WantedRecord, requirements_of};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::vote_tracker::VoteTracker;
@@ -481,6 +481,11 @@ pub struct ExecutionCoordinator {
     /// overlap detection. Wraps the detector as a field so conflict flows
     /// stay co-located with the provision state they reason about.
     provisioning: ProvisioningTracker,
+    /// The records the pool's delivering bodies need, as last reported,
+    /// with the clock each read arms on.
+    pool_wanted: Vec<WantedRecord>,
+    /// Those bodies with the records each consumes, for the readable set.
+    pool_bodies: Vec<(TxHash, Vec<SubstateKey>)>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Per-tick execution
@@ -675,6 +680,8 @@ impl ExecutionCoordinator {
             ticks: TickRegistry::new(),
             early: EarlyArrivalBuffer::new(),
             provisioning: ProvisioningTracker::new(),
+            pool_wanted: Vec::new(),
+            pool_bodies: Vec::new(),
             expected_certs: ExpectedCertTracker::new(),
             outbound_certs: OutboundExecutionCertificateTracker::new(),
             exec_certs,
@@ -2923,8 +2930,59 @@ impl ExecutionCoordinator {
     /// says who was party to each transaction.
     fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let trie = self.counterpart_trie(topology_schedule);
-        self.counterparts
-            .probe(trie, self.committed_ts, self.provisioning.arrived())
+        let wanted = self.wanted_records();
+        self.counterparts.probe(trie, self.committed_ts, &wanted)
+    }
+
+    /// The crossing records consumers here wait on with no arrival for:
+    /// the candidates' filed requirements and the pool's delivering
+    /// bodies, one set.
+    fn wanted_records(&self) -> Vec<WantedRecord> {
+        let mut wanted = self.provisioning.wanted_records();
+        wanted.extend(self.pool_wanted.iter().copied());
+        wanted.sort_unstable_by_key(|wanted| (wanted.key, wanted.tx));
+        wanted.dedup_by_key(|wanted| (wanted.key, wanted.tx));
+        wanted
+    }
+
+    /// The records the pool's delivering bodies need, reported each
+    /// commit: bodies parked for engagement or past their validity end,
+    /// each with the records it consumes and whether its validity end
+    /// has passed, which arms the read at once.
+    pub fn want_records(&mut self, bodies: Vec<(TxHash, Vec<SubstateKey>, bool)>) {
+        let now = self.committed_ts;
+        self.pool_bodies = bodies
+            .iter()
+            .map(|(tx, keys, _)| (*tx, keys.clone()))
+            .collect();
+        self.pool_wanted = bodies
+            .into_iter()
+            .flat_map(|(tx, keys, past_validity_end)| {
+                keys.into_iter().map(move |key| WantedRecord {
+                    key,
+                    tx,
+                    arms_at: past_validity_end.then_some(now),
+                })
+            })
+            .collect();
+    }
+
+    /// The pool's delivering bodies whose every record this validator
+    /// holds a live held reading of, to offer beside them: what the pool
+    /// unparks, so the proposer selects the claims and the body in one
+    /// block.
+    #[must_use]
+    pub fn readable_deliveries(&self) -> Vec<TxHash> {
+        self.pool_bodies
+            .iter()
+            .filter(|(tx, keys)| {
+                !keys.is_empty()
+                    && keys
+                        .iter()
+                        .all(|key| self.counterparts.holds_live_record(*key, *tx))
+            })
+            .map(|(tx, _)| *tx)
+            .collect()
     }
 
     /// Keep a fetched proof for a block this validator proposes.
@@ -3223,28 +3281,12 @@ impl ExecutionCoordinator {
         // ask them; the strands no counterpart can answer for any more
         // are let go of below.
         let trie = self.counterpart_trie(topology_schedule);
-        let committed = self.counterparts.on_commit(
-            trie,
-            topology_schedule,
-            block,
-            self.committed_ts,
-            self.provisioning.arrived(),
-        );
+        let wanted = self.wanted_records();
+        let committed =
+            self.counterparts
+                .on_commit(trie, topology_schedule, block, self.committed_ts, &wanted);
         self.gone_this_commit = committed.gone;
-        // The arrivals whose crossings this block finished with. Left
-        // in place they would re-open the very question the answer
-        // removed was suppressing, at every header of the producer.
-        for record in committed.cleaned {
-            self.provisioning.forget_arrival(record);
-        }
         let mut actions = committed.actions;
-        // The crossings a delivery here waits on that no push can still
-        // serve, asked of whoever holds each record now.
-        actions.extend(self.counterparts.pull_unpushed_crossings(
-            trie,
-            self.committed_ts,
-            &self.provisioning.unpushed_crossings(),
-        ));
         self.release_unanswerable(&committed.unanswerable);
         // After the prune, so a delivery the ledger has let go of is not
         // offered again, and after the release, so one just resolved is
@@ -3309,7 +3351,6 @@ impl ExecutionCoordinator {
             Block::Live {
                 header,
                 transactions,
-                certificates,
                 provisions,
                 ..
             } => actions.extend(self.on_live_block_committed(
@@ -3317,8 +3358,8 @@ impl ExecutionCoordinator {
                 block.hash(),
                 header,
                 transactions,
-                certificates,
                 provisions,
+                block.state_claims(),
             )),
             Block::Sealed {
                 header,
@@ -3345,8 +3386,8 @@ impl ExecutionCoordinator {
         block_hash: BlockHash,
         header: &BlockHeader,
         transactions: &[Arc<Verifiable<Transaction>>],
-        certificates: &[Arc<Verifiable<Finalization>>],
         provisions: &[Arc<Verifiable<Provisions>>],
+        state_claims: &[StateClaim],
     ) -> Vec<Action> {
         let height = header.height();
         let mut actions = Vec::new();
@@ -3367,7 +3408,7 @@ impl ExecutionCoordinator {
         if runnable && self.me == header.proposer() {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(anchored, transactions, certificates, self.me, local_shard)
+                build_provision_requests(anchored, transactions, self.me, local_shard)
             {
                 actions.push(Action::FetchAndBroadcastProvisions {
                     block_hash,
@@ -3392,6 +3433,9 @@ impl ExecutionCoordinator {
         if !transactions.is_empty() {
             self.register_committed_txs(anchored, &block, transactions);
         }
+        // After the block's transactions are registered, so a record
+        // read in a transaction's own block is its arrival.
+        self.provisioning.fold_record_readings(state_claims);
         if !provisions.is_empty() {
             self.apply_committed_provisions(provisions);
         }
@@ -4033,7 +4077,7 @@ impl ExecutionCoordinator {
         // read before routing: the leg's tick settled long ago, so the
         // certificate routes nowhere, and the refusal is the one thing
         // in it this shard still has a use for.
-        let mut actions = self.counterparts.on_certificate(ec);
+        let mut actions = self.counterparts.on_certificate(ec, self.committed_ts);
 
         let routing = self.ticks.classify_attestation(ec);
 
@@ -4649,7 +4693,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_hbor::Capped;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
@@ -4659,9 +4703,9 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, CLAIM_VISIBILITY_LAG, CROSSING_BUNDLE_WINDOW, ConsensusPublicKey,
-        ConsensusReceipt, ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows,
-        ExecutionOutcome, GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
+        BeaconWitnessLeafCount, CLAIM_VISIBILITY_LAG, ConsensusPublicKey, ConsensusReceipt,
+        ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome,
+        GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
         MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate,
         RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
         ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, StoredReceipt, SubstateKey,
@@ -10710,187 +10754,15 @@ mod tests {
     /// the subtraction floors at zero.
     const REFUSED_EXPIRY_MS: u64 = 4_000_000;
 
-    /// A crossing the push can still serve is not pulled.
-    ///
-    /// **The floor is the whole of the arming, and it is measured in the
-    /// wait.** `Requirement::Crossing` is filed at classification, for a
-    /// value edge landing here from a node this shard does not run —
-    /// which is before the producer has run the leg that writes the
-    /// record. Pull on the unfloored set and the ask runs ahead of the
-    /// cell's existence, of which the only possible answer is silence.
-    #[test]
-    fn a_crossing_the_push_can_still_serve_is_not_pulled() {
-        let (mut state, trie, record_key, filed_at) = a_delivery_waiting_on_a_crossing();
-        let still_promptly = filed_at
-            .plus(RETENTION_HORIZON)
-            .minus(Duration::from_millis(1));
-        state.provisioning.advance_clock(still_promptly);
-        state
-            .counterparts
-            .proven_anchors
-            .record(proven_anchor_of(PEER, 9, still_promptly));
-        let unpushed = state.provisioning.unpushed_crossings();
-        assert!(
-            !unpushed.contains(&record_key),
-            "short of the horizon the push and its height-keyed fallback own the case",
-        );
-        assert!(
-            state
-                .counterparts
-                .pull_unpushed_crossings(&trie, still_promptly, &unpushed)
-                .is_empty(),
-            "so nothing is asked, with a proven anchor standing that could be asked at",
-        );
-    }
-
-    /// Past the horizon it is pulled, at an anchor this validator has
-    /// proven, from whoever holds the record's prefix now.
-    ///
-    /// **What the pull is for.** A pushed bundle is pinned to the block
-    /// that promised it, and a delivery that has waited long enough for
-    /// that block to age past the producer's retention can never be
-    /// served one again. The pull names an anchor this validator chose
-    /// because it can verify it, so there is no height to age out.
-    #[test]
-    fn a_crossing_no_push_can_serve_is_pulled_at_a_proven_anchor() {
-        let (mut state, trie, record_key, filed_at) = a_delivery_waiting_on_a_crossing();
-        let at = filed_at.plus(RETENTION_HORIZON);
-        state.provisioning.advance_clock(at);
-        let unpushed = state.provisioning.unpushed_crossings();
-        assert!(
-            unpushed.contains(&record_key),
-            "past the horizon no push can serve it, so it is what a pull asks for",
-        );
-        assert_eq!(
-            trie.shard_for_prefix(record_key.owner),
-            PEER,
-            "and the record's own prefix is what says who to ask",
-        );
-
-        // With no proven anchor of the producer there is nothing to ask
-        // against, and nothing is asked.
-        assert!(
-            state
-                .counterparts
-                .pull_unpushed_crossings(&trie, at, &unpushed)
-                .is_empty(),
-            "an anchor this validator cannot verify is no anchor to ask at",
-        );
-
-        let anchor = proven_anchor_of(PEER, 9, at);
-        state.counterparts.proven_anchors.record(anchor);
-        let asked = state
-            .counterparts
-            .pull_unpushed_crossings(&trie, at, &unpushed);
-        assert_eq!(asked.len(), 1, "one producer, one ask; got {asked:?}");
-        assert!(
-            matches!(
-                &asked[0],
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::CrossingPulls(ids),
-                    shard,
-                    ..
-                }) if *shard == PEER && ids.as_slice() == [(anchor, record_key)]
-            ),
-            "the pull names the record and the anchor it is read at; got {:?}",
-            asked[0],
-        );
-    }
-
-    /// And it is not put again until the producer has moved *and* a
-    /// round trip's worth of time has passed.
-    ///
-    /// **Both halves, because either alone over-asks.** An anchor that
-    /// has not advanced would be read the same way twice, so a producer
-    /// standing still is asked once. And a producer that is running
-    /// lands anchors here every block, far faster than a round trip
-    /// resolves, so paced on the anchor alone the same question goes out
-    /// many times over before its first answer.
-    #[test]
-    fn a_pull_is_not_put_again_until_the_producer_has_moved() {
-        let (mut state, trie, _, filed_at) = a_delivery_waiting_on_a_crossing();
-        let at = filed_at.plus(RETENTION_HORIZON);
-        state.provisioning.advance_clock(at);
-        let unpushed = state.provisioning.unpushed_crossings();
-        state
-            .counterparts
-            .proven_anchors
-            .record(proven_anchor_of(PEER, 9, at));
-        assert_eq!(
-            state
-                .counterparts
-                .pull_unpushed_crossings(&trie, at, &unpushed)
-                .len(),
-            1,
-            "the first ask goes out",
-        );
-        assert!(
-            state
-                .counterparts
-                .pull_unpushed_crossings(&trie, at, &unpushed)
-                .is_empty(),
-            "and is not repeated at the same anchor",
-        );
-
-        let later = at.plus(CROSSING_BUNDLE_WINDOW);
-        assert!(
-            state
-                .counterparts
-                .pull_unpushed_crossings(&trie, later, &unpushed)
-                .is_empty(),
-            "nor once the clock has run on, while the producer stands still",
-        );
-        state
-            .counterparts
-            .proven_anchors
-            .record(proven_anchor_of(PEER, 10, at));
-        assert!(
-            state
-                .counterparts
-                .pull_unpushed_crossings(&trie, at, &unpushed)
-                .is_empty(),
-            "nor on a newer anchor inside one round trip",
-        );
-        assert_eq!(
-            state
-                .counterparts
-                .pull_unpushed_crossings(&trie, later, &unpushed)
-                .len(),
-            1,
-            "only a producer that has moved, a round trip later, is asked again",
-        );
-    }
-
-    /// And a crossing a bundle already carried is not pulled at all.
-    #[test]
-    fn a_crossing_already_in_hand_is_not_pulled() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = arrived_record(0x72, REFUSED_EXPIRY_MS);
-        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
-        state.provisioning.advance_clock(at);
-        state.provisioning.record_required(
-            cell.tx,
-            BTreeSet::from([Requirement::Crossing {
-                source: ShardId::ROOT,
-                key: record_key,
-            }]),
-        );
-        state.provisioning.handed(record_key, cell, at);
-        state.provisioning.advance_clock(at.plus(RETENTION_HORIZON));
-        assert!(
-            state.provisioning.unpushed_crossings().is_empty(),
-            "the bundle carried it, so there is nothing to ask for",
-        );
-    }
-
     /// A shard seated at [`HOME`] with a delivery waiting on a crossing
-    /// [`PEER`] writes, and no bundle for it. Returns the record and the
-    /// clock the requirement was filed at, which is what the pull's
-    /// floor is measured from.
+    /// [`PEER`] writes, and no reading of it. Returns the record, its
+    /// cell and the clock the requirement was filed at, which is what the
+    /// read's arming is measured from.
     fn a_delivery_waiting_on_a_crossing() -> (
         ExecutionCoordinator,
         ShardTrie,
         SubstateKey,
+        CrossingCell,
         WeightedTimestamp,
     ) {
         let schedule = two_shard_topology();
@@ -10900,17 +10772,151 @@ mod tests {
         state.provisioning.advance_clock(filed_at);
         state.provisioning.record_required(
             cell.tx,
-            BTreeSet::from([Requirement::Crossing {
-                source: PEER,
-                key: record_key,
-            }]),
+            BTreeSet::from([Requirement::Crossing { key: record_key }]),
         );
         let trie = schedule
             .at(filed_at)
             .expect("the window is seated")
             .shard_trie()
             .clone();
-        (state, trie, record_key, filed_at)
+        (state, trie, record_key, cell, filed_at)
+    }
+
+    /// The anchors a probe's asks of [`PEER`] name `record` at.
+    fn record_asks(actions: &[Action], record: SubstateKey) -> Vec<Anchor> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::StateProofs(ids),
+                    shard,
+                    ..
+                }) if *shard == PEER => Some(
+                    ids.iter()
+                        .filter(|(_, key)| *key == record)
+                        .map(|(anchor, _)| *anchor)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// A record a delivery here waits on is read from the record's
+    /// holder from the commit that filed the want, at the holder's
+    /// newest proven anchor, and not again until the holder has moved
+    /// on; a committed arrival ends the read.
+    #[test]
+    fn a_record_read_arms_at_the_commit_and_ends_with_the_arrival() {
+        let (mut state, trie, record_key, cell, filed_at) = a_delivery_waiting_on_a_crossing();
+        let before = filed_at.minus(Duration::from_millis(1));
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 9, before));
+        let wanted = state.wanted_records();
+        assert_eq!(wanted.len(), 1);
+        assert!(
+            record_asks(
+                &state.counterparts.probe(&trie, before, &wanted),
+                record_key
+            )
+            .is_empty(),
+            "nothing is asked before the commit that filed the want",
+        );
+
+        let armed = filed_at;
+        let first = proven_anchor_of(PEER, 10, armed);
+        state.counterparts.proven_anchors.record(first);
+        assert_eq!(
+            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key),
+            vec![first],
+            "one ask at the holder's newest proven anchor",
+        );
+        assert!(
+            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key).is_empty(),
+            "and not again at the same anchor",
+        );
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 11, armed));
+        assert!(
+            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key).is_empty(),
+            "the second ask waits two heights",
+        );
+        let third = proven_anchor_of(PEER, 12, armed);
+        state.counterparts.proven_anchors.record(third);
+        assert_eq!(
+            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key),
+            vec![third],
+        );
+
+        state.provisioning.handed(record_key, cell);
+        let wanted = state.wanted_records();
+        assert!(wanted.is_empty(), "a committed arrival ends the want");
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 20, armed));
+        assert!(
+            record_asks(&state.counterparts.probe(&trie, armed, &wanted), record_key).is_empty(),
+        );
+    }
+
+    /// A delivering body the pool reports is asked for at once when it
+    /// is past its validity end, and once every record it consumes is
+    /// held as a live reading the body is readable, to be unparked and
+    /// offered beside the claims.
+    #[test]
+    fn a_parked_deliverys_records_are_asked_and_it_is_readable_once_held() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = arrived_record(0x72, REFUSED_EXPIRY_MS);
+        let now = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        state.provisioning.advance_clock(now);
+        state.committed_ts = now;
+        let trie = schedule
+            .at(now)
+            .expect("the window is seated")
+            .shard_trie()
+            .clone();
+
+        // Inside its validity window nothing but a certificate arms it.
+        state.want_records(vec![(cell.tx, vec![record_key], false)]);
+        let anchor = proven_anchor_of(PEER, 9, now);
+        state.counterparts.proven_anchors.record(anchor);
+        let wanted = state.wanted_records();
+        assert_eq!(wanted.len(), 1);
+        assert!(record_asks(&state.counterparts.probe(&trie, now, &wanted), record_key).is_empty());
+        assert!(state.readable_deliveries().is_empty());
+
+        // Past it the read arms at once.
+        state.want_records(vec![(cell.tx, vec![record_key], true)]);
+        let wanted = state.wanted_records();
+        assert_eq!(
+            record_asks(&state.counterparts.probe(&trie, now, &wanted), record_key),
+            vec![anchor],
+        );
+
+        // The reading lands with the record's value, and the body is
+        // readable.
+        let (state_root, proof) = state_and_proof(PEER, &[record_key], &[record_key]);
+        let proven = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(9),
+            state_root,
+            ts: now,
+        };
+        state.counterparts.proven_anchors.record(proven);
+        state.on_proof_fetched(
+            proven,
+            &[record_key],
+            &proof,
+            &[(record_key, Bytes::new(cell.to_bytes()).unwrap())],
+        );
+        assert_eq!(state.readable_deliveries(), vec![cell.tx]);
     }
 
     /// An anchor of `shard` at `height`, as a validator that has proven

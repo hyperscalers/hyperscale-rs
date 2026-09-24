@@ -4,10 +4,11 @@
 //! One absorption per source shard and transaction —
 //! [`absorbed`](ProvisioningTracker::absorbed) — holds what that shard's
 //! committed bundles carried: the environment its earliest bundle stated
-//! and every leaf, by key. It is what a cross-shard dispatch carries,
-//! where a crossing's record cell is read from, and the evidence that
-//! the shard committed the transaction. Beside it, `required` is what
-//! each candidate waits for, as one set of [`Requirement`]s.
+//! and every leaf, by key. It is what a cross-shard dispatch carries and
+//! the evidence that the shard committed the transaction. Beside it,
+//! `required` is what each candidate waits for, as one set of
+//! [`Requirement`]s, and `arrived` the crossing records committed
+//! claims have read for the candidates that consume them.
 //!
 //! A tx is fully provisioned when every requirement is met; that predicate
 //! is surfaced as [`is_fully_provisioned`](ProvisioningTracker::is_fully_provisioned)
@@ -16,14 +17,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, Member, Side};
-#[cfg(test)]
-use hyperscale_hbor::Bytes;
+use hyperscale_engine::legs::{Classified, Member, Side, live_record};
 use hyperscale_types::{
-    Deadline, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
-    WeightedTimestamp,
+    Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry, SubstateKey, TxHash,
+    Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{CrossingCell, CrossingLeaf, Kind};
+use hyperscale_vm_effects::{CrossingCell, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
 
 /// One thing a cross-shard member waits for before it can run.
@@ -40,21 +39,35 @@ pub enum Requirement {
     /// A counterpart's committed state for the transaction, carried by a
     /// bundle from that shard.
     CommittedState(ShardId),
-    /// A crossing's record cell, present in a committed bundle from the
-    /// shard that wrote it.
+    /// A crossing's record cell, read live by a committed state claim
+    /// naming the transaction as its issuer.
     ///
-    /// Satisfied only by a present value at `key` carried by a bundle
-    /// from `source`: the record sits under the producer's prefix, so
-    /// the producer's root is the one root a proof of it means anything
-    /// under, and a bundle from any other shard carrying the key is a
-    /// quorum there planting a cell it does not own. The same bundle is
-    /// what the arrival is read from.
+    /// The key alone: the record sits under the producer's prefix, and
+    /// admission holds the claim's anchor to the shard that owned that
+    /// prefix at the anchor's own clock, so whoever wrote it, a claim
+    /// that admits speaks for the one root the record means anything
+    /// under. The same claim is what the arrival is read from.
     Crossing {
-        /// The shard that writes the record.
-        source: ShardId,
         /// The record cell.
         key: SubstateKey,
     },
+}
+
+/// A crossing record a consumer here waits on and has no arrival for:
+/// what the fallback read asks a producer's chain for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WantedRecord {
+    /// The record cell.
+    pub key: SubstateKey,
+    /// The transaction the record must name as its issuer.
+    pub tx: TxHash,
+    /// The committed clock past which the read arms on the clock alone:
+    /// the commit that filed the want, for a requirement filed here, or
+    /// the body's validity end, for a delivering body the pool holds.
+    /// `None` where only the producer's certificate arms it. Asking
+    /// ahead of the record's writing costs one absence, and the backoff
+    /// in the holder's heights bounds what follows.
+    pub arms_at: Option<WeightedTimestamp>,
 }
 
 /// What `member`, a divided member of a transaction with these `legs`,
@@ -123,7 +136,6 @@ pub fn divided_requirements(
                     && (edge.crossing.kind == Kind::Owed) == (side == Side::Delivering)
             })
             .map(|edge| Requirement::Crossing {
-                source: edge.from,
                 key: edge.crossing.id.record_key(&ProtocolHasher),
             }),
     );
@@ -189,12 +201,10 @@ impl Absorbed {
     ///
     /// The merge is anchor blind — one anchor over the whole held set —
     /// and what makes that sound is that the bundle kinds a shard sends
-    /// carry **disjoint keys**: its committed state for the
-    /// transaction, and the record cells its certificate wrote. A key
-    /// is therefore added by one kind or restated by a re-broadcast of
-    /// the same kind, never carried by both at two anchors with two
-    /// values. Were they to overlap, [`Self::present`] would answer from
-    /// a set mixed across anchors while `anchor` named only one, and a
+    /// carry **disjoint keys**, so a key is added by one kind or
+    /// restated by a re-broadcast of the same kind, never carried by
+    /// both at two anchors with two values. Were they to overlap, the
+    /// held set would mix anchors while `anchor` named only one, and a
     /// consumer proving a reading against that anchor would be proving
     /// it against a value taken at another.
     ///
@@ -220,26 +230,16 @@ impl Absorbed {
         merged.extend(entries.iter().map(|entry| (entry.key, entry.clone())));
         self.entries = Arc::new(merged.into_values().collect());
     }
-
-    fn present(&self, key: SubstateKey) -> Option<&[u8]> {
-        let index = self
-            .entries
-            .binary_search_by_key(&key, |held| held.key)
-            .ok()?;
-        self.entries[index].value.as_deref()
-    }
 }
 
-/// A crossing a committed bundle has handed this shard, read off the
-/// record cell the bundle carried.
+/// A crossing a committed claim has handed this shard, read off the
+/// record cell the claim carried.
 ///
 /// The one thing a delivery cannot be composed without, so this is
 /// exactly the set of crossings this shard could still run a delivery
-/// for. Past the transaction's validity end that delivery is admissible
-/// only against a proof the record still stands, and this is what says
-/// from when the question is worth asking. Who to ask is not here: the
-/// record's prefix answers that, and follows it to a successor across a
-/// cut where the shard that sent the bundle would not.
+/// for. An execution input and nothing more: a core member still waits
+/// on the producer's certificate, and an arrival never stands in for
+/// it.
 #[derive(Debug, Clone, Copy)]
 pub struct Arrival {
     /// The record cell itself, as the producer committed it.
@@ -251,20 +251,13 @@ pub struct Arrival {
     /// terms off. The deadline and the transaction the other readers ask
     /// for are the cell's own — and they are the producer's bytes for
     /// the same reason, proven against its committed state root by the
-    /// bundle that carried them.
+    /// claim that carried them.
     pub(crate) cell: CrossingCell,
 }
 
 impl Arrival {
-    /// The deadline the record states, which the validity end the
-    /// licence is needed past is read back off.
-    #[must_use]
-    pub(crate) const fn deadline(&self) -> Deadline {
-        Deadline::from_expiry(self.cell.expiry_ms)
-    }
-
     /// The transaction the crossing belongs to, so the arrival goes when
-    /// its absorption does.
+    /// its candidate does.
     #[must_use]
     pub(crate) const fn tx(&self) -> TxHash {
         self.cell.tx
@@ -278,22 +271,26 @@ pub struct ProvisioningTracker {
     /// legs consume.
     absorbed: HashMap<TxHash, BTreeMap<ShardId, Absorbed>>,
 
-    /// Every crossing a committed bundle has handed this shard, by the
+    /// Every crossing a committed claim has handed this shard, by the
     /// record cell that carried it.
     ///
-    /// Written where a bundle is absorbed and dropped where that
-    /// absorption is, so it never outlives the evidence it reads. Kept
-    /// by cell rather than by transaction because what asks about it
-    /// asks one question per record, of one shard.
+    /// Folded from the claims committed blocks carry, for the
+    /// requirements filed here, and dropped with the candidate that
+    /// filed them, so it never outlives what reads it. Kept by cell
+    /// rather than by transaction because what asks about it asks one
+    /// question per record, of one shard. A restart rebuilds it by
+    /// replaying the blocks from the oldest transaction still owed an
+    /// outcome, whose claims ride inline through sealing.
     arrived: BTreeMap<SubstateKey, Arrival>,
 
     /// What each candidate waits for, and the clock it was filed at.
     /// One set per transaction, indexed by nothing else, filed when the
     /// candidate is registered.
     ///
-    /// The stamp is how long this shard has been waiting, which is what
-    /// [`unpushed_crossings`](Self::unpushed_crossings) measures its
-    /// floor against.
+    /// The stamp is the anchor of the block that committed the
+    /// transaction here, which a replay re-derives from the block, so a
+    /// restarted replica arms its record reads at the instant its
+    /// peers did.
     required: HashMap<TxHash, (WeightedTimestamp, BTreeSet<Requirement>)>,
 
     /// The payer shard of each cross-shard transaction whose payer is
@@ -374,54 +371,71 @@ impl ProvisioningTracker {
         self.required.get(&tx_hash).is_some_and(|(_, required)| {
             required.iter().all(|requirement| match requirement {
                 Requirement::CommittedState(shard) => self.has_received_from(tx_hash, *shard),
-                Requirement::Crossing { source, key } => {
-                    self.present_cell(tx_hash, *source, *key).is_some()
-                }
+                Requirement::Crossing { key } => self.arrived.contains_key(key),
             })
         })
     }
 
-    /// Every crossing a candidate here waits on that no push can still
-    /// serve, by record cell.
+    /// Every crossing a candidate here waits on with no arrival for it,
+    /// with the transaction the record must name and the clock its read
+    /// arms on.
     ///
-    /// What a pull is composed from, and the floor is the whole of the
-    /// arming. A crossing unmet for longer than one `RETENTION_HORIZON`
-    /// is one no push can still deliver: whatever block promised it —
-    /// and whether one ever did — is older than the horizon by now, so
-    /// the height-keyed fallback cannot rebuild it either. Short of the
-    /// horizon the push and that fallback own the case, and a pull put
-    /// then only races them.
-    ///
-    /// **The floor is what keeps the question answerable.**
-    /// `Requirement::Crossing` is filed by `divided_requirements` at
-    /// classification, for every value edge landing here from a node
-    /// this shard does not run — which is before the producer has run
-    /// the leg that writes the record. Unfloored, this set is dominated
-    /// by crossings whose cells no producer has written yet, of which
-    /// the only honest answer is silence.
-    ///
-    /// The records alone, and **not the shard the requirement names**.
-    /// That is where the producer sat when the transaction was
-    /// classified; who holds the record now is the record's own prefix,
-    /// read against the current trie by whoever asks. A cut moves a
-    /// prefix, and asking the shard that used to hold it is asking
-    /// somebody who cannot answer.
-    pub(crate) fn unpushed_crossings(&self) -> BTreeSet<SubstateKey> {
-        let mut wanted = BTreeSet::new();
+    /// The records alone, and not the shard a requirement might name:
+    /// who holds a record now is its own prefix, read against the
+    /// current trie by whoever asks. A cut moves a prefix, and asking
+    /// the shard that used to hold it is asking somebody who cannot
+    /// answer.
+    pub(crate) fn wanted_records(&self) -> Vec<WantedRecord> {
+        let mut wanted = Vec::new();
         for (tx_hash, (filed_at, required)) in &self.required {
-            if self.now < filed_at.plus(RETENTION_HORIZON) {
-                continue;
-            }
             for requirement in required {
-                let Requirement::Crossing { source, key } = requirement else {
+                let Requirement::Crossing { key } = requirement else {
                     continue;
                 };
-                if self.present_cell(*tx_hash, *source, *key).is_none() {
-                    wanted.insert(*key);
+                if !self.arrived.contains_key(key) {
+                    wanted.push(WantedRecord {
+                        key: *key,
+                        tx: *tx_hash,
+                        arms_at: Some(*filed_at),
+                    });
                 }
             }
         }
+        wanted.sort_unstable_by_key(|wanted| (wanted.key, wanted.tx));
         wanted
+    }
+
+    /// Fold the crossing records a committed block's claims read, for
+    /// the requirements filed here.
+    ///
+    /// Every claim the block carries is read, whatever question this
+    /// replica had open, so a reading pushed to the proposer folds with
+    /// no ask ever put. A live record naming the requirement's own
+    /// transaction as its issuer is the arrival; a tombstone, a bare
+    /// presence and a record of another transaction are not. Read after
+    /// the block's transactions are registered, so a reading that rides
+    /// in the transaction's own block counts, and only for requirements
+    /// already filed, so a reading in a block before the transaction's
+    /// commit here is never an arrival and the key is read again.
+    pub(crate) fn fold_record_readings(&mut self, state_claims: &[StateClaim]) {
+        if state_claims.is_empty() {
+            return;
+        }
+        for (tx_hash, (_, required)) in &self.required {
+            for requirement in required {
+                let Requirement::Crossing { key } = requirement else {
+                    continue;
+                };
+                if self.arrived.contains_key(key) {
+                    continue;
+                }
+                if let Some((_, cell)) = live_record(state_claims, *key)
+                    && cell.tx == *tx_hash
+                {
+                    self.arrived.insert(*key, Arrival { cell });
+                }
+            }
+        }
     }
 
     // ─── Batch absorption ───────────────────────────────────────────────
@@ -448,44 +462,9 @@ impl ProvisioningTracker {
                 .entry(source_shard)
                 .and_modify(|absorbed| absorbed.absorb(self.now, anchor, &tx_entry.entries))
                 .or_insert_with(|| Absorbed::new(self.now, anchor, &tx_entry.entries));
-            // What the bundle handed this shard, which is what a
-            // delivery of it would run against. A leaf that does not
-            // decode is one no delivery could be composed from, so it is
-            // passed over rather than held.
-            for entry in &tx_entry.entries {
-                let Some(bytes) = entry.value.as_ref() else {
-                    continue;
-                };
-                // A tombstone is not an arrival. Its producer disposed
-                // of the crossing and keeps the key standing only so a
-                // consumer can date the going of it, so there is no
-                // value here to run a delivery against — and its
-                // `expiry_ms` names the removal rather than the
-                // crossing's deadline, which every reader below would
-                // take for one. The classifier reads it as its own arm.
-                let Some(CrossingLeaf::Record { cell, .. }) =
-                    CrossingLeaf::read(&ProtocolHasher, entry.key, bytes)
-                else {
-                    continue;
-                };
-                self.arrived.insert(entry.key, Arrival { cell });
-            }
             touched.push(tx_hash);
         }
         touched
-    }
-
-    /// Forget the arrival a crossing left behind, once this shard's
-    /// answer to it has been removed.
-    ///
-    /// An arrival is an execution input and no verdict is composed off
-    /// one, so this decides nothing — but it is not optional. The
-    /// question `ask_arrived_crossings` puts is gated on this shard
-    /// holding an answer, and the removal takes that gate away, so an
-    /// arrival left behind is a probe put at every header of the
-    /// producer for as long as the bundle is retained.
-    pub(crate) fn forget_arrival(&mut self, record: SubstateKey) {
-        self.arrived.remove(&record);
     }
 
     // ─── Retention ──────────────────────────────────────────────────────
@@ -513,9 +492,7 @@ impl ProvisioningTracker {
                     .values()
                     .any(|absorbed| absorbed.at.plus(RETENTION_HORIZON) > now)
         });
-        let absorbed = &self.absorbed;
-        self.arrived
-            .retain(|_, arrival| absorbed.contains_key(&arrival.tx()));
+        self.arrived.retain(|_, arrival| waiting(arrival.tx()));
         before - self.absorbed.len()
     }
 
@@ -535,44 +512,17 @@ impl ProvisioningTracker {
             })
     }
 
-    /// The bytes of `key` as a committed bundle from `source` carried
-    /// them present for `tx_hash` — a crossing's record, read from the
-    /// one bundle whose root says anything about it.
-    #[must_use]
-    pub(crate) fn present_cell(
-        &self,
-        tx_hash: TxHash,
-        source: ShardId,
-        key: SubstateKey,
-    ) -> Option<&[u8]> {
-        self.absorbed.get(&tx_hash)?.get(&source)?.present(key)
-    }
-
-    /// Hand this shard a crossing, as a committed bundle would.
+    /// Hand this shard a crossing, as a committed claim would.
     ///
-    /// The absorption itself is
-    /// [`absorb_provisions`](Self::absorb_provisions)' and tested there;
-    /// this is for the readers of what it leaves, which are a question
-    /// of their own.
+    /// The fold itself is [`fold_record_readings`](Self::fold_record_readings)'
+    /// and tested there; this is for the readers of what it leaves,
+    /// which are a question of their own.
     #[cfg(test)]
-    pub(crate) fn handed(
-        &mut self,
-        record: SubstateKey,
-        cell: CrossingCell,
-        at: WeightedTimestamp,
-    ) {
-        let entry = SubstateEntry {
-            key: record,
-            value: Some(Bytes::new(cell.to_bytes()).expect("a crossing cell is small")),
-        };
-        self.absorbed.entry(cell.tx).or_default().insert(
-            ShardId::ROOT,
-            Absorbed::new(at, SourceAnchor { clock: at }, &[entry]),
-        );
+    pub(crate) fn handed(&mut self, record: SubstateKey, cell: CrossingCell) {
         self.arrived.insert(record, Arrival { cell });
     }
 
-    /// Every crossing a committed bundle has handed this shard, by the
+    /// Every crossing a committed claim has handed this shard, by the
     /// record cell that carried it.
     #[must_use]
     pub(crate) const fn arrived(&self) -> &BTreeMap<SubstateKey, Arrival> {
@@ -703,101 +653,105 @@ mod tests {
         assert!(t.is_fully_provisioned(tx));
     }
 
-    /// A crossing is answered by a present value at its cell carried by
-    /// the named source and nothing else — a bundle from another shard
-    /// carrying the key, an absent value, or the source carrying other
-    /// cells, answers nothing — and a bundle absorbed before the
-    /// requirement was filed still answers it, with the bytes it carried.
+    /// A crossing is answered by a live record read off a committed
+    /// claim naming its transaction, and by nothing else: a record of
+    /// another transaction, a tombstone, a bare presence and a reading
+    /// folded before the requirement was filed answer nothing, and once
+    /// answered the cell is the arrival every reader runs against.
     #[test]
-    fn a_crossing_is_met_only_by_the_cell_its_source_carried() {
-        use hyperscale_types::{Address, AddressClass, LocalKey};
+    fn a_crossing_is_met_by_a_live_reading_naming_its_transaction() {
+        use hyperscale_hbor::Bytes;
+        use hyperscale_types::{
+            Address, AddressClass, Anchor, Inclusion, LocalKey, StateRoot, Stated,
+        };
+        use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms};
+        use hyperscale_vm_types::ResourceAddr;
 
-        let record = SubstateKey {
-            owner: Address::new([0xC1; 31], AddressClass::Component),
-            local: LocalKey([1; 16]),
+        let id = CrossingId {
+            producer: Address::new([0xC1; 31], AddressClass::Component),
+            consumer: Address::new([0xC2; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0xC3; 32])),
+            local: 1,
+            output: 0,
         };
-        let other = SubstateKey {
-            owner: Address::new([0xC1; 31], AddressClass::Component),
-            local: LocalKey([2; 16]),
-        };
+        let record = id.record_key(&ProtocolHasher);
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        let bundle =
-            |source: ShardId, entries: Capped<Vec<SubstateEntry>, MAX_STATE_ENTRIES_PER_TX>| {
-                Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                    source,
-                    ShardId::leaf(2, 0),
-                    BlockHeight::new(5),
-                    anchor(0).clock,
-                    MerkleInclusionProof::dummy(),
-                    Capped::from_array([ProvisionEntry::new(tx, entries)]),
-                ))
-            };
-        let requirement = Requirement::Crossing {
-            source: shard(1),
-            key: record,
+        let other_tx = TxHash::from(Hash::from_bytes(b"other"));
+        let cell_of = |tx: TxHash, terms: Terms| {
+            id.cell(tx, ResourceAddr::new([0xE1; 31]), 500, 9_000, terms)
         };
+        let claim_of = |height: u64, stated: Stated| {
+            StateClaim::new(
+                Anchor {
+                    shard: ShardId::ROOT,
+                    height: BlockHeight::new(height),
+                    state_root: StateRoot::ZERO,
+                    ts: WeightedTimestamp::from_millis(height * 1_000),
+                },
+                [(record, stated)],
+                MerkleInclusionProof::dummy(),
+            )
+        };
+        let held = |cell: CrossingCell| Stated::Held(Bytes::new(cell.to_bytes()).unwrap());
+        let requirement = Requirement::Crossing { key: record };
 
-        // A stranger carrying the key answers nothing, and its bytes are
-        // never the arrival.
-        let mut planted = ProvisioningTracker::new();
-        planted.record_required(tx, BTreeSet::from([requirement]));
-        planted.absorb_provisions(&bundle(
-            shard(3),
-            Capped::from_array([SubstateEntry::new(record, Some(Bytes::from_array([9])))]),
-        ));
-        assert!(
-            !planted.is_fully_provisioned(tx),
-            "only the producer's bundle carries the record"
-        );
-        assert_eq!(planted.present_cell(tx, shard(1), record), None);
-
-        // Absorbed first, filed second.
+        // Folded before the requirement is filed: never an arrival.
         let mut early = ProvisioningTracker::new();
-        early.absorb_provisions(&bundle(
-            shard(1),
-            Capped::from_array([SubstateEntry::new(record, Some(Bytes::from_array([7])))]),
-        ));
+        early.fold_record_readings(&[claim_of(3, held(cell_of(tx, Terms::Owed)))]);
         early.record_required(tx, BTreeSet::from([requirement]));
-        assert!(early.is_fully_provisioned(tx));
-        assert_eq!(
-            early.present_cell(tx, shard(1), record),
-            Some(&[7u8][..]),
-            "and the arrival is read off the same bundle"
-        );
+        assert!(!early.is_fully_provisioned(tx));
+        assert_eq!(early.wanted_records().len(), 1, "and the key stays wanted");
 
-        // The named source, carrying the wrong cell or an absent value.
+        // Another transaction's record, a tombstone and a bare presence
+        // answer nothing.
         let mut wrong = ProvisioningTracker::new();
         wrong.record_required(tx, BTreeSet::from([requirement]));
-        wrong.absorb_provisions(&bundle(
-            shard(1),
-            Capped::from_array([SubstateEntry::new(other, Some(Bytes::from_array([7])))]),
-        ));
+        wrong.fold_record_readings(&[claim_of(3, held(cell_of(other_tx, Terms::Owed)))]);
         assert!(!wrong.is_fully_provisioned(tx));
-        wrong.absorb_provisions(&bundle(
-            shard(1),
-            Capped::from_array([SubstateEntry::new(record, None)]),
-        ));
-        assert!(!wrong.is_fully_provisioned(tx), "absent answers nothing");
-        wrong.absorb_provisions(&bundle(
-            shard(1),
-            Capped::from_array([SubstateEntry::new(record, Some(Bytes::from_array([7])))]),
-        ));
-        assert!(wrong.is_fully_provisioned(tx));
+        wrong.fold_record_readings(&[claim_of(4, held(cell_of(tx, Terms::Retired)))]);
+        assert!(
+            !wrong.is_fully_provisioned(tx),
+            "a tombstone is not an arrival"
+        );
+        wrong.fold_record_readings(&[claim_of(5, Inclusion::Present([7; 32]).into())]);
+        assert!(
+            !wrong.is_fully_provisioned(tx),
+            "a bare presence licenses nothing"
+        );
 
-        // A committed-state requirement beside it is a different key: the
-        // crossing's bundle does not answer it.
+        // The live record naming the transaction is the arrival, in the
+        // transaction's own block or a later one, and it is the cell
+        // every reader runs against.
+        wrong.fold_record_readings(&[claim_of(6, held(cell_of(tx, Terms::Owed)))]);
+        assert!(wrong.is_fully_provisioned(tx));
+        assert!(wrong.wanted_records().is_empty());
+        assert_eq!(wrong.arrived().get(&record).map(Arrival::tx), Some(tx));
+
+        // A committed-state requirement beside it is a different key:
+        // the claim does not answer it.
         let mut both = ProvisioningTracker::new();
         both.record_required(
             tx,
             BTreeSet::from([requirement, Requirement::CommittedState(shard(2))]),
         );
-        both.absorb_provisions(&bundle(
-            shard(1),
-            Capped::from_array([SubstateEntry::new(record, Some(Bytes::from_array([7])))]),
-        ));
+        both.fold_record_readings(&[claim_of(6, held(cell_of(tx, Terms::Owed)))]);
         assert!(!both.is_fully_provisioned(tx));
-        both.absorb_provisions(&bundle(shard(2), Capped::empty()));
+        both.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
         assert!(both.is_fully_provisioned(tx));
+
+        // The want names what arms it: the commit that filed it.
+        let mut waiting = ProvisioningTracker::new();
+        waiting.advance_clock(WeightedTimestamp::from_millis(7_000));
+        waiting.record_required(tx, BTreeSet::from([requirement]));
+        assert_eq!(
+            waiting.wanted_records(),
+            vec![WantedRecord {
+                key: record,
+                tx,
+                arms_at: Some(WeightedTimestamp::from_millis(7_000)),
+            }]
+        );
+        let _ = LocalKey([0; 16]);
     }
 
     /// The record cell the edge `node` leaves on its first output.
@@ -842,10 +796,7 @@ mod tests {
             delivering,
             BTreeSet::from([
                 Requirement::CommittedState(high),
-                Requirement::Crossing {
-                    source: high,
-                    key: crossings[1],
-                },
+                Requirement::Crossing { key: crossings[1] },
             ]),
             "the caller's delivering member waits on the venue's output",
         );
@@ -854,10 +805,7 @@ mod tests {
             venue,
             BTreeSet::from([
                 Requirement::CommittedState(low),
-                Requirement::Crossing {
-                    source: low,
-                    key: crossings[0],
-                },
+                Requirement::Crossing { key: crossings[0] },
             ]),
             "a single-shard core waits on its arrival and its caller's records",
         );
@@ -879,10 +827,7 @@ mod tests {
         let classified = Classified::freeze(&route, route[0].target, &[], &trie);
         assert!(classified.decomposed());
         assert_eq!(classified.core(), &BTreeSet::from([high, third]));
-        let arrival = Requirement::Crossing {
-            source: low,
-            key: crossings[0],
-        };
+        let arrival = Requirement::Crossing { key: crossings[0] };
         assert_eq!(
             divided_requirements(&route, &classified, high, Side::Issuing),
             BTreeSet::from([
@@ -995,7 +940,13 @@ mod tests {
             1,
             "a re-broadcast is absorbed once"
         );
-        assert_eq!(t.present_cell(tx, shard(1), a), Some(&[1][..]));
+        let value_of = |t: &ProvisioningTracker, key: SubstateKey| {
+            t.provisions_for(tx)[0]
+                .iter()
+                .find(|entry| entry.key == key)
+                .and_then(|entry| entry.value.as_ref().map(|v| v.to_vec()))
+        };
+        assert_eq!(value_of(&t, a), Some(vec![1]));
 
         t.absorb_provisions(&bundle_for(
             shard(1),
@@ -1005,8 +956,8 @@ mod tests {
         let carried = t.provisions_for(tx);
         assert_eq!(carried.len(), 1, "still one absorption for the shard");
         assert_eq!(carried[0].len(), 2, "holding both bundles' cells");
-        assert_eq!(t.present_cell(tx, shard(1), a), Some(&[1][..]));
-        assert_eq!(t.present_cell(tx, shard(1), b), Some(&[2][..]));
+        assert_eq!(value_of(&t, a), Some(vec![1]));
+        assert_eq!(value_of(&t, b), Some(vec![2]));
     }
 
     #[test]

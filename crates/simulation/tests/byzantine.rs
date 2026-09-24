@@ -15,16 +15,16 @@ mod support;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
     build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs};
-use hyperscale_types::network::response::{GetProvisionResponse, GetStateProofResponse};
+use hyperscale_types::network::response::GetStateProofResponse;
 use hyperscale_types::{
-    Deadline, MAX_VALIDITY_RANGE, MerkleInclusionProof, Provisions, ShardId, TransactionDecision,
+    Deadline, MAX_VALIDITY_RANGE, MerkleInclusionProof, ShardId, TransactionDecision,
     TransactionStatus, WeightedTimestamp,
 };
 use support::SimCluster;
@@ -186,18 +186,17 @@ fn a_forged_state_proof_convinces_nobody() {
     });
 }
 
-/// A host that answers provision fetches with rubbish is rotated past,
+/// A host that answers a record's read with rubbish is rotated past,
 /// and the crossing it was carrying still lands.
 ///
 /// The delivery side's evidence seam, and the second thing a drop rule
-/// cannot reach: `cross_shard_provisions_drop_fetch_fallback` makes a
-/// responder silent, which the fetch already has a rotation for. A
-/// responder that answers is the case where a check has to do the work —
-/// a bundle is admitted only against the source header it names and the
-/// root that header carries, so one that decodes to nothing must be
-/// refused at the fetch rather than carried into a block.
+/// cannot reach: a silent responder the fetch already has a rotation
+/// for. A responder that answers is the case where a check has to do
+/// the work — a state proof is checked against the anchor the requester
+/// commit-proved, so an answer that decodes to nothing must be refused
+/// at the fetch rather than carried into a block.
 #[test]
-fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
+fn a_host_answering_a_records_read_with_rubbish_is_rotated_past() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     let (payer_key, from, to) = cross_shard_cast();
@@ -206,12 +205,9 @@ fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
 
     cluster.run_faultable(|c| {
         let recipient_before = vault_balance(c, recipient_shard, to);
-        let refused_before = c.metric("fetch_responses_refused", Some("provision"));
+        let refused_before = c.metric("fetch_responses_refused", Some("state_proof"));
 
-        // The push is cut, so the recipient has to fetch — and one host
-        // of the shard it fetches from answers wrongly.
-        let broadcast_dropped = c.drop_type("provisions.broadcast");
-        // Every host of the shard the bundle is fetched from lies once
+        // Every host of the shard the record is read from lies once
         // and then answers honestly. Picking one host to lie always is
         // the shape that reads better and measures nothing: the fetch
         // chooses its peer, a committee this size offers two, and a run
@@ -226,7 +222,7 @@ fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
                 let lies = Arc::clone(&lies);
                 c.rewrite_responses(
                     host,
-                    "provision.request",
+                    "state_proof.request",
                     Arc::new(move |_asked: &[u8], honest: &[u8]| {
                         if lies.fetch_add(1, Ordering::Relaxed) == 0 {
                             vec![0x5A; 96]
@@ -253,19 +249,15 @@ fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
         assert!(
             c.run_until(epochs(10), |c| vault_balance(c, recipient_shard, to)
                 == recipient_before + 100),
-            "the delivery must claim from an honest peer's bundle; holds {}",
+            "the delivery must run against an honest peer's reading; holds {}",
             vault_balance(c, recipient_shard, to),
-        );
-        assert!(
-            broadcast_dropped.fired() > 0,
-            "the push has to be cut, or nothing fetched",
         );
         assert!(
             forged.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
             "the rubbish has to have been served, or nothing was attacked",
         );
         assert!(
-            c.metric("fetch_responses_refused", Some("provision:unusable_answer")) > refused_before,
+            c.metric("fetch_responses_refused", Some("state_proof")) > refused_before,
             "the rubbish was never refused, so the delivery landing says nothing",
         );
     });
@@ -275,22 +267,22 @@ fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
 /// asked for, and the bytes answered.
 type Kept = Arc<Mutex<Option<(Vec<u8>, Vec<u8>)>>>;
 
-/// A bundle answered with a bundle for another transaction is refused,
-/// and the delivery it was carrying still lands.
+/// A record's read answered with the proof of another record is
+/// refused, and the delivery it was carrying still lands.
 ///
 /// The forgery worth checking at a fetch is a well-formed answer to a
-/// different question, and a delivery bundle is the one payload where
-/// that is free to build: the attacker needs no keys and no forging at
-/// all, only an earlier honest answer kept and served again. What refuses
-/// it is that a bundle is admitted against the source header it names and
-/// the transaction the requester asked about, so an answer that proves
-/// somebody else's crossing proves nothing here.
+/// different question, and a served proof is the one payload where that
+/// is free to build: the attacker needs no keys and no forging at all,
+/// only an earlier honest answer kept and served again. What refuses it
+/// is that a proof is walked against the anchor the requester
+/// commit-proved and over the keys it asked about, so an answer that
+/// proves somebody else's crossing proves nothing here.
 ///
-/// Two payments, and the second one's fetch is answered with the first
-/// one's bundle. Both must arrive: the recipient is credited twice, once
+/// Two payments, and the second one's read is answered with the first
+/// one's proof. Both must arrive: the recipient is credited twice, once
 /// for each, and never once or three times.
 #[test]
-fn a_bundle_replayed_from_another_transaction_is_refused() {
+fn a_proof_replayed_from_another_records_read_is_refused() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     let (payer_key, from, to) = cross_shard_cast();
@@ -299,8 +291,10 @@ fn a_bundle_replayed_from_another_transaction_is_refused() {
 
     cluster.run_faultable(|c| {
         let recipient_before = vault_balance(c, recipient_shard, to);
-        let refused_before = c.metric("fetch_responses_refused", Some("provision:scope_mismatch"));
-        let broadcast_dropped = c.drop_type("provisions.broadcast");
+        let refused_before = c.metric(
+            "fetch_responses_refused",
+            Some("state_proof:unusable_proof"),
+        );
 
         // The first honest answer is kept with the question it answered,
         // and served once to whoever asks a different one. Lying on the
@@ -318,7 +312,7 @@ fn a_bundle_replayed_from_another_transaction_is_refused() {
                 let lies = Arc::clone(&lies);
                 c.rewrite_responses(
                     host,
-                    "provision.request",
+                    "state_proof.request",
                     Arc::new(move |asked: &[u8], honest: &[u8]| {
                         let mut held = kept.lock().unwrap_or_else(PoisonError::into_inner);
                         let reply = match held.as_ref() {
@@ -358,47 +352,44 @@ fn a_bundle_replayed_from_another_transaction_is_refused() {
         assert!(
             c.run_until(epochs(12), |c| vault_balance(c, recipient_shard, to)
                 == recipient_before + 201),
-            "both deliveries must claim, each from a bundle that proves its own \
-             crossing; holds {}",
+            "both deliveries must run, each against a reading that proves its own \
+             record; holds {}",
             vault_balance(c, recipient_shard, to),
         );
         assert!(
-            broadcast_dropped.fired() > 0,
-            "the push has to be cut, or nothing fetched",
-        );
-        assert!(
             replayed.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
-            "the stale bundle has to have been served, or nothing was attacked",
+            "the stale proof has to have been served, or nothing was attacked",
         );
         // Both deliveries landing is what an unattacked run shows too.
-        // The bundle admitted against the transaction the requester asked
-        // about is the rule under test, and refusing the replay is where
-        // it runs.
+        // The proof walked over the keys the requester asked about is the
+        // rule under test, and refusing the replay is where it runs.
         assert!(
-            c.metric("fetch_responses_refused", Some("provision:scope_mismatch")) > refused_before,
-            "the replayed bundle was never refused on its scope",
+            c.metric(
+                "fetch_responses_refused",
+                Some("state_proof:unusable_proof")
+            ) > refused_before,
+            "the replayed proof was never refused on its keys",
         );
     });
 }
 
-/// A bundle whose entries its own proof does not cover is refused, and
-/// the delivery it was carrying still lands.
+/// A record value a served proof does not cover is refused, and the
+/// delivery it was carrying still lands.
 ///
 /// The third shape a responder can take, and the one the other cases
-/// cannot reach: a well-formed answer to the right question, carrying
-/// values the source chain never held. The tx-root the source header
-/// commits is over the transaction hashes, so tampering with an entry's
-/// bytes leaves it intact and every check short of the merkle proof
-/// passes. What refuses it is that a bundle's entries are held to the
-/// state root of the block that issued them, which runs off
-/// `Action::VerifyProvisions` rather than at the fetch.
+/// cannot reach: a well-formed answer to the right question, carrying a
+/// value the source chain never held. The proof reconstructs the root
+/// and claims the key, so every check short of hashing the value passes.
+/// What refuses it is that a served value is held to the presence the
+/// proof reconstructs for its key, at the fetch, so the peer rotates and
+/// an honest answer lands.
 ///
-/// One byte of one entry, rather than a decoded and inflated
-/// `EscrowedValue`: the proof covers the whole value either way, so both
-/// reach the same check, and the cheaper forgery needs nothing of the
-/// engine's encoding.
+/// One byte of the value, rather than a decoded and inflated record:
+/// the hash covers the whole value either way, so both reach the same
+/// check, and the cheaper forgery needs nothing of the kernel's
+/// encoding.
 #[test]
-fn a_bundle_whose_entries_its_proof_does_not_cover_is_refused() {
+fn a_record_value_its_proof_does_not_cover_is_refused() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     let (payer_key, from, to) = cross_shard_cast();
@@ -409,13 +400,12 @@ fn a_bundle_whose_entries_its_proof_does_not_cover_is_refused() {
         let recipient_before = vault_balance(c, recipient_shard, to);
         let refused_before = c.metric(
             "fetch_responses_refused",
-            Some("provision:unproven_entries"),
+            Some("state_proof:value_off_its_proof"),
         );
-        let broadcast_dropped = c.drop_type("provisions.broadcast");
 
-        // Every host tampers with the first bundle it is asked for and
-        // answers honestly after, so the check runs whichever peer the
-        // fetch picked and the retry still has somewhere to land.
+        // Every host tampers with the first record value it is asked for
+        // and answers honestly after, so the check runs whichever peer
+        // the fetch picked and the retry still has somewhere to land.
         let tampered = Arc::new(AtomicUsize::new(0));
         let forged: Vec<FaultHandle> = c
             .committee_hosts(payer_shard)
@@ -424,39 +414,24 @@ fn a_bundle_whose_entries_its_proof_does_not_cover_is_refused() {
                 let tampered = Arc::clone(&tampered);
                 c.rewrite_responses(
                     host,
-                    "provision.request",
+                    "state_proof.request",
                     Arc::new(move |_asked: &[u8], honest: &[u8]| {
-                        let Ok(response) = hbor_from_slice::<GetProvisionResponse>(honest) else {
-                            return honest.to_vec();
-                        };
-                        let Some(bundle) = response.provisions.as_deref() else {
-                            return honest.to_vec();
-                        };
-                        let mut entries = bundle.transactions().clone();
-                        let Some(value) = entries
-                            .iter_mut()
-                            .flat_map(|entry| entry.entries.iter_mut())
-                            .find_map(|entry| entry.value.as_mut())
-                            .and_then(|bytes| bytes.iter_mut().next())
+                        let Ok(mut response) = hbor_from_slice::<GetStateProofResponse>(honest)
                         else {
                             return honest.to_vec();
                         };
+                        if response.values.is_empty() {
+                            return honest.to_vec();
+                        }
                         if tampered.fetch_add(1, Ordering::Relaxed) > 0 {
                             return honest.to_vec();
                         }
-                        *value = value.wrapping_add(1);
-                        let forged = Provisions::new(
-                            bundle.source_shard(),
-                            bundle.target_shard(),
-                            bundle.block_height(),
-                            bundle.source_block_ts(),
-                            bundle.proof().clone(),
-                            Capped::new(entries).expect("a list written out in a test"),
-                        );
-                        hbor_to_vec(&GetProvisionResponse {
-                            provisions: Some(Arc::new(forged)),
-                        })
-                        .unwrap_or_else(|_| honest.to_vec())
+                        let (key, bytes) = response.values[0].clone();
+                        let mut bytes = bytes.to_vec();
+                        bytes[0] = bytes[0].wrapping_add(1);
+                        let forged = Bytes::new(bytes).expect("one byte changed fits");
+                        response.values = Capped::from_array([(key, forged)]);
+                        hbor_to_vec(&response).unwrap_or_else(|_| honest.to_vec())
                     }),
                 )
             })
@@ -477,23 +452,19 @@ fn a_bundle_whose_entries_its_proof_does_not_cover_is_refused() {
         assert!(
             c.run_until(epochs(10), |c| vault_balance(c, recipient_shard, to)
                 == recipient_before + 100),
-            "the delivery must claim from a bundle whose proof covers it; holds {}",
+            "the delivery must run against a value its proof covers; holds {}",
             vault_balance(c, recipient_shard, to),
         );
         assert!(
-            broadcast_dropped.fired() > 0,
-            "the push has to be cut, or nothing fetched",
-        );
-        assert!(
             forged.iter().any(|handle| handle.fired() > 0) && tampered.load(Ordering::Relaxed) > 0,
-            "the tampered bundle has to have been served, or nothing was attacked",
+            "the tampered value has to have been served, or nothing was attacked",
         );
         assert!(
             c.metric(
                 "fetch_responses_refused",
-                Some("provision:unproven_entries")
+                Some("state_proof:value_off_its_proof")
             ) > refused_before,
-            "the tampered bundle was never refused on its proof",
+            "the tampered value was never refused on its proof",
         );
     });
 }

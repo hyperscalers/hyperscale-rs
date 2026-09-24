@@ -259,6 +259,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// proofs included, against the section's budget.
     fn record_state_claims_weight(&self, bytes: usize) {}
 
+    /// A consumer asking a producer's chain for a crossing record it
+    /// waits on: the fallback read a push did not make unnecessary.
+    fn record_record_ask(&self) {}
+
     /// A fetch response the requester's own check refused, by fetch kind
     /// and the check that refused it.
     ///
@@ -772,6 +776,12 @@ pub fn record_reclaim_probe_pending() {
 #[inline]
 pub fn record_state_claims_weight(bytes: usize) {
     recorder().record_state_claims_weight(bytes);
+}
+
+/// Record a consumer's ask for a crossing record.
+#[inline]
+pub fn record_record_ask() {
+    recorder().record_record_ask();
 }
 
 /// Record a fetch response refused by the requester's own check.

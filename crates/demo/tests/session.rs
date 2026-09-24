@@ -293,11 +293,9 @@ fn run_past_split(seed: u64, count: usize) -> Vec<TraceEvent> {
 }
 
 #[test]
-fn a_cross_shard_transfer_is_provisioned_one_way_and_certified_on_each_side() {
+fn a_cross_shard_transfer_is_certified_and_finalized_on_each_side() {
     let events = run_past_split(42, 6);
 
-    // Which shards provisioned state to which, per transaction.
-    let mut provisioned: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
     // Which shards signed a certificate covering each transaction.
     let mut certified: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // Which shards committed a finalization covering it, and who they
@@ -306,14 +304,6 @@ fn a_cross_shard_transfer_is_provisioned_one_way_and_certified_on_each_side() {
 
     for event in &events {
         match &event.kind {
-            TraceKind::ProvisionsVerified { from, to, txs, .. } => {
-                for tx in txs {
-                    provisioned
-                        .entry(tx.0.clone())
-                        .or_default()
-                        .insert((from.0.clone(), to.0.clone()));
-                }
-            }
             TraceKind::ExecutionCertified {
                 shard, outcomes, ..
             } => {
@@ -342,41 +332,28 @@ fn a_cross_shard_transfer_is_provisioned_one_way_and_certified_on_each_side() {
         }
     }
 
+    // A record travels as a state claim rather than a bundle, so what a
+    // cross-shard transfer leaves in the trace is a certificate and a
+    // tick on each side.
+    let crossed: Vec<(&String, &BTreeSet<String>)> = certified
+        .iter()
+        .filter(|(_, signers)| signers.len() == 2)
+        .collect();
     assert!(
-        !provisioned.is_empty(),
+        !crossed.is_empty(),
         "a session past the split must produce cross-shard transfers",
     );
 
-    for (tx, pairs) in &provisioned {
-        let shards: BTreeSet<&String> = pairs.iter().flat_map(|(a, b)| [a, b]).collect();
-        assert_eq!(
-            shards.len(),
-            2,
-            "tx {tx} spans exactly two shards, saw {pairs:?}",
-        );
-        // One direction: the payer's shard settles the transfer alone and
-        // the recipient's takes delivery of what it committed. Nothing
-        // travels back.
-        assert_eq!(
-            pairs.len(),
-            1,
-            "a transfer is provisioned payer to recipient and no other way, saw {pairs:?}",
-        );
-
-        // Each side signed a certificate for its own half.
-        let signers = certified.get(tx).expect("a provisioned tx is certified");
-        assert_eq!(
-            signers.iter().collect::<BTreeSet<_>>(),
-            shards,
-            "tx {tx} needs a certificate from each side",
-        );
-
-        // And each side committed a tick of its own, naming itself alone:
+    for (tx, shards) in crossed {
+        // Each side committed a tick of its own, naming itself alone:
         // the payer's verdict waits on no one, and the delivery is the
         // recipient's own block's business.
         let commits = finalized.get(tx).expect("a certified tx is finalized");
         assert_eq!(
-            commits.iter().map(|(s, _)| s).collect::<BTreeSet<_>>(),
+            &commits
+                .iter()
+                .map(|(s, _)| s.clone())
+                .collect::<BTreeSet<_>>(),
             shards,
             "tx {tx} must finalize on both shards, saw {commits:?}",
         );
@@ -474,14 +451,26 @@ fn the_load_generator_picks_pairs_the_trie_routes_across_shards() {
             _ => None,
         })
         .collect();
-    let crossed: BTreeSet<String> = events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            TraceKind::ProvisionsVerified { txs, .. } => Some(txs),
-            _ => None,
-        })
-        .flatten()
-        .map(|tx| tx.0.clone())
+    // A transfer crosses shards when each side certifies it: the record
+    // it carries travels as a state claim, which the trace does not draw.
+    let mut certified: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for e in &events {
+        if let TraceKind::ExecutionCertified {
+            shard, outcomes, ..
+        } = &e.kind
+        {
+            for (tx, _) in outcomes {
+                certified
+                    .entry(tx.0.clone())
+                    .or_default()
+                    .insert(shard.0.clone());
+            }
+        }
+    }
+    let crossed: BTreeSet<String> = certified
+        .into_iter()
+        .filter(|(_, shards)| shards.len() == 2)
+        .map(|(tx, _)| tx)
         .collect();
 
     assert_eq!(submitted.len(), 8, "every submission is reported");

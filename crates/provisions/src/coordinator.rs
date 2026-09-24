@@ -19,7 +19,7 @@ use hyperscale_storage::CommittedProvisions;
 use hyperscale_types::{
     Anchor, BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CompletedRecovery,
     ForkFence, LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON,
-    ShardId, SubstateKey, TopologySchedule, Verified, WeightedTimestamp,
+    ShardId, TopologySchedule, Verified, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -871,53 +871,6 @@ impl ProvisionCoordinator {
         vec![]
     }
 
-    /// Handle what a producer answered for records this shard named.
-    ///
-    /// **The ids are released whatever came back**, because nothing else
-    /// releases them. An id nobody answers stays in the pending set for
-    /// the process's life and is re-dispatched every fetch tick, and
-    /// `ProvisionsAdmitted` drains `ProvisionBinding` by
-    /// `(source, target, height)` — a key no pull id ever matches. So a
-    /// pull that completed and a pull the producer could not answer both
-    /// end here, and re-asking is the arming's job alone.
-    ///
-    /// **The promise is not checked, because there is none.**
-    /// [`Self::on_state_provisions_received`] holds a pushed bundle to
-    /// the producing header's `provision_tx_roots` — the commitment that
-    /// says which transactions the target was meant to receive, and so
-    /// catches a proposer dropping some on the broadcast path. No block
-    /// promised a pull. What is not skipped is the merkle verification:
-    /// the values are checked against the anchor's own commit-proven
-    /// header exactly as a pushed bundle's are, an anchor this shard
-    /// proved for itself, which is why it could name the height at all.
-    pub fn on_pulled_provisions_received(
-        &mut self,
-        anchor: Anchor,
-        records: Vec<SubstateKey>,
-        provisions: Option<Provisions>,
-    ) -> Vec<Action> {
-        let mut actions = vec![Action::AbandonFetch(FetchIds::CrossingPulls(
-            records.into_iter().map(|key| (anchor, key)).collect(),
-        ))];
-        let Some(provisions) = provisions else {
-            return actions;
-        };
-        if provisions.transactions().is_empty() {
-            return actions;
-        }
-        if provisions.target_shard() != self.local_shard || anchor.shard == self.local_shard {
-            warn!(
-                source_shard = provisions.source_shard().inner(),
-                target_shard = provisions.target_shard().inner(),
-                local_shard = self.local_shard.inner(),
-                "Dropping pulled provisions: not this shard's to absorb"
-            );
-            return actions;
-        }
-        actions.push(Action::VerifyProvisions { provisions, anchor });
-        actions
-    }
-
     /// Handle the verification result for a provisions entry.
     ///
     /// If valid: store, queue, emit events.
@@ -1069,11 +1022,11 @@ mod tests {
     use hyperscale_core::FetchRequest;
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        Address, AddressClass, AggregateSignature, Anchor, Block, BlockHash, BlockHeader,
-        BlockHeaderParts, ChainOrigin, Hash, LocalKey, MerkleInclusionProof, NetworkDefinition,
-        ProposerTimestamp, ProvisionEntry, ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON,
-        Round, ShardId, SignerBitfield, StateRoot, TopologySnapshot, TxHash, ValidatorId,
-        ValidatorSet, Verifiable, WeightedTimestamp, WitnessSources, compute_merkle_root,
+        AggregateSignature, Anchor, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
+        Hash, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
+        ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
+        StateRoot, TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable,
+        WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -2285,39 +2238,6 @@ mod tests {
 
         // Expected provision should be cleared
         assert_eq!(coordinator.expected.len(), 0);
-    }
-
-    /// A pull's fetch ids are released whatever the producer answered.
-    ///
-    /// **Nothing else releases them.** An id nobody answers stays in the
-    /// pending set for the process's life and is re-dispatched every
-    /// fetch tick, and `ProvisionsAdmitted` drains `ProvisionBinding` by
-    /// `(source, target, height)` — a key no pull id matches. So an
-    /// answer carrying nothing has to end the question just as firmly as
-    /// one carrying the record.
-    #[test]
-    fn a_pull_releases_its_ids_on_an_answer_that_carries_nothing() {
-        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
-        let anchor = Anchor {
-            shard: ShardId::leaf(2, 1),
-            height: BlockHeight::new(7),
-            state_root: StateRoot::ZERO,
-            ts: WeightedTimestamp::ZERO,
-        };
-        let record = SubstateKey {
-            owner: Address::new([0x71; 31], AddressClass::Component),
-            local: LocalKey([0x71; 16]),
-        };
-
-        let actions = coordinator.on_pulled_provisions_received(anchor, vec![record], None);
-        assert!(
-            matches!(
-                actions.as_slice(),
-                [Action::AbandonFetch(FetchIds::CrossingPulls(ids))]
-                    if ids.as_slice() == [(anchor, record)]
-            ),
-            "the producer held none of it, and the id is done either way; got {actions:?}",
-        );
     }
 
     #[test]

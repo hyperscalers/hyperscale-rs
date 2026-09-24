@@ -181,8 +181,8 @@ use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::Precut;
 use crate::proposal::{
     Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
-    dispatch_or_defer, late_deliveries, select_abandonment_records, select_finalizations,
-    select_provisions, select_state_claims, select_transactions,
+    dispatch_or_defer, late_deliveries, readable_deliveries, select_abandonment_records,
+    select_finalizations, select_provisions, select_state_claims, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -1148,14 +1148,18 @@ impl ShardCoordinator {
     }
 
     /// Retire the commit-proven anchors nothing can probe against any
-    /// more. One retirement for both consumers, since there is one
-    /// mirror.
+    /// more, and forget those a shard's recovery fences: no block admits
+    /// a claim at a fenced height, so a composer offering one would
+    /// offer what every voter refuses. One retirement for both
+    /// consumers, since there is one mirror.
     ///
     /// What counterparts said is retired by the execution coordinator
     /// instead, against the ledger its entries speak for.
-    fn retire_proven_anchors(&self) {
+    fn retire_proven_anchors(&self, snapshot: &TopologySnapshot) {
         self.proven_anchors
             .retire_below(self.committed_block_anchor_wt);
+        self.proven_anchors
+            .forget_fenced(|shard, height| snapshot.recovery_fences(shard, height));
     }
 
     /// The evidence a vote is fenced on, borrowed for one judgment.
@@ -2106,6 +2110,13 @@ impl ShardCoordinator {
         // read off the claims this block will carry rather than off the
         // ones offered: a claim the cap dropped licenses nothing, and
         // the voter recomputes the set from the block alone.
+        let readable = readable_deliveries(
+            ready_txs,
+            &state_claims,
+            topology_schedule,
+            validity_anchor,
+            self.local_shard,
+        );
         let late = late_deliveries(
             ready_txs,
             &state_claims,
@@ -2119,7 +2130,7 @@ impl ShardCoordinator {
                 precut: &self.precut,
                 late_deliveries: &late,
             },
-            &mut TransactionsFold::beside(&provision_fold),
+            &mut TransactionsFold::beside(&provision_fold, &readable),
             ready_txs,
         );
         let mut finalization_fold = FinalizationsFold::from(&ctx);
@@ -5025,7 +5036,7 @@ impl ShardCoordinator {
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
-        self.retire_proven_anchors();
+        self.retire_proven_anchors(topology_schedule.head());
         record_state_claims_weight(
             block
                 .state_claims()
@@ -12786,7 +12797,7 @@ mod tests {
             let provisions = ProvisionsFold::default();
             admit_all::<TransactionsSection<'_>>(
                 &ctx,
-                &mut TransactionsFold::beside(&provisions),
+                &mut TransactionsFold::beside(&provisions, &std::collections::HashSet::new()),
                 block.transactions().iter().map(unwrapped),
             )
         }

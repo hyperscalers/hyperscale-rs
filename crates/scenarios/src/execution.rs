@@ -1578,27 +1578,25 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
 /// the core's chain that the producer has commit-proven. A core that
 /// halts leaves none to take — its chain freezes and produces nothing
 /// the producer can prove against — so no reading of any kind is
-/// readable, and the record stands with the stake in it. Cutting both
-/// roads a header travels reaches the same state from the producer's
-/// side, and reaches it on a cluster that needs no committee to fail.
+/// readable, and the record stands with the stake in it.
 ///
-/// **The cut is never lifted, and that is what makes the proxy
-/// faithful.** A cut core goes on committing, so it has an in-window
-/// suffix where a halted one has none; the cut delays those headers
-/// rather than preventing them, and the moment it lifts they are
-/// commit-proven and the newest of them answers. The reclaim that
-/// follows is correct — nothing ever claimed — but it is not this
-/// scenario's subject, and a control that heals asserts the loss only
-/// for as long as the backlog happens to stay undelivered. Which is a
-/// span measured in epochs against a window measured in seconds: it held
-/// at a 30s epoch and did not at 300s.
+/// So the core halts: once the leg has staged the stake, its committee's
+/// block votes are cut and its chain freezes below the span. When the
+/// beacon comes to flag the halt it finds no full committee in the pool
+/// to reseat it with, so the core stands as it froze for the rest of the
+/// run. Halting it, rather than cutting the roads its headers travel,
+/// is what keeps the producer's own chain live: every producer member
+/// freezes at the same last anchor, where a header cut leaves each
+/// proven up to a different core height, and a proposer's reading at a
+/// height its peers never proved times its rounds out until the
+/// missed-proposal jail unseats it.
 ///
 /// # Panics
 ///
-/// Panics if the core never commits the stake, if the leg never stages
-/// it, if either cut is never exercised, if the stake is credited back,
-/// or if the record does not stand past every window that could dispose
-/// of it.
+/// Panics if the committees share a host, if the core never commits the
+/// stake, if the leg never stages it, if the halt is never exercised, if
+/// the halted core is reseated, if the stake is credited back, or if the
+/// record does not stand past every window that could dispose of it.
 pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: &mut C) {
     let (payer_key, payer) = remote_delegator();
     let pool = pool_at(GENESIS_POOL_ID);
@@ -1613,12 +1611,24 @@ pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: 
     let mut charges = Charges::default();
 
     // The core's committee can commit but cannot certify: each member
-    // holds only its own execution vote, so no tick of the core's ever
-    // reaches a quorum and no claim is ever written. Every other channel
-    // is open, which is what lets the core engage the leg and the leg
-    // run.
+    // holds only its own execution vote, so a tick the core manages to
+    // run before it halts reaches no quorum and no claim is ever written.
+    // A guard rather than the subject — a core halted before it can
+    // commit the record's reading never runs the stake at all, and then
+    // there is no vote to drop. Every other channel is open, which is
+    // what lets the core engage the leg and the leg run.
+    //
+    // Every cut here is keyed by host, so the two committees must share
+    // none: a host seating a vnode of each would carry the core's votes
+    // in-process, past every rule.
     let core_hosts = c.committee_hosts(core);
-    let votes_cut = c.drop_type_between(&core_hosts, &core_hosts, "execution.vote");
+    let payer_hosts = c.committee_hosts(payer_shard);
+    assert!(
+        core_hosts.iter().all(|host| !payer_hosts.contains(host)),
+        "the core's and the payer's committees must sit on disjoint hosts: core {core_hosts:?}, \
+         payer {payer_hosts:?}",
+    );
+    let _votes_cut = c.drop_type_between(&core_hosts, &core_hosts, "execution.vote");
 
     let validity = validity_around(c.now());
     let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity);
@@ -1643,30 +1653,30 @@ pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: 
         vault_balance(c, payer_shard, payer),
     );
 
-    // Now the core's chain stops being provable, for the whole of the span
-    // an absence of its claim answers in. Both roads a header travels are
-    // cut — the gossip that pushes one and the fetch that pulls it — so
-    // the producer's newest commit-proven anchor of the core freezes below
-    // the span and the next one it can prove is past it. That is what a
-    // halted chain leaves behind, and it is why no reading taken after the
-    // heal undoes it: the anchors an absence would have to be taken at were
-    // never produced. The fetch rule names the *request* type, since the
-    // fault engine tags a request and its response alike.
-    let headers_cut = c.drop_type("remote_header.request");
-    let gossip_cut = c.drop_type("block.committed");
+    // Now the core halts. Its block votes are cut among its own hosts, so
+    // no round of its reaches a quorum and its chain freezes at the last
+    // commit in flight — below the span an absence of its claim answers
+    // in, since the deadline is still ahead. From here on nothing the
+    // producer can prove of the core lies inside the span.
+    let consensus_cut = c.drop_type_between(&core_hosts, &core_hosts, "block.vote");
     let deadline = Deadline::of(validity.end_timestamp_exclusive);
     assert!(
         c.run_until(epochs(70), |c| clock(c)
             >= Window::LegEntry.of(deadline).end),
-        "the cut must stand past the close of the span an absence answers in",
+        "the halt must stand past the close of the span an absence answers in",
     );
     assert!(
-        votes_cut.fired() > 0 && headers_cut.fired() > 0 && gossip_cut.fired() > 0,
-        "every cut must actually have been exercised",
+        consensus_cut.fired() > 0,
+        "the halt must actually have been exercised",
     );
     assert!(
         c.chain_fate(core, hash).1.is_none(),
         "the core must never have certified anything for the stake",
+    );
+    assert_eq!(
+        c.committee_hosts(core),
+        core_hosts,
+        "nothing reseats the halted core: the pool holds no full committee to draw",
     );
 
     // On past the room the reclaim had, with the core still unreadable.
@@ -1729,6 +1739,7 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
 
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
+    let read_dropped = c.drop_type("state_proof.request");
 
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
@@ -1767,12 +1778,13 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
         "the cut must stand past where the delivery used to lapse",
     );
     assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
-        "both bundle channels must actually have been exercised and cut"
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0 && read_dropped.fired() > 0,
+        "the payer's bundle channels and the record's read channel must actually have been \
+         exercised and cut"
     );
     assert!(
         c.chain_fate(recipient_shard, hash).0.is_none(),
-        "the delivery must never have landed while its bundle was cut off",
+        "the delivery must never have landed while its record was cut off",
     );
 
     // Nothing takes the crossing back. The payer stays debited for the
@@ -1814,10 +1826,10 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
 ///
 /// # Panics
 ///
-/// Panics if the payer's leg does not accept, if the bundle channels are
-/// never exercised, if the delivery lands while the cut stands, if the
-/// recipient is not paid once the network heals, or if the world does
-/// not conserve.
+/// Panics if the payer's leg does not accept, if the bundle and read
+/// channels are never exercised, if the delivery lands while the cut
+/// stands, if the recipient is not paid once the network heals, or if
+/// the world does not conserve.
 pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mut C) {
     let (payer_key, from, to) = cross_shard_cast();
     let payer_shard = ShardId::leaf(1, 0);
@@ -1829,6 +1841,7 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
 
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
+    let read_dropped = c.drop_type("state_proof.request");
 
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
@@ -1860,12 +1873,13 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
         "the cut must stand past where the delivery used to lapse",
     );
     assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
-        "both bundle channels must actually have been exercised and cut"
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0 && read_dropped.fired() > 0,
+        "the payer's bundle channels and the record's read channel must actually have been \
+         exercised and cut"
     );
     assert!(
         c.chain_fate(recipient_shard, hash).0.is_none(),
-        "the delivery must never have landed while its bundle was cut off",
+        "the delivery must never have landed while its record was cut off",
     );
 
     // The network is whole again, well past the old close: the record
@@ -1912,10 +1926,10 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
 ///
 /// # Panics
 ///
-/// Panics if the payer's leg does not accept, if the bundle channels are
-/// never exercised, if the delivery lands while the cut stands, if the
-/// recipient is not paid once the network heals, or if any value is left
-/// stranded.
+/// Panics if the payer's leg does not accept, if the bundle and read
+/// channels are never exercised, if the delivery lands while the cut
+/// stands, if the recipient is not paid once the network heals, or if
+/// any value is left stranded.
 pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCluster>(c: &mut C) {
     let (payer_key, from, to) = cross_shard_cast();
     let payer_shard = ShardId::leaf(1, 0);
@@ -1927,6 +1941,7 @@ pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCl
 
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
+    let read_dropped = c.drop_type("state_proof.request");
 
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
@@ -1963,19 +1978,20 @@ pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCl
         "the cut must stand well past the transaction's deadline",
     );
     assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
-        "both bundle channels must actually have been exercised and cut",
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0 && read_dropped.fired() > 0,
+        "the payer's bundle channels and the record's read channel must actually have been \
+         exercised and cut",
     );
     assert!(
         c.chain_fate(recipient_shard, hash).0.is_none(),
-        "the delivery must never have landed while its bundle was cut off",
+        "the delivery must never have landed while its record was cut off",
     );
 
     // Whole again, and not too late. The producer never stopped holding
-    // the record and never stopped offering the crossing, so the bundle
-    // reaches the recipient's shard on the next offer — and the block
-    // that admits the delivery proves the record present rather than
-    // reading a clock that would long since have closed.
+    // the record, so the recipient's read reaches it on the next ask —
+    // and the block that admits the delivery carries the record's live
+    // reading rather than reading a clock that would long since have
+    // closed.
     c.clear_drops();
     assert!(
         c.run_until(epochs(20), |c| vault_balance(c, recipient_shard, to)

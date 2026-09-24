@@ -425,7 +425,6 @@ impl StateMachine for NodeStateMachine {
             // ── Provisions ───────────────────────────────────────────────
             evt @ (ProtocolEvent::VerifiedProvisionsReceived { .. }
             | ProtocolEvent::UnverifiedProvisionsReceived { .. }
-            | ProtocolEvent::PulledProvisionsReceived { .. }
             | ProtocolEvent::StateProvisionsVerified { .. }
             | ProtocolEvent::ProvisionsAdmitted { .. }
             | ProtocolEvent::OutboundProvisionBroadcast { .. }

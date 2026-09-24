@@ -27,6 +27,7 @@ use crate::admission::{
     RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_all, unwrapped,
 };
+use crate::proposal::readable_deliveries;
 
 /// True if `qc.signers()` represents at least 2f+1 of the local committee's
 /// voting power. The synced-block apply path and consensus pre-vote path
@@ -351,7 +352,14 @@ pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork
         &mut provisions,
         block.provisions().iter().map(unwrapped),
     )?;
-    let mut transactions = TransactionsFold::beside(&provisions);
+    let readable = readable_deliveries(
+        block.transactions(),
+        block.state_claims(),
+        ctx.schedule,
+        ctx.anchor,
+        ctx.local_shard,
+    );
+    let mut transactions = TransactionsFold::beside(&provisions, &readable);
     admit_all::<TransactionsSection<'_>>(
         ctx,
         &mut transactions,
@@ -1058,8 +1066,9 @@ pub mod tests {
             .collect();
         let against = plain();
         let provisions = ProvisionsFold::default();
+        let readable = std::collections::HashSet::new();
         let near_cap = || {
-            let mut fold = TransactionsFold::beside(&provisions);
+            let mut fold = TransactionsFold::beside(&provisions, &readable);
             fold.sweepable = MAX_SWEEPABLE_CREATED_PER_BLOCK - full * cells;
             fold
         };

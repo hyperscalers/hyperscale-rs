@@ -64,6 +64,13 @@ impl NodeStateMachine {
             self.beacon_coordinator.current_topology_snapshot(),
             certified,
         ));
+        // The records the pool's delivering bodies need, for the
+        // execution coordinator's reads to ask for beside the ones its
+        // own candidates wait on.
+        s.execution_coordinator.want_records(
+            s.mempool_coordinator
+                .delivery_records_wanted(self.beacon_coordinator.current_topology_snapshot()),
+        );
         // What the block's finalizations settle about the transactions
         // they name is the execution ledger's reading — a name that
         // decides nothing is a leg finalizing here, a deciding success
@@ -122,6 +129,10 @@ impl NodeStateMachine {
         actions.extend(
             s.apply_block_to_execution(self.beacon_coordinator.topology_schedule(), certified),
         );
+        // The delivering bodies whose records the execution coordinator
+        // now holds live readings of are unparked, to ride beside them.
+        s.mempool_coordinator
+            .on_deliveries_readable(&s.execution_coordinator.readable_deliveries());
 
         // The first coast commit quiesces the chain's content: finalization is a
         // finalization in a later block, and no later content block will

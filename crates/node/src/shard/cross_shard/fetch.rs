@@ -21,8 +21,7 @@ use hyperscale_types::network::request::{
     GetLocalProvisionsRequest, GetProvisionsRequest, GetSettledTxsRequest, GetStateProofRequest,
 };
 use hyperscale_types::network::response::{
-    CommittedTxVerdict, GetCommittedTxsResponse, GetProvisionResponse, GetSettledTxsResponse,
-    GetStateProofResponse,
+    CommittedTxVerdict, GetCommittedTxsResponse, GetSettledTxsResponse, GetStateProofResponse,
 };
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
@@ -522,106 +521,6 @@ impl ScopedAnswer for StateProofBinding {
     }
 }
 
-/// The pull: a crossing's record read at an anchor the asker has
-/// commit-proven, for a delivery that needs its value.
-///
-/// [`ProvisionBinding`]'s other half, and the difference is what fixes
-/// the reading. That one names the block that promised a bundle, so it
-/// stops working the moment that block ages past the producer's
-/// retention — which is the defect this exists to close. This one names
-/// an anchor the asker chose because it can verify it, and the asker's
-/// newest proven anchor moves forward for as long as it keeps proving
-/// them.
-pub struct CrossingPullBinding;
-
-impl FetchBinding for CrossingPullBinding {
-    /// `(anchor, record)` — the producer anchor the answer is checked
-    /// against, and one record cell whose value is wanted.
-    type Id = (Anchor, SubstateKey);
-
-    const NAME: &'static str = "crossing_pull";
-
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::CrossingPulls(ids)
-    }
-
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
-        &mut shard.cross_shard.crossing_pull
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Self::Id>,
-        local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
-    }
-}
-
-impl ScopedAnswer for CrossingPullBinding {
-    type Scope = Anchor;
-    type Key = SubstateKey;
-    type Request = GetProvisionsRequest;
-
-    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
-        id
-    }
-
-    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
-        (scope, key)
-    }
-
-    /// **The asker names itself, because a bundle is built for one
-    /// target and carries that target in its own body.** The scope's
-    /// shard is the producer being asked; naming it here would have the
-    /// producer build a bundle addressed to itself, which the asker then
-    /// drops as not its to absorb.
-    fn request(scope: Self::Scope, keys: &[Self::Key], asker: ShardId) -> Self::Request {
-        GetProvisionsRequest::for_records(
-            scope.height,
-            Capped::new(keys.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
-            asker,
-        )
-    }
-
-    /// **A short answer is an answer, not a refusal.** The producer
-    /// serves the keys whose prefix it holds and whose values its state
-    /// has at the height asked, so a bundle carrying fewer than were
-    /// named is honest — a cut moves a prefix, and a record is written
-    /// at some height and absent below it. Every member of the
-    /// committee would say the same, which is what
-    /// [`Refusal::NotHeld`]'s own doc says of a question like this, so
-    /// rotating to another peer buys nothing and costs a round trip.
-    /// What comes back is absorbed for what it carries, its ids are
-    /// released, and whatever is still unmet is asked again by the
-    /// arming, at a newer anchor.
-    ///
-    /// The values are checked downstream against the anchor's own
-    /// commit-proven header, as every bundle's are. Nothing about the
-    /// ask is trusted for that, which is why nothing here needs to be.
-    fn answer(
-        scope: Self::Scope,
-        keys: Vec<Self::Key>,
-        response: GetProvisionResponse,
-    ) -> Result<ProtocolEvent, Refusal> {
-        if let Some(provisions) = &response.provisions
-            && (provisions.source_shard() != scope.shard
-                || provisions.block_height() != scope.height)
-        {
-            return Err(Refusal::Unusable("scope_mismatch"));
-        }
-        Ok(ProtocolEvent::PulledProvisionsReceived {
-            provisions: response.provisions,
-            anchor: scope,
-            records: keys,
-        })
-    }
-}
-
 /// Marker type for the settled-set fetch against a departed shard's
 /// terminal.
 pub struct SettledTxsBinding;
@@ -733,7 +632,7 @@ impl FetchBinding for ProvisionBinding {
         // `target_shard` (the requester's shard) is the body field: the
         // source filters provisions by which shard is asking. Routing
         // shard `shard = source_shard` picks the responding committee.
-        let request = GetProvisionsRequest::at_block(block_height, target_shard);
+        let request = GetProvisionsRequest::new(block_height, target_shard);
         let es = sender.clone();
         network.request(
             shard,

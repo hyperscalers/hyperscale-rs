@@ -490,10 +490,12 @@ struct CutLeg {
     records: Vec<SubstateKey>,
     broadcast_dropped: FaultHandle,
     fetch_dropped: FaultHandle,
+    read_dropped: FaultHandle,
 }
 
 /// Cast the splitter's vote, wait out its activation epoch, cut both
-/// channels a crossing bundle travels, and submit the transfer.
+/// channels the payer's bundle travels and the channel the record is
+/// read through, and submit the transfer.
 ///
 /// The vote goes first because it activates epochs later and the split
 /// is admitted only after that; the leg goes in at the activation epoch,
@@ -523,6 +525,7 @@ fn issue_a_leg_under_a_cut_bundle<C: FaultableCluster>(
     );
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
+    let read_dropped = c.drop_type("state_proof.request");
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(payer_key, payer, recipient, STRADDLER_PAYMENT, validity);
     let price = declared_price(c, &tx);
@@ -540,6 +543,7 @@ fn issue_a_leg_under_a_cut_bundle<C: FaultableCluster>(
         records,
         broadcast_dropped,
         fetch_dropped,
+        read_dropped,
     }
 }
 
@@ -585,6 +589,7 @@ pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut
         records,
         broadcast_dropped,
         fetch_dropped,
+        read_dropped,
     } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
     world.owing(records);
     assert!(
@@ -636,14 +641,15 @@ pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut
         "the cut must stand past where the delivery used to lapse",
     );
     assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
-        "both bundle channels must actually have been exercised and cut"
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0 && read_dropped.fired() > 0,
+        "the payer's bundle channels and the record's read channel must actually have been \
+         exercised and cut"
     );
     for shard in [splitter, child_left, child_right] {
         let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
         assert!(
             fate != Some(TransactionDecision::Accept),
-            "the delivery must never have landed while its bundle was cut off; {shard} reached \
+            "the delivery must never have landed while its record was cut off; {shard} reached \
              {fate:?}",
         );
     }
@@ -718,6 +724,7 @@ pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableClus
         records,
         broadcast_dropped,
         fetch_dropped,
+        read_dropped,
     } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
     world.owing(records);
     assert!(
@@ -768,13 +775,14 @@ pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableClus
         "the cut must stand past where the delivery used to lapse",
     );
     assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
-        "both bundle channels must actually have been exercised and cut"
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0 && read_dropped.fired() > 0,
+        "the payer's bundle channels and the record's read channel must actually have been \
+         exercised and cut"
     );
     let fate = c.chain_fate(survivor, hash).1.map(|(_, decision)| decision);
     assert!(
         fate != Some(TransactionDecision::Accept),
-        "the delivery must never have landed while its bundle was cut off; {survivor} reached \
+        "the delivery must never have landed while its record was cut off; {survivor} reached \
          {fate:?}",
     );
 

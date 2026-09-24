@@ -26,9 +26,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction, TxHash,
+    Address, EscrowedValue, Role, ShardId, ShardTrie, StateClaim, SubstateKey, Transaction, TxHash,
 };
-use hyperscale_vm_effects::{Answered, CrossingEdge as StarEdge, Kind, Star, running_at, star_at};
+use hyperscale_vm_effects::{
+    Answered, Crossing, CrossingCell, CrossingEdge as StarEdge, CrossingLeaf, Kind, Star,
+    running_at, star_at,
+};
 use hyperscale_vm_kernel::{Crossed, Deletion, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
@@ -926,6 +929,37 @@ pub enum PlanDefect {
     Fault(#[from] PlanFault),
 }
 
+/// The live record a block's claims read at `key`, with the crossing
+/// it records.
+///
+/// Among the held readings of the key the block carries, the one at
+/// the newest anchor by weighted time, decoded as a crossing leaf.
+/// `Some` only for a record, never for a tombstone, and a bare presence
+/// of the key licenses nothing — a reading that carries no value says
+/// nothing a delivery can be composed from.
+///
+/// One statement of it, because the licence to engage a delivery, the
+/// licence to carry one past its validity end and the arrival a
+/// delivering member runs against are one reading. The answer does not
+/// depend on how many readings of the key a block carries or in what
+/// order.
+#[must_use]
+pub fn live_record(
+    state_claims: &[StateClaim],
+    key: SubstateKey,
+) -> Option<(Crossing, CrossingCell)> {
+    state_claims
+        .iter()
+        .filter_map(|claim| claim.held(key).map(|bytes| (claim.anchor.ts, bytes)))
+        .max_by_key(|(ts, _)| *ts)
+        .and_then(
+            |(_, bytes)| match CrossingLeaf::read(&ProtocolHasher, key, bytes)? {
+                CrossingLeaf::Record { crossing, cell } => Some((crossing, cell)),
+                CrossingLeaf::Tombstone { .. } | CrossingLeaf::Answer { .. } => None,
+            },
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{Address, AddressClass, LocalKey, SubstateKey};
@@ -1455,6 +1489,41 @@ mod tests {
             assert!(plan.legs.departure(1, 0).is_none());
             assert!(plan.legs.departure(3, 0).is_some());
         }
+    }
+
+    /// An inbound leg off the core feeds core nodes on two shards: the
+    /// edge crosses to every core shard, and the record's consumer
+    /// routes to one of them, so a push reaches one core shard and the
+    /// other reads the record through its own ask.
+    #[test]
+    fn an_inbound_leg_off_the_core_crosses_to_every_core_shard() {
+        let trie = ShardTrie::uniform(2);
+        let (leaf0, leaf1, leaf2) = (
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
+        );
+        let legs = vec![
+            leg(owner_at(0x11, 1), LegRole::Inbound, &[], 0),
+            leg(owner_at(0x12, 0), LegRole::Core, &[(0, 0)], 1),
+            leg(owner_at(0x13, 2), LegRole::Core, &[(1, 0)], 2),
+            leg(owner_at(0x14, 1), LegRole::Outbound, &[(2, 0)], 3),
+        ];
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &trie);
+        assert!(classified.decomposed());
+        assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
+        let edges = classified.edges();
+        let inbound = edges
+            .iter()
+            .find(|edge| edge.producer == 0)
+            .expect("the inbound leg's output crosses");
+        assert_eq!(inbound.from, leaf1);
+        assert_eq!(inbound.to, BTreeSet::from([leaf0, leaf2]));
+        let owner = trie.shard_for_prefix(inbound.crossing.id.consumer);
+        assert!(
+            inbound.to.contains(&owner),
+            "the record's consumer routes to one of the core shards it crosses to"
+        );
     }
 
     /// What a shard runs is what its block reserves, and a multi-shard

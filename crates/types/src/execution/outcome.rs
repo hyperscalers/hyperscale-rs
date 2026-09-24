@@ -332,7 +332,7 @@ impl TxOutcome {
     /// Whether this outcome is the transaction's own execution, rather
     /// than a member settling what one left.
     #[must_use]
-    pub(crate) const fn executes(&self) -> bool {
+    pub const fn executes(&self) -> bool {
         self.role.executes()
     }
 

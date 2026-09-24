@@ -71,12 +71,20 @@ impl ShardParticipation {
         // holds neither a place nor a share of the block's budget.
         let topology = sched.head();
         let riding = Self::riding_this_proposal(&queued);
+        // A delivery-only transaction whose every record this validator
+        // holds a live reading of is engaged by that reading, which
+        // rides this proposal's claims.
+        let readable: HashSet<TxHash> = self
+            .execution_coordinator
+            .readable_deliveries()
+            .into_iter()
+            .collect();
         let ready_txs = self.mempool_coordinator.ready_transactions(
             max_txs,
             in_flight.inner(),
             topology.shard_trie(),
             self.now,
-            |tx| self.engagement_held(tx, topology, &riding),
+            |tx| self.engagement_held(tx, topology, &riding, &readable),
         );
 
         // Provisions coordinator stores `Verified` internally; lift each
@@ -98,12 +106,15 @@ impl ShardParticipation {
 
     /// Whether the engagement evidence for `tx` is in hand: not a
     /// transaction, single-shard, our shard is the payer's, the payer's
-    /// bundle rides in `queued`, or an earlier block already absorbed it.
+    /// bundle rides in `queued`, an earlier block already absorbed it,
+    /// or the records a delivery-only transaction consumes are held as
+    /// live readings to ride beside it.
     fn engagement_held(
         &self,
         tx: &Arc<Verified<Transaction>>,
         topology: &TopologySnapshot,
         riding: &HashSet<(ShardId, TxHash)>,
+        readable: &HashSet<TxHash>,
     ) -> bool {
         if topology.is_single_shard_transaction(tx.as_ref()) {
             return true;
@@ -116,6 +127,7 @@ impl ShardParticipation {
         self.execution_coordinator
             .has_provisions_from(tx_hash, payer_shard)
             || riding.contains(&(payer_shard, tx_hash))
+            || readable.contains(&tx_hash)
     }
 
     /// What the queued bundles name, as a set: `(payer shard, tx)` for

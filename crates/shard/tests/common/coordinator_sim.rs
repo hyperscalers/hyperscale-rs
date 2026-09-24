@@ -1727,14 +1727,12 @@ impl ShardCoordinatorSim {
                 block_hash,
                 expected,
                 transactions,
-                certificates,
                 topology_snapshot,
             } => {
                 let ptx_ctx = ProvisionTxRootsContext {
                     local_shard: self.shard,
                     topology_snapshot: &topology_snapshot,
                     transactions: &transactions,
-                    certificates: &certificates,
                 };
                 let result = expected.verify(&ptx_ctx);
                 self.loopback_q.push_back(Envelope {

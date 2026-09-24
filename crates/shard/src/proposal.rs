@@ -19,7 +19,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_engine::legs::Classified;
+use hyperscale_engine::legs::{Classified, live_record};
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
     LocalTimestamp, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadySignal,
@@ -33,7 +33,7 @@ use tracing::debug;
 use crate::admission::{
     Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, Section, StateClaimsFold, StateClaimsSection, TransactionsFold,
-    TransactionsSection, admit_each, record_reading, unwrapped,
+    TransactionsSection, admit_each, unwrapped,
 };
 use crate::chain_view::ChainView;
 use crate::precut::Precut;
@@ -241,28 +241,62 @@ pub fn select_transactions(
     selected
 }
 
-/// The transactions among `txs`, past their validity end at `anchor`,
-/// that `local_shard` only delivers for and that `state_claims`
-/// licenses: frozen divided against the trie of `anchor`'s window with
-/// this shard outside the core and every leg here a delivery, and every
-/// record that delivery consumes proved present by a claim the block
-/// carries.
+/// The transactions in `txs` that only deliver here and whose every
+/// record consumed here the block's claims read live under the
+/// transaction's own name: what a live held reading engages in place of
+/// a payer bundle, and what a delivery-only transaction is carried on
+/// past its validity end.
 ///
 /// Computed against the block's own anchor and the block's own claims,
-/// by the proposer selecting and by every voter checking, so the set is
-/// one set. Empty when the anchor's window is not retained — a block
-/// there is refused on other grounds.
+/// so proposer and voters derive one set. The licence is the record
+/// read live, in a claim the block carries; the reading window is the
+/// recency rule on it, applied where the claim is admitted, and a claim
+/// the budget dropped licenses nothing.
+#[must_use]
+pub fn readable_deliveries<T: Deref<Target = Transaction>>(
+    txs: &[Arc<T>],
+    state_claims: &[StateClaim],
+    topology_schedule: &TopologySchedule,
+    anchor: WeightedTimestamp,
+    local_shard: ShardId,
+) -> HashSet<TxHash> {
+    if state_claims.iter().all(|claim| !claim.holds_a_value()) {
+        return HashSet::new();
+    }
+    let Some(window) = topology_schedule.at(anchor) else {
+        return HashSet::new();
+    };
+    let trie = window.shard_trie();
+    txs.iter()
+        .filter(|tx| {
+            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
+            if !classified.only_delivers_at(local_shard) {
+                return false;
+            }
+            let mut consumed = classified
+                .crossings()
+                .filter(|(edge, _)| {
+                    edge.crossing.kind == Kind::Owed && edge.to.contains(&local_shard)
+                })
+                .peekable();
+            consumed.peek().is_some()
+                && consumed.all(|(edge, _)| {
+                    live_record(state_claims, edge.crossing.id.record_key(&ProtocolHasher))
+                        .is_some_and(|(_, cell)| cell.tx == tx.hash())
+                })
+        })
+        .map(|tx| tx.hash())
+        .collect()
+}
+
+/// The readable deliveries in `txs` past their validity end at
+/// `anchor`: admissible on the licence the live reading is, not on the
+/// clock.
 ///
-/// **The licence is the record read present, and nothing about when.**
 /// A presence answers wherever it was taken, and a claim at an old
-/// anchor is admitted on purpose: there is no recency rule here and
-/// there cannot be one, because which anchor is newest is a question
-/// each validator answers from its own fetches, so a voter holding a
-/// newer one would refuse a block with nothing to fetch that would
-/// change its mind. What stops a stale proof mattering sits on the other
-/// side — a consumer deletes the answer it holds only once no replay
-/// could still be served against the record — so the wait lives on that
-/// deletion rather than on this admission.
+/// anchor inside the reading window is admitted on purpose: there is no
+/// recency rule here beyond the window, since which anchor is newest is
+/// a question each validator answers from its own fetches.
 #[must_use]
 pub fn late_deliveries<T: Deref<Target = Transaction>>(
     txs: &[Arc<T>],
@@ -271,26 +305,11 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
     anchor: WeightedTimestamp,
     local_shard: ShardId,
 ) -> HashSet<TxHash> {
-    let Some(window) = topology_schedule.at(anchor) else {
-        return HashSet::new();
-    };
-    let trie = window.shard_trie();
+    let readable = readable_deliveries(txs, state_claims, topology_schedule, anchor, local_shard);
     txs.iter()
         .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
-        .filter(|tx| {
-            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-            classified.only_delivers_at(local_shard)
-                && classified
-                    .crossings()
-                    .filter(|(edge, _)| {
-                        edge.crossing.kind == Kind::Owed && edge.to.contains(&local_shard)
-                    })
-                    .all(|(edge, _)| {
-                        record_reading(state_claims, edge.crossing.id.record_key(&ProtocolHasher))
-                            .is_some()
-                    })
-        })
         .map(|tx| tx.hash())
+        .filter(|tx_hash| readable.contains(tx_hash))
         .collect()
 }
 
@@ -608,10 +627,9 @@ mod tests {
     };
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CommittedAt, CommittedTxsRoot, Deadline, Hash,
-        Inclusion, LocalKey, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE,
-        MerkleInclusionProof, NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot,
-        SubstateKey, TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
-        state_claims_admit_block,
+        Inclusion, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE,
+        NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot, TimestampRange,
+        TransactionDecision, UnsettledTx, ValidatorSet, state_claims_admit_block,
     };
 
     use super::*;
@@ -1022,7 +1040,7 @@ mod tests {
                 precut: &refuses_precut(),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
             &txs,
         );
         assert!(
@@ -1043,7 +1061,7 @@ mod tests {
                 precut: &admits_precut(hash),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
             &txs,
         );
         assert_eq!(
@@ -1078,7 +1096,7 @@ mod tests {
                 precut: &refuses_precut(),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
             &txs,
         );
 
@@ -1106,7 +1124,7 @@ mod tests {
                 precut: &refuses_precut(),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
             &txs,
         );
 
@@ -1139,7 +1157,7 @@ mod tests {
                 precut: &refuses_precut(),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
             &txs,
         );
 
@@ -1168,7 +1186,8 @@ mod tests {
         let cells = MAX_INTENTS + 1;
         let full = 3;
         let provisions = ProvisionsFold::default();
-        let mut fold = TransactionsFold::beside(&provisions);
+        let readable = HashSet::new();
+        let mut fold = TransactionsFold::beside(&provisions, &readable);
         fold.sweepable = MAX_SWEEPABLE_CREATED_PER_BLOCK - full * cells - (cells / 2);
         let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
             .map(|i| {
@@ -1229,7 +1248,7 @@ mod tests {
                 precut: &refuses_precut(),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
             &txs,
         );
 
@@ -1291,58 +1310,66 @@ mod tests {
         );
     }
 
-    /// A record read present licenses a late delivery, at whatever
-    /// anchor the reading was taken, and nothing else does.
-    ///
-    /// Both arms matter and they are not symmetric. A record is written
-    /// by the one execution that issues the crossing and swept by
-    /// nothing, so a presence anywhere is a presence and an old anchor
-    /// is admitted on purpose — which is why there is no recency rule
-    /// here. An absence says only that the producer has disposed of it
-    /// by some road, which licenses nobody: it is the reading a replay
-    /// would arrive holding.
+    /// A live record read off a held reading licenses a delivery:
+    /// tombstones license nothing, in either order beside a live
+    /// reading, and neither does a bare presence of the key.
     #[test]
-    fn a_late_delivery_is_licensed_by_the_record_read_present() {
-        let record = SubstateKey {
-            owner: Address::new([0xAA; 31], AddressClass::Component),
-            local: LocalKey([0x01; 16]),
+    fn a_live_record_is_the_one_licence_and_nothing_else_is() {
+        use hyperscale_hbor::Bytes;
+        use hyperscale_types::{MerkleInclusionProof, Stated};
+        use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms, TxHash as VmTxHash};
+        use hyperscale_vm_types::ResourceAddr;
+
+        let id = CrossingId {
+            producer: Address::new([0xAA; 31], AddressClass::Component),
+            consumer: Address::new([0xAB; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0xAC; 32])),
+            local: 0,
+            output: 0,
         };
-        let claim = |height: u64, inclusion: Inclusion| {
+        let record = id.record_key(&ProtocolHasher);
+        let tx = VmTxHash(Hash32([0xAD; 32]));
+        let cell = |terms: Terms| id.cell(tx, ResourceAddr::new([0xE0; 31]), 5, 9_000, terms);
+        let claim = |height: u64, stated: Stated| {
             StateClaim::new(
                 Anchor {
                     shard: ShardId::leaf(1, 1),
                     height: BlockHeight::new(height),
                     state_root: StateRoot::from_raw(Hash::ZERO),
-                    ts: ts(1_000),
+                    ts: ts(height * 1_000),
                 },
-                [(record, inclusion)],
+                [(record, stated)],
                 MerkleInclusionProof::dummy(),
             )
         };
+        let held = |terms: Terms| Stated::Held(Bytes::new(cell(terms).to_bytes()).unwrap());
 
+        assert!(live_record(&[], record).is_none());
+        assert_eq!(
+            live_record(&[claim(7, held(Terms::Owed))], record).map(|(_, cell)| cell.tx),
+            Some(tx),
+            "the record read live is the whole licence",
+        );
+        assert!(live_record(&[claim(7, held(Terms::Retired))], record).is_none());
         assert!(
-            record_reading(&[], record).is_none(),
-            "a block carrying nothing licenses nothing"
+            live_record(&[claim(7, Inclusion::Present([0xAB; 32]).into())], record).is_none(),
+            "a bare presence licenses nothing",
         );
         assert!(
-            record_reading(&[claim(7, Inclusion::Present([0xAB; 32]))], record).is_some(),
-            "the record proved present is the whole licence",
+            live_record(
+                &[claim(3, held(Terms::Owed)), claim(7, held(Terms::Retired))],
+                record
+            )
+            .is_none(),
+            "the newest reading is a tombstone",
         );
         assert!(
-            record_reading(&[claim(1, Inclusion::Present([0xAB; 32]))], record).is_some(),
-            "and it answers at an old anchor too: a presence is not bounded by a clock",
-        );
-        assert!(
-            record_reading(&[claim(7, Inclusion::Absent)], record).is_none(),
-            "a record read absent says the producer disposed of it, which licenses nobody",
-        );
-        let elsewhere = SubstateKey {
-            local: LocalKey([0x02; 16]),
-            ..record
-        };
-        assert!(
-            record_reading(&[claim(7, Inclusion::Present([0xAB; 32]))], elsewhere).is_none(),
-            "and a claim over some other cell is not this crossing's licence",
+            live_record(
+                &[claim(7, held(Terms::Retired)), claim(3, held(Terms::Owed))],
+                record
+            )
+            .is_none(),
+            "in either order",
         );
     }
 
@@ -1372,7 +1399,7 @@ mod tests {
                     precut: &refuses_precut(),
                     late_deliveries: &late,
                 },
-                &mut TransactionsFold::beside(&ProvisionsFold::default()),
+                &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
                 &txs,
             )
             .iter()
@@ -1412,7 +1439,7 @@ mod tests {
                 precut: &refuses_precut(),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
             &txs,
         );
 
@@ -1442,7 +1469,7 @@ mod tests {
                 precut: &refuses_precut(),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
             &[tx],
         );
         assert!(selected.is_empty());

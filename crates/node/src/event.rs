@@ -441,7 +441,6 @@ impl ShardScopedInput {
                 | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
                 | ProtocolEvent::VerifiedProvisionsReceived { .. }
                 | ProtocolEvent::UnverifiedProvisionsReceived { .. }
-                | ProtocolEvent::PulledProvisionsReceived { .. }
                 | ProtocolEvent::ExecutionCertificatesReceived { .. }
                 | ProtocolEvent::FinalizationsReceived { .. }
                 | ProtocolEvent::TransactionsReceived { .. }

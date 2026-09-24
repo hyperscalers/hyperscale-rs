@@ -146,10 +146,6 @@ impl ShardParticipation {
             shard_config.clone(),
             recovered.clone(),
         );
-        // The pool asks a producer for the records a parked body needs,
-        // and reads them at the same mirror everything else does.
-        let mempool_coordinator =
-            mempool_coordinator.with_proven_anchors(Arc::clone(shard_coordinator.proven_anchors()));
         // One mirror of the commit-proven remote anchors and one of what
         // counterparts have said, both owned by the shard coordinator:
         // the vote fence and the execution coordinator ask the same

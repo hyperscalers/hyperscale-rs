@@ -35,6 +35,7 @@ mod outbound_certs;
 mod parked;
 mod provisional;
 mod provisioning;
+mod record_reads;
 mod ticks;
 mod vote_tracker;
 
@@ -42,6 +43,6 @@ pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats
 pub use counterparts::Offers;
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
-pub use lookups::{crossing_requests, provision_request, record_requests};
+pub use lookups::{provision_request, record_pushes, records_written};
 pub use tick_state::TickState;
 pub use vote_tracker::VoteTracker;

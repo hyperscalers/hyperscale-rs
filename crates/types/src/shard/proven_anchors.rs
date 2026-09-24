@@ -162,6 +162,20 @@ impl ProvenAnchors {
             .expect("proven anchors lock poisoned")
             .retain(|_, anchor| anchor.ts >= floor);
     }
+
+    /// Forget every anchor `fenced` names: a height a shard's recovery
+    /// has fenced is one no block admits a claim at, so a composer
+    /// offering a claim there would offer what every voter refuses.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::record`].
+    pub fn forget_fenced(&self, fenced: impl Fn(ShardId, BlockHeight) -> bool) {
+        self.by_height
+            .write()
+            .expect("proven anchors lock poisoned")
+            .retain(|_, anchor| !fenced(anchor.shard, anchor.height));
+    }
 }
 
 #[cfg(test)]

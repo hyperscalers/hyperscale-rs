@@ -190,10 +190,9 @@ pub use shard::roots::{
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     REVEAL_CHAIN_DOMAIN_TAG, RootMismatch, SplitChildRoots, StateRootContext, StateRootVerifyError,
     TerminalRoots, TransactionRootContext, TxRootVerifyError, commit_witness_window,
-    committed_crossings, committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves,
-    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
-    ready_leaf_payload, settled_txs_root_from_hashes,
+    committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves, derive_reshape_trigger,
+    extend_reveal_chain, local_settled_tx_hashes, missed_proposals_since_prev_commit,
+    next_reveal_chain, prove_committed_tx_absent, ready_leaf_payload, settled_txs_root_from_hashes,
 };
 pub use shard::state_claim::{StateClaim, Stated};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};

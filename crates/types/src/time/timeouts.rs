@@ -196,18 +196,23 @@ const _: () = assert!(
 /// walks. Half an epoch is the working margin, not the hard bound.
 const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
 
-/// How far back a producer answers with a bundle for a crossing record,
-/// and so how long a consumer's answer cell has to outlive its record.
+/// How old the anchor of a held reading may be for a block to admit
+/// it, and so how long a consumer's answer cell has to outlive its
+/// record.
+///
+/// A crossing record reaches its consumer as a state claim carrying
+/// the record's value, and a claim carrying a value is admitted only
+/// while its anchor sits inside this window of the admitting block's
+/// own clock. A replayed delivery needs such a reading to dispatch at
+/// all, so past the window no replay can be fed whatever any cell
+/// says, and one reading of the record gone is the whole licence to
+/// delete the answer.
 ///
 /// **The figure is the horizon less one finalization delay, and the
-/// subtraction is the point.** A consumer deletes its answer on two
-/// absences of the record this far apart, because past that no bundle
-/// for it can reach any block and a replayed delivery could never
-/// dispatch. Both readings have to ride in the deleting block, so the
-/// first must still be provable when the second is taken — and a proof
-/// stands for [`RETENTION_HORIZON`]. Subtracting
-/// [`MAX_FINALIZATION_DELAY`] leaves exactly the round trip a fetch of
-/// the pair takes.
+/// subtraction is the point.** The reading has to be provable when it
+/// is admitted, and a proof stands for [`RETENTION_HORIZON`];
+/// subtracting [`MAX_FINALIZATION_DELAY`] leaves exactly the round
+/// trip a fetch of it takes.
 ///
 /// Measured in a smaller constant than the one bounding its own
 /// evidence, which is what the horizon itself could never be: a span of

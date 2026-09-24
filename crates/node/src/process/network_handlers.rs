@@ -788,10 +788,10 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     use hyperscale_engine::Executor;
     use hyperscale_types::network::request::{
-        Anchored, GetBlockRequest, GetCellsRequest, GetCommittedTxsRequest,
-        GetInstanceRecordsRequest, GetPackageArtifactsRequest, GetProvisionsRequest,
-        GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest, GetStateRangeRequest,
-        GetTransactionsRequest, GetWitnessHistoryRequest,
+        GetBlockRequest, GetCellsRequest, GetCommittedTxsRequest, GetInstanceRecordsRequest,
+        GetPackageArtifactsRequest, GetProvisionsRequest, GetRemoteHeadersRequest,
+        GetSettledTxsRequest, GetStateProofRequest, GetStateRangeRequest, GetTransactionsRequest,
+        GetWitnessHistoryRequest,
     };
     use hyperscale_types::network::response::{
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
@@ -990,18 +990,7 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetProvisionsRequest>(
             shard,
             move |req: GetProvisionsRequest| {
-                // A pull is anchored at whatever the tip is when it is
-                // answered, so neither cache below can hold its answer:
-                // both are keyed by a source height, and the height a
-                // pull reads at moves. Served straight through.
-                let Anchored::Block(height) = req.asks else {
-                    return serve_provision_request(
-                        &pending_chain,
-                        shard,
-                        topology_snapshot.load().shard_trie(),
-                        &req,
-                    );
-                };
+                let height = req.height;
                 let cache_key = (height.inner(), req.target_shard.inner());
 
                 // Outbound fast path: if we still hold the exact batch we
