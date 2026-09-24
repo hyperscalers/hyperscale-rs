@@ -19,13 +19,12 @@ use std::sync::Arc;
 use hyperscale_engine::legs::{Classified, Member, Side};
 #[cfg(test)]
 use hyperscale_hbor::Bytes;
-use hyperscale_storage::is_record_cell;
 use hyperscale_types::{
     Deadline, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
     WeightedTimestamp,
 };
-use hyperscale_vm_effects::{CrossingCell, Terms};
-use hyperscale_vm_types::{AddressClass, LegShape};
+use hyperscale_vm_effects::{CrossingCell, CrossingLeaf, Kind};
+use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
 
 /// One thing a cross-shard member waits for before it can run.
 ///
@@ -119,10 +118,13 @@ pub fn divided_requirements(
         classified
             .edges()
             .iter()
-            .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
+            .filter(|edge| {
+                edge.to.contains(&local)
+                    && (edge.crossing.kind == Kind::Owed) == (side == Side::Delivering)
+            })
             .map(|edge| Requirement::Crossing {
                 source: edge.from,
-                key: edge.record.key(),
+                key: edge.crossing.id.record_key(&ProtocolHasher),
             }),
     );
     requirements
@@ -454,22 +456,18 @@ impl ProvisioningTracker {
                 let Some(bytes) = entry.value.as_ref() else {
                     continue;
                 };
-                if !is_record_cell(entry.key, bytes) {
-                    continue;
-                }
-                let Some(cell) = CrossingCell::from_bytes(bytes) else {
-                    continue;
-                };
                 // A tombstone is not an arrival. Its producer disposed
                 // of the crossing and keeps the key standing only so a
                 // consumer can date the going of it, so there is no
                 // value here to run a delivery against — and its
                 // `expiry_ms` names the removal rather than the
                 // crossing's deadline, which every reader below would
-                // take for one.
-                if cell.terms == Terms::Retired {
+                // take for one. The classifier reads it as its own arm.
+                let Some(CrossingLeaf::Record { cell, .. }) =
+                    CrossingLeaf::read(&ProtocolHasher, entry.key, bytes)
+                else {
                     continue;
-                }
+                };
                 self.arrived.insert(entry.key, Arrival { cell });
             }
             touched.push(tx_hash);
@@ -804,10 +802,12 @@ mod tests {
 
     /// The record cell the edge `node` leaves on its first output.
     fn record_of(legs: &[LegShape], node: u32) -> SubstateKey {
-        use hyperscale_vm_effects::CrossingSite;
+        use hyperscale_vm_effects::CrossingId;
         use hyperscale_vm_types::ProtocolHasher;
 
-        CrossingSite::record_of(&ProtocolHasher, &legs[node as usize], 0).key()
+        // The consumer is not in a record's key.
+        let producer = &legs[node as usize];
+        CrossingId::of_edge(producer, producer.target, 0).record_key(&ProtocolHasher)
     }
 
     /// A divided member files its scope minus itself, the records of the

@@ -34,9 +34,9 @@ use hyperscale_types::{
     compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, CrossingCell, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree,
-    PackageHash, PackageMetadata, ResourceKind, Terms as CrossingTerms, Totality, Value,
-    issued_resource, package_hash,
+    AbiParam, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent, IntentHeader,
+    IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Terms as CrossingTerms, Totality,
+    Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
@@ -1162,6 +1162,18 @@ fn far() -> PrincipalAddr {
     PrincipalAddr::new(body)
 }
 
+/// The record keys of the crossings `local` issues, in edge order: every
+/// one, or those of one `kind`.
+fn issued(classified: &Classified, local: ShardId, kind: Option<Kind>) -> Vec<SubstateKey> {
+    classified
+        .crossings()
+        .filter(|(edge, _)| {
+            edge.from == local && kind.is_none_or(|kind| edge.crossing.kind == kind)
+        })
+        .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+        .collect()
+}
+
 /// Execute one batch as `local_shard` under a two-leaf trie.
 fn execute_on_shard(
     executor: &Executor,
@@ -1258,7 +1270,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     assert_eq!(edge.to, BTreeSet::from([far_shard]));
 
     let sender = divided
-        .plan(&[], near_shard, Side::Issuing)
+        .plan(&[], near_shard, Side::Issuing, tx.legs())
         .expect("the sender's legs take no arrival");
     assert!(!sender.legs.is_whole());
     assert!(
@@ -1272,10 +1284,15 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         output: edge.output,
         resource: *PROTOCOL_RESOURCE,
         amount: 100,
-        record: edge.record.key(),
+        record: edge.crossing.id.record_key(&ProtocolHasher),
     };
     let recipient = divided
-        .plan(std::slice::from_ref(&arrived), far_shard, Side::Delivering)
+        .plan(
+            std::slice::from_ref(&arrived),
+            far_shard,
+            Side::Delivering,
+            tx.legs(),
+        )
         .expect("the recipient's leg has its arrival");
     assert!(recipient.legs.arrival(edge.producer, edge.output).is_some());
     assert!(
@@ -1287,7 +1304,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     assert!(recipient.judges.covers(far()) && !recipient.judges.covers(alice()));
 
     assert!(matches!(
-        divided.plan(&[], far_shard, Side::Delivering),
+        divided.plan(&[], far_shard, Side::Delivering, tx.legs()),
         Err(PlanDefect::MissingArrival { .. }),
     ));
 }
@@ -1438,13 +1455,25 @@ fn a_transfer_executes_divided_on_both_shards() {
             output: edge.output,
             resource: *PROTOCOL_RESOURCE,
             amount: 100,
-            record: edge.record.key(),
+            record: edge.crossing.id.record_key(&ProtocolHasher),
         }],
         "the withdraw's value left into the record cell the plan filed",
     );
-    assert!(
-        writes.cells.contains_key(&edge.record.key()),
-        "the record cell is among the sender's writes"
+    let record = writes
+        .cells
+        .get(&edge.crossing.id.record_key(&ProtocolHasher))
+        .and_then(|value| CrossingCell::from_bytes(value.as_deref()?))
+        .expect("the record cell is among the sender's writes");
+    assert_eq!(
+        record.expiry_ms,
+        tx.legs()[edge.producer as usize].expiry_ms,
+        "the record's expiry is the producing intent's own, read off its leg"
+    );
+    assert_ne!(record.expiry_ms, 0, "and never nothing");
+    assert_eq!(
+        CrossingId::of_record(edge.crossing.id.producer, &record),
+        edge.crossing.id,
+        "the record rebuilds the crossing the plan filed"
     );
     assert!(
         !writes
@@ -1543,7 +1572,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
     );
 
     assert!(
-        classified.escrowed_records(near_shard).is_empty(),
+        issued(&classified, near_shard, Some(Kind::Escrowed)).is_empty(),
         "the sender settles none of it under the transaction's own name",
     );
 
@@ -1551,7 +1580,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
         &store,
         Runs::Settle {
             member: Member::whole(near_shard),
-            records: classified.records_issued(near_shard),
+            records: issued(&classified, near_shard, None),
             on: Licence::Unclaimed,
             charged: true,
         },
@@ -1567,7 +1596,9 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
         "the vault stays debited: the crossing is the recipient's"
     );
     assert!(
-        store.cell(edge.record.key()).is_some(),
+        store
+            .cell(edge.crossing.id.record_key(&ProtocolHasher))
+            .is_some(),
         "and the record stands, holding the value for whoever claims it"
     );
 }
@@ -1628,7 +1659,9 @@ fn a_retirement_retires_the_record_and_moves_nothing() {
     };
     store.apply(writes);
     assert!(
-        store.cell(edge.record.key()).is_some(),
+        store
+            .cell(edge.crossing.id.record_key(&ProtocolHasher))
+            .is_some(),
         "the record is written"
     );
 
@@ -1636,7 +1669,7 @@ fn a_retirement_retires_the_record_and_moves_nothing() {
         &store,
         Runs::Settle {
             member: Member::whole(near_shard),
-            records: classified.records_issued(near_shard),
+            records: issued(&classified, near_shard, None),
             on: Licence::Claimed,
             charged: true,
         },
@@ -1649,7 +1682,7 @@ fn a_retirement_retires_the_record_and_moves_nothing() {
     store.apply(writes);
     assert!(
         store
-            .cell(edge.record.key())
+            .cell(edge.crossing.id.record_key(&ProtocolHasher))
             .and_then(|bytes| CrossingCell::from_bytes(&bytes))
             .is_some_and(|tomb| tomb.terms == CrossingTerms::Retired && tomb.amount == 0),
         "the record's value is gone and its key stands on as a tombstone, so the \
@@ -1665,7 +1698,7 @@ fn a_retirement_retires_the_record_and_moves_nothing() {
         &store,
         Runs::Settle {
             member: Member::whole(near_shard),
-            records: classified.records_issued(near_shard),
+            records: issued(&classified, near_shard, None),
             on: Licence::Claimed,
             charged: true,
         },
@@ -1737,7 +1770,7 @@ fn inherited_record() -> Inherited {
         trie,
         shard,
         store,
-        record: edge.record.key(),
+        record: edge.crossing.id.record_key(&ProtocolHasher),
     }
 }
 
@@ -1859,8 +1892,11 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             clock: WeightedTimestamp::from_millis(1_000),
             runs: Runs::Settle {
                 member: Member::whole(near_shard),
-                records: Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie)
-                    .records_issued(near_shard),
+                records: issued(
+                    &Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie),
+                    near_shard,
+                    None,
+                ),
                 on: Licence::Unclaimed,
                 charged,
             },

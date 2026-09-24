@@ -36,8 +36,8 @@ use hyperscale_types::{
     install_protocol_statics, whole_work,
 };
 use hyperscale_vm_effects::{
-    Admitted, ChainRecords, CrossingCell, Declaration, DeclaredAccess, IntentRecord, PackageHash,
-    Terms, legs_of, package_hash,
+    Admitted, Answered, ChainRecords, CrossingCell, Declaration, DeclaredAccess, IntentRecord,
+    PackageHash, Terms, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Deletion, Disposal, Disposition, EnvInputs, ExecutionMode,
@@ -562,7 +562,7 @@ impl Executor {
         let mut entry = Self::prepare(tx, records, packages)?;
         let plan = member
             .classified()
-            .plan(arrivals, member.local(), member.side())
+            .plan(arrivals, member.local(), member.side(), tx.legs())
             .map_err(|defect| format!("no plan for this shard: {defect}"))?;
         // The second member a shard runs of one transaction commits no
         // nullifier: the issuing one did, and a second spend of the same
@@ -1203,7 +1203,14 @@ fn never_answers(
     member
         .classified()
         .refusable_consumed(local_shard)
-        .map(|edge| (edge.claim.key(), never_answer(tx_hash, edge)))
+        .map(|edge| {
+            (
+                edge.crossing
+                    .id
+                    .answer_key(&ProtocolHasher, Answered::Taken),
+                never_answer(tx_hash, edge),
+            )
+        })
         .filter(|(claim, (never, _))| {
             locality.covers(never.owner) && !holds(*claim) && !holds(*never)
         })
@@ -1508,8 +1515,7 @@ fn assemble_executed_tx(
                 record: job
                     .departure(node, output)
                     .expect("the kernel issues only what the plan departs")
-                    .site
-                    .key(),
+                    .record,
             })
             .collect();
         CachedOutput::succeeded(
@@ -2010,7 +2016,7 @@ impl Executor {
 mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{AddressClass, LocalKey, Presence};
-    use hyperscale_vm_effects::{CrossingSite, Hash32, IntentHash};
+    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
     use hyperscale_vm_types::AbortReason;
 
     use super::*;
@@ -2027,26 +2033,23 @@ mod tests {
             owner,
             local: LocalKey([6; 16]),
         };
-        let site = CrossingSite::record(
-            &ProtocolHasher,
-            owner,
-            IntentHash(Hash32([7; 32])),
-            0,
-            0,
-            1_000,
-        );
-        let record = site.crossing(
+        let id = CrossingId {
+            producer: owner,
+            consumer: Address::new([8; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([7; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record_key = id.record_key(&ProtocolHasher);
+        let record = id.cell(
             TxHash::from(Hash::from_bytes(b"issuer")),
             *PROTOCOL_RESOURCE,
             10,
-            SubstateKey {
-                owner,
-                local: LocalKey([8; 16]),
-            },
+            1_000,
             Terms::Escrowed { credit },
         );
         let snapshot = TickBaseline {
-            cells: BTreeMap::from([(site.key(), record.to_bytes())]),
+            cells: BTreeMap::from([(record_key, record.to_bytes())]),
             ..Default::default()
         };
         let trie = ShardTrie::single();
@@ -2058,7 +2061,7 @@ mod tests {
             holds: &ProvisionalHolds::new(),
         };
 
-        let prepared = Executor::prepare_settle(&[site.key()], Licence::Unclaimed, &ctx, &snapshot)
+        let prepared = Executor::prepare_settle(&[record_key], Licence::Unclaimed, &ctx, &snapshot)
             .expect("an unclaimed escrowed record is taken back");
 
         let Job::Records(disposals) = &prepared.job else {
@@ -2067,14 +2070,14 @@ mod tests {
         assert_eq!(
             disposals,
             &[Disposal {
-                record: site.key(),
+                record: record_key,
                 disposition: Disposition::Reclaim,
             }],
         );
         let declared: Vec<Effect> = prepared.declaration.set.iter().collect();
         assert_eq!(declared.len(), 2, "{declared:?}");
         assert!(declared.contains(&Effect {
-            target: EffectTarget::Point(site.key()),
+            target: EffectTarget::Point(record_key),
             mode: Mode::Write { moves: Moves::Both },
         }));
         assert!(declared.contains(&Effect {

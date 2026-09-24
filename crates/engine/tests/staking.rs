@@ -31,7 +31,7 @@ use hyperscale_types::{
     absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    ChainRecords, Composed, CrossingEdge, IntentHeader, Kind, holdings_collection,
+    Answered, ChainRecords, Composed, CrossingEdge, IntentHeader, Kind, holdings_collection,
     instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{IntentBuilder, TypedError};
@@ -903,7 +903,14 @@ impl DividedStake {
         let edges: Vec<_> = self
             .classified
             .refusable_consumed(self.core)
-            .filter(|edge| self.trie.shard_for_prefix(edge.claim.key().owner) == self.core)
+            .filter(|edge| {
+                self.trie.shard_for_prefix(
+                    edge.crossing
+                        .id
+                        .answer_key(&ProtocolHasher, Answered::Taken)
+                        .owner,
+                ) == self.core
+            })
             .cloned()
             .collect();
         assert_eq!(
@@ -1030,7 +1037,13 @@ fn never_is_skipped_where_an_answer_stands() {
     let (never, bytes) = divided.never();
 
     for (name, key, value) in [
-        ("the claim", edge.claim.key(), vec![1u8]),
+        (
+            "the claim",
+            edge.crossing
+                .id
+                .answer_key(&ProtocolHasher, Answered::Taken),
+            vec![1u8],
+        ),
         ("the decline", never, bytes),
     ] {
         let mut answered = divided.store(&divided.seats);
@@ -1065,11 +1078,11 @@ fn a_departure_is_escrowed_exactly_where_its_consumer_may_refuse() {
     let plans = [
         divided
             .classified
-            .plan(&[], divided.payer_shard, Side::Issuing)
+            .plan(&[], divided.payer_shard, Side::Issuing, divided.tx.legs())
             .expect("the payer's shard plans its legs"),
         divided
             .classified
-            .plan(&handed, divided.core, Side::Issuing)
+            .plan(&handed, divided.core, Side::Issuing, divided.tx.legs())
             .expect("the core plans on what it was handed"),
     ];
 
@@ -1088,14 +1101,14 @@ fn a_departure_is_escrowed_exactly_where_its_consumer_may_refuse() {
                 .any(|named| named == edge)
         });
         assert_eq!(
-            departure.kind == Kind::Escrowed,
+            departure.crossing.kind == Kind::Escrowed,
             refusable,
             "edge {}:{} departs {:?} and is refusable: {refusable}",
             edge.producer,
             edge.output,
-            departure.kind,
+            departure.crossing.kind,
         );
-        kinds.insert(departure.kind == Kind::Escrowed);
+        kinds.insert(departure.crossing.kind == Kind::Escrowed);
     }
     assert_eq!(
         kinds,

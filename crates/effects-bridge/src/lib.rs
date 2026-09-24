@@ -29,8 +29,17 @@ pub use vm_statics::{
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_vm_effects::Hasher;
-    use hyperscale_vm_effects::vectors::{address_vector_lines, address_vectors, expected_classes};
+    use std::collections::BTreeMap;
+
+    use hyperscale_types::SubstateKey;
+    use hyperscale_vm_effects::vectors::{
+        address_vector_lines, address_vectors, crossing_key_vector_lines, crossing_key_vectors,
+        expected_classes,
+    };
+    use hyperscale_vm_effects::{
+        CROSSING_CLAIM_SLOT, CROSSING_DECLINE_SLOT, ESCROW_RECORD_SLOT, Hasher, child_key,
+    };
+    use hyperscale_vm_types::{Address, AddressClass};
 
     use super::ProtocolHasher;
 
@@ -54,6 +63,68 @@ mod tests {
                 "resource/protocol = f0762f0fd514e13031e6b12df742a5901b263aec476126ca1bc0b130bc0d3d04",
             ]
         );
+    }
+
+    /// The crossing keys under the hash consensus runs, pinned as
+    /// literals: a record is written where every consumer reads it and
+    /// an answer where the producer reads it, so a derivation that moves
+    /// moves value. Beside the literals, each key is held to the plain
+    /// child-key derivation over the edge's material under its family's
+    /// slot, which is the derivation these keys have always been.
+    #[test]
+    fn crossing_key_vectors_are_pinned_under_the_protocol_hash() {
+        assert_eq!(
+            crossing_key_vector_lines(&ProtocolHasher),
+            vec![
+                "crossing/a/record = 11111111111111111111111111111111111111111111111111111111111111024c3bbac11e5af5f216381f6f352f8cb3",
+                "crossing/a/claim = 2222222222222222222222222222222222222222222222222222222222222201a5a9f756eecc2866e9be87efe93ae2f2",
+                "crossing/a/decline = 22222222222222222222222222222222222222222222222222222222222222015cd2563799de37c1c9d71483f7910f02",
+                "crossing/b/record = c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c302cc1971e048778f73642a5c00ec2a0148",
+                "crossing/b/claim = d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4010f5cdbaab02fafd8aae966e728556554",
+                "crossing/b/decline = d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d40198d33fe5a3afa977066d1369a896611a",
+            ]
+        );
+
+        let derived: BTreeMap<&str, SubstateKey> =
+            crossing_key_vectors(&ProtocolHasher).into_iter().collect();
+        let producer = |seed: u8| Address::new([seed; 31], AddressClass::Component);
+        let consumer = |seed: u8| Address::new([seed; 31], AddressClass::Principal);
+        let material = |seed: u8, output: u32| {
+            vec![
+                [seed ^ 0xFF; 32].to_vec(),
+                (u32::from(seed) % 3).to_le_bytes().to_vec(),
+                output.to_le_bytes().to_vec(),
+            ]
+        };
+        for (name, seeds, output) in [("a", (0x11u8, 0x22u8), 0u32), ("b", (0xC3, 0xD4), 7)] {
+            assert_eq!(
+                derived[format!("crossing/{name}/record").as_str()],
+                child_key(
+                    &ProtocolHasher,
+                    producer(seeds.0),
+                    ESCROW_RECORD_SLOT,
+                    &material(seeds.0, output)
+                ),
+            );
+            assert_eq!(
+                derived[format!("crossing/{name}/claim").as_str()],
+                child_key(
+                    &ProtocolHasher,
+                    consumer(seeds.1),
+                    CROSSING_CLAIM_SLOT,
+                    &material(seeds.0, output)
+                ),
+            );
+            assert_eq!(
+                derived[format!("crossing/{name}/decline").as_str()],
+                child_key(
+                    &ProtocolHasher,
+                    consumer(seeds.1),
+                    CROSSING_DECLINE_SLOT,
+                    &material(seeds.0, output)
+                ),
+            );
+        }
     }
 
     #[test]

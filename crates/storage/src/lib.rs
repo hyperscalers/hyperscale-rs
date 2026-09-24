@@ -58,9 +58,8 @@ pub use shard::retention::{Retired, retire_dated};
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
     SweepIndex, SweepRow, SweepRows, colliding_committed_cell, committed_tx_cell_key,
-    committed_tx_cells, followed_block_writes, is_crossing_answer_cell, is_record_cell,
-    merge_sweep_overlay, sweep_for_block, sweep_through, sweepable_expiry, with_sweep,
-    without_colliding_committed_cells,
+    committed_tx_cells, followed_block_writes, merge_sweep_overlay, sweep_for_block, sweep_through,
+    sweepable_expiry, with_sweep, without_colliding_committed_cells,
 };
 pub use shard::tick_chain::{
     ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,

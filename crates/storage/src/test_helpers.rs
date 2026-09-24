@@ -13,7 +13,7 @@ use hyperscale_hbor::{Bytes, Capped, from_slice};
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    stub_crossing_answer_cell, stub_record_cell, stub_sweepable_cell, test_transaction,
+    stub_sweepable_cell, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
@@ -32,6 +32,8 @@ use hyperscale_types::{
     UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
     WitnessSources, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
+use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, Terms};
+use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
@@ -1622,16 +1624,41 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
         "an ordinary cell is neither family, wherever it sits",
     );
 
-    let record = state_key(2, 2);
-    let sibling = state_key(0x82, 2);
+    // Real leaves at their derived keys, so the scan is held to the
+    // classifier the chain runs: a record sits at its producer's record
+    // key and holds the crossing, and a claim at its consumer's claim
+    // key. `state_key` fills the body with the owner seed, so a
+    // producer seeded under 0x80 sits in the left half.
+    let crossing = |producer: u8, consumer: u8| CrossingId {
+        producer: state_key(producer, 0).owner,
+        consumer: state_key(consumer, 0).owner,
+        intent: IntentHash(Hash32([producer; 32])),
+        local: 0,
+        output: 0,
+    };
+    let record_of = |id: CrossingId| {
+        (
+            id.record_key(&ProtocolHasher),
+            id.cell(
+                VmTxHash(Hash32([0xC0; 32])),
+                ResourceAddr::new([0xE0; 31]),
+                500,
+                1_000,
+                Terms::Owed,
+            )
+            .to_bytes(),
+        )
+    };
+    let (record, record_value) = record_of(crossing(2, 0x83));
+    let (sibling, sibling_value) = record_of(crossing(0x82, 3));
     commit(&SettledWrites::from_absolutes(BTreeMap::from([
-        (record, Some(stub_record_cell(7))),
-        (sibling, Some(stub_record_cell(8))),
+        (record, Some(record_value.clone())),
+        (sibling, Some(sibling_value.clone())),
     ])));
     assert_eq!(
         owed(shard),
         CrossingLeaves {
-            records: vec![(record, stub_record_cell(7))],
+            records: vec![(record, record_value)],
             ..CrossingLeaves::default()
         },
         "a record reads back with the bytes a reclaim composes from, and a \
@@ -1640,7 +1667,7 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
     assert_eq!(
         owed(ShardId::leaf(1, 1)),
         CrossingLeaves {
-            records: vec![(sibling, stub_record_cell(8))],
+            records: vec![(sibling, sibling_value)],
             ..CrossingLeaves::default()
         },
         "and the sibling's own scan answers with its own",
@@ -1658,15 +1685,19 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
     // The answering side of the same scan: a claim this shard wrote is
     // found by the one question a leaf can be asked, beside the records
     // rather than among them.
-    let claim = state_key(3, 3);
+    let answered = crossing(0x84, 3);
+    let claim = answered.answer_key(&ProtocolHasher, Answered::Taken);
+    let claim_value = answered
+        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken)
+        .to_bytes();
     commit(&SettledWrites::from_absolutes(BTreeMap::from([(
         claim,
-        Some(stub_crossing_answer_cell(11)),
+        Some(claim_value.clone()),
     )])));
     assert_eq!(
         owed(shard),
         CrossingLeaves {
-            claims: vec![(claim, stub_crossing_answer_cell(11))],
+            claims: vec![(claim, claim_value)],
             ..CrossingLeaves::default()
         },
         "a claim is the other family the scan answers with",

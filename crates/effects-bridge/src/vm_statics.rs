@@ -25,7 +25,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    Admitted, CROSSING_ANSWER_CELL_BYTES, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite,
+    Admitted, CROSSING_ANSWER_CELL_BYTES, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingId,
     Intent, IntentHeader, IntentRecord, IntentTree, MARKER_CELL_BYTES, ManifestHash, NodeCall,
     PackageHash, Value, admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes,
     effect_units, legs_of, package_hash, package_key as canonical_package_key, principal_address,
@@ -42,8 +42,7 @@ use hyperscale_vm_types::{
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 use crate::records::{
-    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, crossing_answer_cell,
-    record_cell, sweepable_cell,
+    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, sweepable_cell,
 };
 
 /// The accounts a transaction's intents act as: the owners of each
@@ -77,10 +76,11 @@ fn intent_accounts(admitted: &Admitted) -> Vec<Address> {
 pub fn crossing_records(legs: &[LegShape]) -> Vec<SubstateKey> {
     let mut records: Vec<((u32, u32), SubstateKey)> = legs
         .iter()
-        .flat_map(|consumer| &consumer.edges)
-        .filter_map(|edge| {
+        .flat_map(|consumer| consumer.edges.iter().map(move |edge| (consumer, edge)))
+        .filter_map(|(consumer, edge)| {
             let producer = legs.get(edge.source as usize)?;
-            let record = CrossingSite::record_of(&ProtocolHasher, producer, edge.output).key();
+            let record = CrossingId::of_edge(producer, consumer.target, edge.output)
+                .record_key(&ProtocolHasher);
             Some(((edge.source, edge.output), record))
         })
         .collect();
@@ -1211,14 +1211,6 @@ impl ProtocolStatics for BridgeStatics {
         sweepable_cell(Address::from_bytes(owner).ok()?, local, value)
     }
 
-    fn record_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
-        Address::from_bytes(owner).is_ok_and(|owner| record_cell(owner, local, value))
-    }
-
-    fn crossing_answer_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
-        Address::from_bytes(owner).is_ok_and(|owner| crossing_answer_cell(owner, local, value))
-    }
-
     fn rule_admits(
         &self,
         auth_cell: Option<&[u8]>,
@@ -1660,7 +1652,9 @@ mod tests {
         assert_eq!(one.legs[0].intent, first.root.hash(&ProtocolHasher));
 
         let record_of = |derived: &Derived, node: usize| {
-            CrossingSite::record_of(&ProtocolHasher, &derived.legs[node], 0).key()
+            // The consumer is not in a record's key.
+            let producer = &derived.legs[node];
+            CrossingId::of_edge(producer, producer.target, 0).record_key(&ProtocolHasher)
         };
         assert_eq!(
             record_of(&one, 1),

@@ -24,7 +24,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
-use hyperscale_storage::is_record_cell;
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, BlockHeight, CROSSING_BUNDLE_WINDOW, DeclaredWork, Finalization,
     FinalizationHash, Inclusion, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES,
@@ -33,6 +32,8 @@ use hyperscale_types::{
     TxHash, Verifiable, WeightedTimestamp, budget_admits_block, caps_admit_transaction,
     evidence_admits_block, sweep_admits_block,
 };
+use hyperscale_vm_effects::CrossingLeaf;
+use hyperscale_vm_types::ProtocolHasher;
 
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
@@ -156,6 +157,23 @@ pub(crate) trait Section {
     fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, item: &Self::Item) -> Result<(), String>;
 }
 
+/// Whether `batch` carries a crossing record, live or retired: the one
+/// permanent cell a bundle can carry, and so the one the bundle window
+/// is measured against. Read off each leaf by derivation, so every
+/// replica reaches the same verdict whatever it has installed.
+fn carries_a_record(batch: &Provisions) -> bool {
+    batch.transactions().iter().any(|entry| {
+        entry.entries.iter().any(|cell| {
+            cell.value.as_ref().is_some_and(|bytes| {
+                matches!(
+                    CrossingLeaf::read(&ProtocolHasher, cell.key, bytes),
+                    Some(CrossingLeaf::Record { .. } | CrossingLeaf::Tombstone { .. })
+                )
+            })
+        })
+    })
+}
+
 /// The block's provisions.
 pub(crate) struct ProvisionsSection;
 
@@ -216,18 +234,12 @@ impl Section for ProvisionsSection {
         // reads the same two figures off the block and reaches the same
         // verdict.
         //
-        // Only a bundle carrying a record, because only a record is
-        // permanent. Every other cell a bundle carries is a mutable read
-        // whose whole meaning is the height it was taken at, and the
-        // paths that fetch one are prompt by construction.
+        // Only a bundle carrying a record, live or retired, because only
+        // a record is permanent. Every other cell a bundle carries is a
+        // mutable read whose whole meaning is the height it was taken
+        // at, and the paths that fetch one are prompt by construction.
         if ctx.anchor.elapsed_since(batch.source_block_ts()) > CROSSING_BUNDLE_WINDOW
-            && batch.transactions().iter().any(|entry| {
-                entry.entries.iter().any(|cell| {
-                    cell.value
-                        .as_ref()
-                        .is_some_and(|bytes| is_record_cell(cell.key, bytes))
-                })
-            })
+            && carries_a_record(batch)
         {
             return Err(format!(
                 "provisions batch {provision_hash:?} carries a crossing record from outside the \
@@ -984,5 +996,75 @@ pub(crate) mod fixtures {
         }
         sched.set_head(after);
         sched
+    }
+}
+
+#[cfg(test)]
+mod record_window_tests {
+    use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_types::{
+        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
+        SubstateEntry, SubstateKey, TxHash, WeightedTimestamp,
+    };
+    use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, Terms};
+    use hyperscale_vm_types::{
+        Address, AddressClass, ProtocolHasher, ResourceAddr, TxHash as VmTxHash,
+    };
+
+    use super::carries_a_record;
+
+    /// A batch provisioning one transaction with one cell.
+    fn batch(key: SubstateKey, value: Vec<u8>) -> Provisions {
+        Provisions::new(
+            ShardId::leaf(1, 0),
+            ShardId::leaf(1, 1),
+            BlockHeight::new(1),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(
+                TxHash::from(Hash::from_bytes(b"provisioned")),
+                Capped::from_array([SubstateEntry::new(
+                    key,
+                    Some(Bytes::new(value).expect("a cell fits")),
+                )]),
+            )]),
+        )
+    }
+
+    /// The bundle window counts a live record and a retired one alike:
+    /// both are permanent, and a tombstone carried late is a tombstone
+    /// a consumer would date its answer's deletion by. An answer, or an
+    /// ordinary cell, is not a record.
+    #[test]
+    fn a_live_record_and_a_tombstone_both_count_as_a_record() {
+        let id = CrossingId {
+            producer: Address::new([0x5A; 31], AddressClass::Component),
+            consumer: Address::new([0x5C; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0xB0; 32])),
+            local: 1,
+            output: 0,
+        };
+        let record_key = id.record_key(&ProtocolHasher);
+        let tx = VmTxHash(Hash32([0xC0; 32]));
+        let live = id
+            .cell(tx, ResourceAddr::new([0xE0; 31]), 500, 1_000, Terms::Owed)
+            .to_bytes();
+        let retired = id
+            .cell(tx, ResourceAddr::new([0xE0; 31]), 0, 2_000, Terms::Retired)
+            .to_bytes();
+
+        assert!(carries_a_record(&batch(record_key, live)));
+        assert!(carries_a_record(&batch(record_key, retired)));
+        assert!(
+            !carries_a_record(&batch(
+                id.answer_key(&ProtocolHasher, Answered::Taken),
+                id.answer(tx, Answered::Taken).to_bytes(),
+            )),
+            "an answer is not a record",
+        );
+        assert!(
+            !carries_a_record(&batch(record_key, vec![1, 2, 3])),
+            "nor is an ordinary cell",
+        );
     }
 }

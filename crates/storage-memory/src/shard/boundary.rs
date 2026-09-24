@@ -15,13 +15,14 @@ use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, CrossingLeaves, ImportProgress, LeafRows,
     SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
-    is_crossing_answer_cell, is_record_cell, key_under_prefix, prefix_low_key,
+    key_under_prefix, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, ShardId, StateRoot, SubstateKey,
     SubstateLeaf, shard_prefix_path,
 };
-use hyperscale_vm_types::{Address, CollectionId};
+use hyperscale_vm_effects::CrossingLeaf;
+use hyperscale_vm_types::{Address, CollectionId, ProtocolHasher};
 
 use super::core::SimShardStorage;
 use super::snapshot::{entries_in_range_at, value_at_version};
@@ -105,10 +106,12 @@ impl BoundaryStore for SimShardStorage {
             .range(prefix_low_key(&prefix)..)
             .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
         {
-            if is_record_cell(*key, value) {
-                leaves.records.push((*key, value.to_vec()));
-            } else if is_crossing_answer_cell(*key, value) {
-                leaves.claims.push((*key, value.to_vec()));
+            match CrossingLeaf::read(&ProtocolHasher, *key, value) {
+                Some(CrossingLeaf::Record { .. } | CrossingLeaf::Tombstone { .. }) => {
+                    leaves.records.push((*key, value.to_vec()));
+                }
+                Some(CrossingLeaf::Answer { .. }) => leaves.claims.push((*key, value.to_vec())),
+                None => {}
             }
         }
         leaves

@@ -46,34 +46,6 @@ pub fn sweepable_expiry(key: SubstateKey, value: &[u8]) -> Option<u64> {
     protocol_statics().sweepable_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
-/// Whether a committed cell is an escrow record — value the shard holds
-/// for a crossing it issued.
-///
-/// The same seam as [`sweepable_expiry`] and its complement: a record is
-/// outside every sweep's reach by construction, so a store that inherits
-/// a prefix whole has nothing else to tell it that the leaf it just
-/// imported is an obligation. Lives here because both questions are the
-/// same question about a leaf — which family wrote it — asked of the one
-/// authority that can answer from the bytes.
-#[must_use]
-pub fn is_record_cell(key: SubstateKey, value: &[u8]) -> bool {
-    protocol_statics_installed()
-        && protocol_statics().record_cell(key.owner.to_bytes(), key.local.0, value)
-}
-
-/// Whether a committed cell is a crossing answer — a consumer's claim on
-/// a crossing it was handed, or its decline of one.
-///
-/// [`is_record_cell`]'s neighbour, on the same seam and for the same
-/// reason: the two families a sweep never reaches are the two a reader
-/// holding the leaf can only tell apart by asking which role its value
-/// re-derives its key under.
-#[must_use]
-pub fn is_crossing_answer_cell(key: SubstateKey, value: &[u8]) -> bool {
-    protocol_statics_installed()
-        && protocol_statics().crossing_answer_cell(key.owner.to_bytes(), key.local.0, value)
-}
-
 /// One row of the sweep index: an owner holding sweepable cells in a
 /// bucket.
 pub type SweepRow = (SweepBucket, Address);

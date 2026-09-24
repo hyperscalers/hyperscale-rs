@@ -62,6 +62,8 @@ use hyperscale_types::{
     TransactionDecision, TransactionStatus, TxHash, TxResolution, Verified, WeightedTimestamp,
     Window, budget_admits_block, caps_admit_transaction,
 };
+use hyperscale_vm_effects::Kind;
+use hyperscale_vm_types::ProtocolHasher;
 use serde::Deserialize;
 use tracing::instrument;
 
@@ -1137,7 +1139,7 @@ impl MempoolCoordinator {
     /// ledger entry, no member and no provisioning requirement behind —
     /// every later mechanism is downstream of the bundle it is missing.
     /// What the shard does have is the body, and that is enough:
-    /// `crossings_consumed` derives the record cells and the shard
+    /// the classification derives the record cells and the shard
     /// holding each one from the transaction and the placement alone.
     ///
     /// **The floor is one `RETENTION_HORIZON` of waiting**, for the same
@@ -1169,7 +1171,13 @@ impl MempoolCoordinator {
                 let tx = &entry.tx;
                 let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
                 if classified.only_delivers_at(local) {
-                    classified.crossings_consumed(local)
+                    classified
+                        .crossings()
+                        .filter(|(edge, _)| {
+                            edge.crossing.kind == Kind::Owed && edge.to.contains(&local)
+                        })
+                        .map(|(edge, _)| (edge.from, edge.crossing.id.record_key(&ProtocolHasher)))
+                        .collect()
                 } else {
                     Vec::new()
                 }

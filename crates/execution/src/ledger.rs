@@ -30,6 +30,8 @@ use hyperscale_types::{
     Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window,
 };
+use hyperscale_vm_effects::{Answered, Kind};
+use hyperscale_vm_types::ProtocolHasher;
 
 /// What the chain read of one cell a counterpart was asked about:
 /// which question the cell answers, and what it said.
@@ -513,7 +515,23 @@ impl Kept {
     /// departed deliverer's successor, which [`Ledger::questions`]
     /// resolves off the trie it is given.
     fn deliveries(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.classified.owed_claims(local)
+        self.answers(local, Kind::Owed, Answered::Taken)
+    }
+
+    /// The answer cells in `answered`'s role that consumers of the
+    /// `kind` crossings `local` issued write, each under the consumer's
+    /// frozen home.
+    fn answers(
+        &self,
+        local: ShardId,
+        kind: Kind,
+        answered: Answered,
+    ) -> Vec<(ShardId, SubstateKey)> {
+        self.classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == local && edge.crossing.kind == kind)
+            .map(|(edge, home)| (home, edge.crossing.id.answer_key(&ProtocolHasher, answered)))
+            .collect()
     }
 
     /// The claim cells core consumers write for the crossings a leg on
@@ -523,13 +541,13 @@ impl Kept {
     /// core is the core's, so nothing a core shard produces is claimed
     /// by a core it is not in.
     fn claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.classified.escrowed_claims(local)
+        self.answers(local, Kind::Escrowed, Answered::Taken)
     }
 
     /// The decline cells core consumers write for the escrowed crossings
     /// `local` issued: the `Never` beside each of [`Self::claims`].
     fn declines(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.classified.escrowed_declines(local)
+        self.answers(local, Kind::Escrowed, Answered::Never)
     }
 
     /// Every claim cell a consumer elsewhere writes for what `local`
@@ -1769,25 +1787,31 @@ mod tests {
     /// The decline cell the core writes beside [`core_claim`] where it
     /// refuses what `classified` says `LOCAL` issued.
     fn core_decline(classified: &Classified) -> (ShardId, SubstateKey) {
-        let declines = classified.escrowed_declines(LOCAL);
-        assert_eq!(
-            declines.len(),
-            1,
-            "the fixture issues one crossing to the core"
-        );
-        declines[0]
+        one_answer(classified, Kind::Escrowed, Answered::Never, "to the core")
+    }
+
+    /// The one answer cell in `answered`'s role that the consumer of the
+    /// `kind` crossing `LOCAL` issued writes, under that consumer's
+    /// frozen home.
+    fn one_answer(
+        classified: &Classified,
+        kind: Kind,
+        answered: Answered,
+        to: &str,
+    ) -> (ShardId, SubstateKey) {
+        let answers: Vec<(ShardId, SubstateKey)> = classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == LOCAL && edge.crossing.kind == kind)
+            .map(|(edge, home)| (home, edge.crossing.id.answer_key(&ProtocolHasher, answered)))
+            .collect();
+        assert_eq!(answers.len(), 1, "the fixture issues one crossing {to}");
+        answers[0]
     }
 
     /// The claim cell the core writes for what `classified` says `LOCAL`
     /// issued, under the shard holding the consumer's target.
     fn core_claim(classified: &Classified) -> (ShardId, SubstateKey) {
-        let claims = classified.escrowed_claims(LOCAL);
-        assert_eq!(
-            claims.len(),
-            1,
-            "the fixture issues one crossing to the core"
-        );
-        claims[0]
+        one_answer(classified, Kind::Escrowed, Answered::Taken, "to the core")
     }
 
     /// The committed cell `shard` writes for `tx`.
@@ -1802,13 +1826,7 @@ mod tests {
     /// The claim cell a delivery writes for what `classified` says
     /// `LOCAL` issued, under the shard that delivers it.
     fn delivered_claim(classified: &Classified) -> (ShardId, SubstateKey) {
-        let claims = classified.owed_claims(LOCAL);
-        assert_eq!(
-            claims.len(),
-            1,
-            "the fixture issues one crossing to a delivery"
-        );
-        claims[0]
+        one_answer(classified, Kind::Owed, Answered::Taken, "to a delivery")
     }
 
     /// The two depth-2 shards a delivery fixture places off `LOCAL`,

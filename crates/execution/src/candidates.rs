@@ -20,7 +20,8 @@ use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_types::{
     EscrowedValue, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::CrossingCell;
+use hyperscale_vm_effects::{CrossingCell, Kind};
+use hyperscale_vm_types::ProtocolHasher;
 
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
@@ -92,9 +93,12 @@ fn arrivals_for(
     classified
         .edges()
         .iter()
-        .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
+        .filter(|edge| {
+            edge.to.contains(&local)
+                && (edge.crossing.kind == Kind::Owed) == (side == Side::Delivering)
+        })
         .filter_map(|edge| {
-            let key = edge.record.key();
+            let key = edge.crossing.id.record_key(&ProtocolHasher);
             let bytes = provisioning.present_cell(tx.hash(), edge.from, key)?;
             let record = CrossingCell::from_bytes(bytes)?;
             Some(EscrowedValue {

@@ -66,22 +66,6 @@ impl Placement {
     }
 }
 
-/// One owed crossing a shard issued.
-///
-/// Who consumes it, the cell whose presence says it was taken, and the
-/// cell a bundle carrying it is built from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OwedCrossing {
-    /// The shard the consuming node was homed on when the transaction
-    /// committed. A cut moves the claim to whoever holds its prefix
-    /// now, which the caller resolves off the trie it is given.
-    pub consumer: ShardId,
-    /// The claim cell the consumer writes when it takes the crossing.
-    pub claim: SubstateKey,
-    /// The record cell standing for the crossing on the issuing shard.
-    pub record: SubstateKey,
-}
-
 /// What a shard runs of a transaction, frozen at the placement its block
 /// committed: the star its shape implies under the trie the block
 /// committed under, and which of its shards deliver.
@@ -164,14 +148,8 @@ impl Classified {
     ) -> Self {
         let trie = Arc::new(trie.clone());
         let placement = Placement::Read(Arc::clone(&trie));
-        let star = star_at(
-            legs,
-            payer,
-            accounts,
-            &TrieShardResolver { trie: &trie },
-            &ProtocolHasher,
-        )
-        .map_shards(|shard| ShardId::from_heap_index(shard.0));
+        let star = star_at(legs, payer, accounts, &TrieShardResolver { trie: &trie })
+            .map_shards(|shard| ShardId::from_heap_index(shard.0));
         let (delivering, mixed) = if star.decomposes {
             let (delivers, settles) = delivery_sides(&star);
             (
@@ -366,160 +344,21 @@ impl Classified {
         }
     }
 
-    /// The claim cells consumers of what `local` issued write, each
-    /// under the shard holding the consumer's target — the consumer's
-    /// own home, since a claim sits under its target wherever else the
-    /// core runs it.
+    /// Every crossing of the shape with its consumer's frozen home: the
+    /// shard the consuming node was homed on when the transaction
+    /// committed. A cut moves the consumer's cells to whoever holds its
+    /// prefix now, which a caller resolves off the trie it is given; the
+    /// frozen home is what a probe asks first.
     ///
-    /// One fold, asked for by name in two halves rather than returned as
-    /// one list: what a probe asks is the same of both, but what the
-    /// answer licenses is not, so the callers that act on one kind's
-    /// claims take that kind's alone.
-    fn claims_issued(&self, local: ShardId, owed: bool) -> Vec<(ShardId, SubstateKey)> {
+    /// The one fold every reader of the edges filters: on `from` for
+    /// what a shard issued, on `to` for what it consumes, on the kind
+    /// for which family the crossing is, and the keys come off the
+    /// crossing's own identity. Empty for a whole shape, which hands
+    /// nothing between shards.
+    pub fn crossings(&self) -> impl Iterator<Item = (&CrossingEdge, ShardId)> {
         self.edges()
             .iter()
-            .filter(|edge| edge.from == local && edge.delivers == owed)
-            .map(|edge| (self.home(edge.consumer), edge.claim.key()))
-            .collect()
-    }
-
-    /// The claim cells core consumers write for the escrowed crossings
-    /// a leg on `local` issued. A claim present there says the core took
-    /// the crossing, which is what retires the record; absent inside the
-    /// window an absence answers in, nobody took it and the producer
-    /// credits it back.
-    #[must_use]
-    pub fn escrowed_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.claims_issued(local, false)
-    }
-
-    /// The decline cells core consumers write for the escrowed crossings
-    /// a leg on `local` issued, beside [`Self::escrowed_claims`]: the
-    /// consumer's `Never`, present where it refused the transaction, so
-    /// the producer credits the value back. Only a presence answers.
-    #[must_use]
-    pub fn escrowed_declines(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.edges()
-            .iter()
-            .filter(|edge| edge.from == local && !edge.delivers)
-            .map(|edge| {
-                (
-                    self.home(edge.consumer),
-                    edge.claim.answer_key(&ProtocolHasher, Answered::Never),
-                )
-            })
-            .collect()
-    }
-
-    /// The claim cells consumers elsewhere write for the owed crossings
-    /// a node on `local` issued — an inbound leg's, or the core's on a
-    /// core shard.
-    ///
-    /// Only a presence answers: the crossing is its consumer's from the
-    /// moment the core committed it, so the cell absent says the
-    /// consumer has not run and never that it will not.
-    #[must_use]
-    pub fn owed_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.claims_issued(local, true)
-    }
-
-    /// Each owed crossing a node on `local` issued: the claim cell its
-    /// consumer writes, and the record cell a bundle carrying it is
-    /// built from, under the shard the consumer was homed on.
-    ///
-    /// The two cells of one edge, asked for together because that is
-    /// how an outstanding crossing is offered again: the claim says
-    /// whether it is still owed, and the record is what the offer
-    /// carries. [`Self::owed_claims`] answers the first half alone, for
-    /// the probe that only asks.
-    #[must_use]
-    pub fn owed_crossings(&self, local: ShardId) -> Vec<OwedCrossing> {
-        self.edges()
-            .iter()
-            .filter(|edge| edge.from == local && edge.delivers)
-            .map(|edge| OwedCrossing {
-                consumer: self.home(edge.consumer),
-                claim: edge.claim.key(),
-                record: edge.record.key(),
-            })
-            .collect()
-    }
-
-    /// Every record cell a producer on `local` writes for a consumer
-    /// elsewhere, in edge order.
-    ///
-    /// What a retirement of this transaction deletes and what a reclaim
-    /// of it credits back are the same cells; the two differ in what a
-    /// committed record licensed doing with them, which is the ledger's
-    /// question rather than this one's. So there is one fold, and the
-    /// caller names the disposition.
-    #[must_use]
-    pub fn records_issued(&self, local: ShardId) -> Vec<SubstateKey> {
-        self.edges()
-            .iter()
-            .filter(|edge| edge.from == local)
-            .map(|edge| edge.record.key())
-            .collect()
-    }
-
-    /// Every record cell a producer on `local` writes that a settlement
-    /// composed under the transaction's own name may dispose: the
-    /// escrowed ones.
-    ///
-    /// An owed crossing is not among them. Nobody may take one back, so
-    /// its only disposal is the deletion its consumer's claim licenses —
-    /// and the shard that has to be able to compose that is one holding
-    /// the record leaf and no ledger entry at all: a validator seated
-    /// after the transaction committed, a split successor whose ledger
-    /// begins empty. The leaf owns those, and an entry that settled them
-    /// too would put two members over one cell.
-    #[must_use]
-    pub fn escrowed_records(&self, local: ShardId) -> Vec<SubstateKey> {
-        self.edges()
-            .iter()
-            .filter(|edge| edge.from == local && !edge.delivers)
-            .map(|edge| edge.record.key())
-            .collect()
-    }
-
-    /// The record cells a delivery on `local` consumes: the crossings a
-    /// core elsewhere handed the outbound legs seated here.
-    ///
-    /// [`Self::owed_crossings`] read from the far end. There the issuer
-    /// asks which of its own records are still owed a claim; here the
-    /// consumer asks which records it would be running against — the
-    /// cells a bundle has to carry, and the ones a block admitting the
-    /// delivery past its validity end proves still present.
-    ///
-    /// A crossing this shard also produces is not among them: `to` is
-    /// every shard running the consumer that does not also run the
-    /// producer, so a member holding both ends reads the cell itself.
-    #[must_use]
-    pub fn records_consumed(&self, local: ShardId) -> Vec<SubstateKey> {
-        self.crossings_consumed(local)
-            .into_iter()
-            .map(|(_, record)| record)
-            .collect()
-    }
-
-    /// The same cells with the shard that writes each one, for a
-    /// consumer that has to ask somebody for them.
-    ///
-    /// [`Self::records_consumed`] answers where the producer is already
-    /// settled — a bundle names its own source, and a member reading an
-    /// arrival has one in hand. A consumer with no bundle at all has
-    /// neither, and the edge is where both live.
-    ///
-    /// Derived from the transaction and the placement alone, so a shard
-    /// holding only the body can name what it is missing and who holds
-    /// it, without having been told anything.
-    #[must_use]
-    pub fn crossings_consumed(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.edges()
-            .iter()
-            .filter(|edge| edge.delivers && edge.to.contains(&local))
-            .map(|edge| (edge.from, edge.record.key()))
-            .collect()
+            .map(|edge| (edge, self.home(edge.consumer)))
     }
 
     /// The edges `local` consumes and may refuse: the escrowed ones,
@@ -534,14 +373,16 @@ impl Classified {
     pub fn refusable_consumed(&self, local: ShardId) -> impl Iterator<Item = &CrossingEdge> {
         self.edges()
             .iter()
-            .filter(move |edge| !edge.delivers && edge.to.contains(&local))
+            .filter(move |edge| edge.crossing.kind == Kind::Escrowed && edge.to.contains(&local))
     }
 
     /// What `local` runs of the transaction on `side`, what arrives for
     /// it, and what departs from it.
     ///
     /// `arrivals` is what committed bundles attested for the edges this
-    /// member consumes — read, never derived.
+    /// member consumes — read, never derived. `legs` is the transaction's
+    /// own, the slice [`Self::freeze`] classified, which is where a
+    /// departing record's expiry is read from.
     ///
     /// # Errors
     ///
@@ -551,6 +392,7 @@ impl Classified {
         arrivals: &[EscrowedValue],
         local: ShardId,
         side: Side,
+        legs: &[LegShape],
     ) -> Result<ShardPlan, PlanDefect> {
         if !self.decomposed() {
             return Ok(ShardPlan::whole());
@@ -579,6 +421,7 @@ impl Classified {
                     })?;
                 // A refusable arrival files the decline cell its
                 // refusal would write, so the take screen covers it.
+                let id = edge.crossing.id;
                 plan.arrives(
                     edge.producer,
                     edge.output,
@@ -586,23 +429,28 @@ impl Classified {
                         resource: arrived.resource,
                         amount: arrived.amount,
                     },
-                    edge.claim,
-                    edge.record.key(),
-                    (!edge.delivers)
-                        .then(|| edge.claim.answer_key(&ProtocolHasher, Answered::Never)),
+                    id.answer_key(&ProtocolHasher, Answered::Taken),
+                    id,
+                    (edge.crossing.kind == Kind::Escrowed)
+                        .then(|| id.answer_key(&ProtocolHasher, Answered::Never)),
                 )?;
             } else if runs_here(edge.producer) && !runs_here(edge.consumer) {
+                // The record's expiry is the producing intent's own
+                // window end plus its grace, read off the leg the
+                // signer signed, so no record is issued with an expiry
+                // of nothing.
+                let producer = legs
+                    .get(edge.producer as usize)
+                    .ok_or(PlanFault::NoSuchNode {
+                        node: edge.producer,
+                    })?;
                 plan.departs(
                     edge.producer,
                     edge.output,
                     Departure {
-                        site: edge.record,
-                        consumer_claim: edge.claim.key(),
-                        kind: if edge.delivers {
-                            Kind::Owed
-                        } else {
-                            Kind::Escrowed
-                        },
+                        record: edge.crossing.id.record_key(&ProtocolHasher),
+                        crossing: edge.crossing,
+                        expiry_ms: producer.expiry_ms,
                     },
                 )?;
             }
@@ -1013,18 +861,17 @@ impl Runs {
 }
 
 /// The `Never` answer `tx` writes for `edge`: the decline cell under the
-/// consuming node's target, and its bytes naming the record it answers
-/// for.
+/// consuming node's target, and its bytes naming the producer whose
+/// record it answers for.
 ///
-/// The one derivation of the decline cell from an edge, so the member's
-/// refusal receipt and the abandonment cannot derive two different
-/// cells.
+/// Derived through the crossing's one identity, so the member's refusal
+/// receipt and the abandonment cannot derive two different cells.
 #[must_use]
 pub fn never_answer(tx: TxHash, edge: &CrossingEdge) -> (SubstateKey, Vec<u8>) {
+    let id = edge.crossing.id;
     (
-        edge.claim.answer_key(&ProtocolHasher, Answered::Never),
-        edge.claim
-            .answered_by(tx, edge.record.key(), Answered::Never),
+        id.answer_key(&ProtocolHasher, Answered::Never),
+        id.answer(tx, Answered::Never).to_bytes(),
     )
 }
 
@@ -1082,7 +929,7 @@ pub enum PlanDefect {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{Address, AddressClass, LocalKey, SubstateKey};
-    use hyperscale_vm_effects::{CrossingSite, Hash32, IntentHash};
+    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
     use hyperscale_vm_types::{ResourceAddr, ValueEdge};
 
     use super::*;
@@ -1131,9 +978,49 @@ mod tests {
         }
     }
 
-    /// The record cell the edge `node` leaves on `output`.
+    /// The record cell the edge `node` leaves on `output`. The consumer
+    /// is not in a record's key.
     fn record(legs: &[LegShape], node: u32, output: u32) -> SubstateKey {
-        CrossingSite::record_of(&ProtocolHasher, &legs[node as usize], output).key()
+        let producer = &legs[node as usize];
+        CrossingId::of_edge(producer, producer.target, output).record_key(&ProtocolHasher)
+    }
+
+    /// The record keys of the crossings `local` issues, in edge order:
+    /// every one, or those of one `kind`.
+    fn issued(classified: &Classified, local: ShardId, kind: Option<Kind>) -> Vec<SubstateKey> {
+        classified
+            .crossings()
+            .filter(|(edge, _)| {
+                edge.from == local && kind.is_none_or(|kind| edge.crossing.kind == kind)
+            })
+            .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+            .collect()
+    }
+
+    /// The record keys of the owed crossings `local` consumes.
+    fn consumed(classified: &Classified, local: ShardId) -> BTreeSet<SubstateKey> {
+        classified
+            .crossings()
+            .filter(|(edge, _)| edge.crossing.kind == Kind::Owed && edge.to.contains(&local))
+            .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+            .collect()
+    }
+
+    /// The claim cells consumers of the `kind` crossings `local` issues
+    /// write, each with the consumer's frozen home.
+    fn claims(classified: &Classified, local: ShardId, kind: Kind) -> Vec<(ShardId, SubstateKey)> {
+        classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == local && edge.crossing.kind == kind)
+            .map(|(edge, home)| {
+                (
+                    home,
+                    edge.crossing
+                        .id
+                        .answer_key(&ProtocolHasher, Answered::Taken),
+                )
+            })
+            .collect()
     }
 
     fn arrival(node: u32, output: u32, amount: u128) -> EscrowedValue {
@@ -1199,19 +1086,23 @@ mod tests {
     fn owed_claims_name_the_consumers_of_what_a_shard_issued() {
         let legs = transfer();
         let bob = owner(0x22, true);
-        let expected = CrossingSite::claim_of(&ProtocolHasher, bob, &legs[1], 0).key();
-        assert_eq!(frozen(&legs).owed_claims(low()), vec![(high(), expected)]);
+        let expected =
+            CrossingId::of_edge(&legs[1], bob, 0).answer_key(&ProtocolHasher, Answered::Taken);
+        assert_eq!(
+            claims(&frozen(&legs), low(), Kind::Owed),
+            vec![(high(), expected)]
+        );
         assert!(
-            frozen(&legs).owed_claims(high()).is_empty(),
+            claims(&frozen(&legs), high(), Kind::Owed).is_empty(),
             "the delivering shard issued nothing",
         );
         assert!(
-            Classified::whole().owed_claims(low()).is_empty(),
+            claims(&Classified::whole(), low(), Kind::Owed).is_empty(),
             "a whole shape hands nothing between shards",
         );
 
         assert!(
-            frozen(&swap()).owed_claims(low()).is_empty(),
+            claims(&frozen(&swap()), low(), Kind::Owed).is_empty(),
             "a crossing the core consumes is answered by the core, not a delivery",
         );
     }
@@ -1231,25 +1122,23 @@ mod tests {
         for legs in [transfer(), swap()] {
             let classified = frozen(&legs);
             for local in [low(), high()] {
-                let consumed: BTreeSet<SubstateKey> =
-                    classified.records_consumed(local).into_iter().collect();
-                let issued: BTreeSet<SubstateKey> =
-                    classified.records_issued(local).into_iter().collect();
+                let consumed_here = consumed(&classified, local);
+                let issued_here: BTreeSet<SubstateKey> =
+                    issued(&classified, local, None).into_iter().collect();
                 let owed_elsewhere: BTreeSet<SubstateKey> = [low(), high()]
                     .into_iter()
                     .filter(|&producer| producer != local)
-                    .flat_map(|producer| classified.owed_crossings(producer))
-                    .map(|crossing| crossing.record)
+                    .flat_map(|producer| issued(&classified, producer, Some(Kind::Owed)))
                     .collect();
 
-                saw |= !consumed.is_empty();
+                saw |= !consumed_here.is_empty();
                 assert!(
-                    consumed.is_disjoint(&issued),
+                    consumed_here.is_disjoint(&issued_here),
                     "a member holding both ends reads the cell rather than waiting on \
                      a bundle, at {local:?}",
                 );
                 assert!(
-                    consumed.is_subset(&owed_elsewhere),
+                    consumed_here.is_subset(&owed_elsewhere),
                     "every record a delivery here consumes is one another shard owes \
                      it, at {local:?}",
                 );
@@ -1275,14 +1164,14 @@ mod tests {
         for legs in [transfer(), swap()] {
             let classified = frozen(&legs);
             for local in [low(), high()] {
-                let issued: BTreeSet<SubstateKey> =
-                    classified.records_issued(local).into_iter().collect();
+                let all: BTreeSet<SubstateKey> =
+                    issued(&classified, local, None).into_iter().collect();
                 let escrowed: BTreeSet<SubstateKey> =
-                    classified.escrowed_records(local).into_iter().collect();
-                let owed: BTreeSet<SubstateKey> = classified
-                    .owed_crossings(local)
+                    issued(&classified, local, Some(Kind::Escrowed))
+                        .into_iter()
+                        .collect();
+                let owed: BTreeSet<SubstateKey> = issued(&classified, local, Some(Kind::Owed))
                     .into_iter()
-                    .map(|crossing| crossing.record)
                     .collect();
 
                 saw_escrowed |= !escrowed.is_empty();
@@ -1293,23 +1182,23 @@ mod tests {
                 );
                 assert_eq!(
                     &escrowed | &owed,
-                    issued,
+                    all,
                     "and between them they are everything issued at {local:?}",
                 );
 
                 // The kind each departure carries is the kind the leaf
                 // will state, so the partition above is the one the
                 // kernel writes down.
-                let plan = classified.plan(&[], local, Side::Issuing);
+                let plan = classified.plan(&[], local, Side::Issuing, &legs);
                 if let Ok(plan) = plan {
                     for record in plan.legs.records() {
                         let departing = classified
                             .edges()
                             .iter()
-                            .find(|edge| edge.record.key() == record)
+                            .find(|edge| edge.crossing.id.record_key(&ProtocolHasher) == record)
                             .expect("a planned record is an edge of the shape");
                         assert_eq!(
-                            departing.delivers,
+                            departing.crossing.kind == Kind::Owed,
                             owed.contains(&record),
                             "the departure's kind and the accessor agree on {record:?}",
                         );
@@ -1327,7 +1216,7 @@ mod tests {
     #[test]
     fn a_whole_transaction_plans_the_whole_shape() {
         let plan = Classified::whole()
-            .plan(&[], low(), Side::Issuing)
+            .plan(&[], low(), Side::Issuing, &[])
             .expect("a whole plan needs nothing");
         assert!(plan.legs.is_whole());
         assert!(plan.judges.covers(owner(0x22, true)));
@@ -1345,11 +1234,14 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].from, low());
         assert_eq!(edges[0].to, BTreeSet::from([high()]));
-        assert_eq!(edges[0].record.key(), record(&legs, 1, 0));
+        assert_eq!(
+            edges[0].crossing.id.record_key(&ProtocolHasher),
+            record(&legs, 1, 0)
+        );
         assert_eq!(divided.core(), &BTreeSet::from([low()]));
 
         let sender = divided
-            .plan(&[], low(), Side::Issuing)
+            .plan(&[], low(), Side::Issuing, &legs)
             .expect("the sender's legs need no arrival");
         assert!(sender.legs.runs(0) && sender.legs.runs(1) && !sender.legs.runs(2));
         assert!(sender.legs.departure(1, 0).is_some());
@@ -1357,7 +1249,7 @@ mod tests {
         assert!(!sender.judges.covers(owner(0x22, true)));
 
         let recipient = divided
-            .plan(&[arrival(1, 0, 100)], high(), Side::Delivering)
+            .plan(&[arrival(1, 0, 100)], high(), Side::Delivering, &legs)
             .expect("the recipient's leg has its arrival");
         assert!(!recipient.legs.runs(0) && !recipient.legs.runs(1) && recipient.legs.runs(2));
         assert_eq!(
@@ -1383,14 +1275,14 @@ mod tests {
         // signs in and withdraws, waiting on nothing, and its delivering
         // one banks the venue's output once that has crossed back.
         let issuing = divided
-            .plan(&[], low(), Side::Issuing)
+            .plan(&[], low(), Side::Issuing, &legs)
             .expect("the caller's issuing legs take no arrival");
         assert!(issuing.legs.runs(0) && issuing.legs.runs(1));
         assert!(!issuing.legs.runs(2) && !issuing.legs.runs(3));
         assert!(issuing.legs.departure(1, 0).is_some());
         assert!(issuing.legs.arrival(2, 0).is_none());
         let delivering = divided
-            .plan(&[arrival(2, 0, 90)], low(), Side::Delivering)
+            .plan(&[arrival(2, 0, 90)], low(), Side::Delivering, &legs)
             .expect("the caller's delivering leg has its arrival");
         assert!(delivering.legs.runs(3));
         assert!(!delivering.legs.runs(0) && !delivering.legs.runs(1) && !delivering.legs.runs(2));
@@ -1398,7 +1290,7 @@ mod tests {
         assert!(delivering.legs.departure(1, 0).is_none());
 
         let venue = divided
-            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing)
+            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing, &legs)
             .expect("the venue has its arrival");
         assert!(venue.legs.runs(2));
         assert!(!venue.legs.runs(0) && !venue.legs.runs(1) && !venue.legs.runs(3));
@@ -1414,7 +1306,9 @@ mod tests {
     fn a_missing_arrival_is_a_defect() {
         let legs = transfer();
         assert_eq!(
-            frozen(&legs).plan(&[], high(), Side::Delivering).err(),
+            frozen(&legs)
+                .plan(&[], high(), Side::Delivering, &legs)
+                .err(),
             Some(PlanDefect::MissingArrival { node: 1, output: 0 }),
         );
     }
@@ -1428,16 +1322,15 @@ mod tests {
         let legs = swap();
         let divided = frozen(&legs);
         let venue = divided
-            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing)
+            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing, &legs)
             .expect("a core issues what it minted");
         assert!(venue.legs.departure(2, 0).is_some());
 
-        let reclaimed = divided.records_issued(high());
+        let reclaimed = issued(&divided, high(), None);
         assert_eq!(reclaimed, vec![record(&legs, 2, 0)]);
         assert_eq!(reclaimed[0].owner, owner(0x33, true));
         assert_eq!(
-            divided
-                .owed_claims(high())
+            claims(&divided, high(), Kind::Owed)
                 .into_iter()
                 .map(|(shard, _)| shard)
                 .collect::<Vec<_>>(),
@@ -1457,7 +1350,7 @@ mod tests {
         // venue at path 2, so leaf 1 runs nothing.
         assert_eq!(
             divided_deeper
-                .plan(&[], ShardId::leaf(2, 1), Side::Issuing)
+                .plan(&[], ShardId::leaf(2, 1), Side::Issuing, &legs)
                 .err(),
             Some(PlanDefect::NotAParticipant),
         );
@@ -1469,7 +1362,7 @@ mod tests {
     #[test]
     fn a_reclaim_takes_back_the_inbound_crossing_alone() {
         let legs = swap();
-        let reclaimed = frozen(&legs).records_issued(low());
+        let reclaimed = issued(&frozen(&legs), low(), None);
         assert_eq!(
             reclaimed,
             vec![record(&legs, 1, 0)],
@@ -1479,7 +1372,7 @@ mod tests {
 
         let legs = transfer();
         assert!(
-            frozen(&legs).records_issued(high()).is_empty(),
+            issued(&frozen(&legs), high(), None).is_empty(),
             "the recipient's shard issued nothing"
         );
     }
@@ -1510,7 +1403,7 @@ mod tests {
         assert_eq!((edges[0].producer, edges[0].output), (1, 0));
 
         let core = classified
-            .plan(&[arrival(1, 0, 5)], high(), Side::Issuing)
+            .plan(&[arrival(1, 0, 5)], high(), Side::Issuing, &legs)
             .expect("the core member runs the venue and the deposit");
         assert!(core.legs.runs(2) && core.legs.runs(3));
         assert!(
@@ -1518,10 +1411,10 @@ mod tests {
             "the venue's output stays in the execution"
         );
         assert_eq!(
-            classified.plan(&[], high(), Side::Delivering).err(),
+            classified.plan(&[], high(), Side::Delivering, &legs).err(),
             Some(PlanDefect::NotAParticipant),
         );
-        assert!(classified.records_issued(high()).is_empty());
+        assert!(issued(&classified, high(), None).is_empty());
     }
 
     /// An inbound leg on one shard of a multi-shard core is replicated
@@ -1554,7 +1447,7 @@ mod tests {
         assert_eq!(edges[0].to, BTreeSet::from([leaf1]));
         for shard in [leaf0, leaf2] {
             let plan = classified
-                .plan(&[], shard, Side::Issuing)
+                .plan(&[], shard, Side::Issuing, &legs)
                 .expect("a core shard plans the withdraw beside the venues");
             assert!(
                 plan.legs.runs(0) && plan.legs.runs(1) && plan.legs.runs(2) && plan.legs.runs(3)
@@ -1657,7 +1550,7 @@ mod tests {
 
         for shard in [leaf0, leaf2] {
             let plan = classified
-                .plan(&[arrival(0, 0, 5)], shard, Side::Issuing)
+                .plan(&[arrival(0, 0, 5)], shard, Side::Issuing, &legs)
                 .expect("every core shard plans the whole core");
             assert!(
                 (1..5).all(|node| plan.legs.runs(node)) && !plan.legs.runs(0),
@@ -1669,10 +1562,13 @@ mod tests {
             );
         }
         assert!(
-            classified.records_issued(leaf0).is_empty(),
+            issued(&classified, leaf0, None).is_empty(),
             "a core shard issues no record for an edge it runs both ends of",
         );
-        assert_eq!(classified.plan(&[], leaf1, Side::Issuing).err(), None);
+        assert_eq!(
+            classified.plan(&[], leaf1, Side::Issuing, &legs).err(),
+            None
+        );
     }
 
     /// A core member judges its whole core; a leg judges its own shard.
@@ -1746,14 +1642,14 @@ mod tests {
             "the local transfer's edge never crosses"
         );
         let issuing = classified
-            .plan(&[], low(), Side::Issuing)
+            .plan(&[], low(), Side::Issuing, &legs)
             .expect("the issuing member runs both withdraws and the local deposit");
         assert!(issuing.legs.runs(1) && issuing.legs.runs(4) && issuing.legs.runs(5));
         assert!(!issuing.legs.runs(3));
         assert!(issuing.legs.departure(1, 0).is_some());
         assert!(issuing.legs.departure(4, 0).is_none());
         let delivering = classified
-            .plan(&[arrival(2, 0, 7)], low(), Side::Delivering)
+            .plan(&[arrival(2, 0, 7)], low(), Side::Delivering, &legs)
             .expect("the delivering member runs the venue's return alone");
         assert!(delivering.legs.runs(3) && !delivering.legs.runs(5));
     }

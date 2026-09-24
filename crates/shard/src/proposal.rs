@@ -26,6 +26,8 @@ use hyperscale_types::{
     ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash, UnsettledTx,
     ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
+use hyperscale_vm_effects::Kind;
+use hyperscale_vm_types::ProtocolHasher;
 use tracing::debug;
 
 use crate::admission::{
@@ -279,9 +281,14 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
             let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
             classified.only_delivers_at(local_shard)
                 && classified
-                    .records_consumed(local_shard)
-                    .into_iter()
-                    .all(|record| record_reading(state_claims, record).is_some())
+                    .crossings()
+                    .filter(|(edge, _)| {
+                        edge.crossing.kind == Kind::Owed && edge.to.contains(&local_shard)
+                    })
+                    .all(|(edge, _)| {
+                        record_reading(state_claims, edge.crossing.id.record_key(&ProtocolHasher))
+                            .is_some()
+                    })
         })
         .map(|tx| tx.hash())
         .collect()

@@ -19,9 +19,7 @@ use hyperscale_types::{
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
     WeightedTimestamp, Window, sweep_admits_block,
 };
-use hyperscale_vm_effects::{
-    Answered, CrossingAnswer, CrossingCell, Kind, Terms, crossing_decline_key,
-};
+use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms};
 
 use super::{Budget, Cluster};
 
@@ -156,7 +154,8 @@ pub(crate) fn owed_at<C: Cluster + ?Sized>(
         .and_then(|bytes| CrossingCell::from_bytes(&bytes))
         .filter(|record| record.resource == resource)
         .filter(|record| {
-            let claim = record.consumer_claim;
+            let claim = CrossingId::of_record(cell.owner, record)
+                .answer_key(&ProtocolHasher, Answered::Taken);
             c.substate(owning_shard(c, claim.owner), claim.owner, claim.local.0)
                 .is_none()
         })
@@ -242,14 +241,9 @@ pub(crate) fn locked_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> Option
     let shard = owning_shard(c, cell.owner);
     let record = CrossingCell::from_bytes(&c.substate(shard, cell.owner, cell.local.0)?)?;
     let kind = record.terms.kind()?;
-    let claim = record.consumer_claim;
-    let decline = crossing_decline_key(
-        &ProtocolHasher,
-        claim.owner,
-        record.intent,
-        record.local,
-        record.output,
-    );
+    let id = CrossingId::of_record(cell.owner, &record);
+    let claim = id.answer_key(&ProtocolHasher, Answered::Taken);
+    let decline = id.answer_key(&ProtocolHasher, Answered::Never);
     let answered = [claim, decline].into_iter().any(|key| {
         c.substate(owning_shard(c, key.owner), key.owner, key.local.0)
             .is_some()
@@ -362,10 +356,14 @@ pub fn declines_naming(
                     let Some(writes) = receipt.consensus.writes() else {
                         continue;
                     };
-                    named.extend(writes.cells.values().filter_map(|value| {
-                        let answer = CrossingAnswer::from_bytes(value.as_ref()?)?;
+                    named.extend(writes.cells.iter().filter_map(|(key, value)| {
+                        let CrossingLeaf::Answer { id, answer } =
+                            CrossingLeaf::read(&ProtocolHasher, *key, value.as_ref()?)?
+                        else {
+                            return None;
+                        };
                         (answer.answered == Answered::Never && answer.tx == tx)
-                            .then_some((height, answer.record))
+                            .then(|| (height, id.record_key(&ProtocolHasher)))
                     }));
                 }
             }

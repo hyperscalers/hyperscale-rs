@@ -17,9 +17,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice};
 use hyperscale_vm_effects::{
-    ChainRecords, CrossingAnswer, CrossingCell, Hasher, InstanceMeta, InstanceRegistry, Issuance,
-    Marker, MetadataCache, PackageHash, PackageMetadata, ResourceMeta, Value, escrow_record_key,
-    package_hash,
+    ChainRecords, Hasher, InstanceMeta, InstanceRegistry, Issuance, Marker, MetadataCache,
+    PackageHash, PackageMetadata, ResourceMeta, Value, package_hash,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
@@ -94,38 +93,6 @@ pub(crate) fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> O
         return None;
     }
     (marker.key(&ProtocolHasher, owner).local.0 == local).then_some(marker.expiry_ms)
-}
-
-/// Whether a committed cell is an escrow record.
-///
-/// Judged the way the three sweepable families are — the value
-/// re-derives the key under the record's own role — and answering a
-/// different question. A record's key carries no expiry bucket, which is
-/// what keeps every sweep off it, so this is the only thing that tells a
-/// reader holding the leaf that it is value the shard still owes an
-/// answer for.
-#[must_use]
-pub(crate) fn record_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
-    let Ok(cell) = hbor_from_slice::<CrossingCell>(value) else {
-        return false;
-    };
-    let key = escrow_record_key(&ProtocolHasher, owner, cell.intent, cell.local, cell.output);
-    key.local.0 == local
-}
-
-/// Whether a committed cell is a crossing answer — a consumer's claim on
-/// a crossing it was handed, or its decline of one.
-///
-/// Judged the way [`record_cell`] is, and beside it for the same reason:
-/// both families are outside every sweep's reach, so the value
-/// re-deriving its key under its own role is the only thing that tells a
-/// reader holding the leaf which one it is holding.
-#[must_use]
-pub(crate) fn crossing_answer_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
-    let Ok(claim) = hbor_from_slice::<CrossingAnswer>(value) else {
-        return false;
-    };
-    claim.key(&ProtocolHasher, owner).local.0 == local
 }
 
 /// The instance a committed cell seals, or `None` for every other cell.
@@ -1029,7 +996,10 @@ mod tests {
     /// that tells a reader holding the leaf which of the two it holds.
     #[test]
     fn neither_half_of_a_crossing_is_swept_and_each_is_judged_off_its_leaf() {
-        use hyperscale_vm_effects::{CrossingSite, IntentHeader, Terms, crossing_expiry_ms};
+        use hyperscale_vm_effects::{
+            Answered, Crossing, CrossingId, CrossingLeaf, IntentHeader, Kind, Terms,
+            crossing_expiry_ms,
+        };
         use hyperscale_vm_types::{AddressClass, CROSSING_GRACE_MS, IntentHash, NetworkId, TxHash};
 
         let header = IntentHeader {
@@ -1043,20 +1013,25 @@ mod tests {
 
         let producer = Address::new([0x5A; 31], AddressClass::Component);
         let taker = Address::new([0x5C; 31], AddressClass::Component);
-        let intent = IntentHash(Hash32([0xB0; 32]));
-        let record_site = CrossingSite::record(&ProtocolHasher, producer, intent, 1, 0, expiry_ms);
-        let claim_site = CrossingSite::claim(&ProtocolHasher, taker, intent, 1, 0, expiry_ms);
-        let record = record_site.crossing(
+        let id = CrossingId {
+            producer,
+            consumer: taker,
+            intent: IntentHash(Hash32([0xB0; 32])),
+            local: 1,
+            output: 0,
+        };
+        let record_key = id.record_key(&ProtocolHasher);
+        let claim_key = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let record = id.cell(
             TxHash(Hash32([0xC0; 32])),
             ResourceAddr::new([0xE0; 31]),
             500,
-            claim_site.key(),
-            Terms::Escrowed {
-                credit: record_site.key(),
-            },
+            expiry_ms,
+            Terms::Escrowed { credit: record_key },
         );
-        let claim_value = claim_site.claimed_by(TxHash(Hash32([0xC0; 32])), record_site.key());
-        let local = claim_site.key().local.0;
+        let claim = id.answer(TxHash(Hash32([0xC0; 32])), Answered::Taken);
+        let claim_value = claim.to_bytes();
+        let local = claim_key.local.0;
         let mut elsewhere = local;
         elsewhere[15] ^= 1;
         let other_owner = Address::new([0x5B; 31], AddressClass::Component);
@@ -1068,28 +1043,37 @@ mod tests {
             (taker, local, &claim_value),
             (taker, elsewhere, &claim_value),
             (other_owner, local, &claim_value),
-            (taker, record_site.key().local.0, &claim_value),
-            (producer, record_site.key().local.0, &record_value),
-            (producer, claim_site.key().local.0, &record_value),
+            (taker, record_key.local.0, &claim_value),
+            (producer, record_key.local.0, &record_value),
+            (producer, claim_key.local.0, &record_value),
         ] {
             assert_eq!(sweepable_cell(owner, at, value), None);
         }
 
         // What does name each is the one question a reader holding the
         // leaf can ask: which role its value re-derives its key under.
-        assert!(crossing_answer_cell(taker, local, &claim_value));
-        assert!(!crossing_answer_cell(other_owner, local, &claim_value));
-        assert!(!crossing_answer_cell(taker, elsewhere, &claim_value));
-        assert!(!record_cell(taker, local, &claim_value));
-        assert!(record_cell(
-            producer,
-            record_site.key().local.0,
-            &record_value
-        ));
-        assert!(!crossing_answer_cell(
-            producer,
-            record_site.key().local.0,
-            &record_value
-        ));
+        let at = |owner: Address, local: [u8; 16]| SubstateKey {
+            owner,
+            local: LocalKey(local),
+        };
+        let read = |key, value: &[u8]| CrossingLeaf::read(&ProtocolHasher, key, value);
+        assert_eq!(
+            read(claim_key, &claim_value),
+            Some(CrossingLeaf::Answer { id, answer: claim })
+        );
+        assert_eq!(read(at(other_owner, local), &claim_value), None);
+        assert_eq!(read(at(taker, elsewhere), &claim_value), None);
+        assert_eq!(read(at(taker, local), &record_value), None);
+        assert_eq!(
+            read(record_key, &record_value),
+            Some(CrossingLeaf::Record {
+                crossing: Crossing {
+                    id,
+                    kind: Kind::Escrowed
+                },
+                cell: record,
+            })
+        );
+        assert_eq!(read(at(producer, record_key.local.0), &claim_value), None);
     }
 }

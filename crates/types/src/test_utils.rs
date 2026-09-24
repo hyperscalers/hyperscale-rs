@@ -1306,14 +1306,6 @@ impl ProtocolStatics for StubVmStatics {
             && SweepBucket::claimed_by(LocalKey(local)) == SweepBucket::of(expiry))
         .then_some(expiry)
     }
-
-    fn record_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
-        value.first() == Some(&STUB_RECORD_MARKER)
-    }
-
-    fn crossing_answer_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
-        value.first() == Some(&STUB_CROSSING_ANSWER_MARKER)
-    }
 }
 
 /// The local-key first byte the stub judges a package cell by, in place
@@ -1329,34 +1321,6 @@ pub const STUB_PACKAGE_MARKER: u8 = 0xAB;
 /// the half of the judgement a storage backend's index depends on, so a
 /// stub that skipped it would be testing nothing.
 pub const STUB_SWEEPABLE_MARKER: u8 = 0xCD;
-
-/// The value's first byte the stub judges an escrow record by.
-///
-/// No key rule stands beside it, which is the point: a record's key
-/// carries no bucket, so nothing about where it sits says what it is and
-/// the value is the whole of the judgement.
-pub const STUB_RECORD_MARKER: u8 = 0xEF;
-
-/// The value's first byte the stub judges a crossing answer by.
-///
-/// Beside [`STUB_RECORD_MARKER`] and on the same terms, since the two
-/// families the sweep never reaches are told apart by their values and
-/// by nothing else.
-pub const STUB_CROSSING_ANSWER_MARKER: u8 = 0xED;
-
-/// A stub escrow record's value, which [`StubVmStatics`] judges a record
-/// wherever it sits.
-#[must_use]
-pub fn stub_record_cell(body: u8) -> Vec<u8> {
-    vec![STUB_RECORD_MARKER, body]
-}
-
-/// A stub crossing answer's value, which [`StubVmStatics`] judges an
-/// answer wherever it sits.
-#[must_use]
-pub fn stub_crossing_answer_cell(body: u8) -> Vec<u8> {
-    vec![STUB_CROSSING_ANSWER_MARKER, body]
-}
 
 /// A stub sweepable cell's value and the local key it must sit at for
 /// [`StubVmStatics`] to judge it sweepable.

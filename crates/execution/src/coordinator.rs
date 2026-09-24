@@ -68,7 +68,7 @@ use hyperscale_types::{
     TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
     derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
-use hyperscale_vm_effects::Terms;
+use hyperscale_vm_effects::{Kind, ProtocolHasher, Terms};
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
@@ -321,6 +321,26 @@ fn disposal_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
     let mut parts: Vec<&[u8]> = vec![b"hyperscale.record.disposal", &issued_by.0.0];
     parts.extend(keys.iter().map(Vec::as_slice));
     TxHash::from(Hash::from_parts(&parts))
+}
+
+/// The record cells a producer on `local` writes for consumers
+/// elsewhere, in edge order: every one, or those of one `kind`.
+///
+/// What a retirement of the transaction deletes and what a reclaim of
+/// it credits back are the same cells; the two differ in what a
+/// committed record licensed doing with them, which is the ledger's
+/// question. An owed crossing is settled by nobody under the
+/// transaction's name — its only disposal is the deletion its consumer's
+/// claim licenses, composed off the leaf — so the entry's settlements
+/// ask for the escrowed ones alone.
+fn issued_records(classified: &Classified, local: ShardId, kind: Option<Kind>) -> Vec<SubstateKey> {
+    classified
+        .crossings()
+        .filter(|(edge, _)| {
+            edge.from == local && kind.is_none_or(|kind| edge.crossing.kind == kind)
+        })
+        .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+        .collect()
 }
 
 /// The name a housekeeping member over this shard's own tombstones
@@ -1252,7 +1272,7 @@ impl ExecutionCoordinator {
             // that the core never claimed. Nothing is coming, so the
             // candidate goes with the leg it was registered beside.
             self.candidates.remove(tx_hash);
-            let records = classified.records_issued(local_shard);
+            let records = issued_records(&classified, local_shard, None);
             // The plan reads no body — every cell is the record's — but
             // the price still follows the vault, and this is the shard
             // that holds it.
@@ -1460,7 +1480,7 @@ impl ExecutionCoordinator {
             };
             let deletion = Deletion {
                 answer,
-                record: held.record,
+                producer: held.record.owner,
             };
             if !due.contains(&deletion) {
                 due.push(deletion);
@@ -1630,7 +1650,7 @@ impl ExecutionCoordinator {
             // nothing left to compose — every claim it issued is read
             // present, so it closes here rather than on a member that
             // would settle no cell.
-            let records = classified.escrowed_records(local_shard);
+            let records = issued_records(&classified, local_shard, Some(Kind::Escrowed));
             if records.is_empty() {
                 self.counterparts.ledger.close_retired(tx_hash);
                 continue;
@@ -4656,10 +4676,7 @@ mod tests {
         TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo,
         ValidatorSet, Window,
     };
-    use hyperscale_vm_effects::{
-        Answered, CrossingAnswer, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms,
-        crossing_claim_key, crossing_decline_key,
-    };
+    use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
     use super::*;
@@ -9156,7 +9173,7 @@ mod tests {
         state
             .counterparts
             .held
-            .insert(record_key, HeldRecord::of(cell));
+            .insert(record_key, HeldRecord::of(record_key, cell));
 
         commit_finalizing(
             &mut state,
@@ -9197,7 +9214,7 @@ mod tests {
         state
             .counterparts
             .held
-            .insert(record_key, HeldRecord::of(cell));
+            .insert(record_key, HeldRecord::of(record_key, cell));
 
         commit_finalizing(
             &mut state,
@@ -10208,45 +10225,7 @@ mod tests {
     /// that sits on `PEER`, and a cell of its own to credit where
     /// nobody claims it.
     fn held_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
-        let intent = IntentHash(Hash32([local; 32]));
-        let claim = SubstateKey {
-            owner: committed_tx_cell_key(
-                PEER,
-                transaction.hash(),
-                transaction.validity_range().end_timestamp_exclusive,
-            )
-            .owner,
-            local: LocalKey([local; 16]),
-        };
-        let record_key = SubstateKey {
-            owner: committed_tx_cell_key(
-                HOME,
-                transaction.hash(),
-                transaction.validity_range().end_timestamp_exclusive,
-            )
-            .owner,
-            local: LocalKey([local ^ 0xFF; 16]),
-        };
-        let cell = CrossingCell {
-            resource: ResourceAddr::new([0xE1; 31]),
-            amount: 1_000,
-            intent,
-            local: 0,
-            output: 0,
-            expiry_ms,
-            tx: transaction.hash(),
-            consumer_claim: claim,
-            terms: Terms::Escrowed {
-                credit: SubstateKey {
-                    owner: record_key.owner,
-                    local: LocalKey([local ^ 0x0F; 16]),
-                },
-            },
-        };
-        (record_key, claim, cell)
+        crossing_fixture(local, expiry_ms, HOME, PEER)
     }
 
     /// A crossing handed *to* this shard: the record sits on `PEER`
@@ -10258,29 +10237,43 @@ mod tests {
     /// about the answer, a consumer holds the answer and is asked for
     /// it.
     fn arrived_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
-        let (owner, record_key, base) = held_record(local, expiry_ms);
-        // The canonical key this shard's own claim sits at, and not an
-        // arbitrary one under the same owner: a producer asks which
-        // answer it got by asking the two keys the edge derives, so a
-        // fixture whose claim is neither of them models a crossing
-        // nobody could answer.
-        let claim = crossing_claim_key(
-            &ProtocolHasher,
-            owner.owner,
-            base.intent,
-            base.local,
-            base.output,
-        );
-        let cell = CrossingCell {
-            consumer_claim: claim,
-            terms: Terms::Escrowed {
+        crossing_fixture(local, expiry_ms, PEER, HOME)
+    }
+
+    /// A record and its claim for one crossing, produced under a target
+    /// of `producer`'s and consumed under one of `consumer`'s, with the
+    /// keys the system derives.
+    fn crossing_fixture(
+        local: u8,
+        expiry_ms: u64,
+        producer: ShardId,
+        consumer: ShardId,
+    ) -> (SubstateKey, SubstateKey, CrossingCell) {
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let validity_end = transaction.validity_range().end_timestamp_exclusive;
+        let id = CrossingId {
+            producer: committed_tx_cell_key(producer, transaction.hash(), validity_end).owner,
+            consumer: committed_tx_cell_key(consumer, transaction.hash(), validity_end).owner,
+            intent: IntentHash(Hash32([local; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record_key = id.record_key(&ProtocolHasher);
+        let claim = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let cell = id.cell(
+            transaction.hash(),
+            ResourceAddr::new([0xE1; 31]),
+            1_000,
+            expiry_ms,
+            Terms::Escrowed {
                 credit: SubstateKey {
                     owner: record_key.owner,
                     local: LocalKey([local ^ 0x0F; 16]),
                 },
             },
-            ..base
-        };
+        );
         (record_key, claim, cell)
     }
 
@@ -10318,17 +10311,12 @@ mod tests {
         }
         let deadline = Deadline::from_expiry(expiry_ms);
         let read_at = Window::Core.of(deadline).end.plus(Duration::from_secs(1));
-        let decline = crossing_decline_key(
-            &ProtocolHasher,
-            cell.consumer_claim.owner,
-            cell.intent,
-            cell.local,
-            cell.output,
-        );
+        let decline = CrossingId::of_record(record_key.owner, &cell)
+            .answer_key(&ProtocolHasher, Answered::Never);
         state
             .counterparts
             .held
-            .insert(record_key, HeldRecord::of(cell));
+            .insert(record_key, HeldRecord::of(record_key, cell));
 
         // The claim sits on PEER, so the seat asks rather than reads.
         state.committed_ts = read_at;
@@ -10418,7 +10406,7 @@ mod tests {
         state
             .counterparts
             .held
-            .insert(record_key, HeldRecord::of(cell));
+            .insert(record_key, HeldRecord::of(record_key, cell));
 
         // Past the end of the window the entry stood in, which is where
         // the claim cell sweeps too.
@@ -10487,7 +10475,7 @@ mod tests {
         state
             .counterparts
             .held
-            .insert(record_key, HeldRecord::of(cell));
+            .insert(record_key, HeldRecord::of(record_key, cell));
 
         let past = Window::LegEntry
             .of(Deadline::from_expiry(expiry_ms))
@@ -10551,7 +10539,7 @@ mod tests {
         state
             .counterparts
             .held
-            .insert(record_key, HeldRecord::of(cell));
+            .insert(record_key, HeldRecord::of(record_key, cell));
         state.counterparts.ledger.register_committed(
             test_committed(),
             &PriceTable::GENESIS,
@@ -10628,13 +10616,8 @@ mod tests {
         let mut state = make_test_state();
         let expiry_ms = 400_000;
         let (record_key, claim, cell) = held_record(0x6A, expiry_ms);
-        let decline = crossing_decline_key(
-            &ProtocolHasher,
-            claim.owner,
-            cell.intent,
-            cell.local,
-            cell.output,
-        );
+        let decline = CrossingId::of_record(record_key.owner, &cell)
+            .answer_key(&ProtocolHasher, Answered::Never);
         if owed_here {
             let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
                 Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -10648,7 +10631,7 @@ mod tests {
         state
             .counterparts
             .held
-            .insert(record_key, HeldRecord::of(cell));
+            .insert(record_key, HeldRecord::of(record_key, cell));
 
         state.committed_ts = read_at;
         let present_keys: Vec<SubstateKey> = if present { vec![decline] } else { Vec::new() };
@@ -10992,7 +10975,7 @@ mod tests {
             compose_deletions(&mut state, at),
             vec![Deletion {
                 answer: answer_key,
-                record: record_key,
+                producer: record_key.owner,
             }],
             "the record is gone, so its tombstone was swept, so no bundle for it \
              can still be admitted",
@@ -11037,18 +11020,12 @@ mod tests {
     /// cell's key.
     fn answered_crossing(state: &mut ExecutionCoordinator, seed: u8) -> (SubstateKey, SubstateKey) {
         let (record_key, _, cell) = arrived_record(seed, REFUSED_EXPIRY_MS);
-        let answer_key = cell.consumer_claim;
-        state.counterparts.answered.insert(
-            answer_key,
-            AnsweredCrossing::of(&CrossingAnswer {
-                tx: cell.tx,
-                intent: cell.intent,
-                local: cell.local,
-                output: cell.output,
-                record: record_key,
-                answered: Answered::Taken,
-            }),
-        );
+        let answer_key = CrossingId::of_record(record_key.owner, &cell)
+            .answer_key(&ProtocolHasher, Answered::Taken);
+        state
+            .counterparts
+            .answered
+            .insert(answer_key, AnsweredCrossing::of(record_key));
         (record_key, answer_key)
     }
 
@@ -11704,37 +11681,36 @@ mod tests {
     /// The claim cell the core writes for what `classified` says
     /// [`HOME`] issued, under the shard holding the consumer's target.
     fn core_claim(classified: &Classified) -> SubstateKey {
-        let claims = classified.escrowed_claims(HOME);
-        assert_eq!(
-            claims.len(),
-            1,
-            "the fixture issues one crossing to the core"
-        );
-        claims[0].1
+        one_answer(classified, Kind::Escrowed, Answered::Taken, "to the core")
+    }
+
+    /// The one answer cell in `answered`'s role that the consumer of
+    /// the `kind` crossing [`HOME`] issued writes.
+    fn one_answer(
+        classified: &Classified,
+        kind: Kind,
+        answered: Answered,
+        to: &str,
+    ) -> SubstateKey {
+        let answers: Vec<SubstateKey> = classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == HOME && edge.crossing.kind == kind)
+            .map(|(edge, _)| edge.crossing.id.answer_key(&ProtocolHasher, answered))
+            .collect();
+        assert_eq!(answers.len(), 1, "the fixture issues one crossing {to}");
+        answers[0]
     }
 
     /// The decline cell the core writes beside [`core_claim`] where it
     /// refuses what `classified` says [`HOME`] issued.
     fn core_decline(classified: &Classified) -> SubstateKey {
-        let declines = classified.escrowed_declines(HOME);
-        assert_eq!(
-            declines.len(),
-            1,
-            "the fixture issues one crossing to the core"
-        );
-        declines[0].1
+        one_answer(classified, Kind::Escrowed, Answered::Never, "to the core")
     }
 
     /// The claim cell a delivery writes for what `classified` says
     /// [`HOME`] issued.
     fn delivered_claim(classified: &Classified) -> SubstateKey {
-        let claims = classified.owed_claims(HOME);
-        assert_eq!(
-            claims.len(),
-            1,
-            "the fixture issues one crossing to a delivery"
-        );
-        claims[0].1
+        one_answer(classified, Kind::Owed, Answered::Taken, "to a delivery")
     }
 
     /// [`HOME`] beside [`CORE`] and [`CORE_SIBLING`], all live: the
@@ -12708,7 +12684,7 @@ mod tests {
         state
             .counterparts
             .held
-            .insert(record_key, HeldRecord::of(cell));
+            .insert(record_key, HeldRecord::of(record_key, cell));
 
         state.release_tick(tick_id, Some(tx_hash));
         assert!(state.ticks.tick_assignment(tx_hash).is_none());

@@ -18,7 +18,7 @@ use hyperscale_core::{Action, CrossingPulls, FetchIds, FetchRequest, ProtocolEve
 use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
-use hyperscale_storage::{CrossingLeaves, is_crossing_answer_cell, is_record_cell};
+use hyperscale_storage::CrossingLeaves;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight,
     CROSSING_BUNDLE_WINDOW, CounterpartMirror, ExecutionCertificate, Inclusion,
@@ -29,7 +29,7 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    CrossingAnswer, CrossingCell, ProtocolHasher, Terms, crossing_decline_key,
+    Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher, Terms,
 };
 
 use crate::ledger::{Ledger, Question, Unanswerable};
@@ -99,20 +99,22 @@ impl Budget {
 /// and a reading is block content already.
 #[derive(Debug, Clone)]
 pub struct HeldRecord {
-    /// The record leaf, which carries the claim key, the issuing
-    /// transaction and the expiry every window is read off.
+    /// The record leaf, which carries the consumer's target, the
+    /// issuing transaction and the expiry every window is read off.
     pub(crate) cell: CrossingCell,
     /// The newest counterpart header the claim has been asked at, so
     /// the question is not re-sent at the same one every block.
     asked_at: Option<BlockHeight>,
-    /// The decline cell's key, under the same target the claim's key
-    /// sits at and off the same edge.
+    /// The claim cell's key, under the consuming node's target.
     ///
     /// Held rather than re-derived because three sites compare against
     /// it in every block — the probe that asks, the retention rule that
-    /// keeps what lands, and the fold that reads it — and the record
-    /// carries the claim's key for the same reason.
-    pub(crate) consumer_decline: SubstateKey,
+    /// keeps what lands, and the fold that reads it. Derived through the
+    /// crossing's one identity, off the record's own key and value.
+    pub(crate) claim: SubstateKey,
+    /// The decline cell's key, under the same target the claim's key
+    /// sits at and off the same edge, held for the same reason.
+    pub(crate) decline: SubstateKey,
     /// Whether a committed claim read the consumer's claim cell
     /// present: the consumer holds the crossing, so the record is
     /// answered and the value is not the producer's to take back.
@@ -147,17 +149,15 @@ pub struct HeldRecord {
 }
 
 impl HeldRecord {
-    /// The record as the leaves give it: undisposed, unasked.
+    /// The record at `key` as the leaves give it: undisposed, unasked,
+    /// with both answer keys derived through the crossing the leaf
+    /// names.
     #[must_use]
-    pub(crate) fn of(cell: CrossingCell) -> Self {
+    pub(crate) fn of(key: SubstateKey, cell: CrossingCell) -> Self {
+        let id = CrossingId::of_record(key.owner, &cell);
         Self {
-            consumer_decline: crossing_decline_key(
-                &ProtocolHasher,
-                cell.consumer_claim.owner,
-                cell.intent,
-                cell.local,
-                cell.output,
-            ),
+            claim: id.answer_key(&ProtocolHasher, Answered::Taken),
+            decline: id.answer_key(&ProtocolHasher, Answered::Never),
             cell,
             asked_at: None,
             claimed: false,
@@ -238,12 +238,12 @@ pub struct AnsweredCrossing {
 }
 
 impl AnsweredCrossing {
-    /// The answer as the leaves give it: unasked, with nothing yet read
-    /// of the record it names.
+    /// The answer as the leaves give it, for the record at `record` on
+    /// the producer's chain: unasked, with nothing yet read of it.
     #[must_use]
-    pub(crate) const fn of(claim: &CrossingAnswer) -> Self {
+    pub(crate) const fn of(record: SubstateKey) -> Self {
         Self {
-            record: claim.record,
+            record,
             asked_at: None,
             cleanup: Cleanup::Standing(None),
         }
@@ -353,9 +353,8 @@ impl Cleanup {
 /// Read off the keys rather than off a name, because a record's issuing
 /// transaction need not be one this chain committed.
 fn awaited_by(held: &BTreeMap<SubstateKey, HeldRecord>, key: SubstateKey) -> bool {
-    held.values().any(|record| {
-        !record.answered() && (record.cell.consumer_claim == key || record.consumer_decline == key)
-    })
+    held.values()
+        .any(|record| !record.answered() && (record.claim == key || record.decline == key))
 }
 
 /// Whether any answer of this shard's still wants a reading of `key`
@@ -415,23 +414,17 @@ fn wants_reading(
 /// what asks about it from then on. Read whatever the answer says, since
 /// a crossing this shard has answered is one it will not deliver again.
 ///
-/// **Two lookups rather than a walk, and the cell is what makes that
-/// possible.** An answer sits at one of two keys under the consuming
-/// node's own target: the claim, which the record carries outright, and
-/// the decline, which derives from the same edge. Asked from the
-/// record's side there is no owner to derive either from — the record's
-/// owner is the *producing* node's target — so the question could only
-/// be answered by scanning every answer this shard has ever written.
-/// Every caller holds the cell, so none of them has to.
-fn answered_for(answered: &BTreeMap<SubstateKey, AnsweredCrossing>, cell: &CrossingCell) -> bool {
-    answered.contains_key(&cell.consumer_claim)
-        || answered.contains_key(&crossing_decline_key(
-            &ProtocolHasher,
-            cell.consumer_claim.owner,
-            cell.intent,
-            cell.local,
-            cell.output,
-        ))
+/// **Two lookups rather than a walk, and the crossing's identity is
+/// what makes that possible.** An answer sits at one of two keys under
+/// the consuming node's own target, the claim and the decline, and both
+/// derive from the identity a record's key and value rebuild. Asked
+/// from the record's side with no identity there would be no owner to
+/// derive either from — the record's owner is the *producing* node's
+/// target — so the question could only be answered by scanning every
+/// answer this shard has ever written.
+fn answered_for(answered: &BTreeMap<SubstateKey, AnsweredCrossing>, id: &CrossingId) -> bool {
+    answered.contains_key(&id.answer_key(&ProtocolHasher, Answered::Taken))
+        || answered.contains_key(&id.answer_key(&ProtocolHasher, Answered::Never))
 }
 
 /// A question this validator put to a counterpart: the question, the
@@ -627,7 +620,7 @@ impl Counterparts {
                 .iter()
                 .filter_map(|(key, value)| {
                     let cell = CrossingCell::from_bytes(value)?;
-                    (cell.terms != Terms::Retired).then(|| (*key, HeldRecord::of(cell)))
+                    (cell.terms != Terms::Retired).then(|| (*key, HeldRecord::of(*key, cell)))
                 })
                 .collect(),
             cleaned: Vec::new(),
@@ -643,10 +636,10 @@ impl Counterparts {
                 .claims
                 .iter()
                 .filter_map(|(key, value)| {
-                    Some((
-                        *key,
-                        AnsweredCrossing::of(&CrossingAnswer::from_bytes(value)?),
-                    ))
+                    let answer = CrossingAnswer::from_bytes(value)?;
+                    let record =
+                        CrossingId::of_answer(key.owner, &answer).record_key(&ProtocolHasher);
+                    Some((*key, AnsweredCrossing::of(record)))
                 })
                 .collect(),
             arrivals: BTreeMap::new(),
@@ -938,7 +931,7 @@ impl Counterparts {
             if record.answered() || ledger.settles_records(record.cell.tx) {
                 continue;
             }
-            let claim = record.cell.consumer_claim;
+            let claim = record.claim;
             let shard = trie.shard_for_prefix(claim.owner);
             if shard == local {
                 continue;
@@ -957,7 +950,7 @@ impl Counterparts {
             // has two shapes and one of them is the refusal.
             let entry = wanted.entry(anchor).or_default();
             entry.push(claim);
-            entry.push(record.consumer_decline);
+            entry.push(record.decline);
         }
     }
 
@@ -993,7 +986,10 @@ impl Counterparts {
         self.arrivals.retain(|key, _| arrived.contains_key(key));
         for (&record, arrival) in arrived {
             if now < arrival.deadline().validity_end()
-                || answered_for(&self.answered, &arrival.cell)
+                || answered_for(
+                    &self.answered,
+                    &CrossingId::of_record(record.owner, &arrival.cell),
+                )
             {
                 continue;
             }
@@ -1060,7 +1056,8 @@ impl Counterparts {
     /// the fold over its own finalizations do.
     #[cfg(test)]
     pub(crate) fn note_answer(&mut self, key: SubstateKey, answer: &CrossingAnswer) {
-        self.answered.insert(key, AnsweredCrossing::of(answer));
+        let record = CrossingId::of_answer(key.owner, answer).record_key(&ProtocolHasher);
+        self.answered.insert(key, AnsweredCrossing::of(record));
     }
 
     /// Whether this validator holds an answering reading of `key` on
@@ -1222,7 +1219,7 @@ impl Counterparts {
             if record.answered() {
                 continue;
             }
-            let claim = record.cell.consumer_claim;
+            let claim = record.claim;
             if trie.shard_for_prefix(claim.owner) != stated.anchor.shard {
                 continue;
             }
@@ -1233,7 +1230,7 @@ impl Counterparts {
             };
             if read(claim, Probed::Claim).is_some() {
                 record.claimed = true;
-            } else if read(record.consumer_decline, Probed::Decline).is_some() {
+            } else if read(record.decline, Probed::Decline).is_some() {
                 record.declined = true;
             }
         }
@@ -1387,31 +1384,28 @@ impl Counterparts {
                     continue;
                 };
                 for (key, value) in &writes.cells {
-                    match value {
-                        Some(bytes) if is_record_cell(*key, bytes) => {
-                            if let Some(cell) = CrossingCell::from_bytes(bytes) {
-                                // A disposal rewrites the record where it
-                                // stood, so the write that retires one is
-                                // the write that ends its question: the
-                                // held entry goes and a tombstone takes
-                                // its place, due for removal at the
-                                // expiry the producer stamped.
-                                if cell.terms == Terms::Retired {
-                                    self.held.remove(key);
-                                    self.tombstones.insert(*key, cell.expiry_ms);
-                                } else {
-                                    self.held
-                                        .entry(*key)
-                                        .or_insert_with(|| HeldRecord::of(cell));
-                                }
-                            }
+                    let leaf = value
+                        .as_ref()
+                        .map(|bytes| CrossingLeaf::read(&ProtocolHasher, *key, bytes));
+                    match leaf {
+                        Some(Some(CrossingLeaf::Record { cell, .. })) => {
+                            self.held
+                                .entry(*key)
+                                .or_insert_with(|| HeldRecord::of(*key, cell));
                         }
-                        Some(bytes) if is_crossing_answer_cell(*key, bytes) => {
-                            if let Some(claim) = CrossingAnswer::from_bytes(bytes) {
-                                self.answered
-                                    .entry(*key)
-                                    .or_insert_with(|| AnsweredCrossing::of(&claim));
-                            }
+                        // A disposal rewrites the record where it stood,
+                        // so the write that retires one is the write that
+                        // ends its question: the held entry goes and a
+                        // tombstone takes its place, due for removal at
+                        // the expiry the producer stamped.
+                        Some(Some(CrossingLeaf::Tombstone { cell, .. })) => {
+                            self.held.remove(key);
+                            self.tombstones.insert(*key, cell.expiry_ms);
+                        }
+                        Some(Some(CrossingLeaf::Answer { id, .. })) => {
+                            self.answered.entry(*key).or_insert_with(|| {
+                                AnsweredCrossing::of(id.record_key(&ProtocolHasher))
+                            });
                         }
                         None => {
                             self.held.remove(key);
@@ -1426,7 +1420,7 @@ impl Counterparts {
                             }
                             self.tombstones.remove(key);
                         }
-                        Some(_) => {}
+                        Some(None) => {}
                     }
                 }
             }
@@ -1455,12 +1449,12 @@ impl Counterparts {
             if record.answered() {
                 continue;
             }
-            if trie.shard_for_prefix(record.cell.consumer_claim.owner) != local {
+            if trie.shard_for_prefix(record.claim.owner) != local {
                 continue;
             }
-            if self.answered.contains_key(&record.cell.consumer_claim) {
+            if self.answered.contains_key(&record.claim) {
                 record.claimed = true;
-            } else if self.answered.contains_key(&record.consumer_decline) {
+            } else if self.answered.contains_key(&record.decline) {
                 record.declined = true;
             }
         }
@@ -2229,10 +2223,7 @@ mod tests {
             output: 0,
             expiry_ms: deadline.at().as_millis() + CLAIM_WINDOW.as_secs() * 1_000,
             tx: TxHash::from(Hash::from_bytes(&[seed; 32])),
-            consumer_claim: SubstateKey {
-                owner: Address::new([0x11; 31], AddressClass::Component),
-                local: LocalKey([seed; 16]),
-            },
+            consumer: Address::new([0x11; 31], AddressClass::Component),
             terms: Terms::Owed,
         }
     }
@@ -2251,7 +2242,7 @@ mod tests {
         for seed in 0..count {
             counterparts.held.insert(
                 producer_record(seed),
-                HeldRecord::of(producer_cell(seed, deadline)),
+                HeldRecord::of(producer_record(seed), producer_cell(seed, deadline)),
             );
         }
         (
@@ -2261,17 +2252,22 @@ mod tests {
         )
     }
 
-    /// The decline cell of the crossing `producer_cell(seed, ..)`
-    /// records, which sits under the same target its claim does.
+    /// The crossing `producer_cell(seed, ..)` records, as the record at
+    /// `producer_record(seed)` names it.
+    fn producer_crossing(seed: u8, deadline: Deadline) -> CrossingId {
+        CrossingId::of_record(producer_record(seed).owner, &producer_cell(seed, deadline))
+    }
+
+    /// The claim cell of that crossing, under the consuming node's
+    /// target.
+    fn claim_of(seed: u8, deadline: Deadline) -> SubstateKey {
+        producer_crossing(seed, deadline).answer_key(&ProtocolHasher, Answered::Taken)
+    }
+
+    /// The decline cell of that crossing, which sits under the same
+    /// target its claim does.
     fn consumer_decline(seed: u8, deadline: Deadline) -> SubstateKey {
-        let cell = producer_cell(seed, deadline);
-        crossing_decline_key(
-            &ProtocolHasher,
-            cell.consumer_claim.owner,
-            cell.intent,
-            cell.local,
-            cell.output,
-        )
+        producer_crossing(seed, deadline).answer_key(&ProtocolHasher, Answered::Never)
     }
 
     /// A producer whose consumer sits on its own shard is answered off
@@ -2301,7 +2297,7 @@ mod tests {
             let cell = producer_cell(0, deadline);
             counterparts
                 .held
-                .insert(producer_record(0), HeldRecord::of(cell));
+                .insert(producer_record(0), HeldRecord::of(producer_record(0), cell));
             if let Some(key) = answer_at {
                 counterparts.note_answer(
                     key,
@@ -2310,7 +2306,7 @@ mod tests {
                         intent: cell.intent,
                         local: cell.local,
                         output: cell.output,
-                        record: producer_record(0),
+                        producer: producer_record(0).owner,
                         answered,
                     },
                 );
@@ -2334,10 +2330,7 @@ mod tests {
             "its own decline credits the value back, at no anchor and in no window",
         );
         assert_eq!(
-            seated(
-                Some(producer_cell(0, deadline).consumer_claim),
-                Answered::Taken
-            ),
+            seated(Some(claim_of(0, deadline)), Answered::Taken),
             (true, false, false),
             "and its own claim answers without licensing a credit",
         );
@@ -2356,7 +2349,7 @@ mod tests {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
         let (mut producer, trie, anchors) = producing(1, deadline);
         let record = producer_record(0);
-        let claim = producer_cell(0, deadline).consumer_claim;
+        let claim = claim_of(0, deadline);
         let decline = consumer_decline(0, deadline);
         let now = deadline.at();
         assert_eq!(
@@ -2434,7 +2427,7 @@ mod tests {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
         let (mut producer, trie, _anchors) = producing(1, deadline);
         let record = producer_record(0);
-        let claim = producer_cell(0, deadline).consumer_claim;
+        let claim = claim_of(0, deadline);
         let decline = consumer_decline(0, deadline);
 
         let both = StateClaim::new(

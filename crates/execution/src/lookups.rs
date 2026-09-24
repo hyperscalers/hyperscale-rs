@@ -359,7 +359,7 @@ mod tests {
             output: 0,
             expiry_ms: 1,
             tx: TxHash(Hash32([tx; 32])),
-            consumer_claim: key,
+            consumer: key.owner,
             terms: Terms::Escrowed { credit: key },
         };
         (key, cell.to_bytes())
