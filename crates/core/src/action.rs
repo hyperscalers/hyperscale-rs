@@ -359,6 +359,26 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
+    /// Prove the crossing records the committed block at `anchor` wrote
+    /// and push each to the committee of the shard owning its consumer.
+    ///
+    /// Emitted by the proposer of the block after `anchor`'s, whose
+    /// certified header is what proves the anchor to a consumer, so the
+    /// push lands beside its proof. Delegated to the execution pool,
+    /// where each target's keys are read at the block's own view, proved
+    /// at its root, built into held claims and sent as
+    /// `CrossingReadingsNotification`s.
+    PushCrossingReadings {
+        /// The block whose records are pushed.
+        block_hash: BlockHash,
+        /// That block's anchor: the claims' anchor and the proof's root.
+        anchor: Anchor,
+        /// The record keys to push, by the shard owning each consumer.
+        targets: BTreeMap<ShardId, Vec<SubstateKey>>,
+        /// Each target's committee.
+        shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,
+    },
+
     /// Fetch state entries and broadcast provisions for all cross-shard txs in a block.
     ///
     /// Only the block proposer emits this (once per block). Delegated to the
@@ -1772,6 +1792,7 @@ impl Action {
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. }
             | Self::FetchAndBroadcastProvisions { .. }
+            | Self::PushCrossingReadings { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
             | Self::BroadcastShardForkProof { .. }
             | Self::BroadcastShardVoteEquivocation { .. }
@@ -1906,9 +1927,9 @@ impl Action {
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. } => ActionOwner::Execution,
 
-            Self::VerifyProvisions { .. } | Self::FetchAndBroadcastProvisions { .. } => {
-                ActionOwner::Provisions
-            }
+            Self::VerifyProvisions { .. }
+            | Self::FetchAndBroadcastProvisions { .. }
+            | Self::PushCrossingReadings { .. } => ActionOwner::Provisions,
 
             Self::SignAndBroadcastPcVote1 { .. }
             | Self::SignAndBroadcastPcVote2 { .. }

@@ -7,6 +7,7 @@ pub mod beacon;
 
 mod block_header;
 mod block_vote;
+mod crossing_readings;
 mod execution_certificates;
 mod execution_vote;
 mod provisions;
@@ -19,6 +20,7 @@ pub use beacon::{
 };
 pub use block_header::BlockHeaderNotification;
 pub use block_vote::BlockVoteNotification;
+pub use crossing_readings::CrossingReadingsNotification;
 pub use execution_certificates::ExecutionCertificatesNotification;
 pub use execution_vote::ExecutionVoteNotification;
 pub use provisions::ProvisionsNotification;

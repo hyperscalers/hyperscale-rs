@@ -1715,8 +1715,11 @@ fn a_route_the_departing_venue_settled_is_settled_by_the_survivor_sim() {
 
 /// Drive a train of transfers into the splitter across its split at `seed`.
 fn a_train_into_a_splitter_strands_nothing_at_seed(seed: u64) {
-    let mut cluster =
-        SimCluster::with_accounts(&straddler_config(), seed, &split_train_genesis_accounts());
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &straddler_config(),
+        seed,
+        &split_train_genesis_accounts(),
+    );
     a_train_into_a_splitter_strands_nothing(&mut cluster);
 }
 

@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Member, Side, live_record};
 use hyperscale_types::{
-    Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry, SubstateKey, TxHash,
-    Verified, WeightedTimestamp,
+    MAX_FINALIZATION_DELAY, Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry,
+    SubstateKey, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{CrossingCell, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -62,11 +62,12 @@ pub struct WantedRecord {
     /// The transaction the record must name as its issuer.
     pub tx: TxHash,
     /// The committed clock past which the read arms on the clock alone:
-    /// the commit that filed the want, for a requirement filed here, or
+    /// one finalization delay past the commit that filed the want, for
+    /// a requirement filed here, by when the producer's leg has
+    /// finalized or never will and a push that was coming has come; or
     /// the body's validity end, for a delivering body the pool holds.
-    /// `None` where only the producer's certificate arms it. Asking
-    /// ahead of the record's writing costs one absence, and the backoff
-    /// in the holder's heights bounds what follows.
+    /// `None` where only the producer's certificate arms it. The
+    /// certificate arms either sooner.
     pub arms_at: Option<WeightedTimestamp>,
 }
 
@@ -378,7 +379,8 @@ impl ProvisioningTracker {
 
     /// Every crossing a candidate here waits on with no arrival for it,
     /// with the transaction the record must name and the clock its read
-    /// arms on.
+    /// arms on: one finalization delay past the commit that filed it,
+    /// so a pushed reading has its chance to land before any ask.
     ///
     /// The records alone, and not the shard a requirement might name:
     /// who holds a record now is its own prefix, read against the
@@ -396,7 +398,7 @@ impl ProvisioningTracker {
                     wanted.push(WantedRecord {
                         key: *key,
                         tx: *tx_hash,
-                        arms_at: Some(*filed_at),
+                        arms_at: Some(filed_at.plus(MAX_FINALIZATION_DELAY)),
                     });
                 }
             }
@@ -748,7 +750,7 @@ mod tests {
             vec![WantedRecord {
                 key: record,
                 tx,
-                arms_at: Some(WeightedTimestamp::from_millis(7_000)),
+                arms_at: Some(WeightedTimestamp::from_millis(7_000).plus(MAX_FINALIZATION_DELAY)),
             }]
         );
         let _ = LocalKey([0; 16]);

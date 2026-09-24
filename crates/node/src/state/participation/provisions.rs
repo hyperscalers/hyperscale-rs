@@ -5,6 +5,7 @@
 //! the remote ECs that ack them).
 
 use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_metrics::record_crossing_push_dropped;
 use hyperscale_types::TopologySchedule;
 
 use super::ShardParticipation;
@@ -26,6 +27,29 @@ impl ShardParticipation {
             ProtocolEvent::StateProvisionsVerified { result, anchor } => self
                 .provisions_coordinator
                 .on_state_provisions_verified(result, anchor, self.now),
+            ProtocolEvent::CrossingReadingsReceived { claims } => {
+                // A claim at a height this node fences against never
+                // reaches a block, so it is not worth parking either.
+                let fence = &self.fork_fence;
+                let claims: Vec<_> = claims
+                    .into_iter()
+                    .filter(|claim| {
+                        let fenced = fence.is_fenced(claim.anchor.shard, claim.anchor.height);
+                        if fenced {
+                            record_crossing_push_dropped("fenced");
+                        }
+                        !fenced
+                    })
+                    .collect();
+                let actions = self
+                    .execution_coordinator
+                    .on_crossing_readings(sched, claims);
+                // A reading just held may complete a parked delivering
+                // body's records, which the pool then offers beside it.
+                self.mempool_coordinator
+                    .on_deliveries_readable(&self.execution_coordinator.readable_deliveries());
+                actions
+            }
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
                 // A verified bundle is engagement evidence: promote any
                 // parked cross-shard transaction it names, before the

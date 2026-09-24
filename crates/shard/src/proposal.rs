@@ -25,6 +25,7 @@ use hyperscale_types::{
     LocalTimestamp, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadySignal,
     ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, TopologySchedule, TopologySnapshot,
     Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    state_claims_admit_block,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
@@ -381,51 +382,50 @@ pub fn select_abandonment_records(
 
 /// The claims a block may carry of counterparts' cells: what
 /// [`StateClaimsSection`] admits, in the one order it carries them,
-/// spent against the section's byte budget.
+/// spent against the section's byte budget in the order the composer
+/// offers them.
 ///
-/// The candidates are sorted into the order rule and what it refuses is
-/// dropped. The first claim that does not fit is cut to the longest
-/// key prefix whose piece fits, that piece is carried and the section
-/// ends there: a claim is split by key, never dropped whole, and the
-/// composer offers the remainder at the next proposal once the commit
-/// retires what this block carried.
+/// The budget is spent in the offered order, oldest anchors first, so
+/// the claim closest to aging out of its window goes before a younger
+/// one and one busy producer cannot starve another. The first claim
+/// that does not fit is cut to the longest key prefix whose piece fits,
+/// that piece is kept and the spending ends there: a claim is split by
+/// key, never dropped whole, and the composer offers the remainder at
+/// the next proposal once the commit retires what this block carried.
+/// What was kept is then sorted into the section's order and admitted,
+/// and what the order rule refuses is dropped.
 #[must_use]
 pub fn select_state_claims(
     ctx: &Admission<'_>,
     fold: &mut StateClaimsFold,
     state_claims: Vec<StateClaim>,
 ) -> Vec<StateClaim> {
-    let mut sorted = state_claims;
-    sorted.sort_unstable();
-    sorted.dedup();
-    let mut selected = Vec::new();
-    for claim in sorted {
-        if selected.len() >= MAX_STATE_CLAIMS_PER_BLOCK {
+    let mut kept = Vec::new();
+    let mut weight = 0usize;
+    for claim in state_claims {
+        if kept.len() >= MAX_STATE_CLAIMS_PER_BLOCK {
             break;
         }
-        if !fold.in_order(&claim) {
-            continue;
-        }
-        if StateClaimsSection::admit(ctx, fold, &claim).is_ok() {
-            selected.push(claim);
-            continue;
-        }
-        if fold.fits(&claim) {
+        if state_claims_admit_block(weight.saturating_add(claim.wire_weight())) {
+            weight = weight.saturating_add(claim.wire_weight());
+            kept.push(claim);
             continue;
         }
         let keys = claim.keys();
         let piece = (1..keys.len()).rev().find_map(|kept| {
             let piece = claim.restrict(|key| keys[..kept].contains(&key))?;
-            fold.fits(&piece).then_some(piece)
+            state_claims_admit_block(weight.saturating_add(piece.wire_weight())).then_some(piece)
         });
-        if let Some(piece) = piece
-            && StateClaimsSection::admit(ctx, fold, &piece).is_ok()
-        {
-            selected.push(piece);
+        if let Some(piece) = piece {
+            kept.push(piece);
         }
         break;
     }
-    selected
+    kept.sort_unstable();
+    kept.dedup();
+    kept.into_iter()
+        .filter(|claim| fold.in_order(claim) && StateClaimsSection::admit(ctx, fold, claim).is_ok())
+        .collect()
 }
 
 /// Select provisions for inclusion: what [`ProvisionsSection`] admits

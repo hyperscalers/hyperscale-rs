@@ -54,7 +54,8 @@ use hyperscale_engine::{
     CodeAvailability, Deletion, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
 use hyperscale_metrics::{
-    record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
+    record_batch_unavailable, record_crossing_push_dropped, record_reclaim_admitted,
+    record_unresolvable_tx,
 };
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::network::response::ServedValue;
@@ -82,10 +83,11 @@ use crate::gate::{Attested, Gate, gate_certificate};
 use crate::ledger::{Certified, Delivering, Ledger, Settleable, Unanswerable};
 use crate::lookups::{
     assign_participants, attesting_committee, build_provision_requests, ec_has_shard_quorum_power,
-    fetch_keys_covered, peers_excluding_self,
+    fetch_keys_covered, peers_excluding_self, record_pushes,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
+use crate::parked_claims::ParkedClaims;
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, WantedRecord, requirements_of};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
@@ -544,6 +546,12 @@ pub struct ExecutionCoordinator {
     /// a source block's commit proof, a departed partner's settled set —
     /// re-driven through the handler it arrived by ([`Self::release`]).
     parked: ParkedArtifacts,
+    /// Pushed claims waiting on their anchor's proof.
+    parked_claims: ParkedClaims,
+    /// The records the last live block wrote, by the shard owning each
+    /// consumer, kept one commit for the next block's proposer to push
+    /// beside the header that proves them.
+    pending_push: Option<(BlockHash, Anchor, BTreeMap<ShardId, Vec<SubstateKey>>)>,
 
     /// What counterparts have said about the transactions in flight
     /// here, and what this shard still asks them: the ledger of what is
@@ -687,6 +695,8 @@ impl ExecutionCoordinator {
             exec_certs,
             pending_verifications: HashSet::new(),
             parked: ParkedArtifacts::default(),
+            parked_claims: ParkedClaims::new(),
+            pending_push: None,
             me,
             local_shard,
         }
@@ -3027,16 +3037,107 @@ impl ExecutionCoordinator {
     pub fn on_committed_remote_header(
         &mut self,
         topology_schedule: &TopologySchedule,
-        source_shard: ShardId,
+        anchor: Anchor,
     ) -> Vec<Action> {
+        let source_shard = anchor.shard;
         if source_shard == self.local_shard {
             return vec![];
         }
         let mut actions = self.release(topology_schedule, Wake::Proof(source_shard));
+        // The pushed claims that waited on exactly this anchor re-enter
+        // where a fresh push would, against the anchor now proven.
+        let now = self.committed_ts;
+        for claim in self.parked_claims.release(source_shard, anchor.height) {
+            actions.extend(self.place_pushed_claim(topology_schedule, claim, now));
+        }
         // A counterpart's header past a leg's deadline is what a probe
         // of its committed set, or of its claim cell, waits on.
         actions.extend(self.probe_silent_counterparts(topology_schedule));
         actions
+    }
+
+    /// Re-place the early pushes whose keys `wanted` now names: a push
+    /// that ran ahead of its consumer's commit is offered once the
+    /// commit files the want.
+    fn release_early_pushes(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        wanted: &[WantedRecord],
+    ) -> Vec<Action> {
+        let keys: BTreeSet<SubstateKey> = wanted.iter().map(|record| record.key).collect();
+        let now = self.committed_ts;
+        self.parked_claims
+            .release_early(&keys)
+            .into_iter()
+            .flat_map(|claim| self.place_pushed_claim(topology_schedule, claim, now))
+            .collect()
+    }
+
+    /// Place a producer's pushed readings, each past ingress: offered
+    /// where its anchor is one this replica commit-proved, dropped where
+    /// the proven anchor differs, parked until the proof lands where
+    /// there is none yet.
+    pub fn on_crossing_readings(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        claims: Vec<StateClaim>,
+    ) -> Vec<Action> {
+        let now = self.committed_ts;
+        claims
+            .into_iter()
+            .flat_map(|claim| self.place_pushed_claim(topology_schedule, claim, now))
+            .collect()
+    }
+
+    fn place_pushed_claim(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        claim: StateClaim,
+        now: WeightedTimestamp,
+    ) -> Vec<Action> {
+        let anchor = claim.anchor;
+        if topology_schedule.recovery_fences(anchor.shard, anchor.height) {
+            record_crossing_push_dropped("fenced");
+            return vec![];
+        }
+        match self
+            .counterparts
+            .proven_anchors
+            .at(anchor.shard, anchor.height)
+        {
+            Some(proven) if proven == anchor => {
+                let wanted = self.wanted_records();
+                if !self.counterparts.offer_pushed(&claim, &wanted, now)
+                    && let Err(reason) = self.parked_claims.hold_early(claim)
+                {
+                    record_crossing_push_dropped(reason);
+                }
+                vec![]
+            }
+            Some(_) => {
+                record_crossing_push_dropped("anchor_disagrees");
+                vec![]
+            }
+            None => {
+                if let Err(reason) = self.parked_claims.park(claim) {
+                    record_crossing_push_dropped(reason);
+                    return vec![];
+                }
+                // At or below the shard's attested boundary the header
+                // exists and is fetched; above it, it arrives on its own.
+                if topology_schedule
+                    .head()
+                    .boundary(anchor.shard)
+                    .is_some_and(|boundary| anchor.height <= boundary.height)
+                {
+                    return vec![Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                        source_shard: anchor.shard,
+                        block_height: anchor.height,
+                    })];
+                }
+                vec![]
+            }
+        }
     }
 
     /// Re-drive everything `wake` lets through, each by the handler it
@@ -3276,17 +3377,19 @@ impl ExecutionCoordinator {
             self.committed_ts = own_anchor;
         }
         self.provisioning.advance_clock(self.committed_ts);
+        self.parked_claims.retire_below(self.committed_ts);
         self.sweep_candidates();
         // What the block says about counterparts, and what it opens to
         // ask them; the strands no counterpart can answer for any more
         // are let go of below.
         let trie = self.counterpart_trie(topology_schedule);
         let wanted = self.wanted_records();
+        let mut actions = self.release_early_pushes(topology_schedule, &wanted);
         let committed =
             self.counterparts
                 .on_commit(trie, topology_schedule, block, self.committed_ts, &wanted);
         self.gone_this_commit = committed.gone;
-        let mut actions = committed.actions;
+        actions.extend(committed.actions);
         self.release_unanswerable(&committed.unanswerable);
         // After the prune, so a delivery the ledger has let go of is not
         // offered again, and after the release, so one just resolved is
@@ -3360,6 +3463,7 @@ impl ExecutionCoordinator {
                 transactions,
                 provisions,
                 block.state_claims(),
+                block.certificates(),
             )),
             Block::Sealed {
                 header,
@@ -3388,6 +3492,7 @@ impl ExecutionCoordinator {
         transactions: &[Arc<Verifiable<Transaction>>],
         provisions: &[Arc<Verifiable<Provisions>>],
         state_claims: &[StateClaim],
+        finalizations: &[Arc<Verifiable<Finalization>>],
     ) -> Vec<Action> {
         let height = header.height();
         let mut actions = Vec::new();
@@ -3405,6 +3510,11 @@ impl ExecutionCoordinator {
         let runnable = height >= self.compose_from;
 
         // ── Provision broadcasting (proposer only) ─────────────────────
+        // The records the parent block wrote go with it: this block's
+        // certified header is what proves the parent to a consumer, and
+        // its proposer sends both. Taken whether or not this replica
+        // proposes, so nothing older than one commit is ever pushed.
+        let pending_push = self.pending_push.take();
         if runnable && self.me == header.proposer() {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
@@ -3418,6 +3528,30 @@ impl ExecutionCoordinator {
                     source_block_ts: header.parent_qc().weighted_timestamp(),
                     shard_recipients,
                 });
+            }
+            if let Some((parent_hash, anchor, targets)) = pending_push {
+                let shard_recipients = targets
+                    .keys()
+                    .map(|&target| (target, anchored.committee_for_shard(target).to_vec()))
+                    .collect();
+                actions.push(Action::PushCrossingReadings {
+                    block_hash: parent_hash,
+                    anchor,
+                    targets,
+                    shard_recipients,
+                });
+            }
+        }
+        if runnable {
+            let targets = record_pushes(finalizations, anchored.shard_trie(), self.local_shard);
+            if !targets.is_empty() {
+                let anchor = Anchor {
+                    shard: self.local_shard,
+                    height,
+                    state_root: header.state_root(),
+                    ts: header.parent_qc().weighted_timestamp(),
+                };
+                self.pending_push = Some((block_hash, anchor, targets));
             }
         }
 
@@ -4250,6 +4384,7 @@ impl ExecutionCoordinator {
         }
 
         self.counterparts.on_settled(shard, settled);
+        self.parked_claims.drop_shard(shard);
         self.release(topology_schedule, Wake::SettledSet(shard))
     }
 
@@ -4708,9 +4843,9 @@ mod tests {
         GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
         MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate,
         RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, StoredReceipt, SubstateKey,
-        TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo,
-        ValidatorSet, Window,
+        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
+        SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx,
+        ValidatorInfo, ValidatorSet, Window,
     };
     use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
@@ -6129,13 +6264,14 @@ mod tests {
         );
 
         // The commit proof lands: the deferred EC replays into dispatch.
-        state.proven_anchors().record(Anchor {
+        let proven = Anchor {
             shard: remote_shard,
             height: BlockHeight::new(5),
             state_root: StateRoot::ZERO,
             ts: WeightedTimestamp::ZERO,
-        });
-        let actions = state.on_committed_remote_header(&topo, remote_shard);
+        };
+        state.proven_anchors().record(proven);
+        let actions = state.on_committed_remote_header(&topo, proven);
         assert!(
             actions
                 .iter()
@@ -6637,13 +6773,14 @@ mod tests {
 
         // The source block is commit-proven; the gate under test is verify
         // dispatch without a local tracker, not the commit-proof gate.
-        state.proven_anchors().record(Anchor {
+        let proven = Anchor {
             shard: remote_shard,
             height: BlockHeight::new(5),
             state_root: StateRoot::ZERO,
             ts: WeightedTimestamp::ZERO,
-        });
-        state.on_committed_remote_header(&topo, remote_shard);
+        };
+        state.proven_anchors().record(proven);
+        state.on_committed_remote_header(&topo, proven);
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
             actions
@@ -9088,7 +9225,7 @@ mod tests {
         // both chains run on one wall clock: a node holding a
         // counterpart's header at `ts` has committed to there itself.
         state.committed_ts = state.committed_ts.max(ts);
-        let opened = state.on_committed_remote_header(schedule, shard);
+        let opened = state.on_committed_remote_header(schedule, anchor);
         (StateClaim::new(anchor, cells, proof), opened)
     }
 
@@ -9368,13 +9505,14 @@ mod tests {
             (DELIVERER, 4, past_deadline, b"at"),
         ];
         for (shard, height, ts, tag) in held {
-            state.proven_anchors().record(Anchor {
+            let proven = Anchor {
                 shard,
                 height: BlockHeight::new(height),
                 state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
                 ts,
-            });
-            state.on_committed_remote_header(&schedule, shard);
+            };
+            state.proven_anchors().record(proven);
+            state.on_committed_remote_header(&schedule, proven);
         }
         let later = past_deadline.plus(Duration::from_secs(1));
         let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, later, &[], &[claim]);
@@ -9585,13 +9723,14 @@ mod tests {
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
             [(3, deadline, b"short"), (4, past_deadline, b"at")];
         for (height, ts, tag) in held {
-            state.proven_anchors().record(Anchor {
+            let proven = Anchor {
                 shard: successor,
                 height: BlockHeight::new(height),
                 state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
                 ts,
-            });
-            state.on_committed_remote_header(&schedule, successor);
+            };
+            state.proven_anchors().record(proven);
+            state.on_committed_remote_header(&schedule, proven);
         }
         let later = past_deadline.plus(Duration::from_secs(1));
         let (bundle, opened) = proven_at(&mut state, &schedule, successor, 5, later, &[], &[claim]);
@@ -9670,13 +9809,14 @@ mod tests {
             (4, deadline, b"at"),
         ];
         for (height, ts, tag) in held {
-            state.proven_anchors().record(Anchor {
+            let proven = Anchor {
                 shard: CORE,
                 height: BlockHeight::new(height),
                 state_root: root(tag),
                 ts,
-            });
-            let actions = state.on_committed_remote_header(&schedule, CORE);
+            };
+            state.proven_anchors().record(proven);
+            let actions = state.on_committed_remote_header(&schedule, proven);
             assert!(
                 state_proof_fetches(&actions).is_empty(),
                 "before the deadline nothing is asked"
@@ -10804,13 +10944,14 @@ mod tests {
     }
 
     /// A record a delivery here waits on is read from the record's
-    /// holder from the commit that filed the want, at the holder's
-    /// newest proven anchor, and not again until the holder has moved
-    /// on; a committed arrival ends the read.
+    /// holder one finalization delay past the commit that filed the
+    /// want, at the holder's newest proven anchor, and not again until
+    /// the holder has moved on; a committed arrival ends the read.
     #[test]
-    fn a_record_read_arms_at_the_commit_and_ends_with_the_arrival() {
+    fn a_record_read_arms_a_finalization_delay_past_the_commit_and_ends_with_the_arrival() {
         let (mut state, trie, record_key, cell, filed_at) = a_delivery_waiting_on_a_crossing();
-        let before = filed_at.minus(Duration::from_millis(1));
+        let armed = filed_at.plus(MAX_FINALIZATION_DELAY);
+        let before = armed.minus(Duration::from_millis(1));
         state
             .counterparts
             .proven_anchors
@@ -10823,10 +10964,9 @@ mod tests {
                 record_key
             )
             .is_empty(),
-            "nothing is asked before the commit that filed the want",
+            "nothing is asked inside one finalization delay of the commit that filed the want",
         );
 
-        let armed = filed_at;
         let first = proven_anchor_of(PEER, 10, armed);
         state.counterparts.proven_anchors.record(first);
         assert_eq!(
@@ -10917,6 +11057,183 @@ mod tests {
             &[(record_key, Bytes::new(cell.to_bytes()).unwrap())],
         );
         assert_eq!(state.readable_deliveries(), vec![cell.tx]);
+    }
+
+    /// A delivering body past its validity end waiting on one record,
+    /// with the holder's anchor at height 9 proven, and a pushed claim
+    /// of the record at that anchor: the state the push tests start
+    /// from.
+    fn a_body_awaiting_a_push() -> (
+        ExecutionCoordinator,
+        TopologySchedule,
+        ShardTrie,
+        SubstateKey,
+        CrossingCell,
+        Anchor,
+        StateClaim,
+    ) {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = arrived_record(0x75, REFUSED_EXPIRY_MS);
+        let now = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        state.provisioning.advance_clock(now);
+        state.committed_ts = now;
+        let trie = schedule
+            .at(now)
+            .expect("the window is seated")
+            .shard_trie()
+            .clone();
+        state.want_records(vec![(cell.tx, vec![record_key], true)]);
+        let (state_root, proof) = state_and_proof(PEER, &[record_key], &[record_key]);
+        let anchor = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(9),
+            state_root,
+            ts: now,
+        };
+        let claim = StateClaim::new(
+            anchor,
+            [(
+                record_key,
+                Stated::Held(Bytes::new(cell.to_bytes()).unwrap()),
+            )],
+            proof,
+        );
+        (state, schedule, trie, record_key, cell, anchor, claim)
+    }
+
+    #[test]
+    fn a_push_at_a_proven_anchor_is_held_and_stands_in_for_an_ask() {
+        let (mut state, schedule, trie, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.counterparts.proven_anchors.record(anchor);
+        let now = anchor.ts;
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert_eq!(
+            state.readable_deliveries(),
+            vec![cell.tx],
+            "the pushed reading is held and the body is readable",
+        );
+        assert!(state.parked_claims.is_empty());
+
+        // While the pushed reading is held to offer nothing is asked,
+        // and the want stands until a block carries it.
+        let wanted = state.wanted_records();
+        assert_eq!(wanted.len(), 1);
+        for height in [9, 10, 11] {
+            state
+                .counterparts
+                .proven_anchors
+                .record(proven_anchor_of(PEER, height, now));
+            assert!(
+                record_asks(&state.counterparts.probe(&trie, now, &wanted), record_key).is_empty(),
+                "no ask at height {height} while the pushed reading is held",
+            );
+        }
+
+        assert_eq!(
+            state.offers().state_claims.len(),
+            1,
+            "the pushed reading is what the next block carries",
+        );
+    }
+
+    #[test]
+    fn a_push_before_its_proof_is_parked_and_carried_by_the_header() {
+        let (mut state, schedule, _, _, cell, anchor, claim) = a_body_awaiting_a_push();
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert_eq!(
+            state.parked_claims.len(),
+            1,
+            "held until the anchor is proven"
+        );
+        assert!(state.readable_deliveries().is_empty());
+
+        state.counterparts.proven_anchors.record(anchor);
+        state.on_committed_remote_header(&schedule, anchor);
+        assert!(state.parked_claims.is_empty());
+        assert_eq!(state.readable_deliveries(), vec![cell.tx]);
+    }
+
+    #[test]
+    fn a_push_whose_anchor_disagrees_with_the_proven_one_is_dropped() {
+        let (mut state, schedule, _, _, _, anchor, claim) = a_body_awaiting_a_push();
+        state.counterparts.proven_anchors.record(Anchor {
+            state_root: StateRoot::ZERO,
+            ..anchor
+        });
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert!(
+            state.parked_claims.is_empty(),
+            "not parked: the anchor is proven, differently"
+        );
+        assert!(state.readable_deliveries().is_empty());
+        assert!(state.offers().state_claims.is_empty());
+    }
+
+    #[test]
+    fn a_push_ahead_of_its_want_is_held_until_the_want_is_filed() {
+        let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.want_records(Vec::new());
+        state.counterparts.proven_anchors.record(anchor);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert!(
+            state.offers().state_claims.is_empty(),
+            "nothing wants the reading yet, so nothing is offered",
+        );
+        assert_eq!(state.parked_claims.len(), 1, "and it is held for the want");
+
+        state.want_records(vec![(cell.tx, vec![record_key], true)]);
+        let wanted = state.wanted_records();
+        assert!(state.release_early_pushes(&schedule, &wanted).is_empty());
+        assert!(state.parked_claims.is_empty());
+        assert_eq!(state.readable_deliveries(), vec![cell.tx]);
+    }
+
+    #[test]
+    fn held_claims_are_offered_oldest_anchor_first() {
+        let (mut state, schedule, _, record_key, cell, anchor, later) = a_body_awaiting_a_push();
+        let earlier_ts = anchor.ts.minus(Duration::from_secs(1));
+        let (state_root, proof) = state_and_proof(PEER, &[record_key], &[record_key]);
+        let earlier_anchor = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(8),
+            state_root,
+            ts: earlier_ts,
+        };
+        let earlier = StateClaim::new(
+            earlier_anchor,
+            [(
+                record_key,
+                Stated::Held(Bytes::new(cell.to_bytes()).unwrap()),
+            )],
+            proof,
+        );
+        state.counterparts.proven_anchors.record(anchor);
+        state.counterparts.proven_anchors.record(earlier_anchor);
+        state.on_crossing_readings(&schedule, vec![later, earlier]);
+        let offered: Vec<Anchor> = state
+            .offers()
+            .state_claims
+            .iter()
+            .map(|claim| claim.anchor)
+            .collect();
+        assert_eq!(offered, vec![earlier_anchor, anchor]);
     }
 
     /// An anchor of `shard` at `height`, as a validator that has proven

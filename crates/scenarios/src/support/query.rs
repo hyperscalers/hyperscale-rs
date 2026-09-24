@@ -333,6 +333,28 @@ pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHe
     named
 }
 
+/// Whether `shard`'s chain has carried a held reading of `key`: a state
+/// claim, in any committed block, holding the cell's value. A crossing
+/// record reaches its consumer this way, pushed or read.
+#[must_use]
+pub fn reads_record(store: &impl ShardChainReader, key: SubstateKey) -> bool {
+    let tip = store.committed_height();
+    let mut height = BlockHeight::new(1);
+    while height <= tip {
+        if let Some(certified) = store.get_block(height)
+            && certified
+                .block()
+                .state_claims()
+                .iter()
+                .any(|claim| claim.held(key).is_some())
+        {
+            return true;
+        }
+        height = height.next();
+    }
+    false
+}
+
 /// Walk `store`'s committed chain for every crossing refusal naming
 /// `tx`: the height each committed at and the record it refuses.
 ///

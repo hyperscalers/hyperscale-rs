@@ -119,6 +119,16 @@ impl RecordReads {
         }
     }
 
+    /// A pushed reading of `key` at `anchor` was kept: it stands where an
+    /// answered ask would, so the next ask waits one more doubling past
+    /// this anchor, and nothing here disarms — only a committed arrival
+    /// ends the want.
+    pub fn pushed(&mut self, key: SubstateKey, anchor: Anchor) {
+        let read = self.reads.entry(key).or_default();
+        read.last = Some(anchor);
+        read.step = read.step.saturating_add(1);
+    }
+
     /// Whether `key` is asked at `anchor`, a proven anchor of its holder,
     /// and if so the ask is counted as put there.
     ///
@@ -299,5 +309,24 @@ mod tests {
         reads.sweep(now, &[]);
         assert!(!reads.is_armed(want.key));
         assert!(!reads.due(want.key, anchor(9, 9)));
+    }
+
+    #[test]
+    fn a_kept_push_stands_in_for_an_ask_and_does_not_disarm() {
+        let mut reads = RecordReads::new();
+        let key = test_key(1);
+        let wanted = wanted(Some(10_000));
+        reads.arm(&wanted, HOLDER, WeightedTimestamp::from_millis(10_000));
+        reads.pushed(key, anchor(9, 10_000));
+        assert!(reads.is_armed(key), "a push never disarms");
+        assert!(
+            !reads.due(key, anchor(9, 10_000)),
+            "not asked where the push answered"
+        );
+        assert!(
+            !reads.due(key, anchor(10, 10_000)),
+            "the next ask waits two heights"
+        );
+        assert!(reads.due(key, anchor(11, 10_000)));
     }
 }

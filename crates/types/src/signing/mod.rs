@@ -48,6 +48,7 @@ pub fn signed_bytes<M: HborSignedWith<Context = NetworkId>>(
 mod beacon_pc;
 mod beacon_ratify;
 mod beacon_reveal;
+mod crossing_readings;
 mod execution;
 mod provisions;
 mod shard;
@@ -63,6 +64,7 @@ pub use beacon_ratify::RatifyVoteMessage;
 pub use beacon_reveal::{
     BeaconRevealMessage, beacon_reveal_sign, beacon_reveal_verify, vrf_output_from_proof,
 };
+pub use crossing_readings::CrossingReadingsSenderMessage;
 pub use execution::{ExecutionCertificatesSenderMessage, ExecutionVoteMessage};
 pub use provisions::ProvisionsSenderMessage;
 pub use shard::{BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage};
@@ -122,6 +124,10 @@ mod tests {
             (
                 "ProvisionsSenderMessage",
                 ProvisionsSenderMessage::SIGNING_DOMAIN,
+            ),
+            (
+                "CrossingReadingsSenderMessage",
+                CrossingReadingsSenderMessage::SIGNING_DOMAIN,
             ),
             ("ReadySignal", ReadySignal::SIGNING_DOMAIN),
             ("BlockVoteMessage", BlockVoteMessage::SIGNING_DOMAIN),

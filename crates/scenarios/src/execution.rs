@@ -1740,6 +1740,7 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
     let read_dropped = c.drop_type("state_proof.request");
+    let push_dropped = c.drop_type("crossing.readings");
 
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
@@ -1778,9 +1779,12 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
         "the cut must stand past where the delivery used to lapse",
     );
     assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0 && read_dropped.fired() > 0,
-        "the payer's bundle channels and the record's read channel must actually have been \
-         exercised and cut"
+        broadcast_dropped.fired() > 0
+            && fetch_dropped.fired() > 0
+            && read_dropped.fired() > 0
+            && push_dropped.fired() > 0,
+        "the payer's bundle channels and the record's push and read channels must actually \
+         have been exercised and cut"
     );
     assert!(
         c.chain_fate(recipient_shard, hash).0.is_none(),
@@ -1826,8 +1830,8 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
 ///
 /// # Panics
 ///
-/// Panics if the payer's leg does not accept, if the bundle and read
-/// channels are never exercised, if the delivery lands while the cut
+/// Panics if the payer's leg does not accept, if the bundle, push and
+/// read channels are never exercised, if the delivery lands while the cut
 /// stands, if the recipient is not paid once the network heals, or if
 /// the world does not conserve.
 pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mut C) {
@@ -1842,6 +1846,7 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
     let read_dropped = c.drop_type("state_proof.request");
+    let push_dropped = c.drop_type("crossing.readings");
 
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
@@ -1873,9 +1878,12 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
         "the cut must stand past where the delivery used to lapse",
     );
     assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0 && read_dropped.fired() > 0,
-        "the payer's bundle channels and the record's read channel must actually have been \
-         exercised and cut"
+        broadcast_dropped.fired() > 0
+            && fetch_dropped.fired() > 0
+            && read_dropped.fired() > 0
+            && push_dropped.fired() > 0,
+        "the payer's bundle channels and the record's push and read channels must actually \
+         have been exercised and cut"
     );
     assert!(
         c.chain_fate(recipient_shard, hash).0.is_none(),
@@ -1926,8 +1934,8 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
 ///
 /// # Panics
 ///
-/// Panics if the payer's leg does not accept, if the bundle and read
-/// channels are never exercised, if the delivery lands while the cut
+/// Panics if the payer's leg does not accept, if the bundle, push and
+/// read channels are never exercised, if the delivery lands while the cut
 /// stands, if the recipient is not paid once the network heals, or if
 /// any value is left stranded.
 pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCluster>(c: &mut C) {
@@ -1942,6 +1950,7 @@ pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCl
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
     let read_dropped = c.drop_type("state_proof.request");
+    let push_dropped = c.drop_type("crossing.readings");
 
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
@@ -1978,9 +1987,12 @@ pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCl
         "the cut must stand well past the transaction's deadline",
     );
     assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0 && read_dropped.fired() > 0,
-        "the payer's bundle channels and the record's read channel must actually have been \
-         exercised and cut",
+        broadcast_dropped.fired() > 0
+            && fetch_dropped.fired() > 0
+            && read_dropped.fired() > 0
+            && push_dropped.fired() > 0,
+        "the payer's bundle channels and the record's push and read channels must actually \
+         have been exercised and cut",
     );
     assert!(
         c.chain_fate(recipient_shard, hash).0.is_none(),

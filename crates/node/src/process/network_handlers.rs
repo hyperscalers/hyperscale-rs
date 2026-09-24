@@ -7,7 +7,7 @@ use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_hbor::{Bytes, Capped};
-use hyperscale_metrics::record_fetch_response_sent;
+use hyperscale_metrics::{record_crossing_push_dropped, record_fetch_response_sent};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::{
@@ -19,9 +19,9 @@ use hyperscale_types::network::notification::beacon::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::network::notification::{
-    BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
-    ExecutionVoteNotification, ProvisionsNotification, ReadySignalNotification,
-    TimeoutNotification,
+    BlockHeaderNotification, BlockVoteNotification, CrossingReadingsNotification,
+    ExecutionCertificatesNotification, ExecutionVoteNotification, ProvisionsNotification,
+    ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::network::request::beacon::{
     GetBeaconBlockRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
@@ -30,13 +30,14 @@ use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
 };
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, signed_bytes};
+use hyperscale_types::{ExecutionCertificate, ShardId, Signed, Verifiable, signed_bytes};
 use tracing::warn;
 
 use crate::beacon::gossip::register_beacon_gossip_handlers;
 use crate::event::{HostEvent, ShardScopedInput};
 use crate::host::NodeHost;
 use crate::process::{ProcessIo, SharedShardSenders};
+use crate::shard::cross_shard::crossing_push;
 use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
@@ -393,6 +394,78 @@ where
                         }
                     };
                     push_protocol_event(tx, target_shard, event);
+                },
+            );
+
+        // ── crossing.readings → ProtocolEvent::CrossingReadingsReceived ─
+        //
+        // A producer's pushed record readings. Nothing is held before
+        // every check passes: routed and cheap first, then the sender
+        // against the committee that proposed the anchor's block —
+        // resolved at the anchor's own clock, since the head names an
+        // empty committee for a split parent's coast blocks and drops a
+        // member rotated out since — then each claim's own proof, on
+        // this thread as the signature was.
+
+        let senders = self.process.shard_event_senders.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
+        let process = Arc::clone(&self.process);
+        let verifier = Arc::clone(&self.process.verifier);
+        self.process
+            .network
+            .register_notification_handler::<CrossingReadingsNotification>(
+                move |notification: CrossingReadingsNotification| {
+                    let target_shard = notification.target_shard;
+                    let senders = senders.load();
+                    let Some(tx) = senders.get(&target_shard) else {
+                        record_crossing_push_dropped("unhosted");
+                        return;
+                    };
+                    let anchor = match crossing_push::shaped(&notification) {
+                        Ok(anchor) => anchor,
+                        Err(reason) => {
+                            record_crossing_push_dropped(reason);
+                            return;
+                        }
+                    };
+                    let schedule = process.topology_schedule();
+                    let Some((signing, _)) = schedule.at_for_shard(anchor.shard, anchor.ts) else {
+                        record_crossing_push_dropped("unscheduled_anchor");
+                        return;
+                    };
+                    let topo = topology_snapshot.load();
+                    let Some(public_key) = resolve_sender_key(
+                        signing,
+                        &topo,
+                        notification.signer(),
+                        anchor.shard,
+                        "crossing readings",
+                    ) else {
+                        record_crossing_push_dropped("sender");
+                        return;
+                    };
+                    let msg = notification.signing_message(topo.network());
+                    if !verify_sig_with_metrics(
+                        verifier.as_ref(),
+                        &msg,
+                        &public_key,
+                        notification.signature(),
+                        "crossing_readings",
+                    ) {
+                        record_crossing_push_dropped("signature");
+                        return;
+                    }
+                    if let Err(reason) = crossing_push::proven(&notification.claims) {
+                        record_crossing_push_dropped(reason);
+                        return;
+                    }
+                    push_protocol_event(
+                        tx,
+                        target_shard,
+                        ProtocolEvent::CrossingReadingsReceived {
+                            claims: notification.claims.into_inner(),
+                        },
+                    );
                 },
             );
 

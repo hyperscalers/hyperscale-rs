@@ -21,7 +21,7 @@ use hyperscale_types::{
     QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
     Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StoredReceipt, SubstateKey, TickId, Timeout,
+    SpcProposalObjectVerifyError, SpcView, StateClaim, StoredReceipt, SubstateKey, TickId, Timeout,
     Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, Verifiable, VerificationKind,
     Verified, WeightedTimestamp,
 };
@@ -411,6 +411,17 @@ pub enum ProtocolEvent {
     UnverifiedProvisionsReceived {
         /// Provisions batch received from a source shard.
         provisions: Arc<Provisions>,
+    },
+
+    /// A producer's pushed record readings, past ingress: routed to a
+    /// hosted shard, all at one anchor, signed by a member of the
+    /// committee that proposed the anchor's block, and each claim
+    /// well-formed and proving its readings. What remains is the
+    /// execution coordinator's to place: offered where the anchor is
+    /// commit-proven, parked until it is, dropped where it disagrees.
+    CrossingReadingsReceived {
+        /// The claims, every one at the same anchor.
+        claims: Vec<StateClaim>,
     },
 
     /// Received provisions whose merkle proof predicate already holds —

@@ -754,11 +754,6 @@ impl StateClaimsFold {
         let first = claim.cells.first().map(|(key, _)| *key);
         anchor < claim.anchor || (anchor == claim.anchor && first.is_some_and(|key| last < key))
     }
-
-    /// Whether the section still has room for `claim`.
-    pub(crate) fn fits(&self, claim: &StateClaim) -> bool {
-        state_claims_admit_block(self.weight.saturating_add(claim.wire_weight()))
-    }
 }
 
 impl Section for StateClaimsSection {
@@ -1025,5 +1020,135 @@ pub(crate) mod fixtures {
         }
         sched.set_head(after);
         sched
+    }
+}
+
+#[cfg(test)]
+mod state_claim_tests {
+    use std::time::Duration;
+
+    use hyperscale_hbor::Bytes;
+    use hyperscale_types::test_utils::{proven_claim, state_and_proof, test_key};
+    use hyperscale_types::{
+        Anchor, BlockHeight, CROSSING_BUNDLE_WINDOW, ShardId, StateClaim, Stated, SubstateKey,
+        WeightedTimestamp,
+    };
+
+    use super::fixtures::{Against, DEPARTURE_CUT_MS, departures};
+    use super::{Section, StateClaimsFold, StateClaimsSection};
+
+    const PRODUCER: ShardId = ShardId::leaf(1, 0);
+
+    /// A window carrying the producer up to the cut, and the root alone
+    /// past it: past the cut every owner routes to the root, and the
+    /// producer's anchors there own nothing.
+    fn against(block_anchor: WeightedTimestamp) -> Against {
+        let schedule = departures(&[PRODUCER, ShardId::leaf(1, 1)], &[ShardId::ROOT], None);
+        let snapshot = (**schedule.head()).clone();
+        let mut against = Against::schedule(snapshot, schedule);
+        against.anchor = block_anchor;
+        against
+    }
+
+    /// A key the producer's prefix owns.
+    fn producer_key() -> SubstateKey {
+        test_key(0x10)
+    }
+
+    /// A claim on `shard` at `ts` holding `key`'s value, as the fixture
+    /// tree stores it: the key's own bytes.
+    fn held(shard: ShardId, ts: WeightedTimestamp, key: SubstateKey) -> StateClaim {
+        let (state_root, proof) = state_and_proof(shard, &[key], &[key]);
+        StateClaim::new(
+            Anchor {
+                shard,
+                height: BlockHeight::new(9),
+                state_root,
+                ts,
+            },
+            [(
+                key,
+                Stated::Held(Bytes::new(key.to_bytes().to_vec()).unwrap()),
+            )],
+            proof,
+        )
+    }
+
+    fn admit(against: &Against, claim: &StateClaim) -> Result<(), String> {
+        let mut fold = StateClaimsFold::default();
+        StateClaimsSection::admit(&against.ctx(), &mut fold, claim)
+    }
+
+    #[test]
+    fn a_held_reading_is_admitted_inside_the_reading_window_and_refused_past_it() {
+        let read_at = WeightedTimestamp::from_millis(500);
+        let claim = held(PRODUCER, read_at, producer_key());
+        let at_the_window = read_at.plus(CROSSING_BUNDLE_WINDOW);
+        assert_eq!(admit(&against(at_the_window), &claim), Ok(()));
+        let past = at_the_window.plus(Duration::from_millis(1));
+        assert!(
+            admit(&against(past), &claim)
+                .is_err_and(|err| err.contains("outside the reading window")),
+        );
+        let bare = proven_claim(PRODUCER, 9, &[producer_key()], &[producer_key()]);
+        let bare = StateClaim::new(
+            Anchor {
+                ts: read_at,
+                ..bare.anchor
+            },
+            bare.cells.iter().cloned(),
+            bare.proof.clone(),
+        );
+        assert_eq!(
+            admit(&against(past), &bare),
+            Ok(()),
+            "the window binds readings that carry value",
+        );
+    }
+
+    #[test]
+    fn a_held_reading_is_owned_by_its_anchors_shard_at_the_anchors_clock() {
+        let block_anchor = WeightedTimestamp::from_millis(DEPARTURE_CUT_MS + 500);
+        let key = producer_key();
+        assert_eq!(
+            admit(
+                &against(block_anchor),
+                &held(PRODUCER, WeightedTimestamp::from_millis(500), key)
+            ),
+            Ok(()),
+            "before the cut the producer owns the cell",
+        );
+        assert!(
+            admit(
+                &against(block_anchor),
+                &held(
+                    PRODUCER,
+                    WeightedTimestamp::from_millis(DEPARTURE_CUT_MS + 100),
+                    key
+                )
+            )
+            .is_err_and(|err| err.contains("did not own")),
+            "a coast anchor of the departed producer owns nothing",
+        );
+        assert_eq!(
+            admit(
+                &against(block_anchor),
+                &held(
+                    ShardId::ROOT,
+                    WeightedTimestamp::from_millis(DEPARTURE_CUT_MS + 100),
+                    key
+                )
+            ),
+            Ok(()),
+            "the successor's reading past the cut is admitted",
+        );
+        let unscheduled = WeightedTimestamp::from_millis(1_000_000_000);
+        assert!(
+            admit(
+                &against(unscheduled),
+                &held(ShardId::ROOT, unscheduled, key)
+            )
+            .is_err_and(|err| err.contains("no schedule window covers")),
+        );
     }
 }

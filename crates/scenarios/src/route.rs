@@ -10,12 +10,14 @@
 
 use std::time::Duration;
 
+use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     Address, BUNDLE_WAIT, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId,
     SubstateKey, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::Kind;
+use hyperscale_vm_effects::{CrossingId, Kind};
+use hyperscale_vm_types::{LegRole, LegShape};
 
 use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
@@ -629,6 +631,34 @@ fn route_worlds<C: Cluster>(
 
 /// Drive every trader's route through both venues and hold the run to
 /// every route accepting, with both sides of the pair conserved.
+/// Which way a route's record crosses: into the core from the trader's
+/// inbound leg, or out of it to the trader's outbound leg. An edge
+/// between two core legs writes no record, since every core shard runs
+/// the whole core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordRoad {
+    IntoTheCore,
+    OutOfTheCore,
+}
+
+/// The records a route's legs write, each with the road it crosses.
+fn records_by_road(legs: &[LegShape]) -> Vec<(SubstateKey, RecordRoad)> {
+    legs.iter()
+        .flat_map(|consumer| consumer.edges.iter().map(move |edge| (consumer, edge)))
+        .filter_map(|(consumer, edge)| {
+            let producer = legs.get(edge.source as usize)?;
+            let road = match (producer.role, consumer.role) {
+                (LegRole::Inbound, LegRole::Core) => RecordRoad::IntoTheCore,
+                (LegRole::Core, LegRole::Outbound) => RecordRoad::OutOfTheCore,
+                _ => return None,
+            };
+            let key = CrossingId::of_edge(producer, consumer.target, edge.output)
+                .record_key(&ProtocolHasher);
+            Some((key, road))
+        })
+        .collect()
+}
+
 fn drive_routes<C: Cluster>(
     c: &mut C,
     first: &StockedVenue,
@@ -641,6 +671,7 @@ fn drive_routes<C: Cluster>(
     let start = c.now();
     let mut charges = Charges::default();
     let mut submissions: Vec<TxHash> = Vec::with_capacity(traders.len());
+    let mut records: Vec<(SubstateKey, RecordRoad)> = Vec::new();
     for (key, account) in traders {
         let tx = build_route_tx(
             key,
@@ -651,6 +682,11 @@ fn drive_routes<C: Cluster>(
             0,
             validity_around(c.now()),
         );
+        records.extend(records_by_road(
+            &tx.try_derived(c.derivation().as_ref())
+                .expect("a scenario route derives")
+                .legs,
+        ));
         submissions.push(charges.submit(c, tx));
     }
 
@@ -672,11 +708,46 @@ fn drive_routes<C: Cluster>(
         );
     }
 
+    // Each trader's records reached their consumers as held readings in
+    // the consumers' chains: pushed by the producer's next proposer, or
+    // read by the consumer when no push landed. The inbound record is
+    // consumed by the core, which every venue shard runs, so both venue
+    // chains read it, one through the push and the other through its
+    // own read; the outbound record is consumed on the trader's shard,
+    // where the deposit that banks the trader's output lands a hop
+    // after the second venue's verdict. Waited for, since the verdict
+    // is what the status reports and the deposit is what conserves.
+    assert!(
+        !records.is_empty(),
+        "a route through two venues writes records"
+    );
+    let readers = |road: &RecordRoad| -> &'static [ShardId] {
+        match road {
+            RecordRoad::IntoTheCore => &[FIRST_VENUE_SHARD, SECOND_VENUE_SHARD],
+            RecordRoad::OutOfTheCore => &[TRADER_SHARD],
+        }
+    };
+    let unread = |c: &C| -> Vec<(SubstateKey, RecordRoad)> {
+        records
+            .iter()
+            .filter(|(key, road)| {
+                readers(road)
+                    .iter()
+                    .any(|shard| !c.reads_record(*shard, *key))
+            })
+            .copied()
+            .collect()
+    };
+    let delivered = c.run_until(budget, |c| unread(c).is_empty());
+    assert!(
+        delivered,
+        "every trader's record must be read by its consumers' chains within budget; unread: {:?}",
+        unread(c),
+    );
+
     // Nothing here mints: the protocol resource the traders paid in is what the venues
     // now hold less the prices burned, and the units the first venue
-    // paid out are what the second took back. Driven rather than read,
-    // since the deposit that banks each trader's output lands a hop
-    // after the second venue's verdict.
+    // paid out are what the second took back.
     protocol_resource.assert_settles_within(c, &charges, budget, "routes through two venues");
     units.assert_settles_within(c, &Charges::default(), budget, "routes through two venues");
 

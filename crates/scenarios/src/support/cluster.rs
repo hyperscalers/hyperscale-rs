@@ -222,6 +222,11 @@ pub trait Cluster {
     /// reclaim and the settlement it races have both landed.
     fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)>;
 
+    /// Whether `shard`'s chain has carried a held reading of `key`, on
+    /// any live store of the shard: how a crossing record reaches the
+    /// shard that consumes it.
+    fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool;
+
     /// Every crossing decline on `shard`'s chain naming `tx`: the height
     /// each committed at and the record it refuses.
     ///

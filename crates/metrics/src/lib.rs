@@ -263,6 +263,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
 
+    /// A pushed crossing reading dropped on the consumer's side, by the
+    /// check that dropped it: at ingress, at the anchor, or at the
+    /// park. Each drop is one the fallback read has to make up.
+    fn record_crossing_push_dropped(&self, reason: &str) {}
+
     /// A fetch response the requester's own check refused, by fetch kind
     /// and the check that refused it.
     ///
@@ -782,6 +787,12 @@ pub fn record_state_claims_weight(bytes: usize) {
 #[inline]
 pub fn record_record_ask() {
     recorder().record_record_ask();
+}
+
+/// Record a pushed crossing reading dropped by the consumer, by reason.
+#[inline]
+pub fn record_crossing_push_dropped(reason: &str) {
+    recorder().record_crossing_push_dropped(reason);
 }
 
 /// Record a fetch response refused by the requester's own check.

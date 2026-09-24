@@ -25,7 +25,7 @@ use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageFactory,
 };
 use hyperscale_scenarios::query::{
-    RanAs, chain_fate, chain_membership, declines_naming, records_naming,
+    RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
 };
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
@@ -424,6 +424,14 @@ impl Harness {
     pub fn named_unsettled(&self, shard: ShardId, hash: TxHash) -> Vec<(BlockHeight, ShardId)> {
         self.store_for(shard)
             .map_or_else(Vec::new, |store| records_naming(store.as_ref(), hash))
+    }
+
+    /// [`reads_record`] over the live store — whether `shard`'s chain has
+    /// carried a held reading of `key`. False if no host serves `shard`.
+    #[must_use]
+    pub fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool {
+        self.store_for(shard)
+            .is_some_and(|store| reads_record(store.as_ref(), key))
     }
 
     /// [`declines_naming`] over the live store — every crossing on

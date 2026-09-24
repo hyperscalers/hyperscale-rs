@@ -1516,11 +1516,65 @@ impl Counterparts {
         Vec::new()
     }
 
-    /// The claims this validator's own fetches proved that no block has
-    /// carried yet, in the one order a block carries them. The section's
-    /// budget is the composer's to spend, and it cuts what does not fit.
+    /// The claims this validator holds that no block has carried yet,
+    /// oldest anchors first: the one closest to aging out of the reading
+    /// window goes first, and a shard-major order would let one busy
+    /// producer starve another. The section's budget is the composer's
+    /// to spend, and it cuts what does not fit.
     fn state_claims(&self) -> Vec<StateClaim> {
-        self.fetched.keys().cloned().collect()
+        let mut claims: Vec<StateClaim> = self.fetched.keys().cloned().collect();
+        claims.sort_by_key(|claim| (claim.anchor.ts, claim.anchor.shard, claim.anchor.height));
+        claims
+    }
+
+    /// Keep a pushed claim's cells while something here wants them, and
+    /// say whether any was kept. `records` is the wanted set as the
+    /// coordinator derives it now, since a push lands between the
+    /// commits and probes that otherwise refresh it. A claim carrying
+    /// nothing wanted costs no memory: a push that lands before its
+    /// consumer's transaction commits here, or before any body reports
+    /// its record, is dropped and the key is read once it is wanted.
+    /// What is kept is cut to the wanted keys not already held at the
+    /// anchor, so the section stays one proof per claim, disjoint per
+    /// anchor, and each kept key's read counts the push as an ask
+    /// answered at its anchor.
+    pub(crate) fn offer_pushed(
+        &mut self,
+        claim: &StateClaim,
+        records: &[WantedRecord],
+        now: WeightedTimestamp,
+    ) -> bool {
+        if claim.holds_a_value() && now.elapsed_since(claim.anchor.ts) > CROSSING_BUNDLE_WINDOW {
+            return false;
+        }
+        self.wanted = records.iter().map(|record| record.key).collect();
+        let anchor = claim.anchor;
+        let mut wanted: BTreeSet<SubstateKey> = claim
+            .keys()
+            .into_iter()
+            .filter(|key| wants_reading(&self.held, &self.answered, &self.wanted, anchor, *key))
+            .collect();
+        if wanted.is_empty() {
+            return false;
+        }
+        for held in self.fetched.keys() {
+            if held.anchor == anchor {
+                for key in held.keys() {
+                    wanted.remove(&key);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return true;
+        }
+        let Some(kept) = claim.restrict(|key| wanted.contains(&key)) else {
+            return false;
+        };
+        for key in &wanted {
+            self.records.pushed(*key, anchor);
+        }
+        self.fetched.entry(kept).or_default();
+        true
     }
 
     /// Drop the claims no transaction they answered for still needs,

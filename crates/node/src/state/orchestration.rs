@@ -223,7 +223,7 @@ impl NodeStateMachine {
             .on_committed_remote_header(topology_schedule, certified_header);
         actions.extend(
             s.execution_coordinator
-                .on_committed_remote_header(topology_schedule, certified_header.shard_id()),
+                .on_committed_remote_header(topology_schedule, Anchor::of(certified_header)),
         );
         actions
     }

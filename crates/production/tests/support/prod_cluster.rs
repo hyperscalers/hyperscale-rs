@@ -323,6 +323,10 @@ impl Cluster for ProdCluster {
         self.inner.named_unsettled(shard, tx)
     }
 
+    fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool {
+        self.inner.reads_record(shard, key)
+    }
+
     fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
         self.inner.declined(shard, tx)
     }

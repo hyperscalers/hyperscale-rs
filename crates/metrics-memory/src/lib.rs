@@ -302,6 +302,11 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("record_asks", None, 1);
     }
 
+    fn record_crossing_push_dropped(&self, reason: &str) {
+        self.inc("crossing_pushes_dropped", None, 1);
+        self.inc("crossing_pushes_dropped", Some(reason), 1);
+    }
+
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {
         self.inc("fetch_responses_refused", Some(kind), 1);
         self.inc(

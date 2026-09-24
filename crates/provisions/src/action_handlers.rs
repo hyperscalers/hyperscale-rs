@@ -23,6 +23,7 @@ use hyperscale_types::{
 use tracing::warn;
 
 use crate::build::build_provisions;
+use crate::crossing_push::push_crossing_readings;
 
 /// One outbound provision batch destined for a single target shard.
 pub(crate) type ProvisionBatch = (Arc<Provisions>, Vec<ValidatorId>);
@@ -173,6 +174,12 @@ where
                 ctx.network.notify(&recipients, &notification);
             }
         }
+        Action::PushCrossingReadings {
+            block_hash,
+            anchor,
+            targets,
+            shard_recipients,
+        } => push_crossing_readings(ctx, block_hash, anchor, &targets, &shard_recipients),
         _ => unreachable!("hyperscale_provisions::handle_action called with non-provisions action"),
     }
 }

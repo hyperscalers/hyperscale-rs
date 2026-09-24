@@ -10,6 +10,7 @@
 //! beside it.
 
 mod committed_txs_serve;
+pub mod crossing_push;
 mod exec_cert_serve;
 mod fetch;
 mod finalization_serve;

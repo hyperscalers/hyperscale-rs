@@ -33,6 +33,7 @@ mod ledger;
 mod lookups;
 mod outbound_certs;
 mod parked;
+mod parked_claims;
 mod provisional;
 mod provisioning;
 mod record_reads;

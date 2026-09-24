@@ -77,6 +77,7 @@ where
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. }
+            | Action::PushCrossingReadings { .. }
             | Action::BroadcastBlockHeader { .. }
             | Action::SignAndBroadcastBlockVote { .. }
             | Action::SignAndBroadcastTimeout { .. }

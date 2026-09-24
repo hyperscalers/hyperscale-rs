@@ -526,6 +526,10 @@ mod tests {
             Vec::new()
         }
 
+        fn reads_record(&self, _: ShardId, _: SubstateKey) -> bool {
+            false
+        }
+
         fn declined(&self, _: ShardId, _: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
             Vec::new()
         }

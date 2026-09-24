@@ -286,4 +286,22 @@ mod tests {
         assert!(anchors.at(shard, BlockHeight::new(2)).is_some());
         assert_eq!(anchors.len(), 1);
     }
+
+    #[test]
+    fn a_fenced_anchor_is_forgotten_and_the_rest_stand() {
+        let anchors = ProvenAnchors::new();
+        let shard = ShardId::leaf(1, 0);
+        for height in [8, 9, 10] {
+            anchors.record(Anchor {
+                shard,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(height * 1_000),
+            });
+        }
+        anchors.forget_fenced(|s, height| s == shard && height >= BlockHeight::new(9));
+        assert!(anchors.at(shard, BlockHeight::new(8)).is_some());
+        assert!(anchors.at(shard, BlockHeight::new(9)).is_none());
+        assert!(anchors.at(shard, BlockHeight::new(10)).is_none());
+    }
 }
