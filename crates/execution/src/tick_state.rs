@@ -353,6 +353,18 @@ impl Seat {
     fn is_covered(&self) -> bool {
         self.aborted_anywhere || self.membership.awaited().is_subset(&self.covered_by)
     }
+
+    /// Whether a counterpart shares the verdict on this member: a whole
+    /// shape or a core member awaiting a shard other than `local`, which
+    /// settles the member against this shard's certificate.
+    ///
+    /// Read off committed membership alone, never off whether this
+    /// replica has handed its own certificate off, so every replica
+    /// answers alike on the same commit.
+    fn shares_verdict(&self, local: ShardId) -> bool {
+        matches!(self.membership.role(), Role::Whole | Role::Core)
+            && self.membership.abortable(local)
+    }
 }
 
 /// Per-tick state from composition through finalization.
@@ -1398,6 +1410,35 @@ impl TickState {
         self.legs_emitted = true;
         Some(self.with_drained_receipts(attestation))
     }
+
+    /// Release every member sharing no verdict with a counterpart, and
+    /// `abandoned` whatever it shares. Returns the released members and
+    /// the kept ones, each in composition order.
+    ///
+    /// What stays is a member a counterpart can settle against this
+    /// shard's certificate, which outlives the tick: dropped here,
+    /// nothing would settle it, and its entry being certified, nothing
+    /// would abandon it. Every determined seat goes, so the tick owes no
+    /// determined half afterwards; the legs half is owed again for the
+    /// kept legs, since a finalization taken before named a released
+    /// member.
+    pub fn release(&mut self, abandoned: Option<TxHash>) -> (Vec<TxHash>, Vec<TxHash>) {
+        let local = self.tick_id.shard_id();
+        let (kept, released): (Vec<TxHash>, Vec<TxHash>) =
+            self.order.iter().copied().partition(|&tx_hash| {
+                Some(tx_hash) != abandoned
+                    && self
+                        .seats
+                        .get(&tx_hash)
+                        .is_some_and(|seat| seat.shares_verdict(local))
+            });
+        for tx_hash in &released {
+            self.seats.remove(tx_hash);
+        }
+        self.order.clone_from(&kept);
+        self.legs_emitted = false;
+        (released, kept)
+    }
 }
 
 #[cfg(test)]
@@ -1408,6 +1449,64 @@ mod tests {
     };
 
     use super::*;
+
+    /// Two replicas, one with its own certificate in hand and one
+    /// without, release the same members on the same commit: what stays
+    /// is read off committed membership alone.
+    #[test]
+    fn a_release_reads_committed_membership_alone() {
+        let local = ShardId::leaf(1, 0);
+        let peer = ShardId::leaf(1, 1);
+        let tick_id = TickId::new(local, BlockHeight::new(1));
+        let shared = TxHash::from(Hash::from_bytes(&[1; 32]));
+        let alone = TxHash::from(Hash::from_bytes(&[2; 32]));
+        let holding = || {
+            let mut tick = TickState::new(tick_id, BlockHash::ZERO, WeightedTimestamp::ZERO);
+            tick.admit(
+                shared,
+                Membership::whole(BTreeSet::from([local, peer])),
+                None,
+                Admission::Executes,
+            );
+            tick.admit(
+                alone,
+                Membership::whole(BTreeSet::from([local])),
+                None,
+                Admission::Executes,
+            );
+            tick
+        };
+        let mut emitted = holding();
+        emitted.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::ZERO,
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([
+                    TxOutcome::new(shared, ExecutionOutcome::Aborted),
+                    TxOutcome::new(alone, ExecutionOutcome::Aborted),
+                ]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        assert!(emitted.local_ec_emitted());
+        let mut pending = holding();
+        assert!(!pending.local_ec_emitted());
+
+        assert_eq!(emitted.release(None), (vec![alone], vec![shared]));
+        assert_eq!(pending.release(None), (vec![alone], vec![shared]));
+        assert_eq!(emitted.tx_hashes(), &[shared]);
+        assert!(
+            !emitted.determined_unsettled(),
+            "a kept tick owes no determined half",
+        );
+        assert_eq!(
+            holding().release(Some(shared)),
+            (vec![shared, alone], vec![]),
+            "the abandoned member goes whatever it shares",
+        );
+    }
 
     fn tx(seed: u8) -> TxHash {
         TxHash::from(Hash::from_bytes(&[seed; 32]))

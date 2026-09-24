@@ -341,6 +341,27 @@ impl TickRegistry {
         }
     }
 
+    /// Drop the assignments of every member `tick_id` released, keeping
+    /// the tick and the assignments of `kept`; with nothing kept, the
+    /// tick goes as [`discard_tick`](Self::discard_tick) drops it.
+    ///
+    /// A released member is owed an outcome still, and with no tick
+    /// holding it the deadline path reaches one; a kept member's tick
+    /// still speaks for it.
+    pub(crate) fn release_tick(&mut self, tick_id: &TickId, kept: &[TxHash]) -> PruneCounts {
+        if kept.is_empty() {
+            return self.discard_tick(tick_id);
+        }
+        let before_assignments = self.assignments.len();
+        self.assignments
+            .retain(|tx_hash, held_by| held_by != tick_id || kept.contains(tx_hash));
+        PruneCounts {
+            ticks: 0,
+            trackers: 0,
+            assignments: before_assignments - self.assignments.len(),
+        }
+    }
+
     /// Drop resolved ticks and everything keyed against them.
     ///
     /// Ticks whose `tick_id` no longer appears in `assignments.values()`

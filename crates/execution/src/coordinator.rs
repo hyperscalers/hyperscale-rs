@@ -64,10 +64,10 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
     FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, MerkleInclusionProof, Mode,
     Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions, SettledSetVerdict, SettledTxSet,
-    ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window, WindowView,
-    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
+    WindowView, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::{
     CrossingCell, ProtocolHasher, Terms, crossing_decline_key, crossing_obligation_key,
@@ -169,7 +169,9 @@ struct TickedBatch {
     provisional_claims: Vec<(DeclaredKey, Mode)>,
     /// The legs those claims belong to. A tick's fate arrives in halves,
     /// and only the half carrying the legs releases their cells — so the
-    /// entry has to know which members that is.
+    /// entry has to know which members that is. Narrows as legs are
+    /// released: a release lets go of what the released legs held and
+    /// leaves the kept legs' claims to their own settlement.
     legs: BTreeSet<TxHash>,
 }
 
@@ -1151,11 +1153,13 @@ impl ExecutionCoordinator {
                 ..
             } = entry;
             // A tick that held the member can never speak for it — its
-            // coverage will not close — and its other legs would wait on
-            // that coverage forever. It goes with the member; the rest of
-            // its members reach their own deadlines instead.
+            // coverage will not close. The member goes, and with it every
+            // sibling sharing no verdict with a counterpart, to their own
+            // deadlines; a sibling a counterpart can settle stays, since
+            // that counterpart settles it against the certificate already
+            // out.
             if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
-                self.discard_tick(held_by);
+                self.release_tick(held_by, Some(tx_hash));
             }
             let mut participating = self.counterparts.ledger.counterparts(tx_hash, trie);
             participating.insert(local_shard);
@@ -3901,52 +3905,93 @@ impl ExecutionCoordinator {
                     .map_or(0, |tracker| tracker.total_verified_power().inner()),
                 "Releasing a tick that never certified — it was holding the settlement frontier"
             );
-            self.discard_tick(tick_id);
+            // The determined seats a wedged tick owes share no verdict
+            // and go on the rule alone; no member is singled out.
+            self.release_tick(tick_id, None);
         }
     }
 
-    /// Drop a tick that can no longer speak for a member being abandoned,
-    /// releasing the transactions it holds to their own deadlines and the
-    /// cells its legs held against.
-    fn discard_tick(&mut self, tick_id: TickId) {
-        let counts = self.ticks.discard_tick(&tick_id);
-        self.release_chain_holds(tick_id);
-        // Its finalization goes with it: a proposer offering one for a
-        // member abandoned here would be refused by every voter, and
-        // would keep offering it.
-        self.finalized.remove_tick(&tick_id);
-        // And its certificate, which no finalization of this shard's will
-        // ever commit. Left in the cache it is answered to a counterpart
-        // asking by transaction, for a verdict this shard has retracted
-        // and beside the abort that replaced it.
-        self.exec_certs.evict(&tick_id);
-        tracing::info!(
-            tick = %tick_id,
-            released = counts.assignments,
-            "Discarded a tick holding an abandoned member"
-        );
+    /// Release a tick that can no longer speak for `abandoned`, or for
+    /// the determined half it owes: every member sharing no verdict with
+    /// a counterpart goes to its own deadline, and `abandoned` goes
+    /// whatever it shares. A member whose verdict a counterpart shares
+    /// stays, with the tick, its certificate and its assignment: the
+    /// counterpart settles it against that certificate, which outlives
+    /// the tick, and dropped here nothing would settle it and — its
+    /// entry certified — nothing could abandon it.
+    ///
+    /// Nothing kept: the tick, both its finalizations and its
+    /// certificate all go. A proposer offering a finalization for a
+    /// member abandoned here would be refused by every voter, and would
+    /// keep offering it; a certificate left in the cache is answered to
+    /// a counterpart asking by transaction, for a verdict this shard has
+    /// retracted and beside the abort that replaced it.
+    ///
+    /// Something kept: the tick stays and so does its certificate, since
+    /// a sibling settles against it. Its legs half is composed again on
+    /// the kept legs — one taken before names a released member, which
+    /// every voter would refuse, so it is evicted — and its determined
+    /// half is untouched, emitted or pending: it releases no claim, and
+    /// its writes are readable from the append.
+    ///
+    /// Which members stay is read off committed membership alone, never
+    /// off whether this replica has handed its own certificate off, so
+    /// every replica releases the same set on the same commit.
+    fn release_tick(&mut self, tick_id: TickId, abandoned: Option<TxHash>) {
+        let (released, kept) = self
+            .ticks
+            .get_tick_mut(&tick_id)
+            .map_or_else(|| (Vec::new(), Vec::new()), |tick| tick.release(abandoned));
+        let counts = self.ticks.release_tick(&tick_id, &kept);
+        self.release_chain_holds(tick_id, &released, kept.is_empty());
+        if kept.is_empty() {
+            self.finalized.remove_tick(&tick_id);
+            self.exec_certs.evict(&tick_id);
+            tracing::info!(
+                tick = %tick_id,
+                released = counts.assignments,
+                "Released a tick holding nothing a counterpart can settle"
+            );
+        } else {
+            self.finalized.remove_half(&tick_id, TickHalf::Legs);
+            tracing::info!(
+                tick = %tick_id,
+                released = counts.assignments,
+                kept = kept.len(),
+                "Released a tick's members, keeping those a counterpart can settle"
+            );
+        }
     }
 
-    /// Tell the chain a tick's legs reach no verdict, so what they hold
-    /// against the cells they declared is let go of.
+    /// Tell the chain a tick's `released` legs reach no verdict, so what
+    /// they hold against the cells they declared is let go of; `whole`
+    /// releases every leg the tick holds, and drops the entry if it
+    /// holds none.
     ///
     /// A leg's reservation stands on the chain until its tick's fate
     /// resolves it, and every later tick's reader takes it as value
-    /// already spoken for. A tick that has stopped speaking for its
-    /// members reaches no fate, so nothing else would ever release it:
+    /// already spoken for. A tick that has stopped speaking for a member
+    /// reaches no fate for it, so nothing else would ever release it:
     /// the payer's cells stay locked on every replica that ran the tick,
     /// the entry never evicts, and a replica that rebuilt the chain
     /// without the hold reads a different overlay from the same chain.
-    fn release_chain_holds(&mut self, tick_id: TickId) {
-        let Some(members) = self
-            .ticked
-            .get(&tick_id)
-            .map(|ticked| ticked.legs.clone())
-            .filter(|legs| !legs.is_empty())
-        else {
-            self.ticked.remove(&tick_id);
+    /// A kept leg's claims stay for its own settlement to clear.
+    fn release_chain_holds(&mut self, tick_id: TickId, released: &[TxHash], whole: bool) {
+        let Some(ticked) = self.ticked.get(&tick_id) else {
             return;
         };
+        let members: BTreeSet<TxHash> = ticked
+            .legs
+            .iter()
+            .copied()
+            .filter(|leg| whole || released.contains(leg))
+            .collect();
+        if members.is_empty() {
+            if whole {
+                self.ticked.remove(&tick_id);
+            }
+            return;
+        }
         self.record_tick_resolution(&tick_id, TickResolution::Abandoned { members });
     }
 
@@ -4060,7 +4105,7 @@ impl ExecutionCoordinator {
                     covered_by_record = entry.covered_by_record,
                     "Releasing a strand whose counterparts have all fallen silent"
                 );
-                self.discard_tick(tick_id);
+                self.release_tick(tick_id, Some(entry.tx_hash));
             }
         }
     }
@@ -4084,12 +4129,14 @@ impl ExecutionCoordinator {
         //
         // Only the half carrying the legs clears them. A determined
         // member holds no cell — its writes are readable from the append
-        // — so its own half settling releases nothing.
+        // — so its own half settling releases nothing. A resolution
+        // naming some of the legs clears theirs and leaves the rest to
+        // their own: a release lets go of the released legs' holds while
+        // the kept legs' later settlement still finds the entry.
         let releases_claims = match &resolution {
-            TickResolution::Settled { members, .. } => {
+            TickResolution::Settled { members, .. } | TickResolution::Abandoned { members } => {
                 ticked.legs.iter().all(|leg| members.contains(leg))
             }
-            TickResolution::Abandoned { .. } => true,
             // Never reaches here: a restore is emitted for a tick this
             // coordinator holds no claims for, and only the replay emits
             // one at all.
@@ -4097,6 +4144,10 @@ impl ExecutionCoordinator {
         };
         if releases_claims {
             self.ticked.remove(tick_id);
+        } else if let (TickResolution::Abandoned { members }, Some(ticked)) =
+            (&resolution, self.ticked.get_mut(tick_id))
+        {
+            ticked.legs.retain(|leg| !members.contains(leg));
         }
         self.pending_tick_resolutions
             .push((*tick_id, tick_id.block_height(), resolution));
@@ -4408,7 +4459,7 @@ impl ExecutionCoordinator {
                 for tx_hash in finalized_arc.tx_hashes() {
                     self.ticks.remove_assignment(tx_hash);
                 }
-                self.release_chain_holds(tick_id);
+                self.release_chain_holds(tick_id, &[], true);
                 self.drain_ready_tick_resolutions()
             }
         }
@@ -4915,6 +4966,7 @@ mod tests {
     use super::*;
     use crate::counterparts::{AnsweredCrossing, HeldRecord};
     use crate::ledger::{Kept, Part};
+    use crate::tick_state::TICK_SETTLEABLE_SPAN;
 
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
@@ -12899,7 +12951,8 @@ mod tests {
         );
     }
 
-    /// A discarded tick's certificate leaves the serving cache with it.
+    /// A tick released with nothing kept takes its certificate out of
+    /// the serving cache with it.
     ///
     /// No finalization of this shard's will ever commit it, so it never
     /// reaches storage and nothing else drops it — and a counterpart
@@ -12922,7 +12975,7 @@ mod tests {
                 ),
             )));
 
-        state.discard_tick(tick_id);
+        state.release_tick(tick_id, Some(tx_hash));
 
         assert!(
             state.exec_certs.get(&tick_id).is_none(),
@@ -12931,6 +12984,336 @@ mod tests {
         assert!(
             state.exec_certs.certificates_for_tx(tx_hash).is_empty(),
             "and so does the index a counterpart asks by",
+        );
+    }
+
+    /// A success with a receipt in hand, as the engine reports one.
+    fn succeeded() -> ExecutionOutcome {
+        ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+        }
+    }
+
+    /// The receipt a succeeded member's finalization drains.
+    fn succeeded_receipt(tx_hash: TxHash) -> StoredReceipt {
+        StoredReceipt {
+            tx_hash,
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+            metadata: None,
+        }
+    }
+
+    /// [`PEER`]'s certificate settling `tx_hash` against this shard's:
+    /// a success that awaited [`HOME`] for it.
+    fn peer_settles(tx_hash: TxHash) -> Arc<Verified<ExecutionCertificate>> {
+        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            TickId::new(PEER, BlockHeight::new(1)),
+            WeightedTimestamp::from_millis(1_000),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"peer")),
+            Capped::from_array([TxOutcome::new(tx_hash, succeeded()).awaiting([HOME])]),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )))
+    }
+
+    /// A state whose tick at height 1 holds `T`, a transaction whose
+    /// verdict [`PEER`] shares, beside `X`, a member of this shard alone,
+    /// with this shard's own certificate out attesting both succeeded and
+    /// both receipts in hand. Past `X`'s deadline, at a frontier where
+    /// [`PEER`] can still settle `T` against the certificate.
+    fn state_holding_a_shared_verdict(seed: u8) -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        let shared: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(seed)),
+        ));
+        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(seed + 1)),
+        ));
+        let (t, x) = (shared.hash(), alone.hash());
+        let mut tick = tick_holding(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            vec![
+                (
+                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
+                        seed,
+                    ))),
+                    BTreeSet::from([HOME, PEER]),
+                ),
+                (
+                    Arc::new(Verified::new_unchecked_for_test(test_transaction(seed + 1))),
+                    BTreeSet::from([HOME]),
+                ),
+            ],
+        );
+        for tx_hash in [t, x] {
+            tick.record_execution_result(tx_hash, succeeded());
+            tick.record_receipt(succeeded_receipt(tx_hash));
+        }
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
+                Capped::from_array([
+                    TxOutcome::new(t, succeeded()).awaiting([PEER]),
+                    TxOutcome::new(x, succeeded()),
+                ]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        state.ticks.insert_tick(tick_id, tick);
+        state.ticks.assign_tx(t, tick_id);
+        state.ticks.assign_tx(x, tick_id);
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [
+                (&shared, &Classified::whole()),
+                (&alone, &Classified::whole()),
+            ],
+        );
+        state.counterparts.ledger.certify(t);
+        state.counterparts.ledger.certify(x);
+        state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
+        (state, tick_id, t, x)
+    }
+
+    /// After a release, `T` is still this shard's to settle on [`PEER`]'s
+    /// certificate — the kept tick's legs half names `T` and no released
+    /// member — and never this shard's to abandon.
+    fn assert_the_shared_verdict_still_settles(
+        state: &mut ExecutionCoordinator,
+        tick_id: TickId,
+        t: TxHash,
+    ) {
+        let tick = state
+            .ticks
+            .get_tick_mut(&tick_id)
+            .expect("the tick keeps the member whose verdict a counterpart shares");
+        tick.add_execution_certificate(peer_settles(t));
+        let legs = tick
+            .take_legs_finalization()
+            .expect("PEER's certificate settles T against this shard's own");
+        assert_eq!(
+            legs.local_ec()
+                .tx_outcomes()
+                .iter()
+                .map(TxOutcome::tx_hash)
+                .collect::<Vec<_>>(),
+            vec![t],
+            "the legs half names T and nothing released",
+        );
+        assert!(
+            state
+                .abandonable(TickId::new(HOME, BlockHeight::new(10)))
+                .iter()
+                .all(|entry| entry.tx_hash != t),
+            "T is a counterpart's to settle, never this shard's to abandon",
+        );
+    }
+
+    /// A tick released because a sibling member was abandoned keeps the
+    /// member whose verdict a counterpart shares.
+    ///
+    /// `X` is past its deadline and decided alone, so the composing tick
+    /// abandons it; the tick that held it goes with it. `T` sat in the
+    /// same tick awaiting [`PEER`], whose certificate settles it against
+    /// this shard's — out already, and outliving the tick. Dropped with
+    /// the tick, `T` is settled by nobody: its entry is certified, so the
+    /// deadline path never abandons it either.
+    #[test]
+    fn a_release_through_an_abandoned_sibling_keeps_the_member_a_counterpart_can_settle() {
+        let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(1);
+        let sched = two_shard_topology();
+        let composing = TickId::new(HOME, BlockHeight::new(9));
+        let mut composing_tick = TickState::new(
+            composing,
+            BlockHash::from_raw(Hash::from_bytes(b"composing")),
+            WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS),
+        );
+
+        state.admit_abandoned(&sched, composing, &mut composing_tick);
+        assert_eq!(
+            composing_tick.tx_hashes(),
+            &[x],
+            "X is abandoned, T is not: a counterpart can still settle it",
+        );
+
+        assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+    }
+
+    /// A tick released for owing a determined half past
+    /// [`TICK_SETTLEABLE_SPAN`] keeps the member whose verdict a
+    /// counterpart shares.
+    ///
+    /// `X`'s determined half is what the span releases; `T` awaits
+    /// [`PEER`], whose settlement against the certificate the release
+    /// must leave standing.
+    #[test]
+    fn a_wedged_ticks_release_keeps_the_member_a_counterpart_can_settle() {
+        let (mut state, tick_id, t, _) = state_holding_a_shared_verdict(3);
+        let sched = two_shard_topology();
+        let past_the_span = 1_000 + TICK_SETTLEABLE_SPAN.as_secs() * 1_000 + 1_000;
+        state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(1_000);
+        state.committed_ts = WeightedTimestamp::from_millis(past_the_span);
+        let block = make_live_block(BlockHeight::new(4), 0, ValidatorId::new(0), vec![]);
+
+        state.release_wedged_ticks(&sched, &test_certify(block, past_the_span));
+
+        assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+    }
+
+    /// A release through an unanswerable member abandons that member
+    /// and keeps its siblings a counterpart can settle.
+    #[test]
+    fn a_release_through_an_unanswerable_member_keeps_its_siblings() {
+        let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(5);
+
+        state.release_unanswerable(&[Unanswerable {
+            tx_hash: x,
+            covered_by_record: false,
+        }]);
+
+        assert!(
+            state.ticks.tick_assignment(x).is_none(),
+            "the unanswerable member falls to its deadline",
+        );
+        assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+    }
+
+    /// A release of a tick in which no member shares a verdict leaves
+    /// nothing behind: the tick, both its finalizations and its
+    /// certificate all go, and its members fall to their own deadlines.
+    #[test]
+    fn a_release_keeping_nothing_leaves_nothing_behind() {
+        let sched = peer_terminating_schedule(600_000);
+        let (mut state, tick_id, tx_hash) = state_stranded_on(&sched, 1);
+        let certificate = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
+            AggregateSignature::ZERO,
+            quorum_signers(),
+        );
+        state
+            .exec_certs
+            .insert(Arc::new(Verified::new_unchecked_for_test(
+                certificate.clone(),
+            )));
+        for half in [TickHalf::Determined, TickHalf::Legs] {
+            state.finalized.insert(
+                tick_id,
+                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                    Finalization::new(
+                        tick_id,
+                        half,
+                        &Capped::from_array([Arc::new(certificate.clone())]),
+                        Capped::from_array([]),
+                    ),
+                ))),
+            );
+        }
+
+        state.release_tick(tick_id, Some(tx_hash));
+
+        assert!(state.ticks.get_tick(&tick_id).is_none(), "the tick goes");
+        assert!(
+            state.ticks.tick_assignment(tx_hash).is_none(),
+            "and its member falls to its own deadline",
+        );
+        assert!(
+            !state.finalized.contains(&tick_id),
+            "both its finalizations go",
+        );
+        assert!(
+            state.exec_certs.get(&tick_id).is_none(),
+            "and its certificate",
+        );
+    }
+
+    /// After a kept release the `ticked` entry names the kept legs only,
+    /// a legs finalization taken before the release is gone, the next
+    /// take names the kept legs, and the kept legs' later settlement
+    /// clears the entry.
+    #[test]
+    fn a_kept_release_narrows_the_ticked_entry_and_recomposes_the_legs_half() {
+        let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(7);
+        state.ticked.insert(
+            tick_id,
+            TickedBatch {
+                provisional_claims: Vec::new(),
+                legs: BTreeSet::from([t, x]),
+            },
+        );
+        let taken_before = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            Capped::from_array([
+                TxOutcome::new(t, ExecutionOutcome::Aborted),
+                TxOutcome::new(x, ExecutionOutcome::Aborted),
+            ]),
+            AggregateSignature::ZERO,
+            quorum_signers(),
+        );
+        state.finalized.insert(
+            tick_id,
+            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                Finalization::new(
+                    tick_id,
+                    TickHalf::Legs,
+                    &Capped::from_array([Arc::new(taken_before)]),
+                    Capped::from_array([]),
+                ),
+            ))),
+        );
+
+        state.release_tick(tick_id, Some(x));
+
+        assert_eq!(
+            state.ticked[&tick_id].legs,
+            BTreeSet::from([t]),
+            "the entry names the kept legs only",
+        );
+        assert!(
+            state
+                .pending_tick_resolutions
+                .iter()
+                .any(|(tick, _, resolution)| {
+                    *tick == tick_id
+                        && matches!(
+                            resolution,
+                            TickResolution::Abandoned { members } if *members == BTreeSet::from([x])
+                        )
+                }),
+            "the released leg's holds are let go of",
+        );
+        assert!(
+            !state.finalized.contains(&tick_id),
+            "the legs finalization taken before the release is gone",
+        );
+        assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+
+        state.record_tick_resolution(
+            &tick_id,
+            TickResolution::Settled {
+                height: BlockHeight::new(2),
+                members: BTreeSet::from([t]),
+                aborted: BTreeSet::new(),
+            },
+        );
+        assert!(
+            !state.ticked.contains_key(&tick_id),
+            "the kept legs' settlement clears the entry",
         );
     }
 
