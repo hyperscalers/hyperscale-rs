@@ -823,6 +823,25 @@ impl SimulationRunner {
             .then(|| host.vnode_state(shard, 0))
     }
 
+    /// Every vnode `host` carries on `shard`, or nothing when it carries
+    /// none.
+    ///
+    /// The whole group rather than its first member: a host seated
+    /// cross-shard carries a second vnode on the same store, and which of
+    /// the two sits in the shard's committee is not decided by its index.
+    #[must_use]
+    pub fn shard_vnodes_in(&self, host: NodeIndex, shard: ShardId) -> Vec<&NodeStateMachine> {
+        let Some(host) = self.hosts.get(host as usize) else {
+            return Vec::new();
+        };
+        if !host.hosted_shards().any(|s| s == shard) {
+            return Vec::new();
+        }
+        (0..host.vnodes_len(shard))
+            .map(|v| host.vnode_state(shard, v))
+            .collect()
+    }
+
     /// Host `host`'s current topology snapshot, or `None` if `host` is out of
     /// range.
     #[must_use]

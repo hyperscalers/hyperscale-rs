@@ -352,10 +352,16 @@ impl SimCluster {
         Duration::from_millis(EPOCH_MS) * budget.0
     }
 
-    /// Hosts whose `shard` vnode sits in the shard's current committee — the
-    /// live copy. After a grow-then-merge the reformed shard's terminated
-    /// pre-merge chain lingers under the same id on its old hosts; those carry
-    /// no current committee seat, so this filters them out.
+    /// Hosts carrying a `shard` vnode that sits in the shard's current
+    /// committee — the live copy. After a grow-then-merge the reformed
+    /// shard's terminated pre-merge chain lingers under the same id on its
+    /// old hosts; those carry no current committee seat, so this filters
+    /// them out.
+    ///
+    /// Any of the host's vnodes on the shard, not its first: a host that
+    /// kept a lapsed member's vnode on the shard and took a pool
+    /// validator's seat beside it holds one store for both, and that
+    /// store is the committee's.
     fn live_committee_hosts(&self, shard: ShardId) -> Vec<NodeIndex> {
         let Some(topology_snapshot) = self.runner.host_topology(0) else {
             return Vec::new();
@@ -368,8 +374,9 @@ impl SimCluster {
         (0..self.runner.num_hosts())
             .filter(|&host| {
                 self.runner
-                    .vnode_state_in(host, shard)
-                    .is_some_and(|vnode| committee.contains(&vnode.validator_id()))
+                    .shard_vnodes_in(host, shard)
+                    .iter()
+                    .any(|vnode| committee.contains(&vnode.validator_id()))
             })
             .collect()
     }
