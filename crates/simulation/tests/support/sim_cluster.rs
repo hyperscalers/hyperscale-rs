@@ -702,14 +702,17 @@ impl Cluster for SimCluster {
     }
 
     fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
-        // By tallest chain, not by first host: a terminated predecessor's
-        // store can still answer for a shard id its successor has since
-        // reclaimed, and that store's origin is the one the successor
-        // replaced.
+        // The latest origin any store of the shard reports, not the
+        // tallest store's: a terminated predecessor's store can still
+        // answer for a shard id its successor has since reclaimed, and
+        // its origin is the one the successor replaced; and a member
+        // seated past genesis recovers no origin at all, reading network
+        // genesis whatever cut its chain began at. The store seeded at
+        // the cut carries the latest anchor, whichever height it is at.
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .max_by_key(|store| ShardChainReader::committed_height(*store))
             .map(|store| store.load_recovered_state(shard).chain_origin.anchor_wt)
+            .max()
     }
 
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {
