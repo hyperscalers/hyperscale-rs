@@ -31,7 +31,7 @@ pub use package_artifact::GetPackageArtifactsResponse;
 pub use provision::GetProvisionResponse;
 pub use remote_header::GetRemoteHeadersResponse;
 pub use settled_txs::GetSettledTxsResponse;
-pub use state_proof::GetStateProofResponse;
+pub use state_proof::{GetStateProofResponse, ServedValue};
 pub use state_range::{GetStateRangeResponse, MAX_LEAVES_PER_STATE_RANGE, StateRangeChunk};
 pub use transaction::GetTransactionsResponse;
 pub use witness_history::{GetWitnessHistoryResponse, WitnessHistoryChunk};

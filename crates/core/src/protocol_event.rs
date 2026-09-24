@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_engine::TickEnvironment;
+use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     Anchor, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
@@ -769,8 +770,9 @@ pub enum ProtocolEvent {
 
     /// A state proof fetched against a commit-proven remote header
     /// verified: it reconstructs the anchor's root and claims every key
-    /// asked. The execution coordinator keeps the bytes to offer in a
-    /// block it proposes; nothing reads an answer off a fetch, since
+    /// asked, and every value served beside it hashes to the presence
+    /// it proves. The execution coordinator keeps the bytes to offer in
+    /// a block it proposes; nothing reads an answer off a fetch, since
     /// the answer is the chain's once a block carries the proof.
     FetchedStateProofVerified {
         /// The state the proof was checked against.
@@ -779,6 +781,9 @@ pub enum ProtocolEvent {
         keys: Vec<SubstateKey>,
         /// The proof as fetched.
         proof: MerkleInclusionProof,
+        /// The record values the server proved present, each held to
+        /// the proof.
+        values: Vec<ServedValue>,
     },
 
     /// A settled-set fetch verified a past-terminal shard's complete

@@ -19,13 +19,14 @@ use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
 use hyperscale_storage::CrossingLeaves;
+use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight,
     CROSSING_BUNDLE_WINDOW, CounterpartMirror, ExecutionCertificate, Inclusion,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK,
     MerkleInclusionProof, Probed, ProvenAnchors, SettledTxSet, ShardId, ShardTrie, Spoken,
-    StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
-    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
+    StateClaim, Stated, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision,
+    TxHash, TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher, Terms,
@@ -1090,11 +1091,15 @@ impl Counterparts {
     /// to the keys the claim reads, and to the keys no held claim at
     /// the anchor already covers, so what is offered is in the form
     /// the section carries: one proof per claim, disjoint per anchor.
+    /// A record value the server proved present rides in the claim as
+    /// a held reading, which is how a consumer comes to read the
+    /// record's terms.
     pub(crate) fn on_proof_fetched(
         &mut self,
         anchor: Anchor,
         keys: &[SubstateKey],
         proof: &MerkleInclusionProof,
+        values: &[ServedValue],
     ) {
         let answered: Vec<Question> = self
             .probes
@@ -1186,8 +1191,14 @@ impl Counterparts {
         };
         let cells = inclusions
             .iter()
-            .copied()
-            .filter(|(key, _)| fresh.contains(key));
+            .filter(|(key, _)| fresh.contains(key))
+            .map(|&(key, inclusion)| {
+                let held = values
+                    .iter()
+                    .find(|(served, _)| *served == key)
+                    .map(|(_, bytes)| Stated::Held(bytes.clone()));
+                (key, held.unwrap_or(Stated::Inclusion(inclusion)))
+            });
         self.fetched
             .entry(StateClaim::new(anchor, cells, proof))
             .or_default()
@@ -1788,7 +1799,7 @@ impl Counterparts {
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_hbor::Capped;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::test_utils::state_and_proof;
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, BlockHeight, CLAIM_WINDOW, CommittedAt, Deadline, Hash,
@@ -1937,7 +1948,7 @@ mod tests {
             height: BlockHeight::new(8),
             ..anchor
         });
-        counterparts.on_proof_fetched(anchor, &[record], &proof);
+        counterparts.on_proof_fetched(anchor, &[record], &proof, &[]);
         assert!(
             counterparts.probe(&trie, now, &BTreeMap::new()).is_empty(),
             "and not at a newer header while the reading is held to offer",
@@ -1959,7 +1970,7 @@ mod tests {
             counterparts.fold_answered(
                 &StateClaim {
                     anchor: at,
-                    cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
+                    cells: Capped::new(vec![(record, Inclusion::Absent.into())]).expect("one cell"),
                     proof: MerkleInclusionProof::dummy(),
                 },
                 &trie,
@@ -2018,7 +2029,7 @@ mod tests {
         };
         anchors.record(anchor);
         assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
-        counterparts.on_proof_fetched(anchor, &[record], &proof);
+        counterparts.on_proof_fetched(anchor, &[record], &proof, &[]);
 
         // The record is there: the producer has not disposed of it, so
         // the question is worth putting again — and this reading is
@@ -2145,7 +2156,7 @@ mod tests {
         };
         anchors.record(anchor);
         assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
-        counterparts.on_proof_fetched(anchor, &[record], &proof);
+        counterparts.on_proof_fetched(anchor, &[record], &proof, &[]);
 
         // The commit's own pass over what is still wanted. Nothing here
         // names a transaction this ledger owes an outcome for, which is
@@ -2197,7 +2208,7 @@ mod tests {
         };
         anchors.record(anchor);
         assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
-        counterparts.on_proof_fetched(anchor, &[record], &proof);
+        counterparts.on_proof_fetched(anchor, &[record], &proof, &[]);
         counterparts.release_answered_fetches(&trie);
         assert!(
             counterparts
@@ -2215,7 +2226,8 @@ mod tests {
         counterparts.fold_answered(
             &StateClaim {
                 anchor,
-                cells: Capped::new(vec![(record, Inclusion::Present([9; 32]))]).expect("one cell"),
+                cells: Capped::new(vec![(record, Inclusion::Present([9; 32]).into())])
+                    .expect("one cell"),
                 proof: MerkleInclusionProof::dummy(),
             },
             &trie,
@@ -2413,7 +2425,7 @@ mod tests {
             "and it asks after both answers at the one anchor",
         );
 
-        producer.on_proof_fetched(anchor, &[claim, decline], &proof);
+        producer.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
         producer.release_answered_fetches(&trie);
         let carried = producer.state_claims();
         assert_eq!(
@@ -2473,9 +2485,18 @@ mod tests {
         anchors.record(anchor);
         let _ = producer.probe(&trie, now, &BTreeMap::new());
 
-        producer.on_proof_fetched(anchor, &[claim0, decline0, claim1], &first);
+        // The fixture tree's leaf value is the key's own bytes; served
+        // beside the proof, it rides in the claim as a held reading.
+        let served = (decline0, Bytes::new(decline0.to_bytes().to_vec()).unwrap());
+        producer.on_proof_fetched(anchor, &[claim0, decline0, claim1], &first, &[served]);
         let held = producer.state_claims();
         assert_eq!(held.len(), 1);
+        assert_eq!(
+            held[0].held(decline0),
+            Some(decline0.to_bytes().as_slice()),
+            "the served value is held in the claim",
+        );
+        assert_eq!(held[0].held(claim0), None);
         assert_eq!(held[0].keys(), {
             let mut keys = vec![claim0, decline0, claim1];
             keys.sort_unstable();
@@ -2487,7 +2508,7 @@ mod tests {
             "the proof covers exactly the claim's keys"
         );
 
-        producer.on_proof_fetched(anchor, &[claim1, decline1], &second);
+        producer.on_proof_fetched(anchor, &[claim1, decline1], &second, &[]);
         let held = producer.state_claims();
         assert_eq!(held.len(), 2, "the overlap is held once");
         let fresh = held

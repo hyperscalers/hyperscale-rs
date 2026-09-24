@@ -16,14 +16,68 @@
 //! a voter still holds for itself is the anchor: whether the header the
 //! claim names is one it commit-proved is the vote fence's question.
 //! The proof is over exactly the keys the claim reads, and the section
-//! that carries claims is spent by the byte, proof included.
+//! that carries claims is spent by the byte, proof and values included.
+//!
+//! A reading may carry the cell's value. A crossing record reaches its
+//! consumer this way: the bytes ride beside the key, and `verify` holds
+//! them to the presence the proof reconstructs, so no hash travels with
+//! them and none is trusted.
 
-use hyperscale_hbor::{Capped, Hbor};
+use hyperscale_hbor::{Bytes, Capped, Hbor};
 
+use crate::state_key::jmt_value_hash;
 use crate::{
-    Anchor, Inclusion, MAX_PROOFS_PER_QUERY, MerkleInclusionProof, STATE_CLAIM_BYTES,
-    STATE_CLAIM_CELL_BYTES, StateProofError, SubstateKey,
+    Anchor, Inclusion, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, StateProofError, SubstateKey,
 };
+
+/// What a claim states of one cell: whether the anchor's root holds it,
+/// or the value it holds there.
+///
+/// [`Inclusion`] stays the proof's vocabulary: no proof yields a held
+/// value, so the arm belongs to the claim. A held value is what a
+/// consumer reads a crossing record's terms off; every other reader
+/// sees it through [`StateClaim::reading`] as the presence it proves.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hbor)]
+pub enum Stated {
+    /// Whether the key has a leaf, and its value hash if so.
+    Inclusion(Inclusion),
+    /// The bytes the key holds under the anchor's root.
+    Held(Bytes<MAX_HELD_VALUE_BYTES>),
+}
+
+impl From<Inclusion> for Stated {
+    fn from(inclusion: Inclusion) -> Self {
+        Self::Inclusion(inclusion)
+    }
+}
+
+impl Stated {
+    /// What the proof would say of the cell: a held value is a presence
+    /// hashing to it.
+    #[must_use]
+    pub fn inclusion(&self) -> Inclusion {
+        match self {
+            Self::Inclusion(inclusion) => *inclusion,
+            Self::Held(bytes) => Inclusion::Present(jmt_value_hash(bytes)),
+        }
+    }
+
+    /// The bytes it holds, if it carries them.
+    #[must_use]
+    pub fn held(&self) -> Option<&[u8]> {
+        match self {
+            Self::Inclusion(_) => None,
+            Self::Held(bytes) => Some(bytes),
+        }
+    }
+
+    /// The bytes this reading costs a block beyond the key and the
+    /// reading itself: a held value and its length prefix.
+    fn value_weight(&self) -> usize {
+        self.held().map_or(0, |bytes| bytes.len() + 4)
+    }
+}
 
 /// One anchor's answers: what a commit-proven header says about each
 /// cell asked of it, and the proof that it does.
@@ -39,7 +93,7 @@ pub struct StateClaim {
     /// The commit-proven state the readings were taken against.
     pub anchor: Anchor,
     /// Each cell asked about, with what the anchor's root says of it.
-    pub cells: Capped<Vec<(SubstateKey, Inclusion)>, MAX_PROOFS_PER_QUERY>,
+    pub cells: Capped<Vec<(SubstateKey, Stated)>, MAX_PROOFS_PER_QUERY>,
     /// The multiproof the readings were taken from, over exactly the
     /// cells' keys.
     pub proof: MerkleInclusionProof,
@@ -49,12 +103,15 @@ impl StateClaim {
     /// A claim over `cells`, in the one order it may carry them, proven
     /// by `proof`.
     #[must_use]
-    pub fn new(
+    pub fn new<S: Into<Stated>>(
         anchor: Anchor,
-        cells: impl IntoIterator<Item = (SubstateKey, Inclusion)>,
+        cells: impl IntoIterator<Item = (SubstateKey, S)>,
         proof: MerkleInclusionProof,
     ) -> Self {
-        let mut cells: Vec<(SubstateKey, Inclusion)> = cells.into_iter().collect();
+        let mut cells: Vec<(SubstateKey, Stated)> = cells
+            .into_iter()
+            .map(|(key, stated)| (key, stated.into()))
+            .collect();
         cells.sort_unstable();
         cells.dedup_by_key(|(key, _)| *key);
         // A reading list past the cap is one no claim may carry, and an
@@ -86,8 +143,9 @@ impl StateClaim {
     /// The one check a block's claim gets, run by every replica at
     /// admission: the proof is walked over exactly the claim's keys,
     /// and each reading is held to what the walk reconstructed. A
-    /// presence must match the proof's presence, hash and all, and an
-    /// absence its absence.
+    /// presence must match the proof's presence, hash and all, an
+    /// absence its absence, and a held value must hash to the presence
+    /// the proof reconstructs for its key.
     ///
     /// # Errors
     ///
@@ -99,7 +157,11 @@ impl StateClaim {
         let proven =
             self.proof
                 .exact_inclusions(self.anchor.state_root, self.anchor.shard, &self.keys())?;
-        if proven.iter().zip(self.cells.iter()).all(|(a, b)| a == b) {
+        if proven
+            .iter()
+            .zip(self.cells.iter())
+            .all(|((_, proved), (_, stated))| *proved == stated.inclusion())
+        {
             Ok(())
         } else {
             Err(StateProofError::ReadingMismatch)
@@ -112,13 +174,31 @@ impl StateClaim {
         self.cells.iter().map(|(key, _)| *key).collect()
     }
 
-    /// What the claim says of `key`, if it says anything.
+    /// What the claim says of `key`, if it says anything, as the
+    /// presence or absence the proof reconstructs: a held value reads
+    /// as the presence it hashes to.
     #[must_use]
     pub fn reading(&self, key: SubstateKey) -> Option<Inclusion> {
+        self.stated(key).map(Stated::inclusion)
+    }
+
+    /// The value the claim carries for `key`, if it carries one.
+    #[must_use]
+    pub fn held(&self, key: SubstateKey) -> Option<&[u8]> {
+        self.stated(key).and_then(Stated::held)
+    }
+
+    /// Whether any cell of the claim carries its value.
+    #[must_use]
+    pub fn holds_a_value(&self) -> bool {
+        self.cells.iter().any(|(_, stated)| stated.held().is_some())
+    }
+
+    fn stated(&self, key: SubstateKey) -> Option<&Stated> {
         self.cells
             .iter()
             .find(|(asked, _)| *asked == key)
-            .map(|(_, inclusion)| *inclusion)
+            .map(|(_, stated)| stated)
     }
 
     /// This claim cut down to the cells `keep` admits, its proof cut
@@ -131,11 +211,11 @@ impl StateClaim {
     /// once a block has carried the rest.
     #[must_use]
     pub fn restrict(&self, keep: impl Fn(SubstateKey) -> bool) -> Option<Self> {
-        let cells: Vec<(SubstateKey, Inclusion)> = self
+        let cells: Vec<(SubstateKey, Stated)> = self
             .cells
             .iter()
             .filter(|(key, _)| keep(*key))
-            .copied()
+            .cloned()
             .collect();
         if cells.is_empty() {
             return None;
@@ -149,10 +229,19 @@ impl StateClaim {
     }
 
     /// The bytes this claim costs a block: the figures the wire budget
-    /// prices its terms and each cell at, and the proof as it encodes.
+    /// prices its terms and each cell at, every value a cell holds, and
+    /// the proof as it encodes.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
-        STATE_CLAIM_BYTES + self.cells.len() * STATE_CLAIM_CELL_BYTES + self.proof.as_bytes().len()
+        let values: usize = self
+            .cells
+            .iter()
+            .map(|(_, stated)| stated.value_weight())
+            .sum();
+        STATE_CLAIM_BYTES
+            + self.cells.len() * STATE_CLAIM_CELL_BYTES
+            + values
+            + self.proof.as_bytes().len()
     }
 }
 
@@ -217,7 +306,8 @@ mod tests {
     fn a_claim_out_of_its_form_is_refused() {
         let over = |cells: Vec<(SubstateKey, Inclusion)>| StateClaim {
             anchor: anchor(),
-            cells: Capped::new(cells).expect("a list written out in a test"),
+            cells: Capped::new(cells.into_iter().map(|(key, i)| (key, i.into())).collect())
+                .expect("a list written out in a test"),
             proof: MerkleInclusionProof::dummy(),
         };
         assert!(!over(Vec::new()).is_well_formed());
@@ -251,8 +341,8 @@ mod tests {
 
         let mut flipped = claim.clone();
         flipped.cells = Capped::new(vec![
-            (held, Inclusion::Absent),
-            (missing, Inclusion::Absent),
+            (held, Inclusion::Absent.into()),
+            (missing, Inclusion::Absent.into()),
         ])
         .expect("two cells");
         assert_eq!(flipped.verify(), Err(StateProofError::ReadingMismatch));
@@ -274,6 +364,64 @@ mod tests {
         bytes[last] ^= 0x01;
         bit_flipped.proof = MerkleInclusionProof::new(bytes);
         assert!(bit_flipped.verify().is_err());
+    }
+
+    /// A claim may carry a cell's value. It keeps one canonical form,
+    /// round-trips, reads as the presence it hashes to, weighs its
+    /// bytes, and verifies only where the proof's presence is that hash:
+    /// one byte changed refuses, and so does a value where the proof
+    /// says absent.
+    #[test]
+    fn a_held_value_is_held_to_the_proof() {
+        use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+
+        let (held, missing) = (test_key(1), test_key(2));
+        let bare = proven_claim(ShardId::ROOT, 3, &[held], &[held, missing]);
+        // The fixture tree's leaf value is the key's own bytes.
+        let value = held.to_bytes().to_vec();
+        let carrying = StateClaim::new(
+            bare.anchor,
+            [
+                (held, Stated::Held(Bytes::new(value.clone()).unwrap())),
+                (missing, Inclusion::Absent.into()),
+            ],
+            bare.proof.clone(),
+        );
+        assert_eq!(carrying.verify(), Ok(()));
+        assert_eq!(carrying.held(held), Some(value.as_slice()));
+        assert_eq!(carrying.held(missing), None);
+        assert_eq!(carrying.reading(held), bare.reading(held));
+        assert!(carrying.holds_a_value() && !bare.holds_a_value());
+        assert_eq!(
+            carrying.wire_weight(),
+            bare.wire_weight() + value.len() + 4,
+            "a held value costs its bytes and a length prefix",
+        );
+        let encoded = hbor_to_vec(&carrying).unwrap();
+        assert!(encoded.len() <= carrying.wire_weight());
+        assert_eq!(hbor_from_slice::<StateClaim>(&encoded).unwrap(), carrying);
+
+        let mut altered = value.clone();
+        altered[0] ^= 0x01;
+        let forged = StateClaim::new(
+            bare.anchor,
+            [
+                (held, Stated::Held(Bytes::new(altered).unwrap())),
+                (missing, Inclusion::Absent.into()),
+            ],
+            bare.proof.clone(),
+        );
+        assert_eq!(forged.verify(), Err(StateProofError::ReadingMismatch));
+
+        let absent_held = StateClaim::new(
+            bare.anchor,
+            [
+                (held, bare.reading(held).unwrap().into()),
+                (missing, Stated::Held(Bytes::new(value).unwrap())),
+            ],
+            bare.proof,
+        );
+        assert_eq!(absent_held.verify(), Err(StateProofError::ReadingMismatch));
     }
 
     /// A claim cut by key is a claim in its own right: the piece

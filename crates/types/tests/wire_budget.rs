@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
+use hyperscale_hbor::{Bytes, Capped, to_vec as hbor_to_vec};
 use hyperscale_jmt::{
     Blake3Hasher, Key as JmtKey, LeafValue, MAX_SINGLE_CLAIM_PROOF_BYTES, MemoryStore, MultiProof,
     NodeKey, Tree,
@@ -19,11 +19,12 @@ use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass, Anchor,
     BlockHeight, CommittedAt, Deadline, Hash, LocalKey, MAX_ARTIFACT_BYTES, MAX_ENVELOPE_BYTES,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, ROUTE_PREFIX_BYTES, RoutePrefix,
-    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIMS_HEADROOM,
-    SchemeId, ShardId, StateClaim, StateRoot, SubstateKey, TransactionEnvelope, TxHash,
-    UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp, evidence_admits_block, shard_prefix_path,
+    MAX_HELD_VALUE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, ROUTE_PREFIX_BYTES,
+    RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIMS_HEADROOM, SchemeId, ShardId, StateClaim, StateRoot, Stated, SubstateKey,
+    TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp,
+    evidence_admits_block, shard_prefix_path,
 };
 
 type Jmt = Tree<Blake3Hasher, 1>;
@@ -293,17 +294,51 @@ fn a_claims_weight_bounds_its_encoding() {
     );
 }
 
+/// A claim whose cells carry their values at the widest a value may be
+/// encodes under its weight: the values are priced beside the key and
+/// the reading, and the single-cell assert counts one of them.
+#[test]
+fn a_claim_of_held_values_encodes_under_its_weight() {
+    let shard = ShardId::leaf(4, 5);
+    let (store, root, keys) = spread_tree(shard, 400, 7);
+    for cells in [1usize, 2, 200] {
+        let bare = claim_over(&store, shard, root, &keys[..cells]);
+        let holding = StateClaim::new(
+            bare.anchor,
+            bare.cells.iter().map(|(key, _)| {
+                (
+                    *key,
+                    Stated::Held(Bytes::new(vec![0xFF; MAX_HELD_VALUE_BYTES]).unwrap()),
+                )
+            }),
+            bare.proof.clone(),
+        );
+        let encoded = hbor_to_vec(&holding).expect("a claim encodes").len();
+        assert!(
+            encoded <= holding.wire_weight(),
+            "a claim of {cells} held cells encodes to {encoded} bytes, over the {} its weight \
+             claims",
+            holding.wire_weight(),
+        );
+        assert_eq!(
+            holding.wire_weight() - bare.wire_weight(),
+            cells * (MAX_HELD_VALUE_BYTES + 4),
+            "each value costs its bytes and a length prefix",
+        );
+    }
+}
+
 /// The figure the claims budget is derived from, measured.
 ///
 /// A tree of twenty thousand leaves under one leaf shard's prefix,
 /// spread across as many owners from a fixed seed; a thousand single
 /// keys proven against it, half present and half absent; each encoded
 /// as a one-cell claim; and the 99th percentile of those encodings is
-/// what `SINGLE_CELL_CLAIM_P99_BYTES` states: 769 bytes, against a
-/// median of 689. From it the budget is `MAX_STATE_CLAIMS_PER_BLOCK`
+/// what `SINGLE_CELL_CLAIM_P99_BYTES` states: 770 bytes, against a
+/// median of 690. From it the budget is `MAX_STATE_CLAIMS_PER_BLOCK`
 /// such claims rounded up to 16 KiB, 208 KiB, which is the bound that
 /// binds today: the frame leaves 8,970,239 bytes. At that budget the
-/// section carries 277 single-cell claims at the p99, of which the
+/// section carries 276 single-cell claims at the p99, of which the
 /// decode cap admits 256.
 #[test]
 fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {

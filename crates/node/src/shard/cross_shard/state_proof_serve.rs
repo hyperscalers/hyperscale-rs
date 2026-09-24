@@ -14,10 +14,13 @@ use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{PendingChain, ShardStorage, Substates};
 use hyperscale_types::network::request::{GetCellsRequest, GetStateProofRequest};
-use hyperscale_types::network::response::{GetCellsResponse, GetStateProofResponse, RangeAnswer};
+use hyperscale_types::network::response::{
+    GetCellsResponse, GetStateProofResponse, RangeAnswer, ServedValue,
+};
 use hyperscale_types::{
     EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, entry_leaf_key,
 };
+use hyperscale_vm_effects::CrossingLeaf;
 
 /// Serve an inbound state-proof query from the committed chain.
 ///
@@ -28,7 +31,10 @@ use hyperscale_types::{
 /// than inferred from whether the collector has run: the same bound the
 /// provisions server serves under, so both refuse the same heights.
 /// Nothing is asked of the keys: a key nothing ever wrote proves absent
-/// like any other.
+/// like any other. A key present whose leaf is a crossing record, live
+/// or retired, is answered with its value beside the proof, so a
+/// consumer reads the record's terms off one fetch; the requester
+/// holds each value to the presence the proof reconstructs.
 #[must_use]
 pub fn serve_state_proof_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
@@ -46,7 +52,18 @@ pub fn serve_state_proof_request<S: ShardStorage>(
         },
         |proof| {
             record_fetch_response_sent("state_proof", req.keys.len());
-            GetStateProofResponse::found(proof)
+            let values: Vec<ServedValue> = req
+                .keys
+                .iter()
+                .filter_map(|&key| {
+                    let bytes = view.base().get_substate_at_height(key, req.height)??;
+                    CrossingLeaf::read(&ProtocolHasher, key, &bytes)?;
+                    Some((key, Bytes::new(bytes).ok()?))
+                })
+                .collect();
+            // One value at most per key asked, so the list sits under the
+            // request's own cap.
+            GetStateProofResponse::found(proof, Capped::new(values).unwrap_or_default())
         },
     )
 }
@@ -214,6 +231,15 @@ mod tests {
     /// block per entry of `stamps`, and the state root at that first
     /// height — the one a proof taken there reconstructs.
     fn chain_of(stamps: &[u64]) -> (Arc<PendingChain<SimShardStorage>>, StateRoot) {
+        chain_holding(stamps, &[])
+    }
+
+    /// [`chain_of`], with `extra` cells written beside the first block's
+    /// committed cells.
+    fn chain_holding(
+        stamps: &[u64],
+        extra: &[(SubstateKey, Vec<u8>)],
+    ) -> (Arc<PendingChain<SimShardStorage>>, StateRoot) {
         let storage = SimShardStorage::default();
         let mut first_root = StateRoot::ZERO;
         for (index, ts_ms) in stamps.iter().enumerate() {
@@ -251,10 +277,13 @@ mod tests {
                 state_claims: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
-            let creations = committed_tx_cells(
+            let mut creations = committed_tx_cells(
                 SHARD,
                 block.transactions().iter().map(|tx| tx.as_unverified()),
             );
+            if height == 1 {
+                creations.extend(extra.iter().cloned());
+            }
             commit_settled_at(
                 &storage,
                 &make_test_certified(block),
@@ -524,6 +553,75 @@ mod tests {
         assert!(
             attested.iter().all(|(_, inclusion)| inclusion.is_present()),
             "every entry the answer carries stands under the height's root"
+        );
+    }
+
+    /// A record cell the proof shows present is served with its value,
+    /// live or retired; an ordinary cell is proved and not served; and
+    /// the fetch binding accepts what the server built.
+    #[test]
+    fn a_record_cells_value_rides_beside_its_proof() {
+        use hyperscale_types::{Address, AddressClass, Anchor, ResourceAddr};
+        use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms, TxHash as VmTxHash};
+
+        use crate::fetch::ScopedAnswer;
+        use crate::shard::cross_shard::StateProofBinding;
+
+        let id = |seed: u8| CrossingId {
+            producer: Address::new([seed; 31], AddressClass::Component),
+            consumer: Address::new([0x5C; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 1,
+            output: 0,
+        };
+        let tx = VmTxHash(Hash32([0xC0; 32]));
+        let live_key = id(0x5A).record_key(&ProtocolHasher);
+        let live = id(0x5A)
+            .cell(tx, ResourceAddr::new([0xE0; 31]), 500, 1_000, Terms::Owed)
+            .to_bytes();
+        let retired_key = id(0x5B).record_key(&ProtocolHasher);
+        let retired = id(0x5B)
+            .cell(tx, ResourceAddr::new([0xE0; 31]), 0, 2_000, Terms::Retired)
+            .to_bytes();
+        let (chain, root) = chain_holding(
+            &[1_000],
+            &[(live_key, live.clone()), (retired_key, retired.clone())],
+        );
+        let committed = committed_tx_cell_key(
+            SHARD,
+            test_transaction(1).hash(),
+            test_transaction(1).validity_range().end_timestamp_exclusive,
+        );
+        let absent = id(0x5D).record_key(&ProtocolHasher);
+        let keys = vec![live_key, retired_key, committed, absent];
+
+        let response = serve_state_proof_request(
+            &chain,
+            &GetStateProofRequest::new(
+                BlockHeight::new(1),
+                Capped::new(keys.clone()).expect("a list written out in a test"),
+            ),
+        );
+        let served: Vec<(SubstateKey, Vec<u8>)> = response
+            .values
+            .iter()
+            .map(|(key, bytes)| (*key, bytes.to_vec()))
+            .collect();
+        assert_eq!(
+            served,
+            vec![(live_key, live), (retired_key, retired)],
+            "the two record cells, in the order asked, and nothing else",
+        );
+
+        let anchor = Anchor {
+            shard: SHARD,
+            height: BlockHeight::new(1),
+            state_root: root,
+            ts: WeightedTimestamp::from_millis(1_000),
+        };
+        assert!(
+            StateProofBinding::answer(anchor, keys, response).is_ok(),
+            "what the server built passes the requester's check",
         );
     }
 

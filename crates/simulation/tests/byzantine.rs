@@ -91,6 +91,7 @@ fn a_forged_state_proof_convinces_nobody() {
         // this a rotation rather than an outage.
         let unreconstructable = hbor_to_vec(&GetStateProofResponse::found(
             MerkleInclusionProof::new(vec![0xFF; 64]),
+            Capped::empty(),
         ))
         .expect("a state-proof response encodes");
         let lies = Arc::new(AtomicUsize::new(0));

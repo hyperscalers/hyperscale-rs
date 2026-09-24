@@ -24,6 +24,7 @@ use hyperscale_types::network::response::{
     CommittedTxVerdict, GetCommittedTxsResponse, GetProvisionResponse, GetSettledTxsResponse,
     GetStateProofResponse,
 };
+use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
     PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash,
@@ -489,21 +490,34 @@ impl ScopedAnswer for StateProofBinding {
     }
 
     /// Checked here so an unusable proof rotates the peer rather than
-    /// reaching a block. What it says is read off the block that carries
-    /// it, by every replica.
+    /// reaching a block, and so does a served value that does not hash
+    /// to the presence the proof reconstructs for its key. What the
+    /// proof says is read off the block that carries it, by every
+    /// replica.
     fn answer(
         scope: Self::Scope,
         keys: Vec<Self::Key>,
         response: GetStateProofResponse,
     ) -> Result<ProtocolEvent, Refusal> {
         let proof = response.proof.ok_or(Refusal::NotHeld)?;
-        proof
+        let inclusions = proof
             .inclusions(scope.state_root, scope.shard, &keys)
             .map_err(|_| Refusal::Unusable("unusable_proof"))?;
+        let values = response.values.into_inner();
+        for (key, bytes) in &values {
+            let proven = inclusions
+                .iter()
+                .find(|(asked, _)| asked == key)
+                .map(|(_, inclusion)| inclusion.value_hash());
+            if proven != Some(Some(jmt_value_hash(bytes))) {
+                return Err(Refusal::Unusable("value_off_its_proof"));
+            }
+        }
         Ok(ProtocolEvent::FetchedStateProofVerified {
             anchor: scope,
             keys,
             proof,
+            values,
         })
     }
 }
@@ -784,6 +798,58 @@ impl FetchBinding for ProvisionBinding {
                 );
                 ResponseVerdict::Accept
             }),
+        );
+    }
+}
+
+#[cfg(test)]
+mod state_proof_tests {
+    use hyperscale_hbor::Bytes;
+    use hyperscale_types::test_utils::{state_and_proof, test_key};
+    use hyperscale_types::{BlockHeight, MAX_HELD_VALUE_BYTES, WeightedTimestamp};
+
+    use super::*;
+
+    /// A served value is held to the presence the proof reconstructs
+    /// for its key: one that hashes to it rides on, and one that does
+    /// not, or one for a key the proof shows absent, rotates the peer
+    /// as an unusable answer.
+    #[test]
+    fn a_served_value_off_its_proof_rotates_the_peer() {
+        let shard = ShardId::leaf(1, 0);
+        let (held, missing) = (test_key(0x21), test_key(0x22));
+        let (state_root, proof) = state_and_proof(shard, &[held], &[held, missing]);
+        let anchor = Anchor {
+            shard,
+            height: BlockHeight::new(4),
+            state_root,
+            ts: WeightedTimestamp::from_millis(4_000),
+        };
+        let keys = vec![held, missing];
+        let value = |bytes: Vec<u8>| Bytes::new(bytes).unwrap();
+        let answer = |values: Vec<(SubstateKey, Bytes<MAX_HELD_VALUE_BYTES>)>| {
+            StateProofBinding::answer(
+                anchor,
+                keys.clone(),
+                GetStateProofResponse::found(proof.clone(), Capped::new(values).unwrap()),
+            )
+        };
+
+        let Ok(ProtocolEvent::FetchedStateProofVerified { values, .. }) =
+            answer(vec![(held, value(held.to_bytes().to_vec()))])
+        else {
+            panic!("the fixture's leaf value is the key's own bytes");
+        };
+        assert_eq!(values.len(), 1);
+
+        assert_eq!(
+            answer(vec![(held, value(b"another value".to_vec()))]).map(|_| ()),
+            Err(Refusal::Unusable("value_off_its_proof")),
+        );
+        assert_eq!(
+            answer(vec![(missing, value(missing.to_bytes().to_vec()))]).map(|_| ()),
+            Err(Refusal::Unusable("value_off_its_proof")),
+            "a value for a key the proof shows absent",
         );
     }
 }

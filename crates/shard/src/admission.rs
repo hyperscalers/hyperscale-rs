@@ -26,14 +26,14 @@ use std::sync::Arc;
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, CROSSING_BUNDLE_WINDOW, DeclaredWork,
-    Finalization, FinalizationHash, Inclusion, MAX_FINALIZED_TX_PER_BLOCK,
+    Finalization, FinalizationHash, Inclusion, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_TXS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, Probed, ProvisionHash, Provisions, ShardId, StateClaim, SubstateKey,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
     budget_admits_block, caps_admit_transaction, evidence_admits_block, state_claims_admit_block,
     sweep_admits_block,
 };
-use hyperscale_vm_effects::CrossingLeaf;
+use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf};
 use hyperscale_vm_types::ProtocolHasher;
 
 use crate::chain_view::ChainView;
@@ -773,6 +773,10 @@ pub(crate) fn record_reading(
 
 /// The block's state claims.
 pub(crate) struct StateClaimsSection;
+
+/// The one value a reading carries is a crossing record, so the widest
+/// held value is the record cell's own width.
+const _: () = assert!(MAX_HELD_VALUE_BYTES == CROSSING_CELL_BYTES as usize);
 
 /// What the claims admitted so far amount to.
 #[derive(Debug, Default)]

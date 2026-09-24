@@ -57,6 +57,7 @@ use hyperscale_metrics::{
     record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
 };
 use hyperscale_storage::{RecoveredState, TickResolution};
+use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation,
@@ -2932,8 +2933,10 @@ impl ExecutionCoordinator {
         anchor: Anchor,
         keys: &[SubstateKey],
         proof: &MerkleInclusionProof,
+        values: &[ServedValue],
     ) {
-        self.counterparts.on_proof_fetched(anchor, keys, proof);
+        self.counterparts
+            .on_proof_fetched(anchor, keys, proof, values);
     }
 
     /// What this validator holds to offer in a block it proposes.
@@ -9055,7 +9058,7 @@ mod tests {
     ) {
         let keys = claim.keys();
         let (_, proof) = state_and_proof(claim.anchor.shard, present, &keys);
-        state.on_proof_fetched(claim.anchor, &keys, &proof);
+        state.on_proof_fetched(claim.anchor, &keys, &proof, &[]);
     }
 
     /// Commit a block on [`HOME`] carrying `bundles` — the seam every

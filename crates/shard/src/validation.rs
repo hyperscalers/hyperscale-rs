@@ -1248,8 +1248,8 @@ pub mod tests {
 
         let mut disagreeing = claim.clone();
         disagreeing.cells = Capped::new(vec![
-            (present, Inclusion::Absent),
-            (absent, Inclusion::Absent),
+            (present, Inclusion::Absent.into()),
+            (absent, Inclusion::Absent.into()),
         ])
         .expect("two cells");
         let err = held(vec![disagreeing]).expect_err("a reading the proof does not bear out");

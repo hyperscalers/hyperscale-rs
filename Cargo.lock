@@ -2346,6 +2346,7 @@ dependencies = [
  "hyperscale-storage",
  "hyperscale-storage-memory",
  "hyperscale-types",
+ "hyperscale-vm-effects",
  "quick_cache",
  "serde",
  "strum",

@@ -342,8 +342,14 @@ pub const ROUTE_PREFIX_BYTES: usize = size_of::<RoutePrefix>();
 /// and its proof: the anchor, both length prefixes and the framing.
 pub const STATE_CLAIM_BYTES: usize = 64;
 
-/// Bytes one cell of a claim costs: the key and the reading of it.
-pub const STATE_CLAIM_CELL_BYTES: usize = 82;
+/// Bytes one cell of a claim costs: the key and the reading of it,
+/// before any value the reading carries.
+pub const STATE_CLAIM_CELL_BYTES: usize = 83;
+
+/// The widest value a claim's cell may carry: a crossing record, the
+/// one cell a reading carries the value of. `hyperscale-shard` holds it
+/// to the record cell's own width, which this crate cannot see.
+pub const MAX_HELD_VALUE_BYTES: usize = 256;
 
 /// The measured 99th-percentile encoding of a one-cell claim: its
 /// terms, one cell and the proof of it, over a state tree of twenty
@@ -352,7 +358,7 @@ pub const STATE_CLAIM_CELL_BYTES: usize = 82;
 /// Measured by `wire_budget.rs`, which holds the constant to what it
 /// measures, so a change to the encoding or the method moves this and,
 /// through it, the section's budget.
-pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 769;
+pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 770;
 
 /// What the frame leaves for the claims section once every other
 /// section of a proposal is at its cap.
@@ -397,10 +403,15 @@ pub const fn state_claims_admit_block(weight: usize) -> bool {
 }
 
 /// Any single-cell claim fits an empty section: the widest one-claim
-/// proof the wire format can write, under the claim's own terms.
+/// proof the wire format can write, under the claim's own terms, with
+/// the widest value a cell may carry.
 const _: () = assert!(
     MAX_STATE_CLAIMS_BYTES
-        >= STATE_CLAIM_BYTES + STATE_CLAIM_CELL_BYTES + MAX_SINGLE_CLAIM_PROOF_BYTES
+        >= STATE_CLAIM_BYTES
+            + STATE_CLAIM_CELL_BYTES
+            + MAX_HELD_VALUE_BYTES
+            + 4
+            + MAX_SINGLE_CLAIM_PROOF_BYTES
 );
 
 /// Bytes a hash-only entry of a manifest costs.

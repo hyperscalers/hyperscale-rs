@@ -171,7 +171,7 @@ pub use shard::limits::{
     ABANDONMENT_RECORD_BYTES, BLOCK_CAPS, MAX_BLOCK_COMPUTE, MAX_BLOCK_FOOTPRINT,
     MAX_BLOCK_READ_BYTES, MAX_BLOCK_RETENTION_BYTES, MAX_BLOCK_WRITE_BYTES, MAX_CELLS_PER_QUERY,
     MAX_CELLS_RESPONSE_BYTES, MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_HELD_VALUE_BYTES, MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
     MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK,
@@ -195,7 +195,7 @@ pub use shard::roots::{
     missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
     ready_leaf_payload, settled_txs_root_from_hashes,
 };
-pub use shard::state_claim::StateClaim;
+pub use shard::state_claim::{StateClaim, Stated};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
