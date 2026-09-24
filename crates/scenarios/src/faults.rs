@@ -1921,7 +1921,7 @@ pub fn cross_shard_provisions_recovers_after_transient_outage(c: &mut impl Fault
 /// never reaches its vote threshold, so each epoch commits as a skip block:
 /// the topology schedule keeps advancing — shards stay live and keep crossing
 /// epoch cuts — while no shard contribution seats.
-const BEACON_COMMIT_CHANNELS: [&str; 7] = [
+pub const BEACON_COMMIT_CHANNELS: [&str; 7] = [
     "beacon.proposal",
     "beacon.spc.new_view",
     "beacon.spc.new_commit",

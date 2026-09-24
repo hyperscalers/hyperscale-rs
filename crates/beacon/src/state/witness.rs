@@ -4,11 +4,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconProposal, BeaconState, BlockHeader, Hash, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS,
-    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingReshape, PendingWithdrawal,
-    RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitnessPayload, Stake,
-    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
-    validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
+    Admission, BeaconProposal, BeaconState, BlockHeader, Hash, JAIL_COOLDOWN_EPOCHS, JailReason,
+    MAX_SHARDS, MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingReshape,
+    PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitnessPayload, Stake, StakePool,
+    ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, validator_possession_proof_verify,
+    verify_shard_vote_equivocation, verify_vote_equivocation,
 };
 
 use crate::rules;
@@ -555,7 +555,7 @@ pub(super) fn apply_shard_payload(
                 *shard,
                 PendingReshape::Split {
                     last_asserted: state.current_epoch,
-                    admitted_at: state.current_epoch,
+                    admitted: Admission::new(state.current_epoch),
                     cohort,
                     cohort_seed,
                     scheduled: None,
@@ -584,13 +584,11 @@ pub(super) fn apply_shard_payload(
             // hold a live half; a lone half expires via the staleness
             // sweep.
             let refreshed = if let Some(PendingReshape::Merge {
-                halves,
-                admitted_at,
-                ..
+                halves, admitted, ..
             }) = state.pending_reshapes.get_mut(parent)
             {
                 halves.insert(source_shard, state.current_epoch);
-                Some(halves.len() == 2 && admitted_at.is_none())
+                Some(halves.len() == 2 && admitted.is_none())
             } else {
                 None
             };
@@ -614,12 +612,12 @@ pub(super) fn apply_shard_payload(
                     let keepers = draw_merge_keepers(state, *parent);
                     if let Some(PendingReshape::Merge {
                         keepers: seats,
-                        admitted_at,
+                        admitted,
                         ..
                     }) = state.pending_reshapes.get_mut(parent)
                     {
                         *seats = keepers;
-                        *admitted_at = Some(state.current_epoch);
+                        *admitted = Some(Admission::new(state.current_epoch));
                     }
                     tracing::info!(
                         ?parent,
@@ -643,7 +641,7 @@ pub(super) fn apply_shard_payload(
                 PendingReshape::Merge {
                     halves: BTreeMap::from([(source_shard, state.current_epoch)]),
                     keepers: BTreeMap::new(),
-                    admitted_at: None,
+                    admitted: None,
                     scheduled_terminal: None,
                 },
             );
@@ -737,11 +735,11 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
         match reshape {
             PendingReshape::Split {
                 last_asserted,
-                admitted_at,
+                admitted,
                 cohort,
                 ..
             } => {
-                if current.saturating_sub(admitted_at.inner()) >= RESHAPE_READY_TTL_EPOCHS {
+                if current >= admitted.ready_by.inner() {
                     removed.push((*target, "readiness TTL elapsed"));
                 } else if !cohort.is_empty()
                     && current.saturating_sub(last_asserted.inner()) >= RESHAPE_TRIGGER_TTL_EPOCHS
@@ -750,9 +748,7 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
                 }
             }
             PendingReshape::Merge {
-                halves,
-                admitted_at,
-                ..
+                halves, admitted, ..
             } => {
                 halves.retain(|_, last| {
                     current.saturating_sub(last.inner()) < RESHAPE_TRIGGER_TTL_EPOCHS
@@ -761,12 +757,10 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
                 // paired both halves must keep asserting — either going
                 // quiet cancels the reshape and returns the keepers to
                 // ordinary rotation.
-                let required = if admitted_at.is_some() { 2 } else { 1 };
+                let required = if admitted.is_some() { 2 } else { 1 };
                 if halves.len() < required {
                     removed.push((*target, "trigger went quiet"));
-                } else if admitted_at.is_some_and(|at| {
-                    current.saturating_sub(at.inner()) >= RESHAPE_READY_TTL_EPOCHS
-                }) {
+                } else if admitted.is_some_and(|admitted| current >= admitted.ready_by.inner()) {
                     removed.push((*target, "readiness TTL elapsed"));
                 }
             }
@@ -790,37 +784,40 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
     }
 }
 
-/// Carry every pending reshape's staleness and readiness anchors forward
-/// one epoch.
+/// Carry every pending reshape's staleness anchors and readiness deadline
+/// forward one epoch.
 ///
 /// The trigger and readiness TTLs measure how many epochs a reshape has
 /// gone without asserting or readying, against `current_epoch`. A skip
 /// epoch folds no witnesses, so no trigger can re-assert and no readiness
 /// can advance; charging that epoch against the TTLs would cancel a
 /// reshape that only looks quiet because the beacon stalled. Advancing the
-/// anchors in lockstep with the skipped epoch holds each TTL's elapsed
-/// count fixed across the stall.
+/// anchors and the deadline in lockstep with the skipped epoch holds each
+/// TTL's elapsed count fixed across the stall.
+///
+/// `admitted.at` is the settled-window evidence floor of the shard the
+/// reshape terminates, and is fixed: counterpart fences have held
+/// straddlers since that fold, whether or not the beacon stalled after
+/// it.
 pub(super) fn defer_reshape_ttls(state: &mut BeaconState) {
     for reshape in state.pending_reshapes.values_mut() {
         match reshape {
             PendingReshape::Split {
                 last_asserted,
-                admitted_at,
+                admitted,
                 ..
             } => {
                 *last_asserted = last_asserted.next();
-                *admitted_at = admitted_at.next();
+                admitted.ready_by = admitted.ready_by.next();
             }
             PendingReshape::Merge {
-                halves,
-                admitted_at,
-                ..
+                halves, admitted, ..
             } => {
                 for last in halves.values_mut() {
                     *last = last.next();
                 }
-                if let Some(at) = admitted_at {
-                    *at = at.next();
+                if let Some(admitted) = admitted {
+                    admitted.ready_by = admitted.ready_by.next();
                 }
             }
         }
@@ -835,8 +832,9 @@ mod tests {
         BlockHash, BlockHeight, BlockVote, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
         JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
         MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, PoolConviction, ProposerTimestamp,
-        Randomness, Round, ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
-        Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus,
+        RESHAPE_READY_TTL_EPOCHS, Randomness, Round, ShardCommittee, ShardId,
+        ShardVoteEquivocation, ShardWitnessPayload, Stake, StakePool, StakePoolId, ValidatorId,
+        ValidatorStatus,
     };
     use hyperscale_types::{ConsensusSignature, Signer, signed_bytes};
 
@@ -2555,7 +2553,7 @@ mod tests {
 
         let Some(PendingReshape::Split {
             last_asserted,
-            admitted_at,
+            admitted,
             cohort,
             ..
         }) = state.pending_reshapes.get(&p)
@@ -2563,7 +2561,7 @@ mod tests {
             panic!("split not recorded");
         };
         assert_eq!(*last_asserted, Epoch::new(5));
-        assert_eq!(*admitted_at, Epoch::new(5));
+        assert_eq!(admitted.at, Epoch::new(5));
         assert_eq!(cohort.len(), 4);
 
         // The pool drained into Observing placements carried on the
@@ -2791,20 +2789,18 @@ mod tests {
 
         // Reaching the trigger TTL (still inside the readiness TTL)
         // lapses: the cohort returns to the pool, the record stays with
-        // an empty cohort retaining its seed, and `admitted_at` is
+        // an empty cohort retaining its seed, and `admitted.at` is
         // unchanged so the readiness TTL keeps counting from first admit.
         state.current_epoch = Epoch::new(5 + RESHAPE_TRIGGER_TTL_EPOCHS);
         prune_stale_reshapes(&mut state);
         let Some(PendingReshape::Split {
-            cohort,
-            admitted_at,
-            ..
+            cohort, admitted, ..
         }) = state.pending_reshapes.get(&p)
         else {
             panic!("a lapsed split keeps its record");
         };
         assert!(cohort.is_empty(), "the lapse empties the cohort");
-        assert_eq!(*admitted_at, Epoch::new(5));
+        assert_eq!(admitted.at, Epoch::new(5));
         assert_eq!(state.pooled_validators().len(), 4);
         assert!(state.next_shard_committees[&p].members.is_empty());
 
@@ -2915,6 +2911,56 @@ mod tests {
         assert_eq!(state.pooled_validators().len(), 4);
     }
 
+    /// A Skip fold moves the readiness deadline and never the admission:
+    /// the deadline is the reshape's to outlast a stall, and the
+    /// admission is the epoch the terminating shard's settled window
+    /// floors on.
+    #[test]
+    fn a_skip_moves_the_readiness_deadline_and_not_the_admission() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = reshape_state(&[p], 4);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
+        for _ in 0..3 {
+            state.current_epoch = state.current_epoch.next();
+            defer_reshape_ttls(&mut state);
+        }
+        let Some(PendingReshape::Split { admitted, .. }) = state.pending_reshapes.get(&p) else {
+            panic!("split not recorded");
+        };
+        assert_eq!(admitted.at, Epoch::new(5), "the admission is fixed");
+        assert_eq!(
+            admitted.ready_by,
+            Epoch::new(5 + RESHAPE_READY_TTL_EPOCHS + 3),
+            "the deadline moved one epoch per skip",
+        );
+
+        let (left, right) = ShardId::ROOT.children();
+        let mut merged = reshape_state(&[left, right], 0);
+        let payload = ShardWitnessPayload::ScheduleMerge {
+            parent: ShardId::ROOT,
+            epoch: Epoch::GENESIS,
+        };
+        apply_shard_payload(&BlsVerifier, &mut merged, &net(), left, &payload);
+        apply_shard_payload(&BlsVerifier, &mut merged, &net(), right, &payload);
+        for _ in 0..3 {
+            merged.current_epoch = merged.current_epoch.next();
+            defer_reshape_ttls(&mut merged);
+        }
+        let Some(PendingReshape::Merge {
+            admitted: Some(admitted),
+            ..
+        }) = merged.pending_reshapes.get(&ShardId::ROOT)
+        else {
+            panic!("both halves pair the merge");
+        };
+        assert_eq!(admitted.at, Epoch::new(5), "the pairing is fixed");
+        assert_eq!(
+            admitted.ready_by,
+            Epoch::new(5 + RESHAPE_READY_TTL_EPOCHS + 3),
+            "the deadline moved one epoch per skip",
+        );
+    }
+
     /// Merge halves pair across the two children; a lone half expires
     /// after the TTL.
     #[test]
@@ -2928,27 +2974,23 @@ mod tests {
 
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &payload);
         let Some(PendingReshape::Merge {
-            halves,
-            admitted_at,
-            ..
+            halves, admitted, ..
         }) = state.pending_reshapes.get(&ShardId::ROOT)
         else {
             panic!("merge half not recorded");
         };
         assert_eq!(halves.len(), 1);
-        assert!(admitted_at.is_none(), "a lone half has not paired");
+        assert!(admitted.is_none(), "a lone half has not paired");
 
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &payload);
         let Some(PendingReshape::Merge {
-            halves,
-            admitted_at,
-            ..
+            halves, admitted, ..
         }) = state.pending_reshapes.get(&ShardId::ROOT)
         else {
             panic!("merge record dropped");
         };
         assert_eq!(halves.len(), 2);
-        assert!(admitted_at.is_some(), "both halves pair the merge");
+        assert!(admitted.is_some(), "both halves pair the merge");
 
         // A fresh lone half goes quiet and expires.
         let mut lone = reshape_state(&[left, right], 0);

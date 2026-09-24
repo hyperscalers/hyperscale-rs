@@ -547,7 +547,7 @@ pub(crate) fn merge_keeper_count<C: Cluster>(c: &C, parent: ShardId) -> Option<u
         .and_then(|state| match state.pending_reshapes.get(&parent) {
             Some(PendingReshape::Merge {
                 keepers,
-                admitted_at: Some(_),
+                admitted: Some(_),
                 ..
             }) => Some(keepers.len()),
             _ => None,

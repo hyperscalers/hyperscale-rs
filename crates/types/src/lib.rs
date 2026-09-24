@@ -37,11 +37,11 @@ mod topology;
 mod transaction;
 
 pub use beacon::{
-    BEACON_SIGNER_COUNT, BeaconBlock, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
-    BeaconProposal, BeaconProposalEquivocationMismatch, BeaconProposalVerifyContext,
-    BeaconProposalVerifyError, BeaconState, BeaconWitnessEvent, CandidateBeaconBlock,
-    CandidateBeaconBlockVerifyError, CandidateVerifyContext, CertifiedBeaconBlock,
-    CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
+    Admission, BEACON_SIGNER_COUNT, BeaconBlock, BeaconCert, BeaconChainConfig,
+    BeaconGenesisConfig, BeaconProposal, BeaconProposalEquivocationMismatch,
+    BeaconProposalVerifyContext, BeaconProposalVerifyError, BeaconState, BeaconWitnessEvent,
+    CandidateBeaconBlock, CandidateBeaconBlockVerifyError, CandidateVerifyContext,
+    CertifiedBeaconBlock, CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
     CertifiedBeaconBlockVerifyError, CohortSeat, CommitteeTransition, CompletedRecovery,
     EMISSION_PARTICIPATION_WEIGHT, EMISSION_STORAGE_WEIGHT, EMISSION_WORK_WEIGHT,
     EMISSIONS_PER_EPOCH, EPOCHS_PER_YEAR, GenesisPool, GenesisValidator, HALT_THRESHOLD_EPOCHS,

@@ -100,7 +100,8 @@ pub use route_reshape::{
 };
 pub use straddler::{
     a_delivery_is_owed_when_its_deliverer_splits,
-    a_record_is_owed_by_the_successor_when_its_issuer_splits, isolate_ec_intake,
+    a_record_is_owed_by_the_successor_when_its_issuer_splits,
+    a_skip_deferred_split_keeps_every_settlement_in_its_window, isolate_ec_intake,
     merge_straddler_atomic, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
 };

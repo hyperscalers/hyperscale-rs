@@ -32,7 +32,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::{DeclaredWork, PriceTable};
 
-use crate::beacon::constants::{HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
+use crate::beacon::constants::{
+    HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET, RESHAPE_READY_TTL_EPOCHS,
+};
 use crate::beacon::genesis::BeaconChainConfig;
 use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
@@ -405,6 +407,34 @@ pub struct KeeperSeat {
     pub ready: bool,
 }
 
+/// When a reshape was admitted, and by when it must be ready.
+///
+/// Two epochs with two roles. `at` is the epoch whose fold admitted the
+/// split or paired the merge: a fact nothing moves, and the floor of the
+/// terminating shard's settled-transaction window, since counterpart
+/// fences hold straddlers from that fold on. `ready_by` is the readiness
+/// deadline: only a Skip fold moves it, forward one epoch, so a beacon
+/// stall does not cost a reshape the epochs it could not ready in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct Admission {
+    /// The epoch whose fold admitted the reshape.
+    pub at: Epoch,
+    /// The epoch at which an unready reshape is abandoned.
+    pub ready_by: Epoch,
+}
+
+impl Admission {
+    /// An admission at `epoch`, ready by
+    /// [`RESHAPE_READY_TTL_EPOCHS`] epochs later.
+    #[must_use]
+    pub const fn new(epoch: Epoch) -> Self {
+        Self {
+            at: epoch,
+            ready_by: epoch.saturating_add(RESHAPE_READY_TTL_EPOCHS),
+        }
+    }
+}
+
 /// An admitted, not-yet-executed shard reshape, keyed in
 /// [`BeaconState::pending_reshapes`] by its target: the splitting shard
 /// itself, or the parent a merge reforms under.
@@ -431,8 +461,8 @@ pub enum PendingReshape {
     Split {
         /// Epoch the shard's trigger last folded.
         last_asserted: Epoch,
-        /// Epoch the split was admitted — starts the readiness TTL.
-        admitted_at: Epoch,
+        /// When the split was admitted, and by when it must be ready.
+        admitted: Admission,
         /// Observer cohort drawn at admission, each seat assigned the
         /// child it syncs. Seats drop with the validator's jail or
         /// deactivation; the execution gate reads ready seats per
@@ -467,9 +497,9 @@ pub enum PendingReshape {
         /// Seats drop with the validator's jail or deactivation.
         /// Empty until paired.
         keepers: BTreeMap<ValidatorId, KeeperSeat>,
-        /// Epoch the merge paired and drew its keepers — starts the
-        /// readiness TTL. `None` until paired.
-        admitted_at: Option<Epoch>,
+        /// When the merge paired and drew its keepers, and by when it
+        /// must be ready. `None` until paired.
+        admitted: Option<Admission>,
         /// The children's final epoch window, stamped once the readiness
         /// gate passes and never moved after — both children share it, so
         /// they leave the trie on the same cut. `None` while the merge is
@@ -1701,16 +1731,16 @@ impl BeaconState {
             .collect();
         for (target, reshape) in &self.pending_reshapes {
             match reshape {
-                PendingReshape::Split { admitted_at, .. } => {
-                    floors.insert(*target, floor(*admitted_at));
+                PendingReshape::Split { admitted, .. } => {
+                    floors.insert(*target, floor(admitted.at));
                 }
                 PendingReshape::Merge {
-                    admitted_at: Some(at),
+                    admitted: Some(admitted),
                     ..
                 } => {
                     let (left, right) = target.children();
-                    floors.insert(left, floor(*at));
-                    floors.insert(right, floor(*at));
+                    floors.insert(left, floor(admitted.at));
+                    floors.insert(right, floor(admitted.at));
                 }
                 PendingReshape::Merge { .. } => {}
             }
@@ -2287,7 +2317,7 @@ mod tests {
             splitting,
             PendingReshape::Split {
                 last_asserted: Epoch::new(1),
-                admitted_at: Epoch::new(1),
+                admitted: Admission::new(Epoch::new(1)),
                 cohort: BTreeMap::new(),
                 cohort_seed: Randomness::ZERO,
                 scheduled: None,
@@ -2331,7 +2361,7 @@ mod tests {
             PendingReshape::Merge {
                 halves: BTreeMap::new(),
                 keepers: BTreeMap::new(),
-                admitted_at: None,
+                admitted: None,
                 scheduled_terminal: None,
             },
         );
@@ -2624,7 +2654,7 @@ mod tests {
             p,
             PendingReshape::Split {
                 last_asserted: Epoch::GENESIS,
-                admitted_at: Epoch::GENESIS,
+                admitted: Admission::new(Epoch::GENESIS),
                 cohort: BTreeMap::from([(
                     observer,
                     CohortSeat {

@@ -11,6 +11,8 @@ use std::time::Duration;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
+#[cfg(feature = "production-epochs")]
+use hyperscale_scenarios::a_skip_deferred_split_keeps_every_settlement_in_its_window;
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
@@ -1732,6 +1734,17 @@ fn split_straddler_atomic_sim() {
         ExecutionMode::Serial,
     );
     split_straddler_atomic(&mut cluster);
+}
+
+/// Under the production epoch length only: at the default 30 s epoch a
+/// split admitted before a beacon stall does not ready before its
+/// deadline, so the run never reaches the cut whose fence this reads.
+#[cfg(feature = "production-epochs")]
+#[test]
+fn a_skip_deferred_split_keeps_every_settlement_in_its_window_sim() {
+    let setup = split_straddler_setup();
+    let mut cluster = SimCluster::with_accounts(&straddler_config(), 11, &setup.accounts);
+    cluster.run_faultable(a_skip_deferred_split_keeps_every_settlement_in_its_window);
 }
 
 /// Assert straddler atomicity under an asymmetric EC partition across a split

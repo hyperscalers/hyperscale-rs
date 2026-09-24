@@ -1438,6 +1438,7 @@ fn compose_merge_parent(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_hbor::Capped;
@@ -1447,11 +1448,12 @@ mod tests {
         BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin,
         CommittedTxsRoot, DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash,
         MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable,
-        QuorumCertificate, ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
-        ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
-        SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS,
-        TerminalRoots, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
-        compute_merkle_root, compute_range_proof, derive_reshape_trigger,
+        QuorumCertificate, RETENTION_HORIZON, ReshapeThresholds, Round, SettledTxsRoot,
+        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad, ShardRecovery,
+        ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
+        StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots, TopologySchedule, TransitionCause,
+        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root, compute_range_proof,
+        derive_reshape_trigger,
     };
 
     use super::*;
@@ -4551,6 +4553,25 @@ mod tests {
         );
     }
 
+    /// A Skip fold: the epoch advances with no witnesses and no
+    /// contributions.
+    fn skip_fold(state: &mut BeaconState) {
+        let next = state.current_epoch.next();
+        apply_epoch(&BlsVerifier, state, &net(), next, ApplyEpochInput::Skip);
+    }
+
+    /// [`assert_lookahead_becomes_the_active_entry`] across a Skip fold.
+    fn assert_lookahead_becomes_the_active_entry_on_a_skip(state: &mut BeaconState, what: &str) {
+        let lookahead = window_frozen_view(&state.derive_next_topology_snapshot(net()));
+        skip_fold(state);
+        let active = window_frozen_view(&state.derive_topology_snapshot(net()));
+        assert_eq!(
+            lookahead, active,
+            "the lookahead written before {what} must equal the active entry \
+             re-derived at that window's promotion",
+        );
+    }
+
     /// The two writes agree across every fold a reshape passes through:
     /// admission, the readiness gate that schedules the cut, and the fold
     /// at the cut that applies it. The scheduling fold is the one that
@@ -4586,6 +4607,11 @@ mod tests {
         );
         assert_lookahead_becomes_the_active_entry(&mut state, "a split admission");
 
+        // A beacon stall between admission and the gate: two Skip folds,
+        // each moving the readiness deadline and leaving the floor.
+        assert_lookahead_becomes_the_active_entry_on_a_skip(&mut state, "the first skip");
+        assert_lookahead_becomes_the_active_entry_on_a_skip(&mut state, "the second skip");
+
         // Every observer readies, so the next fold's gate schedules the cut.
         let seats: Vec<(ValidatorId, ShardId)> = match &state.pending_reshapes[&p] {
             PendingReshape::Split { cohort, .. } => {
@@ -4612,6 +4638,121 @@ mod tests {
         assert!(
             state.pending_reshapes.is_empty(),
             "the cut must have applied for this to cover the applying fold",
+        );
+    }
+
+    /// The fence never arms below the floor: at every instant from the
+    /// admitting window to the cut at which a straddler naming the shard
+    /// is held, the settled window reaches back to the admission, however
+    /// many Skip folds sit between admission and the gate. A floor taken
+    /// from the first frozen window showing the split pending, or from
+    /// the cut, sits above such an instant and fails here.
+    #[test]
+    fn the_fence_never_arms_below_the_floor() {
+        const EPOCH_MS: u64 = 400_000;
+        let p = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(4);
+        state.chain_config.shard_size = 4;
+        state.chain_config.epoch_duration_ms = EPOCH_MS;
+        state.shard_committees = state.next_shard_committees.clone();
+        for i in 0..4u64 {
+            state.validators.insert(
+                ValidatorId::new(1000 + i),
+                validator_record(1000 + i, 0, ValidatorStatus::Pooled),
+            );
+        }
+        apply_next_epoch(&mut state, &[]);
+        // The schedule as the beacon coordinator keeps it: each fold
+        // records its window and publishes the next one's projection.
+        let publish = |state: &BeaconState, schedule: &mut TopologySchedule| {
+            schedule.insert(
+                state.current_epoch,
+                Arc::new(state.derive_topology_snapshot(net())),
+            );
+            schedule.insert_lookahead(
+                state.current_epoch.next(),
+                Arc::new(state.derive_next_topology_snapshot(net())),
+            );
+        };
+        let mut schedule = TopologySchedule::new(
+            EPOCH_MS,
+            state.current_epoch,
+            Arc::new(state.derive_topology_snapshot(net())),
+        );
+        publish(&state, &mut schedule);
+
+        // The admitting fold folds the trigger and publishes the split
+        // pending.
+        apply_next_epoch(&mut state, &[]);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
+        );
+        let admitted = state.current_epoch;
+        publish(&state, &mut schedule);
+
+        // A stall: three Skip folds.
+        for _ in 0..3 {
+            skip_fold(&mut state);
+            publish(&state, &mut schedule);
+        }
+
+        // The observers ready; the next fold's gate schedules the cut, and
+        // the fold after applies it.
+        let seats: Vec<(ValidatorId, ShardId)> = match &state.pending_reshapes[&p] {
+            PendingReshape::Split { cohort, .. } => {
+                cohort.iter().map(|(id, seat)| (*id, seat.child)).collect()
+            }
+            PendingReshape::Merge { .. } => panic!("a split was admitted"),
+        };
+        for (validator, child) in seats {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                p,
+                &ShardWitnessPayload::ReshapeReady { validator, child },
+            );
+        }
+        apply_next_epoch(&mut state, &[]);
+        let cut = state.pending_reshapes[&p]
+            .scheduled_terminal()
+            .expect("the gate schedules the cut");
+        publish(&state, &mut schedule);
+        apply_next_epoch(&mut state, &[]);
+        assert!(state.pending_reshapes.is_empty(), "the cut applies");
+        publish(&state, &mut schedule);
+
+        let floor = WeightedTimestamp::from_millis(
+            admitted.inner() * EPOCH_MS - RETENTION_HORIZON.as_secs() * 1000,
+        );
+        let mut held = 0;
+        let step = EPOCH_MS / 8;
+        let mut wt_ms = admitted.inner() * EPOCH_MS;
+        while wt_ms <= cut.inner() * EPOCH_MS {
+            let wt = WeightedTimestamp::from_millis(wt_ms);
+            if schedule.termination_scheduled(p, wt) {
+                held += 1;
+                let read = schedule
+                    .settled_window_floor(p, wt)
+                    .expect("a held instant reads a floor");
+                assert!(
+                    read <= floor,
+                    "at {wt_ms} ms the fence holds but the floor {read:?} sits above the \
+                     admission's {floor:?}",
+                );
+            }
+            wt_ms += step;
+        }
+        assert!(
+            held > 0,
+            "the fence must hold somewhere in the span, or nothing was checked"
         );
     }
 

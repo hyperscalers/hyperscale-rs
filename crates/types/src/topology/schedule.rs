@@ -1092,7 +1092,7 @@ impl TopologySchedule {
     /// [`merge_pending`]: TopologySnapshot::merge_pending
     /// [`terminates_at_next_boundary`]: Self::terminates_at_next_boundary
     #[must_use]
-    pub(crate) fn termination_scheduled(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+    pub fn termination_scheduled(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
         let pending = self
             .forward_windows(wt)
             .into_iter()

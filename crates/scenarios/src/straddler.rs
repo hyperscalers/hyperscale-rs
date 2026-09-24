@@ -13,15 +13,17 @@ use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, MAX_VALIDITY_RANGE, PrincipalAddr, ShardId,
-    SubstateKey, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
+    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, MAX_VALIDITY_RANGE, PendingReshape,
+    PrincipalAddr, RETENTION_HORIZON, ShardId, SubstateKey, TransactionDecision, TransactionStatus,
+    TxHash, WeightedTimestamp,
 };
 
+use crate::faults::BEACON_COMMIT_CHANNELS;
 use crate::reshape::split_lifecycle;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, committee_size, declared_price, held, split_admitted,
-    vault_balance,
+    anchored_genesis_height, beacon_epoch, clock, committee_size, declared_price, held,
+    split_admitted, vault_balance,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
@@ -108,7 +110,102 @@ pub fn straddler_split_bytes() -> u64 {
 /// Panics if the grow or split misses its budget, or the settled-transaction fence is
 /// breached (a one-sided application, a mismatch, or a hung straddler).
 pub fn split_straddler_atomic(c: &mut impl Cluster) {
-    let run = split_straddler_run(c, |_| {});
+    let run = split_straddler_run(c, |_| {}, |_, _| {});
+    assert_fence_held(c, run.splitter, run.terminal_b, &run.probes);
+    run.assert_conserved(c);
+}
+
+/// A split whose beacon stalls between admission and the gate keeps every
+/// settlement in its window.
+///
+/// The settled floor is the admission epoch, so a straddler the splitter
+/// settles while the beacon commits only skip blocks is named by the
+/// splitter's settled set and the survivor applies it. Every beacon epoch
+/// from admission on commits as a skip, for long enough that a floor
+/// sliding with the readiness deadline would sit above a settlement the
+/// fence is still holding; the stall is then lifted and the run judged as
+/// any split straddler is.
+///
+/// # Panics
+///
+/// As [`split_straddler_atomic`], and if the beacon does not keep
+/// committing skips, seats a contribution during the stall, moves the
+/// admission, or no settling probe settles below where a slid floor would
+/// sit.
+pub fn a_skip_deferred_split_keeps_every_settlement_in_its_window<C: FaultableCluster>(c: &mut C) {
+    let splitter = STRADDLER_SPLITTER;
+    let run = split_straddler_run(
+        c,
+        |c| {
+            for channel in BEACON_COMMIT_CHANNELS {
+                c.drop_type(channel);
+            }
+        },
+        |c, probes| {
+            let state = c.beacon_state().expect("a committed beacon state");
+            let epoch_ms = state.chain_config.epoch_duration_ms;
+            let Some(PendingReshape::Split { admitted, .. }) =
+                state.pending_reshapes.get(&splitter)
+            else {
+                panic!("the splitter's split is admitted before the settling ticks go");
+            };
+            let admitted = admitted.at;
+            let stalled_at = state.current_epoch;
+            let last_live = state.boundaries[&splitter].last_live_epoch;
+            drop(state);
+
+            // Long enough that a floor sliding with the deadline would sit
+            // above the span the settling probes land in, under either
+            // epoch length.
+            let horizon_epochs = RETENTION_HORIZON.as_millis().div_ceil(u128::from(epoch_ms));
+            let k = stalled_at.inner() - admitted.inner()
+                + u64::try_from(horizon_epochs).expect("a horizon of epochs")
+                + 2;
+            let budget = |n: u64| epochs(u32::try_from(n).expect("an epoch budget"));
+
+            // A settling probe lands on the splitter early in the stall,
+            // below where a slid floor would sit.
+            assert!(
+                c.run_until(epochs(3), |c| probes
+                    .iter()
+                    .any(|probe| chain_settled(c, splitter, *probe))),
+                "a settling probe must settle on the splitter while the stall stands",
+            );
+            // Observed now, so it landed no later than now: below the
+            // floor a stall of `k` skips would slide the window to.
+            let slid_floor = WeightedTimestamp::from_millis(
+                (stalled_at.inner() + k) * epoch_ms - RETENTION_HORIZON.as_secs() * 1000,
+            );
+            let observed = clock(c);
+            assert!(
+                observed < slid_floor,
+                "the settlement must land below where a slid floor would sit; observed at \
+                 {observed:?} against {slid_floor:?}",
+            );
+
+            let stall_end = stalled_at.saturating_add(k);
+            assert!(
+                c.run_until(budget(k + 4), |c| beacon_epoch(c)
+                    .is_some_and(|e| e >= stall_end)),
+                "the beacon must keep committing skip blocks through the stall; at {:?} \
+                 against {stall_end:?}",
+                beacon_epoch(c),
+            );
+            let state = c.beacon_state().expect("a committed beacon state");
+            assert_eq!(
+                state.boundaries[&splitter].last_live_epoch, last_live,
+                "a beacon committing only skips must seat no contribution",
+            );
+            let Some(PendingReshape::Split { admitted: held, .. }) =
+                state.pending_reshapes.get(&splitter)
+            else {
+                panic!("the split must survive the stall: its deadline moves with the skips");
+            };
+            assert_eq!(held.at, admitted, "a skip never moves the admission");
+            drop(state);
+            c.clear_drops();
+        },
+    );
     assert_fence_held(c, run.splitter, run.terminal_b, &run.probes);
     run.assert_conserved(c);
 }
@@ -134,9 +231,13 @@ pub fn split_straddler_atomic(c: &mut impl Cluster) {
 /// one-sided (the survivor applies one the splitter never settled).
 pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
     let mut cut = None;
-    let run = split_straddler_run(c, |c| {
-        cut = Some(isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR));
-    });
+    let run = split_straddler_run(
+        c,
+        |c| {
+            cut = Some(isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR));
+        },
+        |_, _| {},
+    );
     let cut = cut.expect("the fault seam runs before any straddler is submitted");
     let one_sided = straddler_one_sided_count(c, run.splitter, run.terminal_b, &run.probes);
     assert!(
@@ -290,7 +391,9 @@ fn straddler_world<C: Cluster>(
 /// for the caller to judge. `before_settling` runs once after the split is
 /// admitted (committees stable, splitter still live) and before the settling
 /// ticks are submitted — the seam a fault probe uses to install a rule keyed on
-/// the live committees.
+/// the live committees. `while_settling` runs once the settling ticks are
+/// submitted and before the gate is waited for, with their hashes — the
+/// seam a scenario uses to hold the beacon while the splitter settles.
 ///
 /// # Panics
 ///
@@ -299,6 +402,7 @@ fn straddler_world<C: Cluster>(
 pub fn split_straddler_run<C: Cluster>(
     c: &mut C,
     mut before_settling: impl FnMut(&mut C),
+    mut while_settling: impl FnMut(&mut C, &[TxHash]),
 ) -> StraddlerRun {
     let splitter = STRADDLER_SPLITTER;
     let (child_left, child_right) = splitter.children();
@@ -321,6 +425,7 @@ pub fn split_straddler_run<C: Cluster>(
     for (key, from, to) in setup.straddlers.iter().take(half) {
         probes.push(submit_straddler(c, &mut charges, key, *from, *to));
     }
+    while_settling(c, &probes);
 
     // Advance until the gate drains the splitter from `pending_reshapes`: the
     // settling ticks finalize on it in this window, and it then coasts to its

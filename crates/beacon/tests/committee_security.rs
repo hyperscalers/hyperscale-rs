@@ -38,9 +38,9 @@ use std::time::Instant;
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, PendingReshape,
-    Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, StakePoolId, ValidatorId,
-    ValidatorRecord, ValidatorStatus,
+    Admission, BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
+    PendingReshape, Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, StakePoolId,
+    ValidatorId, ValidatorRecord, ValidatorStatus,
 };
 
 // ─── The analysis note's chain (committee_security.py §2) ───────────────────
@@ -901,16 +901,16 @@ fn shuffle_skips_split_pending_shard() {
         if window.contains(&e) {
             // A live pending split: both TTL anchors are refreshed each
             // epoch — `last_asserted` emulates the trigger a splitting
-            // shard keeps folding, `admitted_at` outruns the readiness
-            // abandonment (an empty cohort is never ready, and the fold
-            // sweeps an unready split after `RESHAPE_READY_TTL_EPOCHS`)
+            // shard keeps folding, `admitted.ready_by` outruns the
+            // readiness abandonment (an empty cohort is never ready, and
+            // the fold sweeps an unready split once its deadline passes)
             // — while the empty cohort keeps the execution gate
             // unreachable.
             state.pending_reshapes.insert(
                 target,
                 PendingReshape::Split {
                     last_asserted: Epoch::new(e),
-                    admitted_at: Epoch::new(e),
+                    admitted: Admission::new(Epoch::new(e)),
                     cohort: BTreeMap::new(),
                     cohort_seed: Randomness::new([0xaa; 32]),
                     scheduled: None,

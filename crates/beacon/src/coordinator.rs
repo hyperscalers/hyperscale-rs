@@ -5925,6 +5925,68 @@ mod tests {
         assert_eq!(with, Epoch::new(99), "to its terminal cut minus a window");
     }
 
+    /// The retention floor pins the window a settled-window floor reaches
+    /// back to across Skip folds: the admission epoch, which a stall does
+    /// not move, so the certificates the attested window can still name
+    /// keep resolving their signing committees.
+    #[test]
+    fn retention_floor_holds_the_admission_window_across_skips() {
+        use hyperscale_types::{Admission, PendingReshape, RETENTION_HORIZON};
+
+        use crate::state::test_fixtures::net;
+        use crate::state::{ApplyEpochInput, apply_epoch};
+
+        let mut state = state_at(1000, 4);
+        state
+            .boundaries
+            .insert(ShardId::ROOT, boundary_live_at(1000));
+        let ed = state.chain_config.epoch_duration_ms;
+        let admitted = Epoch::new(995);
+        state.pending_reshapes.insert(
+            ShardId::ROOT,
+            PendingReshape::Split {
+                last_asserted: Epoch::new(1000),
+                admitted: Admission::new(admitted),
+                cohort: BTreeMap::new(),
+                cohort_seed: state.randomness,
+                scheduled: None,
+            },
+        );
+        for _ in 0..2 {
+            let next = state.current_epoch.next();
+            apply_epoch(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                next,
+                ApplyEpochInput::Skip,
+            );
+        }
+        assert!(
+            state.pending_reshapes.contains_key(&ShardId::ROOT),
+            "the skips defer the readiness deadline, so the split stands",
+        );
+
+        let head_ms = state.current_epoch.inner() * ed;
+        let floor = retention_floor(
+            &state,
+            WeightedTimestamp::from_millis(head_ms),
+            LocalTimestamp::from_millis(head_ms),
+        );
+        let admission_window =
+            state
+                .chain_config
+                .epoch_windows()
+                .epoch_for(WeightedTimestamp::from_millis(
+                    admitted.inner() * ed - RETENTION_HORIZON.as_secs() * 1000,
+                ));
+        assert!(
+            floor <= Epoch::new(admission_window.inner() - 1),
+            "the floor {floor:?} must sit at or below the admission's window {admission_window:?} \
+             minus one, two skips later",
+        );
+    }
+
     #[test]
     fn adopt_block_refreshes_topology_snapshot_and_emits_topology_changed() {
         let mut coord = fresh_coord();
