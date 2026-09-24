@@ -25,12 +25,13 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, BlockHeight, CROSSING_BUNDLE_WINDOW, DeclaredWork, Finalization,
-    FinalizationHash, Inclusion, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Probed, ProvisionHash,
-    Provisions, ShardId, StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, Verifiable, WeightedTimestamp, budget_admits_block, caps_admit_transaction,
-    evidence_admits_block, sweep_admits_block,
+    AbandonmentRecord, Anchor, BlockHash, BlockHeight, CROSSING_BUNDLE_WINDOW, DeclaredWork,
+    Finalization, FinalizationHash, Inclusion, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, Probed, ProvisionHash, Provisions, ShardId, StateClaim, SubstateKey,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    budget_admits_block, caps_admit_transaction, evidence_admits_block, state_claims_admit_block,
+    sweep_admits_block,
 };
 use hyperscale_vm_effects::CrossingLeaf;
 use hyperscale_vm_types::ProtocolHasher;
@@ -776,53 +777,82 @@ pub(crate) struct StateClaimsSection;
 /// What the claims admitted so far amount to.
 #[derive(Debug, Default)]
 pub(crate) struct StateClaimsFold {
-    /// The last admitted claim, which the next must follow.
-    pub(crate) previous: Option<StateClaim>,
-    /// How many have been admitted, against the block's cap.
-    pub(crate) count: usize,
+    /// The last admitted claim's anchor and its last key, which the
+    /// next claim must follow.
+    pub(crate) previous: Option<(Anchor, SubstateKey)>,
+    /// The bytes admitted so far, against the section's budget.
+    pub(crate) weight: usize,
+}
+
+impl StateClaimsFold {
+    /// Whether `claim` follows what the fold has admitted, by the
+    /// section's order rule: claims ascend by anchor, and claims at one
+    /// anchor carry disjoint keys in ascending order. One anchor's
+    /// readings are one sorted key list cut into claims, so no key is
+    /// read twice at one anchor and no proof is orphaned or duplicated.
+    pub(crate) fn in_order(&self, claim: &StateClaim) -> bool {
+        let Some((anchor, last)) = self.previous else {
+            return true;
+        };
+        let first = claim.cells.first().map(|(key, _)| *key);
+        anchor < claim.anchor || (anchor == claim.anchor && first.is_some_and(|key| last < key))
+    }
+
+    /// Whether the section still has room for `claim`.
+    pub(crate) fn fits(&self, claim: &StateClaim) -> bool {
+        state_claims_admit_block(self.weight.saturating_add(claim.wire_weight()))
+    }
 }
 
 impl Section for StateClaimsSection {
     type Item = StateClaim;
     type Fold = StateClaimsFold;
 
-    /// A well-formed claim, in its place in the section's ascending
-    /// order without repeats, within the block's cap.
+    /// A well-formed claim whose proof bears out every reading, in its
+    /// place in the section's order, within the section's budget.
     ///
-    /// The canonical order — within each claim and across them — means
-    /// one set of answers has one encoding; a claim naming no cell
-    /// answers nothing, so the cap is spent on answers a record can be
-    /// offered from. Whether the anchor and each reading are ones this
-    /// validator took for itself is the vote fence's question, not this
-    /// one: a claim carries nothing checkable in isolation.
+    /// The proof is walked here, so a bad one refuses the block on
+    /// every replica alike: the check is over the block's content and
+    /// the anchor the claim names, nothing this validator fetched.
+    /// Whether that anchor is a header this validator commit-proved is
+    /// the vote fence's question. The order rule gives one set of
+    /// answers one encoding, and the budget is spent by the byte, proof
+    /// included, so the decode cap on the count never binds first.
     fn admit(
         _ctx: &Admission<'_>,
         fold: &mut Self::Fold,
         claim: &StateClaim,
     ) -> Result<(), String> {
+        let at = || {
+            format!(
+                "state claim on {:?} at height {}",
+                claim.anchor.shard,
+                claim.anchor.height.inner()
+            )
+        };
         if !claim.is_well_formed() {
+            return Err(format!("{} is empty, over its cap, or out of order", at()));
+        }
+        claim
+            .verify()
+            .map_err(|err| format!("{} does not prove its readings: {err}", at()))?;
+        if !fold.in_order(claim) {
+            return Err(format!("{} repeats or precedes the one before it", at()));
+        }
+        let weight = fold.weight.saturating_add(claim.wire_weight());
+        if !state_claims_admit_block(weight) {
             return Err(format!(
-                "state claim {} is empty, over its cap, or out of order",
-                fold.count
+                "state claims weigh {weight} bytes, over the section's budget of \
+                 {MAX_STATE_CLAIMS_BYTES}"
             ));
         }
-        if fold
-            .previous
-            .as_ref()
-            .is_some_and(|previous| previous >= claim)
-        {
-            return Err(format!(
-                "state claim {} repeats or precedes the one before it",
-                fold.count
-            ));
-        }
-        if fold.count >= MAX_STATE_CLAIMS_PER_BLOCK {
-            return Err(format!(
-                "block carries more than {MAX_STATE_CLAIMS_PER_BLOCK} state claims"
-            ));
-        }
-        fold.previous = Some(claim.clone());
-        fold.count += 1;
+        let last = claim
+            .cells
+            .last()
+            .map(|(key, _)| *key)
+            .expect("a well-formed claim names a cell");
+        fold.previous = Some((claim.anchor, last));
+        fold.weight = weight;
         Ok(())
     }
 }

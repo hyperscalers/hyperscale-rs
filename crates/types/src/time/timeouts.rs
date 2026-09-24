@@ -116,9 +116,9 @@ const _: () = assert!(
 /// condition is correlated — a producer that cannot get one bundle
 /// through cannot get any through — so erring short costs a burst of
 /// licences against one block's
-/// [`MAX_STATE_CLAIMS_PER_BLOCK`](crate::MAX_STATE_CLAIMS_PER_BLOCK)
-/// exactly when a counterpart is already struggling, where erring long
-/// costs entries nobody will provision.
+/// [`MAX_STATE_CLAIMS_BYTES`](crate::MAX_STATE_CLAIMS_BYTES) exactly
+/// when a counterpart is already struggling, where erring long costs
+/// entries nobody will provision.
 pub const BUNDLE_WAIT: Duration =
     Duration::from_secs(EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS);
 

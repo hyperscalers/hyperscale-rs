@@ -8,14 +8,25 @@
 //! maximal value of its type, and a widened field fails this before it
 //! can quietly overrun the frame.
 
+use std::collections::BTreeMap;
+
 use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
+use hyperscale_jmt::{
+    Blake3Hasher, Key as JmtKey, LeafValue, MAX_SINGLE_CLAIM_PROOF_BYTES, MemoryStore, MultiProof,
+    NodeKey, Tree,
+};
+use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass, Anchor,
-    BlockHeight, CommittedAt, Deadline, Hash, Inclusion, LocalKey, MAX_ARTIFACT_BYTES,
-    MAX_ENVELOPE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_UNSETTLED_PER_BLOCK, ROUTE_PREFIX_BYTES,
-    RoutePrefix, SchemeId, ShardId, StateClaim, StateRoot, SubstateKey, TransactionEnvelope,
-    TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp, evidence_admits_block,
+    BlockHeight, CommittedAt, Deadline, Hash, LocalKey, MAX_ARTIFACT_BYTES, MAX_ENVELOPE_BYTES,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, ROUTE_PREFIX_BYTES, RoutePrefix,
+    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIMS_HEADROOM,
+    SchemeId, ShardId, StateClaim, StateRoot, SubstateKey, TransactionEnvelope, TxHash,
+    UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp, evidence_admits_block, shard_prefix_path,
 };
+
+type Jmt = Tree<Blake3Hasher, 1>;
 
 /// The widest envelope the caps admit: an artifact at its ceiling,
 /// every signature it may bind at the widest registered scheme, a
@@ -163,44 +174,183 @@ fn a_records_weight_bounds_its_encoding() {
     assert!(hbor_to_vec(&empty).expect("encodes").len() <= ABANDONMENT_RECORD_BYTES);
 }
 
-/// The per-cell figure the compile-time assertion prices state claims at
-/// bounds what a claim encodes, at its widest reading.
+/// A state tree of `leaves` cells for `shard`, spread across as many
+/// owners from a fixed seed, and the keys it holds.
 ///
-/// A presence carries a value hash and an absence does not, so the
-/// presence is what has to fit.
-#[test]
-fn a_claims_cells_encode_under_the_figure_the_frame_is_budgeted_at() {
-    /// The figure `limits.rs` prices a claim's cell at.
-    const CELL_BYTES: usize = 82;
-    /// The figure it prices a claim's own terms at.
-    const CLAIM_BYTES: usize = 64;
+/// Every key sits under the shard's prefix, as a shard's tree has it,
+/// and the tree is rooted there; the prefix is written into the owner's
+/// first byte, so the shard is at most eight deep.
+fn spread_tree(
+    shard: ShardId,
+    leaves: usize,
+    seed: u64,
+) -> (MemoryStore, StateRoot, Vec<SubstateKey>) {
+    let root_path = shard_prefix_path(shard);
+    let mut state = seed;
+    let mut next = move || {
+        // splitmix64: a fixed sequence, so the measurement is one figure.
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut random_key = move || {
+        let mut body = [0u8; 31];
+        for chunk in body.chunks_mut(8) {
+            let word = next().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+        let shard_first = root_path.as_bytes().first().copied().unwrap_or(0);
+        let keep = u8::try_from(root_path.len().min(8)).unwrap_or(8);
+        if keep > 0 {
+            let mask = 0xFFu8 << (8 - keep);
+            body[0] = (body[0] & !mask) | (shard_first & mask);
+        }
+        let mut local = [0u8; 16];
+        for chunk in local.chunks_mut(8) {
+            chunk.copy_from_slice(&next().to_le_bytes());
+        }
+        SubstateKey {
+            owner: Address::new(body, AddressClass::Component),
+            local: LocalKey(local),
+        }
+    };
+    let keys: Vec<SubstateKey> = (0..leaves).map(|_| random_key()).collect();
+    let mut store = MemoryStore::new();
+    let updates: BTreeMap<JmtKey, Option<LeafValue>> = keys
+        .iter()
+        .map(|key| {
+            let value = key.to_bytes().to_vec();
+            (
+                key.to_bytes(),
+                Some(LeafValue::new(jmt_value_hash(&value), value.len() as u64)),
+            )
+        })
+        .collect();
+    let result = Jmt::apply_updates_at(&store, None, 1, &shard_prefix_path(shard), &updates)
+        .expect("a fresh tree takes its first version");
+    let root = StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash));
+    store.apply(&result);
+    (store, root, keys)
+}
 
+/// A claim over `asked` against `shard`'s tree in `store` at version
+/// one, read off a real proof.
+fn claim_over(
+    store: &MemoryStore,
+    shard: ShardId,
+    root: StateRoot,
+    asked: &[SubstateKey],
+) -> StateClaim {
+    let jmt_keys: Vec<JmtKey> = asked.iter().map(SubstateKey::to_bytes).collect();
+    let proof = Jmt::prove(store, &NodeKey::new(1, shard_prefix_path(shard)), &jmt_keys)
+        .expect("every key proves against a held version");
+    let proof = MerkleInclusionProof::new(proof.encode());
+    let cells = proof
+        .inclusions(root, shard, asked)
+        .expect("the proof answers for its keys");
     let anchor = Anchor {
-        shard: ShardId::leaf(9, 300),
+        shard,
         height: BlockHeight::new(u64::MAX / 2),
-        state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+        state_root: root,
         ts: WeightedTimestamp::from_millis(u64::MAX / 2),
     };
-    let claim = |cells: usize| {
-        StateClaim::new(
-            anchor,
-            (0..cells).map(|at| {
-                (
-                    key(u8::try_from(at % 256).expect("masked")),
-                    Inclusion::Present([0xFF; 32]),
-                )
-            }),
-        )
-    };
+    StateClaim::new(anchor, cells, proof)
+}
+
+/// A claim's weight bounds its encoding, over its terms, every cell it
+/// carries and the proof of them.
+///
+/// Measured over real proofs at several widths, so a field moving from
+/// the fixed half into the cells cannot be absorbed by slack in the
+/// other, and the proof is priced as it encodes rather than guessed.
+#[test]
+fn a_claims_weight_bounds_its_encoding() {
+    let shard = ShardId::leaf(4, 5);
+    let (store, root, keys) = spread_tree(shard, 400, 7);
     for cells in [1usize, 2, 200] {
-        let encoded = hbor_to_vec(&claim(cells)).expect("a claim encodes");
+        let claim = claim_over(&store, shard, root, &keys[..cells]);
+        assert!(claim.verify().is_ok());
+        let encoded = hbor_to_vec(&claim).expect("a claim encodes").len();
         assert!(
-            encoded.len() <= CLAIM_BYTES + cells * CELL_BYTES,
-            "a claim of {cells} cells encodes to {} bytes, over the {} the frame budgets it at",
-            encoded.len(),
-            CLAIM_BYTES + cells * CELL_BYTES,
+            encoded <= claim.wire_weight(),
+            "a claim of {cells} cells encodes to {encoded} bytes, over the {} its weight claims",
+            claim.wire_weight(),
         );
     }
+    let one = claim_over(&store, shard, root, &keys[..1]);
+    let empty = StateClaim {
+        anchor: one.anchor,
+        cells: Capped::empty(),
+        proof: MerkleInclusionProof::new(Vec::new()),
+    };
+    assert!(hbor_to_vec(&empty).expect("encodes").len() <= STATE_CLAIM_BYTES);
+    assert_eq!(
+        one.wire_weight() - empty.wire_weight(),
+        STATE_CLAIM_CELL_BYTES + one.proof.as_bytes().len(),
+        "one cell more costs one cell and its proof",
+    );
+}
+
+/// The figure the claims budget is derived from, measured.
+///
+/// A tree of twenty thousand leaves under one leaf shard's prefix,
+/// spread across as many owners from a fixed seed; a thousand single
+/// keys proven against it, half present and half absent; each encoded
+/// as a one-cell claim; and the 99th percentile of those encodings is
+/// what `SINGLE_CELL_CLAIM_P99_BYTES` states: 769 bytes, against a
+/// median of 689. From it the budget is `MAX_STATE_CLAIMS_PER_BLOCK`
+/// such claims rounded up to 16 KiB, 208 KiB, which is the bound that
+/// binds today: the frame leaves 8,970,239 bytes. At that budget the
+/// section carries 277 single-cell claims at the p99, of which the
+/// decode cap admits 256.
+#[test]
+fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {
+    let shard = ShardId::leaf(1, 0);
+    let (store, root, keys) = spread_tree(shard, 20_000, 20_000);
+    let (_, _, absent) = spread_tree(shard, 500, 500);
+    let asked = keys.iter().step_by(40).take(500).chain(absent.iter());
+    let mut sizes: Vec<usize> = asked
+        .map(|key| {
+            let claim = claim_over(&store, shard, root, std::slice::from_ref(key));
+            assert!(claim.verify().is_ok());
+            hbor_to_vec(&claim).expect("a claim encodes").len()
+        })
+        .collect();
+    assert_eq!(sizes.len(), 1_000);
+    sizes.sort_unstable();
+    let p99 = sizes[sizes.len() * 99 / 100 - 1];
+    println!(
+        "single-cell claim: p50 {} p99 {p99} max {} bytes; budget {MAX_STATE_CLAIMS_BYTES} of \
+         {STATE_CLAIMS_HEADROOM} headroom",
+        sizes[sizes.len() / 2],
+        sizes[sizes.len() - 1],
+    );
+    assert_eq!(
+        p99, SINGLE_CELL_CLAIM_P99_BYTES,
+        "the measured p99 is what the constant states, so a change to the encoding or the \
+         method moves the budget through it",
+    );
+    let rounding = 16 * 1024;
+    assert!(
+        MAX_STATE_CLAIMS_BYTES < STATE_CLAIMS_HEADROOM / rounding * rounding,
+        "the measured bound binds, not the frame's headroom",
+    );
+    const {
+        assert!(
+            MAX_STATE_CLAIMS_PER_BLOCK * SINGLE_CELL_CLAIM_P99_BYTES <= MAX_STATE_CLAIMS_BYTES,
+            "while the measured bound binds, the decode cap's count of single-cell claims at the \
+             p99 fits the budget",
+        );
+    }
+    // The bound in `hyperscale_jmt` is read off the format, which is
+    // what the encoding above is; a claim cannot decode wider than it.
+    let widest = sizes[sizes.len() - 1];
+    assert!(widest < MAX_SINGLE_CLAIM_PROOF_BYTES);
+    let _: MultiProof =
+        MultiProof::decode(claim_over(&store, shard, root, &keys[..1]).proof.as_bytes())
+            .expect("a claim's proof decodes");
 }
 
 /// The budget is what bounds the section, not the name count: the names

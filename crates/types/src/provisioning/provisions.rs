@@ -361,9 +361,10 @@ impl Verify<&ProvisionsContext> for Provisions {
             .inclusions(ctx.anchor.state_root, source_shard, &keys)
             .map_err(|error| match error {
                 StateProofError::Malformed => ProvisionsVerifyError::MalformedProof,
-                StateProofError::MissingClaim | StateProofError::RootMismatch => {
-                    ProvisionsVerifyError::BadInclusion
-                }
+                StateProofError::MissingClaim
+                | StateProofError::RootMismatch
+                | StateProofError::ExtraClaim
+                | StateProofError::ReadingMismatch => ProvisionsVerifyError::BadInclusion,
             })?;
 
         for (entry, (_, inclusion)) in entries.iter().zip(&attested) {

@@ -112,8 +112,9 @@ pub struct ElidedCertifiedBlock {
     /// a verdict is composed on, so a hop that dropped them would hand
     /// back a block that cannot answer for itself.
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
-    /// The block's state claims, always inline: they are small, and the
-    /// receiver folds them at commit.
+    /// The block's state claims, always inline with their proofs: the
+    /// section is bounded by its own byte budget, and the receiver
+    /// checks and folds them from the block at commit.
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
     /// The crossings the block offers again, always inline: a bundle is
     /// built off the block for each, so a hop that dropped them would

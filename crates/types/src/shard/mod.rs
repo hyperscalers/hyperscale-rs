@@ -45,7 +45,6 @@ pub mod limits;
 pub mod load;
 pub mod manifest;
 pub mod proven_anchors;
-pub mod proven_cells;
 pub mod quorum_certificate;
 pub mod reshape;
 pub mod roots;

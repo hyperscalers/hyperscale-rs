@@ -161,6 +161,9 @@ pub struct Metrics {
     /// composed each: an entry, or the record leaf alone.
     pub reclaims_admitted: CounterVec,
     pub reclaim_probes_pending: Counter,
+    /// The bytes a committed block's state claims weigh, proofs
+    /// included.
+    pub state_claims_weight: Histogram,
     /// Fetch responses a requester's own check refused, by fetch kind and
     /// the check that refused them.
     pub fetch_responses_refused: CounterVec,
@@ -775,6 +778,16 @@ impl Metrics {
             )
             .unwrap(),
 
+            state_claims_weight: register_histogram!(
+                "hyperscale_state_claims_weight_bytes",
+                "Bytes a committed block's state claims weigh, proofs included",
+                vec![
+                    0.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 131_072.0, 262_144.0,
+                    1_048_576.0,
+                ]
+            )
+            .unwrap(),
+
             fetch_responses_refused: register_counter_vec!(
                 "hyperscale_fetch_responses_refused_total",
                 "Fetch responses refused by the requester's own check",
@@ -1102,6 +1115,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_reclaim_probe_pending(&self) {
         self.metrics.reclaim_probes_pending.inc();
+    }
+
+    fn record_state_claims_weight(&self, bytes: usize) {
+        self.metrics.state_claims_weight.observe(bytes as f64);
     }
 
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {

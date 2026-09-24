@@ -51,9 +51,6 @@ pub enum FetchIds {
     /// anchor the asker picked because it can verify it, so it moves
     /// forward rather than expiring.
     CrossingPulls(Vec<(Anchor, SubstateKey)>),
-    /// State-proof relays as `(anchor, key)` — the same question as
-    /// [`Self::StateProofs`], put to this shard's own committee.
-    RelayedStateProofs(Vec<(Anchor, SubstateKey)>),
     /// Departed shards' settled sets, by the terminal each is checked
     /// against.
     SettledTxs(Vec<TerminalEvidence>),

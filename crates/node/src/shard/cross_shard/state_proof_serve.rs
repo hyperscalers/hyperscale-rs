@@ -13,13 +13,10 @@ use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{PendingChain, ShardStorage, Substates};
-use hyperscale_types::network::request::{
-    GetCellsRequest, GetRelayedStateProofRequest, GetStateProofRequest,
-};
+use hyperscale_types::network::request::{GetCellsRequest, GetStateProofRequest};
 use hyperscale_types::network::response::{GetCellsResponse, GetStateProofResponse, RangeAnswer};
 use hyperscale_types::{
-    EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, ProvenCells,
-    entry_leaf_key,
+    EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, entry_leaf_key,
 };
 
 /// Serve an inbound state-proof query from the committed chain.
@@ -186,38 +183,6 @@ pub fn serve_cells_request<S: ShardStorage>(
             )
         },
     )
-}
-
-/// Relay a proof of another shard's state that this node fetched for
-/// itself, to a committee peer that could not obtain one.
-///
-/// Answers only from what is already held: this node has no copy of the
-/// counterpart's tree and cannot construct a proof of it. So a peer
-/// asking about an anchor this node never probed, or about keys no one
-/// proof of it covers, is answered `not_found` and rotates to a member
-/// whose probe did land there.
-///
-/// Passing the bytes on grants no trust. The requester checks them
-/// against the state root of the header it commit-proved for the height,
-/// so a relayed proof of any other tree fails there just as a
-/// counterpart's would.
-#[must_use]
-pub fn serve_relayed_state_proof_request(
-    proven_cells: &Arc<ProvenCells>,
-    req: &GetRelayedStateProofRequest,
-) -> GetStateProofResponse {
-    proven_cells
-        .relay(req.shard, req.height, &req.keys)
-        .map_or_else(
-            || {
-                record_fetch_response_sent("relayed_state_proof", 0);
-                GetStateProofResponse::not_found()
-            },
-            |proof| {
-                record_fetch_response_sent("relayed_state_proof", req.keys.len());
-                GetStateProofResponse::found(proof)
-            },
-        )
 }
 
 #[cfg(test)]

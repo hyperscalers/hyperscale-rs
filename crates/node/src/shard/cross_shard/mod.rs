@@ -27,7 +27,7 @@ pub use fetch::{
     CommittedTxBinding, CommittedTxFetch, CrossingPullBinding, ExecCertBinding, ExecCertFetch,
     FinalizationBinding, FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch,
     ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding,
-    StateProofFetch, StateProofRelayBinding,
+    StateProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
@@ -36,9 +36,7 @@ pub use provision_serve::serve_provision_request;
 use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
 pub use settled_txs_serve::{SettledTxsCache, serve_settled_txs_request};
-pub use state_proof_serve::{
-    serve_cells_request, serve_relayed_state_proof_request, serve_state_proof_request,
-};
+pub use state_proof_serve::{serve_cells_request, serve_state_proof_request};
 
 use crate::config::NodeConfig;
 use crate::fetch::FetchConfig;
@@ -65,11 +63,6 @@ pub struct CrossShardState {
     /// State-proof fetch against other shards' commit-proven headers
     /// (rotates through the anchor's committee).
     pub(crate) state_proof: StateProofFetch,
-    /// State-proof relay for a claim this validator has not proven,
-    /// asked of its own committee (rotates through it). Its own slot
-    /// rather than the one above, so a relay is not suppressed by a
-    /// counterpart-addressed fetch of the same cell that is failing.
-    pub(crate) relayed_state_proof: StateProofFetch,
     /// Settled-set fetch against departed shards' terminals (rotates
     /// through the terminal committee).
     pub(crate) settled_txs: SettledTxsFetch,
@@ -121,14 +114,6 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
-            relayed_state_proof: StateProofFetch::new(
-                "relayed_state_proof",
-                FetchConfig {
-                    max_in_flight: 256,
-                    max_ids_per_request: 64,
-                    parallel_chunks_per_tick: 2,
-                },
-            ),
             settled_txs: SettledTxsFetch::new(
                 "settled_txs",
                 FetchConfig {
@@ -161,7 +146,6 @@ impl CrossShardState {
             || self.local_provision.has_pending()
             || self.committed_tx.has_pending()
             || self.state_proof.has_pending()
-            || self.relayed_state_proof.has_pending()
             || self.settled_txs.has_pending()
             || self.crossing_pull.has_pending()
     }

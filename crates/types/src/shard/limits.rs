@@ -9,7 +9,7 @@
 //! limits down on a single node only degrades that node's responsiveness
 //! without reducing the protocol-wide load it has to keep up with.
 
-use hyperscale_jmt::MAX_PROOF_CLAIMS;
+use hyperscale_jmt::{MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES};
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
     MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS, VERIFY_WEIGHT,
@@ -293,17 +293,12 @@ const CELLS_ANSWER_FIXED_BYTES: usize = MAX_MERKLE_PROOF_LEN + 64 * 1024;
 /// proof at the decoder's cap still fits the frame that carries it.
 const _: () = assert!(MAX_CELLS_RESPONSE_BYTES + CELLS_ANSWER_FIXED_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
-/// Hard cap on the state claims a block can carry.
+/// The decode cap on the state claims a block can carry.
 ///
-/// One claim answers one fetch against one counterpart height; the
-/// proposer offers what its own fetches read and the rest waits a
-/// block. This bounds the section's bytes, and nothing else: the vote
-/// fence withholds the vote on the whole block, so a single claim no
-/// voter can check already couples every transaction beside it to a
-/// counterpart's silence, and no cap above one changes that. What
-/// bounds the coupling is the round timer, which prices a block held
-/// at the fence at the ordinary timeout rather than the progress
-/// window — see `has_own_work_at_round` in `hyperscale-shard`.
+/// A count and nothing more: the section is spent by the byte, proof
+/// included, against [`MAX_STATE_CLAIMS_BYTES`], and that is what the
+/// composer fills to and admission checks. A block whose claims are
+/// each a single cell at the measured size carries this many of them.
 pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
 
 /// Byte budget the abandonment records of one block share.
@@ -343,11 +338,70 @@ pub const UNSETTLED_TX_BYTES: usize = 160;
 /// costs.
 pub const ROUTE_PREFIX_BYTES: usize = size_of::<RoutePrefix>();
 
-/// Bytes one [`StateClaim`](crate::StateClaim) costs before its cells.
-const STATE_CLAIM_BYTES: usize = 64;
+/// Bytes one [`StateClaim`](crate::StateClaim) costs before its cells
+/// and its proof: the anchor, both length prefixes and the framing.
+pub const STATE_CLAIM_BYTES: usize = 64;
 
 /// Bytes one cell of a claim costs: the key and the reading of it.
-const STATE_CLAIM_CELL_BYTES: usize = 82;
+pub const STATE_CLAIM_CELL_BYTES: usize = 82;
+
+/// The measured 99th-percentile encoding of a one-cell claim: its
+/// terms, one cell and the proof of it, over a state tree of twenty
+/// thousand leaves spread across as many owners.
+///
+/// Measured by `wire_budget.rs`, which holds the constant to what it
+/// measures, so a change to the encoding or the method moves this and,
+/// through it, the section's budget.
+pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 769;
+
+/// What the frame leaves for the claims section once every other
+/// section of a proposal is at its cap.
+pub const STATE_CLAIMS_HEADROOM: usize = MAX_WIRE_MESSAGE_BYTES
+    - 1
+    - PROPOSAL_FIXED_BYTES
+    - MAX_TXS_PER_BLOCK * HASH_BYTES
+    - MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
+    - MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
+    - MAX_PROPOSAL_EVIDENCE_BYTES;
+
+/// The granularity the claims budget is rounded to.
+const STATE_CLAIMS_ROUNDING: usize = 16 * 1024;
+
+/// Byte budget the state claims of one block share, proofs included.
+///
+/// A full section carries the decode cap's count of single-cell claims
+/// at the measured size, unless the frame cannot hold that many, in
+/// which case it carries what the frame leaves and nothing else in the
+/// proposal is resized to make room. `wire_budget.rs` states which of
+/// the two binds.
+pub const MAX_STATE_CLAIMS_BYTES: usize = {
+    let measured = (MAX_STATE_CLAIMS_PER_BLOCK * SINGLE_CELL_CLAIM_P99_BYTES)
+        .div_ceil(STATE_CLAIMS_ROUNDING)
+        * STATE_CLAIMS_ROUNDING;
+    let headroom = STATE_CLAIMS_HEADROOM / STATE_CLAIMS_ROUNDING * STATE_CLAIMS_ROUNDING;
+    if measured < headroom {
+        measured
+    } else {
+        headroom
+    }
+};
+
+/// Whether a block may still carry claims weighing `weight` between
+/// them.
+///
+/// The one reading of the budget, so the composer that fills the
+/// section and the admission that checks it stop at the same place.
+#[must_use]
+pub const fn state_claims_admit_block(weight: usize) -> bool {
+    weight <= MAX_STATE_CLAIMS_BYTES
+}
+
+/// Any single-cell claim fits an empty section: the widest one-claim
+/// proof the wire format can write, under the claim's own terms.
+const _: () = assert!(
+    MAX_STATE_CLAIMS_BYTES
+        >= STATE_CLAIM_BYTES + STATE_CLAIM_CELL_BYTES + MAX_SINGLE_CLAIM_PROOF_BYTES
+);
 
 /// Bytes a hash-only entry of a manifest costs.
 const HASH_BYTES: usize = 32;
@@ -357,7 +411,7 @@ const HASH_BYTES: usize = 32;
 const PROPOSAL_FIXED_BYTES: usize = 64 * 1024;
 
 /// The widest a proposal can encode: every section at its own cap, and
-/// the record section at its byte budget.
+/// the record and claim sections at their byte budgets.
 ///
 /// The per-item figures above are upper bounds on the real encoding,
 /// which `wire_budget.rs` holds them to by encoding a maximal value of
@@ -368,8 +422,7 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
     + MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
     + MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
     + MAX_PROPOSAL_EVIDENCE_BYTES
-    + MAX_STATE_CLAIMS_PER_BLOCK
-        * (STATE_CLAIM_BYTES + MAX_PROOFS_PER_QUERY * STATE_CLAIM_CELL_BYTES);
+    + MAX_STATE_CLAIMS_BYTES;
 
 /// INV-WIRE-1: a proposal every section of which is at its cap still
 /// fits the frame that carries it. The transports drop an oversize

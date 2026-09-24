@@ -22,9 +22,9 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
-    LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction, TxHash, UnsettledTx,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    LocalTimestamp, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadySignal,
+    ReshapeTrigger, RevealChain, Round, ShardId, StateClaim, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
@@ -32,7 +32,7 @@ use tracing::debug;
 
 use crate::admission::{
     Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
-    RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
+    RecordsFold, RecordsSection, Section, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_each, record_reading, unwrapped,
 };
 use crate::chain_view::ChainView;
@@ -360,10 +360,16 @@ pub fn select_abandonment_records(
     admit_each::<RecordsSection<'_>, _>(ctx, fold, trimmed, |record| record).0
 }
 
-/// The proofs a block may carry of counterparts' cells: what
-/// [`StateClaimsSection`] admits, in the one order it carries them —
-/// ascending, without repeats, and no more than the block's cap, with
-/// the rest waiting a block.
+/// The claims a block may carry of counterparts' cells: what
+/// [`StateClaimsSection`] admits, in the one order it carries them,
+/// spent against the section's byte budget.
+///
+/// The candidates are sorted into the order rule and what it refuses is
+/// dropped. The first claim that does not fit is cut to the longest
+/// key prefix whose piece fits, that piece is carried and the section
+/// ends there: a claim is split by key, never dropped whole, and the
+/// composer offers the remainder at the next proposal once the commit
+/// retires what this block carried.
 #[must_use]
 pub fn select_state_claims(
     ctx: &Admission<'_>,
@@ -373,7 +379,34 @@ pub fn select_state_claims(
     let mut sorted = state_claims;
     sorted.sort_unstable();
     sorted.dedup();
-    admit_each::<StateClaimsSection, _>(ctx, fold, sorted, |bundle| bundle).0
+    let mut selected = Vec::new();
+    for claim in sorted {
+        if selected.len() >= MAX_STATE_CLAIMS_PER_BLOCK {
+            break;
+        }
+        if !fold.in_order(&claim) {
+            continue;
+        }
+        if StateClaimsSection::admit(ctx, fold, &claim).is_ok() {
+            selected.push(claim);
+            continue;
+        }
+        if fold.fits(&claim) {
+            continue;
+        }
+        let keys = claim.keys();
+        let piece = (1..keys.len()).rev().find_map(|kept| {
+            let piece = claim.restrict(|key| keys[..kept].contains(&key))?;
+            fold.fits(&piece).then_some(piece)
+        });
+        if let Some(piece) = piece
+            && StateClaimsSection::admit(ctx, fold, &piece).is_ok()
+        {
+            selected.push(piece);
+        }
+        break;
+    }
+    selected
 }
 
 /// Select provisions for inclusion: what [`ProvisionsSection`] admits
@@ -576,13 +609,16 @@ mod tests {
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CommittedAt, CommittedTxsRoot, Deadline, Hash,
         Inclusion, LocalKey, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE,
-        NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot, SubstateKey,
-        TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
+        MerkleInclusionProof, NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot,
+        SubstateKey, TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
+        state_claims_admit_block,
     };
 
     use super::*;
+    use crate::admission::admit_all;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
     use crate::commit_dedup::CommitDedupIndex;
+    use crate::validation::tests::wide_claims;
 
     /// Admission under `snapshot` at `anchor` for a chain that began at
     /// `origin`, with `txs` behind the parent and `dedup` committed.
@@ -1203,6 +1239,58 @@ mod tests {
         );
     }
 
+    /// The composer spends the section's bytes: the first claim that
+    /// does not fit is cut to the longest key prefix whose piece fits,
+    /// the piece passes admission, the section ends there, and the
+    /// remainder is a claim a next proposal carries.
+    #[test]
+    fn a_claim_past_the_budget_is_cut_to_its_longest_fitting_prefix() {
+        let (_, wide) = wide_claims(ShardId::ROOT);
+        let ctx = finalizations_against(CommitDedupIndex::new());
+        let mut fold = StateClaimsFold::default();
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, wide.clone());
+        assert!(!selected.is_empty() && selected.len() < wide.len());
+        assert!(state_claims_admit_block(
+            selected.iter().map(StateClaim::wire_weight).sum()
+        ));
+        let cut = selected.last().expect("something was carried");
+        let whole = &wide[selected.len() - 1];
+        assert_ne!(
+            cut, whole,
+            "the last claim carried is a piece of the one that did not fit"
+        );
+        assert!(
+            whole.keys().starts_with(&cut.keys()),
+            "cut to a prefix of its keys",
+        );
+        assert!(
+            !state_claims_admit_block(
+                selected[..selected.len() - 1]
+                    .iter()
+                    .map(StateClaim::wire_weight)
+                    .sum::<usize>()
+                    + whole.wire_weight()
+            ),
+            "the whole did not fit",
+        );
+        let mut checked = StateClaimsFold::default();
+        assert!(
+            admit_all::<StateClaimsSection>(&ctx.ctx(), &mut checked, &selected).is_ok(),
+            "what the composer selected passes admission",
+        );
+
+        let carried = cut.keys();
+        let remainder = whole
+            .restrict(|key| !carried.contains(&key))
+            .expect("the cut left something");
+        let mut next = StateClaimsFold::default();
+        assert_eq!(
+            select_state_claims(&ctx.ctx(), &mut next, vec![remainder.clone()]),
+            vec![remainder],
+            "the remainder rides the next proposal whole",
+        );
+    }
+
     /// A record read present licenses a late delivery, at whatever
     /// anchor the reading was taken, and nothing else does.
     ///
@@ -1228,6 +1316,7 @@ mod tests {
                     ts: ts(1_000),
                 },
                 [(record, inclusion)],
+                MerkleInclusionProof::dummy(),
             )
         };
 

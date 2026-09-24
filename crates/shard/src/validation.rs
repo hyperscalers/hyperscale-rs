@@ -471,7 +471,7 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
@@ -479,20 +479,21 @@ mod tests {
         test_principal,
     };
     use hyperscale_types::{
-        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
-        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline,
-        ExecutionOutcome, Finalization, Hash, Inclusion, LocalKey, MAX_INTENTS,
-        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
-        ProvisionEntry, Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad,
-        Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
-        TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
-        WitnessSources, test_utils,
+        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
+        BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, ExecutionOutcome,
+        Finalization, Hash, Inclusion, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
+        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
+        Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer,
+        SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange,
+        Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId,
+        ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+        state_claims_admit_block, test_utils,
     };
 
     use super::*;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
+    use crate::admission::{Section, StateClaimsFold, StateClaimsSection};
     use crate::commit_dedup::CommitDedupIndex;
 
     /// Admit `block`'s sections against `against`.
@@ -1136,29 +1137,46 @@ mod tests {
         }
     }
 
-    /// A claim against `ROOT` at `height`, answering for `keys`.
+    /// Claims at one anchor of `shard` wide enough that together they
+    /// outrun the section's budget: each reads two hundred cells of a
+    /// tree holding two thousand, over disjoint ascending ranges, so
+    /// the one that does not fit leaves room for a piece of itself.
+    /// Returns the tree's leaves beside them.
+    pub fn wide_claims(shard: ShardId) -> (Vec<SubstateKey>, Vec<StateClaim>) {
+        let leaves: Vec<SubstateKey> = (0u16..2_048)
+            .map(|at| SubstateKey {
+                owner: test_utils::test_prefix(u8::try_from(at / 256).expect("under 8")),
+                local: LocalKey([u8::try_from(at % 256).expect("masked"); 16]),
+            })
+            .collect();
+        let mut sorted = leaves.clone();
+        sorted.sort_unstable();
+        let claims: Vec<StateClaim> = sorted
+            .chunks(200)
+            .map(|asked| test_utils::proven_claim(shard, 3, &leaves, asked))
+            .collect();
+        let total: usize = claims.iter().map(StateClaim::wire_weight).sum();
+        assert!(
+            !state_claims_admit_block(total),
+            "the fixture's {total} bytes must outrun the budget",
+        );
+        (leaves, claims)
+    }
+
+    /// A claim against `ROOT` at `height`, answering absent for `keys`,
+    /// with a real proof of it.
     fn bundle_at(height: u64, keys: &[u8]) -> StateClaim {
-        StateClaim::new(
-            Anchor {
-                shard: ShardId::ROOT,
-                height: BlockHeight::new(height),
-                state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
-                ts: WeightedTimestamp::from_millis(height * 1_000),
-            },
-            keys.iter().map(|seed| {
-                let key = SubstateKey {
-                    owner: Address::new([*seed; 31], AddressClass::Component),
-                    local: LocalKey([*seed; 16]),
-                };
-                (key, Inclusion::Absent)
-            }),
-        )
+        let asked: Vec<SubstateKey> = keys
+            .iter()
+            .map(|seed| test_utils::test_key(*seed))
+            .collect();
+        test_utils::proven_claim(ShardId::ROOT, height, &[], &asked)
     }
 
     /// The section is bound to the header's root and held to one form:
     /// ascending without repeats, every bundle naming something. A
     /// second form of the same answers, or a root that does not commit
-    /// them, is refused before any proof is walked.
+    /// them, is refused.
     #[test]
     fn a_state_proof_section_is_held_to_its_root_and_form() {
         let held = |bundles: Vec<StateClaim>, root: StateClaimsRoot| {
@@ -1190,6 +1208,130 @@ mod tests {
         let err = held(empty.clone(), StateClaimsRoot::over(&empty))
             .expect_err("a bundle naming no key is refused");
         assert!(err.contains("empty"), "{err}");
+    }
+
+    /// A claim is checked from the block alone: one whose proof bears
+    /// out every reading under its anchor's root is admitted, and one
+    /// whose proof reconstructs another root, speaks for another
+    /// shard's tree, carries a key the claim does not read, or
+    /// disagrees with a reading is refused. A proof bit flipped fails
+    /// the header's root before the claim is walked, and the sealed
+    /// form keeps the claims and their root.
+    #[test]
+    fn a_state_claim_is_checked_from_the_block() {
+        let held = |bundles: Vec<StateClaim>| {
+            let root = StateClaimsRoot::over(&bundles);
+            let block = block_with_state_claims(bundles, root);
+            validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
+        };
+        let (present, absent) = (test_utils::test_key(1), test_utils::test_key(2));
+        let claim = test_utils::proven_claim(ShardId::ROOT, 3, &[present], &[present, absent]);
+        assert!(held(vec![claim.clone()]).is_ok());
+
+        let mut other_root = claim.clone();
+        other_root.anchor.state_root = StateRoot::from_raw(Hash::from_bytes(b"another"));
+        let err = held(vec![other_root]).expect_err("a proof of another root is refused");
+        assert!(err.contains("does not prove"), "{err}");
+
+        let mut other_shard = claim.clone();
+        other_shard.anchor.shard = ShardId::leaf(1, 1);
+        let err = held(vec![other_shard]).expect_err("a proof of another shard's tree is refused");
+        assert!(err.contains("does not prove"), "{err}");
+
+        let extra = StateClaim::new(
+            claim.anchor,
+            [(present, claim.reading(present).unwrap())],
+            claim.proof.clone(),
+        );
+        let err = held(vec![extra]).expect_err("a proof claiming a key the claim does not read");
+        assert!(err.contains("does not prove"), "{err}");
+
+        let mut disagreeing = claim.clone();
+        disagreeing.cells = Capped::new(vec![
+            (present, Inclusion::Absent),
+            (absent, Inclusion::Absent),
+        ])
+        .expect("two cells");
+        let err = held(vec![disagreeing]).expect_err("a reading the proof does not bear out");
+        assert!(err.contains("does not prove"), "{err}");
+
+        let mut flipped = claim.clone();
+        let mut bytes = flipped.proof.as_bytes().to_vec();
+        bytes[0] ^= 0x80;
+        flipped.proof = MerkleInclusionProof::new(bytes);
+        let block = block_with_state_claims(
+            vec![flipped],
+            StateClaimsRoot::over(std::slice::from_ref(&claim)),
+        );
+        let err = validate_roots_commit_sections(&block)
+            .expect_err("a proof bit flipped under the honest root fails the root");
+        assert!(err.contains("does not commit"), "{err}");
+
+        let live = block_with_state_claims(vec![claim.clone()], StateClaimsRoot::over(&[claim]));
+        let sealed = live.clone().into_sealed();
+        assert_eq!(sealed.state_claims(), live.state_claims());
+        assert!(validate_roots_commit_sections(&sealed).is_ok());
+        assert!(admit(&plain(), &sealed).is_ok());
+    }
+
+    /// The section's order rule: claims ascend by anchor, and claims at
+    /// one anchor carry disjoint keys in ascending order.
+    #[test]
+    fn the_claim_order_rule_has_three_cases() {
+        let held = |bundles: Vec<StateClaim>| {
+            let root = StateClaimsRoot::over(&bundles);
+            let block = block_with_state_claims(bundles, root);
+            validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
+        };
+        let key = test_utils::test_key;
+        let at = |height: u64, asked: &[SubstateKey]| {
+            test_utils::proven_claim(ShardId::ROOT, height, &[key(1), key(3)], asked)
+        };
+        assert!(
+            held(vec![at(3, &[key(1), key(2)]), at(3, &[key(3), key(4)])]).is_ok(),
+            "disjoint ascending claims at one anchor are admitted",
+        );
+        let err = held(vec![at(3, &[key(1), key(2)]), at(3, &[key(2), key(3)])])
+            .expect_err("two claims at one anchor reading one key are refused");
+        assert!(err.contains("repeats or precedes"), "{err}");
+        let err = held(vec![at(3, &[key(1), key(2)]), at(3, &[key(1)])])
+            .expect_err("a claim at one anchor below the last key is refused");
+        assert!(err.contains("repeats or precedes"), "{err}");
+        let err = held(vec![at(4, &[key(1)]), at(3, &[key(2)])])
+            .expect_err("claims at two anchors out of order are refused");
+        assert!(err.contains("repeats or precedes"), "{err}");
+    }
+
+    /// The section is spent by the byte, proof included: the claim that
+    /// takes the weight past the budget is refused, however few claims
+    /// stand before it.
+    #[test]
+    fn a_claims_section_past_its_budget_is_refused() {
+        let (leaves, wide) = wide_claims(ShardId::ROOT);
+        let mut fold = StateClaimsFold::default();
+        let mut carried = 0usize;
+        let mut refused = None;
+        for claim in &wide {
+            match StateClaimsSection::admit(&plain().ctx(), &mut fold, claim) {
+                Ok(()) => carried += 1,
+                Err(err) => {
+                    refused = Some(err);
+                    break;
+                }
+            }
+        }
+        let err = refused.expect("the wide claims outrun the budget");
+        assert!(err.contains("over the section's budget"), "{err}");
+        assert!(
+            carried > 0 && carried < wide.len(),
+            "{carried} of {} carried",
+            wide.len()
+        );
+        assert!(state_claims_admit_block(fold.weight));
+        assert!(!state_claims_admit_block(
+            fold.weight + wide[carried].wire_weight()
+        ));
+        drop(leaves);
     }
 
     /// The figures of a name reaching one route under each departed

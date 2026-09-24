@@ -22,11 +22,10 @@ use hyperscale_storage::CrossingLeaves;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight,
     CROSSING_BUNDLE_WINDOW, CounterpartMirror, ExecutionCertificate, Inclusion,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells,
-    SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey, TerminalEvidence,
-    TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK,
+    MerkleInclusionProof, Probed, ProvenAnchors, SettledTxSet, ShardId, ShardTrie, Spoken,
+    StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash,
+    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher, Terms,
@@ -467,7 +466,7 @@ pub struct Committed {
 
 /// What this validator holds to offer in a block it proposes.
 pub struct Offers {
-    /// Readings its own fetches took that no block has carried yet, in
+    /// Claims its own fetches proved that no block has carried yet, in
     /// the one order a block carries them.
     pub state_claims: Vec<StateClaim>,
     /// The records it has evidence for and has not yet written down.
@@ -505,27 +504,18 @@ pub struct Counterparts {
     /// here would have chosen.
     pub(crate) proven_anchors: Arc<ProvenAnchors>,
 
-    /// What this validator's own fetches have proven of counterparts'
-    /// cells, shared with the shard coordinator's vote fence and with
-    /// the state-proof server that relays a peer the bytes.
-    ///
-    /// Written here because a fetch lands here, and read there because
-    /// a block states a reading rather than proving it. Kept apart from
-    /// the mirror above for the reason stated on
-    /// [`ProvenCells`]: a reading licenses this validator's vote and
-    /// composes nothing.
-    pub(crate) proven_cells: Arc<ProvenCells>,
-
-    /// The readings this validator's own fetches took that answered,
+    /// The claims this validator's own fetches proved that answered,
     /// each with the transactions whose probes it spoke to, held to
     /// offer in a block this validator proposes: a claim is committed
-    /// content, folded by every replica at the same height, and the
-    /// fetch is only how the proposer came by the answer. A claim leaves
-    /// when a block carries it, or when every transaction it answered
-    /// for is gone. While it is here the question it answers is not put
-    /// again: what licenses that is narrower than the mirror, which
-    /// stays fed by committed content alone so two validators at one
-    /// committed height compose the same records.
+    /// content, checked and folded by every replica at the same height,
+    /// and the fetch is only how the proposer came by the proof. The
+    /// claims at one anchor are disjoint, in the form the section
+    /// carries them. A claim leaves by key as blocks carry its cells,
+    /// or whole when every transaction it answered for is gone. While
+    /// it is here the question it answers is not put again: what
+    /// licenses that is narrower than the mirror, which stays fed by
+    /// committed content alone so two validators at one committed
+    /// height compose the same records.
     fetched: BTreeMap<StateClaim, BTreeSet<TxHash>>,
 
     /// The escrow records this shard holds under its prefix, each still
@@ -602,7 +592,6 @@ impl Counterparts {
     pub(crate) fn holding(
         local_shard: ShardId,
         proven_anchors: Arc<ProvenAnchors>,
-        proven_cells: Arc<ProvenCells>,
         mirror: Arc<CounterpartMirror>,
         leaves: &CrossingLeaves,
     ) -> Self {
@@ -610,7 +599,6 @@ impl Counterparts {
             ledger: Ledger::new(local_shard),
             mirror,
             proven_anchors,
-            proven_cells,
             fetched: BTreeMap::new(),
             // Tombstones are passed over: a retired record asks its
             // consumer nothing, and what is left of it is a clock its
@@ -666,9 +654,29 @@ impl Counterparts {
     ) -> Committed {
         self.gc_settled_sets(topology_schedule, now);
         // A reading the chain now carries is everybody's: its answers
-        // are folded here, and nothing offers it again.
+        // are folded here, and nothing offers it again. Retired by key
+        // from every held claim at the anchor, so a claim another
+        // proposer cut differently leaves only what the block carried,
+        // and the remainder of a cut claim is offered whole.
+        let mut carried: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
         for claim in block.state_claims() {
-            self.fetched.remove(claim);
+            carried
+                .entry(claim.anchor)
+                .or_default()
+                .extend(claim.keys());
+        }
+        if !carried.is_empty() {
+            self.fetched = std::mem::take(&mut self.fetched)
+                .into_iter()
+                .filter_map(|(claim, speaks_for)| {
+                    let Some(keys) = carried.get(&claim.anchor) else {
+                        return Some((claim, speaks_for));
+                    };
+                    claim
+                        .restrict(|key| !keys.contains(&key))
+                        .map(|rest| (rest, speaks_for))
+                })
+                .collect();
         }
         let mut gone = Vec::new();
         self.cleaned.clear();
@@ -818,10 +826,9 @@ impl Counterparts {
     /// its prefix sits: on the shard that was to deliver it and on the
     /// shard the trie names for its owner now, which is the successor
     /// holding the departed chain's cells. Both are asked rather than
-    /// the trie's answer alone, because the vote fence checks a record
-    /// against the voter's own proof of the shard it names, and two
-    /// validators straddling the cut would otherwise prove different
-    /// shards and never both vote one record.
+    /// the trie's answer alone, because a departed shard may leave no
+    /// header past the lapse, and the successor's is the one a proof can
+    /// still be taken at.
     ///
     /// The cell is named from signed content and the counterpart shard
     /// alone, so nothing but the header and the proof is fetched.
@@ -1069,27 +1076,25 @@ impl Counterparts {
             .any(|claim| claim.anchor.shard == shard && claim.reading(key).is_some())
     }
 
-    /// Take what a fetched proof attests: hold it as proven, close the
-    /// questions it answers, and keep the reading to offer in a block
-    /// this validator proposes.
+    /// Take what a fetched proof attests: close the questions it
+    /// answers, and hold the claim it proves to offer in a block this
+    /// validator proposes.
     ///
-    /// The proof is walked once, on the way into [`ProvenCells`], and
-    /// what comes back is the reading. That is what a block carries and
-    /// what this validator's vote fence holds another proposer's block
-    /// to, so it is recorded whatever the ledger wanted — a proof a peer
-    /// relayed answers for a claim rather than for a probe, and the
-    /// ledger has no entry waiting on it.
-    ///
-    /// What the ledger did ask about is what is offered. The probes the
-    /// proof spoke to are marked answered, so the question is not put to
-    /// the same header again, and a reading that answered is kept
-    /// beside the transactions it answered for, which is what keeps the
-    /// question from being put to any header until a block carries it.
+    /// The proof is walked once, under the anchor's root, and what
+    /// comes back is the reading. What the ledger asked about is what
+    /// is offered: the probes the proof spoke to are marked answered,
+    /// so the question is not put to the same header again, and the
+    /// claim is kept beside the transactions it answered for, which is
+    /// what keeps the question from being put to any header until a
+    /// block carries it. The claim's proof is the fetched one cut down
+    /// to the keys the claim reads, and to the keys no held claim at
+    /// the anchor already covers, so what is offered is in the form
+    /// the section carries: one proof per claim, disjoint per anchor.
     pub(crate) fn on_proof_fetched(
         &mut self,
         anchor: Anchor,
-        keys: Vec<SubstateKey>,
-        proof: MerkleInclusionProof,
+        keys: &[SubstateKey],
+        proof: &MerkleInclusionProof,
     ) {
         let answered: Vec<Question> = self
             .probes
@@ -1102,7 +1107,7 @@ impl Counterparts {
                 probe.question
             })
             .collect();
-        let Some(inclusions) = self.proven_cells.record(anchor, keys, proof) else {
+        let Ok(inclusions) = proof.inclusions(anchor.state_root, anchor.shard, keys) else {
             tracing::warn!(
                 shard = ?anchor.shard,
                 height = anchor.height.inner(),
@@ -1119,9 +1124,8 @@ impl Counterparts {
         // worth neither. A probe fires from the deadline, and a lapse
         // opens a validity range past it, so the readings taken in
         // between are absences outside their window — true of the tree
-        // and mute about the question. Offering one spends a block's
-        // cap on a cell no record can be composed from, and holds every
-        // voter to a non-answer taken at one height.
+        // and mute about the question. Offering one spends the section
+        // on a cell no record can be composed from.
         let mut answering: BTreeSet<SubstateKey> = BTreeSet::new();
         let mut speaks_for: BTreeSet<TxHash> = BTreeSet::new();
         for question in &answered {
@@ -1148,12 +1152,44 @@ impl Counterparts {
         if answering.is_empty() {
             return;
         }
+        // A cell a held claim at this anchor already reads is not held
+        // twice; the transactions this proof spoke for lean on that
+        // claim instead.
+        let mut fresh = answering.clone();
+        for (held, held_for) in &mut self.fetched {
+            if held.anchor != anchor {
+                continue;
+            }
+            let covered: Vec<SubstateKey> = held
+                .keys()
+                .into_iter()
+                .filter(|key| answering.contains(key))
+                .collect();
+            if !covered.is_empty() {
+                held_for.extend(speaks_for.iter().copied());
+                for key in covered {
+                    fresh.remove(&key);
+                }
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let kept: Vec<SubstateKey> = fresh.iter().copied().collect();
+        let Ok(proof) = proof.restrict(&kept) else {
+            tracing::warn!(
+                shard = ?anchor.shard,
+                height = anchor.height.inner(),
+                "A fetched state proof cannot be cut to the cells it answers"
+            );
+            return;
+        };
         let cells = inclusions
             .iter()
             .copied()
-            .filter(|(key, _)| answering.contains(key));
+            .filter(|(key, _)| fresh.contains(key));
         self.fetched
-            .entry(StateClaim::new(anchor, cells))
+            .entry(StateClaim::new(anchor, cells, proof))
             .or_default()
             .extend(speaks_for);
     }
@@ -1541,15 +1577,11 @@ impl Counterparts {
         Vec::new()
     }
 
-    /// The readings this validator's own fetches took that no block has
-    /// carried yet, in the one order a block carries them, under the
-    /// block's cap.
+    /// The claims this validator's own fetches proved that no block has
+    /// carried yet, in the one order a block carries them. The section's
+    /// budget is the composer's to spend, and it cuts what does not fit.
     fn state_claims(&self) -> Vec<StateClaim> {
-        self.fetched
-            .keys()
-            .take(MAX_STATE_CLAIMS_PER_BLOCK)
-            .cloned()
-            .collect()
+        self.fetched.keys().cloned().collect()
     }
 
     /// Drop the claims no transaction they answered for still needs,
@@ -1818,7 +1850,6 @@ mod tests {
         let mut counterparts = Counterparts::holding(
             CONSUMER,
             Arc::clone(&anchors),
-            Arc::new(ProvenCells::default()),
             Arc::new(CounterpartMirror::default()),
             &CrossingLeaves::default(),
         );
@@ -1906,7 +1937,7 @@ mod tests {
             height: BlockHeight::new(8),
             ..anchor
         });
-        counterparts.on_proof_fetched(anchor, vec![record], proof);
+        counterparts.on_proof_fetched(anchor, &[record], &proof);
         assert!(
             counterparts.probe(&trie, now, &BTreeMap::new()).is_empty(),
             "and not at a newer header while the reading is held to offer",
@@ -1929,6 +1960,7 @@ mod tests {
                 &StateClaim {
                     anchor: at,
                     cells: Capped::new(vec![(record, Inclusion::Absent)]).expect("one cell"),
+                    proof: MerkleInclusionProof::dummy(),
                 },
                 &trie,
             );
@@ -1986,7 +2018,7 @@ mod tests {
         };
         anchors.record(anchor);
         assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
-        counterparts.on_proof_fetched(anchor, vec![record], proof);
+        counterparts.on_proof_fetched(anchor, &[record], &proof);
 
         // The record is there: the producer has not disposed of it, so
         // the question is worth putting again — and this reading is
@@ -2113,7 +2145,7 @@ mod tests {
         };
         anchors.record(anchor);
         assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
-        counterparts.on_proof_fetched(anchor, vec![record], proof);
+        counterparts.on_proof_fetched(anchor, &[record], &proof);
 
         // The commit's own pass over what is still wanted. Nothing here
         // names a transaction this ledger owes an outcome for, which is
@@ -2165,7 +2197,7 @@ mod tests {
         };
         anchors.record(anchor);
         assert_eq!(counterparts.probe(&trie, now, &BTreeMap::new()).len(), 1);
-        counterparts.on_proof_fetched(anchor, vec![record], proof);
+        counterparts.on_proof_fetched(anchor, &[record], &proof);
         counterparts.release_answered_fetches(&trie);
         assert!(
             counterparts
@@ -2184,6 +2216,7 @@ mod tests {
             &StateClaim {
                 anchor,
                 cells: Capped::new(vec![(record, Inclusion::Present([9; 32]))]).expect("one cell"),
+                proof: MerkleInclusionProof::dummy(),
             },
             &trie,
         );
@@ -2235,7 +2268,6 @@ mod tests {
         let mut counterparts = Counterparts::holding(
             PRODUCER,
             Arc::clone(&anchors),
-            Arc::new(ProvenCells::default()),
             Arc::new(CounterpartMirror::default()),
             &CrossingLeaves::default(),
         );
@@ -2290,7 +2322,6 @@ mod tests {
             let mut counterparts = Counterparts::holding(
                 CONSUMER,
                 Arc::new(ProvenAnchors::default()),
-                Arc::new(ProvenCells::default()),
                 Arc::new(CounterpartMirror::default()),
                 &CrossingLeaves::default(),
             );
@@ -2382,7 +2413,7 @@ mod tests {
             "and it asks after both answers at the one anchor",
         );
 
-        producer.on_proof_fetched(anchor, vec![claim, decline], proof);
+        producer.on_proof_fetched(anchor, &[claim, decline], &proof);
         producer.release_answered_fetches(&trie);
         let carried = producer.state_claims();
         assert_eq!(
@@ -2415,6 +2446,62 @@ mod tests {
         );
     }
 
+    /// A fetched proof is held as a claim over exactly the keys it
+    /// answered, with its proof cut to them, and the claim passes the
+    /// check a block's admission runs. A second fetch at the same anchor
+    /// overlapping it is held cut to the keys not yet held, so what is
+    /// offered at one anchor is disjoint.
+    #[test]
+    fn a_fetched_proof_is_held_as_a_claim_over_its_answering_keys() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let (mut producer, trie, anchors) = producing(2, deadline);
+        let (claim0, decline0) = (claim_of(0, deadline), consumer_decline(0, deadline));
+        let (claim1, decline1) = (claim_of(1, deadline), consumer_decline(1, deadline));
+        let now = deadline.at();
+        // One tree for both fetches, so both proofs reconstruct the
+        // one root the anchor names.
+        let (state_root, first) =
+            state_and_proof(CONSUMER, &[decline0], &[claim0, decline0, claim1]);
+        let (same_root, second) = state_and_proof(CONSUMER, &[decline0], &[claim1, decline1]);
+        assert_eq!(state_root, same_root);
+        let anchor = Anchor {
+            shard: CONSUMER,
+            height: BlockHeight::new(7),
+            state_root,
+            ts: now,
+        };
+        anchors.record(anchor);
+        let _ = producer.probe(&trie, now, &BTreeMap::new());
+
+        producer.on_proof_fetched(anchor, &[claim0, decline0, claim1], &first);
+        let held = producer.state_claims();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].keys(), {
+            let mut keys = vec![claim0, decline0, claim1];
+            keys.sort_unstable();
+            keys
+        });
+        assert_eq!(
+            held[0].verify(),
+            Ok(()),
+            "the proof covers exactly the claim's keys"
+        );
+
+        producer.on_proof_fetched(anchor, &[claim1, decline1], &second);
+        let held = producer.state_claims();
+        assert_eq!(held.len(), 2, "the overlap is held once");
+        let fresh = held
+            .iter()
+            .find(|claim| claim.keys() == vec![decline1])
+            .expect("the second fetch is held cut to the key the first did not cover");
+        assert_eq!(fresh.verify(), Ok(()));
+        let mut all: Vec<SubstateKey> = held.iter().flat_map(StateClaim::keys).collect();
+        let before = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), before, "no key is held twice at one anchor");
+    }
+
     /// A claim read present answers over a decline read beside it.
     ///
     /// Both cells present is a refusal rather than a preference, and the
@@ -2441,6 +2528,7 @@ mod tests {
                 (claim, Inclusion::Present([0xAB; 32])),
                 (decline, Inclusion::Present([0xCD; 32])),
             ],
+            MerkleInclusionProof::dummy(),
         );
         producer.fold_held(&both, &trie);
 

@@ -15,7 +15,6 @@ use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Intent, Release};
 use crate::shard::cross_shard::{
     CommittedTxBinding, CrossingPullBinding, ExecCertBinding, FinalizationBinding,
     LocalProvisionBinding, ProvisionBinding, SettledTxsBinding, StateProofBinding,
-    StateProofRelayBinding,
 };
 use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
@@ -148,9 +147,6 @@ where
             FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(intent.input(ids)),
             FetchIds::CrossingPulls(ids) => {
                 self.drive_fetch::<CrossingPullBinding>(intent.input(ids));
-            }
-            FetchIds::RelayedStateProofs(ids) => {
-                self.drive_fetch::<StateProofRelayBinding>(intent.input(ids));
             }
             FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(intent.input(ids)),
             FetchIds::BeaconProposals(ids) => {

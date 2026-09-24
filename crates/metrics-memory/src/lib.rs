@@ -294,6 +294,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("reclaim_probes_pending", None, 1);
     }
 
+    fn record_state_claims_weight(&self, bytes: usize) {
+        self.observe("state_claims_weight", None, bytes as f64);
+    }
+
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {
         self.inc("fetch_responses_refused", Some(kind), 1);
         self.inc(

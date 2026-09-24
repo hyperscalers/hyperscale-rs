@@ -62,10 +62,10 @@ use hyperscale_types::{
     CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
     FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, MerkleInclusionProof, Mode,
-    Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions, SettledSetVerdict, SettledTxSet,
-    ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
-    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
+    Movement, PriceTable, ProvenAnchors, Provisions, SettledSetVerdict, SettledTxSet, ShardId,
+    ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
     derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::{Kind, ProtocolHasher, Terms};
@@ -589,7 +589,6 @@ impl ExecutionCoordinator {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         )
     }
@@ -625,7 +624,6 @@ impl ExecutionCoordinator {
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizationStore>,
         proven_anchors: Arc<ProvenAnchors>,
-        proven_cells: Arc<ProvenCells>,
         mirror: Arc<CounterpartMirror>,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
@@ -655,7 +653,6 @@ impl ExecutionCoordinator {
             counterparts: Counterparts::holding(
                 local_shard,
                 proven_anchors,
-                proven_cells,
                 mirror,
                 &recovered.crossing_leaves,
             ),
@@ -2921,14 +2918,6 @@ impl ExecutionCoordinator {
         &self.counterparts.proven_anchors
     }
 
-    /// The shared mirror of what this validator has proven of
-    /// counterparts' cells, which the shard coordinator owns and this
-    /// coordinator's fetches fill.
-    #[must_use]
-    pub const fn proven_cells(&self) -> &Arc<ProvenCells> {
-        &self.counterparts.proven_cells
-    }
-
     /// Ask each silent counterpart what it holds, against the trie that
     /// says who was party to each transaction.
     fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
@@ -2941,8 +2930,8 @@ impl ExecutionCoordinator {
     pub fn on_proof_fetched(
         &mut self,
         anchor: Anchor,
-        keys: Vec<SubstateKey>,
-        proof: MerkleInclusionProof,
+        keys: &[SubstateKey],
+        proof: &MerkleInclusionProof,
     ) {
         self.counterparts.on_proof_fetched(anchor, keys, proof);
     }
@@ -7580,7 +7569,6 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -8239,7 +8227,6 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -8294,7 +8281,6 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -8369,7 +8355,6 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -8444,7 +8429,6 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -8520,7 +8504,6 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
         assert!(
@@ -9059,7 +9042,7 @@ mod tests {
         // counterpart's header at `ts` has committed to there itself.
         state.committed_ts = state.committed_ts.max(ts);
         let opened = state.on_committed_remote_header(schedule, shard);
-        (StateClaim::new(anchor, cells), opened)
+        (StateClaim::new(anchor, cells, proof), opened)
     }
 
     /// Feed `state` the proof its own fetch brings back for `claim`,
@@ -9072,7 +9055,7 @@ mod tests {
     ) {
         let keys = claim.keys();
         let (_, proof) = state_and_proof(claim.anchor.shard, present, &keys);
-        state.on_proof_fetched(claim.anchor, keys, proof);
+        state.on_proof_fetched(claim.anchor, &keys, &proof);
     }
 
     /// Commit a block on [`HOME`] carrying `bundles` — the seam every

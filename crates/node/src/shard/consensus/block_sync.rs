@@ -712,12 +712,14 @@ mod tests {
     }
 
     /// A block's state claims are the one body list beside the records
-    /// that a manifest holds by value, and every replica folds them at
-    /// commit; a serving peer that drops or forges them hands back a
-    /// block whose answers are not the chain's.
+    /// that a manifest holds by value, and every replica checks and
+    /// folds them at commit; a serving peer that drops or forges them,
+    /// proof included, hands back a block whose answers are not the
+    /// chain's. The sealed form carries the same claims under the same
+    /// root.
     #[test]
     fn validate_binds_state_claims_in_both_directions() {
-        use hyperscale_types::{Anchor, Inclusion, StateClaim, StateRoot};
+        use hyperscale_types::{Anchor, Inclusion, MerkleInclusionProof, StateClaim, StateRoot};
         let bundles = vec![StateClaim::new(
             Anchor {
                 shard: ShardId::leaf(1, 0),
@@ -726,6 +728,7 @@ mod tests {
                 ts: WeightedTimestamp::from_millis(3_000),
             },
             [(stub_abort_charge(1).vault, Inclusion::Absent)],
+            MerkleInclusionProof::new(b"proof".to_vec()),
         )];
         let root = Verified::<StateClaimsRoot>::compute(&bundles).into_inner();
         let live = |state_claims: Vec<StateClaim>| Block::Live {
@@ -755,11 +758,27 @@ mod tests {
             "state_claims_root_mismatch"
         );
 
+        let mut forged = bundles.clone();
+        forged[0].proof = MerkleInclusionProof::new(b"other".to_vec());
+        let forged = live(forged);
+        let qc = qc_for(&forged);
+        assert_eq!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(forged, qc)).unwrap_err(),
+            "state_claims_root_mismatch",
+            "a proof altered in flight fails the root"
+        );
+
         let carried = live(bundles);
         let qc = qc_for(&carried);
+        let sealed = carried.clone().into_sealed();
         assert!(
-            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc)).is_ok(),
-            "the proofs the header commits are the ones it accepts"
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc.clone()))
+                .is_ok(),
+            "the claims the header commits are the ones it accepts"
+        );
+        assert!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(sealed, qc)).is_ok(),
+            "and the sealed form recomputes the same root"
         );
     }
 

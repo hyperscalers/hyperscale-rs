@@ -18,8 +18,7 @@
 //! the fetch key (no id-set to enumerate).
 
 use hyperscale_types::{
-    Anchor, MessageClass, PredecessorTerminal, ShardId, SubstateKey, TerminalEvidence, TxHash,
-    ValidatorId,
+    MessageClass, PredecessorTerminal, ShardId, TerminalEvidence, TxHash, ValidatorId,
 };
 
 use crate::FetchIds;
@@ -80,33 +79,6 @@ pub enum FetchRequest {
         /// Transactions whose membership in that chain's committed set
         /// is outstanding.
         tx_hashes: Vec<TxHash>,
-        /// Always `None` for this variant; see variant-level doc.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// A state proof this shard's own committee relays, for a cell a
-    /// block claims that this validator has not proven for itself.
-    ///
-    /// Routing shard is the local one: what is wanted is not a
-    /// counterpart's state but a peer's copy of a proof of it. Every
-    /// member probes, so most hold the bytes already, and the proposer
-    /// of the block making the claim certainly does. `preferred` is
-    /// `None` for that reason — any member that probed the anchor
-    /// answers, and health-weighted rotation is what moves off one that
-    /// did not.
-    ///
-    /// Distinct from [`Self::StateProof`] rather than a routing flag on
-    /// it, because a fetch is keyed by its ids: the two ask different
-    /// committees the same `(anchor, key)`, and one slot would hold
-    /// whichever asked first and never rotate to the other.
-    RelayedStateProof {
-        /// The commit-proven state the proof reconstructs.
-        anchor: Anchor,
-        /// The keys whose presence or absence under it is wanted.
-        keys: Vec<SubstateKey>,
-        /// Always the local shard for this variant.
-        shard: ShardId,
         /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.

@@ -15,9 +15,8 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    Anchor, BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal,
-    ShardId, SubstateKey, TerminalEvidence, TopologySchedule, TransactionStatus, TxHash,
-    ValidatorId, Verified,
+    BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal, ShardId,
+    TerminalEvidence, TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -29,7 +28,7 @@ use crate::shard::commit::{
     QcOnlyPending, make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
-use crate::shard::cross_shard::{CommittedTxBinding, SettledTxsBinding, StateProofRelayBinding};
+use crate::shard::cross_shard::{CommittedTxBinding, SettledTxsBinding};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -654,31 +653,6 @@ where
                         class,
                     });
                 }
-            }
-            FetchRequest::RelayedStateProof {
-                anchor,
-                keys,
-                shard,
-                preferred,
-                class,
-            } => {
-                let wanted: BTreeSet<(Anchor, SubstateKey)> =
-                    keys.into_iter().map(|key| (anchor, key)).collect();
-                // A deferral names what every block deferred at this
-                // anchor is waiting on, not what one of them wants, so a
-                // cell the fetch still holds under it and the ask no
-                // longer names is one nobody is waiting on — the block
-                // that claimed it was discarded, or this validator's own
-                // probe proved the cell first. Nothing else retires
-                // these ids: a committee that never holds the proof
-                // would pin them for good.
-                self.abandon_unwanted::<StateProofRelayBinding>(&wanted, |id| id.0 == anchor);
-                self.drive_fetch::<StateProofRelayBinding>(FetchInput::Request {
-                    ids: wanted.into_iter().collect(),
-                    shard,
-                    preferred,
-                    class,
-                });
             }
         }
     }

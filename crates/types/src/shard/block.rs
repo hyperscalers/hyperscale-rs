@@ -127,9 +127,10 @@ pub enum Block {
         /// Committed via the header's `abandonment_root`.
         abandonment_records: Arc<Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>>,
         /// What this block commits about counterparts' chains: cells
-        /// their commit-proven state holds, proved against their
-        /// headers. Committed via the header's `state_claims_root` and
-        /// folded by every replica at commit.
+        /// their commit-proven state holds, each claim carrying the
+        /// proof of its readings under its anchor's root. Committed via
+        /// the header's `state_claims_root`, checked from the block at
+        /// admission and folded by every replica at commit.
         state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
@@ -158,9 +159,11 @@ pub enum Block {
         /// composed on this evidence however long after the terminal it
         /// came from, which is the whole reason it is written down.
         abandonment_records: Arc<Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>>,
-        /// Proofs of counterparts' cells, retained through sealing like
-        /// the records: a replay of any depth re-folds its answers off
-        /// the block it reads, and the root binds at every stage.
+        /// Claims about counterparts' cells, retained through sealing
+        /// with their proofs, like the records: a replay of any depth
+        /// re-folds its answers off the block it reads, the root binds
+        /// at every stage, and no stage has a claim form without its
+        /// proof.
         state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold

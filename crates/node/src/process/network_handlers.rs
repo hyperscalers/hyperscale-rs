@@ -790,9 +790,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     use hyperscale_types::network::request::{
         Anchored, GetBlockRequest, GetCellsRequest, GetCommittedTxsRequest,
         GetInstanceRecordsRequest, GetPackageArtifactsRequest, GetProvisionsRequest,
-        GetRelayedStateProofRequest, GetRemoteHeadersRequest, GetSettledTxsRequest,
-        GetStateProofRequest, GetStateRangeRequest, GetTransactionsRequest,
-        GetWitnessHistoryRequest,
+        GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest, GetStateRangeRequest,
+        GetTransactionsRequest, GetWitnessHistoryRequest,
     };
     use hyperscale_types::network::response::{
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
@@ -806,8 +805,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::shard::cross_shard::{
         CommittedTxsCache, SettledTxsCache, serve_cells_request, serve_committed_txs_request,
         serve_execution_certs_request, serve_finalizations_request, serve_local_provisions_request,
-        serve_provision_request, serve_relayed_state_proof_request, serve_remote_headers_request,
-        serve_settled_txs_request, serve_state_proof_request,
+        serve_provision_request, serve_remote_headers_request, serve_settled_txs_request,
+        serve_state_proof_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1236,21 +1235,6 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetCellsRequest>(shard, move |req| {
             serve_cells_request(&pending_chain, &req)
-        });
-
-    // ── relayed_state_proof.request → a peer's copy of a proof ────
-    //
-    // A committee member fencing a vote on a block's state claim needs a
-    // proof of the counterpart's cell and could not obtain one from the
-    // counterpart itself. Anything this node fetched for its own probes
-    // is passed on; nothing is constructed, since this node holds no
-    // copy of that shard's tree. The requester checks the bytes against
-    // the root it commit-proved, so relaying grants no trust.
-    let proven_cells = Arc::clone(&io.caches.proven_cells);
-    process
-        .network
-        .register_request_handler::<GetRelayedStateProofRequest>(shard, move |req| {
-            serve_relayed_state_proof_request(&proven_cells, &req)
         });
 
     // ── beacon.proposal.request → process-level serve cache ──────

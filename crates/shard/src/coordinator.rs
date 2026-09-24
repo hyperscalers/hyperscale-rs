@@ -14,13 +14,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_core::{
-    Action, CommitSource, FeeDemand, FetchIds, FetchRequest, ProtocolEvent, TimerId,
-};
+use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
     FinalizationHash, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr,
-    ProposerTimestamp, ProvenAnchors, ProvenCells, ProvisionHash, ReadySignal, ReshapeThresholds,
+    ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
     ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
     SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, derive_reshape_trigger,
     ready_signal_window,
@@ -149,7 +147,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_metrics::record_halt_recovery_offer_refused;
+use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{CommittedProvisions, RecoveredState};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
@@ -554,11 +552,11 @@ pub struct ShardCoordinator {
     precut_generation: u64,
 
     /// The generations of everything the fence reads — the counterpart
-    /// mirror's, the proven anchors', the proven cells', the pre-cut
-    /// answers' — at the last re-drive of the votes the fence deferred.
-    /// Compared once per dispatch, so a vote deferred on any of them is
-    /// re-driven by whatever advanced it.
-    fence_seen: (u64, u64, u64, u64),
+    /// mirror's, the proven anchors', the pre-cut answers' — at the last
+    /// re-drive of the votes the fence deferred. Compared once per
+    /// dispatch, so a vote deferred on any of them is re-driven by
+    /// whatever advanced it.
+    fence_seen: (u64, u64, u64),
 
     /// What counterparts have said about the transactions legs here
     /// issued for, as the execution coordinator mirrored and folded
@@ -581,16 +579,6 @@ pub struct ShardCoordinator {
     /// anchor. One mirror, so the fence cannot accept a bundle at an
     /// anchor the prober would not have chosen.
     proven_anchors: Arc<ProvenAnchors>,
-
-    /// The counterpart cells this validator has proven for itself, for
-    /// the state-claim check: a block states a reading, and the voter
-    /// holds it to the one it took.
-    ///
-    /// Owned here and written by the execution coordinator, whose
-    /// fetches are where a reading comes from, and read by the
-    /// state-proof server, which relays a peer the proof one was taken
-    /// from.
-    proven_cells: Arc<ProvenCells>,
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -778,10 +766,9 @@ impl ShardCoordinator {
             chain_origin: recovered.chain_origin,
             precut: Precut::succeeding(recovered.predecessors),
             precut_generation: 0,
-            fence_seen: (0, 0, 0, 0),
+            fence_seen: (0, 0, 0),
             mirror: Arc::new(CounterpartMirror::new()),
             proven_anchors: Arc::new(ProvenAnchors::new()),
-            proven_cells: Arc::new(ProvenCells::new()),
         }
     }
 
@@ -1146,14 +1133,6 @@ impl ShardCoordinator {
         &self.proven_anchors
     }
 
-    /// The cells this validator has proven, for the execution
-    /// coordinator to write what its fetches attest and the state-proof
-    /// server to relay the bytes they came from.
-    #[must_use]
-    pub const fn proven_cells(&self) -> &Arc<ProvenCells> {
-        &self.proven_cells
-    }
-
     /// The committed-provision window, which the provisions coordinator
     /// reads at its receipt seam.
     ///
@@ -1177,8 +1156,6 @@ impl ShardCoordinator {
     fn retire_proven_anchors(&self) {
         self.proven_anchors
             .retire_below(self.committed_block_anchor_wt);
-        self.proven_cells
-            .retire_below(self.committed_block_anchor_wt);
     }
 
     /// The evidence a vote is fenced on, borrowed for one judgment.
@@ -1186,117 +1163,15 @@ impl ShardCoordinator {
         VoteFence {
             mirror: &self.mirror,
             proven_anchors: &self.proven_anchors,
-            proven_cells: &self.proven_cells,
             precut: &self.precut,
             cut: self.chain_origin.anchor_wt,
             local_shard: self.local_shard,
         }
     }
 
-    /// Widen a deferral's relay asks to the cells every deferred block
-    /// at those anchors is waiting on.
-    ///
-    /// The relay binding retires by anchor: an ask states the whole
-    /// pending set under it, so a second block deferring at an anchor a
-    /// first already asked about would cancel the first's in-flight ids
-    /// and leave it waiting on a proof nobody is fetching. What an
-    /// anchor is waiting on is the union across the blocks deferred at
-    /// it, which is what an ask has to name for that retirement to be
-    /// the truth. Anchors this deferral does not name are left alone,
-    /// since the retirement is scoped to the anchor asked about.
-    fn relay_asks_across_deferred(
-        &self,
-        judged: BlockHash,
-        mut wanted: Vec<Action>,
-    ) -> Vec<Action> {
-        let anchors: BTreeSet<Anchor> = wanted
-            .iter()
-            .filter_map(|action| match action {
-                Action::Fetch(FetchRequest::RelayedStateProof { anchor, .. }) => Some(*anchor),
-                _ => None,
-            })
-            .collect();
-        if anchors.is_empty() {
-            return wanted;
-        }
-        let fence = self.vote_fence();
-        let mut beside: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
-        for pending in self.pending_blocks.iter() {
-            if !pending.awaiting_counterpart() || pending.header().hash() == judged {
-                continue;
-            }
-            let Some(block) = pending.block() else {
-                continue;
-            };
-            for (anchor, keys) in fence.unread_cells(block) {
-                if anchors.contains(&anchor) {
-                    beside.entry(anchor).or_default().extend(keys);
-                }
-            }
-        }
-        for action in &mut wanted {
-            if let Action::Fetch(FetchRequest::RelayedStateProof { anchor, keys, .. }) = action
-                && let Some(extra) = beside.get(anchor)
-            {
-                let mut union: BTreeSet<SubstateKey> = keys.drain(..).collect();
-                union.extend(extra.iter().copied());
-                *keys = union.into_iter().collect();
-            }
-        }
-        wanted
-    }
-
-    /// Every cell the blocks held at the vote fence are waiting to have
-    /// relayed, as the fetch ids naming them.
-    ///
-    /// Derived from the fence rather than stored, so it cannot say
-    /// something other than what a deferral would ask for.
-    fn relay_asks_outstanding(&self) -> BTreeSet<(Anchor, SubstateKey)> {
-        let mut outstanding = BTreeSet::new();
-        let deferred: Vec<&Arc<Block>> = self
-            .pending_blocks
-            .iter()
-            .filter(|pending| pending.awaiting_counterpart())
-            .filter_map(PendingBlock::block)
-            .collect();
-        if deferred.is_empty() {
-            return outstanding;
-        }
-        let fence = self.vote_fence();
-        for block in deferred {
-            for (anchor, keys) in fence.unread_cells(block) {
-                outstanding.extend(keys.into_iter().map(|key| (anchor, key)));
-            }
-        }
-        outstanding
-    }
-
-    /// Retire the relay ids `before` named that no pending block is
-    /// waiting on any more.
-    ///
-    /// The relay binding retires by anchor, inside the ask itself — so
-    /// an anchor the last block deferred at it has left is one nothing
-    /// asks about again, and its ids would sit in flight for the life of
-    /// the process. `before` is read on the same pending set a moment
-    /// earlier, so what the two readings differ by is exactly what the
-    /// departing blocks carried: a cell the fence stopped naming for any
-    /// other reason is in both.
-    fn abandon_orphaned_relays(&self, before: &BTreeSet<(Anchor, SubstateKey)>) -> Vec<Action> {
-        if before.is_empty() {
-            return Vec::new();
-        }
-        let after = self.relay_asks_outstanding();
-        let orphaned: Vec<(Anchor, SubstateKey)> = before.difference(&after).copied().collect();
-        if orphaned.is_empty() {
-            return Vec::new();
-        }
-        vec![Action::AbandonFetch(FetchIds::RelayedStateProofs(orphaned))]
-    }
-
     /// Whether anything the vote fence reads has been written since the
     /// last time this answered `true`: a counterpart's word, a settled
-    /// set, a record's cover, a proven anchor, a proven cell, a
-    /// predecessor's answer.
+    /// set, a record's cover, a proven anchor, a predecessor's answer.
     /// The state machine asks once per dispatch and re-drives the
     /// pending votes on `true`, so no writer has to know which votes
     /// were deferred on what it wrote.
@@ -1304,7 +1179,6 @@ impl ShardCoordinator {
         let now = (
             self.mirror.generation(),
             self.proven_anchors.generation(),
-            self.proven_cells.generation(),
             self.precut_generation,
         );
         let advanced = now != self.fence_seen;
@@ -3745,7 +3619,6 @@ impl ShardCoordinator {
                         %why,
                         "The vote fence cannot yet judge the block — deferring"
                     );
-                    let wanted = self.relay_asks_across_deferred(block_hash, wanted);
                     if let Some(pending) = self.pending_blocks.get_mut(block_hash) {
                         pending.set_awaiting_counterpart(true);
                     }
@@ -5153,6 +5026,13 @@ impl ShardCoordinator {
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
         self.retire_proven_anchors();
+        record_state_claims_weight(
+            block
+                .state_claims()
+                .iter()
+                .map(StateClaim::wire_weight)
+                .sum(),
+        );
 
         // Retire the committed block's substate delta into the count
         // frontier. Sync commits carry no delta (QC-trusted, never
@@ -6636,7 +6516,6 @@ impl ShardCoordinator {
     /// finalization, and provision fetches — those no surviving block still
     /// needs — so the FSM releases their slots.
     fn cleanup_old_state(&mut self, committed_height: BlockHeight) -> Vec<Action> {
-        let relays = self.relay_asks_outstanding();
         let orphaned = self.pending_blocks.prune_committed(committed_height);
 
         self.votes.cleanup_committed(committed_height);
@@ -6657,9 +6536,7 @@ impl ShardCoordinator {
         self.pending_bytes_deltas
             .retain(|hash, _| self.pending_blocks.get(*hash).is_some());
 
-        let mut actions = orphaned.into_abandon_actions();
-        actions.extend(self.abandon_orphaned_relays(&relays));
-        actions
+        orphaned.into_abandon_actions()
     }
 
     /// Drive the verification of the blocks the store handed back at
@@ -6942,13 +6819,9 @@ impl ShardCoordinator {
     /// for this block would linger past its lifetime, eating slots in the
     /// `max_in_flight` cap.
     fn remove_pending_block(&mut self, block_hash: BlockHash) -> Vec<Action> {
-        let relays = self.relay_asks_outstanding();
-        let mut actions = self
-            .pending_blocks
+        self.pending_blocks
             .remove_orphaning(block_hash)
-            .map_or_default(OrphanedFetches::into_abandon_actions);
-        actions.extend(self.abandon_orphaned_relays(&relays));
-        actions
+            .map_or_default(OrphanedFetches::into_abandon_actions)
     }
 
     /// Enforce [`MAX_PENDING_PER_HEIGHT`] before storing a header at `(height,
@@ -13046,7 +12919,7 @@ mod tests {
     /// A claim against `shard` at height 5 under the root `root` names,
     /// claiming the anchor's clock is `ts_ms`.
     fn bundle_against(shard: ShardId, root: &[u8], ts_ms: u64) -> StateClaim {
-        use hyperscale_types::Inclusion;
+        use hyperscale_types::{Inclusion, MerkleInclusionProof};
         StateClaim::new(
             Anchor {
                 shard,
@@ -13055,6 +12928,7 @@ mod tests {
                 ts: WeightedTimestamp::from_millis(ts_ms),
             },
             [(stub_abort_charge(1).vault, Inclusion::Absent)],
+            MerkleInclusionProof::dummy(),
         )
     }
 
@@ -13085,7 +12959,7 @@ mod tests {
     /// header this voter holds is refused outright: its reading would
     /// have been taken against a root the chain never committed, or
     /// dated to a clock the chain never carried. An anchor that agrees
-    /// leaves the reading itself to answer for.
+    /// passes, with no cell to read: the claim proves those itself.
     #[test]
     fn a_state_claim_disagreeing_with_the_held_header_is_refused() {
         let mut coord = fence_coordinator();
@@ -13112,147 +12986,9 @@ mod tests {
         ),);
 
         let agreeing = block_with_state_claims(vec![bundle_against(peer, b"root", 5_000)]);
-        let claim = &agreeing.state_claims()[0];
-        assert!(
-            matches!(
-                coord.vote_fence().state_claims(&agreeing),
-                Err(Withheld::Deferred { .. })
-            ),
-            "the anchor the chain committed stands, and the reading is still owed"
-        );
-        coord
-            .proven_cells()
-            .proven(claim.anchor, claim.cells.clone());
         assert!(
             coord.vote_fence().state_claims(&agreeing).is_ok(),
-            "and passes once this validator has proven the cell for itself"
-        );
-    }
-
-    /// Two blocks deferring at one anchor on different cells.
-    ///
-    /// The relay fetch retires by anchor, so an ask naming only the
-    /// second block's cells would cancel the first's in-flight ids and
-    /// leave it waiting on a proof nobody is fetching. What the anchor
-    /// is waiting on is both.
-    #[test]
-    fn a_relay_ask_names_every_cell_its_anchor_is_deferred_on() {
-        use hyperscale_types::Inclusion;
-
-        let mut coord = fence_coordinator();
-        let peer = ShardId::leaf(1, 1);
-        let anchor = Anchor {
-            shard: peer,
-            height: BlockHeight::new(5),
-            state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
-            ts: WeightedTimestamp::from_millis(5_000),
-        };
-        coord.record_proven_anchor(anchor);
-
-        let cell_of = |seed: u8| stub_abort_charge(seed).vault;
-        let claim_on = |seed: u8| StateClaim::new(anchor, [(cell_of(seed), Inclusion::Absent)]);
-
-        let first = block_with_state_claims(vec![claim_on(1)]);
-        let second = block_with_state_claims(vec![claim_on(2)]);
-        assert_ne!(
-            cell_of(1),
-            cell_of(2),
-            "the two blocks read different cells"
-        );
-
-        // The first block is already deferred at the anchor.
-        let mut pending = PendingBlock::from_complete_block(
-            &first,
-            Vec::new(),
-            Vec::new(),
-            LocalTimestamp::from_millis(0),
-        );
-        pending.construct_block().expect("no content is missing");
-        pending.set_awaiting_counterpart(true);
-        coord.pending_blocks.insert(pending);
-
-        let Err(Withheld::Deferred { wanted, .. }) = coord.vote_fence().state_claims(&second)
-        else {
-            panic!("the second block's own reading is unproven, so its vote is withheld");
-        };
-        let widened = coord.relay_asks_across_deferred(second.header().hash(), wanted);
-
-        let [Action::Fetch(FetchRequest::RelayedStateProof { keys, .. })] = widened.as_slice()
-        else {
-            panic!("one relay ask at the one anchor, got {widened:?}");
-        };
-        let asked: BTreeSet<SubstateKey> = keys.iter().copied().collect();
-        assert_eq!(
-            asked,
-            BTreeSet::from([cell_of(1), cell_of(2)]),
-            "the ask states what the anchor is waiting on, not what one block wants"
-        );
-    }
-
-    /// Dropping a block deferred at an anchor retires the relay cells it
-    /// alone was waiting on, and leaves a sibling's alone — at both
-    /// chokepoints, the single-block drop and the commit-time prune.
-    ///
-    /// The relay binding retires by anchor, inside the ask — so when the
-    /// last block deferred at an anchor is discarded, nothing asks there
-    /// again and its ids are retired by nothing.
-    #[test]
-    fn dropping_a_deferred_block_retires_the_relay_cells_only_it_wanted() {
-        use hyperscale_types::Inclusion;
-
-        let mut coord = fence_coordinator();
-        let peer = ShardId::leaf(1, 1);
-        let anchor = Anchor {
-            shard: peer,
-            height: BlockHeight::new(5),
-            state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
-            ts: WeightedTimestamp::from_millis(5_000),
-        };
-        coord.record_proven_anchor(anchor);
-
-        let cell_of = |seed: u8| stub_abort_charge(seed).vault;
-        let claim_on = |seed: u8| StateClaim::new(anchor, [(cell_of(seed), Inclusion::Absent)]);
-
-        let defer = |coord: &mut ShardCoordinator, block: &Block| {
-            let mut pending = PendingBlock::from_complete_block(
-                block,
-                Vec::new(),
-                Vec::new(),
-                LocalTimestamp::from_millis(0),
-            );
-            pending.construct_block().expect("no content is missing");
-            pending.set_awaiting_counterpart(true);
-            coord.pending_blocks.insert(pending);
-        };
-
-        let first = block_with_state_claims(vec![claim_on(1)]);
-        let second = block_with_state_claims(vec![claim_on(2)]);
-        defer(&mut coord, &first);
-        defer(&mut coord, &second);
-
-        let relays_in = |actions: &[Action]| -> BTreeSet<(Anchor, SubstateKey)> {
-            actions
-                .iter()
-                .filter_map(|action| match action {
-                    Action::AbandonFetch(FetchIds::RelayedStateProofs(ids)) => Some(ids.clone()),
-                    _ => None,
-                })
-                .flatten()
-                .collect()
-        };
-
-        let dropped_first = coord.remove_pending_block(first.header().hash());
-        assert_eq!(
-            relays_in(&dropped_first),
-            BTreeSet::from([(anchor, cell_of(1))]),
-            "only the cell the departing block alone was waiting on is retired",
-        );
-
-        let pruned = coord.cleanup_old_state(second.header().height());
-        assert_eq!(
-            relays_in(&pruned),
-            BTreeSet::from([(anchor, cell_of(2))]),
-            "the last block deferred at an anchor retires what it was waiting on",
+            "the anchor the chain committed stands, and nothing else is this voter's to read"
         );
     }
 

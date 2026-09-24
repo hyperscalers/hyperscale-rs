@@ -15,17 +15,18 @@ use hyperscale_vm_types::{
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
-    AbortCharge, AggregateSignature, Attested, Block, BlockHash, BlockHeader, BlockHeaderParts,
-    BlockHeight, BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeclaredKey, Derivation,
-    DerivationError, Derived, EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptHash, Hash, MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp,
-    ProtocolStatics, QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId, ShardLoad,
-    SignerBitfield, StateRoot, StateWrites, StoredReceipt, TickHalf, TickId, TimestampRange,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, install_protocol_statics,
-    protocol_statics_installed, signed_bytes,
+    AbortCharge, AggregateSignature, Anchor, Attested, Block, BlockHash, BlockHeader,
+    BlockHeaderParts, BlockHeight, BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader,
+    ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
+    DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt, ExecutionCertificate,
+    ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, MerkleInclusionProof,
+    NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Role,
+    Round, Routing, ShardForkProof, ShardId, ShardLoad, SignerBitfield, StateClaim, StateRoot,
+    StateWrites, StoredReceipt, TickHalf, TickId, TimestampRange, TopologySnapshot, Transaction,
+    TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
+    ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, install_protocol_statics, protocol_statics_installed,
+    signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -1620,6 +1621,36 @@ pub fn state_and_proof(
     let proof = Tree::<Blake3Hasher, 1>::prove(&store, &NodeKey::new(1, root_path), &jmt_keys)
         .expect("every key proves against a held version");
     (root, MerkleInclusionProof::new(proof.encode()))
+}
+
+/// A claim over `asked` at `shard`'s `height`, proven against a
+/// one-version tree holding `leaves`.
+///
+/// Built as [`state_and_proof`] builds the tree: what a test hands
+/// admission in place of a composer's fetch. The anchor's clock is one
+/// second per height.
+///
+/// # Panics
+///
+/// As [`state_and_proof`].
+#[must_use]
+pub fn proven_claim(
+    shard: ShardId,
+    height: u64,
+    leaves: &[SubstateKey],
+    asked: &[SubstateKey],
+) -> StateClaim {
+    let (state_root, proof) = state_and_proof(shard, leaves, asked);
+    let anchor = Anchor {
+        shard,
+        height: BlockHeight::new(height),
+        state_root,
+        ts: WeightedTimestamp::from_millis(height * 1_000),
+    };
+    let cells = proof
+        .inclusions(state_root, shard, asked)
+        .expect("the fixture proof answers for its keys");
+    StateClaim::new(anchor, cells, proof)
 }
 
 #[cfg(test)]

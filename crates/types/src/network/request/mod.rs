@@ -32,7 +32,7 @@ pub use package_artifact::{GetPackageArtifactsRequest, MAX_PACKAGE_ARTIFACTS_PER
 pub use provision::{Anchored, GetProvisionsRequest};
 pub use remote_header::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
 pub use settled_txs::GetSettledTxsRequest;
-pub use state_proof::{GetRelayedStateProofRequest, GetStateProofRequest};
+pub use state_proof::GetStateProofRequest;
 pub use state_range::GetStateRangeRequest;
 pub use sync::SyncCompleteAnnouncement;
 pub use transaction::GetTransactionsRequest;

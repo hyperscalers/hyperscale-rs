@@ -28,9 +28,10 @@ pub struct BlockManifest {
     /// the records themselves however long after the terminal they came
     /// from, and there is no later source to fetch them from.
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
-    /// The block's state claims, mirrored verbatim: they are small, and
-    /// a voter checks each against a proof of its own rather than
-    /// against anything it could fetch back from a later source.
+    /// The block's state claims, mirrored verbatim with their proofs:
+    /// the section is bounded by its own byte budget, and a claim is
+    /// checked from the block rather than against anything a voter
+    /// could fetch back from a later source.
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under

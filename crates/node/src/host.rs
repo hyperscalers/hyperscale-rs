@@ -761,7 +761,6 @@ fn build_shard_io<S: ShardStorage>(
         Arc::clone(rep.state.mempool_coordinator().tx_store()),
         Arc::clone(rep.state.execution_coordinator().exec_cert_store()),
         Arc::clone(rep.state.execution_coordinator().finalization_store()),
-        Arc::clone(rep.state.execution_coordinator().proven_cells()),
     );
     let storage = Arc::new(storage);
     // The chain's own origin, which the committed-window walks floor on

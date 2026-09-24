@@ -84,7 +84,7 @@ impl ShardParticipation {
                 proof,
             } => {
                 self.execution_coordinator
-                    .on_proof_fetched(anchor, keys, proof);
+                    .on_proof_fetched(anchor, &keys, &proof);
                 Vec::new()
             }
             // A predecessor answered which of the queried transactions it

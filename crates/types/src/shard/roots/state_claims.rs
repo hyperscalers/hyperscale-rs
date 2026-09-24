@@ -36,8 +36,8 @@ impl LeafRoot for StateClaimsRoot {
 mod tests {
     use super::*;
     use crate::{
-        Address, AddressClass, Anchor, BlockHeight, Inclusion, LocalKey, RootMismatch, ShardId,
-        StateRoot, SubstateKey, Verified, Verify, WeightedTimestamp,
+        Address, AddressClass, Anchor, BlockHeight, Inclusion, LocalKey, MerkleInclusionProof,
+        RootMismatch, ShardId, StateRoot, SubstateKey, Verified, Verify, WeightedTimestamp,
     };
 
     fn key(seed: u8) -> SubstateKey {
@@ -60,6 +60,7 @@ mod tests {
                 value[..reading.len().min(32)].copy_from_slice(reading);
                 (key(*seed), Inclusion::Present(value))
             }),
+            MerkleInclusionProof::new(reading.to_vec()),
         )
     }
 
@@ -69,7 +70,7 @@ mod tests {
     }
 
     /// Every term of a claim is under its leaf: the anchor, the clock,
-    /// the cells and what each was read as move the root.
+    /// the cells, what each was read as and the proof move the root.
     #[test]
     fn every_term_of_a_claim_moves_the_root() {
         let base = StateClaimsRoot::over(&[claim(3, &[1, 2], b"p")]);
@@ -79,6 +80,13 @@ mod tests {
         let mut other_clock = claim(3, &[1, 2], b"p");
         other_clock.anchor.ts = WeightedTimestamp::from_millis(1);
         assert_ne!(base, StateClaimsRoot::over(&[other_clock]));
+        let mut other_proof = claim(3, &[1, 2], b"p");
+        other_proof.proof = MerkleInclusionProof::new(b"pq".to_vec());
+        assert_ne!(
+            base,
+            StateClaimsRoot::over(&[other_proof]),
+            "a proof bit flipped fails the root, so a peer serving the block cannot alter it",
+        );
     }
 
     #[test]
