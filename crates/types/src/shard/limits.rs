@@ -137,11 +137,7 @@ pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 5 * MAX_TXS_PER_BLOCK;
 /// Twice the creation cap, so a backlog drains rather than holding
 /// station: a shard that fell behind under peak load catches up in
 /// bounded time once the load stops, and one running at the creation cap
-/// still removes what it creates with room to spare. The margin is also
-/// what carries the one family member no block budgets at creation — a
-/// reclaim's claim is written where the reclaim runs, one per record and
-/// never beside the record's own claim, so it adds at most the record's
-/// own rate to what the sweep must retire.
+/// still removes what it creates with room to spare.
 pub const MAX_SWEEP_PER_BLOCK: usize = 2 * MAX_SWEEPABLE_CREATED_PER_BLOCK;
 
 /// The removal cap must outrun the creation cap, or the resident

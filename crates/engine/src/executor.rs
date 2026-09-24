@@ -36,8 +36,8 @@ use hyperscale_types::{
     install_protocol_statics, whole_work,
 };
 use hyperscale_vm_effects::{
-    Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, IntentRecord,
-    PackageHash, Terms, legs_of, package_hash,
+    Admitted, ChainRecords, CrossingCell, Declaration, DeclaredAccess, IntentRecord, PackageHash,
+    Terms, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Deletion, Disposal, Disposition, EnvInputs, ExecutionMode,
@@ -675,19 +675,11 @@ impl Executor {
                 },
                 None,
             )?;
-            // The claim site under the producer's own target: what a
-            // reclaim writes, and what holds either settlement to the
-            // record's edge.
-            let claim = CrossingSite::claim_on(&ProtocolHasher, key.owner, &record);
             let disposition = match record.terms {
+                // Taken back: the record goes and the value it held is
+                // credited to the cell it left, and nothing else is
+                // written.
                 Terms::Escrowed { credit } if takes_back => {
-                    declare_here(
-                        Effect {
-                            target: EffectTarget::Point(claim.key()),
-                            mode: Mode::Write { moves: Moves::Both },
-                        },
-                        None,
-                    )?;
                     declare_here(
                         Effect {
                             target: EffectTarget::Point(credit),
@@ -706,7 +698,6 @@ impl Executor {
             };
             disposals.push(Disposal {
                 record: *key,
-                claim,
                 disposition,
             });
         }
@@ -2073,9 +2064,78 @@ impl Executor {
 mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{AddressClass, LocalKey, Presence};
+    use hyperscale_vm_effects::{CrossingSite, Hash32, IntentHash};
     use hyperscale_vm_types::AbortReason;
 
     use super::*;
+    use crate::TickEnvironment;
+
+    /// A reclaim declares the record and the credit, and nothing else:
+    /// the record `Write`, so its removal and any second settlement share
+    /// a conflict group, and the credit `Delta`, so the kernel holds a
+    /// movement handle on the cell the value returns to.
+    #[test]
+    fn a_reclaim_declares_the_record_and_the_credit_alone() {
+        let owner = Address::new([5; 31], AddressClass::Component);
+        let credit = SubstateKey {
+            owner,
+            local: LocalKey([6; 16]),
+        };
+        let site = CrossingSite::record(
+            &ProtocolHasher,
+            owner,
+            IntentHash(Hash32([7; 32])),
+            0,
+            0,
+            1_000,
+        );
+        let record = site.crossing(
+            TxHash::from(Hash::from_bytes(b"issuer")),
+            *PROTOCOL_RESOURCE,
+            10,
+            SubstateKey {
+                owner,
+                local: LocalKey([8; 16]),
+            },
+            Terms::Escrowed { credit },
+        );
+        let snapshot = TickBaseline {
+            cells: BTreeMap::from([(site.key(), record.to_bytes())]),
+            ..Default::default()
+        };
+        let trie = ShardTrie::single();
+        let ctx = TickBatchContext {
+            local_shard: ShardId::ROOT,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+
+        let prepared = Executor::prepare_settle(&[site.key()], Licence::Unclaimed, &ctx, &snapshot)
+            .expect("an unclaimed escrowed record is taken back");
+
+        let Job::Records(disposals) = &prepared.job else {
+            panic!("a settlement is a records job: {:?}", prepared.job);
+        };
+        assert_eq!(
+            disposals,
+            &[Disposal {
+                record: site.key(),
+                disposition: Disposition::Reclaim,
+            }],
+        );
+        let declared: Vec<Effect> = prepared.declaration.set.iter().collect();
+        assert_eq!(declared.len(), 2, "{declared:?}");
+        assert!(declared.contains(&Effect {
+            target: EffectTarget::Point(site.key()),
+            mode: Mode::Write { moves: Moves::Both },
+        }));
+        assert!(declared.contains(&Effect {
+            target: EffectTarget::Point(credit),
+            mode: Mode::Delta { moves: Moves::Both },
+        }));
+    }
 
     /// Every bound the preparation fixed reaches the entry the kernel
     /// runs. A bound left behind here is one the kernel never applies,
