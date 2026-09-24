@@ -8,7 +8,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash,
+    ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, Transaction, TxHash,
     Verifiable, Verified,
 };
 
@@ -99,7 +99,7 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Returns only transactions that were found (missing hashes are skipped).
     fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<Transaction>>;
 
-    /// Get multiple certificates by `TickId` (batch read).
+    /// Get multiple finalizations by hash (batch read).
     ///
     /// Returns only certificates that were found (missing ids are skipped).
     fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization>;
@@ -107,17 +107,7 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Retrieve the consensus-bound receipt portion for a transaction.
     fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>>;
 
-    /// Retrieve every held copy of the execution certificates of
-    /// `tick_ids` (batch read).
-    ///
-    /// A tick is held as every copy no other copy carries, so one id can
-    /// return more than one certificate; missing ids are skipped.
-    fn get_execution_certificates_batch(
-        &self,
-        tick_ids: &[TickId],
-    ) -> Vec<Verified<ExecutionCertificate>>;
-
-    /// Retrieve the execution certificates carrying outcomes for
+    /// Retrieve this shard's execution certificates carrying outcomes for
     /// `tx_hashes`, deduplicated — one certificate covers every
     /// transaction of its batch, so several requested transactions
     /// commonly resolve to the same certificate. Only the copies that
@@ -125,8 +115,12 @@ pub trait ShardChainReader: Send + Sync + 'static {
     ///
     /// This is the key a counterpart shard asks by: it knows the
     /// transaction from our committed header and cannot know which
-    /// certificate we put it in. Transactions with no attested outcome
-    /// here are skipped.
+    /// certificate we put it in. Served off the committed finalizations
+    /// themselves, through an index written beside each of this shard's
+    /// own: every finalization naming the transaction answers with its
+    /// local certificate, so the verdict and whatever later settled what
+    /// it left both answer. Transactions with no attested outcome here
+    /// are skipped.
     fn get_execution_certificates_for_txs(
         &self,
         tx_hashes: &[TxHash],

@@ -120,6 +120,18 @@ impl DbCodec<Vec<u8>> for RawCodec {
     }
 }
 
+/// Zero-byte codec for a column family whose key is the whole entry.
+#[derive(Default)]
+pub struct UnitCodec;
+
+impl DbEncode<()> for UnitCodec {
+    fn encode_to(&self, (): &(), _buf: &mut Vec<u8>) {}
+}
+
+impl DbCodec<()> for UnitCodec {
+    fn decode(&self, _bytes: &[u8]) {}
+}
+
 /// JMT node key codec — the tree's own canonical encoding,
 /// `version_be (8B) || bits_be (2B) || path_bytes`. Version-first
 /// ordering groups a version's writes together, which is what makes

@@ -9,10 +9,10 @@ use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{JmtSnapshot, SweepRows, entry_leaf_rows, index_leaf, retire_dated};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-    ConsensusReceipt, EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization,
-    FinalizationHash, Hash, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters,
-    SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction,
-    TxHash, ValidatorId, WeightedTimestamp,
+    ConsensusReceipt, EntryKey, ExecutionMetadata, Finalization, FinalizationHash, Hash,
+    ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites,
+    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash, ValidatorId,
+    WeightedTimestamp,
 };
 use im::OrdMap;
 
@@ -240,12 +240,10 @@ pub struct ConsensusState {
     pub(crate) execution_metadata: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub(crate) receipt_heights: HashMap<TxHash, BlockHeight>,
-    /// Execution certificates keyed by [`TickId`]: every copy of the
-    /// tick no other copy carries.
-    pub(crate) execution_certs: HashMap<TickId, Vec<ExecutionCertificate>>,
-    /// Index: attested transaction → every certificate of this shard's
-    /// carrying an outcome for it. Mirrors the production
-    /// `tx_cert_index` CF so simulation integration tests serve the
+    /// Index: every finalization of this shard's carrying an outcome for
+    /// a transaction, keyed by the transaction then the finalization's
+    /// hash, its key in `certificates`. Mirrors the production
+    /// `tx_finalizations` CF so simulation integration tests serve the
     /// by-transaction certificate fetch the same way a real node does.
     ///
     /// A set rather than a slot: a shard certifies one transaction its
@@ -253,9 +251,7 @@ pub struct ConsensusState {
     /// a retirement, a reclaim, an abandonment — and a counterpart that
     /// asks by naming the transaction cannot say which of them it
     /// wants.
-    pub(crate) tx_cert_index: HashMap<TxHash, BTreeSet<TickId>>,
-    /// Index: `block_height` → `TickId`s at that height.
-    pub(crate) finalizations_by_height: HashMap<BlockHeight, Vec<TickId>>,
+    pub(crate) tx_finalizations: BTreeSet<(TxHash, FinalizationHash)>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
     /// `RocksDB` `beacon_witnesses` CF so simulation integration tests
     /// can serve fetches and replay the accumulator on restart. Shard
@@ -301,9 +297,7 @@ impl ConsensusState {
             consensus_receipts: HashMap::new(),
             execution_metadata: HashMap::new(),
             receipt_heights: HashMap::new(),
-            execution_certs: HashMap::new(),
-            tx_cert_index: HashMap::new(),
-            finalizations_by_height: HashMap::new(),
+            tx_finalizations: BTreeSet::new(),
             beacon_witnesses: BTreeMap::new(),
             provisions: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,

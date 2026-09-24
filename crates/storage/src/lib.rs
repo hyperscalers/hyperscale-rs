@@ -61,7 +61,6 @@ pub use shard::sweep::{
     followed_block_writes, is_crossing_answer_cell, is_crossing_obligation_cell, is_record_cell,
     merge_sweep_overlay, sweep_for_block, sweep_through, sweepable_expiry, with_sweep,
 };
-pub use shard::tick_certs::{fold_tick_copy, tick_copies};
 pub use shard::tick_chain::{
     ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,
 };

@@ -3,16 +3,15 @@
 //! This is the single source of truth for what column families exist,
 //! what they store, and how their keys/values are encoded.
 
-use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
 use hyperscale_hbor::{HborDecode, HborEncode};
 use hyperscale_jmt::{Node, NodeKey};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
-    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
-    Provisions, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, TickId,
-    Transaction, ValidatorId,
+    ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash, Provisions,
+    SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, Transaction, TxHash,
+    ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
@@ -22,7 +21,7 @@ use super::sweep_key::SweepRowCodec;
 use super::versioned_key::VersionedSubstateKeyCodec;
 use crate::typed_cf::{
     BeU64Codec, ChainOriginCodec, DbCodec, DbEncode, HashCodec, HborCodec, JmtKeyCodec,
-    JmtNodeCodec, JmtStaleKeysCodec, RawCodec, TypedCf,
+    JmtNodeCodec, JmtStaleKeysCodec, RawCodec, TypedCf, UnitCodec,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -101,19 +100,20 @@ pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
 /// error), keyed by tx hash. Absent when the tx was synced from a peer.
 pub const EXECUTION_METADATA_CF: &str = "execution_metadata";
 
-/// Column family for execution certificates keyed by [`TickId`].
-pub const EXECUTION_CERTS_CF: &str = "execution_certs";
-
-/// Column family mapping a transaction to the certificate carrying its
-/// outcome, keyed by tx hash with a [`TickId`] value.
+/// Column family indexing every finalization of this shard's carrying an
+/// outcome for a transaction, keyed `(TxHash, FinalizationHash)` with no
+/// value.
 ///
 /// A counterpart shard asks for outcomes by transaction — it learned of
 /// the transaction from our committed header and has no way to know which
 /// certificate we ended up putting it in. This index is how the fetch
 /// responder answers that from storage once the in-memory cache has
-/// evicted. Written in the same batch as [`EXECUTION_CERTS_CF`], one entry
-/// per attested outcome.
-pub const TX_CERT_INDEX_CF: &str = "tx_cert_index";
+/// evicted: the finalization's hash is its key in [`CERTIFICATES_CF`],
+/// and the certificate served is that finalization's own. Written in
+/// the same batch as the finalization, one key per attested outcome; a
+/// composite key makes every write a blind put, so nothing stored is
+/// read to widen it. Never pruned, like the finalizations it names.
+pub const TX_FINALIZATIONS_CF: &str = "tx_finalizations";
 
 /// Column family for beacon-witness leaves on this shard.
 ///
@@ -245,8 +245,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     STALE_JMT_NODES_CF,
     CONSENSUS_RECEIPTS_CF,
     EXECUTION_METADATA_CF,
-    EXECUTION_CERTS_CF,
-    TX_CERT_INDEX_CF,
+    TX_FINALIZATIONS_CF,
     BEACON_WITNESSES_CF,
     SUBSTATE_BYTES_CF,
     VERSION_TIME_CF,
@@ -280,8 +279,7 @@ pub struct CfHandles<'a> {
     stale_jmt_nodes: &'a ColumnFamily,
     consensus_receipts: &'a ColumnFamily,
     execution_metadata: &'a ColumnFamily,
-    execution_certs: &'a ColumnFamily,
-    tx_cert_index: &'a ColumnFamily,
+    tx_finalizations: &'a ColumnFamily,
     beacon_witnesses: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
     version_time: &'a ColumnFamily,
@@ -317,8 +315,7 @@ impl<'a> CfHandles<'a> {
             stale_jmt_nodes: resolve(STALE_JMT_NODES_CF),
             consensus_receipts: resolve(CONSENSUS_RECEIPTS_CF),
             execution_metadata: resolve(EXECUTION_METADATA_CF),
-            execution_certs: resolve(EXECUTION_CERTS_CF),
-            tx_cert_index: resolve(TX_CERT_INDEX_CF),
+            tx_finalizations: resolve(TX_FINALIZATIONS_CF),
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
             version_time: resolve(VERSION_TIME_CF),
@@ -675,39 +672,50 @@ impl TypedCf for ExecutionMetadataCf {
     }
 }
 
-// Execution Certificates
+// Transaction → finalization index
 
-pub struct ExecutionCertsCf;
-impl TypedCf for ExecutionCertsCf {
-    const NAME: &'static str = EXECUTION_CERTS_CF;
-    type Key = TickId;
-    /// Every copy of the tick no other copy carries: a shard's own tick
-    /// finalizes in two halves, each carrying the members it settles, and
-    /// the two copies are disjoint answers rather than one wide one.
-    type Value = Vec<ExecutionCertificate>;
-    type KeyCodec = HborCodec<TickId>;
-    type ValueCodec = HborCodec<Vec<ExecutionCertificate>>;
-    type Handles<'a> = CfHandles<'a>;
-    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
-        cf.execution_certs
+/// Key codec for [`TxFinalizationsCf`]: the transaction hash, then the
+/// finalization's hash, 64 bytes. Transaction first so one transaction's
+/// finalizations sit together, and a forward scan from the transaction
+/// paired with the zero hash reads every one of them.
+#[derive(Default)]
+pub struct TxFinalizationKeyCodec;
+
+impl DbEncode<(TxHash, FinalizationHash)> for TxFinalizationKeyCodec {
+    fn encode_to(&self, value: &(TxHash, FinalizationHash), buf: &mut Vec<u8>) {
+        let (tx, finalization) = value;
+        buf.extend_from_slice(tx.as_bytes());
+        buf.extend_from_slice(finalization.as_bytes());
     }
 }
 
-pub struct TxCertIndexCf;
-impl TypedCf for TxCertIndexCf {
-    const NAME: &'static str = TX_CERT_INDEX_CF;
-    type Key = Hash;
-    /// Every tick of this shard's that carried an outcome for the
-    /// transaction, not the newest: a shard certifies one transaction
-    /// its verdict and then again whatever settles what the verdict left
-    /// — a retirement, a reclaim, an abandonment — and a counterpart
-    /// fetching by transaction cannot name which of them it wants.
-    type Value = BTreeSet<TickId>;
-    type KeyCodec = HashCodec;
-    type ValueCodec = HborCodec<BTreeSet<TickId>>;
+impl DbCodec<(TxHash, FinalizationHash)> for TxFinalizationKeyCodec {
+    fn decode(&self, bytes: &[u8]) -> (TxHash, FinalizationHash) {
+        assert_eq!(bytes.len(), 64, "tx finalization key must be 32 + 32 bytes");
+        let (tx, finalization) = bytes.split_at(32);
+        (
+            TxHash::from(Hash::from_hash_bytes(tx)),
+            FinalizationHash::from_raw(Hash::from_hash_bytes(finalization)),
+        )
+    }
+}
+
+/// Every finalization of this shard's carrying an outcome for a
+/// transaction, not the newest: a shard certifies one transaction its
+/// verdict and then again whatever settles what the verdict left — a
+/// retirement, a reclaim, an abandonment — and a counterpart fetching by
+/// transaction cannot name which of them it wants. See
+/// [`TX_FINALIZATIONS_CF`].
+pub struct TxFinalizationsCf;
+impl TypedCf for TxFinalizationsCf {
+    const NAME: &'static str = TX_FINALIZATIONS_CF;
+    type Key = (TxHash, FinalizationHash);
+    type Value = ();
+    type KeyCodec = TxFinalizationKeyCodec;
+    type ValueCodec = UnitCodec;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
-        cf.tx_cert_index
+        cf.tx_finalizations
     }
 }
 

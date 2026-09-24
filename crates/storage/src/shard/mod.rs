@@ -20,7 +20,6 @@ pub mod recovered_state;
 pub mod retention;
 pub mod store;
 pub mod sweep;
-pub mod tick_certs;
 pub mod tick_chain;
 pub mod unresolved;
 pub mod vote_registers;

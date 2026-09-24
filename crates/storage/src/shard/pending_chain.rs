@@ -14,7 +14,7 @@ use hyperscale_types::{
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey,
     ExecutionCertificate, Finalization, FinalizationHash, QuorumCertificate, RETENTION_HORIZON,
     ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SweepBucket, SweepFrontier,
-    TerminalRoots, TickId, Transaction, TxHash, Verifiable, Verified, WeightedTimestamp,
+    TerminalRoots, Transaction, TxHash, Verifiable, Verified, WeightedTimestamp,
     committed_txs_root_from_hashes, local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 use hyperscale_vm_types::{Address, CollectionId};
@@ -776,15 +776,6 @@ where
         self.base.get_consensus_receipt(tx_hash)
     }
 
-    /// Batched execution-certificate read by `TickId`. Pass-through to
-    /// base storage.
-    pub fn execution_certificates_batch(
-        &self,
-        ids: &[TickId],
-    ) -> Vec<Verified<ExecutionCertificate>> {
-        self.base.get_execution_certificates_batch(ids)
-    }
-
     /// The execution certificates carrying outcomes for `tx_hashes`,
     /// deduplicated. Pass-through to base storage.
     pub fn execution_certificates_for_txs(
@@ -1534,12 +1525,6 @@ mod tests {
         }
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
             None
-        }
-        fn get_execution_certificates_batch(
-            &self,
-            _tick_ids: &[TickId],
-        ) -> Vec<Verified<ExecutionCertificate>> {
-            Vec::new()
         }
         fn get_execution_certificates_for_txs(
             &self,

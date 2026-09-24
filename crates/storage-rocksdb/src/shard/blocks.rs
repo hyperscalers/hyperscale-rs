@@ -28,7 +28,7 @@ use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{
     BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, ProvisionKeyCodec,
-    ProvisionsCf, TransactionsCf, VotedBlockKeyCodec, VotedBlocksCf,
+    ProvisionsCf, TransactionsCf, TxFinalizationsCf, VotedBlockKeyCodec, VotedBlocksCf,
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
@@ -161,13 +161,30 @@ impl RocksDbShardStorage {
                 Some(tx.cached_wire_bytes()),
             );
         }
+        let tx_finalizations_cf = TxFinalizationsCf::handle(&cf);
+        let local_shard = block.header().shard_id();
         for fw in block.certificates().iter() {
-            batch_put::<CertificatesCf>(
-                batch,
-                certificates_cf,
-                &fw.receipt_hash(),
-                &fw.attestation(),
-            );
+            let hash = fw.receipt_hash();
+            batch_put::<CertificatesCf>(batch, certificates_cf, &hash, &fw.attestation());
+            // The by-transaction index rides the same batch, so a crash
+            // cannot leave a key naming a finalization the certificates
+            // family lacks. Only a finalization of this shard's own tick
+            // is indexed, and only for its local certificate: a
+            // counterpart's certificate riding inside it answers a
+            // question nobody asks this shard, and an asker served its
+            // own certificate back refuses it as unsolicited and asks
+            // again.
+            if fw.tick_id().shard_id() != local_shard {
+                continue;
+            }
+            for outcome in fw.local_ec().tx_outcomes() {
+                batch_put::<TxFinalizationsCf>(
+                    batch,
+                    tx_finalizations_cf,
+                    &(outcome.tx_hash(), hash),
+                    &(),
+                );
+            }
         }
         self.append_provisions_to_batch(batch, block, retention_floor);
     }

@@ -1,6 +1,6 @@
 //! `ShardChainReader` implementation for `SimShardStorage`.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::read_or_recover;
@@ -8,8 +8,8 @@ use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction,
-    TxHash, Verifiable, Verified,
+    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, Transaction, TxHash,
+    Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -108,35 +108,28 @@ impl ShardChainReader for SimShardStorage {
             .cloned()
     }
 
-    fn get_execution_certificates_batch(
-        &self,
-        tick_ids: &[TickId],
-    ) -> Vec<Verified<ExecutionCertificate>> {
-        let c = read_or_recover(&self.consensus);
-        tick_ids
-            .iter()
-            .filter_map(|wid| c.execution_certs.get(wid))
-            .flatten()
-            .cloned()
-            .map(Verified::<ExecutionCertificate>::from_persisted)
-            .collect()
-    }
-
     fn get_execution_certificates_for_txs(
         &self,
         tx_hashes: &[TxHash],
     ) -> Vec<Verified<ExecutionCertificate>> {
         let c = read_or_recover(&self.consensus);
-        let mut seen: HashSet<&TickId> = HashSet::new();
-        tx_hashes
+        // Every finalization any asked transaction names, read once each:
+        // one finalization commonly answers for several of them.
+        let asked: BTreeSet<TxHash> = tx_hashes.iter().copied().collect();
+        let finalizations: BTreeSet<FinalizationHash> = asked
             .iter()
-            .filter_map(|tx| c.tx_cert_index.get(tx))
-            .flatten()
-            .filter(|tick_id| seen.insert(tick_id))
-            .filter_map(|tick_id| c.execution_certs.get(tick_id))
-            .flatten()
-            .filter(|copy| tx_hashes.iter().any(|tx| copy.covers(tx)))
-            .cloned()
+            .flat_map(|tx| {
+                c.tx_finalizations
+                    .range((*tx, FinalizationHash::from_raw(Hash::ZERO))..)
+                    .take_while(move |(at, _)| at == tx)
+                    .map(|(_, finalization)| *finalization)
+            })
+            .collect();
+        finalizations
+            .iter()
+            .filter_map(|id| c.certificates.get(id))
+            .map(|fw| fw.local_ec().clone())
+            .filter(|cert| asked.iter().any(|tx| cert.covers(tx)))
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }

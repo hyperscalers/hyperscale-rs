@@ -7,16 +7,16 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, fold_tick_copy,
-    holds_this_block_at, settled_writes_at, tick_copies,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, holds_this_block_at,
+    settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
-    SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
+    StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
-use super::state::{ConsensusState, apply_writes};
+use super::state::apply_writes;
 
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
@@ -177,17 +177,28 @@ fn build_prepared_commit(
                 c.transactions.insert(tx.hash(), (***tx).clone());
             }
             c.blocks.insert(block.height(), unwrapped);
+            let local_shard = block.header().shard_id();
             for fw in block.certificates().iter() {
-                let tick_id = *fw.tick_id();
-                c.certificates.insert(fw.receipt_hash(), fw.attestation());
-                c.finalizations_by_height
-                    .entry(tick_id.block_height())
-                    .or_default()
-                    .push(tick_id);
+                let hash = fw.receipt_hash();
+                c.certificates.insert(hash, fw.attestation());
+                // Only a finalization of this shard's own tick is indexed,
+                // and only for its local certificate: a counterpart's
+                // certificate riding inside it answers a question nobody
+                // asks this shard, and an asker served its own
+                // certificate back refuses it as unsolicited and asks
+                // again.
+                if fw.tick_id().shard_id() != local_shard {
+                    continue;
+                }
+                c.tx_finalizations.extend(
+                    fw.local_ec()
+                        .tx_outcomes()
+                        .iter()
+                        .map(|outcome| (outcome.tx_hash(), hash)),
+                );
             }
             c.record_provisions(block, floor);
             c.insert_receipts(&receipts);
-            record_execution_certs(&mut c, block);
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
@@ -215,45 +226,6 @@ impl SimShardStorage {
         for (offset, payload) in witness.leaves.iter().enumerate() {
             c.beacon_witnesses
                 .insert(start + offset as u64, payload.clone());
-        }
-    }
-}
-
-/// Fold a block's execution certificates into the consensus map, keeping
-/// every copy of a tick no other copy carries and indexing the
-/// transactions this shard's own copies attest.
-///
-/// Only this shard's own certificates are indexed. A settled cross-shard
-/// transaction lands here under both sides' certificates, and the index
-/// answers "what did THIS shard attest for the transaction" — the
-/// question a counterpart's fallback fetch asks this shard. A remote copy
-/// in there serves the requester its own certificate back, which it
-/// rightly refuses as unsolicited, and the fetch loops forever.
-///
-/// Every one of this shard's is indexed, not the newest: the verdict and
-/// whatever settles what it left both name the transaction, and only the
-/// asker can tell which answers the question its tick waits on. And
-/// indexed whether or not the copy was kept, since a copy the fold turns
-/// away is one a held copy of the same tick already carries.
-fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
-    let local_shard = block
-        .certificates()
-        .first()
-        .map(|finalization| finalization.tick_id().shard_id());
-    for (tick_id, copies) in tick_copies(block) {
-        let held = consensus.execution_certs.entry(tick_id).or_default();
-        for cert in &copies {
-            fold_tick_copy(held, (*cert).clone());
-        }
-        if Some(tick_id.shard_id()) != local_shard {
-            continue;
-        }
-        for outcome in copies.iter().flat_map(|cert| cert.tx_outcomes()) {
-            consensus
-                .tx_cert_index
-                .entry(outcome.tx_hash())
-                .or_default()
-                .insert(tick_id);
         }
     }
 }

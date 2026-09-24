@@ -238,7 +238,7 @@ impl RocksDbShardStorage {
 
         let cold_write_buffer_size: usize = 16 * 1024 * 1024; // 16MB
 
-        let cf_descriptors: Vec<_> = ALL_COLUMN_FAMILIES
+        let mut cf_descriptors: Vec<_> = ALL_COLUMN_FAMILIES
             .iter()
             .copied()
             .map(|name| {
@@ -272,8 +272,28 @@ impl RocksDbShardStorage {
             })
             .collect();
 
-        let db = DB::open_cf_descriptors(&opts, dir.join("db"), cf_descriptors)
+        // A family on disk has to be opened whether or not this layer
+        // names it, and one it does not name is dropped once it is: a
+        // family an earlier layout wrote is otherwise a copy the store
+        // carries forever and nothing reads. A fresh directory lists
+        // nothing.
+        let stray: Vec<String> = DB::list_cf(&opts, dir.join("db"))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| !ALL_COLUMN_FAMILIES.contains(&name.as_str()))
+            .collect();
+        cf_descriptors.extend(
+            stray
+                .iter()
+                .map(|name| ColumnFamilyDescriptor::new(name, Options::default())),
+        );
+
+        let mut db = DB::open_cf_descriptors(&opts, dir.join("db"), cf_descriptors)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        for name in &stray {
+            db.drop_cf(name)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        }
 
         // Validate all expected column families exist at startup.
         // This fails fast instead of panicking on first access at runtime.

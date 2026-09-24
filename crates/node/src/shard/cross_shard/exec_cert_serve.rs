@@ -47,9 +47,15 @@ pub fn serve_execution_certs_request<S: ShardStorage>(
     // request named it for.
     let mut asked: Vec<(Arc<ExecutionCertificate>, HashSet<TxHash>)> = Vec::new();
 
+    // Filtered by what each certificate carries, as the chain tier is: a
+    // copy of the tick held here can be narrower than the tick, and a
+    // certificate that does not cover the transaction answers nothing
+    // the asker waits on.
     for &tx_hash in &req.tx_hashes {
         for cert in exec_cert_store.certificates_for_tx(tx_hash) {
-            record(&mut asked, Arc::new((**cert).clone()), tx_hash);
+            if cert.covers(&tx_hash) {
+                record(&mut asked, Arc::new((**cert).clone()), tx_hash);
+            }
         }
     }
 
@@ -199,6 +205,57 @@ mod tests {
             .collect();
         ticks.sort_unstable();
         assert_eq!(ticks, vec![*verdict.tick_id(), *settling.tick_id()]);
+    }
+
+    /// A certificate the store tier holds for the tick that does not
+    /// carry the asked transaction is omitted.
+    ///
+    /// The tier holds one copy per tick, which can be narrower than the
+    /// tick; a copy that does not cover the transaction answers nothing
+    /// the asker waits on.
+    #[test]
+    fn the_store_tier_omits_a_certificate_that_does_not_cover_the_asked_transaction() {
+        let carried = TxHash::from(Hash::from_bytes(&[6u8; 32]));
+        let asked = TxHash::from(Hash::from_bytes(&[7u8; 32]));
+        let outcomes: Vec<TxOutcome> = [carried, asked]
+            .into_iter()
+            .map(|tx_hash| {
+                TxOutcome::new(
+                    tx_hash,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+            })
+            .collect();
+        let complete = ExecutionCertificate::new(
+            TickId::new(ShardId::ROOT, BlockHeight::new(1)),
+            WeightedTimestamp::from_millis(2),
+            compute_global_receipt_root(&outcomes),
+            Capped::new(outcomes).expect("two outcomes"),
+            AggregateSignature::new([0u8; 96]),
+            SignerBitfield::new(4),
+        );
+        let narrow = complete
+            .project_to(&HashSet::from([carried]))
+            .expect("the tick carries it");
+
+        let store = ExecCertStore::new();
+        store.insert(Arc::new(Verified::new_unchecked_for_test(narrow)));
+        let pending_chain =
+            PendingChain::new(Arc::new(SimShardStorage::default()), ChainOrigin::ROOT);
+
+        let answered = serve_execution_certs_request(
+            &pending_chain,
+            &store,
+            &GetExecutionCertsRequest {
+                tx_hashes: Capped::from_array([asked]),
+            },
+        );
+        assert!(
+            answered.certificates.is_none(),
+            "the held copy does not carry the asked transaction",
+        );
     }
 
     /// The two halves of one of this shard's ticks each answer for the

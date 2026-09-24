@@ -419,6 +419,12 @@ fn the_tx_index_answers_with_every_certificate_of_this_shards() {
 }
 
 #[test]
+fn a_foreign_ticks_finalization_is_stored_and_not_indexed() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_foreign_ticks_finalization_is_stored_and_not_indexed(&storage);
+}
+
+#[test]
 fn test_ec_storage_roundtrip() {
     let storage = SimShardStorage::default();
     test_helpers::test_ec_storage_roundtrip(&storage);

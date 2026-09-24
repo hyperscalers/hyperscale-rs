@@ -16,9 +16,11 @@
 //!
 //! Eviction is lifecycle-driven: entries are dropped in
 //! [`ExecutionCoordinator::remove_finalization`] once the tick's containing
-//! block commits, at which point the EC is durably available via
-//! [`ShardStorage::get_execution_certificates_by_height`] and the network handler
-//! falls through to that on cache miss.
+//! block commits, at which point the EC is durably available by
+//! transaction through
+//! [`ShardChainReader::get_execution_certificates_for_txs`], off the
+//! committed finalization itself, and the network handler reads that
+//! tier beside this one.
 //!
 //! Mirrors [`hyperscale_mempool::TxStore`] in shape and intent: a primary
 //! index keyed by the natural identifier (`TickId` here, `TxHash` there),
@@ -37,7 +39,7 @@
 //!
 //! [`ExecutionCertificate`]: hyperscale_types::ExecutionCertificate
 //! [`ExecutionCoordinator::remove_finalization`]: crate::ExecutionCoordinator::remove_finalization
-//! [`ShardStorage::get_execution_certificates_by_height`]: hyperscale_storage::ShardStorage::get_execution_certificates_by_height
+//! [`ShardChainReader::get_execution_certificates_for_txs`]: hyperscale_storage::ShardChainReader::get_execution_certificates_for_txs
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -72,8 +74,17 @@ impl ExecCertStore {
     /// Insert a verified execution certificate. Idempotent: re-inserting
     /// the same `TickId` is a no-op (the existing `Arc` is preserved so
     /// callers holding clones keep pointing at the same allocation).
+    ///
+    /// A no-op for a wider copy of a held tick too: the index is a
+    /// function of the certificate held, so it names only what that copy
+    /// carries and [`evict`](Self::evict) removes exactly what this
+    /// added. The writer is single, so the check and the insert do not
+    /// race.
     pub fn insert(&self, cert: Arc<Verified<ExecutionCertificate>>) {
         let tick_id = *cert.tick_id();
+        if self.inner.pin().contains_key(&tick_id) {
+            return;
+        }
         // Index before the primary insert, so a concurrent reader that
         // resolves a transaction always finds the certificate behind it.
         let by_tx = self.by_tx.pin();
@@ -239,6 +250,33 @@ mod tests {
             store.certificates_for_tx(hash).is_empty(),
             "and the last one leaving takes the entry with it",
         );
+    }
+
+    /// A wider second copy of a held tick changes nothing: the index is
+    /// the held certificate's, and eviction removes exactly what the
+    /// held copy added.
+    #[test]
+    fn a_wider_copy_of_a_held_tick_is_not_indexed() {
+        let store = ExecCertStore::new();
+        let (carried, extra) = (tx(1), tx(2));
+        let narrow = attesting(1, vec![outcome(carried, Role::Core)]);
+        let wide = attesting(
+            1,
+            vec![outcome(carried, Role::Core), outcome(extra, Role::Core)],
+        );
+        store.insert(Arc::clone(&narrow));
+        store.insert(Arc::clone(&wide));
+
+        assert_eq!(store.len(), 1);
+        assert!(
+            store.certificates_for_tx(extra).is_empty(),
+            "the transaction only the wider copy carries is not answered",
+        );
+        assert_eq!(store.certificates_for_tx(carried).len(), 1);
+
+        store.evict(narrow.tick_id());
+        assert!(store.certificates_for_tx(carried).is_empty());
+        assert!(store.by_tx.pin().is_empty(), "and the index is empty");
     }
 
     #[test]

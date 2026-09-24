@@ -169,10 +169,9 @@ fn build_prepared_commit(
             );
             storage.append_beacon_witnesses_to_batch(&mut write_batch, witness);
 
-            // The block's execution certificates and its sweep-index
-            // delta append inside `try_apply_prepared_commit`, which
-            // holds `commit_lock` across the reads their writes depend
-            // on.
+            // The block's sweep-index delta appends inside
+            // `try_apply_prepared_commit`, which holds `commit_lock`
+            // across the reads its write depends on.
             let applied = storage.try_apply_prepared_commit(
                 write_batch,
                 &sweep_rows,
