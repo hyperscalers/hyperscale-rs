@@ -33,7 +33,7 @@ use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
     ChainEntry, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
-    ShardChainWriter, SubstateStore, TerminalWindow, sweep_for_block,
+    ShardChainWriter, SubstateStore, TerminalWindow, colliding_committed_cell, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -1880,6 +1880,10 @@ impl ShardCoordinatorSim {
                 assert_eq!(
                     computed_sweep_frontier, claimed_sweep_frontier,
                     "the sim's proposer and verifier walk the same interval",
+                );
+                assert!(
+                    colliding_committed_cell(&creations, &view.snapshot()).is_none(),
+                    "the sim's proposer defers a transaction whose committed cell collides",
                 );
                 let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                     ParentAnchor {

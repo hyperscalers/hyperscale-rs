@@ -14,7 +14,8 @@ use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore,
-    SubstateView, SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, sweep_for_block,
+    SubstateView, SweepIndex, TerminalWindow, VersionedStore, colliding_committed_cell,
+    committed_tx_cells, sweep_for_block, without_colliding_committed_cells,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -246,6 +247,14 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // validator has persisted, and a movement baseline that moves with
     // persistence progress forks the root against replicas that lag.
     let anchored = view.snapshot();
+    // A transaction whose committed cell would collide — with a cell the
+    // parent state holds, or with another transaction's here — is
+    // deferred: the first of each set is kept, and everything below
+    // reads the kept list, so the block a verifier refuses is never
+    // built. The deferred ones stay pooled.
+    let mut transactions = transactions.clone();
+    without_colliding_committed_cells(local_shard, &mut transactions, &anchored);
+    let transactions = &transactions;
     // The sweep, before the root it moves. Removals are ordinary writes,
     // so they fold in with the block's settling receipts and land under
     // `state_root` like anything else — and the frontier the walk stops
@@ -1072,6 +1081,28 @@ where
                     ?claimed_sweep_frontier,
                     ?computed_sweep_frontier,
                     "Rejecting block whose sweep frontier is not the one its interval produces"
+                );
+                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                    block_hash,
+                    kind: VerificationKind::StateRoot,
+                    outcome: CheckOutcome::Refused,
+                });
+                return;
+            }
+            // A block carries no transaction whose committed cell is
+            // present in its parent state or named by another of its
+            // transactions. Two creations at one key would halt every
+            // replica in the fold's assert, and a creation over a live
+            // cell would leave a later retraction deleting another
+            // transaction's cell. A validity rule at vote time, judged
+            // against the anchored view: a replica following a certified
+            // block never evaluates it.
+            if let Some(key) = colliding_committed_cell(&creations, &anchored) {
+                tracing::warn!(
+                    ?block_hash,
+                    height = block_height.inner(),
+                    ?key,
+                    "Rejecting block whose committed cell is already present or named twice"
                 );
                 ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
                     block_hash,
