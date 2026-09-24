@@ -732,7 +732,7 @@ mod tests {
     use crate::admission::admit_all;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
     use crate::commit_dedup::CommitDedupIndex;
-    use crate::validation::tests::wide_claims;
+    use crate::validation::tests::{wide_claims, wide_claims_at};
 
     /// Admission under `snapshot` at `anchor` for a chain that began at
     /// `origin`, with `txs` behind the parent and `dedup` committed.
@@ -1403,6 +1403,61 @@ mod tests {
             select_state_claims(&ctx.ctx(), &mut next, vec![remainder.clone()]),
             vec![remainder],
             "the remainder rides the next proposal whole",
+        );
+    }
+
+    /// The budget is spent in the order the composer offers, one
+    /// producer's claims in anchor order: with room for both, a claim at
+    /// `a1` and one at `a2 > a1` both ride; with room for one, the one
+    /// at `a1` rides whole and the one at `a2` is cut behind it, so no
+    /// reading at `a2` is carried while one at `a1` is held back.
+    #[test]
+    fn a_producers_older_anchor_rides_before_its_newer_one() {
+        let (_, at_a1) = wide_claims_at(ShardId::ROOT, 3);
+        let (_, at_a2) = wide_claims_at(ShardId::ROOT, 4);
+        let ctx = finalizations_against(CommitDedupIndex::new());
+        let is_whole = |carried: &StateClaim, offered: &[StateClaim]| offered.contains(carried);
+
+        let both = vec![at_a1[0].clone(), at_a2[0].clone()];
+        let mut fold = StateClaimsFold::default();
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, both.clone());
+        assert_eq!(selected.len(), 2, "with room for both, both ride");
+        assert!(selected.iter().all(|claim| is_whole(claim, &both)));
+
+        // `a1`'s claims until `a2`'s first no longer fits whole behind
+        // them, then `a2`'s first.
+        let mut offered: Vec<StateClaim> = Vec::new();
+        let mut weight = 0usize;
+        for claim in &at_a1 {
+            if !state_claims_admit_block(weight + at_a2[0].wire_weight()) {
+                break;
+            }
+            weight += claim.wire_weight();
+            offered.push(claim.clone());
+        }
+        let older = offered.len();
+        assert!(
+            older > 0 && state_claims_admit_block(weight),
+            "the fixture's a1 claims fit by themselves",
+        );
+        assert!(
+            !state_claims_admit_block(weight + at_a2[0].wire_weight()),
+            "and leave no room for a2's whole",
+        );
+        offered.push(at_a2[0].clone());
+        let mut fold = StateClaimsFold::default();
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, offered.clone());
+        let (carried_a1, carried_a2): (Vec<&StateClaim>, Vec<&StateClaim>) = selected
+            .iter()
+            .partition(|claim| claim.anchor.height == BlockHeight::new(3));
+        assert_eq!(carried_a1.len(), older, "every claim at a1 rides");
+        assert!(
+            carried_a1.iter().all(|claim| is_whole(claim, &offered)),
+            "and rides whole",
+        );
+        assert!(
+            carried_a2.iter().all(|claim| !is_whole(claim, &offered)),
+            "what rides at a2 is a piece cut behind a1's, never the whole",
         );
     }
 

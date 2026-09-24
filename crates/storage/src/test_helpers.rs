@@ -13,25 +13,25 @@ use hyperscale_hbor::{Bytes, Capped, from_slice};
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    stub_sweepable_cell, test_transaction,
+    proven_claim, stub_sweepable_cell, test_key, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
     BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
-    CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, Event,
+    CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, EpochWindows, Event,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
     FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
     MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable,
     ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
-    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, Round,
-    SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload,
-    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
-    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
-    TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
-    Verified, VotePosition, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    compute_merkle_root, entry_leaf_key,
+    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFrontier,
+    ReadMark, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
+    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId,
+    StateClaim, StateRoot, StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket,
+    SweepFrontier, SyncHint, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -2119,6 +2119,197 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
         },
         sealed @ Block::Sealed { .. } => sealed,
     }
+}
+
+/// Attach `claims` to a live block, preserving everything else.
+fn with_state_claims(block: Block, claims: Vec<StateClaim>) -> Block {
+    match block {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
+            witness_sources,
+        },
+        sealed @ Block::Sealed { .. } => sealed,
+    }
+}
+
+/// The grid the frontier fixtures read marks on: wide enough that every
+/// anchor they name falls in epoch zero and no entry ages out.
+const FRONTIER_WINDOW_MS: u64 = 1_000_000;
+
+/// A block at `height` carrying one claim of `producer` at its height
+/// `read_at`, over one absent key under `producer`'s prefix, and the
+/// frontier inputs the block's shard reads off it.
+fn block_reading(height: u64, producer: ShardId, read_at: u64) -> (Block, FrontierInputs) {
+    let asked = test_key(0xD0);
+    let block = with_state_claims(
+        make_test_block(BlockHeight::new(height)),
+        vec![proven_claim(producer, read_at, &[], &[asked])],
+    );
+    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+    (block, inputs)
+}
+
+/// The table one reading of `producer` at `read_at` leaves, on the
+/// fixtures' grid.
+fn frontier_of(producer: ShardId, read_at: u64) -> ReadFrontier {
+    ReadFrontier::from_entries([(
+        producer,
+        ReadMark {
+            epoch: Epoch::new(0),
+            height: BlockHeight::new(read_at),
+        },
+    )])
+}
+
+/// Commit `block` at the store's tip through the one commit path, with
+/// `frontier` as what its claims do to the read frontier. Returns the
+/// root the commit prepared beside the one it flushed.
+fn commit_raising<S: TestStore>(
+    storage: &S,
+    block: Block,
+    frontier: &FrontierInputs,
+) -> (StateRoot, StateRoot) {
+    let storage = Arc::new(storage.clone());
+    let (prepared, _, commit) = storage.prepare_block_commit(
+        ParentAnchor {
+            state_root: storage.state_root(),
+            height: storage.jmt_height(),
+            state: &storage.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &[],
+        &[],
+        &[],
+        frontier,
+        block.height(),
+    );
+    let committed = commit(
+        SyncHint::FlushNow,
+        &make_test_certified(block),
+        &empty_witness(),
+    );
+    (prepared, committed)
+}
+
+/// Shared: the read frontier is state, written by the one commit path.
+///
+/// A block carrying a claim raises its producer's entry under the root
+/// it prepares and commits; the same reading again moves nothing; the
+/// store answers for the table through `read_frontier`, and a store
+/// resumed from the same state answers the same, so a restart seeds the
+/// coordinator's copy from what the chain wrote. Both children read the
+/// table too: the left one where it stands, the right one from its copy.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_the_read_frontier_is_read_off_the_state<S>(
+    storage: &S,
+    recovered: impl Fn(ShardId) -> RecoveredState,
+) where
+    S: BoundaryStore + TestStore,
+{
+    let local = ShardId::ROOT;
+    let producer = ShardId::leaf(2, 3);
+    let table = |shard: ShardId| {
+        let held = storage.read_frontier(shard);
+        assert_eq!(
+            recovered(shard).read_frontier,
+            held,
+            "a resumed store holds the table a running one does",
+        );
+        held
+    };
+    assert!(table(local).is_empty(), "a fresh store has read nothing");
+
+    let (block, inputs) = block_reading(1, producer, 7);
+    let parent_root = storage.state_root();
+    let (prepared, committed) = commit_raising(storage, block, &inputs);
+    assert_ne!(prepared, parent_root, "a raise moves the root");
+    assert_eq!(committed, prepared, "the commit lands the root it prepared");
+    let expected = frontier_of(producer, 7);
+    assert_eq!(table(local), expected, "the store answers for the raise");
+    let (left, right) = local.children();
+    assert_eq!(table(left), expected, "the left child inherits the table");
+    assert_eq!(table(right), expected, "and the right child reads its copy");
+
+    let (again, inputs) = block_reading(2, producer, 7);
+    let (prepared, committed) = commit_raising(storage, again, &inputs);
+    assert_eq!(
+        prepared, committed,
+        "a block raising nothing prepares its parent's root"
+    );
+    assert_eq!(committed, storage.state_root());
+    assert_eq!(table(local), expected, "and leaves the table as it was");
+
+    let (higher, inputs) = block_reading(3, producer, 9);
+    let before = storage.state_root();
+    let (_, committed) = commit_raising(storage, higher, &inputs);
+    assert_ne!(committed, before, "a higher reading moves the root again");
+    assert_eq!(table(local), frontier_of(producer, 9));
+}
+
+/// Shared: a split observer following the parent's blocks into one half
+/// rebuilds the parent's raise from the copy on that half alone.
+///
+/// `parent` holds the whole keyspace and commits a block carrying a
+/// claim through the one commit path; `left` and `right` hold one half
+/// each and follow the same block. Each half's root moves, the two
+/// recompose the parent's, and each child reads the table the parent
+/// wrote from its own half.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_followed_halves_hold_the_read_frontier<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let producer = ShardId::leaf(2, 3);
+    let (block, inputs) = block_reading(1, producer, 7);
+    let (_, parent_root) = commit_raising(parent, block.clone(), &inputs);
+
+    let left_before = left.state_root();
+    let right_before = right.state_root();
+    let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
+    let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert_ne!(left_root, left_before, "the left half holds the table");
+    assert_ne!(right_root, right_before, "and the right half its copy");
+    assert!(
+        SplitChildRoots {
+            left: left_root,
+            right: right_root,
+        }
+        .composes_to(parent_root),
+        "the followed halves recompose the parent's root",
+    );
+
+    let expected = frontier_of(producer, 7);
+    let (left_child, right_child) = ShardId::ROOT.children();
+    assert_eq!(
+        left.read_frontier(left_child),
+        expected,
+        "the left child reads the table off its half",
+    );
+    assert_eq!(
+        right.read_frontier(right_child),
+        expected,
+        "and the right child off its own",
+    );
 }
 
 /// Shared prepare-path test: a block that carries a transaction and no

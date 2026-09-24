@@ -1152,6 +1152,11 @@ pub mod tests {
     /// the one that does not fit leaves room for a piece of itself.
     /// Returns the tree's leaves beside them.
     pub fn wide_claims(shard: ShardId) -> (Vec<SubstateKey>, Vec<StateClaim>) {
+        wide_claims_at(shard, 3)
+    }
+
+    /// [`wide_claims`] at `shard`'s `height`.
+    pub fn wide_claims_at(shard: ShardId, height: u64) -> (Vec<SubstateKey>, Vec<StateClaim>) {
         let leaves: Vec<SubstateKey> = (0u16..2_048)
             .map(|at| SubstateKey {
                 owner: test_utils::test_prefix(u8::try_from(at / 256).expect("under 8")),
@@ -1162,7 +1167,7 @@ pub mod tests {
         sorted.sort_unstable();
         let claims: Vec<StateClaim> = sorted
             .chunks(200)
-            .map(|asked| test_utils::proven_claim(shard, 3, &leaves, asked))
+            .map(|asked| test_utils::proven_claim(shard, height, &leaves, asked))
             .collect();
         let total: usize = claims.iter().map(StateClaim::wire_weight).sum();
         assert!(

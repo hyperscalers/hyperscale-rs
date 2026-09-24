@@ -532,7 +532,7 @@ mod tests {
     use hyperscale_storage::{BoundaryStore, ImportCursor, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_key;
-    use hyperscale_types::{ChainOrigin, LEAF_KEY_BYTES, ShardWitnessPayload};
+    use hyperscale_types::{ChainOrigin, Epoch, LEAF_KEY_BYTES, ReadMark, ShardWitnessPayload};
 
     use super::*;
     use crate::bootstrap::state_range_serve::serve_state_range_request;
@@ -693,7 +693,17 @@ mod tests {
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
         drive(&mut bootstrap, &serving, &pending_chain, &fresh);
 
-        let recovered = bootstrap.into_recovered_state(ReadFrontier::default());
+        // The joiner's table is whatever the store it imported into
+        // holds; it is handed in, and the recovery carries it whole.
+        let read_frontier = ReadFrontier::from_entries([(
+            ShardId::leaf(1, 1),
+            ReadMark {
+                epoch: Epoch::new(2),
+                height: BlockHeight::new(40),
+            },
+        )]);
+        let recovered = bootstrap.into_recovered_state(read_frontier.clone());
+        assert_eq!(recovered.read_frontier, read_frontier);
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));

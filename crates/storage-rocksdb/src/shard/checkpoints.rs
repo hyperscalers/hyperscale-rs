@@ -742,7 +742,8 @@ mod tests {
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
         test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
-        test_import_gate_reads_the_trie,
+        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
+        test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, ShardChainReader, SubstateStore};
     use hyperscale_types::AddressClass;
@@ -922,6 +923,30 @@ mod tests {
         test_escrow_records_are_read_off_the_state(&storage, |shard| {
             storage.load_recovered_state(shard)
         });
+    }
+
+    /// A store answers for the read frontier its state holds, the same
+    /// whether it is running or resumed.
+    #[test]
+    fn the_read_frontier_is_read_off_the_state() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        test_the_read_frontier_is_read_off_the_state(&storage, |shard| {
+            storage.load_recovered_state(shard)
+        });
+    }
+
+    /// A split follower on each half rebuilds the parent's raise from
+    /// the copy on its half, and the halves recompose the parent's root.
+    #[test]
+    fn followed_halves_hold_the_read_frontier() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_followed_halves_hold_the_read_frontier(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
     }
 
     #[test]

@@ -110,7 +110,8 @@ fn verified_recovered_state(
 mod tests {
     use hyperscale_storage::CrossingLeaves;
     use hyperscale_types::{
-        BlockHeight, ChainOrigin, Hash, ReadFrontier, StateRoot, WeightedTimestamp,
+        BlockHeight, ChainOrigin, Epoch, Hash, ReadFrontier, ReadMark, ShardId, StateRoot,
+        WeightedTimestamp,
     };
 
     use super::verified_recovered_state;
@@ -122,9 +123,18 @@ mod tests {
         }
     }
 
+    /// A seat boots from the root it adopted, and carries the read
+    /// frontier the adopted state holds into the coordinator's copy.
     #[test]
     fn matching_root_yields_the_seat_state() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"adopted"));
+        let read_frontier = ReadFrontier::from_entries([(
+            ShardId::leaf(1, 1),
+            ReadMark {
+                epoch: Epoch::new(2),
+                height: BlockHeight::new(40),
+            },
+        )]);
         let recovered = verified_recovered_state(
             root,
             root,
@@ -132,11 +142,12 @@ mod tests {
             4_096,
             Vec::new(),
             CrossingLeaves::default(),
-            ReadFrontier::default(),
+            read_frontier.clone(),
         )
         .expect("matches");
         assert_eq!(recovered.substate_bytes, 4_096);
         assert_eq!(recovered.chain_origin, origin());
+        assert_eq!(recovered.read_frontier, read_frontier);
     }
 
     #[test]
