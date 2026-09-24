@@ -1848,8 +1848,18 @@ fn assert_train_fates<C: Cluster>(
             "successor {successor} must be served within budget",
         );
     }
+    // Whether some chain holding the recipient — the leaving shard or a
+    // successor — has settled `hash` in the recipient's favour.
+    let delivered_by = |c: &C, hash: TxHash| {
+        std::iter::once(terminating)
+            .chain(successors.iter().copied())
+            .any(|shard| {
+                c.chain_fate(shard, hash)
+                    .1
+                    .is_some_and(|(_, decision)| decision == TransactionDecision::Accept)
+            })
+    };
     let mut never_included = 0;
-    let mut lost = 0;
     for (hash, to, phase) in sent {
         let (included, settled) = c.chain_fate(terminating, *hash);
         // Settled means settled in the recipient's favour. An abort on
@@ -1873,37 +1883,24 @@ fn assert_train_fates<C: Cluster>(
         // shard's or, for a transfer it never settled, whichever
         // successor took the recipient's prefix. A transfer accepted by
         // its payer and by no chain holding the recipient is one whose
-        // delivery has not landed: the payment stands in its record,
-        // registered when the leg was sent, and nothing reclaims it.
-        let delivered = std::iter::once(terminating)
-            .chain(successors.iter().copied())
-            .any(|shard| {
-                c.chain_fate(shard, *hash)
-                    .1
-                    .is_some_and(|(_, decision)| decision == TransactionDecision::Accept)
-            });
+        // delivery has not landed yet: the payment stands in its record,
+        // registered when the leg was sent, until the successor lands
+        // it, and nothing reclaims it.
+        let delivered = delivered_by(c, *hash);
         let credited = match (fate_owed(*phase, settled), status, delivered) {
             (
                 Fate::Settled | Fate::Carried,
                 Some(TransactionStatus::Completed(TransactionDecision::Accept)),
                 true,
             ) => 10 + STRADDLER_PAYMENT,
-            // The payment never left.
+            // The payment never left, or has not landed yet.
             (
                 Fate::Carried,
-                Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
+                Some(TransactionStatus::Completed(
+                    TransactionDecision::Accept | TransactionDecision::Aborted,
+                )),
                 false,
             ) => 10,
-            // The payer's chain accepted and no chain holding the
-            // recipient delivered: the payment stands in its record.
-            (
-                Fate::Carried,
-                Some(TransactionStatus::Completed(TransactionDecision::Accept)),
-                false,
-            ) => {
-                lost += 1;
-                10
-            }
             (owed, other, delivered) => panic!(
                 "a transfer sent {phase:?} and {taken} by the leaving shard owes {owed:?} and \
                  reached {other:?}, delivered = {delivered}, tx = {hash}",
@@ -1921,12 +1918,25 @@ fn assert_train_fates<C: Cluster>(
         never_included > 0,
         "the train has to reach the leaving shard's coast, or nothing here crosses the cut",
     );
+    // Read at one instant, once every credit has been waited for: a
+    // delivery the successor lands after its leg was classified leaves
+    // nothing standing, and one it has not landed leaves its record.
+    let undelivered: Vec<TxHash> = sent
+        .iter()
+        .filter(|(hash, ..)| {
+            matches!(
+                c.tx_status(*hash),
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ) && !delivered_by(c, *hash)
+        })
+        .map(|(hash, ..)| *hash)
+        .collect();
     let standing = world.standing(c);
     assert_eq!(
         standing.len(),
-        lost,
+        undelivered.len(),
         "every payment accepted by its payer and delivered nowhere stands in its record, and \
-         nothing else does; standing = {standing:?}",
+         nothing else does; undelivered = {undelivered:?}, standing = {standing:?}",
     );
 }
 
