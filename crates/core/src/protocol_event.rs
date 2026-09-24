@@ -38,11 +38,12 @@ pub struct TickBatchOutcome {
     /// Per-member outcomes extracted on the handler thread for vote
     /// signing.
     pub tx_outcomes: Vec<TxOutcome>,
-    /// Fee receipts built beside the execution receipts, for the
-    /// transactions this shard pays for and a counterpart can still
-    /// refuse. Held in reserve: an abort settles one of these in place of
-    /// the discarded execution receipt.
-    pub fee_receipts: Vec<StoredReceipt>,
+    /// Refusal receipts built beside the execution receipts: the charge
+    /// of a transaction this shard pays for, and the `Never` answers of
+    /// a consumer that was or can still be refused. Held in reserve: a
+    /// refusal settles one of these in place of the discarded execution
+    /// receipt.
+    pub refusal_receipts: Vec<StoredReceipt>,
 }
 
 /// How a node learned about the certifying QC that commits a given block.

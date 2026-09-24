@@ -41,8 +41,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Deletion, Disposal, Disposition, EnvInputs, ExecutionMode,
-    FeeBurn, Job, LegPlan, ManifestWalk, Obligations, OwnerSet, Receipt, Refusal, Substates,
-    execute_batch,
+    FeeBurn, Job, LegPlan, ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -51,7 +50,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Licence, Member, Runs};
+use crate::legs::{Licence, Member, Runs, never_answer};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -718,78 +717,6 @@ impl Executor {
         })
     }
 
-    /// Lower a refusal: the cells it writes, declared, and nothing
-    /// read.
-    ///
-    /// [`Self::prepare_settle`]'s mirror, and shorter for the reason the
-    /// two differ: a settlement reads a record this shard holds and
-    /// decides what becomes of it, where a refusal holds no record at
-    /// all. Its every term comes in with the member — the producer's own
-    /// committed cell, carried from the bundle that proved it — so what
-    /// is left here is declaring the cells it touches: the decline it
-    /// writes, the claim it reads, and the note it retires.
-    ///
-    /// What the refusal may not do is checked inside the kernel against
-    /// the committed baseline, not here: a crossing owed to its consumer
-    /// is not refusable, and one this shard has already claimed is
-    /// answered. Both are value, and both are refused where every
-    /// replica reads the same state rather than where a composer reads
-    /// its own.
-    ///
-    /// # Errors
-    ///
-    /// A refusal naming no crossing, or a declaration two of its cells
-    /// contradict.
-    fn prepare_refuse(
-        crossings: &[Refusal],
-        ctx: &TickBatchContext<'_>,
-    ) -> Result<PreparedTx, String> {
-        if crossings.is_empty() {
-            return Err("this shard has no crossing to refuse".to_string());
-        }
-        let mut declaration = Declaration::default();
-        for refusal in crossings {
-            let mut declare_here = |effect| {
-                declare(&mut declaration, effect, None).map_err(|conflict| {
-                    format!("refused cell contradicts the declaration: {conflict}")
-                })
-            };
-            declare_here(Effect {
-                target: EffectTarget::Point(refusal.site),
-                mode: Mode::Write { moves: Moves::Both },
-            })?;
-            // The claim the kernel reads to establish the crossing is
-            // unanswered. Declared because everything a member touches
-            // is, and read because a refusal writes it under no
-            // circumstances: the one cell here it looks at and leaves.
-            declare_here(Effect {
-                target: EffectTarget::Point(refusal.cell.consumer_claim),
-                mode: Mode::Read,
-            })?;
-            // And the note this shard wrote itself about the crossing,
-            // which the answer retires. A write, because a removal is
-            // one — and the cell need not be there, since a crossing
-            // refused before the ledger caught up with it never had a
-            // note to retire.
-            declare_here(Effect {
-                target: EffectTarget::Point(refusal.obligation),
-                mode: Mode::Write { moves: Moves::Both },
-            })?;
-        }
-        let trie = ctx.shard_trie.clone();
-        let local = ctx.local_shard;
-        Ok(PreparedTx {
-            job: Job::Refusals(crossings.to_vec()),
-            declaration,
-            nullifiers: Vec::new(),
-            gas_limits: Vec::new(),
-            // A refusal invokes no node, so nothing of it emits.
-            event_bytes: Vec::new(),
-            work: DeclaredWork::ZERO,
-            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
-        })
-    }
-
     /// Lower an answer cleanup: the cells it removes, declared, and
     /// nothing read.
     ///
@@ -877,54 +804,6 @@ impl Executor {
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
             // A sweep invokes no node, so nothing of it emits.
-            event_bytes: Vec::new(),
-            work: DeclaredWork::ZERO,
-            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
-        })
-    }
-
-    /// Lower obligation-ledger work: the notes it writes and the notes
-    /// it lets go of, declared, and nothing read.
-    ///
-    /// [`Self::prepare_refuse`]'s neighbour, and shorter still. A
-    /// refusal reads the claim that would make the crossing answered;
-    /// this reads nothing at all, because what licenses each half was
-    /// read by the composer off this shard's own state and there is
-    /// nothing in a note to hold it to.
-    ///
-    /// # Errors
-    ///
-    /// Work naming nothing, or a declaration two of its cells
-    /// contradict.
-    fn prepare_owe(work: &Obligations, ctx: &TickBatchContext<'_>) -> Result<PreparedTx, String> {
-        if work.owe.is_empty() && work.disown.is_empty() {
-            return Err("this shard has no obligation to record".to_string());
-        }
-        let mut declaration = Declaration::default();
-        for key in work
-            .owe
-            .iter()
-            .map(|refusal| refusal.obligation)
-            .chain(work.disown.iter().copied())
-        {
-            declare(
-                &mut declaration,
-                Effect {
-                    target: EffectTarget::Point(key),
-                    mode: Mode::Write { moves: Moves::Both },
-                },
-                None,
-            )
-            .map_err(|conflict| format!("obligation contradicts the declaration: {conflict}"))?;
-        }
-        let trie = ctx.shard_trie.clone();
-        let local = ctx.local_shard;
-        Ok(PreparedTx {
-            job: Job::Obligations(work.clone()),
-            declaration,
-            nullifiers: Vec::new(),
-            gas_limits: Vec::new(),
-            // A ledger entry invokes no node, so nothing of it emits.
             event_bytes: Vec::new(),
             work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
@@ -1257,18 +1136,31 @@ struct FoldState {
 /// only value already spoken for, which is what leaves a sibling's judged
 /// debit on the same vault — judged against committed balance less
 /// outstanding holds — still feasible when it settles.
+///
+/// Beside the charge ride the member's `Never` answers, one absolute
+/// cell write per refusable crossing it consumed and was refused for,
+/// under one writes root. `None` where both are empty: a member with
+/// nothing to settle apart names no receipt.
 #[must_use]
-pub fn build_fee_receipt(
+pub fn build_refusal_receipt(
     local_shard: ShardId,
     shard_trie: &ShardTrie,
     tx_hash: TxHash,
-    vault: SubstateKey,
-    charge: Movement,
-) -> ConsensusReceipt {
-    let amount = charge.debit.saturating_add(charge.unjudged_debit);
+    charge: Option<(SubstateKey, Movement)>,
+    nevers: &[(SubstateKey, Vec<u8>)],
+) -> Option<ConsensusReceipt> {
+    if charge.is_none() && nevers.is_empty() {
+        return None;
+    }
+    let amount = charge.as_ref().map_or(0, |(_, movement)| {
+        movement.debit.saturating_add(movement.unjudged_debit)
+    });
     let writes = StateWrites {
-        cells: BTreeMap::new(),
-        movements: BTreeMap::from([(vault, charge)]),
+        cells: nevers
+            .iter()
+            .map(|(key, value)| (*key, Some(value.clone())))
+            .collect(),
+        movements: charge.into_iter().collect(),
         entries: BTreeMap::new(),
     };
     let receipt_hash = GlobalReceipt::new(
@@ -1286,7 +1178,37 @@ pub fn build_fee_receipt(
         Vec::new(),
         Vec::new(),
     );
-    project_to_shard(&cached, tx_hash, local_shard, shard_trie).consensus
+    Some(project_to_shard(&cached, tx_hash, local_shard, shard_trie).consensus)
+}
+
+/// The `Never` answers a refused member writes: one per refusable
+/// crossing it consumed whose decline cell this shard holds, where
+/// neither the claim nor the decline holds a value already, read off
+/// `holds` — the batch's running fold over the tick's baseline.
+///
+/// A `Never` is skipped where an answer stands, never trapped: the only
+/// writer of this member's claim or decline key is the member itself,
+/// which no tick runs twice, so a value found there is the answer
+/// already given. Nothing for a member that runs no shape.
+fn never_answers(
+    runs: Option<&Runs>,
+    tx_hash: TxHash,
+    local_shard: ShardId,
+    locality: &OwnerSet,
+    holds: impl Fn(SubstateKey) -> bool,
+) -> Vec<(SubstateKey, Vec<u8>)> {
+    let Some(Runs::Shape(member)) = runs else {
+        return Vec::new();
+    };
+    member
+        .classified()
+        .refusable_consumed(local_shard)
+        .map(|edge| (edge.claim.key(), never_answer(tx_hash, edge)))
+        .filter(|(claim, (never, _))| {
+            locality.covers(never.owner) && !holds(*claim) && !holds(*never)
+        })
+        .map(|(_, answer)| answer)
+        .collect()
 }
 
 /// Settle one publish: the artifact lands in the cell its content
@@ -1359,19 +1281,19 @@ fn assemble_published_tx(
     // the artifact's length under the signed ceiling — as every refusal
     // does: the shard judged these bytes before it knew the answer, and
     // what it charges is what it declared, never the ceiling.
-    let fee_receipt = match (&refusal, fee) {
-        (Some(_), Some(payer)) => Some(build_fee_receipt(
+    let refusal_receipt = match (&refusal, fee) {
+        (Some(_), Some(payer)) => build_refusal_receipt(
             ctx.local_shard,
             ctx.shard_trie,
             tx_hash,
-            payer.vault,
-            Movement::unjudged(*PROTOCOL_RESOURCE, charged),
-        )),
+            Some((payer.vault, Movement::unjudged(*PROTOCOL_RESOURCE, charged))),
+            &[],
+        ),
         _ => None,
     };
 
     let mut executed = project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie);
-    executed.fee_receipt = fee_receipt;
+    executed.refusal_receipt = refusal_receipt;
     executed
 }
 
@@ -1398,7 +1320,10 @@ static WHOLE_JOB: LazyLock<Job> = LazyLock::new(|| Job::Manifest {
 /// A cell the declaration already carries under another mode: the
 /// member is refused rather than run against a contradiction.
 fn declare_crossing_cells(declaration: &mut Declaration, legs: &LegPlan) -> Result<(), String> {
-    for key in legs.records().chain(legs.claims()) {
+    // The decline cells beside the claims: the member's refusal receipt
+    // writes them, so the declaration is honest, the baseline pre-read
+    // holds them, and every writer of one sits in one conflict group.
+    for key in legs.records().chain(legs.claims()).chain(legs.nevers()) {
         let effect = Effect {
             target: EffectTarget::Point(key),
             mode: Mode::Write { moves: Moves::Both },
@@ -1466,12 +1391,13 @@ fn assemble_executed_tx(
     vm_tx: TxHash,
     kernel: KernelOutput<'_>,
     fee: Option<PayerFee>,
+    runs: Option<&Runs>,
 ) -> ExecutedTx {
     let BatchInputs { base, locality, .. } = inputs;
     let KernelOutput { receipt, job } = kernel;
     let tx_hash = vm_tx;
     let charged = fee.map_or(0, |payer| payer.burned());
-    let fee_receipt = fee
+    let charge = fee
         .filter(|payer| settled_apart(&receipt.outcome, *payer))
         .map(|payer| {
             // A completed run was priced against the vault the kernel
@@ -1483,14 +1409,25 @@ fn assemble_executed_tx(
             } else {
                 Movement::unjudged(*PROTOCOL_RESOURCE, payer.burned())
             };
-            build_fee_receipt(
-                ctx.local_shard,
-                ctx.shard_trie,
-                tx_hash,
-                payer.vault,
-                charge,
-            )
+            (payer.vault, charge)
         });
+    // The member's answers where it can still be refused: here, by
+    // its own outcome, or later, by a counterpart's verdict. A
+    // multi-core consumer that completed here, holds no vault and is
+    // refused by a sibling still names a receipt carrying its `Never`.
+    let nevers = if matches!(receipt.outcome, Outcome::Completed { .. })
+        && !runs.is_some_and(Runs::abortable)
+    {
+        Vec::new()
+    } else {
+        never_answers(runs, tx_hash, ctx.local_shard, locality, |key| {
+            fold.running
+                .get(&key)
+                .map_or_else(|| base.cells.contains_key(&key), Option::is_some)
+        })
+    };
+    let refusal_receipt =
+        build_refusal_receipt(ctx.local_shard, ctx.shard_trie, tx_hash, charge, &nevers);
     let cached = if matches!(receipt.outcome, Outcome::Completed { .. }) {
         // What the receipt carries: exclusive writes as absolutes,
         // everything commutative as the movement it was. Unresolved,
@@ -1587,7 +1524,7 @@ fn assemble_executed_tx(
         CachedOutput::failed(vm_metadata(charged, Some(abort_reason(&receipt.outcome))))
     };
     let mut executed = project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie);
-    executed.fee_receipt = fee_receipt;
+    executed.refusal_receipt = refusal_receipt;
     executed
 }
 
@@ -1702,8 +1639,6 @@ impl Executor {
                 Runs::Settle { records, on, .. } => {
                     Self::prepare_settle(records, *on, ctx, snapshot)
                 }
-                Runs::Refuse { crossings, .. } => Self::prepare_refuse(crossings, ctx),
-                Runs::Owe { work, .. } => Self::prepare_owe(work, ctx),
                 Runs::Clean { answers, .. } => Self::prepare_clean(answers, ctx),
                 Runs::Sweep { tombstones, .. } => Self::prepare_sweep(tombstones, ctx),
                 Runs::Shape(shape) => input
@@ -1909,6 +1844,7 @@ impl Executor {
                 *vm_tx,
                 kernel,
                 fee_by_tx.get(vm_tx).copied(),
+                shapes.get(vm_tx).map(|input| &input.runs),
             );
             folded.insert(*vm_tx, executed);
         }
@@ -1978,15 +1914,25 @@ impl Executor {
                     let cached = CachedOutput::failed(vm_metadata(charged, Some(reason)));
                     let mut executed =
                         project_to_shard(&cached, vm_tx, ctx.local_shard, ctx.shard_trie);
-                    executed.fee_receipt = fee.map(|payer| {
-                        build_fee_receipt(
-                            ctx.local_shard,
-                            ctx.shard_trie,
-                            vm_tx,
-                            payer.vault,
-                            Movement::unjudged(*PROTOCOL_RESOURCE, charged),
-                        )
-                    });
+                    // Refused before any of it ran, so nothing of this
+                    // batch wrote its answers: the tick's baseline is
+                    // what says whether one already stands.
+                    let nevers = never_answers(
+                        shapes.get(&vm_tx).map(|input| &input.runs),
+                        vm_tx,
+                        ctx.local_shard,
+                        &locality,
+                        |key| base.cells.contains_key(&key),
+                    );
+                    executed.refusal_receipt = build_refusal_receipt(
+                        ctx.local_shard,
+                        ctx.shard_trie,
+                        vm_tx,
+                        fee.map(|payer| {
+                            (payer.vault, Movement::unjudged(*PROTOCOL_RESOURCE, charged))
+                        }),
+                        &nevers,
+                    );
                     executed
                 })
             })

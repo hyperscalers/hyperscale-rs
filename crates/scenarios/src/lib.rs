@@ -81,7 +81,7 @@ pub use route::{
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
-    a_route_whose_core_never_combines_is_reclaimed_once, route_genesis_accounts,
+    a_route_whose_core_never_combines_holds_its_input, route_genesis_accounts,
 };
 pub use route_reshape::{
     MERGE_TRAIN, SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,

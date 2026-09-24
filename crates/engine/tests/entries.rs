@@ -168,12 +168,12 @@ fn run_tick(
         .expect("the harness engine holds every package it runs");
 
     let before = storage.state_root();
-    // Execution and fee receipts both, as the tick stores them: a failed
+    // Execution and refusal receipts both, as the tick stores them: a failed
     // attempt applies nothing itself but its charge still settles.
     let mut receipts: Vec<StoredReceipt> = Vec::new();
     for tx in &executed {
         let mut tx = tx.clone();
-        if let Some(fee) = tx.fee_receipt.take() {
+        if let Some(fee) = tx.refusal_receipt.take() {
             receipts.push(StoredReceipt::synced(tx.tx_hash, Arc::new(fee)));
         }
         receipts.push(StoredReceipt::from(tx));

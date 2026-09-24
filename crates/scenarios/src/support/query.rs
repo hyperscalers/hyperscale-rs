@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 
+use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::ShardChainReader;
@@ -18,7 +19,9 @@ use hyperscale_types::{
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
     WeightedTimestamp, Window, sweep_admits_block,
 };
-use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingCell, Terms};
+use hyperscale_vm_effects::{
+    Answered, CrossingAnswer, CrossingCell, Kind, Terms, crossing_decline_key,
+};
 
 use super::{Budget, Cluster};
 
@@ -213,6 +216,53 @@ pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
     }
 }
 
+/// A crossing record standing with no answer: value the protocol holds
+/// locked, listed and counted, until a verdict releases it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locked {
+    /// The record cell.
+    pub record: SubstateKey,
+    /// The transaction that issued the crossing.
+    pub tx: TxHash,
+    /// Which kind of crossing the record is.
+    pub kind: Kind,
+    /// What the record holds.
+    pub resource: ResourceAddr,
+    /// How much of it.
+    pub amount: u128,
+}
+
+/// The record standing at `cell` that nothing has answered: an escrowed
+/// or owed record whose claim key and decline key are both absent.
+/// `None` for an absent key, a retired record, or one either answer
+/// stands beside — a record in flight at the instant of the read looks
+/// the same, so this reports and asserts nothing.
+#[must_use]
+pub(crate) fn locked_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> Option<Locked> {
+    let shard = owning_shard(c, cell.owner);
+    let record = CrossingCell::from_bytes(&c.substate(shard, cell.owner, cell.local.0)?)?;
+    let kind = record.terms.kind()?;
+    let claim = record.consumer_claim;
+    let decline = crossing_decline_key(
+        &ProtocolHasher,
+        claim.owner,
+        record.intent,
+        record.local,
+        record.output,
+    );
+    let answered = [claim, decline].into_iter().any(|key| {
+        c.substate(owning_shard(c, key.owner), key.owner, key.local.0)
+            .is_some()
+    });
+    (!answered).then_some(Locked {
+        record: cell,
+        tx: record.tx,
+        kind,
+        resource: record.resource,
+        amount: record.amount,
+    })
+}
+
 /// The live shard whose prefix `owner` falls under.
 ///
 /// The beacon's live leaf partition is the authority: a split's parent
@@ -292,11 +342,11 @@ pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHe
 /// Walk `store`'s committed chain for every crossing refusal naming
 /// `tx`: the height each committed at and the record it refuses.
 ///
-/// Read off the decline cells this shard's own finalizations wrote,
-/// which is where a refusal is: a member that runs no node, writes the
-/// one cell and moves nothing. So a scenario asking whether this shard
-/// refused a crossing asks the chain rather than the state, and gets the
-/// height it happened at with the answer.
+/// Read off the `Never` cells this shard's own finalizations wrote,
+/// which is where a refusal is: the consuming member's refusal receipt,
+/// riding the finalization that refused it. So a scenario asking whether
+/// this shard refused a crossing asks the chain rather than the state,
+/// and gets the height it happened at with the answer.
 #[must_use]
 pub fn declines_naming(
     store: &impl ShardChainReader,
@@ -314,7 +364,7 @@ pub fn declines_naming(
                     };
                     named.extend(writes.cells.values().filter_map(|value| {
                         let answer = CrossingAnswer::from_bytes(value.as_ref()?)?;
-                        (answer.answered == Answered::Declined && answer.tx == tx)
+                        (answer.answered == Answered::Never && answer.tx == tx)
                             .then_some((height, answer.record))
                     }));
                 }

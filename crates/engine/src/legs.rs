@@ -26,12 +26,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction,
+    Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction, TxHash,
 };
-use hyperscale_vm_effects::{CrossingEdge as StarEdge, Kind, Star, running_at, star_at};
-use hyperscale_vm_kernel::{
-    Crossed, Deletion, Departure, LegPlan, Obligations, OwnerSet, PlanFault, Refusal,
-};
+use hyperscale_vm_effects::{Answered, CrossingEdge as StarEdge, Kind, Star, running_at, star_at};
+use hyperscale_vm_kernel::{Crossed, Deletion, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
 use crate::sharding::TrieShardResolver;
@@ -395,6 +393,24 @@ impl Classified {
         self.claims_issued(local, false)
     }
 
+    /// The decline cells core consumers write for the escrowed crossings
+    /// a leg on `local` issued, beside [`Self::escrowed_claims`]: the
+    /// consumer's `Never`, present where it refused the transaction, so
+    /// the producer credits the value back. Only a presence answers.
+    #[must_use]
+    pub fn escrowed_declines(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        self.edges()
+            .iter()
+            .filter(|edge| edge.from == local && !edge.delivers)
+            .map(|edge| {
+                (
+                    self.home(edge.consumer),
+                    edge.claim.answer_key(&ProtocolHasher, Answered::Never),
+                )
+            })
+            .collect()
+    }
+
     /// The claim cells consumers elsewhere write for the owed crossings
     /// a node on `local` issued — an inbound leg's, or the core's on a
     /// core shard.
@@ -506,6 +522,21 @@ impl Classified {
             .collect()
     }
 
+    /// The edges `local` consumes and may refuse: the escrowed ones,
+    /// which a core member consumes.
+    ///
+    /// Whether a consumer may refuse is decided here, off the frozen
+    /// classification and from the member's side. An escrowed edge's
+    /// consumer is a core node, so only a core member consumes one; a
+    /// delivering member consumes only owed edges, which nothing takes
+    /// back, so it never writes a negative answer. The producer writes
+    /// `Terms::Owed` exactly for an owed edge, off the same flag.
+    pub fn refusable_consumed(&self, local: ShardId) -> impl Iterator<Item = &CrossingEdge> {
+        self.edges()
+            .iter()
+            .filter(move |edge| !edge.delivers && edge.to.contains(&local))
+    }
+
     /// What `local` runs of the transaction on `side`, what arrives for
     /// it, and what departs from it.
     ///
@@ -546,6 +577,8 @@ impl Classified {
                         node: edge.producer,
                         output: edge.output,
                     })?;
+                // A refusable arrival files the decline cell its
+                // refusal would write, so the take screen covers it.
                 plan.arrives(
                     edge.producer,
                     edge.output,
@@ -555,6 +588,8 @@ impl Classified {
                     },
                     edge.claim,
                     edge.record.key(),
+                    (!edge.delivers)
+                        .then(|| edge.claim.answer_key(&ProtocolHasher, Answered::Never)),
                 )?;
             } else if runs_here(edge.producer) && !runs_here(edge.consumer) {
                 plan.departs(
@@ -883,37 +918,6 @@ pub enum Runs {
         /// that dissolved.
         charged: bool,
     },
-    /// No node at all: the crossings handed to this shard that nothing
-    /// here will ever take, each answered with a decline cell.
-    ///
-    /// [`Self::Settle`]'s mirror. That one disposes of records this
-    /// shard holds, on evidence of what its consumer did; this one
-    /// answers records another shard holds, and the evidence is that
-    /// nothing here can still speak. It moves no value — the producer
-    /// already has it, and the cell is the licence to keep it.
-    Refuse {
-        /// The member the refusal runs as: whole, on its own shard,
-        /// reaching nobody else.
-        member: Member,
-        /// The crossings refused, each carrying the record cell its
-        /// producer committed and the key the decline sits at.
-        crossings: Vec<Refusal>,
-    },
-    /// No node at all: this shard's own note of what it was handed and
-    /// has not answered, brought in line with the bundles that reached
-    /// it and the answers it has given.
-    ///
-    /// Housekeeping on cells nobody outside this shard reads. What it
-    /// writes is a bundle's crossing made durable, so the refusal
-    /// [`Self::Refuse`] may later compose needs no bundle at any age;
-    /// what it removes is a note whose answer already stands.
-    Owe {
-        /// The member the ledger work runs as: whole, on its own shard,
-        /// reaching nobody else.
-        member: Member,
-        /// What to write down and what to let go of.
-        work: Obligations,
-    },
     /// No node at all: this shard's own answers to crossings whose
     /// records their producers have since disposed of, taken away.
     ///
@@ -955,8 +959,6 @@ impl Runs {
         match self {
             Self::Shape(member)
             | Self::Settle { member, .. }
-            | Self::Refuse { member, .. }
-            | Self::Owe { member, .. }
             | Self::Clean { member, .. }
             | Self::Sweep { member, .. } => member,
         }
@@ -969,11 +971,7 @@ impl Runs {
     pub fn reaches_beyond(&self) -> bool {
         match self {
             Self::Shape(member) => member.reaches_beyond(),
-            Self::Settle { .. }
-            | Self::Refuse { .. }
-            | Self::Owe { .. }
-            | Self::Clean { .. }
-            | Self::Sweep { .. } => false,
+            Self::Settle { .. } | Self::Clean { .. } | Self::Sweep { .. } => false,
         }
     }
 
@@ -983,11 +981,7 @@ impl Runs {
     pub fn abortable(&self) -> bool {
         match self {
             Self::Shape(member) => member.abortable(),
-            Self::Settle { .. }
-            | Self::Refuse { .. }
-            | Self::Owe { .. }
-            | Self::Clean { .. }
-            | Self::Sweep { .. } => false,
+            Self::Settle { .. } | Self::Clean { .. } | Self::Sweep { .. } => false,
         }
     }
 
@@ -1004,20 +998,34 @@ impl Runs {
                 charged,
                 ..
             } => *charged,
-            // A refusal charges nothing for the reason a retirement
-            // does not: it is housekeeping on a transaction this shard
-            // never ran and was never asked to price, so whatever it
-            // owed was owed where it committed.
+            // Housekeeping charges nothing for the reason a retirement
+            // does not: it runs on a transaction this shard never ran
+            // and was never asked to price, so whatever it owed was owed
+            // where it committed.
             Self::Settle {
                 on: Licence::Claimed,
                 ..
             }
-            | Self::Refuse { .. }
-            | Self::Owe { .. }
             | Self::Clean { .. }
             | Self::Sweep { .. } => true,
         }
     }
+}
+
+/// The `Never` answer `tx` writes for `edge`: the decline cell under the
+/// consuming node's target, and its bytes naming the record it answers
+/// for.
+///
+/// The one derivation of the decline cell from an edge, so the member's
+/// refusal receipt and the abandonment cannot derive two different
+/// cells.
+#[must_use]
+pub fn never_answer(tx: TxHash, edge: &CrossingEdge) -> (SubstateKey, Vec<u8>) {
+    (
+        edge.claim.answer_key(&ProtocolHasher, Answered::Never),
+        edge.claim
+            .answered_by(tx, edge.record.key(), Answered::Never),
+    )
 }
 
 /// What one shard runs of a transaction, and the scope it judges under.

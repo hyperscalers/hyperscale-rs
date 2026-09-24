@@ -43,7 +43,7 @@ use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 use crate::records::{
     InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, crossing_answer_cell,
-    crossing_obligation_cell, record_cell, sweepable_cell,
+    record_cell, sweepable_cell,
 };
 
 /// The accounts a transaction's intents act as: the owners of each
@@ -1217,10 +1217,6 @@ impl ProtocolStatics for BridgeStatics {
 
     fn crossing_answer_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
         Address::from_bytes(owner).is_ok_and(|owner| crossing_answer_cell(owner, local, value))
-    }
-
-    fn crossing_obligation_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
-        Address::from_bytes(owner).is_ok_and(|owner| crossing_obligation_cell(owner, local, value))
     }
 
     fn rule_admits(

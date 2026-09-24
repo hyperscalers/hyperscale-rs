@@ -148,7 +148,7 @@ pub struct TickTxInput<'a> {
     /// it — or a settlement of what a leg here issued. What it says of
     /// the member decides the batch's write locality — a member
     /// declaring remote cells has its writes filtered to the subtree
-    /// this shard owns — and the reserve fee receipt, which only a
+    /// this shard owns — and the reserve refusal receipt, which only a
     /// member a counterpart's verdict can still discard holds.
     pub runs: Runs,
     /// What committed bundles attested for the edges this shard's legs

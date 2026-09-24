@@ -23,14 +23,17 @@ pub struct ExecutedTx {
     /// Node-local diagnostics (fees, logs, error). Never crosses the wire;
     /// dropped when this record is forwarded to a peer.
     pub metadata: ExecutionMetadata,
-    /// A receipt carrying the payer's fee debit and nothing else: the
-    /// class charge of a failed or infeasible attempt, or the floor a
-    /// cross-shard leg holds in reserve against a tick abort. Built
-    /// beside the execution receipt because a transaction whose effects
-    /// are discarded still owes its charge, and state moves only through
-    /// receipts. Present only where this shard is the fee payer of an
-    /// outcome that charges one.
-    pub fee_receipt: Option<ConsensusReceipt>,
+    /// A receipt carrying what the member settles apart from the
+    /// transaction's own effects: the payer's fee debit — the class
+    /// charge of a failed or infeasible attempt, or the floor a
+    /// cross-shard leg holds in reserve against a tick abort — and the
+    /// `Never` answer of every refusable crossing the member consumed,
+    /// where it was or can still be refused. Built beside the execution
+    /// receipt because a transaction whose effects are discarded still
+    /// owes its charge and its answers, and state moves only through
+    /// receipts. Present only where this shard pays for the outcome or
+    /// holds a decline cell to write.
+    pub refusal_receipt: Option<ConsensusReceipt>,
     /// What this execution escrowed out, one entry per departing edge.
     /// Empty for a member that ran the whole shape, which hands nothing
     /// to anyone.
@@ -51,7 +54,7 @@ impl ExecutedTx {
             tx_hash,
             consensus,
             metadata,
-            fee_receipt: None,
+            refusal_receipt: None,
             escrowed: Vec::new(),
         }
     }
@@ -63,7 +66,7 @@ impl ExecutedTx {
             tx_hash,
             consensus: ConsensusReceipt::Failed,
             metadata: ExecutionMetadata::empty(),
-            fee_receipt: None,
+            refusal_receipt: None,
             escrowed: Vec::new(),
         }
     }

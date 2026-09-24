@@ -127,21 +127,19 @@ impl Deadline {
 /// A half-open window read off a transaction's deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Window {
-    /// Where a core's committed cell being absent proves the core never
-    /// took the transaction — never included it, or included it and
-    /// refused, which retracts the cell: from the deadline, since
+    /// Where a core's committed cell being absent proves only that the
+    /// core never included the transaction: from the deadline, since
     /// before it the core may still commit, to the cell's own sweep two
     /// [`MAX_VALIDITY_RANGE`]s on, past which a proof is a true proof of
-    /// a cell that was present.
+    /// a cell that was present. A core that included and refused the
+    /// transaction keeps its cell and answers its producers with a
+    /// `Never` instead.
     ///
     /// Two ranges, and they are not one span counted twice. A core may
     /// abandon anywhere inside the one range its abandonment is
-    /// admissible in, and the refusal that retracts the cell lands
-    /// wherever it does; reading the absence that leaves is a probe at
-    /// a counterpart's own anchor, which needs a range of its own. One
-    /// range for both makes a refusal at the end of it unreadable, and
-    /// every crossing that fed the core strands on a cell nobody can
-    /// prove absent.
+    /// admissible in; reading the absence a core that never included
+    /// the transaction leaves is a probe at a counterpart's own anchor,
+    /// which needs a range of its own.
     Core,
     /// Where a leg entry stands: from the deadline to one
     /// [`CLAIM_WINDOW`] on, past which no evidence that could decide the
@@ -195,9 +193,11 @@ pub fn admissible_until(tx: &Transaction) -> WeightedTimestamp {
 ///
 /// Each cell is written by one execution and by nothing else, so what
 /// a reading says is a property of the cell. A committed cell is
-/// written at a core member's inclusion and retracted by its refusal,
-/// so only its absence is an answer: present, the member is still
-/// pending, and the cell is asked again at a newer header. A claim cell
+/// written at a core member's inclusion and removed by no verdict, so
+/// only its absence is an answer: present, the member included the
+/// transaction and answers for it itself, with a claim or a `Never`
+/// beside the cell, and the cell is asked again at a newer header. A
+/// claim cell
 /// is written by the execution that takes the crossing, so only its
 /// presence is an answer — and that holds whichever consumer wrote it.
 /// A core's claim is absent while a sibling is still pending, and the
@@ -207,8 +207,7 @@ pub fn admissible_until(tx: &Transaction) -> WeightedTimestamp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Probed {
     /// A core member's committed cell, past the transaction's deadline:
-    /// absent where the member never included the transaction, or
-    /// included it and refused.
+    /// absent only where the member never included the transaction.
     Core,
     /// A consumer's claim cell: present says that consumer holds the
     /// crossing. For a core it means its certificate speaks next; for a
@@ -325,9 +324,9 @@ impl Probed {
     /// The one rule, stated once, so the prober asks only what a reading
     /// would answer and the fold reads a carried proof by the same rule
     /// whoever fetched it. A committed cell answers absent — the member
-    /// never included the transaction, or refused and retracted the
-    /// cell — and present is a member still pending, whose refusal may
-    /// yet retract it. A claim and a decline answer present — each is
+    /// never included the transaction — and present is a member that
+    /// included it, whose verdict is a claim or a `Never` beside the
+    /// cell. A claim and a decline answer present — each is
     /// written once by the one thing that writes it and is swept by
     /// nothing — and either absence says only that the consumer has not
     /// answered that way. A record answers present —
@@ -405,22 +404,18 @@ mod tests {
     /// proof there is a true proof of a cell that was present, so it
     /// licenses nothing.
     ///
-    /// A refusal at the last moment a core may abandon in is still
-    /// readable, and stays so for a range past it.
-    ///
-    /// The abandonment window and the window an absence answers in were
-    /// the same span, so a core abandoning at the end of its own left a
-    /// retraction no leg could prove — and every crossing that fed it
-    /// stranded on a cell nobody could read absent.
+    /// Short of it an absence answers at any anchor, a whole range past
+    /// the last moment a core may abandon in, so a leg whose probe lands
+    /// late still reads what a core that never included the transaction
+    /// left.
     #[test]
     fn an_absence_answers_a_range_past_the_last_moment_a_core_may_refuse() {
         let deadline = Deadline::of(ms(60_000));
-        // An abandonment is admissible for one range from the deadline,
-        // so this is the last anchor a retraction can land at.
+        // An abandonment is admissible for one range from the deadline.
         let last_refusal = deadline.at().plus(MAX_VALIDITY_RANGE);
         assert!(
             Probed::Core.absence_answers_at(last_refusal, deadline),
-            "a retraction left at the last moment is one a leg can read",
+            "an absence at the last moment a core may abandon in is one a leg can read",
         );
         assert!(
             Probed::Core.absence_answers_at(

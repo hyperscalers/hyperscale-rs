@@ -680,20 +680,6 @@ pub trait ProtocolStatics: Send + Sync {
         let _ = (owner, local, value);
         false
     }
-
-    /// Whether this committed cell is a crossing obligation — a
-    /// crossing a bundle handed this shard and that it has not
-    /// answered, written down where a bundle's retention cannot reach
-    /// it.
-    ///
-    /// The third of the crossing families and judged as the other two
-    /// are: the value re-derives its own key under the obligation's own
-    /// role. What asks is a shard seating a prefix, which reads back the
-    /// answers it still owes from state alone.
-    fn crossing_obligation_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
-        let _ = (owner, local, value);
-        false
-    }
 }
 
 static PROTOCOL_STATICS: OnceLock<Box<dyn ProtocolStatics>> = OnceLock::new();

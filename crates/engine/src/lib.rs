@@ -42,12 +42,12 @@ pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
 #[cfg(feature = "test-utils")]
 pub use executor::AllCodeRuns;
 pub use executor::{
-    CodeAvailability, CodeUnavailable, Executor, artifact_package, build_fee_receipt,
+    CodeAvailability, CodeUnavailable, Executor, artifact_package, build_refusal_receipt,
     instance_of_record, protocol_hash,
 };
 pub use genesis::{GenesisConfig, PROTOCOL_RESOURCE, World, genesis_world, genesis_writes};
 pub use hyperscale_effects_bridge::{LocalCells, account_address};
-pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, Deletion, ExecutionMode, Obligations, Refusal};
+pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, Deletion, ExecutionMode};
 pub use output::ExecutedTx;
 pub use preview::{
     DeclaredReads, FetchedCells, FetchedEntries, Holds, PreviewGrants, PreviewInputs,

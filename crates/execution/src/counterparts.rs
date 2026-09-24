@@ -18,9 +18,7 @@ use hyperscale_core::{Action, CrossingPulls, FetchIds, FetchRequest, ProtocolEve
 use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
-use hyperscale_storage::{
-    CrossingLeaves, is_crossing_answer_cell, is_crossing_obligation_cell, is_record_cell,
-};
+use hyperscale_storage::{CrossingLeaves, is_crossing_answer_cell, is_record_cell};
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight,
     CROSSING_BUNDLE_WINDOW, CounterpartMirror, ExecutionCertificate, Inclusion,
@@ -31,7 +29,7 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    CrossingAnswer, CrossingCell, CrossingObligation, ProtocolHasher, Terms, crossing_decline_key,
+    CrossingAnswer, CrossingCell, ProtocolHasher, Terms, crossing_decline_key,
 };
 
 use crate::ledger::{Ledger, Question, Unanswerable};
@@ -579,17 +577,6 @@ pub struct Counterparts {
     /// term the question needs, the record it answers for.
     pub(crate) answered: BTreeMap<SubstateKey, AnsweredCrossing>,
 
-    /// The crossings this shard was handed and has not answered, by the
-    /// obligation cell it wrote down for each.
-    ///
-    /// Read from the leaves like [`held`](Self::held) and
-    /// [`answered`](Self::answered) beside it, and for a reason those
-    /// two do not have: what a bundle handed this shard is otherwise
-    /// known only to the provisioning account, which no replica
-    /// reproduces and no restart recovers. The leaf is the arrival made
-    /// durable, so a refusal is composable from state at any age.
-    pub(crate) owed: BTreeMap<SubstateKey, CrossingObligation>,
-
     /// The producer header each crossing handed to this shard has been
     /// asked about at, by the record cell a bundle carried.
     ///
@@ -661,11 +648,6 @@ impl Counterparts {
                         AnsweredCrossing::of(&CrossingAnswer::from_bytes(value)?),
                     ))
                 })
-                .collect(),
-            owed: leaves
-                .obligations
-                .iter()
-                .filter_map(|(key, value)| Some((*key, CrossingObligation::from_bytes(value)?)))
                 .collect(),
             arrivals: BTreeMap::new(),
             probes: BTreeMap::new(),
@@ -815,8 +797,8 @@ impl Counterparts {
     /// counterpart may still legitimately act. Every core shard is asked
     /// about the transaction's committed cell past the deadline: any one
     /// of them absent is the whole answer, while a shard that still
-    /// holds its cell says only that a member is pending — its refusal
-    /// may yet retract it — and is asked again at each newer header. The
+    /// holds its cell included the transaction and answers with a claim
+    /// or a `Never` beside it, and is asked again at each newer header. The
     /// shard holding the core consumer's target is asked about the
     /// consumer's claim, whose presence is what licenses the retirement.
     /// A delivering shard is asked about the crossing's claim cell past
@@ -1079,36 +1061,6 @@ impl Counterparts {
     #[cfg(test)]
     pub(crate) fn note_answer(&mut self, key: SubstateKey, answer: &CrossingAnswer) {
         self.answered.insert(key, AnsweredCrossing::of(answer));
-    }
-
-    /// Whether this shard has already answered the crossing `record`
-    /// names, either way.
-    ///
-    /// Read off the answer cells this shard holds, which
-    /// [`holding`](Self::holding) seeds from state rather than from a
-    /// replay — so a seat that came up after the answer was written
-    /// reads it whole.
-    #[must_use]
-    pub fn holds_answer_for(&self, cell: &CrossingCell) -> bool {
-        answered_for(&self.answered, cell)
-    }
-
-    /// Whether this shard has already written down that it owes an
-    /// answer for the crossing `record` names.
-    ///
-    /// [`holds_answer_for`](Self::holds_answer_for)'s neighbour, on the
-    /// same terms: read off the cells this shard holds, which
-    /// [`holding`](Self::holding) seeds from state, so a seat that came
-    /// up after the note was written reads it whole.
-    #[must_use]
-    pub fn holds_obligation_for(&self, record: SubstateKey) -> bool {
-        self.owed.values().any(|note| note.record == record)
-    }
-
-    /// Every obligation this shard holds, by the cell it sits at.
-    #[must_use]
-    pub const fn obligations(&self) -> &BTreeMap<SubstateKey, CrossingObligation> {
-        &self.owed
     }
 
     /// Whether this validator holds an answering reading of `key` on
@@ -1461,11 +1413,6 @@ impl Counterparts {
                                     .or_insert_with(|| AnsweredCrossing::of(&claim));
                             }
                         }
-                        Some(bytes) if is_crossing_obligation_cell(*key, bytes) => {
-                            if let Some(note) = CrossingObligation::from_bytes(bytes) {
-                                self.owed.entry(*key).or_insert(note);
-                            }
-                        }
                         None => {
                             self.held.remove(key);
                             // An answer removed is a crossing over at both
@@ -1477,7 +1424,6 @@ impl Counterparts {
                             if let Some(answer) = self.answered.remove(key) {
                                 self.cleaned.push(answer.record);
                             }
-                            self.owed.remove(key);
                             self.tombstones.remove(key);
                         }
                         Some(_) => {}
@@ -1553,9 +1499,9 @@ impl Counterparts {
     /// Tell the mempool a core's refusal of a transaction a leg here
     /// issued for: the verdict, as the counterpart's certificate carries
     /// it. Nothing is written down — what licenses taking the crossing
-    /// back is the committed cell the refusal retracts, read absent past
-    /// the deadline — and the mempool reads a verdict it already holds
-    /// as nothing new.
+    /// back is the `Never` the refusal's own receipt writes, read
+    /// present — and the mempool reads a verdict it already holds as
+    /// nothing new.
     pub(crate) fn relay_refusal(
         &self,
         shard: ShardId,
@@ -2378,12 +2324,12 @@ mod tests {
         };
 
         assert_eq!(
-            seated(None, Answered::Declined),
+            seated(None, Answered::Never),
             (false, false, false),
             "a consumer that has not answered leaves the record waiting",
         );
         assert_eq!(
-            seated(Some(consumer_decline(0, deadline)), Answered::Declined),
+            seated(Some(consumer_decline(0, deadline)), Answered::Never),
             (false, true, true),
             "its own decline credits the value back, at no anchor and in no window",
         );

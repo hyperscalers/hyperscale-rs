@@ -668,7 +668,7 @@ pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut
         "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    world.assert_settled(c, charges.burned(c), "a delivery owed across a split");
+    world.assert_settled(c, &charges, "a delivery owed across a split");
 }
 
 /// A record inherited across its issuer's split still owes its
@@ -804,7 +804,7 @@ pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableClus
         "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    world.assert_settled(c, charges.burned(c), "a record owed by the successor");
+    world.assert_settled(c, &charges, "a record owed by the successor");
 }
 
 /// Verify a surviving sibling's second-generation split seats correctly.

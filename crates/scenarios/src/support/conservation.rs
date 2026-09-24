@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     Address, ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
@@ -21,8 +22,8 @@ use hyperscale_types::{
 };
 
 use super::query::{
-    MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at, owed_at,
-    unclaimable_at,
+    Locked, MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at, locked_at,
+    owed_at, unclaimable_at,
 };
 use super::tx::{recipient, sender};
 use super::{Budget, Cluster};
@@ -184,6 +185,26 @@ impl World {
             .collect()
     }
 
+    /// Every crossing record the world can name that stands unanswered:
+    /// the records of every transaction `charges` recorded, and the ones
+    /// [`owing`](Self::owing) registered. Value locked rather than
+    /// stranded — a record in flight reads the same way — so this
+    /// reports and asserts nothing; a scenario that constructs a lock
+    /// asserts on it.
+    #[must_use]
+    pub fn locked<C: Cluster + ?Sized>(&self, c: &C, charges: &Charges) -> Vec<Locked> {
+        self.read.set(true);
+        let records: BTreeSet<SubstateKey> = charges
+            .records(c)
+            .into_iter()
+            .chain(self.owed.iter().copied())
+            .collect();
+        records
+            .into_iter()
+            .filter_map(|record| locked_at(c, record))
+            .collect()
+    }
+
     /// Whether what the world holds now, plus what `burned` accounts for,
     /// is exactly what it held when opened.
     ///
@@ -203,6 +224,9 @@ impl World {
     /// reading it once says nothing about how many times value came
     /// back.
     ///
+    /// Returns what [`locked`](Self::locked) reports at the settled
+    /// instant.
+    ///
     /// # Panics
     ///
     /// As [`assert_settled`](Self::assert_settled).
@@ -212,21 +236,29 @@ impl World {
         charges: &Charges,
         budget: Budget,
         context: &str,
-    ) {
+    ) -> Vec<Locked> {
         let _ = c.run_until(budget, |c| self.settles(c, charges.burned(c)));
         let tail = c.now() + SETTLED_TAIL;
         let _ = c.run_until(budget, |c| c.now() >= tail);
-        self.assert_settled(c, charges.burned(c), context);
+        let locked = self.assert_settled(c, charges, context);
         charges.assert_each_fits_a_full_block(c);
+        locked
     }
 
-    /// Assert [`settles`](Self::settles), naming both sides.
+    /// Assert [`settles`](Self::settles) against what `charges` burned,
+    /// naming both sides, and report what stands locked.
     ///
     /// # Panics
     ///
     /// Panics if the world grew — value from nowhere — or shrank by more
     /// than the burn — value stranded.
-    pub fn assert_settled<C: Cluster + ?Sized>(&self, c: &C, burned: u128, context: &str) {
+    pub fn assert_settled<C: Cluster + ?Sized>(
+        &self,
+        c: &C,
+        charges: &Charges,
+        context: &str,
+    ) -> Vec<Locked> {
+        let burned = charges.burned(c);
         // Counting a standing record as value the world holds is what
         // keeps the sum honest while a crossing is in flight, and it is
         // also what a strand would hide: the value is there, so the two
@@ -259,6 +291,13 @@ impl World {
                 "value was stranded"
             },
         );
+        let locked = self.locked(c, charges);
+        let holding: u128 = locked.iter().map(|lock| lock.amount).sum();
+        println!(
+            "{context}: {} locked record(s) holding {holding}",
+            locked.len()
+        );
+        locked
     }
 }
 
@@ -304,6 +343,18 @@ impl Charges {
         let hash = self.record(&tx);
         c.submit(tx);
         hash
+    }
+
+    /// The record cell of every crossing the recorded transactions
+    /// derive, skipping a transaction that does not derive here.
+    #[must_use]
+    pub fn records<C: Cluster + ?Sized>(&self, c: &C) -> Vec<SubstateKey> {
+        let derivation = c.derivation();
+        self.owed
+            .values()
+            .filter_map(|tx| tx.try_derived(derivation.as_ref()).ok())
+            .flat_map(|derived| crossing_records(&derived.legs))
+            .collect()
     }
 
     /// The envelope recorded under `hash`, for a scenario that has to

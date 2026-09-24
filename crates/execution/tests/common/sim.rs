@@ -475,7 +475,7 @@ impl ExecutionSim {
         let ExecutionOutputs {
             outcomes,
             results,
-            fee_receipts,
+            refusal_receipts,
         } = split_execution_outputs(executed);
         self.receipts
             .entry(tick_id)
@@ -484,12 +484,12 @@ impl ExecutionSim {
         self.charges
             .entry(tick_id)
             .or_default()
-            .extend(fee_receipts.iter().cloned());
+            .extend(refusal_receipts.iter().cloned());
         let outcome = TickBatchOutcome {
             tick_id,
             results,
             tx_outcomes: outcomes,
-            fee_receipts,
+            refusal_receipts,
         };
 
         self.outputs.push((tick, output.clone()));
@@ -735,7 +735,7 @@ fn stub_execute(
     // member. Which of the two settles is the tick's decision, not this
     // shard's.
     if abortable {
-        executed.fee_receipt = charged.map(stub_charge);
+        executed.refusal_receipt = charged.map(stub_charge);
     }
     executed
 }
@@ -822,7 +822,7 @@ pub fn settle_refused_by_counterpart(
         .iter()
         .zip(charges)
         .map(|(receipt, charge)| {
-            TxOutcome::with_fee(
+            TxOutcome::with_refusal(
                 receipt.tx_hash,
                 ExecutionOutcome::Succeeded {
                     receipt_hash: receipt.consensus.receipt_hash(),

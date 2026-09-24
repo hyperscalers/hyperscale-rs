@@ -1426,7 +1426,7 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
     // record stands and the reserves are untouched.
     protocol_resource.assert_settled(
         c,
-        charges.burned(c),
+        &charges,
         "a route committed before its departure was voted",
     );
 }
@@ -1642,11 +1642,9 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
             .settles(c, charges.burned(c))),
         "a route through a departing venue: the world must settle against the burn alone",
     );
-    route.protocol_resource.assert_settled(
-        c,
-        charges.burned(c),
-        "a route through a departing venue",
-    );
+    route
+        .protocol_resource
+        .assert_settled(c, &charges, "a route through a departing venue");
     charges.assert_each_fits_a_full_block(c);
     route.units.assert_settles_within(
         c,

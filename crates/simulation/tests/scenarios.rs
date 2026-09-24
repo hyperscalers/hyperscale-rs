@@ -11,8 +11,6 @@ use std::time::Duration;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
-#[cfg(feature = "production-epochs")]
-use hyperscale_scenarios::a_skip_deferred_split_keeps_every_settlement_in_its_window;
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
@@ -48,7 +46,6 @@ use hyperscale_scenarios::{
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
-    a_route_whose_core_never_combines_is_reclaimed_once,
     a_spent_nullifier_is_swept_once_unreachable, a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
@@ -92,6 +89,11 @@ use hyperscale_scenarios::{
     unbound_remote_payer_engages_nothing, venue_genesis_accounts, venue_genesis_accounts_on,
     wide_swapper_shards, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
     withdrawals_compose_over_one_vault, zipf_payments,
+};
+#[cfg(feature = "production-epochs")]
+use hyperscale_scenarios::{
+    a_route_whose_core_never_combines_holds_its_input,
+    a_skip_deferred_split_keeps_every_settlement_in_its_window,
 };
 use hyperscale_simulation::ExecutionMode;
 use hyperscale_storage::ShardChainReader;
@@ -767,23 +769,30 @@ fn route_cluster_on_dedicated_hosts() -> SimCluster {
     )
 }
 
-/// The refusal's own shape: a shard handed a crossing it never holds a
-/// body for, so no tick and no candidate of its can ever write the
-/// claim. Sim-only for the same reason as its neighbours — the
-/// conservation runs to the producer's own reclaim.
+/// The refusal's own shape: a venue refuses its member, and the `Never`
+/// rides its rejecting finalization. Sim-only for the same reason as its
+/// neighbours — the conservation runs to the producer's own reclaim.
 #[test]
 fn a_crossing_the_consumer_refuses_is_declined_sim() {
     let mut cluster = route_cluster_on_dedicated_hosts();
     cluster.run_faultable(a_crossing_the_consumer_refuses_is_declined);
 }
 
-/// Its neighbour's other outcome: the same cut, held the whole way, so
-/// the leaf reclaims instead of the core settling. Sim-only — the span
-/// runs to the close of `Window::LegEntry`, minutes of weighted time.
+/// The cut-off route's other outcome: the same cut, held past the close
+/// of the core window, so the core is held by its silent sibling and
+/// the input stays locked until the cut lifts. Sim-only — the span runs
+/// past the close of `Window::Core`, minutes of weighted time.
+///
+/// Under the production epoch length only: at the default 30 s epoch
+/// `BUNDLE_WAIT` closes the trader's delivery window 150 s after the
+/// commit, short of the core window's close 240 s past the deadline, so
+/// the route's output is a delivery cut off past its window — the
+/// delivery scenarios' case, not this one's.
+#[cfg(feature = "production-epochs")]
 #[test]
-fn a_route_whose_core_never_combines_is_reclaimed_once_sim() {
+fn a_route_whose_core_never_combines_holds_its_input_sim() {
     let mut cluster = route_cluster_on_dedicated_hosts();
-    cluster.run_faultable(a_route_whose_core_never_combines_is_reclaimed_once);
+    cluster.run_faultable(a_route_whose_core_never_combines_holds_its_input);
 }
 
 #[test]

@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    Address, BUNDLE_WAIT, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
-    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    Address, BUNDLE_WAIT, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId,
+    SubstateKey, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
+use hyperscale_vm_effects::Kind;
 
 use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
@@ -327,45 +328,36 @@ fn assert_venues_gave_back<C: Cluster>(
     );
 }
 
-/// A core whose siblings never combine is reclaimed against, once, and
-/// its late return takes nothing.
+/// A core whose siblings never combine holds its input, and settles
+/// whole once they do.
 ///
 /// [`a_route_cut_off_across_its_deadline_is_not_reclaimed`] holds the
-/// same cut and lifts it before the producer's leaf can read anything,
-/// and the route settles whole. This one holds it the whole way and the
-/// other outcome is pinned: the input goes back to the trader and the
-/// venues, speaking again too late, take nothing.
+/// same cut and lifts it before the producer's leaf can read anything.
+/// This one holds it past the close of [`Window::Core`], and pins that
+/// nothing speaks there: the trader's input is neither refunded nor
+/// banked, neither venue writes a `Never`, and the one escrowed record
+/// stands locked at [`ROUTE_INPUT`], named by the world's report. A
+/// member awaiting a sibling is never released for being wedged and
+/// never abandoned while uncovered, so once the cut lifts the core
+/// combines, the route settles whole, the resource is conserved and the
+/// report is empty.
 ///
-/// **The verdict is a presence, and the consumer is what speaks it.** A
-/// claim's absence answers nothing at any anchor — the consumer has not
-/// run, never that it will not — so the producer waits on the venue's
-/// *decline*. What makes one possible here is that a member awaiting a
-/// sibling that never arrives stops standing the refusal down once the
-/// close of [`Window::Core`] has passed: past it the member can no
-/// longer commit, so it is not one that could still write the claim, and
-/// `release_wedged_ticks` will never release it — its only reader is
-/// gated on a determined half and such a member has none.
-///
-/// **What the decline changes is the evidence, not the guarantee.** The
-/// producer acts on the consumer's own statement rather than on an
-/// inference from its silence, and both are taken at the same instant.
-/// What still holds the other side is unchanged and is what this pins:
-/// the core's tick goes with the entries at the same close, so no claim
-/// is coming. Nothing forecloses one — the claim and the decline are
-/// different keys and the kernel checks neither against the other — so
-/// break that and the input pays twice: credited to the trader, then
-/// banked by a core that returned.
+/// **The verdict is a presence, and only the consumer speaks it.** A
+/// claim's absence answers nothing at any anchor, and a core member held
+/// by a silent sibling has no answer to give: its certificate may be
+/// out, and the sibling may yet combine an accept with it. What the
+/// producer waits on is the member's own verdict, whenever it comes.
 ///
 /// Requires disjoint committees, as its neighbour does.
 ///
 /// # Panics
 ///
 /// Panics if either venue misses its budget standing up, if the trader's
-/// leg never pays, if the cut never fires, if the reclaim does not fire
-/// inside the span that answers, if a venue never declines the crossing
-/// it cannot run, if a venue certifies after the fact, or if the
-/// resource is not conserved.
-pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(c: &mut C) {
+/// leg never pays, if the cut never fires, if anything moves the input
+/// while the cut stands, if a venue writes a `Never` for a crossing its
+/// member may still take, if the route does not settle whole once the
+/// cut lifts, or if the resource is not conserved.
+pub fn a_route_whose_core_never_combines_holds_its_input<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
@@ -397,126 +389,138 @@ pub fn a_route_whose_core_never_combines_is_reclaimed_once<C: FaultableCluster>(
     );
     let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
-    // The cut stands while the venue declines the crossing it can no
-    // longer run and the producer takes the input back off that decline.
-    // The venue cannot speak before the close of [`Window::Core`], and
-    // the leaf only settles once the entry that would otherwise settle
-    // the record has pruned — so what this waits on is the refund itself
-    // rather than a clock that happens to land near it.
     let deadline = Deadline::of(validity.end_timestamp_exclusive);
-    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
-    let reclaimed = c.run_until(epochs(70), |c| {
-        held(c, trader.address(), *PROTOCOL_RESOURCE) >= paid + ROUTE_INPUT
-    });
+    hold_past_the_core_window(c, deadline);
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
         "the certificate channel must actually have been exercised and cut",
     );
-    assert!(
-        reclaimed,
-        "the leaf must reclaim the input while the core is still holding its member; \
-         trader holds {} against {paid}, clock {:?} against the window \
-         {:?}..{:?}",
-        held(c, trader.address(), *PROTOCOL_RESOURCE),
-        clock(c),
-        Window::Core.of(deadline).end,
-        Window::LegEntry.of(deadline).end,
-    );
-    assert!(
-        clock(c) >= Window::Core.of(deadline).end,
-        "and it must land past the close the venue may first speak at, not before it",
-    );
-    for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
-        assert!(
-            c.chain_fate(shard, hash).1.is_none(),
-            "neither venue may have certified while its sibling was silent",
-        );
-    }
-    let refunded = held(c, trader.address(), *PROTOCOL_RESOURCE);
-
-    // The sibling speaks again, and it is too late for it to matter: the
-    // core's tick went with the entries at the same close the leaf's
-    // window ends at, so nothing is left to certify and no claim is ever
-    // written against a crossing whose value has gone home.
-    c.clear_drops();
-    let banked = c.run_until(epochs(12), |c| {
-        held(c, trader.address(), *PROTOCOL_RESOURCE) > refunded
-    });
-    assert!(
-        !banked,
-        "a core that never combined must bank nothing once its sibling speaks: \
-         the input it would have taken was credited back",
-    );
-    for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
-        assert!(
-            c.chain_fate(shard, hash).1.is_none(),
-            "and neither venue certifies after the fact",
-        );
-    }
-    // And one of them said so. The crossing the trader staged lands on
-    // one venue's prefix, so one decline is the whole verdict — written
-    // by a venue still holding a member it can never run, which is the
-    // case this scenario exists for.
-    assert!(
-        [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
-            .iter()
-            .any(|shard| !c.declined(*shard, hash).is_empty()),
-        "the venue holding a member it can never run must decline the crossing, \
-         which is what the producer credits back off",
-    );
-
-    let after = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    assert_nothing_spoke(c, hash, *trader, paid);
+    let locked = protocol_resource.locked(c, &charges);
     assert_eq!(
-        after, refunded,
-        "the trader ends holding its input and having paid the price, once: \
-         funded = {funded}, after = {after}, input = {ROUTE_INPUT}",
+        locked.len(),
+        1,
+        "the one escrowed record stands locked: {locked:?}"
+    );
+    assert_eq!(
+        (locked[0].kind, locked[0].amount),
+        (Kind::Escrowed, ROUTE_INPUT),
+        "and it is the trader's input: {locked:?}",
+    );
+
+    // The siblings combine, and the route settles whole.
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(12), |c| held(
+            c,
+            trader.address(),
+            *PROTOCOL_RESOURCE
+        ) > paid),
+        "once the cut lifts the core must combine and the route bank its output: \
+         trader holds {} against {paid}",
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+    );
+    let status = c.tx_status(hash);
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "a route whose core was held must still settle whole; status = {status:?}",
+    );
+    let locked = protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(10),
+        "a route whose core never combined",
     );
     assert!(
-        protocol_resource.settles(c, charges.burned(c)),
-        "and the resource is conserved: the input paid once and came back once",
+        locked.is_empty(),
+        "nothing stays locked once the route settled: {locked:?}"
     );
-    // The core never combined, so no unit moved.
-    units.assert_settled(c, 0, "a route whose core never combines");
+    units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(10),
+        "a route whose core never combined",
+    );
 }
 
-/// A crossing whose consumer has refused it, and whose producer has not
-/// heard, is declined.
+/// Run past the close of the core window and hold there for the tail a
+/// refund would land in: no clock of any shard's speaks for a member
+/// awaiting its sibling, so what a wrong clock would do is given room
+/// to show.
 ///
-/// The ordinary refusal, held open long enough to see the answer
-/// written. A venue asked for a price no pool this size can pay refuses
-/// its member, and a refused member's writes are discarded — so the
-/// claim is never written and the record stands. With the venue's
+/// # Panics
+///
+/// Panics if the clock never reaches the close, or a venue stops
+/// committing past it.
+fn hold_past_the_core_window<C: Cluster>(c: &mut C, deadline: Deadline) {
+    let close = Window::Core.of(deadline).end;
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(70), |c| clock(c) >= close),
+        "the cut must stand past the close of the core window; clock {:?} against {close:?}",
+        clock(c),
+    );
+    for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            await_blocks(c, venue, RECLAIM_TAIL_BLOCKS, epochs(2)),
+            "venue {venue} must keep committing past the close",
+        );
+    }
+}
+
+/// Assert that nothing has spoken for the route `hash` while its core is
+/// held by a silent sibling: the trader still holds exactly `paid`, and
+/// neither venue has certified or written a `Never`.
+///
+/// # Panics
+///
+/// Panics if the input moved, or a venue certified or answered.
+fn assert_nothing_spoke<C: Cluster>(c: &C, hash: TxHash, trader: PrincipalAddr, paid: u128) {
+    assert_eq!(
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+        paid,
+        "while the core is held by its silent sibling the input is neither refunded nor banked",
+    );
+    for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.chain_fate(shard, hash).1.is_none(),
+            "neither venue may certify while its sibling is silent",
+        );
+        assert!(
+            c.declined(shard, hash).is_empty(),
+            "and neither may write a Never for a crossing its member may still take",
+        );
+    }
+}
+
+/// A crossing whose consumer has refused it is declined by the
+/// consumer's own finalization.
+///
+/// The ordinary refusal. A venue asked for a price no pool this size can
+/// pay refuses its member, and a refused member's writes are discarded —
+/// so the claim is never written and the record stands. What the venue's
+/// refusal receipt writes instead is `Never` at the crossing's decline
+/// key, and it lands with the rejecting finalization itself: on no
+/// clock, past no deadline, waiting on no member. With the venue's
 /// verdict cut off from the shard that staged the value, the producer
-/// cannot reclaim off it either, and past the deadline the venue holds
-/// no tick and no candidate that could still speak. The refusal is the
-/// crossing's only answer.
+/// cannot reclaim off it until the cut lifts, and the `Never` is what
+/// it then reclaims off.
 ///
-/// Its pair is [`a_route_whose_core_never_combines_is_reclaimed_once`],
-/// where a venue *does* hold a member and so waits out the close of
-/// [`Window::Core`] before refusing. The two together are the decline's
-/// held-member conjunct read from both ends: the same cell and the same
-/// question — could an execution here still write the claim — answered
-/// at the deadline where nothing holds one, and at that close where
-/// something does and can never run it.
-///
-/// **What this pins is the write and the conservation across it, not
-/// which road the value comes home by.** A refusal and the producer's
-/// own probe of the core's committed cell open at the same instant —
-/// the deadline — and while the caller's leg entry stands, the leaf
-/// that would read the refusal stands down for it. So the input may be
-/// home before the cut lifts or after it, and the scenario asserts only
-/// that it comes home once and that nothing moved twice. What would be
-/// caught here is a refusal that moved value on its own, or one written
-/// beside a claim.
+/// Its pair is [`a_route_whose_core_never_combines_holds_its_input`],
+/// where a venue holds a member it cannot run and says nothing at all.
 ///
 /// Requires disjoint committees, as its neighbours do.
 ///
 /// # Panics
 ///
 /// Panics if either venue misses its budget standing up, if the caller's
-/// leg never pays, if the venue does not refuse, if the cut never fires,
-/// if the venue writes no refusal past the deadline, if the input never
-/// comes home, or if either side of the pair is not conserved.
+/// leg never pays, if the venue does not refuse, if the `Never` does not
+/// land with the refusing finalization, if the cut never fires, if the
+/// input never comes home, or if either side of the pair is not
+/// conserved.
 pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
@@ -524,8 +528,7 @@ pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut 
     let (key, trader) = &traders[0];
     // The venue's own committee certifies its refusal; what is cut is
     // the road that verdict takes to the shard holding the record, so
-    // the producer has nothing to reclaim off and the record stands past
-    // the deadline.
+    // the producer has nothing to reclaim off while the cut stands.
     let cut = isolate_ec_intake(c, TRADER_SHARD, FIRST_VENUE_SHARD);
     let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
 
@@ -555,43 +558,27 @@ pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut 
         )),
         "the venue must refuse the swap: a refused member is what leaves the claim unwritten",
     );
-
-    // From the deadline — the instant past which nothing can be included
-    // anywhere — and needing the record proved present in the same
-    // block, which the producer still holds because it has not heard.
-    let deadline = Deadline::of(validity.end_timestamp_exclusive);
-    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
-    let refused = c.run_until(epochs(10), |c| {
-        !c.declined(FIRST_VENUE_SHARD, hash).is_empty()
-    });
+    let (refused_at, _) = c
+        .chain_fate(FIRST_VENUE_SHARD, hash)
+        .1
+        .expect("the venue refused");
+    let declined: Vec<BlockHeight> = c
+        .declined(FIRST_VENUE_SHARD, hash)
+        .into_iter()
+        .map(|(height, _)| height)
+        .collect();
+    assert_eq!(
+        declined,
+        vec![refused_at],
+        "the Never lands with the venue's rejecting finalization and rides nothing else",
+    );
     assert!(
-        cut.fired() > 0,
+        c.run_until(epochs(4), |_| cut.fired() > 0),
         "the certificate channel must actually have been exercised and cut",
     );
-    assert!(
-        refused,
-        "a venue that refused and holds no member must write the crossing's answer past \
-         the deadline {:?}; clock {:?}",
-        deadline.at(),
-        clock(c),
-    );
-    assert!(
-        clock(c) >= deadline.at(),
-        "and not before it: inside its own window the member could still be composed again",
-    );
-    // **Which road brings the input home is not this scenario's to
-    // say.** Both open at the deadline: the refusal here, and the
-    // producer's own probe of the core's committed cell, which a
-    // refusal retracts. While the trader's leg entry stands, the leaf
-    // that would read the refusal stands down for it
-    // (`settles_records`), so the entry's absence is the likelier
-    // road — and at a production epoch the run reaches far enough past
-    // the deadline for it to fire before the cut lifts. Telling the
-    // two apart wants one settler, which is phase 10's.
-    //
-    // What this pins either way is the refusal: written past the
-    // deadline, by a shard whose verdict never reached the producer,
-    // with the pair conserving across it.
+
+    // The verdict reaches the producer, and the input comes home off the
+    // `Never` once, with the pair conserved across it.
     c.clear_drops();
     assert!(
         c.run_until(epochs(10), |c| held(

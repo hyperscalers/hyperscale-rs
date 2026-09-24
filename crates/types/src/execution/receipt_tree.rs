@@ -16,7 +16,8 @@ const TX_OUTCOME_LEAF_TAG: &[u8] = b"hyperscale.tx_outcome_leaf.v1";
 /// The vote signature covers only the receipt root, and decoding
 /// recomputes that root from the outcomes, so every field of the
 /// outcome has to sit under the leaf or it is an aggregator's to forge:
-/// the verdict, the attested and reserved work, any settled fee receipt,
+/// the verdict, the attested and reserved work, any settled refusal
+/// receipt,
 /// the shards the settlement waits on, what the execution escrowed and
 /// where those crossings land, and what the outcome says of its own
 /// role. The encoding admits one reading of all of them, so nothing is
@@ -201,13 +202,13 @@ mod tests {
     }
 
     /// What a transaction was charged is folded into the leaf on the
-    /// outcomes that settle a fee receipt too, so a forged charge fails
-    /// the receipt-root recompute every EC decode runs.
+    /// outcomes that settle a refusal receipt too, so a forged charge
+    /// fails the receipt-root recompute every EC decode runs.
     #[test]
-    fn leaf_covers_the_charge_on_a_fee_settling_outcome() {
-        let fee = GlobalReceiptHash::from_raw(Hash::from_bytes(b"fee"));
+    fn leaf_covers_the_charge_on_a_refusal_settling_outcome() {
+        let refusal = GlobalReceiptHash::from_raw(Hash::from_bytes(b"refusal"));
         let outcome = |charged| {
-            TxOutcome::with_fee(tx_hash(), ExecutionOutcome::Failed, fee).reserving(charged)
+            TxOutcome::with_refusal(tx_hash(), ExecutionOutcome::Failed, refusal).reserving(charged)
         };
         assert_ne!(
             tx_outcome_leaf(&outcome(7)),

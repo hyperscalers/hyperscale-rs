@@ -120,21 +120,25 @@ impl Role {
 pub struct TxOutcome {
     tx_hash: TxHash,
     outcome: ExecutionOutcome,
-    /// Set when this shard charges a transaction it pays for without
-    /// applying its effects: the hash of the receipt carrying that charge.
+    /// Set when this shard settles something apart from the
+    /// transaction's own effects: the hash of the refusal receipt
+    /// carrying the payer's charge, where this shard holds the vault,
+    /// and the `Never` answers of every refusable crossing the member
+    /// consumed, where it was refused.
     ///
     /// An aborted transaction's own effects never apply — that is what
     /// makes a cross-shard abort atomic — and a failed one produced none
     /// to apply. Either way the payer still owes for the work the attempt
-    /// consumed, and state moves only through receipts. The fee receipt is
-    /// the reconciliation: it carries that debit and nothing else, and
-    /// naming its hash here puts it under the signed receipt root like any
-    /// other receipt's content.
+    /// consumed, the consumer owes its producers one answer, and state
+    /// moves only through receipts. The refusal receipt is the
+    /// reconciliation: it carries the debit and the answers and nothing
+    /// else, and naming its hash here puts it under the signed receipt
+    /// root like any other receipt's content.
     ///
     /// A failure that settles one takes the place of the `Failed` receipt
     /// it would otherwise store, so the one-receipt-per-outcome pairing is
     /// unchanged.
-    fee_receipt: Option<GlobalReceiptHash>,
+    refusal_receipt: Option<GlobalReceiptHash>,
     /// What this shard attests it did for the transaction, under the
     /// engine's schedule.
     ///
@@ -204,18 +208,6 @@ pub struct TxOutcome {
     /// shard promising a bundle reads this a block earlier than it can
     /// resolve the trie the issuer used.
     crossing_targets: Capped<Vec<ShardId>, MAX_PROVISION_TARGET_SHARDS>,
-    /// The committed cell this shard wrote at the transaction's inclusion
-    /// and this outcome retracts: a core member that refused or aborted
-    /// the transaction, whose settling block deletes the cell so a leg
-    /// probing it reads the same absence a core that never included the
-    /// transaction leaves. A core's verdict is then a fact about its
-    /// state, like its inclusion and its claim.
-    ///
-    /// Attested rather than derived because the key carries the
-    /// transaction's validity end, and a validator holding the
-    /// certificate but not the transaction — one that synced past its
-    /// block — still has to delete the same cell or its root forks.
-    retracts: Option<SubstateKey>,
     /// What the attesting shard was to the transaction: the one fact
     /// that says whether this outcome bears the verdict, whether it is
     /// the transaction's own execution, and whether a counterpart could
@@ -230,7 +222,7 @@ pub struct TxOutcome {
 }
 
 impl TxOutcome {
-    /// Create a new `TxOutcome` settling no fee receipt.
+    /// Create a new `TxOutcome` settling no refusal receipt.
     #[must_use]
     pub const fn new(tx_hash: TxHash, outcome: ExecutionOutcome) -> Self {
         Self {
@@ -238,21 +230,12 @@ impl TxOutcome {
             reserved: false,
             tx_hash,
             outcome,
-            fee_receipt: None,
+            refusal_receipt: None,
             counterparts: Capped::empty(),
             escrowed: Capped::empty(),
             crossing_targets: Capped::empty(),
-            retracts: None,
             role: Role::Whole,
         }
-    }
-
-    /// Bind the committed cell this outcome retracts, if it refuses the
-    /// transaction a core member here was written one for.
-    #[must_use]
-    pub const fn retracting(mut self, cell: Option<SubstateKey>) -> Self {
-        self.retracts = cell;
-        self
     }
 
     /// Bind what this transaction was charged, and that its committing
@@ -353,40 +336,33 @@ impl TxOutcome {
         self.role.executes()
     }
 
-    /// Create a `TxOutcome` that settles the payer's charge through the
-    /// named fee receipt.
+    /// Create a `TxOutcome` that settles what it owes apart from the
+    /// transaction's own effects through the named refusal receipt.
     ///
-    /// Both outcomes that owe a charge without applying the transaction's
-    /// own effects use this: an abort, whose effects are discarded to keep
-    /// the cross-shard settlement atomic, and a failure, whose effects the
-    /// engine never produced. In either case the transaction did work its
-    /// payer owes for, and the receipt named here is the only thing that
-    /// moves that charge.
+    /// Every outcome that owes something without applying the
+    /// transaction's own effects uses this: an abort, whose effects are
+    /// discarded to keep the cross-shard settlement atomic, and a
+    /// failure, whose effects the engine never produced. In either case
+    /// the transaction did work its payer owes for and consumed
+    /// crossings its producers are owed an answer for, and the receipt
+    /// named here is the only thing that moves either.
     #[must_use]
-    pub const fn with_fee(
+    pub const fn with_refusal(
         tx_hash: TxHash,
         outcome: ExecutionOutcome,
-        fee_receipt: GlobalReceiptHash,
+        refusal_receipt: GlobalReceiptHash,
     ) -> Self {
         Self {
             charged: 0,
             reserved: false,
             tx_hash,
             outcome,
-            fee_receipt: Some(fee_receipt),
+            refusal_receipt: Some(refusal_receipt),
             counterparts: Capped::empty(),
             escrowed: Capped::empty(),
             crossing_targets: Capped::empty(),
-            retracts: None,
             role: Role::Whole,
         }
-    }
-
-    /// The committed cell this outcome retracts, where it refuses a
-    /// transaction a core member here was written one for.
-    #[must_use]
-    pub const fn retracts(&self) -> Option<SubstateKey> {
-        self.retracts
     }
 
     /// What this transaction was charged, in quanta.
@@ -402,10 +378,10 @@ impl TxOutcome {
         self.reserved
     }
 
-    /// The fee receipt this outcome settles, if any.
+    /// The refusal receipt this outcome settles, if any.
     #[must_use]
-    pub const fn fee_receipt(&self) -> Option<GlobalReceiptHash> {
-        self.fee_receipt
+    pub const fn refusal_receipt(&self) -> Option<GlobalReceiptHash> {
+        self.refusal_receipt
     }
 
     /// The shards this transaction's settlement waits on, besides the one

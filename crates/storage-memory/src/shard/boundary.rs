@@ -15,8 +15,7 @@ use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, CrossingLeaves, ImportProgress, LeafRows,
     SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
-    is_crossing_answer_cell, is_crossing_obligation_cell, is_record_cell, key_under_prefix,
-    prefix_low_key,
+    is_crossing_answer_cell, is_record_cell, key_under_prefix, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, ShardId, StateRoot, SubstateKey,
@@ -110,8 +109,6 @@ impl BoundaryStore for SimShardStorage {
                 leaves.records.push((*key, value.to_vec()));
             } else if is_crossing_answer_cell(*key, value) {
                 leaves.claims.push((*key, value.to_vec()));
-            } else if is_crossing_obligation_cell(*key, value) {
-                leaves.obligations.push((*key, value.to_vec()));
             }
         }
         leaves

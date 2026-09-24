@@ -63,7 +63,7 @@ pub fn merge_writes_from_receipts(
 
 /// Everything a prepared commit lands: the receipts `finalizations`
 /// settle, resolved against the parent's baseline, plus the block's own
-/// creations, the sweep's removals and the refusals' retractions.
+/// creations and the sweep's removals.
 ///
 /// One resolution, feeding both the tree and the substate store — they
 /// commit the same values or they disagree about state. It happens once
@@ -100,7 +100,7 @@ pub fn settled_writes_at(
     with_sweep(
         merge_writes_from_receipts(&settling, baseline),
         creations,
-        &removals_of(swept, finalizations),
+        &removals_of(swept),
     )
 }
 

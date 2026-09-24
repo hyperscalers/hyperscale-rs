@@ -42,18 +42,18 @@ use hyperscale_types::{
 pub fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
     let mut outcomes = Vec::with_capacity(executed.len());
     let mut results = Vec::with_capacity(executed.len());
-    let mut fee_receipts = Vec::new();
+    let mut refusal_receipts = Vec::new();
     for mut tx in executed {
         outcomes.push(tx.outcome());
-        if let Some(fee) = tx.fee_receipt.take() {
-            fee_receipts.push(StoredReceipt::synced(tx.tx_hash, Arc::new(fee)));
+        if let Some(fee) = tx.refusal_receipt.take() {
+            refusal_receipts.push(StoredReceipt::synced(tx.tx_hash, Arc::new(fee)));
         }
         results.push(StoredReceipt::from(tx));
     }
     ExecutionOutputs {
         outcomes,
         results,
-        fee_receipts,
+        refusal_receipts,
     }
 }
 
@@ -66,7 +66,7 @@ pub struct ExecutionOutputs {
     /// Per-tx execution receipts.
     pub results: Vec<StoredReceipt>,
     /// Charges held in reserve against a tick abort.
-    pub fee_receipts: Vec<StoredReceipt>,
+    pub refusal_receipts: Vec<StoredReceipt>,
 }
 
 /// Fold one tick's executed records into the tick output.
@@ -111,7 +111,9 @@ pub fn accumulate_tick_output(
         let mut writes = StateWrites::default();
         for part in [
             tx.consensus.writes(),
-            tx.fee_receipt.as_ref().and_then(ConsensusReceipt::writes),
+            tx.refusal_receipt
+                .as_ref()
+                .and_then(ConsensusReceipt::writes),
         ]
         .into_iter()
         .flatten()
@@ -130,7 +132,7 @@ pub fn accumulate_tick_output(
             tx_hash: tx.tx_hash,
             writes: tx.consensus.writes().cloned(),
             reserve: tx
-                .fee_receipt
+                .refusal_receipt
                 .as_ref()
                 .and_then(|fee| fee.writes())
                 .cloned(),
@@ -327,7 +329,7 @@ where
             let ExecutionOutputs {
                 outcomes: tx_outcomes,
                 results,
-                fee_receipts,
+                refusal_receipts,
             } = split_execution_outputs(executed);
 
             // Append before notifying: the coordinator dispatches the next
@@ -339,7 +341,7 @@ where
                     tick_id,
                     results,
                     tx_outcomes,
-                    fee_receipts,
+                    refusal_receipts,
                 },
             });
         }

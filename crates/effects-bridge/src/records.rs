@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice};
 use hyperscale_vm_effects::{
-    ChainRecords, CrossingAnswer, CrossingCell, CrossingObligation, Hasher, InstanceMeta,
-    InstanceRegistry, Issuance, Marker, MetadataCache, PackageHash, PackageMetadata, ResourceMeta,
-    Value, escrow_record_key, package_hash,
+    ChainRecords, CrossingAnswer, CrossingCell, Hasher, InstanceMeta, InstanceRegistry, Issuance,
+    Marker, MetadataCache, PackageHash, PackageMetadata, ResourceMeta, Value, escrow_record_key,
+    package_hash,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
@@ -126,20 +126,6 @@ pub(crate) fn crossing_answer_cell(owner: Address, local: [u8; 16], value: &[u8]
         return false;
     };
     claim.key(&ProtocolHasher, owner).local.0 == local
-}
-
-/// Whether a committed cell is a crossing obligation — a crossing a
-/// bundle handed this shard and that it has not answered.
-///
-/// The third of the families outside every sweep, judged the way the
-/// other two are. Its value carries a whole record, and the edge that
-/// record names is what re-derives this key.
-#[must_use]
-pub(crate) fn crossing_obligation_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
-    let Ok(obligation) = hbor_from_slice::<CrossingObligation>(value) else {
-        return false;
-    };
-    obligation.key(&ProtocolHasher, owner).local.0 == local
 }
 
 /// The instance a committed cell seals, or `None` for every other cell.
@@ -1043,9 +1029,7 @@ mod tests {
     /// that tells a reader holding the leaf which of the two it holds.
     #[test]
     fn neither_half_of_a_crossing_is_swept_and_each_is_judged_off_its_leaf() {
-        use hyperscale_vm_effects::{
-            CrossingObligation, CrossingSite, IntentHeader, Terms, crossing_expiry_ms,
-        };
+        use hyperscale_vm_effects::{CrossingSite, IntentHeader, Terms, crossing_expiry_ms};
         use hyperscale_vm_types::{AddressClass, CROSSING_GRACE_MS, IntentHash, NetworkId, TxHash};
 
         let header = IntentHeader {
@@ -1107,47 +1091,5 @@ mod tests {
             record_site.key().local.0,
             &record_value
         ));
-
-        // And the third family, which a shard writes about a crossing it
-        // was handed and has not answered. Judged the same way, and told
-        // apart from the two above by the same one question — which
-        // matters more here than for either of them, because the
-        // commit fold tries the answer's arm first and a note that
-        // answered to it would be folded as a verdict.
-        let obligation = CrossingObligation {
-            record: record_site.key(),
-            cell: record,
-        };
-        let obligation_key = obligation.key(&ProtocolHasher, taker);
-        let obligation_value = obligation.to_bytes();
-        assert!(crossing_obligation_cell(
-            taker,
-            obligation_key.local.0,
-            &obligation_value
-        ));
-        assert!(!crossing_obligation_cell(
-            other_owner,
-            obligation_key.local.0,
-            &obligation_value
-        ));
-        assert!(!crossing_obligation_cell(
-            taker,
-            elsewhere,
-            &obligation_value
-        ));
-        assert!(!crossing_answer_cell(
-            taker,
-            obligation_key.local.0,
-            &obligation_value
-        ));
-        assert!(!record_cell(
-            taker,
-            obligation_key.local.0,
-            &obligation_value
-        ));
-        assert_eq!(
-            sweepable_cell(taker, obligation_key.local.0, &obligation_value),
-            None
-        );
     }
 }

@@ -49,15 +49,14 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
+use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side, never_answer};
 use hyperscale_engine::{
-    CodeAvailability, Deletion, Obligations, PROTOCOL_RESOURCE, Refusal, TickEnvironment,
-    build_fee_receipt,
+    CodeAvailability, Deletion, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
 use hyperscale_metrics::{
     record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
 };
-use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
+use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation,
@@ -66,12 +65,10 @@ use hyperscale_types::{
     Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions, SettledSetVerdict, SettledTxSet,
     ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
     TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
-    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
-    WindowView, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
+    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
-use hyperscale_vm_effects::{
-    CrossingCell, ProtocolHasher, Terms, crossing_decline_key, crossing_obligation_key,
-};
+use hyperscale_vm_effects::Terms;
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
@@ -81,7 +78,7 @@ use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalizations::FinalizationStore;
 use crate::gate::{Attested, Gate, gate_certificate};
-use crate::ledger::{Delivering, Ledger, Settleable, Unanswerable};
+use crate::ledger::{Certified, Delivering, Ledger, Settleable, Unanswerable};
 use crate::lookups::{
     assign_participants, attesting_committee, build_provision_requests, ec_has_shard_quorum_power,
     fetch_keys_covered, peers_excluding_self,
@@ -326,27 +323,12 @@ fn disposal_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
     TxHash::from(Hash::from_parts(&parts))
 }
 
-/// The name a housekeeping member over this shard's obligation ledger
-/// takes.
-///
-/// [`disposal_member_name`]'s neighbour and derived the same way, under
-/// its own domain so the two never collide: a shard writing down what it
-/// owes and a shard disposing of what it holds are two members over one
-/// transaction's crossings, and a chain that admitted one name for both
-/// would compose only the first.
-fn obligation_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
-    let keys: Vec<Vec<u8>> = records.iter().map(|key| key.to_bytes().to_vec()).collect();
-    let mut parts: Vec<&[u8]> = vec![b"hyperscale.crossing.obligation", &issued_by.0.0];
-    parts.extend(keys.iter().map(Vec::as_slice));
-    TxHash::from(Hash::from_parts(&parts))
-}
-
-/// The name a housekeeping member over this shard's own answer cells
+/// The name a housekeeping member over this shard's own tombstones
 /// takes.
 ///
 /// [`disposal_member_name`]'s neighbour under its own domain, and named
-/// by the cells it removes rather than by a transaction: a cleanup's
-/// answers belong to as many transactions as there are crossings, and
+/// by the cells it removes rather than by a transaction: a sweep's
+/// tombstones belong to as many transactions as there are crossings, and
 /// what has to be one member is one block's worth of them.
 fn sweep_member_name(tombstones: &[SubstateKey]) -> TxHash {
     let keys: Vec<Vec<u8>> = tombstones
@@ -365,54 +347,6 @@ fn deletion_member_name(answers: &[SubstateKey]) -> TxHash {
     let mut parts: Vec<&[u8]> = vec![b"hyperscale.crossing.deletion"];
     parts.extend(keys.iter().map(Vec::as_slice));
     TxHash::from(Hash::from_parts(&parts))
-}
-
-/// Whether this shard owes an answer for the crossing a bundle handed
-/// it at `record`.
-///
-/// The one rule both housekeeping admitters select on, stated once
-/// because they must not drift: a refusal and the note it is later
-/// composed from answer for exactly the same set.
-///
-/// Three terms. The crossing is **escrowed**, since nothing takes an
-/// owed one back and its consumer's verdict is never final. Its record
-/// is **not this shard's**, wherever the producer's prefix sits now — a
-/// crossing whose two ends have converged here is one this shard
-/// answers to itself. And its consumer's target **is** this shard's,
-/// because both the note and the decline sit under that target and a
-/// session writes a crossing cell only where the member's shard applies
-/// its owner: composed anywhere else, the member runs, succeeds, writes
-/// nothing, and is composed again at every commit thereafter.
-fn owes_an_answer(
-    trie: &ShardTrie,
-    local_shard: ShardId,
-    record: SubstateKey,
-    cell: &CrossingCell,
-) -> bool {
-    matches!(cell.terms, Terms::Escrowed { .. })
-        && trie.shard_for_prefix(record.owner) != local_shard
-        && trie.shard_for_prefix(cell.consumer_claim.owner) == local_shard
-}
-
-/// The refusal of the crossing `cell` records at `record`: the
-/// producer's own bytes, and the two keys under the consuming node's
-/// target that this shard writes about it.
-///
-/// Derived in one place so the answer and the note it retires always
-/// name one edge.
-fn refusal_of(record: SubstateKey, cell: CrossingCell) -> Refusal {
-    let (owner, intent, local, output) = (
-        cell.consumer_claim.owner,
-        cell.intent,
-        cell.local,
-        cell.output,
-    );
-    Refusal {
-        record,
-        cell,
-        site: crossing_decline_key(&ProtocolHasher, owner, intent, local, output),
-        obligation: crossing_obligation_key(&ProtocolHasher, owner, intent, local, output),
-    }
 }
 
 /// Execution state machine.
@@ -1113,16 +1047,6 @@ impl ExecutionCoordinator {
         vec![Action::ResolveTicks { resolutions }]
     }
 
-    /// Compose this commit's tick and set it up to be attested.
-    ///
-    /// The tick takes the candidates that can reach their outcome in it
-    /// and the transactions past their deadline that nothing else will,
-    /// and nothing else. That is what makes it votable the moment its
-    /// batch returns: every member of a tick has an outcome there, so no
-    /// member of one waits on another.
-    ///
-    /// Returns the tick, if the commit composed one, and any early votes
-    /// its leader can now replay.
     /// Admit into the tick being composed everything this commit
     /// abandons: past its deadline, with no shard left that could settle
     /// it.
@@ -1137,6 +1061,18 @@ impl ExecutionCoordinator {
     /// dominant, so their coverage closes on it — and what the fence
     /// asks its question about. Nothing is awaited: an abort needs no
     /// counterpart's verdict, so the whole shape's one set serves.
+    ///
+    /// An abandonment reaches no engine, so what its verdict settles is
+    /// built here rather than read off a result: the charge, where the
+    /// vault is this shard's, and a `Never` at each refusable crossing
+    /// the member consumed, where the ledger says the abandonment
+    /// answers for it and the decline key is this shard's. The receipt
+    /// rides the abandonment's finalization under the transaction's own
+    /// name, so a later accept of it on this chain is refused as already
+    /// resolved. It reads no answer first: an entry the ledger lets
+    /// answer never reached an executing tick, so nothing wrote its
+    /// claim or decline key, and a second abandonment writes the same
+    /// bytes to a key that still holds nothing.
     fn admit_abandoned(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1169,30 +1105,39 @@ impl ExecutionCoordinator {
                 Some(charged),
                 Admission::Aborted,
             );
-            // An abandonment reaches no engine, so the charge its verdict
-            // settles is built here rather than read off a result. The
-            // floor is owed whether or not the transaction ever ran: the
-            // reservation engaged when its block committed it, and an
+            // The floor is owed whether or not the transaction ever ran:
+            // the reservation engaged when its block committed it, and an
             // abort that released it without burning would price an
             // attempt nobody could execute below the success it was
-            // competing with.
-            //
-            // Fees never move cross-shard, so only the shard holding the
-            // vault settles it — the same question the engine asks of the
-            // payers it prices.
-            if trie.shard_for_prefix(charge.vault.owner) == local_shard {
-                let fee = build_fee_receipt(
-                    local_shard,
-                    trie,
-                    tx_hash,
+            // competing with. Fees never move cross-shard, so only the
+            // shard holding the vault settles it — the same question the
+            // engine asks of the payers it prices.
+            let vault = (trie.shard_for_prefix(charge.vault.owner) == local_shard).then(|| {
+                (
                     charge.vault,
                     Movement::unjudged(*PROTOCOL_RESOURCE, charge.amount),
-                );
-                state.record_fee_receipt(StoredReceipt::synced(tx_hash, Arc::new(fee)));
+                )
+            });
+            let nevers: Vec<(SubstateKey, Vec<u8>)> = self
+                .counterparts
+                .ledger
+                .abandonment_answers(tx_hash)
+                .map_or_default(|classified| {
+                    classified
+                        .refusable_consumed(local_shard)
+                        .map(|edge| never_answer(tx_hash, edge))
+                        .filter(|(key, _)| trie.shard_for_prefix(key.owner) == local_shard)
+                        .collect()
+                });
+            if let Some(receipt) = build_refusal_receipt(local_shard, trie, tx_hash, vault, &nevers)
+            {
+                state.record_refusal_receipt(StoredReceipt::synced(tx_hash, Arc::new(receipt)));
             }
             self.candidates.remove(tx_hash);
             self.ticks.assign_tx(tx_hash, tick_id);
-            self.counterparts.ledger.certify(tx_hash);
+            self.counterparts
+                .ledger
+                .certify(tx_hash, Certified::ByAbandonment);
         }
     }
 
@@ -1458,141 +1403,6 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Admit into the tick being composed a refusal of every crossing
-    /// handed to this shard that nothing here can still take.
-    ///
-    /// The escrowed path's obligation, discharged. A crossing arrives as
-    /// a bundle, so its consumer knows it owes an answer; a refusal is
-    /// the answer where no execution here will ever give the other one,
-    /// and the producer credits the value back off it rather than
-    /// inferring anything from a silence.
-    ///
-    /// **Three conditions, and each bounds a different way a claim could
-    /// still be coming.**
-    ///
-    /// The crossing is *unanswered* — this shard holds no answer cell
-    /// naming its record. Read off `answered`, which seeds from the
-    /// answer leaves in state rather than from a replay, so a restarted
-    /// seat reads it whole. The kernel reads the claim again against the
-    /// committed baseline, which is what makes the two answers exclusive
-    /// by construction; this is selection, so that a member which would
-    /// refuse is not composed.
-    ///
-    /// The transaction's *deadline has passed*, read off the record's
-    /// own expiry. The deadline and not the validity end: a claim is
-    /// written at a member's coverage rather than at its admission, so a
-    /// core admitted a millisecond before its window closed has a whole
-    /// finalization delay to write one, and a rule keyed on the validity
-    /// end refuses a crossing whose claim is still coming — on the
-    /// healthy path of a core that simply committed late.
-    ///
-    /// And *nothing here still holds a member* for it. The deadline does
-    /// not bound this, which is why it is its own condition: the
-    /// deadline fence on finalizations refuses only what decides alone,
-    /// so a core member with a sibling settles on the sibling's clock
-    /// however late. While a tick or a candidate holds one, a claim may
-    /// still be coming; once neither does, none ever can, because a
-    /// member composed past the deadline runs nothing and writes
-    /// nothing.
-    ///
-    /// **Composed off the notes this shard wrote itself**, which is what
-    /// makes the composition reproducible. A consumer holds no leaf for a
-    /// crossing it has not answered and no entry either, so this used to
-    /// read the provisioning account's arrivals — node-local, empty after
-    /// a restart, and never replayed, so a reseated validator composed
-    /// fewer refusals than one that watched the bundles land. The
-    /// obligation set is seeded from state at every seat and folded from
-    /// committed blocks, so every replica at one frontier composes the
-    /// same set, and no bundle is read for a verdict at any age.
-    fn admit_refusals(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        tick_id: TickId,
-        tick_ts: WeightedTimestamp,
-        prices: PriceTable,
-        state: &mut TickState,
-        requests: &mut Vec<CrossShardExecutionRequest>,
-    ) {
-        let Some(window) = topology_schedule.at(tick_ts) else {
-            return;
-        };
-        let trie = window.shard_trie();
-        let local_shard = self.local_shard;
-        // One member per issuing transaction, so crossings refused
-        // together settle together and one still waiting holds nothing
-        // back.
-        let mut due: BTreeMap<TxHash, Vec<Refusal>> = BTreeMap::new();
-        for note in self.counterparts.obligations().values() {
-            let (record, cell) = (note.record, note.cell);
-            if !owes_an_answer(trie, local_shard, record, &cell) {
-                continue;
-            }
-            let deadline = Deadline::from_expiry(cell.expiry_ms);
-            if self.counterparts.holds_answer_for(&cell) || !deadline.passed(tick_ts) {
-                continue;
-            }
-            // A member of the crossing's own transaction could still
-            // write the claim, so a refusal beside it would be a second
-            // answer — until the instant that premise expires. Past the
-            // close of `Window::Core` no core member can still commit,
-            // and a member held past it is one awaiting a sibling that
-            // is never coming: `release_wedged_ticks` cannot release it,
-            // because its only reader is gated on a determined half and
-            // such a member has none.
-            //
-            // Read on this shard's own clock about this shard's own
-            // member, which is what makes it a different question from
-            // reading a counterpart's cell absent inside a window.
-            if Window::Core.of(deadline).end >= tick_ts && self.holds_member_for(cell.tx) {
-                continue;
-            }
-            due.entry(cell.tx)
-                .or_default()
-                .push(refusal_of(record, cell));
-        }
-        for (issued_by, crossings) in due {
-            let records: Vec<SubstateKey> = crossings.iter().map(|one| one.record).collect();
-            let tx_hash = disposal_member_name(issued_by, &records);
-            // A refusal already in flight is not composed again, and
-            // the guard has to be on **this member's** name rather than
-            // on the transaction's. The condition above reads
-            // `holds_member_for(cell.tx)`, which asks whether an
-            // execution of the crossing's own transaction could still
-            // write a claim — a different question with a different
-            // hash, so it never sees the refusal beside it.
-            //
-            // What ends the composition is the decline reaching state,
-            // which `holds_answer_for` then reads; and until it does,
-            // every commit that still sees the arrival composes the
-            // member again. The kernel refuses all but the first, so
-            // nothing is written twice — but the tick fills with
-            // members that cannot run, and the decline they were
-            // composed to write never gets through.
-            if self.holds_member_for(tx_hash) {
-                continue;
-            }
-            state.admit(
-                tx_hash,
-                Membership::whole(BTreeSet::from([local_shard])).settling(),
-                None,
-                Admission::Executes,
-            );
-            self.ticks.assign_tx(tx_hash, tick_id);
-            requests.push(CrossShardExecutionRequest {
-                tx_hash,
-                transaction: None,
-                provisions: Vec::new(),
-                clock: tick_ts,
-                prices,
-                runs: Runs::Refuse {
-                    member: Member::whole(local_shard),
-                    crossings,
-                },
-                arrivals: Vec::new(),
-            });
-        }
-    }
-
     /// Admit into the tick being composed the removal of every answer
     /// this block's own claims read the record gone at, twice, a span
     /// apart.
@@ -1687,13 +1497,13 @@ impl ExecutionCoordinator {
     }
 
     /// Admit the housekeeping this shard's own crossing cells need: the
-    /// notes it owes, the answers it may let go of, and the tombstones
-    /// its grace has run out on.
+    /// answers it may let go of, and the tombstones its grace has run
+    /// out on.
     ///
-    /// Three admitters and one question — what does this shard's
-    /// crossing ledger say, and what does the block in hand change
-    /// about it — so they are put in one place rather than three lines
-    /// of the tick's own composition.
+    /// Two admitters and one question — what does this shard's crossing
+    /// ledger say, and what does the block in hand change about it — so
+    /// they are put in one place rather than two lines of the tick's
+    /// own composition.
     fn admit_crossing_ledger_work(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1703,7 +1513,6 @@ impl ExecutionCoordinator {
         state: &mut TickState,
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
-        self.admit_obligations(topology_schedule, tick_id, tick_ts, prices, state, requests);
         self.admit_answer_deletions(topology_schedule, tick_id, tick_ts, prices, state, requests);
         self.admit_tombstone_sweeps(topology_schedule, tick_id, tick_ts, prices, state, requests);
     }
@@ -1786,98 +1595,6 @@ impl ExecutionCoordinator {
             },
             arrivals: Vec::new(),
         });
-    }
-
-    /// Admit into the tick being composed the ledger work this shard's
-    /// obligations need: a note for every escrowed crossing a bundle
-    /// handed it and it has not answered, and the removal of every note
-    /// whose answer now stands.
-    ///
-    /// **This is the last composition that reads `arrived`, and it reads
-    /// it for the one thing it can answer**: what a bundle handed this
-    /// shard, while that bundle is in hand. Every verdict downstream
-    /// reads the leaf this writes, which is state — seeded at a seat,
-    /// folded from committed blocks, and bounded by no horizon. What the
-    /// arrival map was never able to be is reproducible; what it is good
-    /// for is being the thing that saw the bundle.
-    ///
-    /// **What stops the member being composed again**, asked explicitly
-    /// because the answer is never the obvious one: the note's own write,
-    /// which is blocks away. So the guard is on this member's own name,
-    /// exactly as the refusal's is — `holds_obligation_for` reads state
-    /// that has not changed yet, and would let every commit in between
-    /// compose the member afresh.
-    ///
-    /// The owed crossings are left alone. Nothing here ever refuses one
-    /// — its consumer's verdict is not final — so a note this shard
-    /// could never answer from would be a cell written for nobody.
-    fn admit_obligations(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        tick_id: TickId,
-        tick_ts: WeightedTimestamp,
-        prices: PriceTable,
-        state: &mut TickState,
-        requests: &mut Vec<CrossShardExecutionRequest>,
-    ) {
-        let Some(window) = topology_schedule.at(tick_ts) else {
-            return;
-        };
-        let trie = window.shard_trie();
-        let local_shard = self.local_shard;
-        // One member per issuing transaction, as the refusal beside it
-        // does, so the notes of one crossing's siblings are made and let
-        // go of together.
-        let mut due: BTreeMap<TxHash, Obligations> = BTreeMap::new();
-        for (&record, arrival) in self.provisioning.arrived() {
-            let cell = arrival.cell;
-            if !owes_an_answer(trie, local_shard, record, &cell) {
-                continue;
-            }
-            if self.counterparts.holds_answer_for(&cell)
-                || self.counterparts.holds_obligation_for(record)
-            {
-                continue;
-            }
-            due.entry(cell.tx)
-                .or_default()
-                .owe
-                .push(refusal_of(record, cell));
-        }
-        // And the other half of the one job: a note whose crossing this
-        // shard has answered, either way, says nothing any more.
-        for (&key, note) in self.counterparts.obligations() {
-            if self.counterparts.holds_answer_for(&note.cell) {
-                due.entry(note.cell.tx).or_default().disown.push(key);
-            }
-        }
-        for (issued_by, work) in due {
-            let mut records: Vec<SubstateKey> = work.owe.iter().map(|one| one.record).collect();
-            records.extend(work.disown.iter().copied());
-            let tx_hash = obligation_member_name(issued_by, &records);
-            if self.holds_member_for(tx_hash) {
-                continue;
-            }
-            state.admit(
-                tx_hash,
-                Membership::whole(BTreeSet::from([local_shard])).settling(),
-                None,
-                Admission::Executes,
-            );
-            self.ticks.assign_tx(tx_hash, tick_id);
-            requests.push(CrossShardExecutionRequest {
-                tx_hash,
-                transaction: None,
-                provisions: Vec::new(),
-                clock: tick_ts,
-                prices,
-                runs: Runs::Owe {
-                    member: Member::whole(local_shard),
-                    work,
-                },
-                arrivals: Vec::new(),
-            });
-        }
     }
 
     /// Admit into the tick being composed every retirement a committed
@@ -2042,25 +1759,10 @@ impl ExecutionCoordinator {
             _ => BTreeSet::new(),
         };
         state.record_crossing_targets(member.request.tx_hash, targets);
-        // A core member's inclusion wrote this shard's committed cell
-        // for the transaction, and its refusal retracts it: what a leg
-        // probing the core reads as the same absence a core that never
-        // included the transaction leaves.
-        if let Some((shape, body)) = &shape
-            && shape.side() == Side::Issuing
-            && shape.in_core()
-        {
-            state.record_committed_cell(
-                member.request.tx_hash,
-                committed_tx_cell_key(
-                    local_shard,
-                    member.request.tx_hash,
-                    body.validity_range().end_timestamp_exclusive,
-                ),
-            );
-        }
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
-        self.counterparts.ledger.certify(member.request.tx_hash);
+        self.counterparts
+            .ledger
+            .certify(member.request.tx_hash, Certified::ByExecution);
         // A shard with legs on both sides of the core runs them as two
         // members: the issuing one just admitted, and a delivering one
         // that waits on what the core returns. Registered here, at the
@@ -2134,14 +1836,6 @@ impl ExecutionCoordinator {
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_record_disposals(tick_id, block.ts, tick_prices, &mut state, &mut requests);
-        self.admit_refusals(
-            topology_schedule,
-            tick_id,
-            block.ts,
-            tick_prices,
-            &mut state,
-            &mut requests,
-        );
         self.admit_crossing_ledger_work(
             topology_schedule,
             tick_id,
@@ -2358,14 +2052,14 @@ impl ExecutionCoordinator {
             tick_id,
             results,
             tx_outcomes,
-            fee_receipts,
+            refusal_receipts,
         } = outcome;
         if let Some(state) = self.ticks.get_tick_mut(&tick_id) {
             for result in results {
                 state.record_receipt(result);
             }
-            for fee in fee_receipts {
-                state.record_fee_receipt(fee);
+            for fee in refusal_receipts {
+                state.record_refusal_receipt(fee);
             }
             for wr in tx_outcomes {
                 state.record_escrowed(wr.tx_hash(), wr.escrowed().to_vec());
@@ -4054,8 +3748,11 @@ impl ExecutionCoordinator {
                 self.counterparts.ledger.is_covered(tx_hash)
                     || held_by.is_some_and(|tick| tick.decided_alone(tx_hash))
             }
+            // An entry no execution of ours took is re-offered once its
+            // tick is gone: it spends nothing to abort at any age, and
+            // its only exit is an abandonment's committed finalization.
             None => {
-                !self.counterparts.ledger.is_certified(tx_hash)
+                !self.counterparts.ledger.executed(tx_hash)
                     || self.no_counterpart_can_settle(tx_hash)
             }
         }
@@ -4294,7 +3991,9 @@ impl ExecutionCoordinator {
         let tick_id = TickId::new(self.local_shard, block_height);
         for tx in transactions {
             self.ticks.assign_tx(tx.hash(), tick_id);
-            self.counterparts.ledger.certify(tx.hash());
+            self.counterparts
+                .ledger
+                .certify(tx.hash(), Certified::ByExecution);
         }
     }
 
@@ -4958,8 +4657,8 @@ mod tests {
         ValidatorSet, Window,
     };
     use hyperscale_vm_effects::{
-        Answered, CrossingAnswer, CrossingCell, CrossingObligation, Hash32, IntentHash,
-        ProtocolHasher, Terms, crossing_claim_key, crossing_decline_key,
+        Answered, CrossingAnswer, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms,
+        crossing_claim_key, crossing_decline_key,
     };
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
@@ -5426,7 +5125,7 @@ mod tests {
                 tick_id,
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
-                fee_receipts: vec![],
+                refusal_receipts: vec![],
             },
         );
 
@@ -5488,7 +5187,7 @@ mod tests {
                 tick_id,
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
-                fee_receipts: vec![],
+                refusal_receipts: vec![],
             },
         );
 
@@ -7573,7 +7272,7 @@ mod tests {
                 tick_id,
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
-                fee_receipts: vec![],
+                refusal_receipts: vec![],
             },
         );
         tick_id
@@ -8362,13 +8061,17 @@ mod tests {
         let schedule = make_test_topology();
         let mut state = make_test_state();
         let tx = test_transaction(1);
-        let expected = build_fee_receipt(
+        let expected = build_refusal_receipt(
             ShardId::ROOT,
             state.counterpart_trie(&schedule),
             tx.hash(),
-            tx.fee_vault(),
-            Movement::unjudged(*PROTOCOL_RESOURCE, tx.price(&PriceTable::GENESIS)),
-        );
+            Some((
+                tx.fee_vault(),
+                Movement::unjudged(*PROTOCOL_RESOURCE, tx.price(&PriceTable::GENESIS)),
+            )),
+            &[],
+        )
+        .expect("a charge names a receipt");
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
         state.on_block_committed(
@@ -8391,7 +8094,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].is_aborted());
         assert_eq!(
-            outcomes[0].fee_receipt(),
+            outcomes[0].refusal_receipt(),
             Some(expected.receipt_hash()),
             "the abandonment settles the same floor an attested abort would",
         );
@@ -8449,7 +8152,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].is_aborted());
         assert_eq!(
-            outcomes[0].fee_receipt(),
+            outcomes[0].refusal_receipt(),
             None,
             "the vault is not here, so neither is the burn",
         );
@@ -8681,7 +8384,7 @@ mod tests {
     /// members, however far back each one's own store reaches.
     ///
     /// The abandonment rides the tick being composed — a member and its
-    /// fee receipt — so it reaches a `TxOutcome` and the receipt root. What
+    /// refusal receipt — so it reaches a `TxOutcome` and the receipt root. What
     /// decides it is which tick holds the member and whether a
     /// certificate of this shard's covers it, and both are composition's
     /// output: a replay that composed nothing there would have to assert
@@ -8886,7 +8589,7 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )],
-                fee_receipts: Vec::new(),
+                refusal_receipts: Vec::new(),
             },
         );
         state.emit_vote_actions(&schedule);
@@ -9085,7 +8788,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &leg_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         state
             .counterparts
             .ledger
@@ -9170,7 +8876,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &leg_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
 
         let certificate = |outcome: ExecutionOutcome| {
             Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
@@ -9278,7 +8987,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(transaction, classified)],
         );
-        state.counterparts.ledger.certify(transaction.hash());
+        state
+            .counterparts
+            .ledger
+            .certify(transaction.hash(), Certified::ByExecution);
         state
     }
 
@@ -9598,7 +9310,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &delivery_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
 
         let held: [(ShardId, u64, WeightedTimestamp, &[u8]); 3] = [
             (BEARER, 3, deadline, b"bearer"),
@@ -9673,7 +9388,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &delivery_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         let (bundle, opened) = proven_at(
             &mut state,
             &schedule,
@@ -9730,7 +9448,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &delivery_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
 
         let asked_from = Deadline::of_transaction(&transaction).at();
         let (bundle, opened) = proven_at(
@@ -9806,7 +9527,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &delivery_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         // The local chain has crossed the deliverer's cut: its committee
         // is anchored in a window whose trie names the children.
         state.committed_committee_anchor_wt = past_deadline;
@@ -9924,6 +9648,9 @@ mod tests {
 
     /// The core's committed cell proved absent past the deadline
     /// reaches the vote fence and is offered as an `Unclaimed` record.
+    /// An absence says only that the core never included the
+    /// transaction: a core that included and refused it keeps its cell
+    /// and answers with a `Never` instead.
     /// The window is what licenses the answer, not the anchor the
     /// proposer happened to probe at: a proof taken short of the
     /// deadline says nothing, and a second copy adds nothing.
@@ -9943,7 +9670,11 @@ mod tests {
             state_proof_fetches(&opened),
             vec![(
                 bundle.anchor,
-                vec![key, core_claim(&two_shard_core_classified())]
+                vec![
+                    key,
+                    core_claim(&two_shard_core_classified()),
+                    core_decline(&two_shard_core_classified()),
+                ]
             )],
             "the newest header inside the window is the anchor, and the consumer's claim is \
              asked beside the committed cell"
@@ -9993,14 +9724,15 @@ mod tests {
         );
     }
 
-    /// A committed cell read present is not the core's last word. A
-    /// member that included the transaction can still refuse or abort
-    /// inside the core window, and its retraction is what the leg has
-    /// to read to take the crossing back — so a present cell is a
-    /// member still pending, asked again at each newer header, and its
-    /// certificate is not fetched on it.
+    /// A committed cell read present is the core's inclusion, not its
+    /// verdict. A member that included the transaction answers its
+    /// producers itself, with a claim or a `Never` beside the cell, so
+    /// the cell is asked again at each newer header with both answers
+    /// beside it: no certificate is fetched on it, a cell that stays
+    /// present licenses nothing on its own, and the `Never` beside it is
+    /// what licenses taking the crossing back.
     #[test]
-    fn a_core_cell_read_present_is_asked_again_until_its_retraction_answers() {
+    fn a_core_cell_read_present_is_answered_by_the_never_beside_it() {
         let schedule = two_shard_core_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -10016,10 +9748,13 @@ mod tests {
         .at();
         let validity_end = transaction.validity_range().end_timestamp_exclusive;
         let cell = |shard| committed_tx_cell_key(shard, tx_hash, validity_end);
+        let claim = core_claim(&two_shard_core_classified());
+        let decline = core_decline(&two_shard_core_classified());
         let mut state = leg_state(&transaction, &two_shard_core_classified());
         state.committed_ts = deadline;
 
-        // Both core shards had committed the transaction at the deadline.
+        // Both core shards had committed the transaction at the deadline,
+        // and the core had answered nothing yet.
         let (included, opened) = proven_at(
             &mut state,
             &schedule,
@@ -10027,16 +9762,14 @@ mod tests {
             4,
             deadline,
             &[cell(CORE)],
-            &[cell(CORE)],
+            &[cell(CORE), claim, decline],
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(
-                included.anchor,
-                vec![cell(CORE), core_claim(&two_shard_core_classified())]
-            )],
-            "the committed cell is asked about, and the consumer's claim beside it"
+            vec![(included.anchor, vec![cell(CORE), claim, decline])],
+            "the committed cell is asked about, and the consumer's answers beside it"
         );
+        fetch_answers(&mut state, &included, &[cell(CORE)]);
         let (sibling_included, _) = proven_at(
             &mut state,
             &schedule,
@@ -10056,7 +9789,7 @@ mod tests {
         );
         assert!(
             reading(&state, CORE_SIBLING, tx_hash, cell(CORE_SIBLING)).is_none(),
-            "a cell present is a member still pending, not an answer"
+            "a cell present is a member that included the transaction, not an answer"
         );
         assert!(
             !folded.iter().any(|action| matches!(
@@ -10070,30 +9803,38 @@ mod tests {
         );
         assert!(state.offers().abandonment_records.is_empty());
 
-        // A block later the sibling aborted it and retracted its cell.
+        // A block later the core still holds its cell, and beside it
+        // the `Never` its refusal wrote.
         let later = deadline.plus(Duration::from_secs(1));
-        let (retracted, opened) = proven_at(
+        let (refused, opened) = proven_at(
             &mut state,
             &schedule,
-            CORE_SIBLING,
+            CORE,
             5,
             later,
-            &[],
-            &[cell(CORE_SIBLING)],
+            &[cell(CORE), decline],
+            &[cell(CORE), claim, decline],
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(retracted.anchor, vec![cell(CORE_SIBLING)])],
-            "the sibling is asked again at the newer header",
+            vec![(refused.anchor, vec![cell(CORE), claim, decline])],
+            "the core is asked again at the newer header",
         );
-        commit_carrying(&mut state, &schedule, 2, later.as_millis(), vec![retracted]);
-        assert_eq!(
-            reading(&state, CORE_SIBLING, tx_hash, cell(CORE_SIBLING)),
-            Some(Inclusion::Absent)
+        commit_carrying(&mut state, &schedule, 2, later.as_millis(), vec![refused]);
+        assert!(
+            reading(&state, CORE, tx_hash, cell(CORE)).is_none(),
+            "a cell still present is still no answer",
+        );
+        assert!(
+            matches!(
+                reading(&state, CORE, tx_hash, decline),
+                Some(Inclusion::Present(_))
+            ),
+            "the Never beside it is",
         );
         assert!(
             reclaim_admitted(&state, tx_hash),
-            "which is what licenses taking the crossing back"
+            "and it is what licenses taking the crossing back",
         );
     }
 
@@ -10133,7 +9874,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &two_shard_core_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         state.committed_ts = deadline;
 
         let (never, opened) = proven_at(
@@ -10221,7 +9965,11 @@ mod tests {
             state_proof_fetches(&opened),
             vec![(
                 included.anchor,
-                vec![cell(CORE), core_claim(&two_shard_core_classified())]
+                vec![
+                    cell(CORE),
+                    core_claim(&two_shard_core_classified()),
+                    core_decline(&two_shard_core_classified()),
+                ]
             )],
             "the shard holding the consumer's target is asked about its claim too",
         );
@@ -10297,7 +10045,10 @@ mod tests {
             BTreeSet::from([claim]),
             "the claim the fixture asks about is the one the shape derives",
         );
-        state.counterparts.ledger.certify(transaction.hash());
+        state
+            .counterparts
+            .ledger
+            .certify(transaction.hash(), Certified::ByExecution);
         state.committed_ts = UnsettledTx::for_transaction(
             transaction,
             test_committed(),
@@ -10344,8 +10095,11 @@ mod tests {
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![cell, claim])],
-            "the committed cell is asked about, and the consumer's claim beside it"
+            vec![(
+                bundle.anchor,
+                vec![cell, claim, core_decline(&leg_classified())]
+            )],
+            "the committed cell is asked about, and the consumer's answers beside it"
         );
 
         fetch_answers(&mut state, &bundle, &[]);
@@ -10416,8 +10170,11 @@ mod tests {
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![core_key, claim])],
-            "the committed cell and the claim are asked together"
+            vec![(
+                bundle.anchor,
+                vec![core_key, claim, core_decline(&two_shard_core_classified())]
+            )],
+            "the committed cell and the consumer's answers are asked together"
         );
 
         fetch_answers(&mut state, &bundle, &[core_key]);
@@ -10490,24 +10247,6 @@ mod tests {
             },
         };
         (record_key, claim, cell)
-    }
-
-    /// Seed the note this shard wrote about a crossing it was handed,
-    /// which is what a refusal is composed from once no bundle is in
-    /// hand. The chain's own way in is a committed obligation cell; a
-    /// test states it directly.
-    fn noted(state: &mut ExecutionCoordinator, record: SubstateKey, cell: CrossingCell) {
-        let key = crossing_obligation_key(
-            &ProtocolHasher,
-            cell.consumer_claim.owner,
-            cell.intent,
-            cell.local,
-            cell.output,
-        );
-        state
-            .counterparts
-            .owed
-            .insert(key, CrossingObligation { record, cell });
     }
 
     /// A crossing handed *to* this shard: the record sits on `PEER`
@@ -10997,186 +10736,10 @@ mod tests {
         );
     }
 
-    /// What a shard handed one crossing composes at `at`, given what
-    /// else it holds.
-    ///
-    /// Returns the refusal the commit dispatched, if any.
     /// An expiry well past [`CLAIM_WINDOW`], so the deadline it derives
     /// is an instant the tests can sit either side of rather than one
     /// the subtraction floors at zero.
     const REFUSED_EXPIRY_MS: u64 = 4_000_000;
-
-    fn refusal_at(
-        at: WeightedTimestamp,
-        terms: Terms,
-        holds_member: bool,
-        answered: bool,
-    ) -> Option<Runs> {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, claim, base) = arrived_record(0x6A, REFUSED_EXPIRY_MS);
-        let cell = CrossingCell { terms, ..base };
-        state.provisioning.handed(record_key, cell, at);
-        noted(&mut state, record_key, cell);
-        if holds_member {
-            // A seated tick, not a bare assignment: an assignment whose
-            // tick has no state is pruned at the commit, which is the
-            // registry keeping itself consistent rather than anything
-            // this is about.
-            let tick_id = TickId::new(HOME, BlockHeight::new(1));
-            state.ticks.insert_tick(
-                tick_id,
-                TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at),
-            );
-            state.ticks.assign_tx(cell.tx, tick_id);
-        }
-        if answered {
-            let answer = CrossingAnswer {
-                tx: cell.tx,
-                intent: cell.intent,
-                local: cell.local,
-                output: cell.output,
-                record: record_key,
-                answered: Answered::Taken,
-            };
-            state
-                .counterparts
-                .note_answer(answer.key(&ProtocolHasher, claim.owner), &answer);
-        }
-        state.committed_ts = at;
-        let actions = commit_carrying(&mut state, &schedule, 1, at.as_millis(), vec![]);
-        actions.iter().find_map(|action| match action {
-            Action::ExecuteTransactions { requests, .. } => requests
-                .iter()
-                .find(|request| matches!(request.runs, Runs::Refuse { .. }))
-                .map(|request| request.runs.clone()),
-            _ => None,
-        })
-    }
-
-    /// A refusal already in flight is not composed again.
-    ///
-    /// Nothing about the crossing changes until the decline its member
-    /// writes reaches state, so without a guard on **this member's own
-    /// name** every later commit that still sees the arrival composes
-    /// it afresh. The kernel refuses all but the first, so no cell is
-    /// written twice — what it costs is the tick, which fills with
-    /// members that cannot run while the one decline they were composed
-    /// to write never gets through. The condition beside it reads
-    /// `holds_member_for(cell.tx)`, a different question about a
-    /// different hash, and never sees this.
-    ///
-    /// Driven straight at the admitter rather than through two commits:
-    /// a second `commit_carrying` composes nothing whatever the guard
-    /// says, so an assertion over one passes without the code it is
-    /// about.
-    #[test]
-    fn a_composed_refusal_is_not_composed_again() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = arrived_record(0x6A, REFUSED_EXPIRY_MS);
-        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
-        state.provisioning.handed(record_key, cell, at);
-        noted(&mut state, record_key, cell);
-        state.committed_ts = at;
-
-        let compose = |state: &mut ExecutionCoordinator, height: u64| {
-            let tick_id = TickId::new(HOME, BlockHeight::new(height));
-            let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
-            let mut requests = Vec::new();
-            state.admit_refusals(
-                &schedule,
-                tick_id,
-                at,
-                PriceTable::GENESIS,
-                &mut tick,
-                &mut requests,
-            );
-            requests
-                .iter()
-                .filter(|request| matches!(request.runs, Runs::Refuse { .. }))
-                .count()
-        };
-        assert_eq!(
-            compose(&mut state, 1),
-            1,
-            "the crossing is past its deadline and nothing here holds a member",
-        );
-        assert_eq!(
-            compose(&mut state, 2),
-            0,
-            "and the answer is still on its way, so nothing is composed again",
-        );
-    }
-
-    /// Compose this shard's obligation-ledger work once, at `height`,
-    /// and report the members it produced.
-    fn compose_obligations(
-        state: &mut ExecutionCoordinator,
-        schedule: &TopologySchedule,
-        height: u64,
-        at: WeightedTimestamp,
-    ) -> Vec<Obligations> {
-        let tick_id = TickId::new(HOME, BlockHeight::new(height));
-        let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
-        let mut requests = Vec::new();
-        state.admit_obligations(
-            schedule,
-            tick_id,
-            at,
-            PriceTable::GENESIS,
-            &mut tick,
-            &mut requests,
-        );
-        requests
-            .iter()
-            .filter_map(|request| match &request.runs {
-                Runs::Owe { work, .. } => Some(work.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// A bundle's crossing is written down once, and the member is not
-    /// composed again while the note is on its way.
-    ///
-    /// The second half is this family's shipped defect asked of a new
-    /// admitter: nothing about the crossing changes until the note the
-    /// member writes reaches state, so a guard on anything but **this
-    /// member's own name** lets every commit in between compose it
-    /// afresh — a tick full of members that cannot run, and the one note
-    /// they were composed to write never getting through.
-    ///
-    /// Driven straight at the admitter, because a second
-    /// `commit_carrying` at one height dispatches nothing whatever the
-    /// guard says.
-    #[test]
-    fn a_handed_crossing_is_written_down_once() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = arrived_record(0x6A, REFUSED_EXPIRY_MS);
-        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
-        state.provisioning.handed(record_key, cell, at);
-        state.committed_ts = at;
-
-        let first = compose_obligations(&mut state, &schedule, 1, at);
-        assert_eq!(first.len(), 1, "the crossing arrived and is unanswered");
-        assert_eq!(
-            first[0]
-                .owe
-                .iter()
-                .map(|one| one.record)
-                .collect::<Vec<_>>(),
-            vec![record_key],
-            "and the note names the record a bundle carried",
-        );
-        assert!(first[0].disown.is_empty());
-
-        assert!(
-            compose_obligations(&mut state, &schedule, 2, at).is_empty(),
-            "and the note is still on its way, so nothing is composed again",
-        );
-    }
 
     /// A crossing the push can still serve is not pulled.
     ///
@@ -11392,55 +10955,6 @@ mod tests {
         }
     }
 
-    /// A shard that has forgotten the bundle still refuses the crossing.
-    ///
-    /// **The whole of what this phase is for.** `ProvisioningTracker`
-    /// starts empty and nothing replays it, so before the note existed a
-    /// restarted or reseated validator composed no refusal at all and
-    /// the producer waited on a re-offer to remind it. Here the arrival
-    /// map is empty by construction and the note is the only evidence in
-    /// the shard — which is the state every replica reaches at a seat,
-    /// and the one a bundle's retention can never take away.
-    #[test]
-    fn a_refusal_is_composed_from_the_note_alone() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = arrived_record(0x6E, REFUSED_EXPIRY_MS);
-        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
-        noted(&mut state, record_key, cell);
-        state.committed_ts = at;
-        assert!(
-            state.provisioning.arrived().is_empty(),
-            "no bundle is in hand, which is the point",
-        );
-
-        let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
-        let mut requests = Vec::new();
-        state.admit_refusals(
-            &schedule,
-            tick_id,
-            at,
-            PriceTable::GENESIS,
-            &mut tick,
-            &mut requests,
-        );
-        let refused: Vec<SubstateKey> = requests
-            .iter()
-            .filter_map(|request| match &request.runs {
-                Runs::Refuse { crossings, .. } => Some(crossings),
-                _ => None,
-            })
-            .flatten()
-            .map(|refusal| refusal.record)
-            .collect();
-        assert_eq!(
-            refused,
-            vec![record_key],
-            "the note carries the producer's own cell, so the refusal needs no bundle",
-        );
-    }
-
     /// An answer goes on one reading of its record gone, because the
     /// producer dated the going of it.
     ///
@@ -11575,259 +11089,6 @@ mod tests {
             .collect()
     }
 
-    /// A crossing whose consumer sits on another shard is neither
-    /// written down nor refused here.
-    ///
-    /// **The liveness defect this guard exists for, and it is not
-    /// theoretical.** A bundle carries what its target needs to run, so
-    /// after a cut moves a prefix it can hand this shard a crossing
-    /// whose consuming node's target belongs to somebody else. Both the
-    /// note and the decline sit under that target, and a session writes
-    /// a crossing cell only where the member's shard applies its owner
-    /// — so a member composed here runs, succeeds and writes nothing.
-    /// Nothing about the crossing changes, so the next commit composes
-    /// it again, and every commit after that, until the tick carries
-    /// nothing else and the shard stops making progress.
-    ///
-    /// Driven at both admitters, because the guard has to be in both:
-    /// one writes the note, the other writes the answer, and they sit
-    /// at two keys under the one owner neither of them holds.
-    #[test]
-    fn a_crossing_answered_by_another_shard_is_neither_noted_nor_refused() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, claim, mut cell) = arrived_record(0x6D, REFUSED_EXPIRY_MS);
-        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
-        // The consuming node's target moves to the counterpart, which is
-        // what a cut does to a prefix. Everything else is unchanged.
-        let trie = schedule.at(at).expect("the window is seated").shard_trie();
-        assert_eq!(
-            trie.shard_for_prefix(claim.owner),
-            HOME,
-            "the fixture's consumer is this shard's before it is moved",
-        );
-        cell.consumer_claim = SubstateKey {
-            owner: committed_tx_cell_key(PEER, cell.tx, WeightedTimestamp::from_millis(1)).owner,
-            local: claim.local,
-        };
-        assert_ne!(
-            trie.shard_for_prefix(cell.consumer_claim.owner),
-            HOME,
-            "and somebody else's after",
-        );
-        state.provisioning.handed(record_key, cell, at);
-        noted(&mut state, record_key, cell);
-        state.committed_ts = at;
-
-        assert!(
-            compose_obligations(&mut state, &schedule, 1, at).is_empty(),
-            "a note this shard could never write is not composed",
-        );
-
-        let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
-        let mut requests = Vec::new();
-        state.admit_refusals(
-            &schedule,
-            tick_id,
-            at,
-            PriceTable::GENESIS,
-            &mut tick,
-            &mut requests,
-        );
-        assert!(
-            !requests
-                .iter()
-                .any(|request| matches!(request.runs, Runs::Refuse { .. })),
-            "and neither is an answer it could never write",
-        );
-    }
-
-    /// A crossing answered before the ledger caught up with it is never
-    /// written down.
-    ///
-    /// The happy path, which is the one this phase must not make pay: a
-    /// bundle arrives, a member runs, the claim lands, and no note is
-    /// ever composed for it.
-    #[test]
-    fn a_crossing_answered_first_is_never_written_down() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, claim, cell) = arrived_record(0x6B, REFUSED_EXPIRY_MS);
-        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
-        state.provisioning.handed(record_key, cell, at);
-        state.committed_ts = at;
-        let answer = CrossingAnswer {
-            tx: cell.tx,
-            intent: cell.intent,
-            local: cell.local,
-            output: cell.output,
-            record: record_key,
-            answered: Answered::Taken,
-        };
-        state
-            .counterparts
-            .note_answer(answer.key(&ProtocolHasher, claim.owner), &answer);
-
-        assert!(
-            compose_obligations(&mut state, &schedule, 1, at).is_empty(),
-            "a crossing this shard has answered needs no note of what it owes",
-        );
-    }
-
-    /// And a note whose answer now stands is let go of.
-    ///
-    /// The other half of the one job. Without it the note is a permanent
-    /// cell for a question nobody will ever ask again, which is the
-    /// defect this plan family exists to stop making.
-    #[test]
-    fn an_answered_note_is_let_go_of() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, claim, cell) = arrived_record(0x6C, REFUSED_EXPIRY_MS);
-        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
-        state.committed_ts = at;
-        let note_key = crossing_obligation_key(
-            &ProtocolHasher,
-            claim.owner,
-            cell.intent,
-            cell.local,
-            cell.output,
-        );
-        state.counterparts.owed.insert(
-            note_key,
-            CrossingObligation {
-                record: record_key,
-                cell,
-            },
-        );
-        assert!(
-            compose_obligations(&mut state, &schedule, 1, at).is_empty(),
-            "an unanswered crossing's note stands",
-        );
-
-        let answer = CrossingAnswer {
-            tx: cell.tx,
-            intent: cell.intent,
-            local: cell.local,
-            output: cell.output,
-            record: record_key,
-            answered: Answered::Declined,
-        };
-        state
-            .counterparts
-            .note_answer(answer.key(&ProtocolHasher, claim.owner), &answer);
-        let work = compose_obligations(&mut state, &schedule, 2, at);
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].disown, vec![note_key]);
-        assert!(work[0].owe.is_empty());
-    }
-
-    /// The escrowed cell `held_record` gives, whose terms name a cell to
-    /// credit back.
-    fn escrowed_terms() -> Terms {
-        arrived_record(0x6A, REFUSED_EXPIRY_MS).2.terms
-    }
-
-    /// A crossing is refused past its deadline and not before it.
-    ///
-    /// The deadline and not the validity end. A claim is written at a
-    /// member's coverage rather than at its admission, so a core
-    /// admitted a millisecond before its window closed has a whole
-    /// finalization delay to write one — and a rule keyed on the
-    /// validity end refuses a crossing whose claim is still coming, on
-    /// the healthy path of a core that simply committed late.
-    #[test]
-    fn a_crossing_is_refused_past_its_deadline_and_not_before_it() {
-        let deadline = Deadline::from_expiry(REFUSED_EXPIRY_MS);
-        let terms = escrowed_terms();
-        assert!(
-            refusal_at(
-                deadline.at().minus(Duration::from_millis(1)),
-                terms,
-                false,
-                false
-            )
-            .is_none(),
-            "short of the deadline a member may still be composed anywhere",
-        );
-        assert!(
-            refusal_at(deadline.at(), terms, false, false).is_some(),
-            "and past it nothing can be included, so nothing here can still claim",
-        );
-        // The validity end the deadline was derived from, which is
-        // where a rule keyed on admission would fire: a whole
-        // finalization delay before a member that committed at the very
-        // end of its window has written its claim.
-        assert!(
-            refusal_at(
-                deadline.at().minus(MAX_FINALIZATION_DELAY),
-                terms,
-                false,
-                false
-            )
-            .is_none(),
-            "a rule keyed on the validity end fires while the claim is still coming",
-        );
-    }
-
-    /// A crossing a member here still holds is not refused until that
-    /// member can no longer run, and is refused once it cannot.
-    ///
-    /// The deadline does not bound the held-member condition, which is
-    /// why it is its own: the deadline fence on finalizations refuses
-    /// only what decides alone, so a core member with a sibling settles
-    /// on the sibling's clock. What bounds it is the close of
-    /// [`Window::Core`], past which no core member can still commit — so
-    /// a member held past it is one awaiting a sibling that never
-    /// arrives, which nothing releases. Without the bound such a
-    /// crossing is never answered by anybody and its producer holds the
-    /// value forever.
-    #[test]
-    fn a_crossing_a_member_here_still_holds_is_refused_once_it_cannot_run() {
-        let terms = escrowed_terms();
-        let deadline = Deadline::from_expiry(REFUSED_EXPIRY_MS);
-        let close = Window::Core.of(deadline).end;
-
-        assert!(
-            refusal_at(deadline.at(), terms, true, false).is_none(),
-            "inside the window the member may still write the claim",
-        );
-        assert!(
-            refusal_at(close, terms, true, false).is_none(),
-            "and at the close itself it has not run out of room",
-        );
-        assert!(
-            refusal_at(close.plus(Duration::from_secs(1)), terms, true, false).is_some(),
-            "past it the member can never run, so the refusal is the crossing's answer",
-        );
-        assert!(
-            refusal_at(deadline.at(), terms, false, false).is_some(),
-            "and a shard holding no member refuses from the deadline, as before",
-        );
-    }
-
-    /// A crossing this shard has already answered is not refused, and
-    /// one owed to its consumer is never refused at all.
-    ///
-    /// Both arms lose value if they are wrong: a second answer licenses
-    /// a retirement and a reclaim of one value, and a refusal of an owed
-    /// crossing credits a cell nobody named. The kernel refuses both
-    /// against committed state; this is the selection that keeps a
-    /// member which would be refused from being composed.
-    #[test]
-    fn neither_an_answered_crossing_nor_an_owed_one_is_refused() {
-        let at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
-        assert!(
-            refusal_at(at, escrowed_terms(), false, true).is_none(),
-            "a crossing this shard claimed is answered, and answered once",
-        );
-        assert!(
-            refusal_at(at, Terms::Owed, false, false).is_none(),
-            "and nothing takes an owed crossing back, so no refusal of one is composable",
-        );
-    }
-
     /// A record whose issuing transaction the ledger still holds is the
     /// ledger's to settle, not the leaf's.
     ///
@@ -11911,7 +11172,7 @@ mod tests {
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![claim])],
+            vec![(bundle.anchor, vec![claim, core_decline(&leg_classified())])],
             "and the first one past it is",
         );
     }
@@ -12150,7 +11411,10 @@ mod tests {
             ),
         );
         state.counterparts.ledger.seed(tx_hash, delivery_part(&tx));
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
 
@@ -12449,6 +11713,18 @@ mod tests {
         claims[0].1
     }
 
+    /// The decline cell the core writes beside [`core_claim`] where it
+    /// refuses what `classified` says [`HOME`] issued.
+    fn core_decline(classified: &Classified) -> SubstateKey {
+        let declines = classified.escrowed_declines(HOME);
+        assert_eq!(
+            declines.len(),
+            1,
+            "the fixture issues one crossing to the core"
+        );
+        declines[0].1
+    }
+
     /// The claim cell a delivery writes for what `classified` says
     /// [`HOME`] issued.
     fn delivered_claim(classified: &Classified) -> SubstateKey {
@@ -12629,7 +11905,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &Classified::whole())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
         state
             .counterparts
@@ -12722,7 +12001,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &Classified::whole())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         state.committed_ts = WeightedTimestamp::from_millis(200_000);
         state
             .counterparts
@@ -13080,8 +12362,8 @@ mod tests {
                 (&alone, &Classified::whole()),
             ],
         );
-        state.counterparts.ledger.certify(t);
-        state.counterparts.ledger.certify(x);
+        state.counterparts.ledger.certify(t, Certified::ByExecution);
+        state.counterparts.ledger.certify(x, Certified::ByExecution);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
         (state, tick_id, t, x)
     }
@@ -13169,6 +12451,413 @@ mod tests {
         state.release_wedged_ticks(&sched, &test_certify(block, past_the_span));
 
         assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+    }
+
+    /// Commit an empty block on `shard` at `ts`, as the chain hands it
+    /// over, and return what the fold emitted.
+    fn commit_empty_on(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        shard: ShardId,
+        height: u64,
+        ts: WeightedTimestamp,
+    ) -> Vec<Action> {
+        let block = make_live_block_on_shard(
+            shard,
+            BlockHeight::new(height),
+            ts.as_millis(),
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.on_block_committed(schedule, &test_certify(block, ts.as_millis()))
+    }
+
+    /// The outcomes every tick that can vote now attests.
+    fn votable_outcomes(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+    ) -> Vec<TxOutcome> {
+        state
+            .scan_votable_ticks(schedule)
+            .into_iter()
+            .flat_map(|completion| completion.tx_outcomes)
+            .collect()
+    }
+
+    /// A shape frozen divided under [`two_shard_topology`] with an
+    /// inbound leg on [`PEER`] feeding a core of [`HOME`] alone, so
+    /// `HOME` holds the crossing's claim and decline keys.
+    fn peer_fed_core_classified() -> Classified {
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(2, LegRole::Inbound, &[]),
+            leg(0, LegRole::Core, &[(0, 0)]),
+        ];
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::uniform(1));
+        assert_eq!(classified.core(), &BTreeSet::from([HOME]));
+        assert!(classified.decomposed());
+        classified
+    }
+
+    /// [`straddling_transaction`] the other way round: paying from the
+    /// `0b1…` side and writing to the `0b0…` side, so its vault sits on
+    /// [`PEER`] and what it feeds on [`HOME`].
+    fn straddling_transaction_paying_away(seed: u8) -> Transaction {
+        test_transaction_with_prefixes(
+            &[seed | 0x80],
+            &[test_prefix(seed | 0x80)],
+            &[test_prefix(seed & 0x7F)],
+        )
+    }
+
+    /// A state on `shard` holding `transaction` as a core entry no tick
+    /// has taken, frozen as `classified`.
+    fn core_state(
+        shard: ShardId,
+        transaction: &Arc<Verifiable<Transaction>>,
+        classified: &Classified,
+    ) -> ExecutionCoordinator {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), shard);
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(transaction, classified)],
+        );
+        state
+    }
+
+    /// The one `Never` [`HOME`] writes for `transaction` under
+    /// [`peer_fed_core_classified`]: the crossing the leg on [`PEER`]
+    /// hands the core.
+    fn never_of(transaction: &Arc<Verifiable<Transaction>>) -> (SubstateKey, Vec<u8>) {
+        let classified = peer_fed_core_classified();
+        let edges: Vec<_> = classified.refusable_consumed(HOME).collect();
+        assert_eq!(edges.len(), 1, "the fixture hands the core one crossing");
+        never_answer(transaction.hash(), edges[0])
+    }
+
+    /// The deadline of `transaction` as committed at [`test_committed`].
+    fn deadline_of(transaction: &Arc<Verifiable<Transaction>>) -> WeightedTimestamp {
+        UnsettledTx::for_transaction(
+            transaction,
+            test_committed(),
+            transaction.price(&PriceTable::GENESIS),
+            &PriceTable::GENESIS,
+        )
+        .deadline
+        .at()
+    }
+
+    /// A committed core member no tick of this shard's ever took is
+    /// abandoned with a receipt carrying `Never` at each refusable
+    /// crossing it consumed, on the shard holding the decline key, which
+    /// is not the vault's. The receipt rides the abandonment under the
+    /// transaction's own name, and its keys held nothing before it: the
+    /// entry never reached an executing tick, so no member of it ran.
+    #[test]
+    fn an_uncertified_abandonment_answers_on_the_shard_holding_the_decline() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = deadline_of(&transaction);
+        let never = never_of(&transaction);
+        let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
+        let trie = state.counterpart_trie(&schedule);
+        assert_eq!(
+            trie.shard_for_prefix(never.0.owner),
+            HOME,
+            "the fixture's decline key is this shard's",
+        );
+        assert_eq!(
+            trie.shard_for_prefix(transaction.fee_vault().owner),
+            PEER,
+            "and the vault is not",
+        );
+        let expected =
+            build_refusal_receipt(HOME, trie, tx_hash, None, std::slice::from_ref(&never))
+                .expect("a Never names a receipt");
+
+        commit_empty_on(&mut state, &schedule, HOME, 1, deadline);
+        let outcomes = votable_outcomes(&mut state, &schedule);
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the abandonment is composed at the deadline"
+        );
+        assert_eq!(outcomes[0].tx_hash(), tx_hash);
+        assert!(outcomes[0].is_aborted());
+        assert_eq!(
+            outcomes[0].refusal_receipt(),
+            Some(expected.receipt_hash()),
+            "the receipt carries the Never and no charge",
+        );
+    }
+
+    /// An abandonment composed and then lost is composed again, byte for
+    /// byte, and never twice at once: while the tick holding it stands
+    /// nothing is composed for the member, and once the tick is
+    /// released — as `release_wedged_ticks` and the settled-set gate's
+    /// `Reject` release it — the next commit composes the same
+    /// abandonment with the same receipt.
+    #[test]
+    fn a_discarded_abandonment_is_composed_again() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = deadline_of(&transaction);
+        let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
+
+        commit_empty_on(&mut state, &schedule, HOME, 1, deadline);
+        let first = votable_outcomes(&mut state, &schedule);
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0].refusal_receipt().is_some(),
+            "the receipt carries the Never"
+        );
+        let tick_id = state
+            .ticks
+            .tick_assignment(tx_hash)
+            .expect("the abandonment holds the member");
+
+        commit_empty_on(
+            &mut state,
+            &schedule,
+            HOME,
+            2,
+            deadline.plus(Duration::from_secs(1)),
+        );
+        assert_eq!(
+            state.ticks.tick_assignment(tx_hash),
+            Some(tick_id),
+            "while the abandonment stands, no second is composed",
+        );
+
+        state.release_tick(tick_id, Some(tx_hash));
+        assert!(state.ticks.tick_assignment(tx_hash).is_none());
+        commit_empty_on(
+            &mut state,
+            &schedule,
+            HOME,
+            3,
+            deadline.plus(Duration::from_secs(2)),
+        );
+        let again = votable_outcomes(&mut state, &schedule);
+        assert_eq!(
+            again.len(),
+            1,
+            "the entry is re-offered once its tick is gone"
+        );
+        assert_eq!(again[0].tx_hash(), tx_hash);
+        assert_eq!(
+            again[0].refusal_receipt(),
+            first[0].refusal_receipt(),
+            "and composes the same answer to a key that still holds nothing",
+        );
+        assert_ne!(state.ticks.tick_assignment(tx_hash), Some(tick_id));
+    }
+
+    /// An entry an executing tick took, then released, writes no
+    /// `Never` on any exit: its certificate may be out and a sibling may
+    /// have combined an accept with it. Released uncovered it is neither
+    /// abandoned nor answered, and a release for unanswerability leaves
+    /// the producer's record held — value locked, listed and counted.
+    /// Covered by a record, it is abandoned with the charge alone.
+    #[test]
+    fn a_certified_exit_writes_no_never() {
+        let schedule = two_shard_topology();
+        // Paying from this shard, so the charge is settled here and a
+        // receipt carrying the charge alone is told from one carrying a
+        // `Never` beside it.
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = deadline_of(&transaction);
+        let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
+        assert_eq!(
+            state
+                .counterpart_trie(&schedule)
+                .shard_for_prefix(transaction.fee_vault().owner),
+            HOME,
+            "the fixture's vault is this shard's",
+        );
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        state.ticks.insert_tick(
+            tick_id,
+            tick_holding(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                vec![(
+                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                    BTreeSet::from([HOME, PEER]),
+                )],
+            ),
+        );
+        state.ticks.assign_tx(tx_hash, tick_id);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
+        let (record_key, _, cell) = held_record(0x6A, 400_000);
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(cell));
+
+        state.release_tick(tick_id, Some(tx_hash));
+        assert!(state.ticks.tick_assignment(tx_hash).is_none());
+        commit_empty_on(
+            &mut state,
+            &schedule,
+            HOME,
+            2,
+            deadline.plus(Duration::from_secs(1)),
+        );
+        assert!(
+            state.ticks.tick_assignment(tx_hash).is_none(),
+            "an executed member released uncovered is not abandoned",
+        );
+        assert!(votable_outcomes(&mut state, &schedule).is_empty());
+        assert!(
+            state
+                .counterparts
+                .ledger
+                .abandonment_answers(tx_hash)
+                .is_none(),
+            "and nothing answers for it",
+        );
+
+        state.release_unanswerable(&[Unanswerable {
+            tx_hash,
+            covered_by_record: false,
+        }]);
+        assert!(
+            state.counterparts.held.contains_key(&record_key),
+            "the producer's record stays held: no exit past the window writes anything",
+        );
+
+        // Covered by the departed sibling's record, the entry is
+        // abandoned inside its window and settles the charge alone.
+        state.counterparts.ledger.record_terminal(
+            PEER,
+            deadline.plus(Duration::from_secs(2)),
+            None,
+        );
+        record_peer_left_unsettled(&mut state, tx_hash);
+        commit_empty_on(
+            &mut state,
+            &schedule,
+            HOME,
+            3,
+            deadline.plus(Duration::from_secs(3)),
+        );
+        let outcomes = votable_outcomes(&mut state, &schedule);
+        assert_eq!(outcomes.len(), 1, "covered, the entry is abandoned");
+        assert!(outcomes[0].is_aborted());
+        let charge = build_refusal_receipt(
+            HOME,
+            state.counterpart_trie(&schedule),
+            tx_hash,
+            Some((
+                transaction.fee_vault(),
+                Movement::unjudged(*PROTOCOL_RESOURCE, transaction.price(&PriceTable::GENESIS)),
+            )),
+            &[],
+        )
+        .expect("a charge names a receipt");
+        assert_eq!(
+            outcomes[0].refusal_receipt(),
+            Some(charge.receipt_hash()),
+            "the charge alone: an executed entry answers nothing",
+        );
+    }
+
+    /// A core member waiting on a sibling that refused is covered by the
+    /// sibling's certificate, asked for by transaction once the push
+    /// fails, and never by an absence: the sibling keeps its committed
+    /// cell, so the cell reads present and answers nothing.
+    #[test]
+    fn a_refused_siblings_certificate_covers_the_waiting_core() {
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = core_state(CORE, &transaction, &two_shard_core_classified());
+        let tick_id = TickId::new(CORE, BlockHeight::new(1));
+        let mut tick = tick_holding(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            vec![(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                BTreeSet::from([CORE, CORE_SIBLING]),
+            )],
+        );
+        tick.record_execution_result(tx_hash, succeeded());
+        tick.record_receipt(succeeded_receipt(tx_hash));
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
+                Capped::from_array([TxOutcome::new(tx_hash, succeeded()).awaiting([CORE_SIBLING])]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        state.ticks.insert_tick(tick_id, tick);
+        state.ticks.assign_tx(tx_hash, tick_id);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
+        state
+            .expected_certs
+            .register(CORE_SIBLING, tx_hash, state.committed_ts);
+
+        state.committed_height = BlockHeight::new(500);
+        state.committed_ts = WeightedTimestamp::from_millis(60_000);
+        let actions = state.check_exec_cert_timeouts();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(ids),
+                    ..
+                }) if ids == &vec![(CORE_SIBLING, tx_hash)]
+            )),
+            "the sibling's certificate is asked for by transaction, got: {actions:?}",
+        );
+
+        let tick = state
+            .ticks
+            .get_tick_mut(&tick_id)
+            .expect("the waiting core keeps its tick");
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                TickId::new(CORE_SIBLING, BlockHeight::new(1)),
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"sibling")),
+                Capped::from_array([
+                    TxOutcome::new(tx_hash, ExecutionOutcome::Failed).awaiting([CORE])
+                ]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        let legs = tick
+            .take_legs_finalization()
+            .expect("the sibling's refusal settles T against this shard's own certificate");
+        assert_eq!(
+            legs.tx_decisions(),
+            vec![(tx_hash, TransactionDecision::Reject)],
+            "the waiting core is refused by the certificate, not by an absence",
+        );
     }
 
     /// A release through an unanswerable member abandons that member
@@ -13377,7 +13066,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&sibling, &Classified::whole())],
         );
-        state.counterparts.ledger.certify(sibling_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(sibling_hash, Certified::ByExecution);
 
         // The commit that composes the abandonment, on the shard that
         // stranded the member.

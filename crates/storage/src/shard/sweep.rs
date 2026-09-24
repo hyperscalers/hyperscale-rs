@@ -13,9 +13,9 @@ use std::sync::Arc;
 use hyperscale_hbor::Capped;
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    Address, Block, Finalization, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites,
-    ShardId, ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction,
-    TxHash, Verifiable, Verified, WeightedTimestamp, protocol_statics, protocol_statics_installed,
+    Address, Block, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites, ShardId,
+    ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash,
+    Verified, WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
@@ -72,19 +72,6 @@ pub fn is_record_cell(key: SubstateKey, value: &[u8]) -> bool {
 pub fn is_crossing_answer_cell(key: SubstateKey, value: &[u8]) -> bool {
     protocol_statics_installed()
         && protocol_statics().crossing_answer_cell(key.owner.to_bytes(), key.local.0, value)
-}
-
-/// Whether a committed cell is a crossing obligation — a crossing a
-/// bundle handed this shard and that it has not answered.
-///
-/// The third of the families no sweep reaches, on the same seam and for
-/// the same reason. What asks is a shard reading back at a seat what it
-/// still owes an answer for, which is a fact about a bundle that has
-/// long since expired.
-#[must_use]
-pub fn is_crossing_obligation_cell(key: SubstateKey, value: &[u8]) -> bool {
-    protocol_statics_installed()
-        && protocol_statics().crossing_obligation_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
 /// One row of the sweep index: an owner holding sweepable cells in a
@@ -433,8 +420,8 @@ pub fn merge_sweep_overlay(
 }
 
 /// Fold what the block itself writes — the committed-transaction cells
-/// it creates, and the sweep's removals with the refusals' retractions
-/// — into the settled set its receipts produced.
+/// it creates, and the sweep's removals — into the settled set its
+/// receipts produced.
 ///
 /// All are ordinary writes, a value at the key or `None` at it, so
 /// none needs a commit path of its own: they fold with everything else
@@ -476,19 +463,11 @@ pub fn with_sweep(
     SettledWrites::from_parts(cells, entries)
 }
 
-/// Everything a block removes, each once: what its sweep retires, and
-/// the committed cells its finalizations' refusals retract.
-///
-/// One set, because a refused transaction's cell can fall to the sweep
-/// in the block that retracts it, and a removal named twice would be
-/// two `None`s at one key. Ascending, so the fold walks one order.
+/// Everything a block removes, each once: what its sweep retires.
+/// Ascending, so the fold walks one order.
 #[must_use]
-pub(crate) fn removals_of(
-    swept: &[SubstateKey],
-    finalizations: &[Arc<Verifiable<Finalization>>],
-) -> Vec<SubstateKey> {
-    let mut removals: BTreeSet<SubstateKey> = swept.iter().copied().collect();
-    removals.extend(finalizations.iter().flat_map(|fw| fw.retractions()));
+pub(crate) fn removals_of(swept: &[SubstateKey]) -> Vec<SubstateKey> {
+    let removals: BTreeSet<SubstateKey> = swept.iter().copied().collect();
     removals.into_iter().collect()
 }
 
@@ -521,8 +500,7 @@ pub fn sweep_through(
 /// composed it.
 ///
 /// The receipts its ticks settled, the committed cells its committer
-/// derived, the sweep its header names, and the cells its refusals
-/// retract.
+/// derived, and the sweep its header names.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
@@ -551,7 +529,7 @@ pub fn followed_block_writes(
         prior,
     );
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
-    let removals = removals_of(&swept, block.certificates());
+    let removals = removals_of(&swept);
     filter_writes_to_prefix(&with_sweep(merged, creations, &removals), prefix)
 }
 
@@ -595,14 +573,13 @@ pub fn committed_tx_cells<'a>(
 /// One rule, both halves: a block carries no transaction whose committed
 /// key is present in its parent state or named by another transaction in
 /// the same block. Presence is read through `state`, the anchored view,
-/// so a cell an unpersisted ancestor created counts. A retraction always
-/// names a key live in the parent, so a creation that is also a removal
+/// so a cell an unpersisted ancestor created counts. A sweep removes
+/// only what is live in the parent, so a creation that is also a removal
 /// breaks the first half on its own and needs no clause.
 ///
 /// What the rule buys is that a live committed cell always names the
-/// transaction that created it, so a retraction keyed by an attested
-/// outcome deletes that transaction's cell and no other, and a probe
-/// reading the cell absent reads about the transaction it asked about.
+/// transaction that created it, so a probe reading the cell reads about
+/// the transaction it asked about.
 /// A verifier refuses a block that breaks it at vote time, before the
 /// in-block pair reaches [`with_sweep`]'s assert and halts every
 /// replica, and a proposer keeps the first of each colliding set.
@@ -895,32 +872,15 @@ mod tests {
         assert_eq!(settled.cells().get(&removed), Some(&None));
     }
 
-    /// A refusal's retraction removes the cell beside the sweep, and a
-    /// cell both name is removed once.
+    /// A cell the sweep names twice is removed once.
     #[test]
-    fn a_refusals_retraction_removes_beside_the_sweep_once() {
-        use hyperscale_types::test_utils::finalization_of;
-        use hyperscale_types::{BlockHeight, ExecutionOutcome, Hash, TxOutcome};
-
-        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+    fn a_swept_cell_is_removed_once() {
         let (swept, _, _) = cell(1, 1, 0xD1);
-        let (retracted, _, _) = cell(2, 3, 0xC2);
-        let finalizations = vec![Arc::new(Verifiable::from(finalization_of(
-            BlockHeight::new(1),
-            vec![
-                TxOutcome::new(tx(1), ExecutionOutcome::Failed).retracting(Some(retracted)),
-                TxOutcome::new(tx(2), ExecutionOutcome::Aborted).retracting(Some(swept)),
-            ],
-        )))];
-        let mut expected = vec![swept, retracted];
+        let (other, _, _) = cell(2, 3, 0xC2);
+        let mut expected = vec![swept, other];
         expected.sort_unstable();
-        assert_eq!(removals_of(&[swept], &finalizations), expected);
-        let settled = with_sweep(
-            SettledWrites::default(),
-            &[],
-            &removals_of(&[swept], &finalizations),
-        );
-        assert_eq!(settled.cells().get(&retracted), Some(&None));
+        assert_eq!(removals_of(&[other, swept, swept]), expected);
+        let settled = with_sweep(SettledWrites::default(), &[], &removals_of(&[swept, swept]));
         assert_eq!(settled.cells().get(&swept), Some(&None));
     }
 
@@ -999,7 +959,7 @@ mod tests {
     }
 
     /// The other backstop: a transaction created in the block that
-    /// retracts a colliding cell a parent wrote.
+    /// removes a colliding cell a parent wrote.
     #[test]
     #[should_panic(expected = "a sweep removed")]
     fn with_sweep_refuses_a_creation_that_is_also_a_removal() {
@@ -1077,8 +1037,8 @@ mod tests {
     }
 
     /// A live committed cell names the transaction whose key it sits
-    /// at, across a creation, a retraction and a fresh creation in
-    /// consecutive blocks: once the first is retracted the key is
+    /// at, across a creation, a removal and a fresh creation in
+    /// consecutive blocks: once the first is removed the key is
     /// absent, so a second transaction may create it, and the marker
     /// then names the second.
     #[test]
@@ -1109,7 +1069,7 @@ mod tests {
         );
         assert!(
             cell_after(with_sweep(SettledWrites::default(), &[], &[key])).is_none(),
-            "the retraction removes it",
+            "the sweep removes it",
         );
         let recreated = cell_after(with_sweep(
             SettledWrites::default(),

@@ -45,6 +45,25 @@ struct Reading {
     inclusion: Inclusion,
 }
 
+/// How far a tick of this shard's has spoken for a transaction, in the
+/// order the ranks outrank each other: a tick discarded, wedged or
+/// refused never lowers it, and a second abandonment composes the same
+/// answer a first did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Certified {
+    /// No tick of this shard's has taken the transaction.
+    No,
+    /// A tick took it as an abandonment: no execution of ours ran, so
+    /// no counterpart holds a certificate of ours to combine an accept
+    /// with, and the abandonment's own answer is the only one this
+    /// shard gives.
+    ByAbandonment,
+    /// A tick took it as an executing member. Its certificate may be
+    /// out and a sibling may have combined an accept with it, so no
+    /// later exit of this shard's may answer for it.
+    ByExecution,
+}
+
 /// One committed transaction's outstanding account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Owed {
@@ -55,15 +74,17 @@ struct Owed {
     /// them from and must release exactly what was taken, and because a
     /// record naming the transaction restates exactly these.
     figures: UnsettledTx,
-    /// Whether a tick of this shard's took the transaction as a member.
+    /// How far a tick of this shard's has spoken for the transaction.
     ///
     /// What it answers is whether a certificate of ours is out where a
     /// counterpart could settle against it, which is what decides whether
-    /// this shard may speak for the transaction alone. The account is
-    /// where it belongs rather than the tick that produced it: the
-    /// certificate outlives the tick, and a shard that could not say
-    /// whether it had issued one would have to assume it had.
-    certified: bool,
+    /// this shard may speak for the transaction alone, and whether that
+    /// certificate came from an execution, which is what decides whether
+    /// an abandonment may still answer for it. The account is where it
+    /// belongs rather than the tick that produced it: the certificate
+    /// outlives the tick, and a shard that could not say whether it had
+    /// issued one would have to assume it had.
+    certified: Certified,
     /// What this shard's part in the transaction is, which decides what
     /// the entry waits on and what ends it, with whatever it keeps for
     /// the settlement of what it issued.
@@ -126,23 +147,33 @@ impl Owed {
         })
     }
 
+    /// Whether the chain read a consumer's `Never` present: the
+    /// consumer's own word that it will never take the crossing.
+    fn declined(&self) -> bool {
+        self.readings.values().any(|reading| {
+            reading.probed == Probed::Decline && matches!(reading.inclusion, Inclusion::Present(_))
+        })
+    }
+
     /// Whether the chain has established that no counterpart can settle
-    /// the transaction: a departed shard's record names it, or a cell a
+    /// the transaction: a departed shard's record names it, a cell a
     /// counterpart would have written was read absent inside its
-    /// window. Either licenses the abandonment or the reclaim, and puts
-    /// every question the entry asks to rest.
+    /// window, or a consumer's `Never` was read present. Any of the
+    /// three licenses the abandonment or the reclaim, and puts every
+    /// question the entry asks to rest.
     fn covered(&self) -> bool {
-        self.departed_by.is_some() || self.absences().next().is_some()
+        self.departed_by.is_some() || self.absences().next().is_some() || self.declined()
     }
 
     /// What the evidence covering the entry established of the
     /// transaction, where it established a verdict at all: a departure
     /// or a core's committed cell absent says the core never took it,
-    /// which aborts the transaction.
+    /// and a consumer's `Never` says it refused it, which aborts the
+    /// transaction either way.
     ///
-    /// Every way of being covered is one of those two, so this is
+    /// Every way of being covered is one of those three, so this is
     /// [`Self::covered`] with the verdict said out loud rather than a
-    /// second reading of the same rows: an absence that answers nothing
+    /// second reading of the same rows: a reading that answers nothing
     /// never reaches `readings` at all.
     fn abandoned_verdict(&self) -> Option<TransactionDecision> {
         self.covered().then_some(TransactionDecision::Aborted)
@@ -162,6 +193,11 @@ impl Owed {
     fn abandon_window(&self) -> Range<WeightedTimestamp> {
         let opens = self.opens();
         opens..opens.plus(MAX_VALIDITY_RANGE)
+    }
+
+    /// Whether an executing tick of this shard's took the transaction.
+    const fn executed(&self) -> bool {
+        matches!(self.certified, Certified::ByExecution)
     }
 }
 
@@ -490,6 +526,12 @@ impl Kept {
         self.classified.escrowed_claims(local)
     }
 
+    /// The decline cells core consumers write for the escrowed crossings
+    /// `local` issued: the `Never` beside each of [`Self::claims`].
+    fn declines(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        self.classified.escrowed_declines(local)
+    }
+
     /// Every claim cell a consumer elsewhere writes for what `local`
     /// issued, whichever side consumes it.
     fn every_claim(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
@@ -719,7 +761,7 @@ impl Ledger {
                     classified.local_price(tx, self.local, prices),
                     prices,
                 ),
-                certified: false,
+                certified: Certified::No,
                 part: Part::of(self.local, tx, classified),
                 departed_by: None,
                 cued: None,
@@ -864,11 +906,11 @@ impl Ledger {
 
     /// Every question this ledger has open, under `trie`, whatever the
     /// clock: for each entry nothing has answered for, each other core
-    /// shard's committed cell, each delivery's claim on the shard that
-    /// was to deliver it and on whatever shard holds the cell's prefix
-    /// now, and each core consumer's claim on the shard holding the
-    /// consumer's target and on whatever holds the prefix now — each
-    /// less the cells the chain has already read.
+    /// shard's committed cell, each core consumer's claim and decline on
+    /// the shard holding the consumer's target and on whatever holds the
+    /// prefix now, and each delivery's claim on the shard that was to
+    /// deliver it and on whatever shard holds the cell's prefix now —
+    /// each less the cells the chain has already read.
     ///
     /// Whatever the clock, because a claim the chain committed is read
     /// against these too, and the claim's own anchor says whether the
@@ -909,6 +951,14 @@ impl Ledger {
             // whose certificates its own settlement needs. Its
             // deliveries are what it waits on once it has a verdict, as
             // the remainder its acceptance leaves.
+            //
+            // A sibling that refused keeps its committed cell, so the
+            // cell reads present and answers nothing here: what covers
+            // the waiting core is the sibling's certificate, pushed by
+            // its outbound tracker and servable by transaction inside
+            // its retention. Losing that road costs liveness only — a
+            // presence licenses no credit, so nothing is taken back on
+            // it.
             questions.extend(
                 kept.core()
                     .iter()
@@ -921,18 +971,29 @@ impl Ledger {
             if !owed.part.is_leg() {
                 continue;
             }
-            // One question per claim, whichever kind of consumer writes
-            // it: a claim answers by being present and by nothing else,
-            // so the side it was issued to changes nothing about what is
-            // asked. Asked of the shard the classification homed the
-            // consumer on and of whoever holds its prefix now, which are
-            // the same shard until a cut moves it.
-            for (consumer, claim) in kept.every_claim(local) {
-                questions.extend(
-                    BTreeSet::from([consumer, trie.shard_for_prefix(claim.owner)])
-                        .into_iter()
-                        .filter_map(|shard| question(shard, claim, Probed::Claim)),
-                );
+            // One question per answer cell, whichever kind of consumer
+            // writes it: a claim or a decline answers by being present
+            // and by nothing else, so the side it was issued to changes
+            // nothing about what is asked. A core consumer is asked for
+            // both of its answers — it took the crossing, or it never
+            // will — and a delivery for its claim alone, since nothing
+            // takes an owed crossing back. Asked of the shard the
+            // classification homed the consumer on and of whoever holds
+            // its prefix now, which are the same shard until a cut moves
+            // it.
+            let asked = |consumer: ShardId, key: SubstateKey, probed: Probed| {
+                BTreeSet::from([consumer, trie.shard_for_prefix(key.owner)])
+                    .into_iter()
+                    .filter_map(move |shard| question(shard, key, probed))
+            };
+            for (consumer, claim) in kept.claims(local) {
+                questions.extend(asked(consumer, claim, Probed::Claim));
+            }
+            for (consumer, decline) in kept.declines(local) {
+                questions.extend(asked(consumer, decline, Probed::Decline));
+            }
+            for (consumer, claim) in kept.deliveries(local) {
+                questions.extend(asked(consumer, claim, Probed::Claim));
             }
         }
         questions
@@ -1105,10 +1166,12 @@ impl Ledger {
 
     /// Record that a tick of this shard's has taken `tx_hash` as a member,
     /// and so will speak for it in a certificate a counterpart can settle
-    /// against.
-    pub(crate) fn certify(&mut self, tx_hash: TxHash) {
+    /// against. The rank only ever rises: a tick lost after an execution
+    /// took the transaction leaves its certificate out there, and an
+    /// abandonment composed after one never lowers what it answers.
+    pub(crate) fn certify(&mut self, tx_hash: TxHash, how: Certified) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.certified = true;
+            owed.certified = owed.certified.max(how);
         }
     }
 
@@ -1116,9 +1179,46 @@ impl Ledger {
     /// question that decides whether a verdict on it is this shard's alone
     /// to reach. False for a transaction this ledger does not hold, which
     /// is the same answer it gives for one no tick ever took.
+    #[cfg(test)]
+    fn is_certified(&self, tx_hash: TxHash) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.certified != Certified::No)
+    }
+
+    /// Whether an executing tick of this shard's took `tx_hash`, so a
+    /// certificate of ours a counterpart may have settled against is
+    /// out. False for a transaction this ledger does not hold.
     #[must_use]
-    pub(crate) fn is_certified(&self, tx_hash: TxHash) -> bool {
-        self.owed.get(&tx_hash).is_some_and(|owed| owed.certified)
+    pub(crate) fn executed(&self, tx_hash: TxHash) -> bool {
+        self.owed.get(&tx_hash).is_some_and(Owed::executed)
+    }
+
+    /// The classification an abandonment of `tx_hash` answers from,
+    /// where it answers at all: a held core entry no execution of ours
+    /// took and no record covers.
+    ///
+    /// Every term is committed content or a fold of it. The part and
+    /// the classification are the committing block's, the rank is set
+    /// by a composition every replica makes at the same commit, and the
+    /// record is committed. The last term is what keeps a replica that
+    /// held the block and one that reconstructed the entry from a
+    /// record composing the same receipt: an entry a record covers is
+    /// charge-only on both, and its producer reclaims off the record.
+    ///
+    /// Such an entry never reached an executing tick, so its member
+    /// never ran and wrote no answer, and nothing else writes its claim
+    /// or decline key: the abandonment writes `Never` to a key that
+    /// holds nothing, and a second abandonment writes the same bytes.
+    #[must_use]
+    pub(crate) fn abandonment_answers(&self, tx_hash: TxHash) -> Option<&Classified> {
+        let owed = self.owed.get(&tx_hash)?;
+        match &owed.part {
+            Part::Core(kept) if !owed.executed() && owed.departed_by.is_none() => {
+                Some(&kept.classified)
+            }
+            _ => None,
+        }
     }
 
     /// Take what a committed block says departed shards left unsettled.
@@ -1137,9 +1237,10 @@ impl Ledger {
     /// abandonable set than its peers at the same frontier, and could not
     /// sign the tick they compose.
     ///
-    /// A reconstructed entry is `certified`, because a record names
-    /// nothing else, and runs whole: it holds no body to reclaim with,
-    /// and what a record licenses on a name it never held is the abort.
+    /// A reconstructed entry is certified by execution, because a record
+    /// names nothing else, and runs whole: it holds no body to reclaim
+    /// with, and what a record licenses on a name it never held is the
+    /// abort.
     ///
     /// Returns how many it reconstructed, which is how far short this
     /// replica's replay window fell — or how long after the block it was
@@ -1160,7 +1261,7 @@ impl Ledger {
                     entry.tx_hash,
                     Owed {
                         figures: entry.clone(),
-                        certified: true,
+                        certified: Certified::ByExecution,
                         part: Part::whole(),
                         departed_by: Some(record.shard()),
                         cued: None,
@@ -1195,7 +1296,7 @@ impl Ledger {
         self.owed
             .iter()
             .filter(|(_, owed)| {
-                owed.certified
+                owed.certified != Certified::No
                     && !owed.part.is_remainder()
                     && !owed.covered()
                     && self.party_to_entry(owed, shard, cut)
@@ -1440,6 +1541,15 @@ impl Ledger {
     /// stays accountable, and offering it again here is exactly what that
     /// must not cost.
     ///
+    /// It binds only an entry an executing tick took. One no execution
+    /// of ours ever ran has no executing tick to discard and no
+    /// certificate a counterpart could have settled against, so aborting
+    /// it at any age spends nothing, and it is offered until an
+    /// abandonment's committed finalization releases it: never composed,
+    /// or composed and discarded, its abort is the one exit that could
+    /// otherwise fall silent. A chain that halts past the window and
+    /// recovers composes it on its first commit.
+    ///
     /// Read off committed content alone — the ledger is a fold over
     /// committed blocks and `now` is the committed weighted timestamp —
     /// so every replica at the same frontier names the same set, which is
@@ -1457,7 +1567,7 @@ impl Ledger {
             .filter(|(_, owed)| !owed.part.is_leg() && !owed.part.is_delivery())
             .filter(|(_, owed)| {
                 let window = owed.abandon_window();
-                now >= window.start && (owed.covered() || now < window.end)
+                now >= window.start && (owed.covered() || !owed.executed() || now < window.end)
             })
             .map(|(_, owed)| owed.figures.clone())
             .collect()
@@ -1528,6 +1638,13 @@ impl Ledger {
             if owed.part.is_delivery() {
                 return owed.figures.committed.anchor.plus(BUNDLE_WAIT) > now;
             }
+            // A core entry no execution of ours took leaves only by an
+            // abandonment's committed finalization: no clock bounds an
+            // abort that spends nothing, and dropping the entry would be
+            // the silent exit its producer could never read.
+            if !owed.executed() && matches!(owed.part, Part::Core(_)) {
+                return true;
+            }
             // A leg entry goes at its horizon: past it neither the
             // reclaim nor the retirement can be composed *here*,
             // whatever evidence lands, because this is the road that
@@ -1558,7 +1675,7 @@ impl Ledger {
             // something: a transaction that never left this shard has
             // nobody to fall silent, and its own deadline decides it
             // as it decides any other.
-            if owed.certified && self.remote_routes(owed).next().is_some() {
+            if owed.certified != Certified::No && self.remote_routes(owed).next().is_some() {
                 if answerable {
                     return true;
                 }
@@ -1647,6 +1764,18 @@ mod tests {
         let classified = Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([PARTNER]));
         classified
+    }
+
+    /// The decline cell the core writes beside [`core_claim`] where it
+    /// refuses what `classified` says `LOCAL` issued.
+    fn core_decline(classified: &Classified) -> (ShardId, SubstateKey) {
+        let declines = classified.escrowed_declines(LOCAL);
+        assert_eq!(
+            declines.len(),
+            1,
+            "the fixture issues one crossing to the core"
+        );
+        declines[0]
     }
 
     /// The claim cell the core writes for what `classified` says `LOCAL`
@@ -1945,7 +2074,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         ledger.prune(deadline.plus(MAX_VALIDITY_RANGE));
@@ -1968,7 +2097,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(15, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert_eq!(
@@ -2003,7 +2132,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(9, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
@@ -2032,7 +2161,7 @@ mod tests {
             "the fixture reaches a prefix both departures own",
         );
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let first = ms(200_000);
         let second = ms(800_000);
@@ -2064,7 +2193,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(16, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
@@ -2091,7 +2220,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(18, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
@@ -2186,7 +2315,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(17, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let past = deadline.plus(MAX_VALIDITY_RANGE);
@@ -2216,7 +2345,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(18, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(500_000),
@@ -2240,7 +2369,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx_over(HERE, HERE.wrapping_add(1), 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert!(
@@ -2263,7 +2392,7 @@ mod tests {
         // and `0b11…`.
         let tx = tx_over(HERE, 0xC0, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let cut = ms(500_000);
         ledger.record_terminal(ShardId::leaf(2, 2), cut, Some(expiry(cut)));
@@ -2279,7 +2408,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx_over(HERE, HERE.wrapping_add(1), 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(!ledger.reaches_beyond(tx.hash()), "nothing of it is remote");
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
@@ -2298,8 +2427,126 @@ mod tests {
 
         commit(&mut ledger, &tx);
         assert!(!ledger.is_certified(tx.hash()), "committed says nothing");
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(ledger.is_certified(tx.hash()));
+    }
+
+    /// The rank only rises: an abandonment composed after an execution
+    /// took the transaction never lowers what this shard has said, and
+    /// an execution outranks an abandonment whichever came first. Either
+    /// certifies.
+    #[test]
+    fn an_execution_certificate_outranks_an_abandonment() {
+        let mut ledger = Ledger::new(LOCAL);
+        let tx = tx(13, 60_000);
+        commit(&mut ledger, &tx);
+        assert!(!ledger.is_certified(tx.hash()));
+        assert!(!ledger.executed(tx.hash()));
+
+        ledger.certify(tx.hash(), Certified::ByAbandonment);
+        assert!(ledger.is_certified(tx.hash()));
+        assert!(!ledger.executed(tx.hash()));
+
+        ledger.certify(tx.hash(), Certified::ByExecution);
+        assert!(ledger.executed(tx.hash()));
+
+        ledger.certify(tx.hash(), Certified::ByAbandonment);
+        assert!(
+            ledger.executed(tx.hash()),
+            "an abandonment after an execution leaves the certificate out there",
+        );
+        assert!(ledger.is_certified(tx.hash()));
+    }
+
+    /// Past its abandon window a core entry no execution of ours took is
+    /// still offered and still held, an abandonment already composed
+    /// included: it spends nothing to abort at any age, and dropping it
+    /// would be the silent exit its producer could never read. One an
+    /// executing tick took is bounded by the window as before.
+    #[test]
+    fn an_uncertified_entry_outlives_its_abandon_window() {
+        let tx = tx(14, 60_000);
+        for how in [Certified::No, Certified::ByAbandonment] {
+            let mut ledger = Ledger::new(LOCAL);
+            commit_as(&mut ledger, &tx, &two_shard_core());
+            ledger.certify(tx.hash(), how);
+            let past = ledger.owed[&tx.hash()]
+                .abandon_window()
+                .end
+                .plus(Duration::from_secs(1));
+            assert!(
+                ledger
+                    .past_deadline(past)
+                    .iter()
+                    .any(|entry| entry.tx_hash == tx.hash()),
+                "{how:?}: still offered past its window",
+            );
+            ledger.prune(past);
+            assert_eq!(ledger.len(), 1, "{how:?}: and still held");
+        }
+
+        let mut ledger = Ledger::new(LOCAL);
+        commit_as(&mut ledger, &tx, &two_shard_core());
+        ledger.certify(tx.hash(), Certified::ByExecution);
+        let past = ledger.owed[&tx.hash()]
+            .abandon_window()
+            .end
+            .plus(Duration::from_secs(1));
+        assert!(
+            ledger.past_deadline(past).is_empty(),
+            "an executed entry is offered inside its window alone",
+        );
+    }
+
+    /// An abandonment answers exactly where no execution of ours spoke
+    /// and no record does, and answers the same on a replica that held
+    /// the block and one that met the transaction in a record.
+    ///
+    /// Beside
+    /// [`a_reconstructed_entry_names_the_same_parties_as_a_registered_one`]:
+    /// the receipt an abandonment composes reaches the receipt root, so
+    /// the two replicas have to compose the same one. A reconstructed
+    /// entry runs whole and holds no classification, so it answers with
+    /// the charge alone; a record covering the transaction flips the
+    /// seated replica to the same answer.
+    #[test]
+    fn an_abandonment_writes_never_identically_on_a_seated_replica() {
+        let tx = tx(8, 60_000);
+        let record = AbandonmentRecord::new(PARTNER, ms(70_000), [names(&tx)]);
+
+        let mut seated = Ledger::new(LOCAL);
+        commit_as(&mut seated, &tx, &two_shard_core());
+        assert_eq!(
+            seated.abandonment_answers(tx.hash()),
+            Some(&two_shard_core()),
+            "a held core entry no execution took answers off its classification",
+        );
+        seated.certify(tx.hash(), Certified::ByAbandonment);
+        assert!(
+            seated.abandonment_answers(tx.hash()).is_some(),
+            "an abandonment composed and lost does not silence the next",
+        );
+
+        let mut entrant = Ledger::new(LOCAL);
+        entrant.record_abandonment_records(std::slice::from_ref(&record));
+        assert!(
+            entrant.abandonment_answers(tx.hash()).is_none(),
+            "a reconstructed entry answers with the charge alone",
+        );
+
+        seated.record_abandonment_records(&[record]);
+        assert!(
+            seated.abandonment_answers(tx.hash()).is_none(),
+            "a record covering the transaction gives the seated replica the entrant's answer",
+        );
+
+        let mut executed = Ledger::new(LOCAL);
+        commit_as(&mut executed, &tx, &two_shard_core());
+        executed.certify(tx.hash(), Certified::ByExecution);
+        assert!(
+            executed.abandonment_answers(tx.hash()).is_none(),
+            "an executed entry never answers: its certificate may be out",
+        );
     }
 
     /// A counterpart is whoever owns the keyspace the transaction reaches
@@ -2341,7 +2588,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(14, 600_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         // Before the block that committed the transaction here.
         let stale = ms(400_000);
         assert!(
@@ -2368,7 +2615,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         let cut = ms(100_000);
         ledger.record_terminal(PARTNER, cut, None);
         ledger.record_abandonment_records(&[AbandonmentRecord::new(PARTNER, cut, [names(&tx)])]);
@@ -2459,7 +2706,7 @@ mod tests {
         let mut delivered = Ledger::new(LOCAL);
         commit(&mut delivered, &tx);
         delivered.seed(tx.hash(), delivery_part(&tx));
-        delivered.certify(tx.hash());
+        delivered.certify(tx.hash(), Certified::ByExecution);
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
         delivered.release_resolved(&[Arc::new(Verifiable::from(own))]);
         assert_eq!(
@@ -2479,12 +2726,13 @@ mod tests {
         let whole = tx(5, 60_000);
         commit_as(&mut ledger, &leg, &classified());
         commit(&mut ledger, &whole);
-        ledger.certify(leg.hash());
-        ledger.certify(whole.hash());
+        ledger.certify(leg.hash(), Certified::ByExecution);
+        ledger.certify(whole.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let questions = ledger.questions(&ShardTrie::uniform(1));
         let (consumer, claim) = core_claim(&classified());
+        let (_, decline) = core_decline(&classified());
         let question = |key, probed| Question {
             tx_hash: leg.hash(),
             shard: PARTNER,
@@ -2498,8 +2746,10 @@ mod tests {
             vec![
                 question(core_cell(PARTNER, &leg), Probed::Core),
                 question(claim, Probed::Claim),
+                question(decline, Probed::Decline),
             ],
-            "the leg asks the core for its committed cell and its claim, and the whole entry asks nothing"
+            "the leg asks the core for its committed cell and both its answers, and the whole \
+             entry asks nothing"
         );
         assert_eq!(consumer, PARTNER);
         assert!(
@@ -2537,9 +2787,9 @@ mod tests {
     /// absent, and a claim read absent covers nothing.
     ///
     /// The two readings are not interchangeable and only one of them is
-    /// evidence: a committed cell is written at inclusion and retracted
-    /// by a refusal, so its absence says the core never took the
-    /// transaction; a claim is written by the execution that takes the
+    /// evidence: a committed cell is written at inclusion and by nothing
+    /// else, so its absence says the core never took the transaction; a
+    /// claim is written by the execution that takes the
     /// crossing, so its absence says only that nobody has taken it yet.
     /// [`Probed::read`] admits the first and refuses the second, and
     /// [`Ledger::record_reading`] is held to the same rule so an entry
@@ -2549,7 +2799,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let leg = tx(6, 60_000);
         commit_as(&mut ledger, &leg, &delivering());
-        ledger.certify(leg.hash());
+        ledger.certify(leg.hash(), Certified::ByExecution);
 
         let (delivered_by, claim) = delivered_claim(&delivering());
         let question = |shard, key, probed| Question {
@@ -2626,7 +2876,7 @@ mod tests {
             let tx = tx(8, 60_000);
             let mut ledger = Ledger::new(LOCAL);
             commit_as(&mut ledger, &tx, &issuing());
-            ledger.certify(tx.hash());
+            ledger.certify(tx.hash(), Certified::ByExecution);
             let finalization = make_finalization(BlockHeight::new(1), tx.hash(), decision);
             ledger.release_resolved(&[Arc::new(Verifiable::from(finalization))]);
             (ledger, tx)
@@ -2702,7 +2952,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(4, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let own = make_leg_finalization(BlockHeight::new(1), tx.hash());
         ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
@@ -2738,7 +2988,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(7, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(1_000),
@@ -2860,7 +3110,7 @@ mod tests {
         // The replica that was seated when the block committed.
         let mut seated = Ledger::new(LOCAL);
         commit(&mut seated, &tx);
-        seated.certify(tx.hash());
+        seated.certify(tx.hash(), Certified::ByExecution);
         seated.record_abandonment_records(std::slice::from_ref(&record));
 
         // The replica rotated in afterwards, which meets the transaction
@@ -2907,7 +3157,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(
             ledger.consumer_holds(tx.hash(), SUCCESSOR),
             "the shard holding the claim's prefix consumes what the leg issued",
@@ -2935,12 +3185,61 @@ mod tests {
     /// certificate — once every consumer has claimed; the retirement's
     /// own finalization releases the entry, and a claimed entry is
     /// neither reclaimable nor abandonable meanwhile.
+    /// A consumer's `Never` read present covers the entry: the reclaim
+    /// is licensed, the retirement is not, the entry asks nothing more,
+    /// and an absence of the `Never` answers nothing.
+    #[test]
+    fn a_never_read_present_licenses_the_reclaim() {
+        let mut ledger = Ledger::new(LOCAL);
+        let tx = tx(8, 60_000);
+        commit_as(&mut ledger, &tx, &classified());
+        ledger.certify(tx.hash(), Certified::ByExecution);
+        assert!(
+            ledger.reclaimable().is_empty(),
+            "nothing reclaims on a clock"
+        );
+
+        let (consumer, decline) = core_decline(&classified());
+        assert!(
+            !ledger.record_reading(
+                tx.hash(),
+                consumer,
+                decline,
+                Probed::Decline,
+                Inclusion::Absent
+            ),
+            "the Never absent says only that the consumer has not refused",
+        );
+        assert!(ledger.record_reading(
+            tx.hash(),
+            consumer,
+            decline,
+            Probed::Decline,
+            Inclusion::Present([7; 32]),
+        ));
+        let reclaimable = ledger.reclaimable();
+        assert_eq!(
+            reclaimable.len(),
+            1,
+            "the consumer's own word licenses the reclaim"
+        );
+        assert_eq!(reclaimable[0].tx_hash, tx.hash());
+        assert!(
+            ledger.retirable().is_empty(),
+            "a refused crossing retires nothing"
+        );
+        assert!(
+            ledger.questions(&ShardTrie::uniform(1)).is_empty(),
+            "and the entry asks nothing more"
+        );
+    }
+
     #[test]
     fn a_committed_claim_licenses_the_retirement_and_its_finalization_releases_the_entry() {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
 
         let (_, claim) = core_claim(&classified());
@@ -2987,7 +3286,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(5, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Reject);
         ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
@@ -3016,7 +3315,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(6, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(
             ledger.reclaimable().is_empty(),
             "nothing is reclaimed on a clock"
@@ -3107,7 +3406,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &two_shard_core());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let past = deadline.plus(MAX_VALIDITY_RANGE);
         assert!(!ledger.is_covered(tx.hash()));
@@ -3146,7 +3445,7 @@ mod tests {
             let mut ledger = Ledger::new(LOCAL);
             let tx = tx(5, 60_000);
             commit_as(&mut ledger, &tx, &classified());
-            ledger.certify(tx.hash());
+            ledger.certify(tx.hash(), Certified::ByExecution);
             if covered {
                 ledger.record_abandonment_records(&[AbandonmentRecord::new(
                     PARTNER,

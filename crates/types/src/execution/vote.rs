@@ -21,7 +21,8 @@ use crate::{
 /// One vote covers all transactions sharing the same provision dependency
 /// set, with `global_receipt_root` being a padded merkle root over per-tx
 /// leaf hashes ([`tx_outcome_leaf`]: outcome-tagged, extended by the
-/// attested work and any settled fee receipt under their own domain tags).
+/// attested work and any settled refusal receipt under their own domain
+/// tags).
 ///
 /// [`tx_outcome_leaf`]: crate::tx_outcome_leaf
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]

@@ -1123,7 +1123,7 @@ pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
         counterpart_inclusion.is_none(),
         "the counterpart must not engage an insolvent payer's transaction"
     );
-    world.assert_settled(c, charges.burned(c), "an insolvent payer's transaction");
+    world.assert_settled(c, &charges, "an insolvent payer's transaction");
 }
 
 /// A payer whose rule does not admit the signer engages nothing
@@ -1180,7 +1180,7 @@ pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
         "the counterpart must not engage an unbound payer's transaction"
     );
     // Nothing moved, the named account's vault included.
-    world.assert_settled(c, charges.burned(c), "an unbound payer's transaction");
+    world.assert_settled(c, &charges, "an unbound payer's transaction");
 }
 
 /// The same refusal when the payer's shard holds nothing else of the
@@ -1235,11 +1235,7 @@ pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
         "the manifest shard must not engage without the payer's reservation"
     );
     // Nothing moved, the remote victim's vault included.
-    world.assert_settled(
-        c,
-        charges.burned(c),
-        "an unbound remote payer's transaction",
-    );
+    world.assert_settled(c, &charges, "an unbound remote payer's transaction");
 }
 
 /// The whole securify transition, through consensus.
@@ -1548,7 +1544,7 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
         "the refusal must charge exactly the declared price: \
          before = {before}, after = {after}, price = {price}",
     );
-    world.assert_settled(c, charges.burned(c), "a leg refused at its deadline");
+    world.assert_settled(c, &charges, "a leg refused at its deadline");
     // Every member of the payer's shard composes the tick that admits the
     // reclaim, and the counter is read cluster-wide, so the refusal shows
     // as one admission per member: none would be a refusal that never
@@ -1797,7 +1793,7 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
         "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    world.assert_settled(c, charges.burned(c), "a delivery cut off past its window");
+    world.assert_settled(c, &charges, "a delivery cut off past its window");
 }
 
 /// A recipient whose network heals past the old delivery window is paid.

@@ -13,8 +13,7 @@ use hyperscale_hbor::{Bytes, Capped, from_slice};
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    stub_crossing_answer_cell, stub_crossing_obligation_cell, stub_record_cell,
-    stub_sweepable_cell, test_transaction,
+    stub_crossing_answer_cell, stub_record_cell, stub_sweepable_cell, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
@@ -1671,25 +1670,6 @@ pub fn test_escrow_records_are_read_off_the_state<S>(
             ..CrossingLeaves::default()
         },
         "a claim is the other family the scan answers with",
-    );
-
-    // And the third: a crossing this shard was handed and has not
-    // answered. Read back beside the other two rather than among them,
-    // because what a seat does with it is compose the refusal it may
-    // still owe.
-    let obligation = state_key(4, 4);
-    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
-        obligation,
-        Some(stub_crossing_obligation_cell(13)),
-    )])));
-    assert_eq!(
-        owed(shard),
-        CrossingLeaves {
-            claims: vec![(claim, stub_crossing_answer_cell(11))],
-            obligations: vec![(obligation, stub_crossing_obligation_cell(13))],
-            ..CrossingLeaves::default()
-        },
-        "an obligation is the third family, and the scan tells it from an answer",
     );
 }
 
