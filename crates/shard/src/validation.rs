@@ -1753,19 +1753,6 @@ pub mod tests {
         assert!(err.contains("already in QC chain ancestor"));
     }
 
-    #[test]
-    fn validate_no_duplicate_transactions_rejects_retention_dup() {
-        let txs = sorted_txs(&[10, 20]);
-        let dup_tx = Arc::clone(&txs[0]);
-        let block = block_with_transactions(BlockHeight::new(6), txs);
-        let mut against = plain();
-        against
-            .dedup
-            .register_committed_txs(&[dup_tx], WeightedTimestamp::ZERO);
-        let err = admit(&against, &block).unwrap_err();
-        assert!(err.contains("already committed"));
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     // validate_no_duplicate_certificates
     // ═══════════════════════════════════════════════════════════════════════

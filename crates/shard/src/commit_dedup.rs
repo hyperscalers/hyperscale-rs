@@ -1,15 +1,15 @@
 //! Deduplication index for committed artifacts referenced by block contents.
 //!
-//! The shard consensus layer enforces a single contract: every committed artifact (tx,
-//! cert, provision) appears in the chain exactly once. This index is the
-//! mechanism — proposers consult it to filter candidates, validators
-//! consult it to reject duplicate inclusions.
+//! The shard consensus layer enforces a single contract: every committed
+//! artifact appears in the chain exactly once. For a finalization, a
+//! verdict and a provision batch this index is the mechanism — proposers
+//! consult it to filter candidates, validators consult it to reject
+//! duplicate inclusions. A transaction is the exception: its committed
+//! marker sits in the chain's own state, and the verifier reads it there.
 //!
 //! Per-artifact deadline maps bound the index by artifact-specific
 //! BFT-attested horizons:
 //!
-//! - **txs**: one [`RETENTION_HORIZON`] past the block that carried each
-//!   transaction, which covers its whole validity range.
 //! - **certs**: `vote_anchor_ts + RETENTION_HORIZON` from the tick's local
 //!   EC.
 //! - **provisions**: `local_committed_ts + RETENTION_HORIZON`, a
@@ -32,15 +32,11 @@ use std::sync::Arc;
 use hyperscale_storage::{CommittedProvisions, DedupWindow};
 use hyperscale_types::{
     DEDUP_WINDOW, Finalization, FinalizationHash, ProvisionHash, Provisions, RETENTION_HORIZON,
-    ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    ShardId, TxHash, Verifiable, WeightedTimestamp,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
 pub struct CommitDedupIndex {
-    /// `tx_hash → deadline`, where each deadline is one
-    /// [`DEDUP_WINDOW`] past the block that carried it. Pruned when that
-    /// is at or below `current_committed_ts`.
-    tx_retention: HashMap<TxHash, WeightedTimestamp>,
     /// `tx_hash → vote_anchor_ts + RETENTION_HORIZON` of the finalization
     /// that resolved it. Every transaction a committed finalization
     /// reached a verdict for, under whichever verdict — which is what
@@ -89,7 +85,6 @@ impl CommitDedupIndex {
     /// because an unseeded index refuses no duplicate at all.
     pub(crate) fn new() -> Self {
         Self {
-            tx_retention: HashMap::new(),
             resolved_tx_retention: HashMap::new(),
             finalization_retention: HashMap::new(),
             provision_retention: Arc::new(CommittedProvisions::new()),
@@ -101,7 +96,7 @@ impl CommitDedupIndex {
 
     /// An index rebuilt from a window folded off committed blocks.
     ///
-    /// The transaction and resolution tiers reproduce what the live path
+    /// The resolution and finalization tiers reproduce what the live path
     /// registered, because neither deadline depends on when the fold ran.
     /// `provision_tx_retention` stays empty: it is fed from bundle
     /// *content*, which sealing drops, so a rebuilt index votes
@@ -110,7 +105,6 @@ impl CommitDedupIndex {
     #[must_use]
     pub(crate) fn seeded(window: &DedupWindow, now: WeightedTimestamp) -> Self {
         let mut index = Self::new();
-        index.tx_retention.extend(window.committed.iter().copied());
         index
             .resolved_tx_retention
             .extend(window.resolved.iter().copied());
@@ -169,28 +163,6 @@ impl CommitDedupIndex {
     /// a walk would have read.
     pub(crate) fn cover(&mut self, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
-    }
-
-    /// Record a block's transactions in the retention lookup, each held
-    /// one [`RETENTION_HORIZON`] past `anchor` — the block's own.
-    ///
-    /// Keyed off the block rather than off the body, and that is the
-    /// whole of what this tier refuses: a second inclusion of what this
-    /// chain already carried. A transaction admitted *inside* its window
-    /// has a deadline of its own that sits at or below this instant, so
-    /// for those the figure changes nothing.
-    ///
-    /// The figure is [`DEDUP_WINDOW`], which is this index's own depth,
-    /// so nothing is held that the walk rebuilding it would not reach.
-    pub(crate) fn register_committed_txs(
-        &mut self,
-        transactions: &[Arc<Verifiable<Transaction>>],
-        anchor: WeightedTimestamp,
-    ) {
-        let deadline = anchor.plus(DEDUP_WINDOW);
-        for tx in transactions {
-            self.tx_retention.entry(tx.hash()).or_insert(deadline);
-        }
     }
 
     /// Record every transaction a block's finalizations resolved. Each
@@ -270,7 +242,6 @@ impl CommitDedupIndex {
     /// independent rules (tx validity check; finalization-deadline) reject any
     /// re-inclusion, so the entry is no longer correctness-bearing.
     pub(crate) fn prune(&mut self, now: WeightedTimestamp) {
-        self.tx_retention.retain(|_, end| *end > now);
         self.resolved_tx_retention
             .retain(|_, deadline| *deadline > now);
         self.finalization_retention
@@ -278,10 +249,6 @@ impl CommitDedupIndex {
         self.provision_retention.prune(now);
         self.provision_tx_retention
             .retain(|_, deadline| *deadline > now);
-    }
-
-    pub(crate) fn contains_tx(&self, tx_hash: &TxHash) -> bool {
-        self.tx_retention.contains_key(tx_hash)
     }
 
     /// Whether a committed finalization already reached a verdict for
@@ -306,10 +273,6 @@ impl CommitDedupIndex {
         self.provision_tx_retention.contains_key(&(source, tx_hash))
     }
 
-    pub(crate) fn tx_retention_len(&self) -> usize {
-        self.tx_retention.len()
-    }
-
     pub(crate) fn resolved_tx_retention_len(&self) -> usize {
         self.resolved_tx_retention.len()
     }
@@ -322,13 +285,10 @@ impl CommitDedupIndex {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::{
-        StubVmStatics, install_stub_protocol_statics, leg_shape, make_finalization,
-        stub_transaction, test_prefix, test_principal,
-    };
+    use hyperscale_types::test_utils::make_finalization;
     use hyperscale_types::{
-        BlockHeight, Deadline, Hash, LegRole, MerkleInclusionProof, ProvisionEntry, Provisions,
-        ShardId, TimestampRange, TransactionDecision,
+        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
+        TransactionDecision,
     };
 
     use super::*;
@@ -349,10 +309,6 @@ mod tests {
         let now = WeightedTimestamp::from_millis(10_000);
 
         let window = DedupWindow {
-            committed: vec![
-                (live, WeightedTimestamp::from_millis(10_001)),
-                (expired, WeightedTimestamp::from_millis(9_999)),
-            ],
             resolved: vec![
                 (live, WeightedTimestamp::from_millis(10_001)),
                 (expired, WeightedTimestamp::from_millis(9_999)),
@@ -366,45 +322,10 @@ mod tests {
 
         let index = CommitDedupIndex::seeded(&window, now);
 
-        assert!(index.contains_tx(&live));
-        assert!(!index.contains_tx(&expired));
         assert!(index.contains_resolved_tx(&live));
         assert!(!index.contains_resolved_tx(&expired));
         assert!(index.contains_finalization(&receipt_live));
         assert!(!index.contains_finalization(&receipt_expired));
-    }
-
-    /// Build a test tx whose `validity_range.end_timestamp_exclusive == end_ms`.
-    fn tx_with_end(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
-        install_stub_protocol_statics();
-        let range = TimestampRange::new(
-            WeightedTimestamp::ZERO,
-            WeightedTimestamp::from_millis(end_ms),
-        );
-        Arc::new(Verifiable::from(stub_transaction(
-            test_principal(seed),
-            &[test_prefix(seed)],
-            1_000,
-            range,
-        )))
-    }
-
-    /// The same, with a shape whose outbound leg makes a delivery of it
-    /// admissible past the validity end.
-    fn delivering_tx_with_end(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
-        install_stub_protocol_statics();
-        let range = TimestampRange::new(
-            WeightedTimestamp::ZERO,
-            WeightedTimestamp::from_millis(end_ms),
-        );
-        let tx = stub_transaction(test_principal(seed), &[test_prefix(seed)], 1_000, range);
-        Arc::new(Verifiable::from(tx.with_legs(
-            &StubVmStatics,
-            vec![
-                leg_shape(test_prefix(seed), LegRole::Core, &[]),
-                leg_shape(test_prefix(seed ^ 0xFF), LegRole::Outbound, &[(0, 0)]),
-            ],
-        )))
     }
 
     fn make_fw(height: u64) -> Arc<Verifiable<Finalization>> {
@@ -430,84 +351,6 @@ mod tests {
             MerkleInclusionProof::dummy(),
             Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
         ))
-    }
-
-    // ─── Txs ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn register_txs_populates_retention() {
-        let mut idx = CommitDedupIndex::new();
-        let tx = tx_with_end(1, 60_000);
-        let tx_hash = tx.hash();
-        idx.register_committed_txs(std::slice::from_ref(&tx), WeightedTimestamp::ZERO);
-        assert!(idx.contains_tx(&tx_hash));
-        assert_eq!(idx.tx_retention_len(), 1);
-    }
-
-    /// A transaction committed past its own window is refusable all the
-    /// same, and that is the case this tier exists for.
-    ///
-    /// A delivery is admissible past its validity end on a licence
-    /// rather than a clock, so its body has no deadline left to be held
-    /// to — and the cell that refuses a second run of it, the claim its
-    /// execution writes, is a step behind: it reaches state only once
-    /// that execution's finalization commits. This tier covers the step.
-    /// An index keyed on the body would forget the hash the instant the
-    /// block carried it and let a proposer commit the same delivery
-    /// twice into that gap.
-    ///
-    /// The figure is the block's, so a transaction admitted inside its
-    /// own window reads the same rule and is unaffected: its deadline
-    /// sits at or below this instant either way.
-    #[test]
-    fn a_tx_committed_past_its_own_window_is_still_refusable() {
-        let mut idx = CommitDedupIndex::new();
-        // Committed a long way past the end it signed, which is what a
-        // delivery licensed by its record looks like.
-        let late = delivering_tx_with_end(1, 100);
-        let late_hash = late.hash();
-        let anchor = WeightedTimestamp::from_millis(500_000);
-        idx.register_committed_txs(std::slice::from_ref(&late), anchor);
-
-        idx.prune(Deadline::of(WeightedTimestamp::from_millis(100)).at());
-        assert!(
-            idx.contains_tx(&late_hash),
-            "its own deadline went by before the block that carried it",
-        );
-
-        let held_until = anchor.plus(DEDUP_WINDOW);
-        idx.prune(held_until.minus(std::time::Duration::from_millis(1)));
-        assert!(
-            idx.contains_tx(&late_hash),
-            "and it is held one horizon past that block",
-        );
-        idx.prune(held_until);
-        assert!(
-            !idx.contains_tx(&late_hash),
-            "past which the claim its execution wrote is what refuses a second run",
-        );
-    }
-
-    /// The index prunes each entry against the block that carried it,
-    /// so two transactions committed at two anchors go at two instants.
-    #[test]
-    fn prune_drops_txs_past_their_own_blocks_horizon() {
-        let mut idx = CommitDedupIndex::new();
-        let early = delivering_tx_with_end(1, 100);
-        let later = delivering_tx_with_end(2, 900);
-        let early_hash = early.hash();
-        let later_hash = later.hash();
-        let early_anchor = WeightedTimestamp::from_millis(100);
-        let later_anchor = WeightedTimestamp::from_millis(900);
-        idx.register_committed_txs(std::slice::from_ref(&early), early_anchor);
-        idx.register_committed_txs(std::slice::from_ref(&later), later_anchor);
-
-        // Between the two horizons: the earlier block's entry goes and
-        // the later block's stands.
-        idx.prune(early_anchor.plus(DEDUP_WINDOW));
-
-        assert!(!idx.contains_tx(&early_hash));
-        assert!(idx.contains_tx(&later_hash));
     }
 
     // ─── Resolutions ────────────────────────────────────────────────────
@@ -576,7 +419,7 @@ mod tests {
         use hyperscale_types::test_utils::{make_finalization, make_leg_finalization};
         use hyperscale_types::{BlockHeight, TransactionDecision};
 
-        let tx_hash = tx_with_end(7, 60_000).hash();
+        let tx_hash = TxHash::from(Hash::from_bytes(b"leg"));
         let mut index = CommitDedupIndex::new();
         index.register_committed_certs(&[Arc::new(Verifiable::from(make_leg_finalization(
             BlockHeight::new(1),

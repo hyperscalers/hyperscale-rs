@@ -22,14 +22,14 @@ use hyperscale_storage::{
     Substates, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
-    StubVmStatics, install_stub_protocol_statics, leg_shape, make_finalization,
-    make_leg_finalization, stub_transaction, test_prefix, test_principal, test_transaction,
+    install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_transaction,
+    test_prefix, test_principal, test_transaction,
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, DEDUP_WINDOW, FEE_HOLD_WINDOW, FrontierInputs, Hash, LegRole, LocalKey,
-    RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange,
-    Transaction, TransactionDecision, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
+    ChainOrigin, DEDUP_WINDOW, FEE_HOLD_WINDOW, FrontierInputs, Hash, LocalKey, RETENTION_HORIZON,
+    SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction,
+    TransactionDecision, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -622,83 +622,6 @@ fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
     )))
 }
 
-/// The same, with a shape whose outbound leg makes a delivery of it
-/// admissible past its validity end.
-fn delivering_dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
-    install_stub_protocol_statics();
-    let validity = TimestampRange::new(
-        WeightedTimestamp::ZERO,
-        WeightedTimestamp::from_millis(end_ms),
-    );
-    let tx = stub_transaction(test_principal(seed), &[test_prefix(seed)], 1_000, validity);
-    Arc::new(Verifiable::from(tx.with_legs(
-        &StubVmStatics,
-        vec![
-            leg_shape(test_prefix(seed), LegRole::Core, &[]),
-            leg_shape(test_prefix(seed ^ 0xFF), LegRole::Outbound, &[(0, 0)]),
-        ],
-    )))
-}
-
-/// The fold holds every committed transaction one horizon past the
-/// block that carried it, whatever the body says, and keeps only what
-/// the reader's clock has not passed.
-///
-/// One figure, and that is the point: what this tier refuses is a
-/// second inclusion of what the chain already carried, and a delivery
-/// admitted past its own window has no deadline left to be held to. Its
-/// shape says nothing here, so neither does the body — which is what
-/// lets the walk's depth and the entries it keeps be the same figure
-/// rather than two that have to agree.
-#[test]
-fn dedup_window_holds_committed_txs_one_horizon_past_their_block() {
-    let storage = SimShardStorage::default();
-    let delivering = delivering_dedup_tx(1, 90_000);
-    let delivering_hash = delivering.hash();
-    let plain = dedup_tx(2, 90_000);
-    let plain_hash = plain.hash();
-    let expired = dedup_tx(3, 1_000);
-    let expired_hash = expired.hash();
-    let block = block_with_txs(BlockHeight::new(1), 1_000, vec![delivering, plain, expired]);
-    commit_empty(&storage, &block);
-
-    let anchor = WeightedTimestamp::from_millis(1_000);
-    let held_until = anchor.plus(RETENTION_HORIZON);
-    let recover = |resumes_at: WeightedTimestamp| {
-        DedupWindow::from_reader(
-            &storage,
-            BlockHeight::new(1),
-            resumes_at,
-            ChainOrigin {
-                genesis_height: BlockHeight::new(1),
-                anchor_wt: WeightedTimestamp::ZERO,
-            },
-        )
-        .committed
-    };
-
-    // A clock inside the block's own horizon keeps everything it
-    // carried, on the one deadline the block fixes — including the
-    // transaction whose signed window closed long before, because the
-    // chain carried it and that is the whole of what this tier says.
-    assert_eq!(
-        recover(WeightedTimestamp::from_millis(30_000)),
-        vec![
-            (delivering_hash, held_until),
-            (plain_hash, held_until),
-            (expired_hash, held_until),
-        ],
-        "one deadline for everything the block carried, read off the block",
-    );
-
-    // Past it the block contributes nothing, which is the same instant
-    // the walk rebuilding the index stops at.
-    assert!(
-        recover(held_until).is_empty(),
-        "and past its horizon the block is no longer load-bearing",
-    );
-}
-
 /// The fold records the names a finalization *decided*, as the live
 /// index does.
 ///
@@ -785,15 +708,8 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
     let storage = SimShardStorage::default();
     // Three blocks, all inside the window, none of them the chain's
     // claimed origin — so the walk runs out beneath them.
-    let tx = dedup_tx(3, 900_000);
-    let tx_hash = tx.hash();
     for height in 1..=3u64 {
-        let txs = if height == 3 {
-            vec![tx.clone()]
-        } else {
-            vec![]
-        };
-        let block = block_with_txs(BlockHeight::new(height), 400_000 + height, txs);
+        let block = block_with_txs(BlockHeight::new(height), 400_000 + height, vec![]);
         commit_empty(&storage, &block);
     }
 
@@ -804,14 +720,6 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
         ChainOrigin::ROOT,
     );
 
-    assert_eq!(
-        window.committed,
-        vec![(
-            tx_hash,
-            WeightedTimestamp::from_millis(400_003).plus(RETENTION_HORIZON)
-        )],
-        "held one horizon past the block that carried it",
-    );
     assert!(
         !window.reached_origin,
         "a walk that ran out of blocks above its origin has not reached it",
@@ -828,12 +736,9 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
 ///
 /// A hold ends at its validity end plus `RETENTION_HORIZON`, and the
 /// block committing it sits no earlier than one `MAX_VALIDITY_RANGE`
-/// before that end — `FEE_HOLD_WINDOW` past the tip. A committed
-/// transaction is held one `DEDUP_WINDOW` past the block that carried
-/// it, which is `RETENTION_HORIZON` and shallower: what that tier
-/// refuses is a second inclusion of what the chain already carried, and
-/// a block deeper than its own horizon can no longer be one. A walk
-/// floored at the dedup tier's depth would seed a ledger that
+/// before that end — `FEE_HOLD_WINDOW` past the tip. The dedup tiers
+/// reach `DEDUP_WINDOW`, which is `RETENTION_HORIZON` and shallower. A
+/// walk floored at the dedup tiers' depth would seed a ledger that
 /// under-counts what the payer shard still holds engaged.
 #[test]
 fn the_fee_tier_is_folded_below_the_dedup_floor() {
@@ -869,11 +774,10 @@ fn the_fee_tier_is_folded_below_the_dedup_floor() {
         },
     );
 
-    let committed: Vec<TxHash> = window.committed.iter().map(|(h, _)| *h).collect();
     assert_eq!(
-        committed,
-        vec![near_hash],
-        "the dedup tier stops at its own floor",
+        window.covered_from,
+        Some(WeightedTimestamp::from_millis(below_dedup)),
+        "the dedup tiers stop at their own floor",
     );
     let held: Vec<TxHash> = window.fee_holds.iter().map(|hold| hold.tx_hash).collect();
     assert_eq!(

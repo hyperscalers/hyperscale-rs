@@ -20,9 +20,8 @@
 //!
 //! Dedup-index registration is owned by
 //! [`crate::coordinator::ShardCoordinator::record_block_committed`] (in the
-//! `shard` crate) and runs synchronously when the shard coordinator internally commits the
-//! block — earlier than this fanout. So mempool's tombstone-retention pass
-//! in step 2 already sees the up-to-date `tx_retention` map.
+//! `shard` crate) and runs synchronously when the shard coordinator
+//! internally commits the block — earlier than this fanout.
 //!
 //! The order is, with the dependency edge that motivates each step:
 //!
@@ -33,8 +32,6 @@
 //!    any path that may emit child verifications.
 //! 2. `mempool.on_block_committed` — Pending → Committed → Completed
 //!    transitions for `block.transactions` and `block.certificates`.
-//!    Reads the shard coordinator's `dedup_index.tx_retention` (populated synchronously in
-//!    `record_block_committed`) for tombstone retention bounds.
 //! 3. `remote_headers.on_block_committed` — liveness updates and
 //!    cross-shard timeout scheduling. Independent of the local coordinators
 //!    above; ordered here so all "cross-shard" work runs before execution.

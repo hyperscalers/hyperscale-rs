@@ -293,11 +293,6 @@ impl<'p> Section for TransactionsSection<'p> {
                 "transaction {tx_hash} already in QC chain ancestor"
             ));
         }
-        if ctx.dedup.contains_tx(&tx_hash) {
-            return Err(format!(
-                "transaction {tx_hash} already committed within its validity window"
-            ));
-        }
         let trie = ctx.snapshot.shard_trie();
         let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
         if !classified.commits_at(ctx.local_shard) {

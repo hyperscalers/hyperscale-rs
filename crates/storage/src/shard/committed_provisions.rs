@@ -11,7 +11,7 @@
 //! [`ProvenAnchors`](hyperscale_types::ProvenAnchors) is. The tier can
 //! afford the lock its siblings could not: it is read once per provision
 //! batch named by a block manifest and written once per commit, where
-//! `tx_retention` is read once per transaction.
+//! `resolved_tx_retention` is read once per verdict.
 
 use std::collections::HashMap;
 use std::sync::RwLock;

@@ -62,9 +62,6 @@ pub struct ShardMemoryStats {
     pub pending_commits_awaiting_data: usize,
     /// Equivocation-detection records keyed by `(height, validator)`.
     pub received_votes_by_height: usize,
-    /// Committed tx-hash → `end_timestamp_exclusive` entries used for fast
-    /// dedup lookup.
-    pub committed_tx_lookup: usize,
     /// Whether the dedup lookups above cover the whole retention window.
     /// False while a coordinator that resumed or joined mid-chain is still
     /// folding forward to it, during which it refuses fewer duplicates
@@ -103,7 +100,6 @@ impl ShardMemoryStats {
             pending_commits,
             pending_commits_awaiting_data,
             received_votes_by_height,
-            committed_tx_lookup,
             dedup_window_complete,
             committed_resolution_lookup,
             committed_provision_lookup,
@@ -123,7 +119,6 @@ impl ShardMemoryStats {
                 pending_commits_awaiting_data,
             ),
             ("received_votes_by_height", received_votes_by_height),
-            ("committed_tx_lookup", committed_tx_lookup),
             ("dedup_window_complete", usize::from(dedup_window_complete)),
             ("committed_resolution_lookup", committed_resolution_lookup),
             ("committed_provision_lookup", committed_provision_lookup),
@@ -5200,8 +5195,6 @@ impl ShardCoordinator {
         let anchor = block.header().parent_qc().weighted_timestamp();
         self.dedup_index.cover(anchor);
         self.dedup_index
-            .register_committed_txs(block.transactions(), anchor);
-        self.dedup_index
             .register_committed_certs(block.certificates());
         self.dedup_index
             .register_committed_provisions(manifest.provision_hashes(), commit_ts);
@@ -6898,7 +6891,6 @@ impl ShardCoordinator {
             pending_commits: self.commits.out_of_order_len(),
             pending_commits_awaiting_data: 0,
             received_votes_by_height: self.votes.received_votes_len(),
-            committed_tx_lookup: self.dedup_index.tx_retention_len(),
             dedup_window_complete: self.dedup_index.is_complete(self.committed_ts),
             committed_resolution_lookup: self.dedup_index.resolved_tx_retention_len(),
             committed_provision_lookup: self.dedup_index.provision_retention_len(),

@@ -32,16 +32,11 @@ use super::chain_reader::ShardChainReader;
 /// One rebuild of the committed-artifact window, and whether it covers the
 /// whole of it.
 ///
-/// The three maps carry their own deadlines because the tiers differ: a
-/// transaction's is the last anchor a block may carry it at, a
-/// resolution's comes off the resolving certificate, and a provision
-/// batch's is keyed to the block that committed it.
+/// The maps carry their own deadlines because the tiers differ: a
+/// resolution's and a finalization's come off the resolving certificate,
+/// and a provision batch's is keyed to the block that committed it.
 #[derive(Debug, Clone, Default)]
 pub struct DedupWindow {
-    /// `(tx_hash, last admissible anchor)` for every transaction the
-    /// window's blocks committed that the reader's clock has not passed
-    /// already.
-    pub committed: Vec<(TxHash, WeightedTimestamp)>,
     /// `(tx_hash, deadline)` for every transaction a committed
     /// finalization in the window reached a verdict for.
     pub resolved: Vec<(TxHash, WeightedTimestamp)>,
@@ -189,7 +184,7 @@ impl DedupWindow {
                 return window;
             }
             if !dedup_done {
-                window.fold_block(block, anchor, committed_ts);
+                window.fold_block(block, anchor);
             }
             if !fee_done {
                 window.fold_fee_holds(block, committed_ts, &mut released);
@@ -210,19 +205,8 @@ impl DedupWindow {
     ///
     /// `anchor` is the block's own `parent_qc` weighted timestamp, which
     /// the provision tier keys its deadline on.
-    fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp, now: WeightedTimestamp) {
+    fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
-        // What the index would still hold, keyed the way the live one
-        // keys it: one horizon past the block that carried each, which
-        // is this walk's own depth. Read off the block rather than off
-        // the body, because what the tier refuses is a second inclusion
-        // of what this chain already carried.
-        let deadline = anchor.plus(RETENTION_HORIZON);
-        if deadline > now {
-            for tx in block.transactions().iter() {
-                self.committed.push((tx.hash(), deadline));
-            }
-        }
         for finalization in block.certificates().iter() {
             let deadline = finalization.local_ec().deadline();
             self.finalizations

@@ -28,9 +28,7 @@ impl NodeStateMachine {
     /// 1. `shard.on_block_committed_verification` marks the block's JMT snapshot
     ///    as a usable parent so pending child state-root verifications unblock.
     /// 2. `mempool.on_block_committed` drives `block.transactions` Pending →
-    ///    Committed and `block.certificates` to their terminal state. Reads the
-    ///    shard coordinator's `tx_retention` (populated synchronously in
-    ///    `record_block_committed`) for tombstone retention.
+    ///    Committed and `block.certificates` to their terminal state.
     /// 3. `remote_headers.on_block_committed` updates liveness + cross-shard
     ///    timeouts. The schedule (not head) so the probe terminal-clamps a
     ///    drained reshape shard to the committee still serving it.

@@ -76,13 +76,14 @@ pub const RETENTION_HORIZON: Duration =
 /// dedup window.
 ///
 /// One figure for every tier, and they are one figure rather than three
-/// that happen to agree. Every transaction is held to its own deadline
+/// that happen to agree. A verdict is held to its transaction's deadline
 /// ([`admissible_until`](crate::admissible_until)), which sits at most
-/// this far past the block at anchor `A` that carried it: a validity
-/// range to the end, a finalization delay past that. The provision tier
-/// keys `A + RETENTION_HORIZON` outright, and a finalization's deadline
-/// is its transaction's, which sits at or below the block carrying it.
-/// So the walk's depth and the entries it keeps move together.
+/// this far past the block at anchor `A` that carried the transaction: a
+/// validity range to the end, a finalization delay past that. The
+/// provision tier keys `A + RETENTION_HORIZON` outright, and a
+/// finalization's deadline is its transaction's. So the walk's depth and
+/// the entries it keeps move together. A committed transaction is not a
+/// tier: its marker in the chain's own state answers for it.
 pub const DEDUP_WINDOW: Duration = RETENTION_HORIZON;
 
 const _: () = assert!(
