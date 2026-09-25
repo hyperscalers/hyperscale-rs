@@ -485,7 +485,7 @@ pub fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamily, key:
 pub fn iter_all<'a, CF: TypedCf>(
     db: &'a DB,
     cf: &ColumnFamily,
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a + use<'a, CF>
 where
     CF::KeyCodec: DbCodec<CF::Key>,
 {
@@ -501,7 +501,7 @@ pub fn iter_from<'a, CF: TypedCf>(
     db: &'a DB,
     cf: &ColumnFamily,
     key: &CF::Key,
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a + use<'a, CF>
 where
     CF::KeyCodec: DbCodec<CF::Key>,
 {
