@@ -36,7 +36,6 @@ fn leg(target: Address, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
         declares: vec![target],
         intent: IntentHash(Hash32([7; 32])),
         local: 0,
-        expiry_ms: 1_000,
     }
 }
 

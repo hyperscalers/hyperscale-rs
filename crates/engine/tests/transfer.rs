@@ -1269,8 +1269,9 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     assert_eq!(edge.from, near_shard);
     assert_eq!(edge.to, BTreeSet::from([far_shard]));
 
+    let validity_end = tx.validity_range().end_timestamp_exclusive;
     let sender = divided
-        .plan(&[], near_shard, Side::Issuing, tx.legs())
+        .plan(&[], near_shard, Side::Issuing, validity_end)
         .expect("the sender's legs take no arrival");
     assert!(!sender.legs.is_whole());
     assert!(
@@ -1291,7 +1292,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
             std::slice::from_ref(&arrived),
             far_shard,
             Side::Delivering,
-            tx.legs(),
+            validity_end,
         )
         .expect("the recipient's leg has its arrival");
     assert!(recipient.legs.arrival(edge.producer, edge.output).is_some());
@@ -1304,7 +1305,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     assert!(recipient.judges.covers(far()) && !recipient.judges.covers(alice()));
 
     assert!(matches!(
-        divided.plan(&[], far_shard, Side::Delivering, tx.legs()),
+        divided.plan(&[], far_shard, Side::Delivering, validity_end),
         Err(PlanDefect::MissingArrival { .. }),
     ));
 }
@@ -1465,11 +1466,11 @@ fn a_transfer_executes_divided_on_both_shards() {
         .and_then(|value| CrossingCell::from_bytes(value.as_deref()?))
         .expect("the record cell is among the sender's writes");
     assert_eq!(
-        record.expiry_ms,
-        tx.legs()[edge.producer as usize].expiry_ms,
-        "the record's expiry is the producing intent's own, read off its leg"
+        record.validity_end_ms,
+        tx.validity_range().end_timestamp_exclusive.as_millis(),
+        "the record states the transaction's own validity end"
     );
-    assert_ne!(record.expiry_ms, 0, "and never nothing");
+    assert_ne!(record.validity_end_ms, 0, "and never nothing");
     assert_eq!(
         CrossingId::of_record(edge.crossing.id.producer, &record),
         edge.crossing.id,

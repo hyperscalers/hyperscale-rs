@@ -202,7 +202,7 @@ pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
         .substate(shard, cell.owner, cell.local.0)
         .and_then(|bytes| CrossingCell::from_bytes(&bytes))
         .is_some_and(|record| {
-            let deadline = Deadline::from_expiry(record.expiry_ms);
+            let deadline = Deadline::of(WeightedTimestamp::from_millis(record.validity_end_ms));
             match record.terms {
                 Terms::Owed => false,
                 Terms::Escrowed { .. } => Window::LegEntry.of(deadline).end <= clock(c),

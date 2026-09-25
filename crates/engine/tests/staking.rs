@@ -1078,11 +1078,21 @@ fn a_departure_is_escrowed_exactly_where_its_consumer_may_refuse() {
     let plans = [
         divided
             .classified
-            .plan(&[], divided.payer_shard, Side::Issuing, divided.tx.legs())
+            .plan(
+                &[],
+                divided.payer_shard,
+                Side::Issuing,
+                divided.tx.validity_range().end_timestamp_exclusive,
+            )
             .expect("the payer's shard plans its legs"),
         divided
             .classified
-            .plan(&handed, divided.core, Side::Issuing, divided.tx.legs())
+            .plan(
+                &handed,
+                divided.core,
+                Side::Issuing,
+                divided.tx.validity_range().end_timestamp_exclusive,
+            )
             .expect("the core plans on what it was handed"),
     ];
 

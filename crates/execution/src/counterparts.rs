@@ -1897,9 +1897,8 @@ mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::test_utils::state_and_proof;
     use hyperscale_types::{
-        AbortCharge, Address, AddressClass, BlockHeight, CLAIM_WINDOW, CommittedAt, Deadline, Hash,
-        LocalKey, MAX_FINALIZATION_DELAY, ResourceAddr, RoutePrefix, StateRoot,
-        evidence_admits_block,
+        AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
+        MAX_FINALIZATION_DELAY, ResourceAddr, RoutePrefix, StateRoot, evidence_admits_block,
     };
     use hyperscale_vm_effects::{Answered, Hash32, IntentHash, Terms};
 
@@ -2469,7 +2468,7 @@ mod tests {
     }
 
     /// A record this shard holds, naming a claim cell `CONSUMER` holds
-    /// the prefix of, and a deadline read back off the expiry.
+    /// the prefix of, whose transaction's deadline is `deadline`.
     fn producer_cell(seed: u8, deadline: Deadline) -> CrossingCell {
         CrossingCell {
             resource: ResourceAddr::new([0xE1; 31]),
@@ -2477,7 +2476,7 @@ mod tests {
             intent: IntentHash(Hash32([seed; 32])),
             local: 0,
             output: 0,
-            expiry_ms: deadline.at().as_millis() + CLAIM_WINDOW.as_secs() * 1_000,
+            validity_end_ms: deadline.at().as_millis() - MAX_FINALIZATION_DELAY.as_secs() * 1_000,
             tx: TxHash::from(Hash::from_bytes(&[seed; 32])),
             consumer: Address::new([0x11; 31], AddressClass::Component),
             terms: Terms::Owed,

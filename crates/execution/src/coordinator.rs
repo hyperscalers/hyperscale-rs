@@ -10050,8 +10050,8 @@ mod tests {
     /// An escrow record this shard holds: a leaf naming a claim cell
     /// that sits on `PEER`, and a cell of its own to credit where
     /// nobody claims it.
-    fn held_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
-        crossing_fixture(local, expiry_ms, HOME, PEER)
+    fn held_record(local: u8, validity_end_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+        crossing_fixture(local, validity_end_ms, HOME, PEER)
     }
 
     /// A crossing handed *to* this shard: the record sits on `PEER`
@@ -10062,8 +10062,8 @@ mod tests {
     /// the two fixtures differ in: a producer holds the record and asks
     /// about the answer, a consumer holds the answer and is asked for
     /// it.
-    fn arrived_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
-        crossing_fixture(local, expiry_ms, PEER, HOME)
+    fn arrived_record(local: u8, validity_end_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+        crossing_fixture(local, validity_end_ms, PEER, HOME)
     }
 
     /// A record and its claim for one crossing, produced under a target
@@ -10071,7 +10071,7 @@ mod tests {
     /// keys the system derives.
     fn crossing_fixture(
         local: u8,
-        expiry_ms: u64,
+        validity_end_ms: u64,
         producer: ShardId,
         consumer: ShardId,
     ) -> (SubstateKey, SubstateKey, CrossingCell) {
@@ -10092,7 +10092,7 @@ mod tests {
             transaction.hash(),
             ResourceAddr::new([0xE1; 31]),
             1_000,
-            expiry_ms,
+            validity_end_ms,
             Terms::Escrowed {
                 credit: SubstateKey {
                     owner: record_key.owner,
@@ -10123,8 +10123,8 @@ mod tests {
         let schedule = two_shard_topology();
         let mut state = make_test_state();
         // Past the lapse, which is where an absence answers.
-        let expiry_ms = 400_000;
-        let (record_key, claim, cell) = held_record(0x6A, expiry_ms);
+        let validity_end_ms = 400_000;
+        let (record_key, claim, cell) = held_record(0x6A, validity_end_ms);
         if owed_here {
             let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
                 Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -10135,7 +10135,7 @@ mod tests {
                 [(&transaction, &leg_classified())],
             );
         }
-        let deadline = Deadline::from_expiry(expiry_ms);
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(validity_end_ms));
         let read_at = Window::Core.of(deadline).end.plus(Duration::from_secs(1));
         let decline = CrossingId::of_record(record_key.owner, &cell)
             .answer_key(&ProtocolHasher, Answered::Never);
@@ -10218,8 +10218,8 @@ mod tests {
     fn a_departure_reclaims_a_record_no_entry_names() {
         let schedule = two_shard_topology();
         let mut state = make_test_state();
-        let expiry_ms = 400_000;
-        let (record_key, _, cell) = held_record(0x6A, expiry_ms);
+        let validity_end_ms = 400_000;
+        let (record_key, _, cell) = held_record(0x6A, validity_end_ms);
         state
             .counterparts
             .held
@@ -10228,7 +10228,9 @@ mod tests {
         // Past the end of the window the entry stood in, which is where
         // the claim cell sweeps too.
         let past = Window::LegEntry
-            .of(Deadline::from_expiry(expiry_ms))
+            .of(Deadline::of(WeightedTimestamp::from_millis(
+                validity_end_ms,
+            )))
             .end
             .plus(Duration::from_secs(1));
         state.committed_ts = past;
@@ -10280,8 +10282,8 @@ mod tests {
     fn a_record_nobody_may_take_back_is_left_to_its_entry() {
         let schedule = two_shard_topology();
         let mut state = make_test_state();
-        let expiry_ms = 400_000;
-        let (record_key, _, mut cell) = held_record(0x6A, expiry_ms);
+        let validity_end_ms = 400_000;
+        let (record_key, _, mut cell) = held_record(0x6A, validity_end_ms);
         cell.terms = Terms::Owed;
         state
             .counterparts
@@ -10289,7 +10291,9 @@ mod tests {
             .insert(record_key, HeldRecord::of(record_key, cell));
 
         let past = Window::LegEntry
-            .of(Deadline::from_expiry(expiry_ms))
+            .of(Deadline::of(WeightedTimestamp::from_millis(
+                validity_end_ms,
+            )))
             .end
             .plus(Duration::from_secs(1));
         state.committed_ts = past;
@@ -10419,8 +10423,8 @@ mod tests {
     ) -> Option<Runs> {
         let schedule = two_shard_topology();
         let mut state = make_test_state();
-        let expiry_ms = 400_000;
-        let (record_key, claim, cell) = held_record(0x6A, expiry_ms);
+        let validity_end_ms = 400_000;
+        let (record_key, claim, cell) = held_record(0x6A, validity_end_ms);
         let decline = CrossingId::of_record(record_key.owner, &cell)
             .answer_key(&ProtocolHasher, Answered::Never);
         if owed_here {
@@ -10469,7 +10473,7 @@ mod tests {
     /// have licensed.
     #[test]
     fn a_decline_read_present_credits_back_before_any_silence_answers() {
-        let deadline = Deadline::from_expiry(400_000);
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(400_000));
         let at_deadline = deadline.at().plus(Duration::from_secs(1));
         assert!(
             at_deadline < Window::Core.of(deadline).end,
@@ -10508,7 +10512,7 @@ mod tests {
     /// which is its own change with its own agreement test.
     #[test]
     fn a_decline_does_not_reach_a_record_an_entry_here_still_owns() {
-        let at_deadline = Deadline::from_expiry(400_000)
+        let at_deadline = Deadline::of(WeightedTimestamp::from_millis(400_000))
             .at()
             .plus(Duration::from_secs(1));
         assert!(
@@ -10521,10 +10525,9 @@ mod tests {
         );
     }
 
-    /// An expiry well past [`CLAIM_WINDOW`], so the deadline it derives
-    /// is an instant the tests can sit either side of rather than one
-    /// the subtraction floors at zero.
-    const REFUSED_EXPIRY_MS: u64 = 4_000_000;
+    /// A validity end well clear of zero, so the deadline it derives is
+    /// an instant the tests can sit either side of.
+    const REFUSED_VALIDITY_END_MS: u64 = 4_000_000;
 
     /// A shard seated at [`HOME`] with a delivery waiting on a crossing
     /// [`PEER`] writes, and no reading of it. Returns the record, its
@@ -10539,8 +10542,8 @@ mod tests {
     ) {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = arrived_record(0x71, REFUSED_EXPIRY_MS);
-        let filed_at = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        let (record_key, _, cell) = arrived_record(0x71, REFUSED_VALIDITY_END_MS);
+        let filed_at = Deadline::of(WeightedTimestamp::from_millis(REFUSED_VALIDITY_END_MS)).at();
         state.provisioning.advance_clock(filed_at);
         state.provisioning.record_required(
             cell.tx,
@@ -10675,8 +10678,8 @@ mod tests {
     fn a_parked_deliverys_records_are_asked_and_it_is_readable_once_held() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = arrived_record(0x72, REFUSED_EXPIRY_MS);
-        let now = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        let (record_key, _, cell) = arrived_record(0x72, REFUSED_VALIDITY_END_MS);
+        let now = Deadline::of(WeightedTimestamp::from_millis(REFUSED_VALIDITY_END_MS)).at();
         state.provisioning.advance_clock(now);
         state.committed_ts = now;
         let trie = schedule
@@ -10749,8 +10752,8 @@ mod tests {
     ) {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = arrived_record(0x75, REFUSED_EXPIRY_MS);
-        let now = Deadline::from_expiry(REFUSED_EXPIRY_MS).at();
+        let (record_key, _, cell) = arrived_record(0x75, REFUSED_VALIDITY_END_MS);
+        let now = Deadline::of(WeightedTimestamp::from_millis(REFUSED_VALIDITY_END_MS)).at();
         state.provisioning.advance_clock(now);
         state.committed_ts = now;
         let trie = schedule
@@ -10983,7 +10986,7 @@ mod tests {
         state: &mut ExecutionCoordinator,
         seed: u8,
     ) -> (SubstateKey, SubstateKey, CrossingId) {
-        let (record_key, _, cell) = arrived_record(seed, REFUSED_EXPIRY_MS);
+        let (record_key, _, cell) = arrived_record(seed, REFUSED_VALIDITY_END_MS);
         let id = CrossingId::of_record(record_key.owner, &cell);
         let answer_key = id.answer_key(&ProtocolHasher, Answered::Taken);
         state

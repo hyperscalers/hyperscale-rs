@@ -27,16 +27,9 @@ use crate::{
 /// in, which a leg entry has to outlive or the reclaim that absence
 /// licenses can never be composed.
 ///
-/// The figure itself is the record's own encoding. A record's expiry is
-/// stated as the producing intent's validity end plus
-/// [`MAX_FINALIZATION_DELAY`] plus this window, and a reader holding
-/// nothing but the leaf recovers the deadline by taking this window
-/// back off it — so the sum is pinned to
-/// [`TERMINAL_EVIDENCE_EPOCHS`] windows, making a record a successor
-/// inherits across a cut state a deadline as readable as any other
-/// reshape evidence. What a successor does not need it for is deciding
-/// that record: it reads its consumer's answer, present, at whatever
-/// anchor the answer was taken.
+/// The deadline plus this window is pinned to
+/// [`TERMINAL_EVIDENCE_EPOCHS`] windows, so an entry stands exactly as
+/// long as the reshape evidence a departure is judged by stays readable.
 pub const CLAIM_WINDOW: Duration = Duration::from_secs(
     EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS - MAX_FINALIZATION_DELAY.as_secs(),
 );
@@ -88,21 +81,6 @@ impl Deadline {
     #[must_use]
     pub fn of_transaction(tx: &Transaction) -> Self {
         Self::of(tx.validity_range().end_timestamp_exclusive)
-    }
-
-    /// The deadline an escrow record's expiry was derived from.
-    ///
-    /// Neither a record nor the claim that answers it is ever swept, so
-    /// the expiry names no life. What it names is the one figure a
-    /// reader holding the leaf and no body needs: the producing intent's
-    /// validity end plus the crossing grace, which is the deadline one
-    /// [`CLAIM_WINDOW`] on. Taking the window back off it is how that
-    /// reader recovers the deadline.
-    #[must_use]
-    pub const fn from_expiry(expiry_ms: u64) -> Self {
-        Self(WeightedTimestamp::from_millis(
-            expiry_ms.saturating_sub(CLAIM_WINDOW.as_secs() * 1_000),
-        ))
     }
 
     /// The instant itself.
@@ -348,7 +326,7 @@ impl Probed {
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_vm_types::{COMMITTED_GRACE_MS, CROSSING_GRACE_MS};
+    use hyperscale_vm_types::COMMITTED_GRACE_MS;
 
     use super::{CLAIM_WINDOW, Deadline, Probed, Window};
     use crate::{
@@ -523,19 +501,6 @@ mod tests {
             }
             assert_eq!(probed.presence_asked_from(deadline), Some(deadline.at()));
         }
-    }
-
-    /// A record's expiry names the deadline it was derived from, and the
-    /// claim window read off that deadline ends exactly at the expiry.
-    #[test]
-    fn an_escrow_expiry_reads_back_to_its_deadline() {
-        let validity_end = ms(60_000);
-        let expiry_ms = validity_end.as_millis() + CROSSING_GRACE_MS;
-        let deadline = Deadline::from_expiry(expiry_ms);
-        assert_eq!(deadline, Deadline::of(validity_end));
-        let entry = Window::LegEntry.of(deadline);
-        assert_eq!(entry.end, ms(expiry_ms));
-        assert_eq!(entry.end.elapsed_since(entry.start), CLAIM_WINDOW);
     }
 
     /// A committed cell answers absent and never present; a claim, a

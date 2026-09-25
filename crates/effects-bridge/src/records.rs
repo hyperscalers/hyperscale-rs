@@ -996,20 +996,10 @@ mod tests {
     /// that tells a reader holding the leaf which of the two it holds.
     #[test]
     fn neither_half_of_a_crossing_is_swept_and_each_is_judged_off_its_leaf() {
-        use hyperscale_vm_effects::{
-            Answered, Crossing, CrossingId, CrossingLeaf, IntentHeader, Kind, Terms,
-            crossing_expiry_ms,
-        };
-        use hyperscale_vm_types::{AddressClass, CROSSING_GRACE_MS, IntentHash, NetworkId, TxHash};
+        use hyperscale_vm_effects::{Answered, Crossing, CrossingId, CrossingLeaf, Kind, Terms};
+        use hyperscale_vm_types::{AddressClass, IntentHash, TxHash};
 
-        let header = IntentHeader {
-            network: NetworkId(0),
-            validity_start_ms: 0,
-            validity_end_ms: 300_000,
-            discriminator: 0,
-        };
-        let expiry_ms = crossing_expiry_ms(&header);
-        assert_eq!(expiry_ms, 300_000 + CROSSING_GRACE_MS);
+        let validity_end_ms = 300_000;
 
         let producer = Address::new([0x5A; 31], AddressClass::Component);
         let taker = Address::new([0x5C; 31], AddressClass::Component);
@@ -1026,7 +1016,7 @@ mod tests {
             TxHash(Hash32([0xC0; 32])),
             ResourceAddr::new([0xE0; 31]),
             500,
-            expiry_ms,
+            validity_end_ms,
             Terms::Escrowed { credit: record_key },
         );
         let claim = id.answer(TxHash(Hash32([0xC0; 32])), Answered::Taken);

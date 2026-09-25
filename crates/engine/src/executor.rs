@@ -562,7 +562,12 @@ impl Executor {
         let mut entry = Self::prepare(tx, records, packages)?;
         let plan = member
             .classified()
-            .plan(arrivals, member.local(), member.side(), tx.legs())
+            .plan(
+                arrivals,
+                member.local(),
+                member.side(),
+                tx.validity_range().end_timestamp_exclusive,
+            )
             .map_err(|defect| format!("no plan for this shard: {defect}"))?;
         // The second member a shard runs of one transaction commits no
         // nullifier: the issuing one did, and a second spend of the same

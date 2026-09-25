@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Address, EscrowedValue, Role, ShardId, ShardTrie, StateClaim, SubstateKey, Transaction, TxHash,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Answered, Crossing, CrossingCell, CrossingEdge as StarEdge, CrossingLeaf, Kind, Star,
@@ -383,9 +384,8 @@ impl Classified {
     /// it, and what departs from it.
     ///
     /// `arrivals` is what committed bundles attested for the edges this
-    /// member consumes — read, never derived. `legs` is the transaction's
-    /// own, the slice [`Self::freeze`] classified, which is where a
-    /// departing record's expiry is read from.
+    /// member consumes — read, never derived. `validity_end` is the
+    /// transaction's own, which every record it departs states.
     ///
     /// # Errors
     ///
@@ -395,7 +395,7 @@ impl Classified {
         arrivals: &[EscrowedValue],
         local: ShardId,
         side: Side,
-        legs: &[LegShape],
+        validity_end: WeightedTimestamp,
     ) -> Result<ShardPlan, PlanDefect> {
         if !self.decomposed() {
             return Ok(ShardPlan::whole());
@@ -438,22 +438,13 @@ impl Classified {
                         .then(|| id.answer_key(&ProtocolHasher, Answered::Never)),
                 )?;
             } else if runs_here(edge.producer) && !runs_here(edge.consumer) {
-                // The record's expiry is the producing intent's own
-                // window end plus its grace, read off the leg the
-                // signer signed, so no record is issued with an expiry
-                // of nothing.
-                let producer = legs
-                    .get(edge.producer as usize)
-                    .ok_or(PlanFault::NoSuchNode {
-                        node: edge.producer,
-                    })?;
                 plan.departs(
                     edge.producer,
                     edge.output,
                     Departure {
                         record: edge.crossing.id.record_key(&ProtocolHasher),
                         crossing: edge.crossing,
-                        expiry_ms: producer.expiry_ms,
+                        validity_end_ms: validity_end.as_millis(),
                     },
                 )?;
             }
@@ -899,13 +890,18 @@ pub fn live_record(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Address, AddressClass, LocalKey, SubstateKey};
+    use hyperscale_types::{
+        Address, AddressClass, LocalKey, MAX_INTENT_VALIDITY_RANGE, SubstateKey,
+    };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
     use hyperscale_vm_types::{ResourceAddr, ValueEdge};
 
     use super::*;
 
     const RESOURCE: ResourceAddr = ResourceAddr::new([0xE1; 31]);
+
+    /// The fixtures' one validity end; nothing here reads a clock.
+    const VALIDITY_END: WeightedTimestamp = WeightedTimestamp::from_millis(1_000);
 
     /// An owner whose top bit is `high`, which is what a depth-one trie
     /// splits on.
@@ -945,7 +941,6 @@ mod tests {
             declares: vec![target],
             intent: IntentHash(Hash32([7; 32])),
             local,
-            expiry_ms: 1_000,
         }
     }
 
@@ -1160,7 +1155,7 @@ mod tests {
                 // The kind each departure carries is the kind the leaf
                 // will state, so the partition above is the one the
                 // kernel writes down.
-                let plan = classified.plan(&[], local, Side::Issuing, &legs);
+                let plan = classified.plan(&[], local, Side::Issuing, VALIDITY_END);
                 if let Ok(plan) = plan {
                     for record in plan.legs.records() {
                         let departing = classified
@@ -1187,7 +1182,7 @@ mod tests {
     #[test]
     fn a_whole_transaction_plans_the_whole_shape() {
         let plan = Classified::whole()
-            .plan(&[], low(), Side::Issuing, &[])
+            .plan(&[], low(), Side::Issuing, VALIDITY_END)
             .expect("a whole plan needs nothing");
         assert!(plan.legs.is_whole());
         assert!(plan.judges.covers(owner(0x22, true)));
@@ -1212,7 +1207,7 @@ mod tests {
         assert_eq!(divided.core(), &BTreeSet::from([low()]));
 
         let sender = divided
-            .plan(&[], low(), Side::Issuing, &legs)
+            .plan(&[], low(), Side::Issuing, VALIDITY_END)
             .expect("the sender's legs need no arrival");
         assert!(sender.legs.runs(0) && sender.legs.runs(1) && !sender.legs.runs(2));
         assert!(sender.legs.departure(1, 0).is_some());
@@ -1220,7 +1215,12 @@ mod tests {
         assert!(!sender.judges.covers(owner(0x22, true)));
 
         let recipient = divided
-            .plan(&[arrival(1, 0, 100)], high(), Side::Delivering, &legs)
+            .plan(
+                &[arrival(1, 0, 100)],
+                high(),
+                Side::Delivering,
+                VALIDITY_END,
+            )
             .expect("the recipient's leg has its arrival");
         assert!(!recipient.legs.runs(0) && !recipient.legs.runs(1) && recipient.legs.runs(2));
         assert_eq!(
@@ -1232,6 +1232,26 @@ mod tests {
         );
         assert!(recipient.judges.covers(owner(0x22, true)));
         assert!(!recipient.judges.covers(owner(0x11, false)));
+    }
+
+    /// Every departure a plan files states the validity end the plan
+    /// was handed, which is the transaction's: no leg carries a time of
+    /// its own for a member's window to leak into the record.
+    #[test]
+    fn a_departure_carries_the_transactions_validity_end() {
+        let legs = transfer();
+        let divided = frozen(&legs);
+        let edge = &divided.edges()[0];
+        let later = VALIDITY_END.plus(MAX_INTENT_VALIDITY_RANGE);
+        for validity_end in [VALIDITY_END, later] {
+            let departure = divided
+                .plan(&[], low(), Side::Issuing, validity_end)
+                .expect("the sender's legs need no arrival")
+                .legs
+                .departure(edge.producer, edge.output)
+                .expect("the withdraw departs");
+            assert_eq!(departure.validity_end_ms, validity_end.as_millis());
+        }
     }
 
     /// A swap plans the sign-in, the withdraw and the deposit on the
@@ -1246,14 +1266,14 @@ mod tests {
         // signs in and withdraws, waiting on nothing, and its delivering
         // one banks the venue's output once that has crossed back.
         let issuing = divided
-            .plan(&[], low(), Side::Issuing, &legs)
+            .plan(&[], low(), Side::Issuing, VALIDITY_END)
             .expect("the caller's issuing legs take no arrival");
         assert!(issuing.legs.runs(0) && issuing.legs.runs(1));
         assert!(!issuing.legs.runs(2) && !issuing.legs.runs(3));
         assert!(issuing.legs.departure(1, 0).is_some());
         assert!(issuing.legs.arrival(2, 0).is_none());
         let delivering = divided
-            .plan(&[arrival(2, 0, 90)], low(), Side::Delivering, &legs)
+            .plan(&[arrival(2, 0, 90)], low(), Side::Delivering, VALIDITY_END)
             .expect("the caller's delivering leg has its arrival");
         assert!(delivering.legs.runs(3));
         assert!(!delivering.legs.runs(0) && !delivering.legs.runs(1) && !delivering.legs.runs(2));
@@ -1261,7 +1281,7 @@ mod tests {
         assert!(delivering.legs.departure(1, 0).is_none());
 
         let venue = divided
-            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing, &legs)
+            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing, VALIDITY_END)
             .expect("the venue has its arrival");
         assert!(venue.legs.runs(2));
         assert!(!venue.legs.runs(0) && !venue.legs.runs(1) && !venue.legs.runs(3));
@@ -1278,7 +1298,7 @@ mod tests {
         let legs = transfer();
         assert_eq!(
             frozen(&legs)
-                .plan(&[], high(), Side::Delivering, &legs)
+                .plan(&[], high(), Side::Delivering, VALIDITY_END)
                 .err(),
             Some(PlanDefect::MissingArrival { node: 1, output: 0 }),
         );
@@ -1293,7 +1313,7 @@ mod tests {
         let legs = swap();
         let divided = frozen(&legs);
         let venue = divided
-            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing, &legs)
+            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing, VALIDITY_END)
             .expect("a core issues what it minted");
         assert!(venue.legs.departure(2, 0).is_some());
 
@@ -1321,7 +1341,7 @@ mod tests {
         // venue at path 2, so leaf 1 runs nothing.
         assert_eq!(
             divided_deeper
-                .plan(&[], ShardId::leaf(2, 1), Side::Issuing, &legs)
+                .plan(&[], ShardId::leaf(2, 1), Side::Issuing, VALIDITY_END)
                 .err(),
             Some(PlanDefect::NotAParticipant),
         );
@@ -1374,7 +1394,7 @@ mod tests {
         assert_eq!((edges[0].producer, edges[0].output), (1, 0));
 
         let core = classified
-            .plan(&[arrival(1, 0, 5)], high(), Side::Issuing, &legs)
+            .plan(&[arrival(1, 0, 5)], high(), Side::Issuing, VALIDITY_END)
             .expect("the core member runs the venue and the deposit");
         assert!(core.legs.runs(2) && core.legs.runs(3));
         assert!(
@@ -1382,7 +1402,9 @@ mod tests {
             "the venue's output stays in the execution"
         );
         assert_eq!(
-            classified.plan(&[], high(), Side::Delivering, &legs).err(),
+            classified
+                .plan(&[], high(), Side::Delivering, VALIDITY_END)
+                .err(),
             Some(PlanDefect::NotAParticipant),
         );
         assert!(issued(&classified, high(), None).is_empty());
@@ -1418,7 +1440,7 @@ mod tests {
         assert_eq!(edges[0].to, BTreeSet::from([leaf1]));
         for shard in [leaf0, leaf2] {
             let plan = classified
-                .plan(&[], shard, Side::Issuing, &legs)
+                .plan(&[], shard, Side::Issuing, VALIDITY_END)
                 .expect("a core shard plans the withdraw beside the venues");
             assert!(
                 plan.legs.runs(0) && plan.legs.runs(1) && plan.legs.runs(2) && plan.legs.runs(3)
@@ -1556,7 +1578,7 @@ mod tests {
 
         for shard in [leaf0, leaf2] {
             let plan = classified
-                .plan(&[arrival(0, 0, 5)], shard, Side::Issuing, &legs)
+                .plan(&[arrival(0, 0, 5)], shard, Side::Issuing, VALIDITY_END)
                 .expect("every core shard plans the whole core");
             assert!(
                 (1..5).all(|node| plan.legs.runs(node)) && !plan.legs.runs(0),
@@ -1572,7 +1594,9 @@ mod tests {
             "a core shard issues no record for an edge it runs both ends of",
         );
         assert_eq!(
-            classified.plan(&[], leaf1, Side::Issuing, &legs).err(),
+            classified
+                .plan(&[], leaf1, Side::Issuing, VALIDITY_END)
+                .err(),
             None
         );
     }
@@ -1648,14 +1672,14 @@ mod tests {
             "the local transfer's edge never crosses"
         );
         let issuing = classified
-            .plan(&[], low(), Side::Issuing, &legs)
+            .plan(&[], low(), Side::Issuing, VALIDITY_END)
             .expect("the issuing member runs both withdraws and the local deposit");
         assert!(issuing.legs.runs(1) && issuing.legs.runs(4) && issuing.legs.runs(5));
         assert!(!issuing.legs.runs(3));
         assert!(issuing.legs.departure(1, 0).is_some());
         assert!(issuing.legs.departure(4, 0).is_none());
         let delivering = classified
-            .plan(&[arrival(2, 0, 7)], low(), Side::Delivering, &legs)
+            .plan(&[arrival(2, 0, 7)], low(), Side::Delivering, VALIDITY_END)
             .expect("the delivering member runs the venue's return alone");
         assert!(delivering.legs.runs(3) && !delivering.legs.runs(5));
     }
