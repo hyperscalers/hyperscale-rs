@@ -3218,10 +3218,11 @@ impl ExecutionCoordinator {
         let runnable = height >= self.compose_from;
 
         // ── Provision broadcasting (proposer only) ─────────────────────
-        // The records the parent block wrote go with it: this block's
-        // certified header is what proves the parent to a consumer, and
-        // its proposer sends both. Taken whether or not this replica
-        // proposes, so nothing older than one commit is ever pushed.
+        // The crossing changes the parent block made go with it: this
+        // block's certified header is what proves the parent to a
+        // reader, and its proposer sends both. Taken whether or not this
+        // replica proposes, so nothing older than one commit is ever
+        // pushed.
         let pending_push = self.pending_push.take();
         if runnable && self.me == header.proposer() {
             let local_shard = self.local_shard;
@@ -3250,17 +3251,18 @@ impl ExecutionCoordinator {
                 });
             }
         }
+        // Every live block is pushed for, whether or not it wrote a
+        // record: the answers it wrote and the records it removed are
+        // the handler's to find, off the block and its parent.
         if runnable {
             let targets = record_pushes(finalizations, anchored.shard_trie(), self.local_shard);
-            if !targets.is_empty() {
-                let anchor = Anchor {
-                    shard: self.local_shard,
-                    height,
-                    state_root: header.state_root(),
-                    ts: header.parent_qc().weighted_timestamp(),
-                };
-                self.pending_push = Some((block_hash, anchor, targets));
-            }
+            let anchor = Anchor {
+                shard: self.local_shard,
+                height,
+                state_root: header.state_root(),
+                ts: header.parent_qc().weighted_timestamp(),
+            };
+            self.pending_push = Some((block_hash, anchor, targets));
         }
 
         let block = CommittingBlock {
@@ -10113,7 +10115,9 @@ mod tests {
     fn held_settlement(proved: Proved, owed_here: bool) -> Option<Runs> {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        // Past the lapse, which is where an absence answers.
+        // Past the deadline, where a question is first asked, and short
+        // of the abandon window's close, where an escrowed record's is
+        // asked no more.
         let validity_end_ms = 400_000;
         let (record_key, claim, cell) = owned_record(validity_end_ms);
         if owed_here {
@@ -10127,7 +10131,7 @@ mod tests {
             );
         }
         let deadline = Deadline::of(WeightedTimestamp::from_millis(validity_end_ms));
-        let read_at = Window::Core.of(deadline).end.plus(Duration::from_secs(1));
+        let read_at = deadline.at().plus(Duration::from_secs(1));
         let decline = CrossingId::of_record(record_key.owner, &cell)
             .answer_key(&ProtocolHasher, Answered::Never);
         hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);

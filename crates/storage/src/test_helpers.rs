@@ -2141,7 +2141,12 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
 }
 
 /// Attach `claims` to a live block, preserving everything else.
-fn with_state_claims(block: Block, claims: Vec<StateClaim>) -> Block {
+///
+/// # Panics
+///
+/// If `claims` is past the cap a block carries.
+#[must_use]
+pub fn with_state_claims(block: Block, claims: Vec<StateClaim>) -> Block {
     match block {
         Block::Live {
             header,

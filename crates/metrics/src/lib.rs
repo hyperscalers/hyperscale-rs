@@ -263,6 +263,13 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
 
+    /// A crossing question asked past its transaction's deadline, where
+    /// a push did not answer it: by the record's producer (`"producer"`)
+    /// or by the answer's consumer (`"consumer"`).
+    fn record_crossing_fallback_ask(&self, asker: &str) {
+        let _ = asker;
+    }
+
     /// A fenced claim, one carrying a record presence (`"record"`) or a
     /// deleting absence (`"removed"`), either carried by a committed
     /// block or dropped from what a validator held to offer because the
@@ -795,6 +802,12 @@ pub fn record_state_claims_weight(bytes: usize) {
 #[inline]
 pub fn record_record_ask() {
     recorder().record_record_ask();
+}
+
+/// Record a crossing question asked past its deadline, by `asker`.
+#[inline]
+pub fn record_crossing_fallback_ask(asker: &str) {
+    recorder().record_crossing_fallback_ask(asker);
 }
 
 /// Record a fenced claim carried by a block or refused by the read

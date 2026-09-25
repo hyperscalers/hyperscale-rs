@@ -171,6 +171,7 @@ pub struct Metrics {
     /// Fenced claims the read frontier refused from what a validator
     /// held to offer, by what they read.
     pub fenced_claims_refused: CounterVec,
+    pub crossing_fallback_asks: CounterVec,
     /// Pushed crossing readings the consumer dropped, by reason.
     pub crossing_pushes_dropped: CounterVec,
     /// Fetch responses a requester's own check refused, by fetch kind and
@@ -807,6 +808,13 @@ impl Metrics {
             )
             .unwrap(),
 
+            crossing_fallback_asks: register_counter_vec!(
+                "hyperscale_crossing_fallback_asks_total",
+                "Crossing questions asked past their deadline, where no push answered them",
+                &["asker"]
+            )
+            .unwrap(),
+
             crossing_pushes_dropped: register_counter_vec!(
                 "hyperscale_crossing_pushes_dropped_total",
                 "Pushed crossing readings the consumer dropped, by reason",
@@ -1159,6 +1167,13 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_record_ask(&self) {
         self.metrics.record_asks.inc();
+    }
+
+    fn record_crossing_fallback_ask(&self, asker: &str) {
+        self.metrics
+            .crossing_fallback_asks
+            .with_label_values(&[asker])
+            .inc();
     }
 
     fn record_fenced_claim(&self, reading: &str, carried: bool) {

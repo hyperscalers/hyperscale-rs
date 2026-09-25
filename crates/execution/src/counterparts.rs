@@ -16,17 +16,17 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
-    record_fenced_claim, record_rebuilt_record_entry, record_reclaim_probe_answered,
-    record_reclaim_probe_pending,
+    record_crossing_fallback_ask, record_fenced_claim, record_rebuilt_record_entry,
+    record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark, SettledTxSet,
-    ShardId, ShardTrie, Spoken, StateClaim, Stated, SubstateKey, TerminalEvidence,
-    TopologySchedule, TransactionDecision, TxHash, TxOutcome, TxResolution,
+    MAX_VALIDITY_RANGE, MerkleInclusionProof, ProvenAnchors, RETENTION_HORIZON, ReadFrontier,
+    ReadMark, SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, Stated, SubstateKey,
+    TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxOutcome, TxResolution,
     UNCLAIMED_CROSSING_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp,
 };
@@ -191,11 +191,17 @@ impl CrossingIndex for TestRows {
     }
 }
 
+/// The widest gap, in the counterpart's heights, between two asks of a
+/// question nothing has answered.
+const MAX_ANSWER_ASK_GAP: u64 = 64;
+
 /// One question a crossing row of this shard's puts to a counterpart,
 /// with its pacing and nothing that records an answer.
 ///
 /// A question stands exactly while the row it derives from stands, so
-/// a discarded or aborted settlement is asked about again.
+/// a discarded or aborted settlement is asked about again. It is asked
+/// only past its transaction's deadline: before it the answer arrives
+/// by push, and asking is the fallback for a push that did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Asked {
     /// A record here asks its consumer's answer: the claim or the
@@ -203,16 +209,34 @@ enum Asked {
     Answer {
         /// The crossing the record holds.
         id: CrossingId,
-        /// The newest counterpart header the pair has been asked at.
+        /// The record's deadline, `Deadline::of(V)`, from which it is
+        /// asked.
+        due_from: WeightedTimestamp,
+        /// Past this an escrowed record's consumer can commit nothing
+        /// and no abandonment can land, so nothing will answer; `None`
+        /// for an owed record, whose answer no window bounds.
+        disarm_at: Option<WeightedTimestamp>,
+        /// The counterpart header the pair was last asked at.
         asked_at: Option<BlockHeight>,
+        /// How many asks have gone unanswered: after the k-th the next
+        /// waits `2^(k-1)` heights, capped at [`MAX_ANSWER_ASK_GAP`], so
+        /// the asks fall at `h, h+1, h+3, h+7, ...`.
+        step: u32,
     },
     /// An answer here asks whether its producer still holds the record.
     Record {
         /// The crossing the answer answers for.
         id: CrossingId,
+        /// The answer's deadline, `Deadline::of(V)`, from which it is
+        /// asked.
+        due_from: WeightedTimestamp,
         /// The newest producer anchor a reading of the record present was
         /// folded at: a question worth putting only at a newer header.
         seen: Option<Anchor>,
+        /// A pushed absence of the record was refused below the read
+        /// frontier's floor, so the record is read again at once,
+        /// whatever the deadline.
+        reread: bool,
     },
 }
 
@@ -237,11 +261,14 @@ impl Asked {
 /// rather than the names.
 fn wants_reading(
     asks: &BTreeMap<SubstateKey, Asked>,
+    awaited: &BTreeSet<SubstateKey>,
     wanted: &BTreeSet<SubstateKey>,
     anchor: Anchor,
     key: SubstateKey,
 ) -> bool {
-    asks.get(&key).is_some_and(|asked| asked.wants(anchor)) || wanted.contains(&key)
+    asks.get(&key).is_some_and(|asked| asked.wants(anchor))
+        || awaited.contains(&key)
+        || wanted.contains(&key)
 }
 
 /// What a claim reads that the read frontier fences: whether it carries
@@ -372,6 +399,12 @@ pub struct Counterparts {
     /// the crossing for the fold to settle on them.
     names: BTreeMap<SubstateKey, CrossingId>,
 
+    /// The claim and decline keys of every record row, whoever asks
+    /// about them: a pushed answer to one is kept to offer, including
+    /// one for a record an entry here owns, which the leaf does not ask
+    /// about.
+    awaited: BTreeSet<SubstateKey>,
+
     /// The read frontier as the committed chain leaves it: how far
     /// along each producer this shard has read, the copy the fold's own
     /// rule advances here at every commit. Read to license a deletion,
@@ -425,6 +458,7 @@ impl Counterparts {
             index,
             asks: BTreeMap::new(),
             names: BTreeMap::new(),
+            awaited: BTreeSet::new(),
             frontier,
             wanted: BTreeSet::new(),
             records: RecordReads::new(),
@@ -733,6 +767,7 @@ impl Counterparts {
         let local = self.ledger.local();
         let mut asks = BTreeMap::new();
         let mut names = BTreeMap::new();
+        let mut awaited = BTreeSet::new();
         self.local_crossings.clear();
         for (key, value) in self.index.crossing_rows(local) {
             match CrossingLeaf::read(&ProtocolHasher, key, &value) {
@@ -742,6 +777,8 @@ impl Counterparts {
                     let decline = id.answer_key(&ProtocolHasher, Answered::Never);
                     names.insert(claim, id);
                     names.insert(decline, id);
+                    awaited.insert(claim);
+                    awaited.insert(decline);
                     if self.ledger.settles_record(key) {
                         continue;
                     }
@@ -751,15 +788,28 @@ impl Counterparts {
                         }
                         continue;
                     }
-                    let asked_at = match self.asks.get(&claim) {
-                        Some(Asked::Answer { asked_at, .. }) => *asked_at,
-                        _ => None,
+                    let (asked_at, step) = match self.asks.get(&claim) {
+                        Some(Asked::Answer { asked_at, step, .. }) => (*asked_at, *step),
+                        _ => (None, 0),
                     };
+                    let due_from =
+                        Deadline::of(WeightedTimestamp::from_millis(cell.validity_end_ms)).at();
+                    let disarm_at = matches!(cell.terms, Terms::Escrowed { .. })
+                        .then(|| due_from.plus(MAX_VALIDITY_RANGE));
                     for asked in [claim, decline] {
-                        asks.insert(asked, Asked::Answer { id, asked_at });
+                        asks.insert(
+                            asked,
+                            Asked::Answer {
+                                id,
+                                due_from,
+                                disarm_at,
+                                asked_at,
+                                step,
+                            },
+                        );
                     }
                 }
-                Some(CrossingLeaf::Answer { id, .. }) => {
+                Some(CrossingLeaf::Answer { id, answer }) => {
                     let record = id.record_key(&ProtocolHasher);
                     names.insert(record, id);
                     if trie.shard_for_prefix(record.owner) == local {
@@ -768,46 +818,76 @@ impl Counterparts {
                         }
                         continue;
                     }
-                    let seen = match self.asks.get(&record) {
-                        Some(Asked::Record { seen, .. }) => *seen,
-                        _ => None,
+                    let (seen, reread) = match self.asks.get(&record) {
+                        Some(Asked::Record { seen, reread, .. }) => (*seen, *reread),
+                        _ => (None, false),
                     };
-                    asks.insert(record, Asked::Record { id, seen });
+                    let due_from =
+                        Deadline::of(WeightedTimestamp::from_millis(answer.validity_end_ms)).at();
+                    asks.insert(
+                        record,
+                        Asked::Record {
+                            id,
+                            due_from,
+                            seen,
+                            reread,
+                        },
+                    );
                 }
                 None => {}
             }
         }
         self.asks = asks;
         self.names = names;
+        self.awaited = awaited;
     }
 
     /// The records this shard holds ask one question each, of whoever
     /// holds the claim's prefix now: what did the consumer answer? Both
-    /// cells, at one anchor, and nothing asked twice at one header.
+    /// cells, at one anchor.
+    ///
+    /// Asked only past the record's deadline, where no push answered it,
+    /// and then at gaps that double per unanswered ask, capped at
+    /// [`MAX_ANSWER_ASK_GAP`] heights; an escrowed record is asked no
+    /// more once its consumer can commit nothing and no abandonment can
+    /// land, and stands as a strand.
     fn ask_consumer_answers(
         &mut self,
         trie: &ShardTrie,
         now: WeightedTimestamp,
         wanted: &mut BTreeMap<Anchor, Vec<SubstateKey>>,
     ) {
-        let claims: Vec<(SubstateKey, CrossingId, Option<BlockHeight>)> = self
+        let claims: Vec<(SubstateKey, Asked)> = self
             .asks
             .iter()
-            .filter_map(|(key, asked)| match *asked {
-                Asked::Answer { id, asked_at }
-                    if *key == id.answer_key(&ProtocolHasher, Answered::Taken) =>
-                {
-                    Some((*key, id, asked_at))
+            .filter(|(key, asked)| match asked {
+                Asked::Answer { id, .. } => {
+                    **key == id.answer_key(&ProtocolHasher, Answered::Taken)
                 }
-                _ => None,
+                Asked::Record { .. } => false,
             })
+            .map(|(key, asked)| (*key, *asked))
             .collect();
-        for (claim, id, asked_at) in claims {
+        for (claim, asked) in claims {
+            let Asked::Answer {
+                id,
+                due_from,
+                disarm_at,
+                asked_at,
+                step,
+            } = asked
+            else {
+                continue;
+            };
+            if now < due_from || disarm_at.is_some_and(|disarm| now > disarm) {
+                continue;
+            }
             let shard = trie.shard_for_prefix(claim.owner);
             let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
                 continue;
             };
-            if asked_at.is_some_and(|asked| asked >= anchor.height) {
+            let gap = (1u64 << step.saturating_sub(1).min(6)).min(MAX_ANSWER_ASK_GAP);
+            if asked_at.is_some_and(|asked| anchor.height.inner() < asked.inner() + gap) {
                 continue;
             }
             // They are two keys under one owner, so this is one fetch and
@@ -820,10 +900,14 @@ impl Counterparts {
                     key,
                     Asked::Answer {
                         id,
+                        due_from,
+                        disarm_at,
                         asked_at: Some(anchor.height),
+                        step: step.saturating_add(1),
                     },
                 );
             }
+            record_crossing_fallback_ask("producer");
             let entry = wanted.entry(anchor).or_default();
             entry.push(claim);
             entry.push(decline);
@@ -909,6 +993,18 @@ impl Counterparts {
             .map(|(key, asked)| (*key, *asked))
             .collect();
         for (record, asked) in records {
+            let Asked::Record {
+                id,
+                due_from,
+                seen,
+                reread,
+            } = asked
+            else {
+                continue;
+            };
+            if now < due_from && !reread {
+                continue;
+            }
             let shard = trie.shard_for_prefix(record.owner);
             self.records.arm_now(record);
             let Some(anchor) = self.newest_above_floor(shard, now, windows) else {
@@ -924,6 +1020,19 @@ impl Counterparts {
                 continue;
             }
             if self.records.due(record, anchor) {
+                if reread {
+                    self.asks.insert(
+                        record,
+                        Asked::Record {
+                            id,
+                            due_from,
+                            seen,
+                            reread: false,
+                        },
+                    );
+                } else {
+                    record_crossing_fallback_ask("consumer");
+                }
                 wanted.entry(anchor).or_default().push(record);
             }
         }
@@ -1028,7 +1137,7 @@ impl Counterparts {
             inclusions
                 .iter()
                 .map(|(key, _)| *key)
-                .filter(|key| wants_reading(&self.asks, &self.wanted, anchor, *key)),
+                .filter(|key| wants_reading(&self.asks, &self.awaited, &self.wanted, anchor, *key)),
         );
         if answering.is_empty() {
             return;
@@ -1145,6 +1254,7 @@ impl Counterparts {
         let frontier = &self.frontier;
         let asks = &self.asks;
         let mut reset: Vec<SubstateKey> = Vec::new();
+        let mut reread: Vec<SubstateKey> = Vec::new();
         self.fetched.retain(|claim, _| {
             if !frontier.refuses(claim.anchor.shard, ReadMark::of(&claim.anchor, windows)) {
                 return true;
@@ -1160,12 +1270,25 @@ impl Counterparts {
                 record_fenced_claim("removed", false);
             }
             reset.extend(claim.keys());
+            reread.extend(claim.cells.iter().filter_map(|(key, stated)| {
+                (stated.inclusion() == Inclusion::Absent
+                    && matches!(asks.get(key), Some(Asked::Record { .. })))
+                .then_some(*key)
+            }));
             false
         });
-        // A record a consumer here waits on is read again at once; an
-        // answer's question has no deadline behind it and keeps its
-        // backoff, or every carried reading that raises the floor past
-        // another validator's held one restarts that validator's asks.
+        // A record a consumer here waits on is read again at once, and so
+        // is one whose removal was refused: the push that would have
+        // settled the answer is gone. A refused presence behind an
+        // answer keeps its backoff, or every carried reading that raises
+        // the floor past another validator's held one restarts that
+        // validator's asks.
+        for key in reread {
+            if let Some(Asked::Record { reread, .. }) = self.asks.get_mut(&key) {
+                *reread = true;
+            }
+            self.records.reset(key);
+        }
         for key in reset {
             if self.wanted.contains(&key) {
                 self.records.reset(key);
@@ -1351,7 +1474,7 @@ impl Counterparts {
         let mut wanted: BTreeSet<SubstateKey> = claim
             .keys()
             .into_iter()
-            .filter(|key| wants_reading(&self.asks, &self.wanted, anchor, *key))
+            .filter(|key| wants_reading(&self.asks, &self.awaited, &self.wanted, anchor, *key))
             .collect();
         if wanted.is_empty() {
             return false;
@@ -1393,6 +1516,7 @@ impl Counterparts {
         // voter could stand it at, so one whose anchor is gone is let go
         // of here.
         let asks = &self.asks;
+        let awaited = &self.awaited;
         let wanted = &self.wanted;
         let proven = &self.proven_anchors;
         self.fetched.retain(|claim, speaks_for| {
@@ -1405,7 +1529,7 @@ impl Counterparts {
                 || claim
                     .cells
                     .iter()
-                    .any(|(key, _)| wants_reading(asks, wanted, claim.anchor, *key))
+                    .any(|(key, _)| wants_reading(asks, awaited, wanted, claim.anchor, *key))
         });
         // The one retention rule for what counterparts said: an entry
         // there speaks for a transaction this ledger still owes an
@@ -1629,6 +1753,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::state_and_proof;
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
@@ -1699,7 +1824,9 @@ mod tests {
     fn answering() -> Answering {
         let anchors = Arc::new(ProvenAnchors::default());
         let rows = Arc::new(TestRows::default());
-        let cell = producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(60_000)));
+        // A deadline at the clock the tests ask at: nothing is asked
+        // before it.
+        let cell = producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(36_000)));
         let id = CrossingId::of_record(producer_record(0x42).owner, &cell);
         let answer = id.answer_key(&ProtocolHasher, Answered::Taken);
         rows.put(
@@ -2420,6 +2547,109 @@ mod tests {
             through.asks.keys().collect::<Vec<_>>(),
         );
         assert_eq!(seated.names, through.names);
+    }
+
+    /// The heights a producer asks its consumer's answer at, over a run
+    /// of consumer headers `1..=last`, at the committed clock `now`, for
+    /// a record of `terms`.
+    fn asked_heights(terms: Terms, now: WeightedTimestamp, last: u64) -> Vec<u64> {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000));
+        let anchors = Arc::new(ProvenAnchors::default());
+        let rows = Arc::new(TestRows::default());
+        let cell = CrossingCell {
+            terms,
+            ..producer_cell(0, deadline)
+        };
+        rows.put(record_of(0, deadline), cell.to_bytes());
+        let mut producer = Counterparts::new(
+            PRODUCER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            rows,
+            ReadFrontier::default(),
+        );
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        producer.derive_asks(&trie);
+        let mut asked = Vec::new();
+        for height in 1..=last {
+            anchors.record(Anchor {
+                shard: CONSUMER,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::from_raw(Hash::ZERO),
+                ts: WeightedTimestamp::ZERO,
+            });
+            if !producer
+                .probe(&trie, now, &[], EpochWindows::new(0))
+                .is_empty()
+            {
+                asked.push(height);
+            }
+        }
+        asked
+    }
+
+    /// A question nobody answers is asked past the deadline at gaps that
+    /// double per ask, capped at 64 heights, and never before it.
+    #[test]
+    fn the_fallback_backs_off_and_opens_at_the_deadline() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000)).at();
+        assert!(
+            asked_heights(Terms::Owed, deadline.minus(Duration::from_millis(1)), 20).is_empty(),
+            "nothing is asked before the deadline: the answer comes by push",
+        );
+        let asked = asked_heights(Terms::Owed, deadline, 400);
+        assert_eq!(&asked[..8], &[1, 2, 4, 8, 16, 32, 64, 128]);
+        assert!(
+            asked
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] <= MAX_ANSWER_ASK_GAP),
+            "and the gap never passes the cap: {asked:?}",
+        );
+    }
+
+    /// An escrowed record's question is asked no more once its consumer
+    /// can commit nothing and no abandonment can land; an owed record's
+    /// keeps the capped pace, since no window bounds its answer.
+    #[test]
+    fn an_escrowed_record_past_its_abandon_window_is_asked_no_more() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000)).at();
+        let past = deadline
+            .plus(MAX_VALIDITY_RANGE)
+            .plus(Duration::from_millis(1));
+        let escrowed = Terms::Escrowed {
+            credit: producer_record(0),
+        };
+        assert!(!asked_heights(escrowed, deadline, 4).is_empty());
+        assert!(
+            asked_heights(escrowed, past, 20).is_empty(),
+            "the row stands as a strand, asked about by nobody",
+        );
+        assert!(!asked_heights(Terms::Owed, past, 4).is_empty());
+    }
+
+    /// A pushed answer that lands before the deadline is kept to offer,
+    /// including one for a record an entry here owns and the leaf does
+    /// not ask about: a question stands whatever the deadline.
+    #[test]
+    fn an_early_push_is_held() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000));
+        let (mut producer, _, anchors, _) = producing(1, deadline);
+        let claim = claim_of(0, deadline);
+        let (state_root, proof) = state_and_proof(CONSUMER, &[claim], &[claim]);
+        let anchor = Anchor {
+            shard: CONSUMER,
+            height: BlockHeight::new(3),
+            state_root,
+            ts: WeightedTimestamp::from_millis(1_000),
+        };
+        anchors.record(anchor);
+        let pushed = StateClaim::new(
+            anchor,
+            [(claim, Inclusion::Present(jmt_value_hash(&claim.to_bytes())))],
+            proof,
+        );
+        assert!(producer.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000)));
+        assert_eq!(producer.state_claims().len(), 1, "and offered in a block");
     }
 
     /// A producer asks after both answers at one anchor, and a decline

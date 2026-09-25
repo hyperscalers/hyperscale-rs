@@ -302,6 +302,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("record_asks", None, 1);
     }
 
+    fn record_crossing_fallback_ask(&self, asker: &str) {
+        self.inc("crossing_fallback_asks", Some(asker), 1);
+    }
+
     fn record_fenced_claim(&self, reading: &str, carried: bool) {
         let name = if carried {
             "fenced_claims_carried"
