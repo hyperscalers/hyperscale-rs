@@ -50,7 +50,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Member, Runs, never_answer};
+use crate::legs::{Member, Runs, Unclaimable, never_answer};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -607,7 +607,7 @@ impl Executor {
     /// elsewhere has to trap here rather than land in a store that does
     /// not own it.
     fn prepare_reclaim(
-        records: &[SubstateKey],
+        records: &[(SubstateKey, Unclaimable)],
         ctx: &TickBatchContext<'_>,
         snapshot: &(dyn Substates + Sync),
     ) -> Result<PreparedTx, String> {
@@ -616,13 +616,16 @@ impl Executor {
         }
         let mut disposals = Vec::with_capacity(records.len());
         let mut declaration = Declaration::default();
-        for key in records {
+        for (key, evidence) in records {
             let Some(record) = read_record(snapshot, *key) else {
                 continue;
             };
             let Terms::Escrowed { credit } = record.terms else {
                 continue;
             };
+            if !evidence.binds(*key, &record) {
+                continue;
+            }
             let mut declare_here = |effect, holds| {
                 declare(&mut declaration, effect, holds).map_err(|conflict| {
                     format!("reclaimed cell contradicts the declaration: {conflict}")
@@ -1914,16 +1917,40 @@ mod tests {
             owner,
             local: LocalKey([9; 16]),
         };
-        let prepared = Executor::prepare_reclaim(&[record_key, gone], &ctx, &snapshot)
-            .expect("an unclaimed escrowed record is taken back");
+        let issuer = Unclaimable::IssuedBy { tx: record.tx };
+        let prepared =
+            Executor::prepare_reclaim(&[(record_key, issuer), (gone, issuer)], &ctx, &snapshot)
+                .expect("an unclaimed escrowed record is taken back");
 
         let Job::Records(disposals) = &prepared.job else {
             panic!("a reclaim is a records job: {:?}", prepared.job);
         };
         assert_eq!(disposals, &[Disposal { record: record_key }]);
         assert!(
-            Executor::prepare_reclaim(&[gone], &ctx, &snapshot).is_err(),
+            Executor::prepare_reclaim(&[(gone, issuer)], &ctx, &snapshot).is_err(),
             "a reclaim with nothing left to take back is refused",
+        );
+
+        // The evidence binds to the record it is carried with: its own
+        // crossing's `Never`, or a verdict naming its own issuer.
+        let never = |crossing: CrossingId| Unclaimable::Never {
+            read: crossing.answer_key(&ProtocolHasher, Answered::Never),
+        };
+        assert!(
+            Executor::prepare_reclaim(&[(record_key, never(id))], &ctx, &snapshot).is_ok(),
+            "its own consumer's refusal takes it back",
+        );
+        let other = CrossingId { output: 1, ..id };
+        assert!(
+            Executor::prepare_reclaim(&[(record_key, never(other))], &ctx, &snapshot).is_err(),
+            "another crossing's refusal carried with this key moves nothing",
+        );
+        let stranger = Unclaimable::IssuedBy {
+            tx: TxHash::from(Hash::from_bytes(b"stranger")),
+        };
+        assert!(
+            Executor::prepare_reclaim(&[(record_key, stranger)], &ctx, &snapshot).is_err(),
+            "a departure naming another transaction moves nothing",
         );
         let declared: Vec<Effect> = prepared.declaration.set.iter().collect();
         assert_eq!(declared.len(), 2, "{declared:?}");

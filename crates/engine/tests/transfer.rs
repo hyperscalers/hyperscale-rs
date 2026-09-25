@@ -13,7 +13,7 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
-use hyperscale_engine::legs::{Classified, Member, PlanDefect, Runs, Side};
+use hyperscale_engine::legs::{Classified, Member, PlanDefect, Runs, Side, Unclaimable};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
@@ -1164,6 +1164,14 @@ fn far() -> PrincipalAddr {
 
 /// The record keys of the crossings `local` issues, in edge order: every
 /// one, or those of one `kind`.
+/// `records`, each licensed by a verdict naming `tx`, which issued them.
+fn issued_by(records: Vec<SubstateKey>, tx: TxHash) -> Vec<(SubstateKey, Unclaimable)> {
+    records
+        .into_iter()
+        .map(|key| (key, Unclaimable::IssuedBy { tx }))
+        .collect()
+}
+
 fn issued(classified: &Classified, local: ShardId, kind: Option<Kind>) -> Vec<SubstateKey> {
     classified
         .crossings()
@@ -1581,7 +1589,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
         &store,
         Runs::Reclaim {
             member: Member::whole(near_shard),
-            records: issued(&classified, near_shard, None),
+            records: issued_by(issued(&classified, near_shard, None), tx.hash()),
             charged: true,
         },
     );
@@ -1719,6 +1727,7 @@ struct Inherited {
     store: MapDb,
     record: SubstateKey,
     crossing: CrossingId,
+    tx: TxHash,
 }
 
 /// Run the sending half over a fresh store, so the record stands with
@@ -1772,6 +1781,7 @@ fn inherited_record() -> Inherited {
         store,
         record: edge.crossing.id.record_key(&ProtocolHasher),
         crossing: edge.crossing.id,
+        tx: tx.hash(),
     }
 }
 
@@ -1793,7 +1803,7 @@ fn reclaim_inherited(held: &Inherited) -> ExecutedTx {
         clock: WeightedTimestamp::from_millis(2_000),
         runs: Runs::Reclaim {
             member: Member::whole(held.shard),
-            records: vec![held.record],
+            records: issued_by(vec![held.record], held.tx),
             charged: true,
         },
         arrivals: &[],
@@ -1890,10 +1900,13 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             clock: WeightedTimestamp::from_millis(1_000),
             runs: Runs::Reclaim {
                 member: Member::whole(near_shard),
-                records: issued(
-                    &Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie),
-                    near_shard,
-                    None,
+                records: issued_by(
+                    issued(
+                        &Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie),
+                        near_shard,
+                        None,
+                    ),
+                    tx.hash(),
                 ),
                 charged,
             },

@@ -49,7 +49,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Member, Runs, Side, never_answer};
+use hyperscale_engine::legs::{Classified, Member, Runs, Side, Unclaimable, never_answer};
 use hyperscale_engine::{
     CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
@@ -1249,7 +1249,10 @@ impl ExecutionCoordinator {
             // that the core never claimed. Nothing is coming, so the
             // candidate goes with the leg it was registered beside.
             self.candidates.remove(tx_hash);
-            let records = issued_records(&classified, local_shard, None);
+            let records = issued_records(&classified, local_shard, None)
+                .into_iter()
+                .map(|key| (key, Unclaimable::IssuedBy { tx: tx_hash }))
+                .collect();
             // The plan reads no body — every cell is the record's — but
             // the price still follows the vault, and this is the shard
             // that holds it.
@@ -1301,7 +1304,7 @@ impl ExecutionCoordinator {
         // One member per issuing transaction, so records answered the
         // same way go back together and a record still waiting holds
         // nothing back.
-        let mut due: BTreeMap<TxHash, Vec<SubstateKey>> = BTreeMap::new();
+        let mut due: BTreeMap<TxHash, Vec<(SubstateKey, Unclaimable)>> = BTreeMap::new();
         for (key, record) in &self.counterparts.held {
             // Nothing takes an owed crossing back: its only disposal is
             // the fold's removal on its consumer's claim, whoever holds
@@ -1322,14 +1325,24 @@ impl ExecutionCoordinator {
             {
                 continue;
             }
-            due.entry(record.cell.tx).or_default().push(*key);
+            let evidence = if record.declined {
+                Unclaimable::Never {
+                    read: record.decline,
+                }
+            } else {
+                Unclaimable::IssuedBy { tx: record.cell.tx }
+            };
+            due.entry(record.cell.tx)
+                .or_default()
+                .push((*key, evidence));
         }
         for (issued_by, records) in due {
-            let tx_hash = disposal_member_name(issued_by, &records);
+            let keys: Vec<SubstateKey> = records.iter().map(|(key, _)| *key).collect();
+            let tx_hash = disposal_member_name(issued_by, &keys);
             // Taken once: the credit deletes the cell, so a second
             // member over the same record would read nothing and the
             // records would be stranded behind a refusal.
-            for key in &records {
+            for key in &keys {
                 self.counterparts.held.remove(key);
             }
             record_reclaim_admitted(true);
@@ -1357,7 +1370,7 @@ impl ExecutionCoordinator {
         requests: &mut Vec<CrossShardExecutionRequest>,
         tx_hash: TxHash,
         transaction: Option<Arc<Verified<Transaction>>>,
-        records: Vec<SubstateKey>,
+        records: Vec<(SubstateKey, Unclaimable)>,
         charged: bool,
     ) {
         let local_shard = self.local_shard;
@@ -10342,7 +10355,11 @@ mod tests {
             _ => None,
         });
         assert!(
-            matches!(&runs, Some(Runs::Reclaim { records, .. }) if records == &vec![record_key]),
+            matches!(
+                &runs,
+                Some(Runs::Reclaim { records, .. })
+                    if records == &vec![(record_key, Unclaimable::IssuedBy { tx: cell.tx })]
+            ),
             "the departure takes the crossing back; dispatched {runs:?}",
         );
         assert!(

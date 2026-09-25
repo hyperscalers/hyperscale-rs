@@ -31,8 +31,8 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    Answered, Crossing, CrossingCell, CrossingEdge as StarEdge, CrossingLeaf, Kind, Star,
-    running_at, star_at,
+    Answered, Crossing, CrossingCell, CrossingEdge as StarEdge, CrossingId, CrossingLeaf, Kind,
+    Star, running_at, star_at,
 };
 use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{
@@ -757,10 +757,11 @@ pub enum Runs {
         /// The member the reclaim runs as: whole, on its own shard,
         /// reaching nobody else.
         member: Member,
-        /// The record cells to take back. One the commit fold has
-        /// already removed is skipped, not refused: the consumer took
-        /// that crossing, and the rest are still this member's.
-        records: Vec<SubstateKey>,
+        /// The record cells to take back, each with the evidence that
+        /// licenses it. One the commit fold has already removed, or one
+        /// its evidence does not bind, is skipped, not refused: the rest
+        /// are still this member's.
+        records: Vec<(SubstateKey, Unclaimable)>,
         /// Whether this shard settled the transaction's price already.
         /// A leg that ran burned it inside its writes at its own
         /// finalization; one that never ran — held for a bundle that
@@ -769,6 +770,39 @@ pub enum Runs {
         /// price was settled by the chain that dissolved.
         charged: bool,
     },
+}
+
+/// What licenses taking one record back: the evidence the engine binds
+/// to the record it reads before it credits anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unclaimable {
+    /// The consumer's `Never`, read present at `read`.
+    Never {
+        /// The decline cell the reading was of.
+        read: SubstateKey,
+    },
+    /// A verdict that `tx` was never settled by the consumer: a departure
+    /// naming it, or its own entry's.
+    IssuedBy {
+        /// The transaction the verdict names.
+        tx: TxHash,
+    },
+}
+
+impl Unclaimable {
+    /// Whether this evidence speaks for the record at `key`: a `Never`
+    /// read at the decline cell its own crossing derives, or a verdict
+    /// naming the transaction that issued it.
+    #[must_use]
+    pub fn binds(self, key: SubstateKey, cell: &CrossingCell) -> bool {
+        match self {
+            Self::Never { read } => {
+                CrossingId::of_record(key.owner, cell).answer_key(&ProtocolHasher, Answered::Never)
+                    == read
+            }
+            Self::IssuedBy { tx } => cell.tx == tx,
+        }
+    }
 }
 
 impl Runs {
