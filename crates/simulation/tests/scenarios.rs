@@ -40,6 +40,7 @@ use hyperscale_scenarios::{
     a_priority_is_charged_over_the_table_price,
     a_published_package_runs_where_it_was_never_committed,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
+    a_replica_that_missed_the_credit_commits_it_from_the_block,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
@@ -882,6 +883,16 @@ fn a_lost_answer_push_is_asked_past_the_deadline_sim() {
         &cross_shard_genesis_accounts(),
     );
     cluster.run_faultable(a_lost_answer_push_is_asked_past_the_deadline);
+}
+
+#[test]
+fn a_replica_that_missed_the_credit_commits_it_from_the_block_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_replica_that_missed_the_credit_commits_it_from_the_block);
 }
 
 #[test]

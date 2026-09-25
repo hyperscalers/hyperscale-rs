@@ -71,7 +71,9 @@ pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
 pub use pushes::{
     a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
-    a_rejoined_producer_asks_a_lost_answer, a_withheld_fallback_is_asked_by_an_honest_validator,
+    a_rejoined_producer_asks_a_lost_answer,
+    a_replica_that_missed_the_credit_commits_it_from_the_block,
+    a_withheld_fallback_is_asked_by_an_honest_validator,
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
 };
 pub use reshape::{

@@ -1125,13 +1125,16 @@ mod state_claim_tests {
     use std::time::Duration;
 
     use hyperscale_hbor::Bytes;
-    use hyperscale_types::test_utils::{proven_claim, state_and_proof, test_key};
-    use hyperscale_types::{
-        Anchor, BlockHeight, Inclusion, MerkleInclusionProof, NetworkDefinition, RETENTION_HORIZON,
-        ShardId, StateClaim, Stated, SubstateKey, TopologySnapshot, ValidatorSet,
-        WeightedTimestamp,
+    use hyperscale_types::test_utils::{
+        proven_claim, state_and_proof, state_and_proof_holding, test_key,
     };
-    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
+    use hyperscale_types::{
+        Address, AddressClass, Anchor, BlockHeight, Inclusion, MerkleInclusionProof,
+        NetworkDefinition, RETENTION_HORIZON, ShardId, StateClaim, Stated, SubstateKey,
+        TopologySnapshot, ValidatorSet, WeightedTimestamp,
+    };
+    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
+    use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
     use super::fixtures::{Against, DEPARTURE_CUT_MS, departures};
     use super::{Section, StateClaimsFold, StateClaimsSection};
@@ -1284,6 +1287,80 @@ mod state_claim_tests {
             admit(&against(past), &bare)
                 .is_err_and(|err| err.contains("more than a retention horizon")),
             "the bound binds a bare reading too",
+        );
+    }
+
+    /// An owed record's value is carried only where its consumer routes,
+    /// since that shard's fold is the one it credits; an escrowed
+    /// record's is carried wherever it is read.
+    #[test]
+    fn an_owed_record_is_carried_only_where_its_consumer_routes() {
+        let (producer_shard, local) = ShardId::ROOT.children();
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.local_shard = local;
+        against.anchor = WeightedTimestamp::from_millis(900);
+
+        let component = |byte: u8| Address::new([byte; 31], AddressClass::Component);
+        let carrying = |consumer: u8, terms: Terms| {
+            let id = CrossingId {
+                producer: component(0x10),
+                consumer: component(consumer),
+                intent: IntentHash(Hash32([0x5C; 32])),
+                local: 0,
+                output: 0,
+            };
+            let record = id.record_key(&ProtocolHasher);
+            let value = id
+                .cell(
+                    VmTxHash(Hash32([0xC3; 32])),
+                    ResourceAddr::new([0xE1; 31]),
+                    40,
+                    60_000,
+                    terms,
+                )
+                .to_bytes();
+            let (state_root, proof) =
+                state_and_proof_holding(producer_shard, &[(record, value.clone())], &[record]);
+            StateClaim::new(
+                Anchor {
+                    shard: producer_shard,
+                    height: BlockHeight::new(9),
+                    state_root,
+                    ts: WeightedTimestamp::from_millis(500),
+                },
+                [(record, Stated::Held(Bytes::new(value).unwrap()))],
+                proof,
+            )
+            .naming([(record, id)])
+        };
+        let (here, elsewhere) = (0x90, 0x20);
+
+        assert_eq!(
+            admit(&against, &carrying(here, Terms::Owed)),
+            Ok(()),
+            "an owed record whose consumer routes here is the credit this fold lands",
+        );
+        assert!(
+            admit(&against, &carrying(elsewhere, Terms::Owed))
+                .expect_err("an owed record credits only where its consumer is")
+                .contains("owed record whose consumer this shard does not hold"),
+        );
+        assert_eq!(
+            admit(
+                &against,
+                &carrying(
+                    elsewhere,
+                    Terms::Escrowed {
+                        credit: test_key(0x21),
+                    }
+                )
+            ),
+            Ok(()),
+            "an escrowed record is read wherever its consumer runs",
         );
     }
 

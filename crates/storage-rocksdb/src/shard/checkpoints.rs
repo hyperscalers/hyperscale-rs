@@ -737,10 +737,13 @@ mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
-        test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
-        test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
-        test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
-        test_import_gate_reads_the_trie, test_the_read_frontier_is_read_off_the_state,
+        test_a_presence_below_the_deleting_absence_is_refused,
+        test_an_owed_credit_composes_with_a_receipt_on_its_vault,
+        test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
+        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
+        test_crossing_index_equals_the_leaves, test_followed_halves_fold_the_settlements,
+        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
+        test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, ShardChainReader, SubstateStore};
     use hyperscale_types::{AddressClass, shard_prefix_path};
@@ -958,6 +961,40 @@ mod tests {
         let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
         let (left, right) = ShardId::ROOT.children();
         test_followed_halves_fold_the_settlements(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A block crediting an owed crossing lands one root committed,
+    /// followed whole and followed in halves.
+    #[test]
+    fn an_owed_credit_lands_one_root_on_every_path() {
+        let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_an_owed_credit_lands_one_root_on_every_path(
+            &open_storage(dirs[0].path()),
+            &open_storage(dirs[1].path()),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[3].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// An owed credit composes with a receipt's movement on its vault.
+    #[test]
+    fn an_owed_credit_composes_with_a_receipt_on_its_vault() {
+        let dir = TempDir::new().unwrap();
+        test_an_owed_credit_composes_with_a_receipt_on_its_vault(&open_storage(dir.path()));
+    }
+
+    /// The frontier a credit and its deletion leave refuses a presence
+    /// below the deleting absence, whole and on the consumer's half.
+    #[test]
+    fn a_presence_below_the_deleting_absence_is_refused() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_presence_below_the_deleting_absence_is_refused(
             &open_storage(dirs[0].path()),
             &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),

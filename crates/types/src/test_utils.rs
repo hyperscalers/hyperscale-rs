@@ -1506,6 +1506,26 @@ pub fn state_and_proof(
     present: &[SubstateKey],
     asked: &[SubstateKey],
 ) -> (StateRoot, MerkleInclusionProof) {
+    let holding: Vec<(SubstateKey, Vec<u8>)> = present
+        .iter()
+        .map(|key| (*key, key.to_bytes().to_vec()))
+        .collect();
+    state_and_proof_holding(shard, &holding, asked)
+}
+
+/// [`state_and_proof`] over a tree whose `present` leaves hold the
+/// values given, for a claim whose held value has to decode as
+/// something.
+///
+/// # Panics
+///
+/// As [`state_and_proof`].
+#[must_use]
+pub fn state_and_proof_holding(
+    shard: ShardId,
+    present: &[(SubstateKey, Vec<u8>)],
+    asked: &[SubstateKey],
+) -> (StateRoot, MerkleInclusionProof) {
     use std::collections::BTreeMap;
 
     use hyperscale_jmt::{
@@ -1538,18 +1558,19 @@ pub fn state_and_proof(
         "the tree's unrelated leaf is not a key a test may ask about",
     );
     assert!(
-        present.iter().chain(asked).all(under),
+        present.iter().map(|(key, _)| key).chain(asked).all(under),
         "a fixture proof for a shard speaks only for keys that shard owns",
     );
     let mut store = MemoryStore::new();
+    let unrelated_value = unrelated.to_bytes().to_vec();
     let updates: BTreeMap<JmtKey, Option<LeafValue>> = present
         .iter()
-        .chain(std::iter::once(&unrelated))
-        .map(|key| {
-            let value = key.to_bytes().to_vec();
+        .map(|(key, value)| (key, value))
+        .chain(std::iter::once((&unrelated, &unrelated_value)))
+        .map(|(key, value)| {
             (
                 key.to_bytes(),
-                Some(LeafValue::new(jmt_value_hash(&value), value.len() as u64)),
+                Some(LeafValue::new(jmt_value_hash(value), value.len() as u64)),
             )
         })
         .collect();

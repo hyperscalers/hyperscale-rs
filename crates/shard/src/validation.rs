@@ -480,7 +480,7 @@ pub mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
         BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, ExecutionOutcome,
-        Finalization, Hash, Inclusion, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
+        Finalization, Hash, Inclusion, LegRole, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
         NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
         Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer,
@@ -1084,6 +1084,55 @@ pub mod tests {
         // committed cells — the common case must not pay for this rule.
         let binding_nothing = block_with_transactions(BlockHeight::new(3), vec![tx(1)]);
         assert!(admit(&plain(), &binding_nothing).is_ok());
+    }
+
+    /// A transaction whose only leg on a shard is an outbound deposit is
+    /// the recipient's fold's to credit, never a transaction that shard
+    /// commits; the payer's shard admits it.
+    #[test]
+    fn a_transaction_this_shard_only_delivers_for_is_refused() {
+        use crate::admission::ProvisionsFold;
+
+        test_utils::install_stub_protocol_statics();
+        let (payer_shard, recipient_shard) = ShardId::ROOT.children();
+        let payer = PrincipalAddr::new([0x10; 31]);
+        let recipient = Address::new([0x90; 31], AddressClass::Component);
+        let transfer = Arc::new(Verifiable::from(
+            test_utils::stub_transaction(
+                payer,
+                &[payer.address(), recipient],
+                1_000,
+                test_utils::test_validity_range(),
+            )
+            .with_legs(
+                &test_utils::StubVmStatics,
+                vec![
+                    test_utils::leg_shape(payer.address(), LegRole::Core, &[]),
+                    test_utils::leg_shape(recipient, LegRole::Outbound, &[(0, 0)]),
+                ],
+            ),
+        ));
+        let on = |local: ShardId| {
+            let mut against = Against::window(TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                2,
+                ValidatorSet::new(Vec::new()),
+            ));
+            against.local_shard = local;
+            let provisions = ProvisionsFold::default();
+            admit_all::<TransactionsSection<'_>>(
+                &against.ctx(),
+                &mut TransactionsFold::beside(&provisions),
+                std::iter::once(&transfer).map(unwrapped),
+            )
+        };
+
+        assert!(
+            on(recipient_shard)
+                .expect_err("the recipient's shard only delivers")
+                .contains("only delivers here"),
+        );
+        assert_eq!(on(payer_shard), Ok(()), "the payer's shard commits it");
     }
 
     /// A block carrying records, rooted the way the header claims.

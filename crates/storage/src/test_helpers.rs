@@ -23,16 +23,16 @@ use hyperscale_types::{
     CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, EpochWindows, Event,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
     FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Inclusion, LocalKey, LogLevel,
-    MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable,
+    MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable,
     ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
-    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFrontier,
-    ReadMark, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
-    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId,
-    StateClaim, StateRoot, StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket,
-    SweepFrontier, SyncHint, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
-    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
-    shard_prefix_path,
+    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence,
+    ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites,
+    ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots,
+    Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StoredReceipt, SubstateKey,
+    SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
+    TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
+    Verified, VotePosition, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
+    compute_merkle_root, encode_amount, entry_leaf_key, read_amount, shard_prefix_path,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -2199,8 +2199,9 @@ fn frontier_of(producer: ShardId, read_at: u64) -> ReadFrontier {
 }
 
 /// Commit `block` at the store's tip through the one commit path, with
-/// `frontier` as what its claims do to the read frontier. Returns the
-/// root the commit prepared beside the one it flushed.
+/// `frontier` as what its claims do to the read frontier and its own
+/// certificates as what it settles. Returns the root the commit
+/// prepared beside the one it flushed.
 fn commit_raising<S: TestStore>(
     storage: &S,
     block: Block,
@@ -2216,7 +2217,7 @@ fn commit_raising<S: TestStore>(
             pending: &[],
             base_reads: None,
         },
-        &[],
+        &block.certificates()[..],
         ChainWrites {
             creations: &[],
             removals: &[],
@@ -2518,6 +2519,302 @@ where
         .composes_to(parent_root),
         "the followed halves recompose the parent's root",
     );
+}
+
+/// One owed crossing of `straddling_crossing`'s: its record on the left
+/// half of the root split, and the consumer's vault and `Taken` on the
+/// right, where the consumer's fold credits it.
+struct Owed {
+    id: CrossingId,
+}
+
+impl Owed {
+    const RESOURCE: ResourceAddr = ResourceAddr::new([0xE3; 31]);
+    const AMOUNT: u128 = 250;
+
+    /// The producer's shard, which owns the record's prefix.
+    const PRODUCER: ShardId = ShardId::leaf(1, 0);
+
+    const fn new(seed: u8) -> Self {
+        Self {
+            id: straddling_crossing(seed),
+        }
+    }
+
+    fn record(&self) -> SubstateKey {
+        self.id.record_key(&ProtocolHasher)
+    }
+
+    fn taken(&self) -> SubstateKey {
+        self.id.answer_key(&ProtocolHasher, Answered::Taken)
+    }
+
+    /// The consumer's vault for the crossing's resource: where the
+    /// credit lands.
+    fn vault(&self) -> SubstateKey {
+        self.id.owed_credit(&ProtocolHasher, Self::RESOURCE)
+    }
+
+    /// The record's value, as the producer's state holds it.
+    fn held(&self) -> Stated {
+        let cell = self.id.cell(
+            VmTxHash(Hash32([0xC2; 32])),
+            Self::RESOURCE,
+            Self::AMOUNT,
+            1_000,
+            Terms::Owed,
+        );
+        Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits"))
+    }
+
+    /// A claim at the producer's height `read_at` reading the record as
+    /// `stated`, naming its crossing.
+    fn claim(&self, read_at: u64, stated: Stated) -> StateClaim {
+        StateClaim::new(
+            Anchor {
+                shard: Self::PRODUCER,
+                height: BlockHeight::new(read_at),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(read_at * 1_000),
+            },
+            [(self.record(), stated)],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(self.record(), self.id)])
+    }
+
+    /// The fence a later block's presence of the record at `read_at`
+    /// meets, built as the voter builds it.
+    fn presence_at(&self, read_at: u64) -> ReadFence {
+        let anchor = self.claim(read_at, self.held()).anchor;
+        ReadFence {
+            presences: vec![Reading {
+                key: self.record(),
+                shard: anchor.shard,
+                mark: ReadMark::of(&anchor, EpochWindows::new(FRONTIER_WINDOW_MS)),
+            }],
+            absences: Vec::new(),
+            deletions: Vec::new(),
+        }
+    }
+}
+
+/// A block at `height` carrying `claims` and settling one receipt of
+/// `writes` where one is given, and the frontier inputs its shard reads
+/// off it.
+fn owed_block(
+    height: u64,
+    claims: Vec<StateClaim>,
+    writes: Option<StateWrites>,
+) -> (Block, FrontierInputs) {
+    let height = BlockHeight::new(height);
+    let base = writes.map_or_else(
+        || make_test_block(height),
+        |writes| push_certificate(make_test_block(height), settling(height, writes)),
+    );
+    let block = with_state_claims(base, claims);
+    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+    (block, inputs)
+}
+
+/// Writes moving `vault` by `movement` and nothing else.
+fn moving(vault: SubstateKey, movement: Movement) -> StateWrites {
+    let mut writes = StateWrites::default();
+    writes.movements.insert(vault, movement);
+    writes
+}
+
+/// What `store` holds at `key` as an amount, absent as zero.
+fn amount_at<S: SubstateStore>(store: &S, key: SubstateKey) -> u128 {
+    store
+        .cell(key)
+        .map_or(0, |bytes| read_amount(&bytes).expect("an amount cell"))
+}
+
+/// Shared: a block crediting an owed crossing lands one root on every
+/// path.
+///
+/// Build, the vote's verification and a QC-only replica all prepare the
+/// block through `parent`'s commit path; a follower holding the whole
+/// keyspace and the two halves of a split follow it. The whole follower
+/// lands the parent's root, the halves recompose it, and the credit and
+/// `Taken` land on the consumer's half alone.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_owed_credit_lands_one_root_on_every_path<S>(
+    parent: &S,
+    whole: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore,
+{
+    let owed = Owed::new(0x31);
+    let (block, inputs) = owed_block(1, vec![owed.claim(7, owed.held())], None);
+
+    let before = parent.state_root();
+    let (prepared, committed) = commit_raising(parent, block.clone(), &inputs);
+    assert_ne!(prepared, before, "the credit moves the root");
+    assert_eq!(committed, prepared);
+    assert_eq!(amount_at(parent, owed.vault()), Owed::AMOUNT);
+    assert!(
+        parent.cell(owed.taken()).is_some(),
+        "the credit writes Taken"
+    );
+
+    let whole_root = whole.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert_eq!(
+        whole_root, committed,
+        "a follower holding the consumer's prefix lands the committed root",
+    );
+    let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
+    let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert_eq!(amount_at(right, owed.vault()), Owed::AMOUNT);
+    assert!(right.cell(owed.taken()).is_some());
+    assert_eq!(
+        (amount_at(left, owed.vault()), left.cell(owed.taken())),
+        (0, None),
+        "nothing of the credit lands on the producer's half",
+    );
+    assert!(
+        SplitChildRoots {
+            left: left_root,
+            right: right_root,
+        }
+        .composes_to(committed),
+        "the followed halves recompose the committed root",
+    );
+}
+
+/// Shared: an owed credit composes with a receipt's movement on the
+/// same vault.
+///
+/// A receipt settled in the block that credits a crossing moves the
+/// consumer's vault from the parent's balance, and the credit folds
+/// after it: a debit and the credit settle to their net, and a second
+/// block's receipt credit and a second crossing's credit both land.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_owed_credit_composes_with_a_receipt_on_its_vault<S: TestStore>(storage: &S) {
+    const SEED: u128 = 1_000;
+    let first = Owed::new(0x33);
+    let second = Owed {
+        id: CrossingId {
+            local: 1,
+            ..first.id
+        },
+    };
+    assert_eq!(first.vault(), second.vault(), "one consumer, one vault");
+    let vault = first.vault();
+    commit_writes(
+        storage,
+        &SettledWrites::from_absolutes(BTreeMap::from([(
+            vault,
+            Some(encode_amount(SEED).to_vec()),
+        )])),
+    );
+
+    let debit = moving(
+        vault,
+        Movement {
+            resource: Owed::RESOURCE,
+            credit: 0,
+            debit: 30,
+            unjudged_debit: 0,
+        },
+    );
+    let (block, inputs) = owed_block(2, vec![first.claim(7, first.held())], Some(debit));
+    commit_raising(storage, block, &inputs);
+    assert_eq!(
+        amount_at(storage, vault),
+        SEED - 30 + Owed::AMOUNT,
+        "the debit and the credit settle to their net",
+    );
+
+    let credit = moving(
+        vault,
+        Movement {
+            resource: Owed::RESOURCE,
+            credit: 10,
+            debit: 0,
+            unjudged_debit: 0,
+        },
+    );
+    let (block, inputs) = owed_block(3, vec![second.claim(8, second.held())], Some(credit));
+    commit_raising(storage, block, &inputs);
+    assert_eq!(
+        amount_at(storage, vault),
+        SEED - 30 + Owed::AMOUNT + 10 + Owed::AMOUNT,
+        "a receipt credit and a second crossing's credit both land",
+    );
+}
+
+/// Shared: once the fold deletes a crossing's `Taken` on its record's
+/// absence, no presence of the record read below that absence is
+/// admissible, on the consumer's store or on the split half holding it.
+///
+/// Block 1 credits on a reading at 7 and block 2 deletes `Taken` on the
+/// record read absent at 9. The frontier each store holds refuses a
+/// presence at 7 and at 8, passes one at 10, and the vault holds one
+/// credit.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_presence_below_the_deleting_absence_is_refused<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let owed = Owed::new(0x35);
+    let blocks = [
+        owed_block(1, vec![owed.claim(7, owed.held())], None),
+        owed_block(
+            2,
+            vec![owed.claim(9, Stated::from(Inclusion::Absent))],
+            None,
+        ),
+    ];
+    for (block, inputs) in &blocks {
+        commit_raising(parent, block.clone(), inputs);
+        left.follow_block_writes(block, &[], inputs).unwrap();
+        right.follow_block_writes(block, &[], inputs).unwrap();
+    }
+    assert!(
+        parent.cell(owed.taken()).is_none(),
+        "the absence deleted Taken"
+    );
+    assert!(right.cell(owed.taken()).is_none());
+
+    let (_, consumer_half) = ShardId::ROOT.children();
+    for (name, frontier) in [
+        ("the consumer's store", parent.read_frontier(ShardId::ROOT)),
+        (
+            "the half holding the consumer",
+            right.read_frontier(consumer_half),
+        ),
+    ] {
+        for below in [7, 8] {
+            assert!(
+                owed.presence_at(below).check(&frontier).is_err(),
+                "{name} refuses a presence at {below}, below the absence at 9",
+            );
+        }
+        assert_eq!(
+            owed.presence_at(10).check(&frontier),
+            Ok(()),
+            "{name} passes a presence above the absence",
+        );
+    }
+    assert_eq!(
+        amount_at(parent, owed.vault()),
+        Owed::AMOUNT,
+        "credited once"
+    );
+    assert_eq!(amount_at(right, owed.vault()), Owed::AMOUNT);
 }
 
 /// Shared: a split observer following the parent's blocks into one half

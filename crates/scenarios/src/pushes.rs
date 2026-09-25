@@ -468,3 +468,82 @@ pub fn a_rejoined_producer_asks_a_lost_answer<C: FaultableCluster>(
         "a transfer whose answer a rejoined replica read",
     );
 }
+
+/// A recipient replica cut off while an owed crossing is credited, and
+/// healed only once the record behind the credit is gone from the
+/// payer's chain, credits it from the block alone.
+///
+/// One recipient host is isolated before the transfer. The rest of its
+/// committee credits the recipient and the payer retires the record, so
+/// no replica anywhere can serve it. Healed, the host block-syncs the
+/// blocks it missed and commits each on its QC, the credit computed from
+/// the block's own claims; a root that disagrees halts the replica. It
+/// reaches a peer's height with the peer's root.
+///
+/// The cut is short. A member absent for an epoch's randomness
+/// commitment, or for a run of its proposals, is jailed and unseated, so
+/// a committee replica never lags a whole retention horizon.
+///
+/// # Panics
+///
+/// Panics if the transfer does not credit and retire without the
+/// isolated replica, or if the replica does not catch up to its peer's
+/// height and root once healed.
+pub fn a_replica_that_missed_the_credit_commits_it_from_the_block<C: FaultableCluster>(c: &mut C) {
+    let (_, recipient_hosts) = sides(c);
+    let [lagging, peer, ..] = recipient_hosts[..] else {
+        panic!("a recipient committee of at least two: {recipient_hosts:?}");
+    };
+    let (_, _, to) = cross_shard_cast();
+    let recipient_before = vault_balance(c, RECIPIENT_SHARD, to);
+
+    c.isolate(lagging);
+    let isolated_at = c
+        .host_committed_height(lagging, RECIPIENT_SHARD)
+        .expect("the isolated host carries the recipient's shard");
+    let Transfer {
+        world,
+        charges,
+        record,
+        ..
+    } = transfer(c);
+    assert!(
+        c.run_until(epochs(6), |c| vault_balance(c, RECIPIENT_SHARD, to)
+            == recipient_before + 100
+            && !stands(c, record)),
+        "the recipient is credited and the record retired without the isolated replica",
+    );
+    let credited_by = c
+        .host_committed_height(peer, RECIPIENT_SHARD)
+        .expect("the peer runs");
+    let lagged_at = c
+        .host_committed_height(lagging, RECIPIENT_SHARD)
+        .expect("the isolated host still carries the shard");
+    assert!(
+        lagged_at <= isolated_at.next() && lagged_at < credited_by,
+        "the isolated replica commits at most the block in flight when it was cut off, \
+         which precedes the transfer: isolated at {isolated_at:?}, at {lagged_at:?}, \
+         credited by {credited_by:?}",
+    );
+
+    c.heal_all();
+    assert!(
+        c.run_until(epochs(4), |c| {
+            let lagging_at = c.host_committed_height(lagging, RECIPIENT_SHARD);
+            lagging_at.is_some_and(|height| height >= credited_by)
+                && lagging_at == c.host_committed_height(peer, RECIPIENT_SHARD)
+                && c.host_committed_state_root(lagging, RECIPIENT_SHARD)
+                    == c.host_committed_state_root(peer, RECIPIENT_SHARD)
+        }),
+        "the healed replica reaches its peer's height and root, past the credit at \
+         {credited_by:?}: at {:?}, peer at {:?}",
+        c.host_committed_height(lagging, RECIPIENT_SHARD),
+        c.host_committed_height(peer, RECIPIENT_SHARD),
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a transfer a replica that missed the credit caught up on",
+    );
+}
