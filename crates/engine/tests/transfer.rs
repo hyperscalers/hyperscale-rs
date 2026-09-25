@@ -1220,8 +1220,9 @@ fn hash_of(executed: &ExecutedTx) -> Hash {
     *receipt_hash.as_raw()
 }
 
-/// A transfer's two legs emit from accounts on different shards. Each
-/// shard's receipt keeps only the events its own instances emitted,
+/// A transfer's withdrawal emits from an account on another shard than
+/// its recipient. Each shard's receipt keeps only the events its own
+/// instances emitted,
 /// while the receipt hash stays identical under whole locality — this
 /// batch has no abortable member, so the writes root covers the full
 /// fold on both sides. On the abortable path the roots are per shard by
@@ -1245,8 +1246,10 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
     let sender_side = execute_on_shard(&executor, near_shard, std::slice::from_ref(&tx));
     let recipient_side = execute_on_shard(&executor, far_shard, &[tx]);
 
+    // The deposit is the kernel's and emits nothing, so the recipient's
+    // shard keeps no event: the withdrawal's is not its emitter's to hold.
     assert_eq!(events_of(&sender_side[0]), vec![(alice().address(), 0)]);
-    assert_eq!(events_of(&recipient_side[0]), vec![(far().address(), 1)]);
+    assert_eq!(events_of(&recipient_side[0]), vec![]);
     assert_eq!(
         hash_of(&sender_side[0]),
         hash_of(&recipient_side[0]),
@@ -1944,8 +1947,10 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
     };
     let (sender_side, recipient_side) = (run(near_shard), run(far_shard));
 
+    // The deposit is the kernel's and emits nothing, so the recipient's
+    // root covers no event.
     assert_eq!(events_of(&sender_side), vec![(alice().address(), 0)]);
-    assert_eq!(events_of(&recipient_side), vec![(far().address(), 1)]);
+    assert_eq!(events_of(&recipient_side), vec![]);
     for side in [&sender_side, &recipient_side] {
         let ConsensusReceipt::Succeeded {
             receipt_hash,
