@@ -10,7 +10,6 @@ use hyperscale_types::{
     ShardAnchor, StateRoot, ValidatorId, Verified, WeightedTimestamp,
 };
 
-use super::boundary::CrossingLeaves;
 use super::chain_reader::ShardChainReader;
 use super::dedup_window::DedupWindow;
 use super::unresolved::ReplayWindow;
@@ -185,27 +184,6 @@ pub struct RecoveredState {
     /// snap-sync, where the imported store carries no signing history.
     pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
 
-    /// The crossing leaves this store holds under the shard's prefix,
-    /// with their committed bytes.
-    ///
-    /// Value this shard owes an answer for and answers this shard owes a
-    /// cleanup for, read from the leaves that hold them and from nothing
-    /// else — every start's first term, which the commits after it add
-    /// to and take from. Nothing else can name them: the entry that
-    /// would is a fold over a chain a successor never replays and a
-    /// restart replays only a window of, and both families are outside
-    /// every sweep's reach. The state is the authority, and it
-    /// is what every node holding the prefix has — which is what makes
-    /// the set a function of committed content rather than of how a
-    /// node got here.
-    ///
-    /// Read the same way however the store was reached: adopted whole
-    /// at a reshape seat, resumed after a restart, or imported by
-    /// snap-sync. A set seeded by an event one node witnessed and
-    /// another did not is a set two replicas compose different ticks
-    /// from.
-    pub crossing_leaves: CrossingLeaves,
-
     /// The read frontier the committed state holds: how far along each
     /// producer this shard has read, which bounds the record presences
     /// a block may carry and licenses the deletion of an answer. Read
@@ -300,7 +278,6 @@ impl RecoveredState {
                 ChainOrigin::ROOT
             },
             safe_vote_registers: BTreeMap::new(),
-            crossing_leaves: CrossingLeaves::default(),
             read_frontier,
             voted_blocks: Vec::new(),
             recent_headers: Vec::new(),

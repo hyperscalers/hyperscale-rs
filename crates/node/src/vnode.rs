@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
 use hyperscale_engine::CodeAvailability;
-use hyperscale_execution::{ExecCertStore, FinalizationStore};
+use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
@@ -145,6 +145,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
     let tx_store = Arc::new(TxStore::new());
     let exec_cert_store = Arc::new(ExecCertStore::new());
     let finalization_store = Arc::new(FinalizationStore::new());
+    let crossing_index = Arc::new(CrossingIndexSlot::default());
 
     args.vnodes
         .into_iter()
@@ -185,6 +186,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 Arc::clone(&tx_store),
                 Arc::clone(&exec_cert_store),
                 Arc::clone(&finalization_store),
+                Arc::clone(&crossing_index),
             );
             VnodeInit { state, signer }
         })

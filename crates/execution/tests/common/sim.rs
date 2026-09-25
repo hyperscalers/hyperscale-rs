@@ -33,7 +33,9 @@ use hyperscale_engine::{AllCodeRuns, ExecutedTx};
 use hyperscale_execution::action_handlers::{
     ExecutionOutputs, accumulate_tick_output, split_execution_outputs,
 };
-use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
+use hyperscale_execution::{
+    CrossingIndexSlot, ExecCertStore, ExecutionCoordinator, FinalizationStore,
+};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{
     Anchored, RecoveredState, ReplayWindow, SubstateStore, Substates, TickChain, TickOutput,
@@ -540,6 +542,7 @@ impl ExecutionSim {
             ValidatorId::new(0),
             self.local_shard,
             Arc::new(AllCodeRuns),
+            Arc::new(CrossingIndexSlot::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),

@@ -40,8 +40,8 @@ use hyperscale_jmt::TreeReader;
 /// kernel's, so the executor and the chain read one vocabulary.
 pub use hyperscale_vm_kernel::Substates;
 pub use shard::boundary::{
-    AdoptSource, Adoption, BOUNDARY_RETAIN, BoundaryStore, CrossingLeaves, ImportCursor,
-    ImportProgress, Subtree, Vintage, WitnessSeed, adopt_plan, holds_state,
+    AdoptSource, Adoption, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, Subtree,
+    Vintage, WitnessSeed, adopt_plan, holds_state,
 };
 pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
 pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};

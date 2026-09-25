@@ -15,7 +15,7 @@ use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{AllCodeRuns, ExecutionMode, Executor};
-use hyperscale_execution::{ExecCertStore, FinalizationStore};
+use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_hbor::Capped;
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network::HandlerRegistry;
@@ -144,6 +144,7 @@ impl Fixture {
             Arc::new(TxStore::new()),
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
+            Arc::new(CrossingIndexSlot::default()),
         );
         VnodeInit {
             state,

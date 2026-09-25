@@ -41,7 +41,7 @@ mod ticks;
 mod vote_tracker;
 
 pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
-pub use counterparts::Offers;
+pub use counterparts::{CrossingIndex, CrossingIndexSlot, Offers};
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
 pub use lookups::{provision_request, record_pushes, records_written};

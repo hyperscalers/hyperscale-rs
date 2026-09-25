@@ -40,8 +40,8 @@ use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BOUNDARY_RETAIN, BoundaryStore, ChainWrites, CrossingLeaves, GenesisCommit,
-    ImportCursor, ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState,
+    Anchored, BOUNDARY_RETAIN, BoundaryStore, ChainWrites, GenesisCommit, ImportCursor,
+    ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState,
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
     SweepIndex, VersionedStore, WitnessSeed, committed_tx_cell_key, committed_tx_cells,
     holds_state, key_under_prefix, sweep_for_block,
@@ -1724,143 +1724,6 @@ where
         fresh.crossing_rows(&NibblePath::empty()),
         storage.crossing_rows(&NibblePath::empty()),
         "an imported store indexes what the committing one does",
-    );
-}
-
-/// Shared serve → import round trip: leaves enumerated and resolved
-/// from `serving`'s pinned boundary rebuild an identical store in
-/// `fresh`, with the raw substates readable and a second import
-/// rejected.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-/// Shared boundary test: a store answers for the escrow records its
-/// committed state holds, and for nothing else.
-///
-/// Read off the state rather than an index, which is why it does not
-/// matter how the cells arrived — a commit here, an import at a reshape
-/// successor's adoption — nor how the store was reached. `recovered`
-/// answers as a restart does, and answers with the same set: a node
-/// resuming a store owes exactly what a node that never stopped owes,
-/// or the two compose different ticks.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-pub fn test_escrow_records_are_read_off_the_state<S>(
-    storage: &S,
-    recovered: impl Fn(ShardId) -> RecoveredState,
-) where
-    S: BoundaryStore + TestStore,
-{
-    let owed = |shard: ShardId| {
-        let scanned = storage.crossing_leaves(shard);
-        assert_eq!(
-            recovered(shard).crossing_leaves,
-            scanned,
-            "a resumed store owes what a running one does",
-        );
-        scanned
-    };
-    install_stub_protocol_statics();
-    // The left half of the keyspace. `state_key` fills all thirty-one
-    // body bytes with its owner seed, so a seed under 0x80 sits here and
-    // one at or above it sits in the sibling.
-    let shard = ShardId::leaf(1, 0);
-    let commit = |writes: &SettledWrites| {
-        commit_writes(storage, writes);
-    };
-    assert_eq!(
-        owed(shard),
-        CrossingLeaves::default(),
-        "a store holding nothing owes nothing",
-    );
-
-    commit(&make_settled_writes(1, 1, vec![9, 9, 9]));
-    assert_eq!(
-        owed(shard),
-        CrossingLeaves::default(),
-        "an ordinary cell is neither family, wherever it sits",
-    );
-
-    // Real leaves at their derived keys, so the scan is held to the
-    // classifier the chain runs: a record sits at its producer's record
-    // key and holds the crossing, and a claim at its consumer's claim
-    // key. `state_key` fills the body with the owner seed, so a
-    // producer seeded under 0x80 sits in the left half.
-    let crossing = |producer: u8, consumer: u8| CrossingId {
-        producer: state_key(producer, 0).owner,
-        consumer: state_key(consumer, 0).owner,
-        intent: IntentHash(Hash32([producer; 32])),
-        local: 0,
-        output: 0,
-    };
-    let record_of = |id: CrossingId| {
-        (
-            id.record_key(&ProtocolHasher),
-            id.cell(
-                VmTxHash(Hash32([0xC0; 32])),
-                ResourceAddr::new([0xE0; 31]),
-                500,
-                1_000,
-                Terms::Owed,
-            )
-            .to_bytes(),
-        )
-    };
-    let (record, record_value) = record_of(crossing(2, 0x83));
-    let (sibling, sibling_value) = record_of(crossing(0x82, 3));
-    commit(&SettledWrites::from_absolutes(BTreeMap::from([
-        (record, Some(record_value.clone())),
-        (sibling, Some(sibling_value.clone())),
-    ])));
-    assert_eq!(
-        owed(shard),
-        CrossingLeaves {
-            records: vec![(record, record_value)],
-            ..CrossingLeaves::default()
-        },
-        "a record reads back with the bytes a reclaim composes from, and a \
-         record under the sibling's prefix is not this shard's to owe",
-    );
-    assert_eq!(
-        owed(ShardId::leaf(1, 1)),
-        CrossingLeaves {
-            records: vec![(sibling, sibling_value)],
-            ..CrossingLeaves::default()
-        },
-        "and the sibling's own scan answers with its own",
-    );
-
-    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
-        record, None,
-    )])));
-    assert_eq!(
-        owed(shard),
-        CrossingLeaves::default(),
-        "a record taken back is no longer owed",
-    );
-
-    // The answering side of the same scan: a claim this shard wrote is
-    // found by the one question a leaf can be asked, beside the records
-    // rather than among them.
-    let answered = crossing(0x84, 3);
-    let claim = answered.answer_key(&ProtocolHasher, Answered::Taken);
-    let claim_value = answered
-        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken)
-        .to_bytes();
-    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
-        claim,
-        Some(claim_value.clone()),
-    )])));
-    assert_eq!(
-        owed(shard),
-        CrossingLeaves {
-            claims: vec![(claim, claim_value)],
-            ..CrossingLeaves::default()
-        },
-        "a claim is the other family the scan answers with",
     );
 }
 

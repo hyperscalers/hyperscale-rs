@@ -9,7 +9,7 @@
 //! selection, and the acceptance check — so both harnesses call one gate
 //! rather than re-deriving any part of it.
 
-use hyperscale_storage::{AdoptSource, BoundaryStore, CrossingLeaves, RecoveredState};
+use hyperscale_storage::{AdoptSource, BoundaryStore, RecoveredState};
 use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, ReadFrontier, ShardId, StateRoot};
 
 use super::orchestrator::AdoptKind;
@@ -53,18 +53,6 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     let substate_bytes = storage
         .substate_bytes_at_version(origin.genesis_height.inner())
         .unwrap_or(0);
-    // A seat's obligations come from the leaves it imported and from
-    // nothing else, whichever way it was seated. The value a predecessor
-    // escrowed arrives with the prefix and no chain here names it: a
-    // merged parent's chain begins at the import, a memory clone holds
-    // no blocks at all, and the predecessor drops its ledger at the cut.
-    // So the state is the authority for every kind, and it is what every
-    // keeper imported.
-    //
-    // A cloned store carrying the predecessor's blocks composes nothing
-    // twice on top of this: the replay walk stops at this chain's own
-    // origin, so it never reaches a block the predecessor committed.
-    let crossing_leaves = storage.crossing_leaves(shard);
     let read_frontier = storage.read_frontier(shard);
     verified_recovered_state(
         adopted,
@@ -72,7 +60,6 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
         origin,
         substate_bytes,
         predecessors,
-        crossing_leaves,
         read_frontier,
     )
 }
@@ -88,7 +75,6 @@ fn verified_recovered_state(
     origin: ChainOrigin,
     substate_bytes: u64,
     predecessors: Vec<PredecessorTerminal>,
-    crossing_leaves: CrossingLeaves,
     read_frontier: ReadFrontier,
 ) -> Result<RecoveredState, String> {
     if adopted != expected {
@@ -100,7 +86,6 @@ fn verified_recovered_state(
         substate_bytes,
         chain_origin: origin,
         predecessors,
-        crossing_leaves,
         read_frontier,
         ..RecoveredState::default()
     })
@@ -108,7 +93,6 @@ fn verified_recovered_state(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_storage::CrossingLeaves;
     use hyperscale_types::{
         BlockHeight, ChainOrigin, Epoch, Hash, ReadFrontier, ReadMark, ShardId, StateRoot,
         WeightedTimestamp,
@@ -141,7 +125,6 @@ mod tests {
             origin(),
             4_096,
             Vec::new(),
-            CrossingLeaves::default(),
             read_frontier.clone(),
         )
         .expect("matches");
@@ -161,7 +144,6 @@ mod tests {
                 origin(),
                 0,
                 Vec::new(),
-                CrossingLeaves::default(),
                 ReadFrontier::default(),
             )
             .is_err()

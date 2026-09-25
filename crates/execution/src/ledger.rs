@@ -1090,22 +1090,22 @@ impl Ledger {
         self.owed.contains_key(&tx_hash)
     }
 
-    /// Whether an entry here will compose the disposal of the records
-    /// `tx_hash` issued on this shard, so the leaves are not the leaf
-    /// path's to settle beside it.
+    /// Whether an entry here will compose the disposal of the record at
+    /// `key`, so the leaf road leaves it to that entry.
     ///
     /// The entries that issue are exactly those: a leg and a remainder
     /// settle what they issued, and a core member becomes a remainder
     /// at its own verdict. A delivery and a whole entry issue none —
     /// the whole one including a record reconstructed it, which carries
     /// the figures an abandonment restates and nothing a settlement is
-    /// composed from. Such an entry gives the verdict and the
-    /// reservation back; the leaves are answered for where they are.
+    /// composed from. Scans the entries, as [`Self::untaken_legs`] does.
     #[must_use]
-    pub(crate) fn settles_records(&self, tx_hash: TxHash) -> bool {
-        self.owed
-            .get(&tx_hash)
-            .is_some_and(|owed| owed.part.settling().is_some())
+    pub(crate) fn settles_record(&self, key: SubstateKey) -> bool {
+        self.owed.values().any(|owed| {
+            owed.part
+                .settling()
+                .is_some_and(|kept| kept.issued(self.local).contains(&key))
+        })
     }
 
     /// Every leg entry no tick has taken the records of yet, with what
@@ -1161,9 +1161,16 @@ impl Ledger {
 
     /// Record that the commit fold removed `record` on its consumer's
     /// `Taken`, on the entry `tx_hash` names.
-    pub(crate) fn settled(&mut self, record: SubstateKey, tx_hash: TxHash) {
-        if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.part.mark_gone(record);
+    pub(crate) fn settled(&mut self, record: SubstateKey) {
+        let local = self.local;
+        for owed in self.owed.values_mut() {
+            if owed
+                .part
+                .held()
+                .is_some_and(|held| held.kept.issued(local).contains(&record))
+            {
+                owed.part.mark_gone(record);
+            }
         }
     }
 
@@ -3290,7 +3297,7 @@ mod tests {
             .expect("the leg issues one crossing");
         assert!(ledger.closes().is_empty(), "nothing closes on a clock");
 
-        ledger.settled(record, tx.hash());
+        ledger.settled(record);
         assert_eq!(
             ledger.closes(),
             vec![(
@@ -3307,7 +3314,7 @@ mod tests {
         let mut reclaiming = Ledger::new(LOCAL);
         commit_as(&mut reclaiming, &tx, &classified());
         reclaiming.admit_reclaim(tx.hash());
-        reclaiming.settled(record, tx.hash());
+        reclaiming.settled(record);
         assert!(reclaiming.closes().is_empty());
         assert_eq!(reclaiming.len(), 1);
     }
@@ -3326,7 +3333,7 @@ mod tests {
             .find(|(edge, _)| edge.from == LOCAL)
             .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
             .expect("the leg issues one crossing");
-        ledger.settled(record, tx.hash());
+        ledger.settled(record);
         assert!(
             ledger.closes().is_empty(),
             "the delivery this shard owes is still owed",

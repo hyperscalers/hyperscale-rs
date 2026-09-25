@@ -44,6 +44,7 @@ use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard::consensus::{BlockSyncInput, ConsensusState};
 use crate::shard::cross_shard::CrossShardState;
+use crate::shard::crossing_index::ChainCrossings;
 use crate::shard::instances::InstancesState;
 use crate::shard::mempool::MempoolState;
 use crate::shard::packages::PackagesState;
@@ -771,6 +772,12 @@ fn build_shard_io<S: ShardStorage>(
         Arc::clone(&storage),
         rep.state.shard_coordinator().chain_origin(),
     ));
+    // Every vnode of the group asks its crossing questions of this
+    // chain's committed tip, now that the chain is open.
+    rep.state
+        .execution_coordinator()
+        .crossing_index()
+        .bind(Arc::new(ChainCrossings(Arc::clone(&pending_chain))));
     let tick_chain = Arc::new(TickChain::new(Arc::clone(&storage)));
     let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);
     {

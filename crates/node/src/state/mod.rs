@@ -28,7 +28,9 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_engine::CodeAvailability;
-use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
+use hyperscale_execution::{
+    CrossingIndexSlot, ExecCertStore, ExecutionCoordinator, FinalizationStore,
+};
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
     OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
@@ -107,6 +109,7 @@ impl NodeStateMachine {
         tx_store: Arc<TxStore>,
         exec_cert_store: Arc<ExecCertStore>,
         finalization_store: Arc<FinalizationStore>,
+        crossing_index: Arc<CrossingIndexSlot>,
     ) -> Self {
         let verifier = Arc::clone(beacon_coordinator.verifier());
         Self {
@@ -127,6 +130,7 @@ impl NodeStateMachine {
                 tx_store,
                 exec_cert_store,
                 finalization_store,
+                crossing_index,
             )),
         }
     }

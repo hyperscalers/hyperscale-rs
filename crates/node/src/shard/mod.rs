@@ -26,6 +26,7 @@ pub(crate) mod caches;
 pub(crate) mod commit;
 pub(crate) mod consensus;
 pub(crate) mod cross_shard;
+pub(crate) mod crossing_index;
 pub(crate) mod instances;
 pub(crate) mod io;
 pub(crate) mod mempool;

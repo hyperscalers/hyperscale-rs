@@ -19,16 +19,15 @@ use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryStore, CrossingLeaves, ImportProgress, JmtSnapshot, LeafRows,
-    SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
-    key_under_prefix, load_read_frontier, prefix_low_key,
+    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, SubstateStore, Substates,
+    SweepRows, WitnessSeed, followed_block_writes, holds_state, key_under_prefix,
+    load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, FrontierInputs, ReadFrontier, ShardId,
-    StateRoot, SubstateKey, SubstateLeaf, shard_prefix_path,
+    StateRoot, SubstateKey, SubstateLeaf,
 };
-use hyperscale_vm_effects::CrossingLeaf;
-use hyperscale_vm_types::{Address, CollectionId, ProtocolHasher};
+use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
 use tracing::warn;
@@ -522,25 +521,6 @@ impl Substates for CheckpointStore {
 impl BoundaryStore for RocksDbShardStorage {
     type Boundary = CheckpointStore;
 
-    fn crossing_leaves(&self, shard: ShardId) -> CrossingLeaves {
-        let cf = self.cf();
-        let prefix = shard_prefix_path(shard);
-        let mut leaves = CrossingLeaves::default();
-        for (key, value) in
-            iter_from::<StateCf>(&self.db, StateCf::handle(&cf), &prefix_low_key(&prefix))
-                .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
-        {
-            match CrossingLeaf::read(&ProtocolHasher, key, &value) {
-                Some(CrossingLeaf::Record { .. }) => {
-                    leaves.records.push((key, value));
-                }
-                Some(CrossingLeaf::Answer { .. }) => leaves.claims.push((key, value)),
-                None => {}
-            }
-        }
-        leaves
-    }
-
     fn crossing_rows(&self, under: &NibblePath) -> Vec<SubstateKey> {
         let cf = self.cf();
         iter_from::<CrossingIndexCf>(
@@ -759,12 +739,11 @@ mod tests {
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
         test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
-        test_escrow_records_are_read_off_the_state, test_followed_halves_fold_the_settlements,
-        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
-        test_the_read_frontier_is_read_off_the_state,
+        test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
+        test_import_gate_reads_the_trie, test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, ShardChainReader, SubstateStore};
-    use hyperscale_types::AddressClass;
+    use hyperscale_types::{AddressClass, shard_prefix_path};
     use tempfile::TempDir;
 
     use super::*;
@@ -946,17 +925,6 @@ mod tests {
             running,
             "a reopened store holds the index a running one does",
         );
-    }
-
-    /// A store answers for the escrow records its state holds, which is
-    /// what a merge successor's adoption reads its obligations off.
-    #[test]
-    fn escrow_records_are_read_off_the_state() {
-        let temp = TempDir::new().unwrap();
-        let storage = open_storage(temp.path());
-        test_escrow_records_are_read_off_the_state(&storage, |shard| {
-            storage.load_recovered_state(shard)
-        });
     }
 
     /// A store answers for the read frontier its state holds, the same

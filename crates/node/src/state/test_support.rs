@@ -17,7 +17,7 @@ use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::AllCodeRuns;
-use hyperscale_execution::{ExecCertStore, FinalizationStore};
+use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
@@ -85,6 +85,7 @@ impl TestNodeBuilder {
             Arc::new(TxStore::new()),
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
+            Arc::new(CrossingIndexSlot::default()),
         );
 
         TestNode { node, committee }

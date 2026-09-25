@@ -937,53 +937,6 @@ pub fn make_finalization_leaving(
     )
 }
 
-/// [`make_finalization_leaving`] for a member no set of certificates
-/// covers: its outcome awaits `awaiting`, and no certificate here
-/// reports for that shard.
-///
-/// What such a member's writes are is the point — they are in the
-/// finalization and they never reach state, because
-/// `settling_receipts` drops them. A fold that reads `receipts`
-/// instead takes them.
-///
-/// # Panics
-///
-/// If a list written out here is past the cap its type states.
-#[must_use]
-pub fn make_finalization_uncovered(
-    block_height: BlockHeight,
-    tx_hash: TxHash,
-    writes: StateWrites,
-    awaiting: ShardId,
-) -> Finalization {
-    let receipt = StoredReceipt::synced(
-        tx_hash,
-        Arc::new(ConsensusReceipt::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
-            writes,
-            beacon_witness_events: Capped::empty(),
-            events: Capped::empty(),
-        }),
-    );
-    let outcomes =
-        vec![TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)).awaiting([awaiting])];
-    let tick_id = TickId::new(ShardId::ROOT, block_height);
-    let ec = ExecutionCertificate::new(
-        tick_id,
-        WeightedTimestamp::from_millis(block_height.inner() + 1),
-        compute_global_receipt_root(&outcomes),
-        Capped::new(outcomes).expect("a list written out in a test"),
-        AggregateSignature::new([0u8; 96]),
-        SignerBitfield::new(4),
-    );
-    Finalization::new(
-        tick_id,
-        TickHalf::Determined,
-        &Capped::from_array([Arc::new(ec)]),
-        Capped::from_array([receipt]),
-    )
-}
-
 /// A single-certificate finalization at `block_height` over `outcomes`.
 ///
 /// # Panics
