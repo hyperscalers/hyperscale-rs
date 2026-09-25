@@ -323,8 +323,7 @@ where
 
     fn handle_restore_committed_state(&self) {
         let storage = &self.io.storage;
-        let height = storage.committed_height();
-        let hash = storage.committed_hash();
+        let (height, hash) = storage.committed_head();
         let qc = storage.latest_qc();
         push_protocol_event(
             self.event_sender(),

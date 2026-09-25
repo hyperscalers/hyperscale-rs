@@ -3784,8 +3784,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
 pub fn test_a_fresh_store_holds_nothing<S: TestStore + ShardChainReader>(storage: &S) {
     assert_eq!(storage.jmt_height(), BlockHeight::GENESIS);
     assert_eq!(storage.state_root(), StateRoot::ZERO);
-    assert_eq!(storage.committed_height(), BlockHeight::GENESIS);
-    assert!(storage.committed_hash().is_none());
+    assert_eq!(storage.committed_head(), (BlockHeight::GENESIS, None));
     assert!(storage.latest_qc().is_none());
     assert!(storage.get_block(BlockHeight::new(999)).is_none());
     assert!(

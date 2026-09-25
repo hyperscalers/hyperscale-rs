@@ -63,8 +63,9 @@ impl ShardChainReader for RocksDbShardStorage {
         self.read_committed_height()
     }
 
-    fn committed_hash(&self) -> Option<BlockHash> {
-        self.read_committed_hash().map(BlockHash::from_raw)
+    fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {
+        let (height, hash) = self.read_committed_head();
+        (height, hash.map(BlockHash::from_raw))
     }
 
     fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {

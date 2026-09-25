@@ -258,15 +258,13 @@ where
     /// If no blocks have been committed yet, returns a view with no
     /// pending entries (reads fall through to base storage).
     pub fn view_at_committed_tip(self: &Arc<Self>) -> Arc<SubstateView<S>> {
-        self.base.committed_hash().map_or_else(
-            || {
-                Arc::new(SubstateView::base_only(
-                    Arc::clone(&self.base),
-                    self.base.jmt_height(),
-                ))
-            },
-            |h| self.view_at(h, self.base.committed_height()),
-        )
+        match self.base.committed_head() {
+            (height, Some(hash)) => self.view_at(hash, height),
+            (_, None) => Arc::new(SubstateView::base_only(
+                Arc::clone(&self.base),
+                self.base.jmt_height(),
+            )),
+        }
     }
 
     /// Attach the [`CertifiedBlock`] to the entry inserted earlier at
@@ -1340,6 +1338,10 @@ mod tests {
         /// whole-block rehydration. The attested window folds read the
         /// metadata row instead, and a test pins that they make none.
         sync_block_reads: AtomicUsize,
+        /// What [`ShardChainReader::committed_head`] answers. The bare
+        /// [`ShardChainReader::committed_height`] stays at genesis, so a
+        /// reader that pairs the two separately sees a store that moved.
+        head: (BlockHeight, Option<BlockHash>),
     }
 
     impl StubStore {
@@ -1491,8 +1493,8 @@ mod tests {
         fn committed_height(&self) -> BlockHeight {
             BlockHeight::new(0)
         }
-        fn committed_hash(&self) -> Option<BlockHash> {
-            None
+        fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {
+            self.head
         }
         fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
             None
@@ -1627,6 +1629,28 @@ mod tests {
             stub = stub.with_block(b);
         }
         Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT))
+    }
+
+    /// The committed tip's hash and height are one read. A persist that
+    /// lands between two separate reads pairs the old tip's hash with the
+    /// new height while the old tip is still pending, and the walk's
+    /// height check takes the shard loop down with it.
+    #[test]
+    fn the_committed_tip_view_anchors_at_its_own_heads_height() {
+        let tip = bh(b"tip");
+        let stub = StubStore {
+            head: (BlockHeight::new(5), Some(tip)),
+            ..StubStore::default()
+        };
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        chain.insert(
+            tip,
+            entry_at(bh(b"parent"), BlockHeight::new(5), &StateWrites::default()),
+        );
+        assert_eq!(
+            chain.view_at_committed_tip().anchor_height,
+            BlockHeight::new(5)
+        );
     }
 
     #[test]

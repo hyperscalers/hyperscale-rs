@@ -623,11 +623,8 @@ impl RocksDbShardStorage {
     // Chain metadata
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Get the chain metadata (committed height, hash, and QC).
-    ///
-    /// Reads all three chain metadata keys in one call. Use the individual
-    /// `read_committed_height`, `read_committed_hash`, `read_latest_qc`
-    /// methods when only one value is needed.
+    /// Get the chain metadata (committed height, hash, and QC), all three
+    /// read from one snapshot.
     #[must_use]
     pub(crate) fn get_chain_metadata(
         &self,
@@ -638,9 +635,10 @@ impl RocksDbShardStorage {
     ) {
         let start = Instant::now();
 
-        let height = self.read_committed_height();
-        let hash = self.read_committed_hash();
-        let qc = self.read_latest_qc();
+        let snapshot = self.db.snapshot();
+        let height = read_committed_height(&snapshot);
+        let hash = read_committed_hash(&snapshot);
+        let qc = read_committed_qc(&snapshot).map(Verified::<QuorumCertificate>::from_persisted);
 
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);
@@ -654,9 +652,13 @@ impl RocksDbShardStorage {
         read_committed_height(&*self.db)
     }
 
-    /// Read only the committed hash from `RocksDB`.
-    pub(crate) fn read_committed_hash(&self) -> Option<Hash> {
-        read_committed_hash(&*self.db)
+    /// Read the committed height and hash from one snapshot.
+    pub(crate) fn read_committed_head(&self) -> (BlockHeight, Option<Hash>) {
+        let snapshot = self.db.snapshot();
+        (
+            read_committed_height(&snapshot),
+            read_committed_hash(&snapshot),
+        )
     }
 
     /// Read only the latest QC from `RocksDB`.

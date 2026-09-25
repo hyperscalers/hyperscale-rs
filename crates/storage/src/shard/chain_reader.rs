@@ -71,8 +71,11 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;
 
-    /// Get the latest committed block hash.
-    fn committed_hash(&self) -> Option<BlockHash>;
+    /// The committed height and the hash of the block at it, read
+    /// together so a commit landing mid-read never pairs one block's hash
+    /// with another's height. The hash is `None` before the first commit
+    /// and at a split child's adopted genesis.
+    fn committed_head(&self) -> (BlockHeight, Option<BlockHash>);
 
     /// Get the latest quorum certificate.
     fn latest_qc(&self) -> Option<Verified<QuorumCertificate>>;

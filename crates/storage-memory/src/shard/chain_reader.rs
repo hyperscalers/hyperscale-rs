@@ -58,8 +58,9 @@ impl ShardChainReader for SimShardStorage {
         read_or_recover(&self.consensus).committed_height
     }
 
-    fn committed_hash(&self) -> Option<BlockHash> {
-        read_or_recover(&self.consensus).committed_hash
+    fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {
+        let consensus = read_or_recover(&self.consensus);
+        (consensus.committed_height, consensus.committed_hash)
     }
 
     fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
