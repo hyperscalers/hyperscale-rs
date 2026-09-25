@@ -149,11 +149,11 @@ impl DedupWindow {
         loop {
             if height < origin.genesis_height {
                 // The bottom of this chain. Nothing beneath it was ever
-                // committed *here*, and for a reshape successor what its
-                // predecessor committed beneath it is refused by a
-                // different rule — a transaction whose validity window
-                // opened before the chain did cannot be admitted at all,
-                // so there is nothing down there for this window to hold.
+                // committed *here*: a predecessor's finalizations and
+                // provisions reached their own chain, and every one of its
+                // transactions is answered by the markers the precut rule
+                // reads, so there is nothing down there for this window
+                // to hold.
                 window.reached_origin = true;
                 window.fee_holds_whole = true;
                 return window;

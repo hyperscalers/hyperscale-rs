@@ -2577,6 +2577,7 @@ dependencies = [
  "hyperscale-vm-effects",
  "hyperscale-vm-kernel",
  "hyperscale-vm-types",
+ "proptest",
  "rayon",
  "thiserror 2.0.20",
  "tracing",

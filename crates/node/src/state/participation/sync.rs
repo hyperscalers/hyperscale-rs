@@ -6,13 +6,9 @@
 //! provisions flush their expected sets so we can immediately
 //! participate in execution for blocks within the `MAX_FINALIZATION_DELAY` window.
 
-use std::collections::BTreeMap;
-
 use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_shard::SettledTxSet;
-use hyperscale_types::{
-    PredecessorTerminal, ShardId, TopologySchedule, TxHash, derive_block_transactions,
-};
+use hyperscale_types::{ShardId, SubstateKey, TopologySchedule, derive_block_transactions};
 
 use super::ShardParticipation;
 
@@ -75,32 +71,32 @@ impl ShardParticipation {
                 SettledTxSet { txs, terminal_wt },
             ),
 
-            // A state proof against a core's commit-proven header
-            // verified: the execution coordinator reads its probes off
-            // it and hands each absence on.
+            // A state proof against a commit-proven header verified. A
+            // proof against the parent terminal this chain asks answers
+            // which markers it holds: record them and re-drive the
+            // proposal that was filtering them out; the votes that
+            // deferred for want of them re-drive off the fence's
+            // evidence. The execution coordinator reads its own probes
+            // off every proof and ignores keys it never asked.
             ProtocolEvent::FetchedStateProofVerified {
                 anchor,
                 keys,
                 proof,
                 values,
             } => {
+                if self.shard_coordinator.precut_terminal() == Some(anchor)
+                    && let Ok(inclusions) = proof.inclusions(anchor.state_root, anchor.shard, &keys)
+                {
+                    let presences: Vec<(SubstateKey, bool)> = inclusions
+                        .into_iter()
+                        .map(|(key, inclusion)| (key, inclusion.value_hash().is_some()))
+                        .collect();
+                    self.shard_coordinator
+                        .record_precut_proof(anchor, &presences);
+                    self.shard_coordinator.queue_ready_proposal();
+                }
                 self.execution_coordinator
                     .on_proof_fetched(anchor, &keys, &proof, &values);
-                Vec::new()
-            }
-            // A predecessor answered which of the queried transactions it
-            // committed. Record the answers and re-drive the proposal
-            // that was filtering them out; the votes that deferred for
-            // want of them re-drive off the fence's evidence.
-            ProtocolEvent::PrecutResolutionsReceived {
-                predecessor,
-                answers,
-            } => {
-                for (tx_hash, absent) in answers {
-                    self.shard_coordinator
-                        .record_precut_resolution(predecessor, tx_hash, absent);
-                }
-                self.shard_coordinator.queue_ready_proposal();
                 Vec::new()
             }
             _ => unreachable!("non-sync event routed to handle_sync"),
@@ -130,25 +126,24 @@ impl ShardParticipation {
         actions
     }
 
-    /// Ask each predecessor about the pre-cut transactions this node is
-    /// still holding a refusal over.
+    /// Ask the parent's terminal for the markers of the pre-cut
+    /// transactions this right child is still holding a refusal over.
     ///
-    /// One request per predecessor, carrying that predecessor's complete
-    /// outstanding set — the io side diffs it against what the fetch
-    /// already holds, so a pair that drops out of the set here is what
-    /// releases its slot. That is why a predecessor with nothing
-    /// outstanding still gets a request: an empty set is how the last
-    /// query retires.
+    /// One request carrying the complete outstanding set — the io side
+    /// diffs it against what the fetch already holds under the terminal,
+    /// so a key that drops out of the set here is what releases its slot.
+    /// That is why nothing outstanding still sends a request: an empty set
+    /// is how the last query retires.
     ///
     /// Once the rule retires the outstanding set is empty rather than
-    /// unasked, so the last release still goes out; the predecessors are
+    /// unasked, so the last release still goes out; the terminal is
     /// dropped immediately after, which is what makes this the final pass.
     pub(in crate::state) fn scan_precut_queries(&mut self) -> Vec<Action> {
-        if !self.shard_coordinator.has_precut_predecessors() {
+        let Some(terminal) = self.shard_coordinator.precut_terminal() else {
             return Vec::new();
-        }
+        };
         let live = self.shard_coordinator.precut_rule_live();
-        let outstanding = if live {
+        let keys = if live {
             let cut = self.shard_coordinator.chain_origin().anchor_wt;
             let candidates = self.mempool_coordinator.pending_opening_before(cut);
             self.shard_coordinator
@@ -156,31 +151,15 @@ impl ShardParticipation {
         } else {
             Vec::new()
         };
-
-        let mut by_predecessor: BTreeMap<PredecessorTerminal, Vec<TxHash>> = self
-            .shard_coordinator
-            .predecessors()
-            .iter()
-            .map(|predecessor| (*predecessor, Vec::new()))
-            .collect();
-        for (predecessor, tx_hash) in outstanding {
-            by_predecessor.entry(predecessor).or_default().push(tx_hash);
-        }
-        let actions: Vec<Action> = by_predecessor
-            .into_iter()
-            .map(|(predecessor, tx_hashes)| {
-                Action::Fetch(FetchRequest::CommittedTxs {
-                    predecessor,
-                    tx_hashes,
-                    preferred: None,
-                    class: None,
-                })
-            })
-            .collect();
         if !live {
             self.shard_coordinator.retire_precut();
         }
-        actions
+        vec![Action::Fetch(FetchRequest::PrecutProofs {
+            terminal,
+            keys,
+            preferred: None,
+            class: None,
+        })]
     }
 
     /// Record a past-terminal shard's settled set, which releases what

@@ -1232,19 +1232,23 @@ impl MempoolCoordinator {
     }
 
     /// Transactions still awaiting inclusion whose validity window opened
-    /// before `wt`. Parked ones included: a reshape successor refuses
-    /// them all until it can prove them absent from what its predecessor
-    /// committed, so being unselectable for another reason doesn't make
-    /// the question moot.
+    /// before `wt`, each with the end of its range, which names its
+    /// committed marker. Parked ones included: a split's right child
+    /// refuses them all until its parent's terminal state proves their
+    /// markers absent, so being unselectable for another reason doesn't
+    /// make the question moot.
     #[must_use]
-    pub fn pending_opening_before(&self, wt: WeightedTimestamp) -> Vec<TxHash> {
+    pub fn pending_opening_before(
+        &self,
+        wt: WeightedTimestamp,
+    ) -> Vec<(TxHash, WeightedTimestamp)> {
         self.pool
             .iter()
             .filter(|(_, entry)| {
                 matches!(entry.status, TransactionStatus::Pending)
                     && entry.tx.validity_range().start_timestamp_inclusive < wt
             })
-            .map(|(hash, _)| *hash)
+            .map(|(hash, entry)| (*hash, entry.tx.validity_range().end_timestamp_exclusive))
             .collect()
     }
 

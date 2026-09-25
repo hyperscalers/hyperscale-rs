@@ -17,17 +17,15 @@ use hyperscale_metrics::record_fetch_response_refused;
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
-    GetCommittedTxsRequest, GetExecutionCertsRequest, GetFinalizationsRequest,
-    GetLocalProvisionsRequest, GetProvisionsRequest, GetSettledTxsRequest, GetStateProofRequest,
+    GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
+    GetProvisionsRequest, GetSettledTxsRequest, GetStateProofRequest,
 };
-use hyperscale_types::network::response::{
-    CommittedTxVerdict, GetCommittedTxsResponse, GetSettledTxsResponse, GetStateProofResponse,
-};
+use hyperscale_types::network::response::{GetSettledTxsResponse, GetStateProofResponse};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
-    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash,
-    ValidatorId, Verifiable, settled_txs_root_from_hashes,
+    ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId, Verifiable,
+    settled_txs_root_from_hashes,
 };
 
 use crate::fetch::{
@@ -47,12 +45,6 @@ pub type ExecCertFetch = Fetch<(ShardId, TxHash)>;
 /// the responding committee; `target_shard` rides in the body for
 /// response filtering on the responder.
 pub type ProvisionFetch = Fetch<(ShardId, ShardId, BlockHeight)>;
-/// Committed-transaction membership fetch keyed by
-/// `(predecessor, tx_hash)`. The predecessor's shard selects the
-/// responding committee, its terminal rides in the body as the window to
-/// reconstruct, and its `committed_txs_root` is the key each absence
-/// proof is checked against.
-pub type CommittedTxFetch = Fetch<(PredecessorTerminal, TxHash)>;
 pub type StateProofFetch = Fetch<(Anchor, SubstateKey)>;
 /// Settled-set fetch keyed by the departed shard's terminal evidence:
 /// the terminal the window is reconstructed from and the root the list
@@ -323,114 +315,6 @@ impl FetchBinding for ExecCertBinding {
                 }
             }),
         );
-    }
-}
-
-/// Pair a committed-transaction response with the transactions it
-/// answers for, or `None` when the response is unusable.
-///
-/// Verdicts are positional, so a length that doesn't match the request
-/// is malformed rather than partial — nothing in it can be paired up.
-/// Absence is the answer that relaxes the successor's standing refusal,
-/// so it is the one that has to lift to `terminal.committed_txs_root`;
-/// `Committed` is what the successor already assumes and carries no
-/// proof.
-///
-/// One bad entry condemns the whole response rather than being skipped.
-/// A peer that got any of it wrong has said nothing this node can lift
-/// to the attested root, and picking through it would let a peer choose
-/// which questions get answered.
-fn verified_answers(
-    verdicts: &[CommittedTxVerdict],
-    terminal: PredecessorTerminal,
-    tx_hashes: &[TxHash],
-) -> Option<Vec<(TxHash, bool)>> {
-    if verdicts.len() != tx_hashes.len() {
-        return None;
-    }
-    verdicts
-        .iter()
-        .zip(tx_hashes)
-        .map(|(verdict, hash)| match verdict {
-            CommittedTxVerdict::Committed => Some((*hash, false)),
-            CommittedTxVerdict::Absent(proof) => proof
-                .proves_absent(hash, terminal.committed_txs_root)
-                .then_some((*hash, true)),
-        })
-        .collect()
-}
-
-/// Marker type for the committed-transaction membership fetch.
-pub struct CommittedTxBinding;
-
-impl FetchBinding for CommittedTxBinding {
-    /// `(predecessor, tx_hash)` — the chain that ran before this one and
-    /// a transaction whose membership in its committed set decides
-    /// whether this chain may admit it. The predecessor rides whole
-    /// because the request names its terminal and the answer is checked
-    /// against that terminal's root.
-    type Id = (PredecessorTerminal, TxHash);
-
-    const NAME: &'static str = "committed_tx";
-
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::CommittedTxs(ids)
-    }
-
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
-        &mut shard.cross_shard.committed_tx
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Self::Id>,
-        local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
-    }
-}
-
-impl ScopedAnswer for CommittedTxBinding {
-    type Scope = PredecessorTerminal;
-    type Key = TxHash;
-    type Request = GetCommittedTxsRequest;
-
-    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
-        id
-    }
-
-    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
-        (scope, key)
-    }
-
-    fn request(scope: Self::Scope, keys: &[Self::Key], _asker: ShardId) -> Self::Request {
-        GetCommittedTxsRequest::new(
-            scope.height,
-            scope.block_hash,
-            Capped::new(keys.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
-        )
-    }
-
-    /// Absence is the answer that relaxes the successor's standing
-    /// refusal, so it is the one that has to lift to the terminal's
-    /// `committed_txs_root`; `Committed` is what the successor already
-    /// assumes and carries no proof.
-    fn answer(
-        scope: Self::Scope,
-        keys: Vec<Self::Key>,
-        response: GetCommittedTxsResponse,
-    ) -> Result<ProtocolEvent, Refusal> {
-        let verdicts = response.verdicts.ok_or(Refusal::NotHeld)?;
-        let answers = verified_answers(&verdicts, scope, &keys)
-            .ok_or(Refusal::Unusable("unusable_verdicts"))?;
-        Ok(ProtocolEvent::PrecutResolutionsReceived {
-            predecessor: scope.shard,
-            answers,
-        })
     }
 }
 
@@ -750,118 +634,6 @@ mod state_proof_tests {
             Err(Refusal::Unusable("value_off_its_proof")),
             "a value for a key the proof shows absent",
         );
-    }
-}
-
-#[cfg(test)]
-mod committed_tx_tests {
-    use hyperscale_types::{
-        BlockHash, BlockHeight, CommittedTxsRoot, Hash, committed_txs_root_from_hashes,
-        prove_committed_tx_absent,
-    };
-
-    use super::*;
-
-    fn tx(seed: u8) -> TxHash {
-        TxHash::from(Hash::from_bytes(&[seed]))
-    }
-
-    /// A committed set of seeds 0..8 and the terminal that roots it.
-    fn terminal_over(seeds: std::ops::Range<u8>) -> (PredecessorTerminal, Vec<TxHash>) {
-        let mut members: Vec<TxHash> = seeds.map(tx).collect();
-        members.sort_unstable();
-        let terminal = PredecessorTerminal {
-            shard: ShardId::leaf(1, 0),
-            height: BlockHeight::new(9),
-            block_hash: BlockHash::ZERO,
-            committed_txs_root: committed_txs_root_from_hashes(members.iter()),
-        };
-        (terminal, members)
-    }
-
-    fn absence(members: &[TxHash], probe: TxHash) -> CommittedTxVerdict {
-        CommittedTxVerdict::Absent(
-            prove_committed_tx_absent(members, &probe).expect("probe is not a member"),
-        )
-    }
-
-    /// The two verdicts map to the two answers, in the order asked.
-    #[test]
-    fn verifies_each_answer_against_the_terminal_root() {
-        let (terminal, members) = terminal_over(0..8);
-        let probe = tx(200);
-        let answers = verified_answers(
-            &[CommittedTxVerdict::Committed, absence(&members, probe)],
-            terminal,
-            &[members[0], probe],
-        )
-        .expect("both verdicts are usable");
-        assert_eq!(answers, vec![(members[0], false), (probe, true)]);
-    }
-
-    /// An absence proof lifted from a different set doesn't verify
-    /// against this terminal's root, and the whole response goes with it
-    /// — including the `Committed` answer beside it, which on its own
-    /// would have been fine.
-    #[test]
-    fn a_proof_against_another_root_condemns_the_response() {
-        let (terminal, _) = terminal_over(0..8);
-        let (_, other_members) = terminal_over(100..108);
-        let probe = tx(200);
-        assert!(
-            verified_answers(
-                &[
-                    CommittedTxVerdict::Committed,
-                    absence(&other_members, probe)
-                ],
-                terminal,
-                &[tx(0), probe],
-            )
-            .is_none()
-        );
-    }
-
-    /// A transaction the predecessor really committed cannot be shown
-    /// absent: no proof over the rooted set brackets a member.
-    #[test]
-    fn a_member_has_no_absence_proof() {
-        let (_, members) = terminal_over(0..8);
-        assert!(prove_committed_tx_absent(&members, &members[3]).is_none());
-    }
-
-    /// Short and long answers are both malformed rather than partial —
-    /// positional pairing has nothing to anchor on.
-    #[test]
-    fn a_length_mismatch_is_unusable() {
-        let (terminal, _) = terminal_over(0..8);
-        assert!(
-            verified_answers(&[CommittedTxVerdict::Committed], terminal, &[tx(0), tx(1)]).is_none()
-        );
-        assert!(
-            verified_answers(
-                &[CommittedTxVerdict::Committed, CommittedTxVerdict::Committed],
-                terminal,
-                &[tx(0)],
-            )
-            .is_none()
-        );
-    }
-
-    /// An empty set roots to `ZERO` and every absence over it is free,
-    /// so a predecessor that committed nothing in its window answers
-    /// every query without a tree to walk.
-    #[test]
-    fn an_empty_committed_set_proves_every_absence() {
-        let terminal = PredecessorTerminal {
-            shard: ShardId::leaf(1, 0),
-            height: BlockHeight::new(9),
-            block_hash: BlockHash::ZERO,
-            committed_txs_root: CommittedTxsRoot::ZERO,
-        };
-        let probe = tx(7);
-        let answers = verified_answers(&[absence(&[], probe)], terminal, &[probe])
-            .expect("absence over an empty set verifies");
-        assert_eq!(answers, vec![(probe, true)]);
     }
 }
 

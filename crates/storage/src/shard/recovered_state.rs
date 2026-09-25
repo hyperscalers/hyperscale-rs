@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip,
-    Hash, PredecessorTerminal, Provisions, QuorumCertificate, ReadFrontier, SafeVoteRegisters,
+    Anchor, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin,
+    CommittedTip, Hash, Provisions, QuorumCertificate, ReadFrontier, SafeVoteRegisters,
     ShardAnchor, StateRoot, ValidatorId, Verified, WeightedTimestamp,
 };
 
@@ -72,9 +72,9 @@ pub struct RecoveredState {
     /// [`RETENTION_HORIZON`]: hyperscale_types::RETENTION_HORIZON
     pub dedup: DedupWindow,
 
-    /// The chains this one succeeds, and the commitments they left — one
-    /// for a split child, two for a merged parent, empty for a chain born
-    /// at network genesis or recovered by any path but a reshape flip.
+    /// The chains this one succeeds, each as its terminal state — one for
+    /// a split child, two for a merged parent, empty for a chain born at
+    /// network genesis or recovered by any path but a reshape flip.
     ///
     /// Set only on the flip, which is the delivery fast enough to matter:
     /// the rule these relax retires `MAX_VALIDITY_RANGE` past the origin,
@@ -83,7 +83,7 @@ pub struct RecoveredState {
     /// projection instead, via
     /// `TopologySchedule::predecessor_terminals`, and until either lands
     /// the strict rule stands.
-    pub predecessors: Vec<PredecessorTerminal>,
+    pub predecessors: Vec<Anchor>,
 
     /// The provision bodies still held for the blocks that carried them.
     /// A stored block keeps only their hashes, so this is what puts them

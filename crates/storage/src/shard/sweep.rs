@@ -710,6 +710,7 @@ mod tests {
     use hyperscale_types::{
         AddressClass, BlockHeight, CollectionId, Hash, SWEEP_BUCKET_MS, StateRoot,
     };
+    use proptest::prelude::*;
 
     use super::*;
     use crate::CollectedWrites;
@@ -1188,6 +1189,84 @@ mod tests {
             colliding_committed_cell(&[own(key, vec![1])], &state),
             Some(key)
         );
+    }
+
+    /// A state holding exactly the keys given, for the properties below.
+    fn holding_keys(keys: impl IntoIterator<Item = SubstateKey>) -> Holding {
+        Holding(keys.into_iter().collect())
+    }
+
+    proptest! {
+        /// The builder and the voter read one rule: whatever the builder
+        /// keeps, the voter admits, and whatever it drops, the voter
+        /// refuses — alone, or beside a kept twin.
+        #[test]
+        fn the_builder_keeps_exactly_what_the_voter_admits(
+            picks in prop::collection::vec(0u8..6, 0..10),
+            marked in prop::collection::vec((0u8..6, any::<bool>()), 0..6),
+            older_than_the_chain in any::<bool>(),
+        ) {
+            use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+
+            install_stub_protocol_statics();
+            let shard = ShardId::leaf(1, 0);
+            let origin = if older_than_the_chain {
+                WeightedTimestamp::from_millis(1)
+            } else {
+                WeightedTimestamp::ZERO
+            };
+            let state = holding_keys(marked.iter().filter_map(|(seed, inherited)| {
+                let row = committed_here(shard, WeightedTimestamp::from_millis(1), [&test_transaction(*seed)]).remove(0);
+                if *inherited { row.inherited } else { Some(row.key) }
+            }));
+            let listed: Vec<_> = picks
+                .iter()
+                .map(|seed| Arc::new(Verified::new_unchecked_for_test(test_transaction(*seed))))
+                .collect();
+            let mut kept: Capped<Vec<_>, 16> = Capped::new(listed.clone()).expect("under the cap");
+            without_colliding_committed_cells(shard, origin, &mut kept, &state);
+
+            let kept_rows: Vec<CommittedHere> =
+                kept.iter().map(|tx| rows_of_tx(shard, origin, tx)).collect();
+            prop_assert_eq!(colliding_committed_cell(&kept_rows, &state), None);
+            for tx in &listed {
+                let twin_kept = kept.iter().any(|k| k.hash() == tx.hash());
+                let alone = colliding_committed_cell(&[rows_of_tx(shard, origin, tx)], &state);
+                prop_assert!(twin_kept || alone.is_some(), "a dropped transaction the voter admits alone");
+            }
+        }
+
+        /// A transaction admitted inside its own range creates its marker
+        /// above anything the block's sweep can reach: the sweep stops at
+        /// the anchor's bucket, and the marker expires a grace past the
+        /// range's end.
+        #[test]
+        fn a_creation_sits_above_the_sweep(
+            end_ms in 1u64..10_000_000_000,
+            back_ms in 1u64..10_000_000_000,
+            seed in any::<u8>(),
+        ) {
+            use hyperscale_types::test_utils::install_stub_protocol_statics;
+
+            install_stub_protocol_statics();
+            let anchor = WeightedTimestamp::from_millis(end_ms.saturating_sub(back_ms));
+            let tx = TxHash::from(Hash::from_bytes(&[seed; 32]));
+            let key = committed_tx_cell_key(
+                ShardId::leaf(1, 0),
+                tx,
+                WeightedTimestamp::from_millis(end_ms),
+            );
+            prop_assert!(SweepFrontier::of_leaf(key) > SweepFrontier::ceiling_at(anchor));
+        }
+    }
+
+    /// One transaction's row.
+    fn rows_of_tx(
+        shard: ShardId,
+        origin: WeightedTimestamp,
+        tx: &Verified<Transaction>,
+    ) -> CommittedHere {
+        committed_here(shard, origin, [&**tx]).remove(0)
     }
 
     /// A live committed cell names the transaction whose key it sits

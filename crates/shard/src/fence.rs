@@ -271,10 +271,11 @@ impl VoteFence<'_> {
     /// the predecessor actually *committed*. One submitted before the
     /// cut and never committed is harmless, and landing it here is its
     /// first inclusion. Refusing the whole class is the safe default a
-    /// successor runs under until it can ask the finer question, and the
-    /// predecessors' answers are what narrow it: per predecessor, each
-    /// absence proven against a `committed_txs_root` this chain
-    /// commit-proved.
+    /// successor runs under until it knows which chains it succeeds. A
+    /// left child and a merged parent then read every predecessor's
+    /// markers in their own state, which the marker rule does at the
+    /// parent view; a right child asks its parent's terminal state for
+    /// each marker, by a proof against the root this chain commit-proved.
     ///
     /// Unresolved defers rather than refuses. Every honest validator
     /// reaches the same verdict once the answer lands, so a slow answer
@@ -292,8 +293,8 @@ impl VoteFence<'_> {
     ///
     /// # Errors
     ///
-    /// A transaction a predecessor committed, or one no predecessor has
-    /// answered for yet.
+    /// A transaction the parent's terminal state marks committed, or one
+    /// not yet answered for.
     pub(crate) fn precut(&self, block: &Block) -> Result<(), Withheld> {
         let mut deferred = None;
         for tx in block
@@ -301,12 +302,15 @@ impl VoteFence<'_> {
             .iter()
             .filter(|tx| tx.validity_range().start_timestamp_inclusive < self.cut)
         {
-            match self.precut.status(&tx.hash()) {
+            match self
+                .precut
+                .status(tx.hash(), tx.validity_range().end_timestamp_exclusive)
+            {
                 PrecutStatus::Absent => {}
                 PrecutStatus::Committed => {
                     return Err(Withheld::Refused(format!(
-                        "transaction {} predates this chain's origin and a predecessor \
-                         committed it",
+                        "transaction {} predates this chain's origin and its parent's \
+                         terminal state holds its marker",
                         tx.hash()
                     )));
                 }
@@ -315,7 +319,7 @@ impl VoteFence<'_> {
         }
         deferred.map_or(Ok(()), |tx_hash| {
             Err(Withheld::deferred(format!(
-                "pre-cut transaction {tx_hash} unresolved against the predecessors"
+                "pre-cut transaction {tx_hash} unresolved against the parent's terminal"
             )))
         })
     }
@@ -579,5 +583,73 @@ mod tests {
             },
         );
         assert!(matches!(stands(&held), Err(Withheld::Refused(_))));
+    }
+
+    /// A right child's vote on a pre-cut transaction reads its parent's
+    /// terminal state: an unanswered marker defers, a present one
+    /// refuses, an absent one passes. A left child's vote passes it on
+    /// to the marker rule, which reads the parent's markers in its own
+    /// state.
+    #[test]
+    fn a_right_childs_vote_reads_its_parents_terminal() {
+        use hyperscale_storage::committed_tx_cell_key;
+        use hyperscale_types::test_utils::{
+            install_stub_protocol_statics, make_live_block, stub_transaction, test_prefix,
+            test_principal,
+        };
+        use hyperscale_types::{TimestampRange, ValidatorId};
+
+        install_stub_protocol_statics();
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let terminal = Anchor {
+            shard: parent,
+            height: BlockHeight::new(9),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(1_000),
+        };
+        let validity = TimestampRange::new(
+            WeightedTimestamp::from_millis(500),
+            WeightedTimestamp::from_millis(60_000),
+        );
+        let tx = Arc::new(stub_transaction(
+            test_principal(1),
+            &[test_prefix(1)],
+            1_000,
+            validity,
+        ));
+        let marker = committed_tx_cell_key(parent, tx.hash(), validity.end_timestamp_exclusive);
+        let block = make_live_block(
+            right,
+            BlockHeight::new(11),
+            2_000,
+            ValidatorId::new(1),
+            vec![tx],
+            vec![],
+        );
+        let (mirror, proven_anchors) = (CounterpartMirror::new(), ProvenAnchors::new());
+        let judge = |precut: &Precut, local_shard: ShardId| {
+            VoteFence {
+                mirror: &mirror,
+                proven_anchors: &proven_anchors,
+                precut,
+                cut: terminal.ts,
+                local_shard,
+            }
+            .precut(&block)
+        };
+
+        let mut asking = Precut::adopted(right, &[terminal]);
+        assert!(matches!(
+            judge(&asking, right),
+            Err(Withheld::Deferred { .. })
+        ));
+        asking.record(terminal, marker, true);
+        assert!(matches!(judge(&asking, right), Err(Withheld::Refused(_))));
+        let mut absent = Precut::adopted(right, &[terminal]);
+        absent.record(terminal, marker, false);
+        assert!(judge(&absent, right).is_ok());
+
+        assert!(judge(&Precut::adopted(left, &[terminal]), left).is_ok());
     }
 }

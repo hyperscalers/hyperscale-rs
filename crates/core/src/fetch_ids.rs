@@ -10,8 +10,7 @@
 
 use hyperscale_types::{
     Address, Anchor, BlockHash, BlockHeight, Epoch, FinalizationHash, Hash, LeafIndex,
-    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash,
-    ValidatorId,
+    ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId,
 };
 
 /// A batch of ids under the binding that fetches them, keyed exactly as
@@ -37,9 +36,6 @@ pub enum FetchIds {
     /// certificate answers for every transaction it covers, so a dropped
     /// one releases each of them.
     ExecutionCerts(Vec<(ShardId, TxHash)>),
-    /// Committed-transaction membership queries as `(predecessor,
-    /// tx_hash)`.
-    CommittedTxs(Vec<(PredecessorTerminal, TxHash)>),
     /// State-proof probes as `(anchor, key)`.
     StateProofs(Vec<(Anchor, SubstateKey)>),
     /// Departed shards' settled sets, by the terminal each is checked

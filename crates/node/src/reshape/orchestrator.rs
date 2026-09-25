@@ -32,8 +32,8 @@ use hyperscale_types::network::response::{
     GetBlockResponse, GetRemoteHeadersResponse, GetStateRangeResponse,
 };
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, FrontierInputs, LocalTimestamp,
-    NetworkDefinition, PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot,
+    Anchor, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, FrontierInputs,
+    LocalTimestamp, NetworkDefinition, QuorumCertificate, ShardAnchor, ShardId, StateRoot,
     SubstateKey, SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
 };
 
@@ -183,7 +183,7 @@ pub enum ReshapeRequest {
         /// The terminals this duty succeeds, read off the same headers
         /// the genesis derives from — one for a split child, two for a
         /// merged parent.
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     },
     /// Seat the prepared `shard` — install its genesis and run consensus. No
     /// response (terminal).
@@ -308,7 +308,7 @@ enum ObserverPhase {
         /// The derived genesis block.
         genesis: Box<Block>,
         /// The terminals this duty succeeds.
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -523,14 +523,14 @@ enum KeeperPhase {
         anchor: Option<Box<ShardAnchor>>,
         left: Box<KeeperHalf>,
         right: Box<KeeperHalf>,
-        derived: Option<(ChainOrigin, Box<Block>, Vec<PredecessorTerminal>)>,
+        derived: Option<(ChainOrigin, Box<Block>, Vec<Anchor>)>,
         finalize_requested: bool,
     },
     /// Union imported; awaiting the next advance to emit the adopt.
     Adopting {
         origin: ChainOrigin,
         genesis: Box<Block>,
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -576,7 +576,7 @@ enum ParentHalfPhase {
         /// The derived genesis block.
         genesis: Box<Block>,
         /// The terminals this duty succeeds.
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
         /// Whether the seed request is already in flight.
         requested: bool,
     },
@@ -596,7 +596,7 @@ enum ParentHalfPhase {
         /// The derived genesis block.
         genesis: Box<Block>,
         /// The terminals this duty succeeds.
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -1769,7 +1769,7 @@ fn anchored_split_genesis(
     terminal: &BlockHeader,
     qc: &QuorumCertificate,
     anchor: &ShardAnchor,
-) -> Option<(Block, ChainOrigin, Option<PredecessorTerminal>)> {
+) -> Option<(Block, ChainOrigin, Option<Anchor>)> {
     let (genesis, origin) =
         split_genesis_from_terminal(child, terminal, qc, anchor.weighted_timestamp)
             .inspect_err(|error| {
@@ -1785,7 +1785,7 @@ fn anchored_split_genesis(
         );
         return None;
     }
-    Some((genesis, origin, terminal.as_predecessor_terminal()))
+    Some((genesis, origin, terminal.as_terminal_anchor()))
 }
 
 /// Whether the parent's terminal is commit-proven — the gate the flip

@@ -167,20 +167,19 @@ impl ProposalTracker {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// What a proposer answers for itself that its voters answer at the
-/// fence: the predecessors' answers for transactions opening before the
-/// chain's origin.
+/// fence: the precut rule for transactions opening before the chain's
+/// origin.
 #[derive(Clone, Copy)]
 pub struct Prefilter<'a> {
-    /// The predecessors' answers for transactions opening before the
-    /// origin.
+    /// The precut rule for transactions opening before the origin.
     pub(crate) precut: &'a Precut,
 }
 
 /// Filter ready transactions for proposal inclusion. Drops what the
 /// voters' delegated root check refuses — a `validity_range` malformed
 /// against the anchor or not containing it — and what their fence defers on
-/// — a transaction opening before the chain's origin that no
-/// predecessor has proven absent; then keeps what
+/// — a transaction opening before the chain's origin that the precut rule
+/// does not yet pass; then keeps what
 /// [`TransactionsSection`] admits, folding into `fold`. A transaction
 /// that does not fit the sweep cap is skipped rather than ending the
 /// selection, so a large composition never starves the small ones
@@ -205,13 +204,15 @@ pub fn select_transactions(
                 expired += 1;
                 return false;
             }
-            // Opened before this chain did, so it belongs to the
-            // predecessor that ran before the cut. Offerable only where
-            // every predecessor proved it absent from its committed set;
-            // anything else a voter defers on or refuses. Zero for a
-            // chain born at network genesis.
+            // Opened before this chain did, so a predecessor may have
+            // committed it. Offerable once the precut rule passes it —
+            // for a right child, once the parent's terminal state proved
+            // its marker absent; anything else a voter defers on or
+            // refuses. Zero for a chain born at network genesis.
             if range.start_timestamp_inclusive < ctx.chain_origin
-                && !prefilter.precut.admissible(&h)
+                && !prefilter
+                    .precut
+                    .admissible(h, range.end_timestamp_exclusive)
             {
                 predates += 1;
                 return false;
@@ -604,15 +605,16 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_hbor::Capped;
+    use hyperscale_storage::committed_tx_cell_key;
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_abort_charge,
         stub_transaction, stub_transaction_binding, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Deadline, Hash,
-        MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PredecessorTerminal, RoutePrefix, TimestampRange, TopologySchedule, TransactionDecision,
-        TxHash, UnsettledTx, ValidatorSet, state_claims_admit_block,
+        Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, Hash, MAX_INTENTS,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, RoutePrefix,
+        StateRoot, TimestampRange, TopologySchedule, TransactionDecision, TxHash, UnsettledTx,
+        ValidatorSet, state_claims_admit_block,
     };
 
     use super::*;
@@ -974,31 +976,43 @@ mod tests {
         )
     }
 
-    /// A successor of one chain that has answered nothing, so no pre-cut
-    /// transaction is admissible. Cases anchored at
+    /// The parent terminal a right child asks.
+    fn parent_terminal() -> Anchor {
+        Anchor {
+            shard: ShardId::leaf(1, 0),
+            height: BlockHeight::new(9),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::ZERO,
+        }
+    }
+
+    /// A split's right child whose parent has answered nothing, so no
+    /// pre-cut transaction is admissible. Cases anchored at
     /// `WeightedTimestamp::ZERO` never consult it, since nothing opens
     /// before an origin of zero.
     fn refuses_precut() -> Precut {
-        Precut::succeeding(vec![PredecessorTerminal {
-            shard: ShardId::leaf(1, 0),
-            height: BlockHeight::new(9),
-            block_hash: BlockHash::ZERO,
-            committed_txs_root: CommittedTxsRoot::ZERO,
-        }])
+        install_stub_protocol_statics();
+        let terminal = parent_terminal();
+        Precut::adopted(terminal.shard.children().1, &[terminal])
     }
 
-    /// The same successor, with `tx_hash` proven absent from its
-    /// predecessor's committed set.
-    fn admits_precut(tx_hash: TxHash) -> Precut {
+    /// The same right child, with the marker of the transaction `tx_hash`
+    /// ending at `validity_end` proven absent from its parent's terminal
+    /// state.
+    fn admits_precut(tx_hash: TxHash, validity_end: WeightedTimestamp) -> Precut {
         let mut precut = refuses_precut();
-        precut.record(precut.predecessors()[0].shard, tx_hash, true);
+        let terminal = parent_terminal();
+        precut.record(
+            terminal,
+            committed_tx_cell_key(terminal.shard, tx_hash, validity_end),
+            false,
+        );
         precut
     }
 
     /// A transaction opening before the chain's origin is dropped while
-    /// unresolved, and offered once every predecessor has proven it
-    /// absent — the whole point of the committed set, seen from the
-    /// proposer's side.
+    /// unresolved, and offered once the parent's terminal state has
+    /// proven its marker absent.
     #[test]
     fn select_transactions_offers_a_precut_tx_only_once_resolved_absent() {
         let cut = ts(10_000);
@@ -1039,7 +1053,7 @@ mod tests {
             )
             .ctx(),
             Prefilter {
-                precut: &admits_precut(hash),
+                precut: &admits_precut(hash, ts(40_000)),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,

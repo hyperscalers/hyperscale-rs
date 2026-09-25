@@ -40,8 +40,8 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, PredecessorTerminal, ShardId,
-    ValidatorId, Verified, shard_prefix_path,
+    Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, ShardId, ValidatorId,
+    Verified, shard_prefix_path,
 };
 use tracing::error;
 
@@ -423,7 +423,7 @@ impl SimulationRunner {
         kind: AdoptKind,
         origin: ChainOrigin,
         genesis: Block,
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores.get(&(host, shard))?.storage.clone();
         let recovered = adopt_prepared_store(&storage, shard, kind, origin, &genesis, predecessors)

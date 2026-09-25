@@ -147,11 +147,11 @@ use hyperscale_storage::{CommittedProvisions, RecoveredState};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
-    HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, PredecessorTerminal, Provisions,
-    QcContext, QcVerifyError, QuorumCertificate, ReadFence, RecoveryCause, Round,
-    SafeVoteRegisters, StateRoot, Timeout, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload,
+    HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError,
+    QuorumCertificate, ReadFence, RecoveryCause, Round, SafeVoteRegisters, StateRoot, Timeout,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    Verifier, Verify, VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::field::Empty;
@@ -761,7 +761,7 @@ impl ShardCoordinator {
             me,
             local_shard,
             chain_origin: recovered.chain_origin,
-            precut: Precut::succeeding(recovered.predecessors),
+            precut: Precut::adopted(local_shard, &recovered.predecessors),
             precut_generation: 0,
             fence_seen: (0, 0, 0),
             mirror: Arc::new(CounterpartMirror::new()),
@@ -1309,13 +1309,11 @@ impl ShardCoordinator {
                 < self.chain_origin.anchor_wt.plus(MAX_VALIDITY_RANGE)
     }
 
-    /// Whether the relaxation is live: the window is open *and* this node
-    /// holds predecessors to resolve against. A seat that missed the flip
-    /// and has not yet read them off its topology projection holds none,
-    /// and keeps the strict refusal until it does.
+    /// Whether this chain still asks its parent's terminal: it is a
+    /// split's right child and the window is open.
     #[must_use]
     pub fn precut_rule_live(&self) -> bool {
-        self.precut.has_predecessors() && self.precut_window_open()
+        self.precut.terminal().is_some() && self.precut_window_open()
     }
 
     /// Read the chains this one succeeds off the beacon's own boundary
@@ -1324,17 +1322,16 @@ impl ShardCoordinator {
     /// The flip is the fast delivery and covers the seats present at the
     /// cut. This is the durable one, and the only path for a restart, a
     /// validator rotated onto the successor committee afterwards, or a
-    /// snap-synced joiner — none of which run a reshape duty, and none of
-    /// which can re-derive the roots from their own chain.
+    /// snap-synced joiner — none of which run a reshape duty.
     ///
-    /// Runs only while the window is open and only when nothing is held,
-    /// so it neither displaces what the flip delivered nor undoes a
-    /// retirement. Returns whether anything was adopted.
+    /// Runs only while the window is open and only while nothing is
+    /// adopted, so it neither displaces what the flip delivered nor undoes
+    /// a retirement. Returns whether anything was adopted.
     pub(crate) fn adopt_precut_predecessors(
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> bool {
-        if self.precut.has_predecessors() || !self.precut_window_open() {
+        if !self.precut.is_awaiting() || !self.precut_window_open() {
             return false;
         }
         let predecessors =
@@ -1348,46 +1345,37 @@ impl ShardCoordinator {
             count = predecessors.len(),
             "Adopted this chain's predecessors from the topology projection"
         );
-        self.precut = Precut::succeeding(predecessors);
+        self.precut = Precut::adopted(self.local_shard, &predecessors);
         self.precut_generation += 1;
         true
     }
 
-    /// Record one predecessor's answer about a transaction that predates
-    /// this chain.
-    ///
-    /// `absent` must already have been verified against that
-    /// predecessor's attested `committed_txs_root`; a `committed` answer
-    /// carries no proof and needs none, since it leaves the standing
-    /// refusal in place.
-    pub fn record_precut_resolution(
-        &mut self,
-        predecessor: ShardId,
-        tx_hash: TxHash,
-        absent: bool,
-    ) {
-        self.precut.record(predecessor, tx_hash, absent);
+    /// Record what a verified proof against `terminal` says of each asked
+    /// marker key: `true` where the terminal state holds it.
+    pub fn record_precut_proof(&mut self, terminal: Anchor, presences: &[(SubstateKey, bool)]) {
+        for (key, present) in presences {
+            self.precut.record(terminal, *key, *present);
+        }
         self.precut_generation += 1;
     }
 
-    /// The `(predecessor, transaction)` pairs still owed an answer — what
-    /// an acquisition driver turns into queries.
+    /// The marker keys still owed an answer — what an acquisition driver
+    /// asks the parent's terminal for.
     ///
-    /// `tx_hashes` is the caller's candidate set — the mempool's pending
-    /// transactions that open before the cut. Blocks awaiting a vote
-    /// contribute their own pre-cut transactions on top: a vote deferred
-    /// by the [`Precut`](crate::precut::Precut) gate resolves only once the query it waits
-    /// on is issued, and nothing guarantees the block's transactions are
-    /// also sitting in this node's pool.
+    /// `candidates` is the caller's set — the mempool's pending
+    /// transactions that open before the cut, each with the end of its
+    /// range. Blocks awaiting a vote contribute their own pre-cut
+    /// transactions on top: a vote deferred by the
+    /// [`Precut`](crate::precut::Precut) gate resolves only once the query
+    /// it waits on is issued, and nothing guarantees the block's
+    /// transactions are also sitting in this node's pool.
     ///
-    /// Empty on a chain with no predecessors, and empty again once the
-    /// chain has outlived its origin by `MAX_VALIDITY_RANGE`, where
-    /// nothing offered to it opens before the cut.
+    /// Empty unless the rule is live.
     #[must_use]
     pub fn outstanding_precut_queries(
         &self,
-        tx_hashes: impl IntoIterator<Item = TxHash>,
-    ) -> Vec<(PredecessorTerminal, TxHash)> {
+        candidates: impl IntoIterator<Item = (TxHash, WeightedTimestamp)>,
+    ) -> Vec<SubstateKey> {
         if !self.precut_rule_live() {
             return Vec::new();
         }
@@ -1401,37 +1389,28 @@ impl ShardCoordinator {
                     .transactions()
                     .iter()
                     .filter(|tx| tx.validity_range().start_timestamp_inclusive < cut)
-                    .map(|tx| tx.hash())
+                    .map(|tx| (tx.hash(), tx.validity_range().end_timestamp_exclusive))
                     .collect::<Vec<_>>()
             });
-        let candidates: BTreeSet<TxHash> = tx_hashes.into_iter().chain(awaiting_vote).collect();
-        self.precut.outstanding(candidates)
+        self.precut
+            .outstanding(candidates.into_iter().chain(awaiting_vote))
     }
 
-    /// Whether `tx_hash` may be proposed despite opening before this
-    /// chain did — proven absent from every predecessor's committed set.
+    /// The parent's terminal this chain asks, while it still asks.
     #[must_use]
-    pub fn precut_tx_admissible(&self, tx_hash: &TxHash) -> bool {
-        self.precut.admissible(tx_hash)
+    pub const fn precut_terminal(&self) -> Option<Anchor> {
+        self.precut.terminal()
     }
 
-    /// Whether any predecessor is on hand to be asked at all — false on a
-    /// chain born at network genesis, on a seat that missed the flip, and
-    /// on one whose pre-cut rule has already retired.
-    #[must_use]
-    pub const fn has_precut_predecessors(&self) -> bool {
-        self.precut.has_predecessors()
-    }
-
-    /// Drop the predecessors and their answers once the pre-cut rule has
-    /// retired, so neither is held for this coordinator's life.
+    /// Stop asking once the rule has retired, so neither the terminal nor
+    /// its answers are held for this coordinator's life.
     ///
-    /// The caller drives it, because forgetting the predecessors is also
-    /// what stops it releasing the query slots they hold: the release is a
-    /// request naming an empty set, and there is nothing to name it against
-    /// afterwards. Returns whether anything was dropped.
+    /// The caller drives it, because forgetting the terminal is also what
+    /// stops it releasing the query slots it holds: the release is a
+    /// request naming an empty set, and there is nothing to name it
+    /// against afterwards. Returns whether anything was dropped.
     pub fn retire_precut(&mut self) -> bool {
-        if self.precut.is_empty() || self.precut_rule_live() {
+        if self.precut.terminal().is_none() || self.precut_rule_live() {
             return false;
         }
         self.precut.retire();
@@ -6784,18 +6763,6 @@ impl ShardCoordinator {
         self.chain_origin
     }
 
-    /// The chains this one succeeds, and the commitments they left.
-    ///
-    /// Empty on a chain born at network genesis, and on any seat that
-    /// missed the reshape flip — a restart, or a validator rotated on
-    /// afterwards — until
-    /// [`adopt_precut_predecessors`](Self::adopt_precut_predecessors)
-    /// reads them off its topology projection.
-    #[must_use]
-    pub fn predecessors(&self) -> &[PredecessorTerminal] {
-        self.precut.predecessors()
-    }
-
     /// Number of distinct validators for which this coordinator holds
     /// detected double-vote equivocation evidence not yet carried into a
     /// committed block. Drained into each proposal and pruned once the
@@ -7098,6 +7065,7 @@ mod tests {
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
+    use hyperscale_storage::committed_tx_cell_key;
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
@@ -7204,28 +7172,34 @@ mod tests {
 
     // ─── Pre-cut queries ───────────────────────────────────────────────
 
-    /// A successor of one chain, cut at `cut`, with its certified clock
-    /// sitting at `now`.
-    fn make_successor(cut: WeightedTimestamp, now: WeightedTimestamp) -> ShardCoordinator {
-        successor_holding(
-            cut,
-            now,
-            vec![PredecessorTerminal {
-                shard: ShardId::leaf(1, 0),
-                height: BlockHeight::new(9),
-                block_hash: BlockHash::ZERO,
-                committed_txs_root: CommittedTxsRoot::ZERO,
-            }],
-        )
+    /// The split parent every successor here was cut from.
+    const PARENT: ShardId = ShardId::leaf(1, 0);
+
+    /// The parent's terminal, as the flip hands it over.
+    fn parent_terminal() -> Anchor {
+        Anchor {
+            shard: PARENT,
+            height: BlockHeight::new(9),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(10_000),
+        }
     }
 
-    /// A successor cut at `cut`, clock at `now`, holding `predecessors` —
-    /// empty for the seat the reshape flip never reached.
+    /// The parent's right child, cut at `cut`, with its certified clock
+    /// sitting at `now` and the parent's terminal delivered.
+    fn make_successor(cut: WeightedTimestamp, now: WeightedTimestamp) -> ShardCoordinator {
+        successor_holding(PARENT.children().1, cut, now, vec![parent_terminal()])
+    }
+
+    /// `local_shard` cut at `cut`, clock at `now`, holding `predecessors`
+    /// — empty for the seat the reshape flip never reached.
     fn successor_holding(
+        local_shard: ShardId,
         cut: WeightedTimestamp,
         now: WeightedTimestamp,
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     ) -> ShardCoordinator {
+        test_utils::install_stub_protocol_statics();
         let mut recovered = RecoveredState {
             chain_origin: ChainOrigin {
                 genesis_height: BlockHeight::new(10),
@@ -7236,7 +7210,7 @@ mod tests {
         };
         recovered.latest_qc = Some(Verified::new_unchecked_for_test(QuorumCertificate::new(
             BlockHash::ZERO,
-            ShardId::ROOT,
+            local_shard,
             BlockHeight::new(10),
             BlockHash::ZERO,
             Round::new(1),
@@ -7247,7 +7221,7 @@ mod tests {
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
             ValidatorId::new(0),
-            ShardId::ROOT,
+            local_shard,
             ShardConsensusConfig::default(),
             recovered,
         )
@@ -7266,6 +7240,19 @@ mod tests {
         ))
     }
 
+    /// A probe candidate and the end of its range.
+    fn probe(tag: &[u8]) -> (TxHash, WeightedTimestamp) {
+        (
+            TxHash::from(Hash::from_bytes(tag)),
+            WeightedTimestamp::from_millis(60_000),
+        )
+    }
+
+    /// The parent's marker key for `candidate`.
+    fn parent_marker((tx_hash, validity_end): (TxHash, WeightedTimestamp)) -> SubstateKey {
+        committed_tx_cell_key(PARENT, tx_hash, validity_end)
+    }
+
     /// A chain born at network genesis anchors at zero, so nothing can
     /// open before it and nothing is ever asked.
     #[test]
@@ -7274,25 +7261,23 @@ mod tests {
         assert!(!state.precut_rule_live());
         assert!(
             state
-                .outstanding_precut_queries([TxHash::from(Hash::from_bytes(b"probe"))])
+                .outstanding_precut_queries([probe(b"probe")])
                 .is_empty()
         );
     }
 
-    /// A candidate that opened before the cut is owed an answer by the
-    /// predecessor; one that opened after is this chain's own business.
+    /// A right child asks its parent's terminal for the marker of a
+    /// candidate that opened before the cut.
     #[test]
-    fn a_successor_asks_its_predecessor_about_pre_cut_candidates() {
+    fn a_right_child_asks_its_parent_about_pre_cut_candidates() {
         let state = make_successor(
             WeightedTimestamp::from_millis(10_000),
             WeightedTimestamp::from_millis(10_500),
         );
-        let predecessor = state.predecessors()[0];
-        let probe = TxHash::from(Hash::from_bytes(b"probe"));
-
+        assert_eq!(state.precut_terminal(), Some(parent_terminal()));
         assert_eq!(
-            state.outstanding_precut_queries([probe]),
-            vec![(predecessor, probe)]
+            state.outstanding_precut_queries([probe(b"probe")]),
+            vec![parent_marker(probe(b"probe"))]
         );
     }
 
@@ -7305,13 +7290,12 @@ mod tests {
             WeightedTimestamp::from_millis(10_000),
             WeightedTimestamp::from_millis(10_500),
         );
-        let predecessor = state.predecessors()[0];
         // One opens before the cut, one after; only the first is the
-        // predecessor's business.
+        // parent's business.
         let before = precut_tx(1, 9_000);
         let after = precut_tx(2, 10_500);
         let block = make_live_block(
-            ShardId::ROOT,
+            PARENT.children().1,
             BlockHeight::new(11),
             10_600,
             ValidatorId::new(1),
@@ -7322,7 +7306,10 @@ mod tests {
 
         assert_eq!(
             state.outstanding_precut_queries(std::iter::empty()),
-            vec![(predecessor, before.hash())]
+            vec![parent_marker((
+                before.hash(),
+                before.validity_range().end_timestamp_exclusive
+            ))]
         );
     }
 
@@ -7332,47 +7319,47 @@ mod tests {
     #[test]
     fn the_queries_retire_with_the_rule() {
         let cut = WeightedTimestamp::from_millis(10_000);
-        let state = make_successor(cut, cut.plus(MAX_VALIDITY_RANGE));
+        let mut state = make_successor(cut, cut.plus(MAX_VALIDITY_RANGE));
         assert!(!state.precut_rule_live());
         assert!(
             state
-                .outstanding_precut_queries([TxHash::from(Hash::from_bytes(b"probe"))])
+                .outstanding_precut_queries([probe(b"probe")])
                 .is_empty()
         );
+        assert!(state.retire_precut());
+        assert_eq!(state.precut_terminal(), None);
     }
 
-    /// An answered pair drops out; its sibling stays owed.
+    /// An answered key drops out; its sibling stays owed.
     #[test]
-    fn an_answered_pair_is_no_longer_outstanding() {
+    fn an_answered_key_is_no_longer_outstanding() {
         let mut state = make_successor(
             WeightedTimestamp::from_millis(10_000),
             WeightedTimestamp::from_millis(10_500),
         );
-        let predecessor = state.predecessors()[0];
-        let answered = TxHash::from(Hash::from_bytes(b"answered"));
-        let owed = TxHash::from(Hash::from_bytes(b"owed"));
+        let answered = probe(b"answered");
+        let owed = probe(b"owed");
 
-        state.record_precut_resolution(predecessor.shard, answered, true);
+        state.record_precut_proof(parent_terminal(), &[(parent_marker(answered), false)]);
         assert_eq!(
             state.outstanding_precut_queries([answered, owed]),
-            vec![(predecessor, owed)]
+            vec![parent_marker(owed)]
         );
     }
 
-    /// A schedule in which `ShardId::ROOT` terminated at `10_000ms`, leaving
-    /// its two children live and its boundary record carrying the
-    /// commitments a successor reads.
-    fn post_split_schedule(committed: CommittedTxsRoot) -> TopologySchedule {
-        let children: [ShardId; 2] = ShardId::ROOT.children().into();
+    /// A schedule in which `PARENT` terminated at `10_000ms`, leaving its
+    /// two children live and its boundary record carrying its terminal.
+    fn post_split_schedule() -> TopologySchedule {
+        let children: [ShardId; 2] = PARENT.children().into();
         let anchor = ShardAnchor {
             state_root: StateRoot::ZERO,
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"root terminal")),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent terminal")),
             height: BlockHeight::new(9),
             weighted_timestamp: WeightedTimestamp::from_millis(10_000),
             witness_base: BeaconWitnessLeafCount::ZERO,
             terminal_roots: Some(TerminalRoots {
                 settled_txs: SettledTxsRoot::ZERO,
-                committed_txs: committed,
+                committed_txs: CommittedTxsRoot::ZERO,
             }),
             handoff_complete: None,
         };
@@ -7391,13 +7378,10 @@ mod tests {
             ))
         };
         let mut boundaries = HashMap::new();
-        boundaries.insert(ShardId::ROOT, anchor);
+        boundaries.insert(PARENT, anchor);
         let head = live(&children, boundaries);
-        let mut sched = TopologySchedule::new(
-            10_000,
-            Epoch::new(0),
-            live(&[ShardId::ROOT], HashMap::new()),
-        );
+        let mut sched =
+            TopologySchedule::new(10_000, Epoch::new(0), live(&[PARENT], HashMap::new()));
         sched.insert(Epoch::new(1), Arc::clone(&head));
         sched.set_head(head);
         sched
@@ -7405,40 +7389,30 @@ mod tests {
 
     /// A seat the reshape flip never reached — a restart, or a validator
     /// rotated on afterwards — reads its predecessors off the beacon's own
-    /// boundary records instead, and the pre-cut relaxation comes alive
-    /// with them.
+    /// boundary records instead. A right child then asks the parent's
+    /// terminal; a left child reads the parent's markers in its own state
+    /// and asks nothing.
     #[test]
     fn a_seat_that_missed_the_flip_adopts_its_predecessors_from_the_projection() {
-        let committed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"parent window"));
-        let sched = post_split_schedule(committed);
-        let (left, _) = ShardId::ROOT.children();
-        let mut state = successor_holding(
-            WeightedTimestamp::from_millis(10_000),
-            WeightedTimestamp::from_millis(10_500),
-            Vec::new(),
-        );
-        state.local_shard = left;
+        let sched = post_split_schedule();
+        let (left, right) = PARENT.children();
+        let cut = WeightedTimestamp::from_millis(10_000);
+        let now = WeightedTimestamp::from_millis(10_500);
 
+        let mut state = successor_holding(right, cut, now, Vec::new());
         assert!(
-            !state.precut_rule_live(),
-            "holding no predecessors, the strict refusal stands",
+            state.precut.is_awaiting(),
+            "holding nothing, the strict refusal stands"
         );
-        assert!(
-            state.precut_window_open(),
-            "but the window it would relax is still open",
-        );
-
+        assert!(state.precut_window_open(), "but the window is still open");
         assert!(state.adopt_precut_predecessors(&sched));
-        assert_eq!(
-            state.predecessors(),
-            &[PredecessorTerminal {
-                shard: ShardId::ROOT,
-                height: BlockHeight::new(9),
-                block_hash: BlockHash::from_raw(Hash::from_bytes(b"root terminal")),
-                committed_txs_root: committed,
-            }],
-        );
+        assert_eq!(state.precut_terminal(), Some(parent_terminal()));
         assert!(state.precut_rule_live());
+
+        let mut state = successor_holding(left, cut, now, Vec::new());
+        assert!(state.adopt_precut_predecessors(&sched));
+        assert!(matches!(state.precut, Precut::Local));
+        assert!(!state.precut_rule_live());
     }
 
     /// Adoption never displaces what the flip delivered: the flip is the
@@ -7446,32 +7420,34 @@ mod tests {
     /// over it would churn the answers already recorded against it.
     #[test]
     fn adoption_leaves_flip_delivered_predecessors_alone() {
-        let sched = post_split_schedule(CommittedTxsRoot::from_raw(Hash::from_bytes(b"other")));
-        let (left, _) = ShardId::ROOT.children();
+        let sched = post_split_schedule();
         let mut state = make_successor(
             WeightedTimestamp::from_millis(10_000),
             WeightedTimestamp::from_millis(10_500),
         );
-        state.local_shard = left;
-        let delivered = state.predecessors().to_vec();
+        let answered = probe(b"answered");
+        state.record_precut_proof(parent_terminal(), &[(parent_marker(answered), false)]);
 
         assert!(!state.adopt_precut_predecessors(&sched));
-        assert_eq!(state.predecessors(), delivered.as_slice());
+        assert!(state.outstanding_precut_queries([answered]).is_empty());
     }
 
     /// Past the window there is nothing left to relax, so a late boot
     /// adopts nothing rather than taking on state it will only retire.
     #[test]
     fn adoption_stops_once_the_window_has_closed() {
-        let sched = post_split_schedule(CommittedTxsRoot::ZERO);
-        let (left, _) = ShardId::ROOT.children();
+        let sched = post_split_schedule();
         let cut = WeightedTimestamp::from_millis(10_000);
-        let mut state = successor_holding(cut, cut.plus(MAX_VALIDITY_RANGE), Vec::new());
-        state.local_shard = left;
+        let mut state = successor_holding(
+            PARENT.children().1,
+            cut,
+            cut.plus(MAX_VALIDITY_RANGE),
+            Vec::new(),
+        );
 
         assert!(!state.precut_window_open());
         assert!(!state.adopt_precut_predecessors(&sched));
-        assert!(state.predecessors().is_empty());
+        assert!(state.precut.is_awaiting());
     }
 
     #[test]

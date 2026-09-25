@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    BlockHeight, Epoch, EpochWindows, PredecessorTerminal, PriceTable, ReshapeThresholds,
-    ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
+    Anchor, BlockHeight, Epoch, EpochWindows, PriceTable, ReshapeThresholds, ShardAnchor, ShardId,
+    ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
 /// Per-shard committees for request **routing**, terminal-clamped.
@@ -905,7 +905,8 @@ impl TopologySchedule {
             .map(|(epoch, _)| windows.window_of(*epoch).end)
     }
 
-    /// The chains `shard` succeeds, read off the beacon's own boundary
+    /// The chains `shard` succeeds, each as the terminal state its
+    /// markers are proven against, read off the beacon's own boundary
     /// records — one terminal for a split child, two for a merged parent,
     /// none for a chain born at network genesis.
     ///
@@ -924,14 +925,12 @@ impl TopologySchedule {
     /// next.
     ///
     /// All or nothing. A candidate whose boundary record is not yet
-    /// folded, or carries no [`TerminalRoots`](crate::TerminalRoots) yet, takes the whole set
-    /// with it: a successor holding a *subset* of the chains it succeeds
-    /// reads one predecessor's absence proof as the whole answer and
-    /// admits what another predecessor committed, which is the replay
-    /// this rule exists to refuse. Holding none is the strict refusal the
-    /// successor already runs under, so nothing is lost by waiting — and
-    /// a caller only adopts when it holds nothing, so the next fold that
-    /// completes the set is what it takes.
+    /// folded, or carries no [`TerminalRoots`](crate::TerminalRoots) yet,
+    /// takes the whole set with it, so a successor never judges which
+    /// shape it was born by from part of the set. Holding none is the
+    /// strict refusal the successor already runs under, so nothing is lost
+    /// by waiting — and a caller only adopts while it holds nothing, so the
+    /// next fold that completes the set is what it takes.
     ///
     /// The two children's terminals fold independently and need not land
     /// together, so a merged parent reading this mid-window sees exactly
@@ -941,7 +940,7 @@ impl TopologySchedule {
         &self,
         shard: ShardId,
         origin_wt: WeightedTimestamp,
-    ) -> Vec<PredecessorTerminal> {
+    ) -> Vec<Anchor> {
         if origin_wt == WeightedTimestamp::ZERO {
             // The network's first chain. Nothing ran before it, so nothing
             // offered to it can open before it began.
@@ -953,17 +952,18 @@ impl TopologySchedule {
         // which reshape produced it, and the cut binding admits at most
         // one of the two shapes: a shard born at a cut has no children
         // that could have terminated at it.
-        let complete: Option<Vec<PredecessorTerminal>> = [shard.parent(), Some(left), Some(right)]
+        let complete: Option<Vec<Anchor>> = [shard.parent(), Some(left), Some(right)]
             .into_iter()
             .flatten()
             .filter(|candidate| self.terminal_cut_wt(*candidate) == Some(origin_wt))
             .map(|candidate| {
-                let anchor = self.head.boundary(candidate)?;
-                Some(PredecessorTerminal {
+                let record = self.head.boundary(candidate)?;
+                record.terminal_roots?;
+                Some(Anchor {
                     shard: candidate,
-                    height: anchor.height,
-                    block_hash: anchor.block_hash,
-                    committed_txs_root: anchor.terminal_roots?.committed_txs,
+                    height: record.height,
+                    state_root: record.state_root,
+                    ts: record.weighted_timestamp,
                 })
             })
             .collect();
@@ -1223,6 +1223,11 @@ mod tests {
 
     /// A snapshot whose head trie holds `live` and whose boundary map
     /// records `terminated` with the given committed-transaction root.
+    /// The state root `shard`'s boundary record carries.
+    fn terminal_root(shard: ShardId) -> StateRoot {
+        StateRoot::from_raw(Hash::from_bytes(format!("root-{shard:?}").as_bytes()))
+    }
+
     fn topology_with(
         live: &[ShardId],
         terminated: &[(ShardId, Option<CommittedTxsRoot>)],
@@ -1235,7 +1240,7 @@ mod tests {
                 (
                     *shard,
                     ShardAnchor {
-                        state_root: StateRoot::ZERO,
+                        state_root: terminal_root(*shard),
                         block_hash: BlockHash::from_raw(Hash::from_bytes(
                             format!("{shard:?}").as_bytes(),
                         )),
@@ -1287,7 +1292,7 @@ mod tests {
     }
 
     /// A split child succeeds the parent that terminated at its origin,
-    /// and reads the parent's commitment off the boundary record.
+    /// and reads the parent's terminal state off the boundary record.
     #[test]
     fn a_split_child_succeeds_the_parent_that_terminated_at_its_cut() {
         let (left, right) = ShardId::ROOT.children();
@@ -1304,11 +1309,11 @@ mod tests {
         assert_eq!(predecessors.len(), 1);
         assert_eq!(predecessors[0].shard, ShardId::ROOT);
         assert_eq!(predecessors[0].height, BlockHeight::new(41));
-        assert_eq!(predecessors[0].committed_txs_root, root_committed());
+        assert_eq!(predecessors[0].state_root, terminal_root(ShardId::ROOT));
     }
 
-    /// A merged parent succeeds both children — one absence proof settles
-    /// nothing, so both terminals have to be found.
+    /// A merged parent succeeds both children, and both terminals are
+    /// found.
     #[test]
     fn a_merged_parent_succeeds_both_children() {
         let (left, right) = ShardId::ROOT.children();
@@ -1332,11 +1337,9 @@ mod tests {
     /// And both or neither. The two children's terminals fold
     /// independently and need not land together, so a merged parent
     /// reading this mid-window can see one with its roots and one
-    /// without — the ordinary state, not a corrupt one. Holding the one
-    /// would read its absence proof as the whole answer and admit what
-    /// the other child committed, so the partial set is refused entirely.
-    /// A caller adopts only while it holds nothing, so the fold that
-    /// completes the pair is the one it takes.
+    /// without — the ordinary state, not a corrupt one. The partial set
+    /// is refused entirely, and a caller adopts only while it holds
+    /// nothing, so the fold that completes the pair is the one it takes.
     #[test]
     fn a_merged_parent_holds_both_children_or_neither() {
         let (left, right) = ShardId::ROOT.children();

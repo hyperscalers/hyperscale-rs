@@ -25,7 +25,7 @@ use super::query::{
     Locked, MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at, locked_at,
     owed_at, unclaimable_at,
 };
-use super::tx::{recipient, sender};
+use super::tx::{LEFT_PROBE_SENDER, recipient, sender};
 use super::{Budget, Cluster};
 
 /// How long a settled world is held settled before it is asserted.
@@ -40,12 +40,17 @@ use super::{Budget, Cluster};
 const SETTLED_TAIL: Duration = Duration::from_secs(5);
 
 /// The world a [`build_probe_transfer_tx`](super::tx::build_probe_transfer_tx)
-/// train reaches: the first genesis-funded sender and recipient, in protocol resource.
+/// train reaches: the two probe senders and the recipient, in protocol
+/// resource.
 pub fn probe_world<C: Cluster + ?Sized>(c: &C) -> World {
     World::open(
         c,
         *PROTOCOL_RESOURCE,
-        [sender(0).1.address(), recipient(0).address()],
+        [
+            sender(0).1.address(),
+            sender(LEFT_PROBE_SENDER).1.address(),
+            recipient(0).address(),
+        ],
         [],
     )
 }

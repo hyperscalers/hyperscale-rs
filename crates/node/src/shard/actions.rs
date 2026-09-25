@@ -15,7 +15,7 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal, ShardId,
+    Anchor, BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, ShardId, SubstateKey,
     TerminalEvidence, TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
@@ -28,7 +28,7 @@ use crate::shard::commit::{
     QcOnlyPending, make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
-use crate::shard::cross_shard::{CommittedTxBinding, SettledTxsBinding};
+use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -605,30 +605,26 @@ where
                 preferred,
                 class,
             } => self.request_fetch(ids, shard, preferred, class),
-            FetchRequest::CommittedTxs {
-                predecessor,
-                tx_hashes,
+            FetchRequest::PrecutProofs {
+                terminal,
+                keys,
                 preferred,
                 class,
             } => {
-                let wanted: BTreeSet<(PredecessorTerminal, TxHash)> = tx_hashes
-                    .into_iter()
-                    .map(|tx_hash| (predecessor, tx_hash))
-                    .collect();
-                // The scan re-derives the whole wanted set for this
-                // predecessor each pass, so anything the fetch still
-                // holds under it and the scan no longer names is an
-                // answer nobody is waiting for — a transaction that
-                // expired out of the pool, or the rule retiring as the
-                // chain outlives its origin. Nothing else retires these
-                // ids: a terminated committee that never answers would
-                // pin them for good.
-                self.abandon_unwanted::<CommittedTxBinding>(&wanted, |id| {
-                    id.0.shard == predecessor.shard
-                });
-                self.drive_fetch::<CommittedTxBinding>(FetchInput::Request {
+                let wanted: BTreeSet<(Anchor, SubstateKey)> =
+                    keys.into_iter().map(|key| (terminal, key)).collect();
+                // The scan re-derives the whole wanted set under this
+                // terminal each pass, so anything the fetch still holds
+                // under it and the scan no longer names is an answer
+                // nobody is waiting for — a transaction that expired out
+                // of the pool, or the rule retiring as the chain outlives
+                // its origin. Nothing else retires these ids: a
+                // terminated committee that never answers would pin them
+                // for good.
+                self.abandon_unwanted::<StateProofBinding>(&wanted, |id| id.0 == terminal);
+                self.drive_fetch::<StateProofBinding>(FetchInput::Request {
                     ids: wanted.into_iter().collect(),
-                    shard: predecessor.shard,
+                    shard: terminal.shard,
                     preferred,
                     class,
                 });

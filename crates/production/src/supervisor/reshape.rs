@@ -29,8 +29,8 @@ use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, FrontierInputs, PredecessorTerminal, ReshapeSeat, ShardAnchor,
-    ShardId, StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
+    Anchor, Block, BlockHeight, ChainOrigin, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId,
+    StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -650,7 +650,7 @@ impl ShardSupervisor {
         kind: AdoptKind,
         origin: ChainOrigin,
         genesis: Block,
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     ) {
         let Some(storage) = self.reshape_stores.get_mut(&shard).map(|entry| {
             entry.genesis = Some(genesis.clone());

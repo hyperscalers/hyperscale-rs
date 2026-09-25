@@ -25,9 +25,9 @@ mod state_proof_serve;
 pub use committed_txs_serve::{CommittedTxsCache, serve_committed_txs_request};
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
-    CommittedTxBinding, CommittedTxFetch, ExecCertBinding, ExecCertFetch, FinalizationBinding,
-    FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding,
-    ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding, StateProofFetch,
+    ExecCertBinding, ExecCertFetch, FinalizationBinding, FinalizationFetch, LocalProvisionBinding,
+    LocalProvisionFetch, ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch,
+    StateProofBinding, StateProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
@@ -57,9 +57,6 @@ pub struct CrossShardState {
     pub(crate) finalization: FinalizationFetch,
     /// Local-provision fetch (pinned to proposer).
     pub(crate) local_provision: LocalProvisionFetch,
-    /// Committed-transaction membership fetch against the chains this
-    /// one succeeds (rotates through the predecessor's committee).
-    pub(crate) committed_tx: CommittedTxFetch,
     /// State-proof fetch against other shards' commit-proven headers
     /// (rotates through the anchor's committee).
     pub(crate) state_proof: StateProofFetch,
@@ -89,14 +86,6 @@ impl CrossShardState {
                 FetchConfig {
                     max_in_flight: 64,
                     max_ids_per_request: 16,
-                    parallel_chunks_per_tick: 2,
-                },
-            ),
-            committed_tx: CommittedTxFetch::new(
-                "committed_tx",
-                FetchConfig {
-                    max_in_flight: 256,
-                    max_ids_per_request: 64,
                     parallel_chunks_per_tick: 2,
                 },
             ),
@@ -130,7 +119,6 @@ impl CrossShardState {
             || self.exec_cert.has_pending()
             || self.finalization.has_pending()
             || self.local_provision.has_pending()
-            || self.committed_tx.has_pending()
             || self.state_proof.has_pending()
             || self.settled_txs.has_pending()
     }

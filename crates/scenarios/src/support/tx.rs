@@ -908,9 +908,21 @@ pub fn livelock_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// the payment itself.
 #[must_use]
 pub fn build_probe_transfer_tx(validity: TimestampRange) -> Transaction {
-    let (payer, from) = sender(0);
+    build_probe_transfer_tx_from(0, validity)
+}
+
+/// A probe paid by `sender(index)`, which is where it commits: `0`
+/// routes to the right half of a two-way split and [`LEFT_PROBE_SENDER`]
+/// to the left.
+#[must_use]
+pub fn build_probe_transfer_tx_from(index: u8, validity: TimestampRange) -> Transaction {
+    let (payer, from) = sender(index);
     build_transfer_tx(&payer, from, recipient(0), PROBE_PAYMENT, validity)
 }
+
+/// The probe sender whose account routes to the left half of a two-way
+/// split. [`probe_train_genesis_accounts`] funds it for one probe.
+pub const LEFT_PROBE_SENDER: u8 = 1;
 
 /// What [`build_probe_transfer_tx`] moves: enough to be a real credit,
 /// far under the sender's genesis funding so a scenario can submit
@@ -928,7 +940,11 @@ pub(crate) const PROBE_PAYMENT: u128 = 100;
 #[must_use]
 pub fn probe_train_genesis_accounts(count: u32) -> Vec<(PrincipalAddr, u128)> {
     let funded = u128::from(count) * (MAX_FEE + PROBE_PAYMENT) * 2;
-    vec![(sender(0).1, funded), (recipient(0), 10)]
+    vec![
+        (sender(0).1, funded),
+        (sender(LEFT_PROBE_SENDER).1, (MAX_FEE + PROBE_PAYMENT) * 2),
+        (recipient(0), 10),
+    ]
 }
 
 /// `count` accounts routing to `shard` under a `num_shards`-wide trie,

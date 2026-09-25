@@ -10,7 +10,7 @@
 //! rather than re-deriving any part of it.
 
 use hyperscale_storage::{AdoptSource, BoundaryStore, RecoveredState};
-use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, ReadFrontier, ShardId, StateRoot};
+use hyperscale_types::{Anchor, Block, ChainOrigin, ReadFrontier, ShardId, StateRoot};
 
 use super::orchestrator::AdoptKind;
 
@@ -40,7 +40,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     kind: AdoptKind,
     origin: ChainOrigin,
     genesis: &Block,
-    predecessors: Vec<PredecessorTerminal>,
+    predecessors: Vec<Anchor>,
 ) -> Result<RecoveredState, String> {
     let source = match kind {
         AdoptKind::Split => AdoptSource::FollowedTip,
@@ -74,7 +74,7 @@ fn verified_recovered_state(
     expected: StateRoot,
     origin: ChainOrigin,
     substate_bytes: u64,
-    predecessors: Vec<PredecessorTerminal>,
+    predecessors: Vec<Anchor>,
     read_frontier: ReadFrontier,
 ) -> Result<RecoveredState, String> {
     if adopted != expected {

@@ -37,10 +37,10 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, PredecessorTerminal, QuorumCertificate,
-    ReadySignal, ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot,
-    ValidatorId, WeightedTimestamp, ready_signal_window, shard_prefix_path,
+    Anchor, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin,
+    CommitProof, MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal,
+    ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot, ValidatorId,
+    WeightedTimestamp, ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -304,7 +304,7 @@ pub struct DerivedGenesis {
     /// The parent terminal this child succeeds, carried off the same
     /// header the genesis derives from. `None` when that header carries
     /// no committed-transaction commitment.
-    pub predecessor: Option<PredecessorTerminal>,
+    pub predecessor: Option<Anchor>,
 }
 
 /// Derive `child`'s genesis from the parent's terminal header.
@@ -320,7 +320,7 @@ fn derive_child_genesis(
     Some(DerivedGenesis {
         block,
         origin,
-        predecessor: terminal.as_predecessor_terminal(),
+        predecessor: terminal.as_terminal_anchor(),
     })
 }
 

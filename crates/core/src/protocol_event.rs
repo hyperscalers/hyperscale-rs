@@ -786,21 +786,6 @@ pub enum ProtocolEvent {
         terminal_wt: WeightedTimestamp,
     },
 
-    /// A predecessor's committee answered which of the queried
-    /// transactions it committed before terminating. Every `absent`
-    /// answer here arrives already checked against that predecessor's
-    /// `committed_txs_root`; a `committed` answer needs no proof, since
-    /// it leaves the successor's standing refusal in place.
-    ///
-    /// `ShardCoordinator` records them and re-drives any vote that
-    /// deferred for want of one.
-    PrecutResolutionsReceived {
-        /// The terminated chain that answered.
-        predecessor: ShardId,
-        /// One `(transaction, absent)` pair per answered query.
-        answers: Vec<(TxHash, bool)>,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon consensus
     // ═══════════════════════════════════════════════════════════════════════

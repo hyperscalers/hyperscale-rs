@@ -8,12 +8,11 @@ use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::{
-    AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-    CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, PredecessorTerminal,
-    ProposerTimestamp, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
-    SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier,
-    TerminalRoots, TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify,
-    WeightedTimestamp,
+    AbandonmentRoot, Anchor, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
+    CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
+    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot,
+    ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier, TerminalRoots,
+    TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -682,19 +681,21 @@ impl BlockHeader {
         self.terminal_roots.map(|roots| roots.committed_txs)
     }
 
-    /// This header as the terminal a successor succeeds.
+    /// This header as the terminal a successor succeeds: the state its
+    /// markers are proven against.
     ///
     /// `None` on any header carrying no terminal roots, which is every
     /// header but a terminating boundary's. A successor handed nothing
-    /// here keeps refusing everything from before its origin, which is
-    /// the rule it would relax rather than a fallback.
+    /// here keeps refusing everything from before its origin until it
+    /// reads its predecessors off the schedule.
     #[must_use]
-    pub fn as_predecessor_terminal(&self) -> Option<PredecessorTerminal> {
-        Some(PredecessorTerminal {
+    pub fn as_terminal_anchor(&self) -> Option<Anchor> {
+        self.terminal_roots?;
+        Some(Anchor {
             shard: self.shard_id(),
             height: self.height(),
-            block_hash: self.hash(),
-            committed_txs_root: self.terminal_roots?.committed_txs,
+            state_root: self.state_root(),
+            ts: self.parent_qc().weighted_timestamp(),
         })
     }
 
@@ -1037,14 +1038,13 @@ mod tests {
         assert_ne!(carrying.hash(), bare.hash());
     }
 
-    /// A terminating header describes itself as a predecessor terminal;
-    /// an ordinary one has nothing to offer a successor and says so,
-    /// which is what keeps the successor on its strict rule rather than
-    /// handing it a root it could not have committed to.
+    /// A terminating header describes itself as the terminal a successor
+    /// proves against; an ordinary one has nothing to offer a successor
+    /// and says so, which is what keeps the successor on its strict rule.
     #[test]
-    fn only_a_terminating_header_is_a_predecessor_terminal() {
+    fn only_a_terminating_header_is_a_terminal_anchor() {
         let bare = BlockHeader::new(BlockHeaderParts::default());
-        assert!(bare.as_predecessor_terminal().is_none());
+        assert!(bare.as_terminal_anchor().is_none());
 
         let roots = sample_terminal_roots();
         let terminal = BlockHeader::new(BlockHeaderParts {
@@ -1053,13 +1053,12 @@ mod tests {
             terminal_roots: Some(roots),
             ..Default::default()
         });
-        let predecessor = terminal
-            .as_predecessor_terminal()
-            .expect("a terminating header carries the commitment");
-        assert_eq!(predecessor.shard, ShardId::leaf(1, 0));
-        assert_eq!(predecessor.height, BlockHeight::new(41));
-        assert_eq!(predecessor.block_hash, terminal.hash());
-        assert_eq!(predecessor.committed_txs_root, roots.committed_txs);
+        let anchor = terminal
+            .as_terminal_anchor()
+            .expect("a terminating header is a terminal");
+        assert_eq!(anchor.shard, ShardId::leaf(1, 0));
+        assert_eq!(anchor.height, BlockHeight::new(41));
+        assert_eq!(anchor.state_root, terminal.state_root());
     }
 
     fn sample_terminal_roots() -> TerminalRoots {
