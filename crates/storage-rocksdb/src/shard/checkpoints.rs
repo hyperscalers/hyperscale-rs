@@ -34,8 +34,8 @@ use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
-    ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, EntriesCf, ImportStagingCf, JmtNodesCf,
-    PackageArtifactsCf, StateCf, SubstateBytesCf,
+    ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, CrossingIndexCf, EntriesCf, ImportStagingCf,
+    JmtNodesCf, PackageArtifactsCf, StateCf, SubstateBytesCf,
 };
 use super::core::{RocksDbShardStorage, fold_sweep_rows};
 use super::entry_key::scan_entries;
@@ -63,6 +63,7 @@ fn index_imported_leaves(
     let state_cf = StateCf::handle(cf);
     let entries_cf = EntriesCf::handle(cf);
     let artifacts_cf = PackageArtifactsCf::handle(cf);
+    let crossing_cf = CrossingIndexCf::handle(cf);
     let mut sweep_rows = SweepRows::default();
     for leaf in leaves {
         batch_put::<StateCf>(batch, state_cf, &leaf.key, &leaf.value.to_vec());
@@ -70,7 +71,11 @@ fn index_imported_leaves(
             entry,
             package,
             sweep,
+            crossing,
         } = LeafRows::of(leaf.key, &leaf.value);
+        if crossing {
+            batch_put::<CrossingIndexCf>(batch, crossing_cf, &leaf.key, &());
+        }
         if let Some((entry_key, value)) = entry {
             batch_put::<EntriesCf>(batch, entries_cf, &entry_key, &value);
         }
@@ -536,6 +541,18 @@ impl BoundaryStore for RocksDbShardStorage {
         leaves
     }
 
+    fn crossing_rows(&self, under: &NibblePath) -> Vec<SubstateKey> {
+        let cf = self.cf();
+        iter_from::<CrossingIndexCf>(
+            &self.db,
+            CrossingIndexCf::handle(&cf),
+            &prefix_low_key(under),
+        )
+        .map(|(key, ())| key)
+        .take_while(|key| key_under_prefix(&key.to_bytes(), under))
+        .collect()
+    }
+
     fn read_frontier(&self, shard: ShardId) -> ReadFrontier {
         load_read_frontier(self, shard)
     }
@@ -741,9 +758,10 @@ mod tests {
     use hyperscale_storage::test_helpers::{
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
-        test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
-        test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
-        test_import_gate_reads_the_trie, test_the_read_frontier_is_read_off_the_state,
+        test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
+        test_escrow_records_are_read_off_the_state, test_followed_halves_fold_the_settlements,
+        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
+        test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, ShardChainReader, SubstateStore};
     use hyperscale_types::AddressClass;
@@ -912,6 +930,22 @@ mod tests {
         let fresh_dir = TempDir::new().unwrap();
         let fresh = open_storage(fresh_dir.path());
         test_boundary_import_roundtrip(&storage, &fresh);
+    }
+
+    /// The crossing index equals the leaves across commits, deletes and
+    /// an import, and a reopened store holds the index a running one does.
+    #[test]
+    fn the_crossing_index_equals_the_leaves() {
+        let (dir, fresh_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let storage = open_storage(dir.path());
+        test_crossing_index_equals_the_leaves(&storage, &open_storage(fresh_dir.path()));
+        let running = storage.crossing_rows(&NibblePath::empty());
+        drop(storage);
+        assert_eq!(
+            open_storage(dir.path()).crossing_rows(&NibblePath::empty()),
+            running,
+            "a reopened store holds the index a running one does",
+        );
     }
 
     /// A store answers for the escrow records its state holds, which is

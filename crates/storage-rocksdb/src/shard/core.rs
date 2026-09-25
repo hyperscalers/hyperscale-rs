@@ -23,8 +23,8 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, GenesisCommit, JmtSnapshot, SubstateStore, Substates, SweepRows,
-    entry_leaf_value, index_leaf, pending_write, tree,
+    BaseReadCache, GenesisCommit, Indexed, JmtSnapshot, RowChange, SubstateStore, Substates,
+    SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
@@ -40,9 +40,10 @@ use tracing::field::Empty;
 use tracing::{Level, Span, instrument};
 
 use super::column_families::{
-    ALL_COLUMN_FAMILIES, CfHandles, EntriesCf, EntriesHistoryCf, HOT_WRITE_COLUMN_FAMILIES,
-    JmtNodesCf, PackageArtifactsCf, STATE_HISTORY_CF, StaleEntriesHistoryCf, StaleJmtNodesCf,
-    StaleStateHistoryCf, StateCf, StateHistoryCf, SubstateBytesCf, SweepIndexCf,
+    ALL_COLUMN_FAMILIES, CfHandles, CrossingIndexCf, EntriesCf, EntriesHistoryCf,
+    HOT_WRITE_COLUMN_FAMILIES, JmtNodesCf, PackageArtifactsCf, STATE_HISTORY_CF,
+    StaleEntriesHistoryCf, StaleJmtNodesCf, StaleStateHistoryCf, StateCf, StateHistoryCf,
+    SubstateBytesCf, SweepIndexCf,
 };
 use super::entry_key::VersionedEntryKeyCodec;
 use super::jmt_snapshot_store::SnapshotTreeStore;
@@ -568,15 +569,22 @@ impl RocksDbShardStorage {
         let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
         let mut sweep_rows = SweepRows::default();
         let artifacts_cf = PackageArtifactsCf::handle(&cf);
+        let crossing_cf = CrossingIndexCf::handle(&cf);
         for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
             let prior =
                 prior_slot.expect("every write must have a resolved prior (cache hit or fetched)");
-            let package = index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
+            let Indexed { package, crossing } =
+                index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
             // A cell that self-identifies as a package lands its artifact
             // in the content-addressed index, in the same atomic batch as
             // the state that carries it.
             if let (Some(package), Some(value)) = (package, change) {
                 batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
+            }
+            match crossing {
+                RowChange::Put => batch_put::<CrossingIndexCf>(batch, crossing_cf, key, &()),
+                RowChange::Delete => batch_delete::<CrossingIndexCf>(batch, crossing_cf, key),
+                RowChange::Keep => {}
             }
             if let Some(new_value) = change {
                 // No-op short-circuit: setting a key to the value it

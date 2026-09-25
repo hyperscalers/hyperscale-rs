@@ -222,6 +222,17 @@ pub const PACKAGE_ARTIFACTS_CF: &str = "package_artifacts";
 /// an owner is answerable from the state root alone.
 pub const SWEEP_INDEX_CF: &str = "sweep_index";
 
+/// Column family indexing the committed crossing leaves: one row per
+/// record or answer.
+///
+/// Key: the leaf's `SubstateKey`; value: empty. Derived state on the
+/// same terms as [`SWEEP_INDEX_CF`]: written in the commit batch where
+/// priors are already resolved, rebuilt from the leaves at boundary
+/// import, filtered by owner at a repoint, and equal at every height to
+/// what the tree's crossing leaves say. Owner-major like the state, so a
+/// shard's rows are one contiguous run.
+pub const CROSSING_INDEX_CF: &str = "crossing_index";
+
 // Default-CF metadata keys are defined as MetadataEntry types in typed_cf.rs.
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
@@ -255,6 +266,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     PROVISIONS_CF,
     PACKAGE_ARTIFACTS_CF,
     SWEEP_INDEX_CF,
+    CROSSING_INDEX_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -289,6 +301,7 @@ pub struct CfHandles<'a> {
     provisions: &'a ColumnFamily,
     package_artifacts: &'a ColumnFamily,
     sweep_index: &'a ColumnFamily,
+    crossing_index: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -324,6 +337,7 @@ impl<'a> CfHandles<'a> {
             import_staging: resolve(IMPORT_STAGING_CF),
             package_artifacts: resolve(PACKAGE_ARTIFACTS_CF),
             sweep_index: resolve(SWEEP_INDEX_CF),
+            crossing_index: resolve(CROSSING_INDEX_CF),
             provisions: resolve(PROVISIONS_CF),
         }
     }
@@ -455,6 +469,21 @@ impl TypedCf for SweepIndexCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.sweep_index
+    }
+}
+
+/// Crossing index — one row per committed crossing leaf. See
+/// [`CROSSING_INDEX_CF`].
+pub struct CrossingIndexCf;
+impl TypedCf for CrossingIndexCf {
+    const NAME: &'static str = CROSSING_INDEX_CF;
+    type Key = SubstateKey;
+    type Value = ();
+    type KeyCodec = SubstateKeyCodec;
+    type ValueCodec = UnitCodec;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.crossing_index
     }
 }
 

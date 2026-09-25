@@ -21,14 +21,18 @@ use std::sync::atomic::Ordering;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::Jmt;
-use hyperscale_storage::{AdoptSource, Adoption, Subtree, SweepRows, Vintage, adopt_plan};
+use hyperscale_storage::{
+    AdoptSource, Adoption, Subtree, SweepRows, Vintage, adopt_plan, key_under_prefix,
+};
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
 };
 use rocksdb::WriteBatch;
 use rocksdb::checkpoint::Checkpoint;
 
-use super::column_families::{CfHandles, JmtNodesCf, SubstateBytesCf, SweepIndexCf};
+use super::column_families::{
+    CfHandles, CrossingIndexCf, JmtNodesCf, SubstateBytesCf, SweepIndexCf,
+};
 use super::core::RocksDbShardStorage;
 use super::metadata::{
     delete_committed_qc, read_chain_origin, read_jmt_metadata, write_chain_origin,
@@ -125,6 +129,7 @@ impl RocksDbShardStorage {
                 let root = self.repoint(&cf, &mut batch, subtree, genesis_version)?;
                 write_jmt_metadata(&mut batch, genesis_version, root);
                 self.drop_foreign_sweep_rows(&cf, &mut batch);
+                self.drop_foreign_crossing_rows(&cf, &mut batch);
                 root
             }
         };
@@ -146,6 +151,17 @@ impl RocksDbShardStorage {
             .collect();
         for row in rows.retain_under(&self.root_path) {
             batch_delete::<SweepIndexCf>(batch, sweep_cf, &row);
+        }
+    }
+
+    /// Drop the crossing-index rows of owners outside this store's prefix,
+    /// so a cloned child's index equals a snap-synced child's.
+    fn drop_foreign_crossing_rows(&self, cf: &CfHandles, batch: &mut WriteBatch) {
+        let crossing_cf = CrossingIndexCf::handle(cf);
+        for (key, ()) in iter_all::<CrossingIndexCf>(&self.db, crossing_cf) {
+            if !key_under_prefix(&key.to_bytes(), &self.root_path) {
+                batch_delete::<CrossingIndexCf>(batch, crossing_cf, &key);
+            }
         }
     }
 
@@ -289,7 +305,7 @@ impl TreeReader for PreRootStore<'_> {
 mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES, Key, NibblePath};
-    use hyperscale_storage::test_helpers::import_boundary_state;
+    use hyperscale_storage::test_helpers::{crossing_record_leaf, import_boundary_state};
     use hyperscale_storage::{AdoptSource, BoundaryStore, SweepIndex, WitnessSeed};
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
@@ -385,6 +401,58 @@ mod tests {
             .map_or(StateRoot::ZERO, |slot| {
                 StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash))
             })
+    }
+
+    /// A cloned child indexes only its own crossings, exactly as a child
+    /// that snap-synced its half does.
+    #[test]
+    fn a_cloned_child_indexes_only_its_own_crossings() {
+        let leaf = |side: u8| crossing_record_leaf(if side == 0 { 0x02 } else { 0x82 });
+        let parent_dir = TempDir::new().unwrap();
+        let parent = RocksDbShardStorage::open(parent_dir.path(), NibblePath::empty()).unwrap();
+        import_boundary_state(
+            &parent,
+            BlockHeight::new(9),
+            &[leaf(0), leaf(1)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
+        let (parent_version, _) = parent.read_jmt_metadata();
+        assert_eq!(parent.crossing_rows(&NibblePath::empty()).len(), 2);
+
+        for side in [0u8, 1u8] {
+            let child_dir = TempDir::new().unwrap();
+            let target = child_dir.path().join("store");
+            parent.checkpoint_into(&target).unwrap();
+            let child = RocksDbShardStorage::open(&target, child_path(side)).unwrap();
+            let child_root = child_root_from_parent(&parent, parent_version, side);
+            child
+                .adopt_genesis(
+                    origin_at_10(),
+                    &genesis_at_10(child_of(side), child_root),
+                    AdoptSource::ParentSubtree,
+                )
+                .unwrap();
+            let synced_dir = TempDir::new().unwrap();
+            let synced = RocksDbShardStorage::open(synced_dir.path(), child_path(side)).unwrap();
+            import_boundary_state(
+                &synced,
+                BlockHeight::new(9),
+                &[leaf(side)],
+                WitnessSeed::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                child.crossing_rows(&NibblePath::empty()),
+                vec![leaf(side).key],
+                "child {side} indexes its own record and not its sibling's",
+            );
+            assert_eq!(
+                child.crossing_rows(&NibblePath::empty()),
+                synced.crossing_rows(&NibblePath::empty()),
+                "and what a snap-synced child indexes",
+            );
+        }
     }
 
     /// A cloned child sweeps only its own cells.

@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
-use hyperscale_storage::{JmtSnapshot, SweepRows, entry_leaf_rows, index_leaf, retire_dated};
+use hyperscale_storage::{
+    Indexed, JmtSnapshot, RowChange, SweepRows, entry_leaf_rows, index_leaf, retire_dated,
+};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
     ConsensusReceipt, EntryKey, ExecutionMetadata, Finalization, FinalizationHash, Hash,
@@ -86,6 +88,9 @@ pub struct SharedState {
     /// from the same judgement so both backends enumerate the same
     /// candidates.
     pub(crate) sweep_index: SweepRows,
+    /// The crossing index — the mirror of the `RocksDB` backend's: one
+    /// key per committed crossing record or answer.
+    pub(crate) crossing_index: BTreeSet<SubstateKey>,
 }
 
 impl SharedState {
@@ -132,6 +137,7 @@ impl SharedState {
             substate_bytes: BTreeMap::new(),
             package_artifacts: BTreeMap::new(),
             sweep_index: SweepRows::default(),
+            crossing_index: BTreeSet::new(),
         }
     }
 
@@ -382,9 +388,19 @@ pub fn apply_writes(
     let mut sweep_rows = SweepRows::default();
     for (key, change) in writes.cells().iter().chain(&leaf_rows) {
         let prior = state.current_state.get(key).cloned();
-        let package = index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
+        let Indexed { package, crossing } =
+            index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
         if let (Some(package), Some(value)) = (package, change) {
             state.package_artifacts.insert(package, value.clone());
+        }
+        match crossing {
+            RowChange::Put => {
+                state.crossing_index.insert(*key);
+            }
+            RowChange::Delete => {
+                state.crossing_index.remove(key);
+            }
+            RowChange::Keep => {}
         }
         if write_history {
             state.state_history.insert((*key, version), prior);

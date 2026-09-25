@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::Jmt;
-use hyperscale_storage::{AdoptSource, Adoption, Subtree, Vintage, adopt_plan};
+use hyperscale_storage::{AdoptSource, Adoption, Subtree, Vintage, adopt_plan, key_under_prefix};
 use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
 
 use super::core::{SimImportStaging, SimShardStorage};
@@ -75,6 +75,9 @@ impl SimShardStorage {
             Adoption::Repoint(subtree) => {
                 let root = install_adoption(&mut shared, origin, subtree)?;
                 shared.sweep_index.retain_under(&vintage.prefix);
+                shared
+                    .crossing_index
+                    .retain(|key| key_under_prefix(&key.to_bytes(), &vintage.prefix));
                 root
             }
         };
@@ -167,8 +170,8 @@ fn install_adoption(
 mod tests {
     use hyperscale_hbor::Bytes;
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES};
-    use hyperscale_storage::test_helpers::import_boundary_state;
-    use hyperscale_storage::{AdoptSource, SweepIndex, WitnessSeed};
+    use hyperscale_storage::test_helpers::{crossing_record_leaf, import_boundary_state};
+    use hyperscale_storage::{AdoptSource, BoundaryStore, SweepIndex, WitnessSeed};
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
         Address, AddressClass, Block, BlockHash, BlockHeight, ChainOrigin, Hash, SWEEP_BUCKET_MS,
@@ -345,6 +348,52 @@ mod tests {
     /// root and their counts partition the leaves. Adoption is idempotent:
     /// a re-run returns the recorded root rather than failing on the
     /// parent slot the first run consumed.
+    /// A cloned child indexes only its own crossings, exactly as a child
+    /// that snap-synced its half does.
+    #[test]
+    fn a_cloned_child_indexes_only_its_own_crossings() {
+        let leaf = |side: u8| crossing_record_leaf(if side == 0 { 0x02 } else { 0x82 });
+        let parent = SimShardStorage::default();
+        import_boundary_state(
+            &parent,
+            BlockHeight::new(9),
+            &[leaf(0), leaf(1)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
+        assert_eq!(parent.crossing_rows(&NibblePath::empty()).len(), 2);
+
+        for side in [0u8, 1u8] {
+            let child = parent.clone_for_split_child(child_path(side));
+            let genesis = split_genesis(
+                child_of(side),
+                child_subtree_root(&parent, side),
+                origin_at_10().anchor_wt,
+            );
+            child
+                .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+                .unwrap();
+            let synced = SimShardStorage::default();
+            import_boundary_state(
+                &synced,
+                BlockHeight::new(9),
+                &[leaf(side)],
+                WitnessSeed::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                child.crossing_rows(&NibblePath::empty()),
+                vec![leaf(side).key],
+                "child {side} indexes its own record and not its sibling's",
+            );
+            assert_eq!(
+                child.crossing_rows(&NibblePath::empty()),
+                synced.crossing_rows(&NibblePath::empty()),
+                "and what a snap-synced child indexes",
+            );
+        }
+    }
+
     /// A cloned child sweeps only its own cells.
     ///
     /// The clone carries the sibling's leaves, so without the adoption

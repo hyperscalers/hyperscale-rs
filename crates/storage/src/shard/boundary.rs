@@ -446,6 +446,13 @@ pub trait BoundaryStore {
     /// a contiguous run and the scan is that run and nothing else.
     fn crossing_leaves(&self, shard: ShardId) -> CrossingLeaves;
 
+    /// The persisted crossing index's rows under `under`: the keys of the
+    /// committed crossing records and answers there, ascending.
+    ///
+    /// Persisted rows only; an unpersisted ancestor's writes are the
+    /// overlay's to add.
+    fn crossing_rows(&self, under: &NibblePath) -> Vec<SubstateKey>;
+
     /// The read frontier `shard`'s slice of the committed state holds:
     /// [`load_read_frontier`](crate::load_read_frontier) over the store,
     /// read the same way however the store was reached, since the table

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_hbor::{Bytes, Capped, from_slice};
-use hyperscale_jmt::{KEY_BYTES, TreeReader};
+use hyperscale_jmt::{KEY_BYTES, NibblePath, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
     proven_claim, stub_sweepable_cell, test_key, test_transaction,
@@ -32,8 +32,9 @@ use hyperscale_types::{
     SweepFrontier, SyncHint, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
     TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
     WitnessSources, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    shard_prefix_path,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, Terms};
+use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -43,7 +44,7 @@ use crate::{
     ImportCursor, ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState,
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
     SweepIndex, VersionedStore, WitnessSeed, committed_tx_cell_key, committed_tx_cells,
-    holds_state, sweep_for_block,
+    holds_state, key_under_prefix, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -1580,6 +1581,152 @@ where
     );
 }
 
+/// The crossing `producer` issues to `consumer`, both owners seeded as
+/// [`state_key`] seeds them: a seed under `0x80` sits in the left half.
+const fn fixture_crossing(producer: u8, consumer: u8) -> CrossingId {
+    CrossingId {
+        producer: state_key(producer, 0).owner,
+        consumer: state_key(consumer, 0).owner,
+        intent: IntentHash(Hash32([producer; 32])),
+        local: 0,
+        output: 0,
+    }
+}
+
+/// A record leaf of the crossing `producer` issues, at its derived key.
+///
+/// # Panics
+///
+/// Never: a crossing cell is narrower than a leaf's cap.
+#[must_use]
+pub fn crossing_record_leaf(producer: u8) -> SubstateLeaf {
+    let id = fixture_crossing(producer, producer ^ 0x80);
+    SubstateLeaf {
+        key: id.record_key(&ProtocolHasher),
+        value: Bytes::new(
+            id.cell(
+                VmTxHash(Hash32([0xC0; 32])),
+                ResourceAddr::new([0xE0; 31]),
+                500,
+                1_000,
+                Terms::Owed,
+            )
+            .to_bytes(),
+        )
+        .expect("a crossing cell fits a leaf"),
+    }
+}
+
+/// The crossing index equals the leaves.
+///
+/// After a commit that writes a record and an answer, one that deletes
+/// each, and an import of the store's leaves into `fresh`, the rows
+/// under each half are exactly the keys among those written that
+/// `CrossingLeaf::read` classifies.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_crossing_index_equals_the_leaves<S>(storage: &S, fresh: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    install_stub_protocol_statics();
+    let mut written: BTreeSet<SubstateKey> = BTreeSet::new();
+    let halves = [
+        shard_prefix_path(ShardId::leaf(1, 0)),
+        shard_prefix_path(ShardId::leaf(1, 1)),
+    ];
+    let holds = |store: &S, written: &BTreeSet<SubstateKey>| {
+        for half in &halves {
+            let leaves: Vec<SubstateKey> = written
+                .iter()
+                .filter(|key| key_under_prefix(&key.to_bytes(), half))
+                .filter(|key| {
+                    store.cell(**key).is_some_and(|value| {
+                        CrossingLeaf::read(&ProtocolHasher, **key, &value).is_some()
+                    })
+                })
+                .copied()
+                .collect();
+            assert_eq!(store.crossing_rows(half), leaves, "rows under {half:?}");
+        }
+    };
+    let commit = |written: &mut BTreeSet<SubstateKey>,
+                  cells: Vec<(SubstateKey, Option<Vec<u8>>)>| {
+        written.extend(cells.iter().map(|(key, _)| *key));
+        commit_writes(
+            storage,
+            &SettledWrites::from_absolutes(cells.into_iter().collect()),
+        );
+    };
+
+    holds(storage, &BTreeSet::new());
+    let ordinary = state_key(1, 1);
+    let (left, right) = (crossing_record_leaf(2), crossing_record_leaf(0x82));
+    let answered = fixture_crossing(0x84, 3);
+    let answer = answered.answer_key(&ProtocolHasher, Answered::Taken);
+    let answer_value = answered
+        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken)
+        .to_bytes();
+    commit(
+        &mut written,
+        vec![
+            (ordinary, Some(vec![9, 9, 9])),
+            (left.key, Some(left.value.to_vec())),
+            (right.key, Some(right.value.to_vec())),
+            (answer, Some(answer_value)),
+        ],
+    );
+    holds(storage, &written);
+    assert_eq!(
+        storage.crossing_rows(&NibblePath::empty()).len(),
+        3,
+        "a record under each half and an answer, and no ordinary cell",
+    );
+
+    commit(&mut written, vec![(left.key, None), (answer, None)]);
+    holds(storage, &written);
+    assert_eq!(
+        storage.crossing_rows(&NibblePath::empty()),
+        vec![right.key],
+        "a record and an answer removed leave their rows",
+    );
+
+    commit(&mut written, vec![(left.key, Some(left.value.to_vec()))]);
+    storage.pin_boundary(BlockHeight::new(3)).unwrap();
+    let boundary = storage.open_boundary(BlockHeight::new(3)).expect("pinned");
+    let root_key = boundary.get_root_key(3).expect("root resolves");
+    let chunk = Jmt::collect_range(
+        &boundary,
+        &root_key,
+        &[0u8; KEY_BYTES],
+        &[0xFF; KEY_BYTES],
+        1_000,
+    )
+    .unwrap();
+    let leaves: Vec<SubstateLeaf> = chunk
+        .leaves
+        .iter()
+        .map(|(leaf_key, _)| {
+            let key =
+                SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address");
+            SubstateLeaf {
+                key,
+                value: Bytes::new(boundary.cell(key).expect("resolves"))
+                    .expect("a list written out in a test"),
+            }
+        })
+        .collect();
+    import_boundary_state(fresh, BlockHeight::new(3), &leaves, WitnessSeed::default()).unwrap();
+    holds(fresh, &written);
+    assert_eq!(
+        fresh.crossing_rows(&NibblePath::empty()),
+        storage.crossing_rows(&NibblePath::empty()),
+        "an imported store indexes what the committing one does",
+    );
+}
+
 /// Shared serve → import round trip: leaves enumerated and resolved
 /// from `serving`'s pinned boundary rebuild an identical store in
 /// `fresh`, with the raw substates readable and a second import
@@ -2452,6 +2599,28 @@ where
         right.cell(settling.taken()).is_some(),
         "the answer on the right"
     );
+    let under = |store: &S, key: SubstateKey| {
+        store
+            .crossing_rows(&NibblePath::empty())
+            .into_iter()
+            .filter(|row| *row == key)
+            .count()
+    };
+    assert_eq!(
+        (
+            under(left, settling.record()),
+            under(right, settling.taken())
+        ),
+        (1, 1),
+        "a followed block indexes what a committed one does",
+    );
+    assert_eq!(
+        (
+            under(parent, settling.record()),
+            under(parent, settling.taken())
+        ),
+        (1, 1),
+    );
 
     let (block, inputs) = settling.block(2);
     let (_, parent_root) = commit_raising(parent, block.clone(), &inputs);
@@ -2464,6 +2633,14 @@ where
     assert!(
         right.cell(settling.taken()).is_none(),
         "the right half deletes the answer"
+    );
+    assert_eq!(
+        (
+            under(left, settling.record()),
+            under(right, settling.taken())
+        ),
+        (0, 0),
+        "and drops the rows the fold removed",
     );
     assert!(
         SplitChildRoots {
