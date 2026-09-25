@@ -528,9 +528,13 @@ fn issue_a_leg_under_a_cut_push<C: FaultableCluster>(
         .chain_config
         .epoch_duration_ms;
     cast_splitter_vote(c, straddler_split_bytes());
-    let activation = cast_at.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
+    let lead = vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
+    let activation = cast_at.inner() + lead;
+    // The wait covers the lead the harness's fold budget sets, which is
+    // longer on a wall-clock harness than on the simulator.
+    let budget = epochs(u32::try_from(lead + 4).expect("a lead of a few epochs"));
     assert!(
-        await_beacon_epoch(c, activation, epochs(8)),
+        await_beacon_epoch(c, activation, budget),
         "the vote's activation epoch must open within budget",
     );
     let cuts = RecordCuts {
