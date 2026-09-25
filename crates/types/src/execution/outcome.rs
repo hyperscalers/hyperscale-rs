@@ -94,20 +94,6 @@ impl Role {
     pub const fn delivers(self) -> bool {
         matches!(self, Self::Delivery)
     }
-
-    /// Whether a *success* in this role claims what crossed to it.
-    ///
-    /// What an issuer's record is held for is the claim, and only a
-    /// member that ran the consuming side makes one: a delivery, or a
-    /// core member, or an undivided participant. A leg's success says
-    /// its own side went through and nothing about anyone else's, so an
-    /// issuer reading it as a claim would retire a record before the
-    /// value it stands for has been taken — which on a shard that is
-    /// both a caller and a recipient is every swap.
-    #[must_use]
-    pub(crate) const fn success_claims(self) -> bool {
-        matches!(self, Self::Whole | Self::Core | Self::Delivery)
-    }
 }
 
 /// Carried inside execution certificates so remote shards can extract

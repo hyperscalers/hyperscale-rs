@@ -4547,14 +4547,13 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, CLAIM_VISIBILITY_LAG, ConsensusPublicKey, ConsensusReceipt,
-        ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome,
-        GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
-        MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate,
-        RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
-        SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution, UnclaimedCrossing,
-        UnsettledTx, ValidatorInfo, ValidatorSet, Window,
+        BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
+        EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash,
+        Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
+        NetworkDefinition, Probed, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryCause,
+        Role, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim,
+        StateRoot, Stated, StoredReceipt, SubstateKey, TickHalf, TransactionDecision, TxClaim,
+        TxResolution, UnclaimedCrossing, UnsettledTx, ValidatorInfo, ValidatorSet, Window,
     };
     use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
@@ -8815,7 +8814,7 @@ mod tests {
                 TickId::new(PEER, BlockHeight::new(3)),
                 WeightedTimestamp::from_millis(7_000),
                 GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(tx_hash, outcome)]),
+                Capped::from_array([TxOutcome::new(tx_hash, outcome).as_role(Role::Core)]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )))
@@ -11238,35 +11237,25 @@ mod tests {
         (transaction, figures, claim, state)
     }
 
-    /// A cued claim is not asked about before the counterpart could
-    /// have written it.
-    ///
-    /// The cue names where the writing execution ran, and the cell
-    /// lands a lag past it, so a probe inside the lag is a fetch spent
-    /// on an answer that cannot be there — and, since a claim is held
-    /// to each voter's own reading, one taken at whichever height each
-    /// member's own poll happened to reach.
+    /// Nothing asks a consumer's claim before the transaction's
+    /// deadline: before it the answer arrives by push, and a question
+    /// put there reads a cell that may not be written yet.
     #[test]
-    fn a_cued_claim_waits_for_the_cell_to_be_readable() {
+    fn a_claim_is_not_asked_before_the_deadline() {
         let schedule = two_shard_topology();
-        let (transaction, figures, claim, mut state) = consumer_claim_fixture();
-        let claimed_at = figures.deadline.at().minus(Duration::from_secs(5));
-        state
-            .counterparts
-            .fold_claimed(PEER, transaction.hash(), claimed_at);
-
+        let (_, figures, claim, mut state) = consumer_claim_fixture();
         let (_, early) = proven_at(
             &mut state,
             &schedule,
             PEER,
             5,
-            claimed_at.plus(CLAIM_VISIBILITY_LAG / 2),
+            figures.deadline.at().minus(Duration::from_secs(5)),
             &[],
             &[claim],
         );
         assert!(
             state_proof_fetches(&early).is_empty(),
-            "a header inside the lag is not asked of",
+            "a header short of the deadline is not asked of",
         );
 
         let (bundle, opened) = proven_at(
@@ -11274,23 +11263,24 @@ mod tests {
             &schedule,
             PEER,
             6,
-            claimed_at.plus(CLAIM_VISIBILITY_LAG),
+            figures.deadline.at(),
             &[claim],
             &[claim],
         );
-        assert_eq!(
-            state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![claim, core_decline(&leg_classified())])],
-            "and the first one past it is",
+        let asked = state_proof_fetches(&opened);
+        assert!(
+            asked.iter().any(|(at, keys)| *at == bundle.anchor
+                && keys.contains(&claim)
+                && keys.contains(&core_decline(&leg_classified()))),
+            "and the first one at it is: {asked:?}",
         );
     }
 
     /// A consumer's claim proved present, named for its crossing, is
     /// what settles the record: the commit fold removes it, the entry
     /// that issued it closes as the transaction accepted, and no member
-    /// is composed. The committed claim is the whole of the evidence — it
-    /// reaches no mirror and no record — and the certificate is still
-    /// fetched, since a core's acceptance decides the transaction.
+    /// is composed. The committed claim is the whole of the evidence: no
+    /// certificate is fetched after it.
     #[test]
     fn a_claim_proved_present_settles_the_record_in_the_fold() {
         let schedule = two_shard_topology();
@@ -11340,15 +11330,14 @@ mod tests {
             vec![bundle.naming([(claim, crossing)])],
         );
         assert!(
-            folded.iter().any(|action| matches!(
+            !folded.iter().any(|action| matches!(
                 action,
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::ExecutionCerts(fetched),
+                    ids: FetchIds::ExecutionCerts(_),
                     ..
                 })
-                    if fetched.as_slice() == [(PEER, tx_hash)]
             )),
-            "a present claim fetches the consumer's certificate"
+            "a present claim fetches no certificate"
         );
         assert!(
             !folded.iter().any(|action| matches!(

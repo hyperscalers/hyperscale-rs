@@ -499,7 +499,8 @@ impl Counterparts {
                 })
                 .collect();
         }
-        let mut actions = self.fold_state_claims(trie, block);
+        self.fold_state_claims(trie, block);
+        let mut actions = Vec::new();
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -676,7 +677,6 @@ impl Counterparts {
                 key,
                 probed,
                 deadline,
-                cued,
                 ..
             } = question;
             // The newest header the question stands at, of those
@@ -685,7 +685,7 @@ impl Counterparts {
             // this committee is asking of.
             let Some(anchor) = self
                 .proven_anchors
-                .newest_licensed(shard, now, |ts| probed.asks_at(ts, deadline, cued))
+                .newest_licensed(shard, now, |ts| probed.asks_at(ts, deadline))
             else {
                 continue;
             };
@@ -1097,7 +1097,7 @@ impl Counterparts {
     }
 
     /// Fold the claims a committed block carries into the answers every
-    /// replica holds, and hand each to the vote fence.
+    /// replica holds.
     ///
     /// A claim answers every cell of the ledger's on the anchor's shard
     /// whose window the anchor's clock sits inside — whether or not this
@@ -1105,25 +1105,19 @@ impl Counterparts {
     /// replica that never fetched reads the same answer as the one that
     /// did. A claim cell present is the consumer holding the crossing,
     /// which is written straight to the ledger and licenses the
-    /// retirement, and the counterpart's own certificate speaks for the
-    /// verdict next. A core consumer's claim absent says only that a
+    /// retirement. A core consumer's claim absent says only that a
     /// sibling is pending, and a committed cell present that a member
-    /// is; either is asked again at the next header.
-    /// The first proof to answer a cell is the answer; a later one adds
-    /// nothing. The hand-off is a continuation emitted here rather than
-    /// a map the fence reads later, so an answer is never collected
-    /// before it is drained.
-    fn fold_state_claims(&mut self, trie: &ShardTrie, block: &Block) -> Vec<Action> {
+    /// is; either is asked again at the next header. The first proof to
+    /// answer a cell is the answer; a later one adds nothing.
+    fn fold_state_claims(&mut self, trie: &ShardTrie, block: &Block) {
         if block.state_claims().is_empty() {
-            return Vec::new();
+            return;
         }
         let questions = self.ledger.questions(trie);
-        let mut actions = Vec::new();
         for claim in block.state_claims() {
-            actions.extend(self.fold_cells(claim, &questions));
+            self.fold_cells(claim, &questions);
             self.fold_seen(claim);
         }
-        actions
     }
 
     /// Count the fenced claims the block carries, by what each reads: a
@@ -1213,8 +1207,7 @@ impl Counterparts {
 
     /// Fold one claim's answers into the questions the ledger is
     /// waiting on.
-    fn fold_cells(&mut self, claim: &StateClaim, questions: &[Question]) -> Vec<Action> {
-        let mut actions = Vec::new();
+    fn fold_cells(&mut self, claim: &StateClaim, questions: &[Question]) {
         for &Question {
             tx_hash,
             shard,
@@ -1249,19 +1242,7 @@ impl Counterparts {
                 continue;
             }
             record_reclaim_probe_answered(inclusion.is_present());
-            // The counterpart took it, and its certificate says how.
-            // Its broadcast may have missed this shard, so it is fetched
-            // rather than waited for.
-            if inclusion.is_present() {
-                actions.push(Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::ExecutionCerts(vec![(shard, tx_hash)]),
-                    shard,
-                    preferred: None,
-                    class: None,
-                }));
-            }
         }
-        actions
     }
 
     /// Write what the block's records cover into the mirror the gate and
@@ -1295,25 +1276,15 @@ impl Counterparts {
         })]
     }
 
-    /// Fold a counterpart's claiming success: the cue to ask whether it
-    /// wrote the claim, and — where the shard is in the core — one more
-    /// core shard saying the transaction went through.
+    /// Fold a core shard's acceptance: one more core shard saying the
+    /// transaction went through, and the mempool told once every core
+    /// shard has.
     ///
-    /// Nothing is written down. A success is not evidence: its own
-    /// finalization can still be refused afterwards, so what a record
-    /// stands on is the claim cell proved present, and this only opens
-    /// the question.
-    pub(crate) fn fold_claimed(
-        &mut self,
-        shard: ShardId,
-        tx_hash: TxHash,
-        at: WeightedTimestamp,
-    ) -> Vec<Action> {
+    /// Nothing is written down. What a record stands on is its
+    /// consumer's answer, pushed or read present.
+    pub(crate) fn fold_accepted(&mut self, shard: ShardId, tx_hash: TxHash) -> Vec<Action> {
         if shard == self.ledger.local() {
             return Vec::new();
-        }
-        if self.ledger.consumer_holds(tx_hash, shard) {
-            self.ledger.cue_probe(tx_hash, at);
         }
         if self.ledger.core_holds(tx_hash, shard) && self.ledger.record_acceptance(tx_hash, shard) {
             return vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
@@ -1611,7 +1582,7 @@ impl Counterparts {
         for (tx_hash, spoken) in ec.verdicts() {
             actions.extend(match spoken {
                 Spoken::Refused(decision) => self.relay_refusal(shard, tx_hash, decision),
-                Spoken::Claimed { at } => self.fold_claimed(shard, tx_hash, at),
+                Spoken::Accepted => self.fold_accepted(shard, tx_hash),
             });
         }
         actions

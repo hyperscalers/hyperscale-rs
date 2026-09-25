@@ -245,30 +245,6 @@ pub const PROGRESS_WAIT_MULTIPLIER: u32 = 3;
 /// something the waiting member can read.
 pub const HALT_HARVEST_WAIT: Duration = Duration::from_secs(10);
 
-/// How long past a counterpart's claiming vote its claim cell becomes
-/// readable in that counterpart's committed state.
-///
-/// The vote anchor a certificate speaks at is where the counterpart's
-/// execution ran, and the cell it writes lands where the tick casting
-/// that vote commits — a few of that shard's blocks later. A probe
-/// before then is certain to miss, and costs more than the fetch it
-/// wastes: a claim is held to each voter's own reading, so members
-/// polling on their own fetch latencies hold readings at different
-/// heights and a block claiming one sends the rest to fetch it again.
-/// Measured from the anchor the certificate names, which every member
-/// reads the same, so they ask one question at one height.
-///
-/// Sized well above a handful of block intervals and far under the
-/// windows a reading answers in, which run to minutes. A counterpart
-/// slower than this is asked again at a newer header, as before; one
-/// faster is retired a moment later than it might have been.
-pub const CLAIM_VISIBILITY_LAG: Duration = Duration::from_secs(1);
-
-const _: () = assert!(
-    CLAIM_VISIBILITY_LAG.as_secs() * 20 < MAX_VALIDITY_RANGE.as_secs(),
-    "the wait before a claim is asked about is a rounding error against the window it answers in",
-);
-
 /// Beacon-chain epoch length, measured against committed beacon-slot
 /// `weighted_timestamp`.
 ///

@@ -16,8 +16,8 @@ use std::time::Duration;
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    CLAIM_VISIBILITY_LAG, EPOCH_DURATION, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE,
-    RETENTION_HORIZON, TERMINAL_EVIDENCE_EPOCHS, Transaction, WeightedTimestamp,
+    EPOCH_DURATION, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, RETENTION_HORIZON,
+    TERMINAL_EVIDENCE_EPOCHS, Transaction, WeightedTimestamp,
 };
 
 /// The span past the deadline in which a record can be disposed of at
@@ -234,9 +234,7 @@ impl Probed {
     ///
     /// A presence answers wherever it was taken, so this bounds only
     /// when the question is worth putting: a consumer's claim is there
-    /// by the deadline or the consumer has not run yet. A consumer's
-    /// claiming success opens the question earlier, and that cue is the
-    /// prober's to read.
+    /// by the deadline or the consumer has not run yet.
     #[must_use]
     pub(crate) const fn presence_asked_from(self, deadline: Deadline) -> Option<WeightedTimestamp> {
         match self {
@@ -246,25 +244,14 @@ impl Probed {
     }
 
     /// Whether a header at `anchor_wt` is one to ask this question at,
-    /// for a transaction with this `deadline` whose consumer's claiming
-    /// success, if one was heard, was spoken at `cued`: inside the
-    /// window an absence answers in, or past the point a presence is
-    /// asked from — the question's own, or one
-    /// [`CLAIM_VISIBILITY_LAG`] past the cue, whichever is earlier,
-    /// since the reading a cue is after is a presence and a presence
-    /// answers wherever it was taken.
+    /// for a transaction with this `deadline`: inside the window an
+    /// absence answers in, or past the point a presence is asked from.
     #[must_use]
-    pub fn asks_at(
-        self,
-        anchor_wt: WeightedTimestamp,
-        deadline: Deadline,
-        cued: Option<WeightedTimestamp>,
-    ) -> bool {
+    pub fn asks_at(self, anchor_wt: WeightedTimestamp, deadline: Deadline) -> bool {
         self.absence_answers_at(anchor_wt, deadline)
-            || self.presence_asked_from(deadline).is_some_and(|from| {
-                anchor_wt >= from
-                    || cued.is_some_and(|cued| anchor_wt >= cued.plus(CLAIM_VISIBILITY_LAG))
-            })
+            || self
+                .presence_asked_from(deadline)
+                .is_some_and(|from| anchor_wt >= from)
     }
 
     /// What `inclusion` of the probed cell, read at `probed_wt`, says
@@ -329,10 +316,7 @@ mod tests {
     use hyperscale_vm_types::COMMITTED_GRACE_MS;
 
     use super::{CLAIM_WINDOW, Deadline, Probed, Window};
-    use crate::{
-        CLAIM_VISIBILITY_LAG, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE,
-        WeightedTimestamp,
-    };
+    use crate::{Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, WeightedTimestamp};
 
     fn ms(value: u64) -> WeightedTimestamp {
         WeightedTimestamp::from_millis(value)
@@ -519,28 +503,13 @@ mod tests {
         assert_eq!(Probed::Decline.read(Inclusion::Absent), None);
     }
 
-    /// A claim is asked from the deadline, or one lag past a cue heard
-    /// earlier; a committed cell only inside its absence window, since a
-    /// cue promises a presence and a present committed cell answers
-    /// nothing.
+    /// A claim is asked from the deadline and not before; a committed
+    /// cell only inside its absence window.
     #[test]
-    fn a_cue_opens_a_presence_question_early_and_never_a_committed_cell() {
+    fn a_presence_question_opens_at_the_deadline() {
         let deadline = Deadline::of(ms(60_000));
-        let cued = deadline.at().minus(Duration::from_secs(30));
-        let readable = cued.plus(CLAIM_VISIBILITY_LAG);
-        assert!(!Probed::Claim.asks_at(
-            readable.minus(Duration::from_millis(1)),
-            deadline,
-            Some(cued)
-        ));
-        assert!(Probed::Claim.asks_at(readable, deadline, Some(cued)));
-        assert!(!Probed::Claim.asks_at(
-            deadline.at().minus(Duration::from_millis(1)),
-            deadline,
-            None
-        ));
-        assert!(Probed::Claim.asks_at(deadline.at(), deadline, None));
-        assert!(!Probed::Core.asks_at(readable, deadline, Some(cued)));
-        assert!(Probed::Core.asks_at(deadline.at(), deadline, Some(cued)));
+        assert!(!Probed::Claim.asks_at(deadline.at().minus(Duration::from_millis(1)), deadline));
+        assert!(Probed::Claim.asks_at(deadline.at(), deadline));
+        assert!(Probed::Core.asks_at(deadline.at(), deadline));
     }
 }

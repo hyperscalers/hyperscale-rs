@@ -105,17 +105,6 @@ struct Owed {
     /// is a block carrying the abort — and the departure that covered it
     /// is the one clock both the entry and the record are stated in.
     departed_by: Option<ShardId>,
-    /// Where a consumer's certificate spoke a claiming success for this
-    /// transaction, if one has.
-    ///
-    /// The cue to ask, never the answer. A certificate says a
-    /// counterpart's execution succeeded; whether it wrote the claim its
-    /// success promises is a question about that shard's committed
-    /// state, and only its state answers. Opening the probe here rather
-    /// than at the deadline is what keeps a retirement as prompt as that
-    /// state can show it, which is one [`CLAIM_VISIBILITY_LAG`](hyperscale_types::CLAIM_VISIBILITY_LAG) past the
-    /// anchor kept here.
-    cued: Option<WeightedTimestamp>,
     /// The core shards whose certificates accepted it. A core shard's
     /// tick closes on every other core shard's certificate, so one
     /// saying it succeeded is not the transaction accepted — that is
@@ -588,14 +577,6 @@ impl Kept {
     fn declines(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
         self.answers(local, Kind::Escrowed, Answered::Never)
     }
-
-    /// Every claim cell a consumer elsewhere writes for what `local`
-    /// issued, whichever side consumes it.
-    fn every_claim(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        let mut claims = self.claims(local);
-        claims.extend(self.deliveries(local));
-        claims
-    }
 }
 
 /// A leg entry a committed record has licensed a settlement of, with
@@ -662,22 +643,16 @@ pub struct Question {
     /// The entry's deadline, which every window an answer is held to
     /// is read off.
     pub(crate) deadline: Deadline,
-    /// Where a consumer's claiming success was spoken, if one has been
-    /// heard: the anchor that opens a presence question ahead of the
-    /// deadline, and that the cell it asks about becomes readable one
-    /// [`CLAIM_VISIBILITY_LAG`](hyperscale_types::CLAIM_VISIBILITY_LAG) past.
-    pub(crate) cued: Option<WeightedTimestamp>,
 }
 
 impl Question {
     /// Whether the question is worth putting at `now`, the chain's
-    /// committed clock: past the deadline, or cued by a consumer's
-    /// claiming success. The deadline opens the absence — before it the
-    /// core may still legitimately commit, so absence says nothing —
-    /// and the cue opens the presence, which needs no window at all.
+    /// committed clock: past the deadline. Before it the core may still
+    /// legitimately commit, so an absence says nothing, and a presence
+    /// arrives by push.
     #[must_use]
     pub(crate) fn open_at(self, now: WeightedTimestamp) -> bool {
-        self.deadline.passed(now) || self.cued.is_some()
+        self.deadline.passed(now)
     }
 }
 
@@ -814,7 +789,6 @@ impl Ledger {
                 certified: Certified::No,
                 part: Part::of(self.local, tx, classified),
                 departed_by: None,
-                cued: None,
                 accepted: BTreeSet::new(),
                 readings: BTreeMap::new(),
             };
@@ -860,28 +834,6 @@ impl Ledger {
     pub(crate) fn core_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         self.leg_core(tx_hash)
             .is_some_and(|core| core.contains(&shard))
-    }
-
-    /// Whether `shard` consumes a crossing this shard issued for the
-    /// transaction — a core consumer's or a delivery's — so that its
-    /// acceptance is the claim the record here was held for.
-    ///
-    /// Matched on the claim's prefix rather than on the shard the
-    /// commit froze, because a claim cell follows its prefix across a
-    /// cut and the prober already asks whoever holds it now. Reading the
-    /// frozen shard alone would drop the successor's answer to the
-    /// question this ledger asked it.
-    #[must_use]
-    pub(crate) fn consumer_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        let kept = self
-            .owed
-            .get(&tx_hash)
-            .and_then(|owed| owed.part.settling());
-        kept.is_some_and(|kept| {
-            kept.every_claim(self.local)
-                .iter()
-                .any(|(_, claim)| ShardTrie::shard_owns_prefix(shard, claim.owner))
-        })
     }
 
     /// Mirror a core shard's acceptance, and say whether it was the last
@@ -940,20 +892,6 @@ impl Ledger {
         }
     }
 
-    /// Note that a consumer's certificate spoke a claiming success for
-    /// `tx_hash` at `at`, which opens its probe.
-    ///
-    /// The anchor is kept rather than a flag: it is where the writing
-    /// execution ran, so it is what the probe holds its own anchor to,
-    /// and every member reads it off the same certificate. Where more
-    /// than one consumer speaks, the earliest stands — the entry is
-    /// asked about as soon as any cell it waits on could be there.
-    pub(crate) fn cue_probe(&mut self, tx_hash: TxHash, at: WeightedTimestamp) {
-        if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.cued = Some(owed.cued.map_or(at, |cued| cued.min(at)));
-        }
-    }
-
     /// Every question this ledger has open, under `trie`, whatever the
     /// clock: for each entry nothing has answered for, each other core
     /// shard's committed cell, each core consumer's claim and decline on
@@ -992,7 +930,6 @@ impl Ledger {
                     key,
                     probed,
                     deadline,
-                    cued: owed.cued,
                 })
             };
             // What an entry asks about is what it waits on. A leg waits
@@ -1302,7 +1239,6 @@ impl Ledger {
                         certified: Certified::ByExecution,
                         part: Part::whole(),
                         departed_by: Some(record.shard()),
-                        cued: None,
                         accepted: BTreeSet::new(),
                         readings: BTreeMap::new(),
                     },
@@ -2792,7 +2728,6 @@ mod tests {
             key,
             probed,
             deadline: Deadline::of(ms(60_000)),
-            cued: None,
         };
         assert_eq!(
             questions,
@@ -2861,7 +2796,6 @@ mod tests {
             key,
             probed,
             deadline: Deadline::of(ms(60_000)),
-            cued: None,
         };
         assert_eq!(delivered_by, DELIVERER);
         assert_eq!(
@@ -2954,7 +2888,6 @@ mod tests {
                 key: claim,
                 probed: Probed::Claim,
                 deadline: Deadline::of(ms(60_000)),
-                cued: None,
             }],
             "a remainder asks about its deliveries, and never about itself"
         );
@@ -3211,10 +3144,6 @@ mod tests {
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash(), Certified::ByExecution);
-        assert!(
-            ledger.consumer_holds(tx.hash(), SUCCESSOR),
-            "the shard holding the claim's prefix consumes what the leg issued",
-        );
 
         let (_, claim) = core_claim(&classified());
         assert!(
