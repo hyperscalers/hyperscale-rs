@@ -1019,7 +1019,7 @@ mod tests {
             validity_end_ms,
             Terms::Escrowed { credit: record_key },
         );
-        let claim = id.answer(TxHash(Hash32([0xC0; 32])), Answered::Taken);
+        let claim = id.answer(TxHash(Hash32([0xC0; 32])), Answered::Taken, 1_000);
         let claim_value = claim.to_bytes();
         let local = claim_key.local.0;
         let mut elsewhere = local;

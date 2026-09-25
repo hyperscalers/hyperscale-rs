@@ -1731,7 +1731,11 @@ mod tests {
         let cell = producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(60_000)));
         let id = CrossingId::of_record(producer_record(0x42).owner, &cell);
         let answer = id.answer_key(&ProtocolHasher, Answered::Taken);
-        rows.put(answer, id.answer(cell.tx, Answered::Taken).to_bytes());
+        rows.put(
+            answer,
+            id.answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+                .to_bytes(),
+        );
         let mut counterparts = Counterparts::new(
             CONSUMER,
             Arc::clone(&anchors),
@@ -2307,7 +2311,8 @@ mod tests {
             if let Some(answered) = answered {
                 rows.put(
                     id.answer_key(&ProtocolHasher, answered),
-                    id.answer(cell.tx, answered).to_bytes(),
+                    id.answer(cell.tx, answered, cell.validity_end_ms)
+                        .to_bytes(),
                 );
             }
             let mut counterparts = Counterparts::new(
@@ -2355,7 +2360,8 @@ mod tests {
             let rows = Arc::new(TestRows::default());
             rows.put(
                 id.answer_key(&ProtocolHasher, Answered::Taken),
-                id.answer(cell.tx, Answered::Taken).to_bytes(),
+                id.answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+                    .to_bytes(),
             );
             if record_stands {
                 rows.put(record_of(0, deadline), cell.to_bytes());

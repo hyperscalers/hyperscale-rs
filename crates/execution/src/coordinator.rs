@@ -1146,6 +1146,7 @@ impl ExecutionCoordinator {
         for entry in self.abandonable(tick_id) {
             let UnsettledTx {
                 tx_hash,
+                deadline,
                 charged,
                 charge,
                 ..
@@ -1187,7 +1188,9 @@ impl ExecutionCoordinator {
                 .map_or_default(|classified| {
                     classified
                         .refusable_consumed(local_shard)
-                        .map(|edge| never_answer(tx_hash, edge))
+                        .map(|edge| {
+                            never_answer(tx_hash, deadline.validity_end().as_millis(), edge)
+                        })
                         .filter(|(key, _)| trie.shard_for_prefix(key.owner) == local_shard)
                         .collect()
                 });
@@ -11170,7 +11173,11 @@ mod tests {
         hold(
             state,
             schedule,
-            [(answer_key, id.answer(cell.tx, Answered::Taken).to_bytes())],
+            [(
+                answer_key,
+                id.answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+                    .to_bytes(),
+            )],
         );
         (record_key, answer_key, id)
     }
@@ -12581,7 +12588,14 @@ mod tests {
         let classified = peer_fed_core_classified();
         let edges: Vec<_> = classified.refusable_consumed(HOME).collect();
         assert_eq!(edges.len(), 1, "the fixture hands the core one crossing");
-        never_answer(transaction.hash(), edges[0])
+        never_answer(
+            transaction.hash(),
+            transaction
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis(),
+            edges[0],
+        )
     }
 
     /// The deadline of `transaction` as committed at [`test_committed`].

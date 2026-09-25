@@ -1667,7 +1667,7 @@ where
     let answered = fixture_crossing(0x84, 3);
     let answer = answered.answer_key(&ProtocolHasher, Answered::Taken);
     let answer_value = answered
-        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken)
+        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken, 1_000)
         .to_bytes();
     commit(
         &mut written,
@@ -2346,7 +2346,7 @@ impl Settling {
                 self.taken(),
                 Some(
                     self.answered
-                        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken)
+                        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken, 1_000)
                         .to_bytes(),
                 ),
             ),

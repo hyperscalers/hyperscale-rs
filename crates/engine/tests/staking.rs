@@ -924,7 +924,11 @@ impl DividedStake {
     /// The one `Never` the core member writes: for the crossing it
     /// consumes, may refuse, and holds the decline cell of.
     fn never(&self) -> (SubstateKey, Vec<u8>) {
-        never_answer(self.tx.hash(), &self.own_edge())
+        never_answer(
+            self.tx.hash(),
+            self.tx.validity_range().end_timestamp_exclusive.as_millis(),
+            &self.own_edge(),
+        )
     }
 }
 

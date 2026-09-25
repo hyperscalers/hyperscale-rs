@@ -34,7 +34,7 @@ use hyperscale_vm_effects::{
     Answered, Crossing, CrossingCell, CrossingEdge as StarEdge, CrossingId, CrossingLeaf, Kind,
     Star, running_at, star_at,
 };
-use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
+use hyperscale_vm_kernel::{Arrival, Crossed, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{
     DeclaredWork, LegRole, LegShape, MAX_CROSSINGS_PER_TX, PriceTable, ProtocolHasher, Quanta,
 };
@@ -451,14 +451,17 @@ impl Classified {
                 plan.arrives(
                     edge.producer,
                     edge.output,
-                    Crossed {
-                        resource: arrived.resource,
-                        amount: arrived.amount,
+                    &Arrival {
+                        crossed: Crossed {
+                            resource: arrived.resource,
+                            amount: arrived.amount,
+                        },
+                        claim: id.answer_key(&ProtocolHasher, Answered::Taken),
+                        id,
+                        never: (edge.crossing.kind == Kind::Escrowed)
+                            .then(|| id.answer_key(&ProtocolHasher, Answered::Never)),
+                        validity_end_ms: validity_end.as_millis(),
                     },
-                    id.answer_key(&ProtocolHasher, Answered::Taken),
-                    id,
-                    (edge.crossing.kind == Kind::Escrowed)
-                        .then(|| id.answer_key(&ProtocolHasher, Answered::Never)),
                 )?;
             } else if runs_here(edge.producer) && !runs_here(edge.consumer) {
                 plan.departs(
@@ -855,11 +858,15 @@ impl Runs {
 /// Derived through the crossing's one identity, so the member's refusal
 /// receipt and the abandonment cannot derive two different cells.
 #[must_use]
-pub fn never_answer(tx: TxHash, edge: &CrossingEdge) -> (SubstateKey, Vec<u8>) {
+pub fn never_answer(
+    tx: TxHash,
+    validity_end_ms: u64,
+    edge: &CrossingEdge,
+) -> (SubstateKey, Vec<u8>) {
     let id = edge.crossing.id;
     (
         id.answer_key(&ProtocolHasher, Answered::Never),
-        id.answer(tx, Answered::Never).to_bytes(),
+        id.answer(tx, Answered::Never, validity_end_ms).to_bytes(),
     )
 }
 
@@ -950,7 +957,7 @@ mod tests {
     use hyperscale_types::{
         Address, AddressClass, LocalKey, MAX_INTENT_VALIDITY_RANGE, SubstateKey,
     };
-    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
+    use hyperscale_vm_effects::{CrossingAnswer, CrossingId, Hash32, IntentHash};
     use hyperscale_vm_types::{ResourceAddr, ValueEdge};
 
     use super::*;
@@ -1312,9 +1319,9 @@ mod tests {
         );
     }
 
-    /// Every departure a plan files states the validity end the plan
-    /// was handed, which is the transaction's: no leg carries a time of
-    /// its own for a member's window to leak into the record.
+    /// Every departure and arrival a plan files, and every `Never` the
+    /// member writes, states the validity end the plan was handed, which
+    /// is the transaction's: the answer's figure is the record's.
     #[test]
     fn a_departure_carries_the_transactions_validity_end() {
         let legs = transfer();
@@ -1329,6 +1336,29 @@ mod tests {
                 .departure(edge.producer, edge.output)
                 .expect("the withdraw departs");
             assert_eq!(departure.validity_end_ms, validity_end.as_millis());
+            let arrival = divided
+                .plan(
+                    &[arrival(1, 0, 100)],
+                    high(),
+                    Side::Delivering,
+                    validity_end,
+                )
+                .expect("the recipient's leg has its arrival")
+                .legs
+                .arrival(edge.producer, edge.output)
+                .expect("the deposit takes the crossing");
+            assert_eq!(
+                arrival.validity_end_ms,
+                validity_end.as_millis(),
+                "the answer a take writes states the record's figure",
+            );
+            let (_, never) = never_answer(TxHash(Hash32([1; 32])), validity_end.as_millis(), edge);
+            assert_eq!(
+                CrossingAnswer::from_bytes(&never)
+                    .expect("a decline decodes")
+                    .validity_end_ms,
+                validity_end.as_millis(),
+            );
         }
     }
 

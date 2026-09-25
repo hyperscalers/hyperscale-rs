@@ -1045,15 +1045,24 @@ pub fn build_refusal_receipt(
 /// which no tick runs twice, so a value found there is the answer
 /// already given. Nothing for a member that runs no shape.
 fn never_answers(
-    runs: Option<&Runs>,
+    input: Option<&TickTxInput<'_>>,
     tx_hash: TxHash,
     local_shard: ShardId,
     locality: &OwnerSet,
     holds: impl Fn(SubstateKey) -> bool,
 ) -> Vec<(SubstateKey, Vec<u8>)> {
-    let Some(Runs::Shape(member)) = runs else {
+    let Some(TickTxInput {
+        runs: Runs::Shape(member),
+        transaction: Some(transaction),
+        ..
+    }) = input
+    else {
         return Vec::new();
     };
+    let validity_end_ms = transaction
+        .validity_range()
+        .end_timestamp_exclusive
+        .as_millis();
     member
         .classified()
         .refusable_consumed(local_shard)
@@ -1062,7 +1071,7 @@ fn never_answers(
                 edge.crossing
                     .id
                     .answer_key(&ProtocolHasher, Answered::Taken),
-                never_answer(tx_hash, edge),
+                never_answer(tx_hash, validity_end_ms, edge),
             )
         })
         .filter(|(claim, (never, _))| {
@@ -1252,8 +1261,9 @@ fn assemble_executed_tx(
     vm_tx: TxHash,
     kernel: KernelOutput<'_>,
     fee: Option<PayerFee>,
-    runs: Option<&Runs>,
+    input: Option<&TickTxInput<'_>>,
 ) -> ExecutedTx {
+    let runs = input.map(|input| &input.runs);
     let BatchInputs { base, locality, .. } = inputs;
     let KernelOutput { receipt, job } = kernel;
     let tx_hash = vm_tx;
@@ -1281,7 +1291,7 @@ fn assemble_executed_tx(
     {
         Vec::new()
     } else {
-        never_answers(runs, tx_hash, ctx.local_shard, locality, |key| {
+        never_answers(input, tx_hash, ctx.local_shard, locality, |key| {
             fold.running
                 .get(&key)
                 .map_or_else(|| base.cells.contains_key(&key), Option::is_some)
@@ -1700,7 +1710,7 @@ impl Executor {
                 *vm_tx,
                 kernel,
                 fee_by_tx.get(vm_tx).copied(),
-                shapes.get(vm_tx).map(|input| &input.runs),
+                shapes.get(vm_tx).copied(),
             );
             folded.insert(*vm_tx, executed);
         }
@@ -1774,7 +1784,7 @@ impl Executor {
                     // batch wrote its answers: the tick's baseline is
                     // what says whether one already stands.
                     let nevers = never_answers(
-                        shapes.get(&vm_tx).map(|input| &input.runs),
+                        shapes.get(&vm_tx).copied(),
                         vm_tx,
                         ctx.local_shard,
                         &locality,
