@@ -27,7 +27,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Composed, Constraint, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree, ManifestGraph,
-    ResourceKind, SignedIntent, SlotId, Totality, Value, child_key, issued_resource, package_hash,
+    ResourceKind, SignedIntent, SlotId, Value, child_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{
@@ -1889,13 +1889,6 @@ pub(crate) fn storm_artifact(nonce: u16) -> Vec<u8> {
         })
         .expect("a name the package does not already hold");
     metadata.events.push(named);
-    // The mark is granted to protocol code seeded at genesis, and this
-    // artifact publishes through the ordinary path.
-    for signature in metadata.methods.values_mut() {
-        if signature.totality == Totality::Total {
-            signature.totality = Totality::Infallible;
-        }
-    }
     attach_metadata(STAKING_MODULE, &metadata).expect("storm metadata attaches")
 }
 

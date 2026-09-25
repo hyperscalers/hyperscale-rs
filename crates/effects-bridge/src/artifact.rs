@@ -62,24 +62,22 @@ pub fn extract_metadata(artifact: &[u8]) -> Result<Option<PackageMetadata>, Deri
 /// [`DerivationError`] on an artifact outside the profile, an absent or
 /// non-canonical metadata section, a declared method the component does
 /// not export, an ABI binding the export's type cannot honour, or a
-/// claim to totality, which only [`admit_protocol_package`] grants.
+/// claim only [`admit_protocol_package`] grants.
 pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, DerivationError> {
     chain(admit(artifact))
 }
 
 /// Admit an artifact the protocol supplies rather than a publisher.
 ///
-/// Identical to [`admit_package`] but for the totality mark, which a
-/// publisher cannot claim and which this one reads against the code
-/// rather than takes on faith. Genesis seeds the stdlib through here;
+/// Identical to [`admit_package`] but for what only the protocol's own
+/// packages may be: seal-free, and able to present a badge they hold.
+/// Genesis seeds the stdlib through here;
 /// nothing reachable from a transaction does, so the distinction is a
 /// fact about the caller rather than about the bytes.
 ///
 /// # Errors
 ///
-/// As [`admit_package`], except that a claim to totality is checked
-/// against the artifact instead of refused, and fails admission when the
-/// code does not support it.
+/// As [`admit_package`], less the two refusals provenance lifts.
 pub fn admit_protocol_package(artifact: &[u8]) -> Result<PackageMetadata, DerivationError> {
     chain(admit_protocol(artifact))
 }
@@ -98,9 +96,9 @@ mod tests {
         let artifact = account_artifact();
         assert!(admit_protocol_package(artifact).is_ok());
 
-        let refused = admit_package(artifact).expect_err("a publish cannot claim totality");
+        let refused = admit_package(artifact).expect_err("a published package needs a seal");
         assert!(
-            refused.to_string().contains("claims totality"),
+            refused.to_string().contains("configuration leaf"),
             "{}",
             refused.to_string()
         );

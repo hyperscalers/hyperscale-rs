@@ -35,7 +35,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     AbiParam, Answered, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent,
-    IntentHeader, IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Totality, Value,
+    IntentHeader, IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Value,
     issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
@@ -2109,7 +2109,7 @@ fn package_cell(writes: &StateWrites, artifact: &[u8]) -> Option<Vec<u8>> {
 fn a_publish_writes_the_artifact_under_its_own_address() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
-    let artifact = published_account_artifact();
+    let artifact = published_artifact();
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
         7,
         artifact.clone(),
@@ -2167,7 +2167,7 @@ fn a_publish_writes_the_artifact_under_its_own_address() {
 fn a_publish_charges_no_more_than_the_ceiling_it_signed() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
-    let artifact = published_account_artifact();
+    let artifact = published_artifact();
 
     // The ceiling is derived from the price rather than pinned, so this
     // keeps saying the same thing as the table moves under it.
@@ -2358,7 +2358,7 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
     // A package the world has never seen: the stdlib artifact with its
     // metadata attached a second time under a different publisher would
     // be the same bytes, so vary the metadata to vary the address.
-    let mut metadata = published_metadata();
+    let mut metadata = staking::metadata();
     naming(&mut metadata, "republished");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -2391,25 +2391,16 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
     );
 }
 
-/// Wait out the compile worker; the bound is a harness valve, not a
-/// verdict — consensus never reads a clock here.
-/// The stdlib account's metadata as a *publisher* could submit it.
-///
-/// These tests publish through the ordinary transaction path, and that
-/// path refuses a claim to totality — the mark is the protocol's, granted
-/// to what genesis seeds. The account declares one total method, so the
-/// fixture drops the claim rather than the tests asserting a publish the
-/// gate does not allow.
-fn published_account_artifact() -> Vec<u8> {
-    attach_metadata(STAKING_MODULE, &published_metadata()).expect("attaches")
-}
-
-/// The metadata a publisher's artifact carries.
+/// The staking package's artifact, as a publisher submits it.
 ///
 /// The staking package rather than the account's: a published package
 /// serves instances, and the gate holds one to declaring the seal its
 /// components come up through — which the account, serving principals,
 /// has no reason to carry.
+fn published_artifact() -> Vec<u8> {
+    attach_metadata(STAKING_MODULE, &staking::metadata()).expect("attaches")
+}
+
 /// Vary `metadata`, and so the address of any artifact carrying it, by
 /// naming one more event.
 ///
@@ -2433,16 +2424,8 @@ fn naming(metadata: &mut PackageMetadata, event: &str) {
     metadata.events.push(named);
 }
 
-fn published_metadata() -> PackageMetadata {
-    let mut metadata = staking::metadata();
-    for signature in metadata.methods.values_mut() {
-        if signature.totality == Totality::Total {
-            signature.totality = Totality::Infallible;
-        }
-    }
-    metadata
-}
-
+/// Wait out the compile worker; the bound is a harness valve, not a
+/// verdict — consensus never reads a clock here.
 fn await_code_runnable(executor: &Executor, package: PackageHash) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while executor.package_standing(package) != Availability::Runnable {
@@ -2459,7 +2442,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
 
-    let mut metadata = published_metadata();
+    let mut metadata = staking::metadata();
     naming(&mut metadata, "compiled");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -2493,7 +2476,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
 fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     let executor = executor(ExecutionMode::Serial);
 
-    let mut metadata = published_metadata();
+    let mut metadata = staking::metadata();
     naming(&mut metadata, "reseeded");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -2531,7 +2514,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
     let executor = executor(ExecutionMode::Serial);
     let cache = executor.packages();
 
-    let mut metadata = published_metadata();
+    let mut metadata = staking::metadata();
     naming(&mut metadata, "smuggled");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -3167,7 +3150,7 @@ fn a_node_reaching_for_another_partys_authority_never_previews() {
 #[test]
 fn a_preview_prices_a_publish_through_the_table() {
     let payer = fee_payer(7);
-    let artifact = published_account_artifact();
+    let artifact = published_artifact();
     let executor = executor(ExecutionMode::Serial);
     let tx = signed_publish(7, artifact.clone());
     let report = preview_on(
@@ -3248,11 +3231,6 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // own package declares.
     let mut metadata = staking::metadata();
     naming(&mut metadata, "instantiable");
-    for signature in metadata.methods.values_mut() {
-        if signature.totality == Totality::Total {
-            signature.totality = Totality::Infallible;
-        }
-    }
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
