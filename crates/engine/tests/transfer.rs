@@ -13,7 +13,7 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
-use hyperscale_engine::legs::{Classified, Member, PlanDefect, Runs, Side, Unclaimable};
+use hyperscale_engine::legs::{Classified, Member, PlanDefect, Runs, Unclaimable};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
@@ -1279,7 +1279,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
 
     let validity_end = tx.validity_range().end_timestamp_exclusive;
     let sender = divided
-        .plan(&[], near_shard, Side::Issuing, validity_end)
+        .plan(&[], near_shard, validity_end)
         .expect("the sender's legs take no arrival");
     assert!(!sender.legs.is_whole());
     assert!(
@@ -1288,43 +1288,23 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     );
     assert!(sender.judges.covers(alice()) && !sender.judges.covers(far()));
 
-    let arrived = EscrowedValue {
-        node: edge.producer,
-        output: edge.output,
-        resource: *PROTOCOL_RESOURCE,
-        amount: 100,
-        record: edge.crossing.id.record_key(&ProtocolHasher),
-    };
-    let recipient = divided
-        .plan(
-            std::slice::from_ref(&arrived),
-            far_shard,
-            Side::Delivering,
-            validity_end,
-        )
-        .expect("the recipient's leg has its arrival");
-    assert!(recipient.legs.arrival(edge.producer, edge.output).is_some());
-    assert!(
-        recipient
-            .legs
-            .departure(edge.producer, edge.output)
-            .is_none()
-    );
-    assert!(recipient.judges.covers(far()) && !recipient.judges.covers(alice()));
-
+    // The deposit is the recipient's shard's commit fold, off the
+    // record's reading: that shard runs no member of the transfer.
+    assert!(!divided.commits_at(far_shard));
     assert!(matches!(
-        divided.plan(&[], far_shard, Side::Delivering, validity_end),
-        Err(PlanDefect::MissingArrival { .. }),
+        divided.plan(&[], far_shard, validity_end),
+        Err(PlanDefect::NotAParticipant),
     ));
 }
 
 /// A shard's share under a classification is the shares of the owners it
-/// holds, the terms of the nodes its members run, and what every shard
-/// bears. Over the shards of a trie the shares sum to the whole in
-/// footprint, past it in compute by what every shard repeats, and each
-/// carries the whole retention.
+/// holds, the terms of the nodes its member runs, and what every shard
+/// bears. A divided transfer is committed by the payer's shard alone: it
+/// runs the withdraw beside its verification and carries the whole
+/// retention, and the recipient's vault, which the recipient's fold
+/// credits, is outside its footprint.
 #[test]
-fn local_shares_sum_to_the_whole_across_a_trie() {
+fn local_shares_cover_what_the_committing_shard_runs() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
@@ -1339,30 +1319,22 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
     let whole = tx.work();
 
     let divided = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
-    let mine = divided.local_work(&tx, near_shard);
-    let theirs = divided.local_work(&tx, far_shard);
-
-    // Both shards verify the signatures and write the committed cell, so
-    // compute and writes sum past the whole by exactly one verification
-    // and one marker; footprint sums exactly, since a cell is excluded
-    // where it lives.
-    let verification = attestation_work(&tx.body().signatures).compute;
-    assert_eq!(mine.compute + theirs.compute, whole.compute + verification);
-    assert_eq!(mine.footprint + theirs.footprint, whole.footprint);
-    assert_eq!(mine.retention, whole.retention);
-    assert_eq!(theirs.retention, whole.retention);
-    // A node each, and a verification each: the withdrawal the payer's
-    // shard runs and the deposit the recipient's are the whole of it,
-    // since the sign-in that used to sit beside the withdrawal is the
-    // signature the intent already carries.
-    assert_eq!(
-        mine.compute, theirs.compute,
-        "one node and one verification on each side"
-    );
     assert!(
-        theirs.compute > verification,
-        "the recipient's shard runs the deposit beside its verification"
+        !divided.commits_at(far_shard),
+        "the recipient's shard commits nothing"
     );
+    let mine = divided.local_work(&tx, near_shard);
+    let verification = attestation_work(&tx.body().signatures).compute;
+    assert!(
+        mine.compute > verification,
+        "the payer's shard runs the withdraw beside its verification"
+    );
+    assert!(mine.compute < whole.compute + verification);
+    assert!(
+        mine.footprint < whole.footprint,
+        "the recipient's vault is the recipient's fold's"
+    );
+    assert_eq!(mine.retention, whole.retention);
 
     let one = ShardTrie::from_leaves([ShardId::ROOT]);
     assert_eq!(
@@ -1385,10 +1357,9 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
     let artifact = artifacts[0].read_bytes;
     assert!(artifact > 0, "the fixture publishes the account's artifact");
     assert!(
-        mine.read_bytes >= artifact && theirs.read_bytes >= artifact,
-        "each end reserves the artifact it instantiates: {} and {} against {artifact}",
+        mine.read_bytes >= artifact,
+        "the payer's shard reserves the artifact it instantiates: {} against {artifact}",
         mine.read_bytes,
-        theirs.read_bytes,
     );
 
     // And a classification that read no placement bears the whole
@@ -1406,12 +1377,11 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
 }
 
 /// A transfer executed divided, end to end through the engine: the
-/// sender's shard runs the sign-in and the withdraw, escrows the value
-/// into the record cell the plan filed, and attests exactly that; the
-/// recipient's shard runs the deposit against the attested arrival and
-/// escrows nothing. Neither side runs the other's leg.
+/// sender's shard runs the withdraw, escrows the value into the record
+/// cell the plan filed, and attests exactly that. The recipient's shard
+/// runs nothing: its fold credits the deposit off the record.
 #[test]
-fn a_transfer_executes_divided_on_both_shards() {
+fn a_transfer_executes_divided_on_the_payers_shard() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
@@ -1442,7 +1412,6 @@ fn a_transfer_executes_divided_on_both_shards() {
             runs: Runs::Shape(Member::of(
                 classified.clone(),
                 local_shard,
-                classified.first_side_at(local_shard),
                 BTreeSet::from([near_shard, far_shard]),
             )),
             arrivals,
@@ -1493,23 +1462,10 @@ fn a_transfer_executes_divided_on_both_shards() {
     );
 
     let recipient = run(far_shard, &sender.escrowed);
-    let ConsensusReceipt::Succeeded { writes, .. } = &recipient.consensus else {
-        panic!("the recipient's leg must succeed: {:?}", recipient.metadata);
-    };
-    assert!(recipient.escrowed.is_empty(), "a deposit hands nothing on");
-    assert!(
-        writes
-            .movements
-            .keys()
-            .any(|key| key.owner == far().address()),
-        "the deposit credited the recipient"
-    );
-    assert!(
-        !writes
-            .movements
-            .keys()
-            .any(|key| key.owner == alice().address()),
-        "the recipient ran no leg of the sender's"
+    assert_eq!(
+        recipient.consensus,
+        ConsensusReceipt::Failed,
+        "the recipient's shard has no plan: nothing it runs takes the crossing",
     );
 }
 
@@ -1564,7 +1520,6 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
         Runs::Shape(Member::of(
             classified.clone(),
             near_shard,
-            Side::Issuing,
             std::iter::once(near_shard)
                 .chain(edge.to.iter().copied())
                 .collect(),
@@ -1677,7 +1632,6 @@ fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
         runs: Runs::Shape(Member::of(
             classified,
             near_shard,
-            Side::Issuing,
             std::iter::once(near_shard)
                 .chain(edge.to.iter().copied())
                 .collect(),
@@ -1759,7 +1713,6 @@ fn inherited_record() -> Inherited {
         runs: Runs::Shape(Member::of(
             classified,
             shard,
-            Side::Issuing,
             std::iter::once(shard)
                 .chain(edge.to.iter().copied())
                 .collect(),
@@ -1980,7 +1933,6 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             runs: Runs::Shape(Member::of(
                 Classified::whole(),
                 local_shard,
-                Side::Issuing,
                 BTreeSet::from([near_shard, far_shard]),
             )),
             arrivals: &[],

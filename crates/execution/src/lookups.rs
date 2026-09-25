@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
+use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     BlockHeight, ConsensusPublicKey, ConsensusReceipt, DeclaredKey, DeclaredRange,
     ExecutionCertificate, Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule,
@@ -168,6 +169,9 @@ pub fn provision_request(
         .filter(|range| trie.shard_for_prefix(range.owner) == local_shard)
         .collect();
     let payer_shard = trie.shard_for_prefix(tx.fee_payer());
+    // A shard that only takes delivery of the transaction never includes
+    // it, so no bundle goes there.
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
     let targets: Vec<ShardId> =
         if local_keys.is_empty() && local_ranges.is_empty() && payer_shard != local_shard {
             // The engagement echo: a counterpart with nothing to serve still
@@ -179,7 +183,7 @@ pub fn provision_request(
                 .all_prefixes()
                 .into_iter()
                 .map(|prefix| trie.shard_for_prefix(prefix))
-                .filter(|&s| s != local_shard)
+                .filter(|&s| s != local_shard && classified.commits_at(s))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect()

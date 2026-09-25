@@ -19,8 +19,9 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
-    HALT_STRADDLER_BATCH, build_swap_tx, build_transfer_tx, cross_shard_genesis_accounts,
-    genesis_accounts, halt_straddler_setup, recipient, sender, validity_around,
+    HALT_STRADDLER_BATCH, build_leg_payment_tx, build_swap_tx, build_transfer_tx,
+    cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup, recipient, sender,
+    validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
@@ -203,8 +204,8 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
         // a certified block above the commit tip at the instant they go
         // down, which is what an owed outcome marks.
         let mut submitted = Vec::new();
-        for (key, from, to) in &setup.straddlers[..HALT_STRADDLER_BATCH] {
-            let tx = build_transfer_tx(key, *from, *to, 100, validity_around(c.now()));
+        for leg in &setup.straddlers[..HALT_STRADDLER_BATCH] {
+            let tx = build_leg_payment_tx(leg, 100, validity_around(c.now()));
             submitted.push(tx.hash());
             c.submit(Arc::new(tx));
         }

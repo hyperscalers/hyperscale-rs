@@ -1140,12 +1140,12 @@ mod tests {
     }
 
     /// A success speaks an acceptance only from a core member. A leg's
-    /// success is its own side going through, and a delivery's or a
-    /// whole shape's decides nothing a counterpart's mempool waits on.
+    /// success is its own side going through, and a whole shape's
+    /// decides nothing a counterpart's mempool waits on.
     #[test]
     fn only_a_claiming_success_speaks_an_acceptance() {
         let outcomes = vec![
-            outcome(1).as_role(Role::Delivery),
+            outcome(1).as_role(Role::Leg),
             outcome(2).as_role(Role::Leg),
             outcome(3).as_role(Role::Core),
             outcome(5).as_role(Role::Whole),

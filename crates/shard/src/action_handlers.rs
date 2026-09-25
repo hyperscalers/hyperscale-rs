@@ -14,7 +14,7 @@ use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage,
-    SubstateStore, SubstateView, Substates, SweepIndex, TerminalWindow, VersionedStore,
+    SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore,
     colliding_committed_cell, committed_tx_cells, load_read_frontier, sweep_for_block,
     without_colliding_committed_cells,
 };
@@ -49,7 +49,7 @@ use hyperscale_types::{
 use crate::local_crossings::{
     disagreeing_parent_reading, keep_standing_unclaimed, misstated_unclaimed, parent_claims,
 };
-use crate::read_fence::{Dropped, drop_refused, written_by};
+use crate::read_fence::{Dropped, drop_refused};
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -364,9 +364,13 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     let local_receipt_root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     let provision_root = Verified::<ProvisionsRoot>::compute(&raw_provision_hashes).into_inner();
-    let provision_tx_roots =
-        Verified::<ProvisionTxRootsMap>::compute(local_shard, topology_snapshot, &transactions)
-            .into_inner();
+    let provision_tx_roots = Verified::<ProvisionTxRootsMap>::compute(
+        local_shard,
+        topology_snapshot,
+        &transactions,
+        &committing_shards(topology_snapshot),
+    )
+    .into_inner();
 
     // The drain is deterministic from the block's own content: the
     // places its transactions take, less those its certificates give
@@ -703,13 +707,11 @@ where
             expected_root,
             transactions,
             validity_anchor,
-            late_deliveries,
         } => {
             let start = Stopwatch::start();
             let tx_ctx = TransactionRootContext {
                 transactions: &transactions,
                 validity_anchor,
-                late_deliveries: &late_deliveries,
             };
             let result = expected_root.verify(&tx_ctx);
             record_signature_verification_latency(
@@ -730,10 +732,12 @@ where
             topology_snapshot,
         } => {
             let start = Stopwatch::start();
+            let committing = committing_shards(&topology_snapshot);
             let ptx_ctx = ProvisionTxRootsContext {
                 local_shard: ctx.shard,
                 topology_snapshot: &topology_snapshot,
                 transactions: &transactions,
+                committing: &committing,
             };
             let result = expected.verify(&ptx_ctx);
             record_signature_verification_latency(
@@ -1126,15 +1130,12 @@ where
             // The read frontier's fence, judged against the parent
             // state: a record presence below the floor its producer's
             // lineage has been read to, one below a same-block absence
-            // of its key, or a late delivery whose crossing this shard
-            // already answered. A validity rule at vote time, like the
+            // of its key, or a deleting absence below the floor or off
+            // the record's owner. A validity rule at vote time, like the
             // collision above: a replica following a certified block
             // never evaluates it.
             let parent_frontier = load_read_frontier(&anchored, ctx.shard);
-            let written = written_by(&finalizations);
-            if let Err(refusal) = fence.check(&parent_frontier, |key| {
-                written.contains(&key) || anchored.cell(key).is_some()
-            }) {
+            if let Err(refusal) = fence.check(&parent_frontier) {
                 tracing::warn!(
                     ?block_hash,
                     height = block_height.inner(),
@@ -1320,7 +1321,6 @@ where
             classification_topology_snapshot: classification_topology,
             frontier,
             fence,
-            record_licences,
             parent_anchor,
             local_crossings,
         } => {
@@ -1346,27 +1346,14 @@ where
                 .view_at(parent_block_hash, parent_block_height);
             // What the read frontier would refuse, dropped before the
             // block is built so a proposal never refuses itself: every
-            // refused presence is cut from its claim, every refused late
-            // delivery goes, and so does every transaction whose licence
-            // rode a dropped presence. The frontier's inputs are then
-            // recomputed over the claims kept.
-            let (state_claims, transactions, frontier) = {
+            // refused presence or deleting absence is cut from its claim.
+            // The frontier's inputs are then recomputed over the claims
+            // kept.
+            let (state_claims, frontier) = {
                 let anchored = view.snapshot();
                 let parent_frontier = load_read_frontier(&anchored, shard_id);
-                let written = written_by(&finalizations);
-                let Dropped {
-                    claims,
-                    transactions,
-                    refused,
-                } = drop_refused(
-                    state_claims,
-                    transactions,
-                    &fence,
-                    &record_licences,
-                    frontier.windows,
-                    &parent_frontier,
-                    |key| written.contains(&key) || anchored.cell(key).is_some(),
-                );
+                let Dropped { claims, refused } =
+                    drop_refused(state_claims, &fence, frontier.windows, &parent_frontier);
                 if refused > 0 {
                     tracing::debug!(
                         ?shard_id,
@@ -1387,7 +1374,7 @@ where
                     frontier.anchor,
                     frontier.local,
                 );
-                (claims, transactions, frontier)
+                (claims, frontier)
             };
             // A crossing named off a leaf the parent no longer holds as
             // named would refuse the block at every voter.
@@ -1770,9 +1757,29 @@ where
     }
 }
 
+/// The shards that commit each transaction under `topology`.
+///
+/// Its participants, less any that only take delivery of its owed
+/// crossings: what a block's provision fan-out reaches, on the proposer
+/// and the verifier alike.
+pub fn committing_shards(
+    topology: &TopologySnapshot,
+) -> impl Fn(&Transaction) -> Vec<ShardId> + '_ {
+    move |tx| {
+        Classified::freeze(
+            tx.legs(),
+            tx.fee_payer(),
+            tx.accounts(),
+            topology.shard_trie(),
+        )
+        .committing(topology.all_shards_for_transaction(tx))
+        .into_iter()
+        .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
@@ -2422,7 +2429,6 @@ mod tests {
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
         let anchor = WeightedTimestamp::ZERO;
         let ctx = TransactionRootContext {
-            late_deliveries: &HashSet::new(),
             transactions: &txs,
             validity_anchor: anchor,
         };
@@ -2456,7 +2462,6 @@ mod tests {
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
 
         let ctx = TransactionRootContext {
-            late_deliveries: &HashSet::new(),
             transactions: &txs,
             validity_anchor: anchor,
         };
@@ -2477,47 +2482,10 @@ mod tests {
         let txs2 = vec![tx2];
         let root2 = Verified::<TransactionRoot>::compute(&txs2).into_inner();
         let ctx2 = TransactionRootContext {
-            late_deliveries: &HashSet::new(),
             transactions: &txs2,
             validity_anchor: anchor,
         };
         assert!(root2.verify(&ctx2).is_ok());
-    }
-
-    /// An expired transaction the block's late-delivery set names passes
-    /// the root check at any anchor past its validity end; one the set
-    /// does not name fails there.
-    #[test]
-    fn verify_transaction_root_admits_a_named_late_delivery_at_any_anchor() {
-        use std::time::Duration;
-
-        let end = WeightedTimestamp::from_millis(1_000);
-        let range = TimestampRange::new(WeightedTimestamp::ZERO, end);
-        install_stub_protocol_statics();
-        let tx = Arc::new(Verifiable::from(stub_transaction(
-            test_principal(4),
-            &[test_prefix(4)],
-            1_000,
-            range,
-        )));
-        let late: HashSet<TxHash> = std::iter::once(tx.hash()).collect();
-        let txs = vec![tx];
-        let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
-        let verify = |anchor: WeightedTimestamp, late: &HashSet<TxHash>| {
-            root.verify(&TransactionRootContext {
-                late_deliveries: late,
-                transactions: &txs,
-                validity_anchor: anchor,
-            })
-            .is_ok()
-        };
-        assert!(verify(end, &late), "admitted at the validity end");
-        assert!(
-            verify(end.plus(Duration::from_hours(24)), &late),
-            "and at any anchor past it: what admits a late delivery is the licence \
-             the set stands for, and a licence is not on a clock"
-        );
-        assert!(!verify(end, &HashSet::new()), "and refused unnamed");
     }
 
     #[test]
@@ -2541,7 +2509,6 @@ mod tests {
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
 
         let ctx = TransactionRootContext {
-            late_deliveries: &HashSet::new(),
             transactions: &txs,
             validity_anchor: anchor,
         };

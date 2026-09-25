@@ -1,6 +1,6 @@
 //! Action types for the deterministic state machine.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -898,9 +898,6 @@ pub enum Action {
         /// one-block lag (this block's own QC may carry a slightly later
         /// timestamp) is bounded by `MAX_VALIDITY_RANGE`.
         validity_anchor: WeightedTimestamp,
-        /// Transactions this shard only delivers for, admissible past
-        /// their validity end to the delivery window's close.
-        late_deliveries: HashSet<TxHash>,
     },
 
     /// Verify a block's provisions root.
@@ -1140,11 +1137,6 @@ pub enum Action {
         /// What the read frontier judges of the offered content. The
         /// handler drops whatever it refuses against the parent state.
         fence: ReadFence,
-        /// For each transaction admitted on a record presence rather
-        /// than a payer bundle, the record keys it leaned on: one whose
-        /// keys lose their live reading among the kept claims is dropped
-        /// with them.
-        record_licences: BTreeMap<TxHash, Vec<SubstateKey>>,
     },
 
     /// Execute one tick's whole batch: the committing block's

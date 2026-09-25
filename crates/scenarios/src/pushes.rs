@@ -228,24 +228,26 @@ fn lost_answer_push<C: FaultableCluster>(c: &mut C, withholding: usize) {
 /// A lost removal push is read by the consumer's fallback, past the
 /// deadline its answer carries.
 ///
-/// Every push from the payer's shard to the recipient's is cut, so the
-/// record reaches the recipient by its read and its removal reaches it
-/// not at all. The recipient delivers and its answer's push retires the
-/// record at the payer; the answer stands, unasked, until the deadline
-/// it carries, then the recipient asks the record, reads it absent, and
+/// The record reaches the recipient by its push and the recipient's fold
+/// credits it, while the answer's push back is cut, so the payer's record
+/// stands. Then the cut turns round: every push from the payer's shard to
+/// the recipient's is cut, and the answer pushes flow again. The payer
+/// reads the answer by its own fallback and retires the record, and the
+/// removal's push is lost. The answer stands, unasked, until the deadline
+/// it carries; then the recipient asks the record, reads it absent, and
 /// its fold deletes the answer.
 ///
 /// # Panics
 ///
-/// Panics if the transfer does not accept or deliver, if the record is
-/// not retired, if anything asks or the answer goes before the deadline,
-/// if the cut never fires, if the answer is not deleted past the
-/// deadline, or if the world does not conserve.
+/// Panics if the transfer does not accept or the recipient is not
+/// credited, if the record is not retired, if anything asks or the answer
+/// goes before the deadline, if the cut never fires, if the answer is not
+/// deleted past the deadline, or if the world does not conserve.
 pub fn a_lost_removal_push_is_asked_past_the_deadline<C: FaultableCluster>(c: &mut C) {
     let (payer_hosts, recipient_hosts) = sides(c);
     let (_, _, to) = cross_shard_cast();
     let recipient_before = vault_balance(c, RECIPIENT_SHARD, to);
-    let removals_cut = c.drop_type_between(&payer_hosts, &recipient_hosts, "crossing.readings");
+    c.drop_type_between(&recipient_hosts, &payer_hosts, "crossing.readings");
 
     let Transfer {
         world,
@@ -258,15 +260,20 @@ pub fn a_lost_removal_push_is_asked_past_the_deadline<C: FaultableCluster>(c: &m
     assert!(
         c.run_until(epochs(6), |c| vault_balance(c, RECIPIENT_SHARD, to)
             == recipient_before + 100
-            && !stands(c, record)),
-        "the recipient is paid and its answer's push retires the record",
+            && stands(c, answer)),
+        "the recipient is credited and its answer stands",
     );
-
+    c.clear_drops();
+    let removals_cut = c.drop_type_between(&payer_hosts, &recipient_hosts, "crossing.readings");
     nothing_moves_before_the_deadline(
         c,
         deadline,
         |c| asks(c, CONSUMER_ASKS) > 0 || !stands(c, answer),
-        "before the deadline nothing asks and the answer stands: the removal's push is lost",
+        "before the deadline nothing asks and the answer stands",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| !stands(c, record)),
+        "the payer reads the answer and retires the record",
     );
     assert!(
         c.run_until(epochs(8), |c| !stands(c, answer)),

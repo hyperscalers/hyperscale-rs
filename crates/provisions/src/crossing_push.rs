@@ -23,7 +23,7 @@ use hyperscale_types::{
     MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ShardId, ShardTrie,
     StateClaim, Stated, SubstateKey, ValidatorId, signed_bytes,
 };
-use hyperscale_vm_effects::{CrossingId, CrossingLeaf, ProtocolHasher};
+use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher};
 use tracing::warn;
 
 /// One crossing cell a block changed that a counterpart reads: an answer
@@ -42,13 +42,26 @@ pub struct CrossingChange {
     pub present: bool,
 }
 
+/// The `Taken` keys of the owed records `claim` reads with their value,
+/// each of which the commit fold writes where it credits the reading.
+fn credited(claim: &StateClaim) -> impl Iterator<Item = SubstateKey> + '_ {
+    claim
+        .crossings
+        .iter()
+        .filter(move |(key, id)| {
+            *key == id.record_key(&ProtocolHasher) && claim.held(*key).is_some()
+        })
+        .map(|(_, id)| id.answer_key(&ProtocolHasher, Answered::Taken))
+}
+
 /// The crossing changes `block` made that a counterpart reads, judged
 /// from each written cell's value before (`prior`) and after (`after`)
 /// the block: an answer put, and a record deleted.
 ///
 /// The cells a block's crossing state moves on are its settling
-/// receipts' writes and the records and answers its claims settle in
-/// the fold; nothing else it writes is a crossing leaf. A target equal
+/// receipts' writes, the records and answers its claims settle in the
+/// fold, and the `Taken` its fold writes crediting an owed record's
+/// reading; nothing else it writes is a crossing leaf. A target equal
 /// to `local` is left out: the local rule reads the cell at the parent.
 /// An answer deleted is not pushed, since nothing reads it, and a
 /// record written is the records' own push.
@@ -72,6 +85,13 @@ pub fn crossing_changes(
         })
         .flat_map(BTreeMap::into_keys)
         .chain(block.state_claims().iter().flat_map(StateClaim::settles))
+        .chain(
+            block
+                .state_claims()
+                .iter()
+                .flat_map(credited)
+                .filter(|taken| prior(*taken).is_none()),
+        )
         .collect();
     written.sort_unstable();
     written.dedup();

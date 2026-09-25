@@ -15,6 +15,7 @@ hyperscale-node.workspace = true
 hyperscale-simulation.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
+hyperscale-vm-effects.workspace = true
 
 serde.workspace = true
 

@@ -278,6 +278,31 @@ fn wants_reading(
         || wanted.contains(&key)
 }
 
+/// Whether `claim` holds at `key` an owed record this shard's commit
+/// fold would credit: one whose consumer sits under `local`'s prefix and
+/// for which no `Taken` stands at the committed tip.
+///
+/// Nothing here asks about such a record — the shard runs no member of
+/// its transaction — so a push of it is kept on this rule alone, until
+/// the fold's `Taken` lands.
+fn owed_here(
+    claim: &StateClaim,
+    key: SubstateKey,
+    local: ShardId,
+    index: &dyn CrossingIndex,
+) -> Option<CrossingId> {
+    match CrossingLeaf::read(&ProtocolHasher, key, claim.held(key)?)? {
+        CrossingLeaf::Record { crossing, cell }
+            if cell.terms == Terms::Owed
+                && ShardTrie::shard_owns_prefix(local, cell.consumer)
+                && !index.present(crossing.id.answer_key(&ProtocolHasher, Answered::Taken)) =>
+        {
+            Some(crossing.id)
+        }
+        _ => None,
+    }
+}
+
 /// What a claim reads that the read frontier fences: whether it carries
 /// a record presence, and whether it carries an absence of the record
 /// behind an answer this shard holds.
@@ -414,6 +439,17 @@ pub struct Counterparts {
     /// about.
     awaited: BTreeSet<SubstateKey>,
 
+    /// Every owed record this shard holds for a consumer elsewhere, with
+    /// its crossing and the instant its re-push opens: what the consumer
+    /// credits only once a reading reaches it, and so what this shard
+    /// sends it again until its `Taken` comes back.
+    owed: BTreeMap<SubstateKey, (CrossingId, WeightedTimestamp)>,
+
+    /// When each owed record was last re-pushed, at this shard's height,
+    /// and how many times: node-local pacing, so a restarted replica
+    /// re-pushes at once.
+    repushed: BTreeMap<SubstateKey, (BlockHeight, u32)>,
+
     /// The read frontier as the committed chain leaves it: how far
     /// along each producer this shard has read, the copy the fold's own
     /// rule advances here at every commit. Read to license a deletion,
@@ -468,6 +504,8 @@ impl Counterparts {
             asks: BTreeMap::new(),
             names: BTreeMap::new(),
             awaited: BTreeSet::new(),
+            owed: BTreeMap::new(),
+            repushed: BTreeMap::new(),
             frontier,
             wanted: BTreeSet::new(),
             records: RecordReads::new(),
@@ -647,10 +685,9 @@ impl Counterparts {
     /// or a `Never` beside it, and is asked again at each newer header. The
     /// shard holding the core consumer's target is asked about the
     /// consumer's claim, whose presence is what licenses the retirement.
-    /// A delivering shard is asked about the crossing's claim cell past
-    /// the lapse, the delivery window's close plus the finalization
-    /// delay, since a delivery admitted under the close has claimed by
-    /// then or never will. Each is asked against that shard's newest
+    /// The shard holding an owed crossing's consumer is asked about the
+    /// crossing's claim cell past the deadline, where no push answered
+    /// it. Each is asked against that shard's newest
     /// commit-proven header the question stands at — inside the window
     /// an absence answers in, at or past its floor and short of the
     /// probed cell's own sweep, or past the point a presence is asked
@@ -788,6 +825,7 @@ impl Counterparts {
         let mut asks = BTreeMap::new();
         let mut names = BTreeMap::new();
         let mut awaited = BTreeSet::new();
+        let mut owed = BTreeMap::new();
         self.local_crossings.clear();
         for (key, value) in self.index.crossing_rows(local) {
             match CrossingLeaf::read(&ProtocolHasher, key, &value) {
@@ -799,11 +837,23 @@ impl Counterparts {
                     names.insert(decline, id);
                     awaited.insert(claim);
                     awaited.insert(decline);
+                    let due_from =
+                        Deadline::of(WeightedTimestamp::from_millis(cell.validity_end_ms)).at();
+                    let consumer_here = trie.shard_for_prefix(claim.owner) == local;
+                    if cell.terms == Terms::Owed && !consumer_here {
+                        owed.insert(key, (id, due_from));
+                    }
                     if self.ledger.settles_record(key) {
                         continue;
                     }
-                    if trie.shard_for_prefix(claim.owner) == local {
-                        if self.index.present(claim) || self.index.present(decline) {
+                    if consumer_here {
+                        // An owed record whose consumer a merge brought
+                        // here is credited by this shard's own fold, off
+                        // its reading at the parent.
+                        if self.index.present(claim)
+                            || self.index.present(decline)
+                            || cell.terms == Terms::Owed
+                        {
                             self.local_crossings.insert(id);
                         }
                         continue;
@@ -812,8 +862,6 @@ impl Counterparts {
                         Some(Asked::Answer { asked_at, step, .. }) => (*asked_at, *step),
                         _ => (None, 0),
                     };
-                    let due_from =
-                        Deadline::of(WeightedTimestamp::from_millis(cell.validity_end_ms)).at();
                     let disarm_at = matches!(cell.terms, Terms::Escrowed { .. })
                         .then(|| due_from.plus(MAX_VALIDITY_RANGE));
                     for asked in [claim, decline] {
@@ -859,7 +907,51 @@ impl Counterparts {
         }
         self.asks = asks;
         self.names = names;
+        self.repushed.retain(|record, _| owed.contains_key(record));
+        self.owed = owed;
         self.awaited = awaited;
+    }
+
+    /// The owed records to push to their consumers again at `height`,
+    /// by the shard holding each consumer's prefix under `trie`.
+    ///
+    /// An owed record's consumer credits it only once a reading reaches
+    /// it, and nothing there asks: the shard runs no member of the
+    /// transaction. So the record is pushed again from its deadline, at
+    /// this shard's heights `h, h+1, h+3, h+7, ...` with the gap capped
+    /// at [`MAX_ANSWER_ASK_GAP`], for as long as it stands, which is
+    /// until the fold here reads the `Taken` the consumer's fold wrote.
+    /// The pacing is taken as the push is, so a call only a proposer
+    /// makes paces only its own pushes.
+    pub(crate) fn owed_repushes(
+        &mut self,
+        trie: &ShardTrie,
+        now: WeightedTimestamp,
+        height: BlockHeight,
+    ) -> BTreeMap<ShardId, Vec<SubstateKey>> {
+        let mut targets: BTreeMap<ShardId, Vec<SubstateKey>> = BTreeMap::new();
+        for (record, (id, due_from)) in &self.owed {
+            if now < *due_from {
+                continue;
+            }
+            let pushed = self.repushed.get(record).copied();
+            if pushed.is_some_and(|(at, times)| height.inner() < at.inner() + answer_ask_gap(times))
+            {
+                continue;
+            }
+            self.repushed.insert(
+                *record,
+                (
+                    height,
+                    pushed.map_or(1, |(_, times)| times.saturating_add(1)),
+                ),
+            );
+            targets
+                .entry(trie.shard_for_prefix(id.consumer))
+                .or_default()
+                .push(*record);
+        }
+        targets
     }
 
     /// The records this shard holds ask one question each, of whoever
@@ -1066,20 +1158,6 @@ impl Counterparts {
         self.fetched
             .keys()
             .any(|claim| claim.anchor.shard == shard && claim.reading(key).is_some())
-    }
-
-    /// Whether this validator holds, to offer, a live reading of the
-    /// record at `key` naming `tx` as its issuer: what a delivering body
-    /// that consumes it can be admitted beside.
-    pub(crate) fn holds_live_record(&self, key: SubstateKey, tx: TxHash) -> bool {
-        self.fetched.keys().any(|claim| {
-            claim.held(key).is_some_and(|bytes| {
-                matches!(
-                    CrossingLeaf::read(&ProtocolHasher, key, bytes),
-                    Some(CrossingLeaf::Record { cell, .. }) if cell.tx == tx
-                )
-            })
-        })
     }
 
     /// Take what a fetched proof attests: close the questions it
@@ -1515,10 +1593,14 @@ impl Counterparts {
         }
         self.wanted = records.iter().map(|record| record.key).collect();
         let anchor = claim.anchor;
+        let local = self.ledger.local();
         let mut wanted: BTreeSet<SubstateKey> = claim
             .keys()
             .into_iter()
-            .filter(|key| wants_reading(&self.asks, &self.awaited, &self.wanted, anchor, *key))
+            .filter(|key| {
+                wants_reading(&self.asks, &self.awaited, &self.wanted, anchor, *key)
+                    || owed_here(claim, *key, local, self.index.as_ref()).is_some()
+            })
             .collect();
         if wanted.is_empty() {
             return false;
@@ -1535,6 +1617,21 @@ impl Counterparts {
         }
         let Some(kept) = claim.restrict(|key| wanted.contains(&key)) else {
             return false;
+        };
+        // An owed record addressed here names its own crossing, which
+        // is what the fold credits it under.
+        let owed: Vec<(SubstateKey, CrossingId)> = wanted
+            .iter()
+            .filter_map(|key| {
+                owed_here(&kept, *key, local, self.index.as_ref()).map(|id| (*key, id))
+            })
+            .collect();
+        let kept = if owed.is_empty() {
+            kept
+        } else {
+            let named: Vec<(SubstateKey, CrossingId)> =
+                kept.crossings.iter().copied().chain(owed).collect();
+            kept.naming(named)
         };
         for key in &wanted {
             self.records.pushed(*key, anchor);
@@ -1563,6 +1660,8 @@ impl Counterparts {
         let awaited = &self.awaited;
         let wanted = &self.wanted;
         let proven = &self.proven_anchors;
+        let local = unresolved.local();
+        let index = self.index.as_ref();
         self.fetched.retain(|claim, speaks_for| {
             if proven.at(claim.anchor.shard, claim.anchor.height) != Some(claim.anchor) {
                 return false;
@@ -1570,10 +1669,10 @@ impl Counterparts {
             speaks_for
                 .iter()
                 .any(|tx_hash| unresolved.contains(*tx_hash))
-                || claim
-                    .cells
-                    .iter()
-                    .any(|(key, _)| wants_reading(asks, awaited, wanted, claim.anchor, *key))
+                || claim.cells.iter().any(|(key, _)| {
+                    wants_reading(asks, awaited, wanted, claim.anchor, *key)
+                        || owed_here(claim, *key, local, index).is_some()
+                })
         });
         // The one retention rule for what counterparts said: an entry
         // there speaks for a transaction this ledger still owes an
@@ -2437,18 +2536,26 @@ mod tests {
 
     /// A producer whose consumer sits on its own shard offers the
     /// crossing to the block to read at its parent, once the consumer's
-    /// answer is in this shard's own state, and asks nothing of it.
+    /// answer is in this shard's own state, and asks nothing of it. An
+    /// owed record is offered unanswered: its credit is this shard's own
+    /// fold's.
     #[test]
     fn a_local_consumers_answer_is_read_at_the_parent() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
         let trie = ShardTrie::from_leaves([ShardId::ROOT]);
         let now = deadline.at();
         let id = producer_crossing(0, deadline);
-        let seated = |answered: Option<Answered>| {
+        let escrowed = Terms::Escrowed {
+            credit: producer_record(0),
+        };
+        let seated = |terms: Terms, answered: Option<Answered>| {
             // Seated where both ends route, which is what a successor
             // inheriting both prefixes becomes.
             let rows = Arc::new(TestRows::default());
-            let cell = producer_cell(0, deadline);
+            let cell = CrossingCell {
+                terms,
+                ..producer_cell(0, deadline)
+            };
             rows.put(record_of(0, deadline), cell.to_bytes());
             if let Some(answered) = answered {
                 rows.put(
@@ -2474,18 +2581,23 @@ mod tests {
         };
 
         assert!(
-            seated(None).is_empty(),
+            seated(escrowed, None).is_empty(),
             "a consumer that has not answered leaves the record waiting, and nothing is read",
         );
         assert_eq!(
-            seated(Some(Answered::Never)),
+            seated(escrowed, Some(Answered::Never)),
             vec![id],
             "its own decline has the crossing read at the parent",
         );
         assert_eq!(
-            seated(Some(Answered::Taken)),
+            seated(escrowed, Some(Answered::Taken)),
             vec![id],
             "and so does its own claim, whose reading the fold retires the record on",
+        );
+        assert_eq!(
+            seated(Terms::Owed, None),
+            vec![id],
+            "an owed record is read unanswered, for this shard's fold to credit",
         );
     }
 
@@ -2694,6 +2806,112 @@ mod tests {
         );
         assert!(producer.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000)));
         assert_eq!(producer.state_claims().len(), 1, "and offered in a block");
+    }
+
+    /// A standing owed record is pushed to its consumer again from its
+    /// deadline, at this shard's heights `1, 2, 4, 8, 16, ...`, and no
+    /// more once the row goes.
+    #[test]
+    fn a_standing_owed_record_is_pushed_again_on_the_backoff() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000));
+        let (mut producer, trie, _, rows) = producing(1, deadline);
+        let record = record_of(0, deadline);
+        assert!(
+            producer
+                .owed_repushes(
+                    &trie,
+                    deadline.at().minus(Duration::from_millis(1)),
+                    BlockHeight::new(1)
+                )
+                .is_empty(),
+            "before the deadline the first push is the only one",
+        );
+        let pushed: Vec<u64> = (1..=20)
+            .filter(|height| {
+                let targets =
+                    producer.owed_repushes(&trie, deadline.at(), BlockHeight::new(*height));
+                if targets.is_empty() {
+                    return false;
+                }
+                assert_eq!(targets, BTreeMap::from([(CONSUMER, vec![record])]));
+                true
+            })
+            .collect();
+        assert_eq!(pushed, vec![1, 2, 4, 8, 16]);
+
+        rows.remove(record);
+        producer.derive_asks(&trie);
+        assert!(
+            producer
+                .owed_repushes(&trie, deadline.at(), BlockHeight::new(64))
+                .is_empty(),
+            "a retired record is pushed no more",
+        );
+    }
+
+    /// A pushed owed record is kept to offer, named for its crossing,
+    /// where its consumer's prefix is held and no `Taken` stands; it is
+    /// dropped anywhere else, and once the `Taken` is written.
+    #[test]
+    fn a_pushed_owed_record_is_kept_where_its_consumer_is() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000));
+        let record = record_of(0, deadline);
+        let id = producer_crossing(0, deadline);
+        let value = producer_cell(0, deadline).to_bytes();
+        let (state_root, proof) = state_and_proof(PRODUCER, &[record], &[record]);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(3),
+            state_root,
+            ts: WeightedTimestamp::from_millis(1_000),
+        };
+        let pushed = StateClaim::new(
+            anchor,
+            [(
+                record,
+                Stated::Held(Bytes::new(value).expect("a record fits")),
+            )],
+            proof,
+        );
+        let offered = |local: ShardId, rows: Arc<TestRows>| {
+            let anchors = Arc::new(ProvenAnchors::default());
+            anchors.record(anchor);
+            let mut counterparts = Counterparts::new(
+                local,
+                anchors,
+                Arc::new(CounterpartMirror::default()),
+                rows,
+                ReadFrontier::default(),
+            );
+            let kept =
+                counterparts.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000));
+            (kept, counterparts.state_claims())
+        };
+
+        let (kept, claims) = offered(CONSUMER, Arc::new(TestRows::default()));
+        assert!(kept, "the consumer's shard keeps it");
+        assert_eq!(
+            claims
+                .iter()
+                .flat_map(|claim| claim.crossings.iter().copied())
+                .collect::<Vec<_>>(),
+            vec![(record, id)],
+            "named for its crossing, which is what the fold credits it under",
+        );
+        assert!(
+            !offered(ShardId::leaf(2, 3), Arc::new(TestRows::default())).0,
+            "a shard not holding the consumer drops it",
+        );
+        let answered = Arc::new(TestRows::default());
+        answered.put(
+            id.answer_key(&ProtocolHasher, Answered::Taken),
+            id.answer(producer_cell(0, deadline).tx, Answered::Taken, 0)
+                .to_bytes(),
+        );
+        assert!(
+            !offered(CONSUMER, answered).0,
+            "and once its Taken stands there is nothing to credit",
+        );
     }
 
     /// A removal pushed below the read frontier's floor is refused on

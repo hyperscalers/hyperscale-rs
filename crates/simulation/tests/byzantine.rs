@@ -15,17 +15,24 @@ mod support;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
-    build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, validity_around,
+    build_swap_tx, build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts,
+    validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
-use hyperscale_scenarios::{Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs};
+use hyperscale_scenarios::{
+    Cluster, FaultHandle, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig,
+    StockedVenue, VENUE_SHARD, epochs, grind_onto, stand_up_venue, venue_genesis_accounts,
+};
+use hyperscale_types::network::request::GetStateProofRequest;
 use hyperscale_types::network::response::GetStateProofResponse;
 use hyperscale_types::{
-    Deadline, MAX_VALIDITY_RANGE, MerkleInclusionProof, ShardId, TransactionDecision,
-    TransactionStatus, WeightedTimestamp,
+    Deadline, Ed25519PrivateKey, MAX_VALIDITY_RANGE, MerkleInclusionProof, PrincipalAddr, ShardId,
+    TransactionDecision, TransactionStatus, WeightedTimestamp,
 };
 use support::SimCluster;
 
@@ -41,6 +48,56 @@ const fn cross_shard_config() -> ScenarioConfig {
         split_bytes: u64::MAX,
         latency: std::time::Duration::from_millis(150),
     }
+}
+
+/// A venue on one shard and its callers on the other, over the fixture
+/// packages: a swap's core reads the caller's escrowed record, which is
+/// the record read these tests attack.
+fn venue_swap_cluster() -> SimCluster {
+    SimCluster::with_grown_packages(
+        &cross_shard_config(),
+        42,
+        &venue_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+/// Cut the pushes of the caller's shard to the venue's, so the core
+/// reads the caller's record by asking for it — the fetch these tests
+/// attack.
+fn cut_record_pushes(c: &mut SimCluster) {
+    let callers = c.committee_hosts(SWAPPER_SHARD);
+    let venues = c.committee_hosts(VENUE_SHARD);
+    c.drop_type_between(&callers, &venues, "crossing.readings");
+}
+
+/// Submit a swap of `caller`'s through `venue` and wait for it to
+/// accept: the core has read the caller's record and run.
+fn swap_accepts(
+    c: &mut SimCluster,
+    venue: &StockedVenue,
+    caller_key: &Ed25519PrivateKey,
+    caller: PrincipalAddr,
+) {
+    let tx = build_swap_tx(
+        caller_key,
+        caller,
+        &venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    let verdict = await_tx_terminal(c, hash, epochs(12));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the swap must accept, its core having read the caller's record; verdict = {verdict:?}",
+    );
 }
 
 /// A forged state proof convinces nobody, and the reclaim it was meant to
@@ -115,12 +172,11 @@ fn a_forged_state_proof_convinces_nobody() {
             })
             .collect();
 
-        // The bundle does not reach the recipient while the cut stands,
-        // so the delivery has not claimed and the payer goes on asking
-        // the recipient's chain about the claim cell — which is the
+        // The record's push does not reach the recipient while the cut
+        // stands, so nothing credits it and the payer goes on asking the
+        // recipient's chain about the claim cell — which is the
         // state-proof fetch this attacks.
-        let broadcast_dropped = c.drop_type("provisions.broadcast");
-        let fetch_dropped = c.drop_type("provision.request");
+        let push_dropped = c.drop_type("crossing.readings");
 
         let validity = validity_around(c.now());
         let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
@@ -151,8 +207,8 @@ fn a_forged_state_proof_convinces_nobody() {
             "the cut must stand while the payer is asking about the claim",
         );
         assert!(
-            broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
-            "both bundle channels must actually have been exercised and cut",
+            push_dropped.fired() > 0,
+            "the record's push must actually have been exercised and cut",
         );
         assert!(
             forged.iter().any(|handle| handle.fired() > 0),
@@ -168,14 +224,14 @@ fn a_forged_state_proof_convinces_nobody() {
             "no state-proof answer was refused on its proof, so the reconstruction never ran",
         );
 
-        // And the shard makes progress past the attack: with the bundle
-        // flowing again the delivery lands and the recipient is paid,
-        // which is where the crossing was owed all along.
+        // And the shard makes progress past the attack: with the push
+        // flowing again the recipient is credited, which is where the
+        // crossing was owed all along.
         c.clear_drops();
         assert!(
             c.run_until(epochs(12), |c| vault_balance(c, recipient_shard, to)
                 == recipient_before + 100),
-            "the recipient must be paid once the bundle can reach it; holds {}",
+            "the recipient must be paid once the record can reach it; holds {}",
             vault_balance(c, recipient_shard, to),
         );
         assert_eq!(
@@ -189,7 +245,7 @@ fn a_forged_state_proof_convinces_nobody() {
 /// A host that answers a record's read with rubbish is rotated past,
 /// and the crossing it was carrying still lands.
 ///
-/// The delivery side's evidence seam, and the second thing a drop rule
+/// The consuming core's evidence seam, and the second thing a drop rule
 /// cannot reach: a silent responder the fetch already has a rotation
 /// for. A responder that answers is the case where a check has to do
 /// the work — a state proof is checked against the anchor the requester
@@ -197,14 +253,12 @@ fn a_forged_state_proof_convinces_nobody() {
 /// at the fetch rather than carried into a block.
 #[test]
 fn a_host_answering_a_records_read_with_rubbish_is_rotated_past() {
-    let mut cluster =
-        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
-    let (payer_key, from, to) = cross_shard_cast();
-    let payer_shard = ShardId::leaf(1, 0);
-    let recipient_shard = ShardId::leaf(1, 1);
-
+    let mut cluster = venue_swap_cluster();
     cluster.run_faultable(|c| {
-        let recipient_before = vault_balance(c, recipient_shard, to);
+        let mut taken = Vec::new();
+        let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
+        let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
+        cut_record_pushes(c);
         let refused_before = c.metric("fetch_responses_refused", Some("state_proof"));
 
         // Every host of the shard the record is read from lies once
@@ -216,7 +270,7 @@ fn a_host_answering_a_records_read_with_rubbish_is_rotated_past() {
         // front of the check every time.
         let lies = Arc::new(AtomicUsize::new(0));
         let forged: Vec<FaultHandle> = c
-            .committee_hosts(payer_shard)
+            .committee_hosts(SWAPPER_SHARD)
             .into_iter()
             .map(|host| {
                 let lies = Arc::clone(&lies);
@@ -234,31 +288,14 @@ fn a_host_answering_a_records_read_with_rubbish_is_rotated_past() {
             })
             .collect();
 
-        let tx = build_transfer_tx(&payer_key, from, to, 100, validity_around(c.now()));
-        let hash = tx.hash();
-        c.submit(Arc::new(tx));
-
-        let verdict = await_tx_terminal(c, hash, epochs(8));
-        assert!(
-            matches!(
-                verdict,
-                Some(TransactionStatus::Completed(TransactionDecision::Accept))
-            ),
-            "the payer's leg settles alone and accepts; verdict = {verdict:?}",
-        );
-        assert!(
-            c.run_until(epochs(10), |c| vault_balance(c, recipient_shard, to)
-                == recipient_before + 100),
-            "the delivery must run against an honest peer's reading; holds {}",
-            vault_balance(c, recipient_shard, to),
-        );
+        swap_accepts(c, &venue, &caller_key, caller);
         assert!(
             forged.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
             "the rubbish has to have been served, or nothing was attacked",
         );
         assert!(
             c.metric("fetch_responses_refused", Some("state_proof")) > refused_before,
-            "the rubbish was never refused, so the delivery landing says nothing",
+            "the rubbish was never refused, so the swap landing says nothing",
         );
     });
 }
@@ -268,7 +305,7 @@ fn a_host_answering_a_records_read_with_rubbish_is_rotated_past() {
 type Kept = Arc<Mutex<Option<(Vec<u8>, Vec<u8>)>>>;
 
 /// A record's read answered with the proof of another record is
-/// refused, and the delivery it was carrying still lands.
+/// refused, and the swap it was carrying still lands.
 ///
 /// The forgery worth checking at a fetch is a well-formed answer to a
 /// different question, and a served proof is the one payload where that
@@ -278,23 +315,17 @@ type Kept = Arc<Mutex<Option<(Vec<u8>, Vec<u8>)>>>;
 /// commit-proved and over the keys it asked about, so an answer that
 /// proves somebody else's crossing proves nothing here.
 ///
-/// Two payments, and the second one's read is answered with the first
-/// one's proof. Both must arrive: the recipient is credited twice, once
-/// for each, and never once or three times.
+/// Two swaps, and the second one's read is answered with the first
+/// one's proof. Both must accept, each on a reading of its own record.
 #[test]
 fn a_proof_replayed_from_another_records_read_is_refused() {
-    let mut cluster =
-        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
-    let (payer_key, from, to) = cross_shard_cast();
-    let payer_shard = ShardId::leaf(1, 0);
-    let recipient_shard = ShardId::leaf(1, 1);
-
+    let mut cluster = venue_swap_cluster();
     cluster.run_faultable(|c| {
-        let recipient_before = vault_balance(c, recipient_shard, to);
-        let refused_before = c.metric(
-            "fetch_responses_refused",
-            Some("state_proof:unusable_proof"),
-        );
+        let mut taken = Vec::new();
+        let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
+        let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
+        cut_record_pushes(c);
+        let refused_before = c.metric("fetch_responses_refused", Some("state_proof"));
 
         // The first honest answer is kept with the question it answered,
         // and served once to whoever asks a different one. Lying on the
@@ -305,7 +336,7 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
         let kept: Kept = Arc::new(Mutex::new(None));
         let lies = Arc::new(AtomicUsize::new(0));
         let replayed: Vec<FaultHandle> = c
-            .committee_hosts(payer_shard)
+            .committee_hosts(SWAPPER_SHARD)
             .into_iter()
             .map(|host| {
                 let kept = Arc::clone(&kept);
@@ -315,9 +346,18 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
                     "state_proof.request",
                     Arc::new(move |asked: &[u8], honest: &[u8]| {
                         let mut held = kept.lock().unwrap_or_else(PoisonError::into_inner);
+                        // Another question is other keys: the same keys
+                        // asked again at a later height over an unchanged
+                        // root are the same question, and its answer
+                        // honestly answers it.
+                        let keys = |bytes: &[u8]| {
+                            hbor_from_slice::<GetStateProofRequest>(bytes)
+                                .map(|request| request.keys)
+                                .ok()
+                        };
                         let reply = match held.as_ref() {
                             Some((earlier, reply))
-                                if earlier != asked
+                                if keys(earlier) != keys(asked)
                                     && lies.fetch_add(1, Ordering::Relaxed) == 0 =>
                             {
                                 reply.clone()
@@ -335,46 +375,26 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
             })
             .collect();
 
-        let mut hashes = Vec::new();
-        for amount in [100u128, 101] {
-            let tx = build_transfer_tx(&payer_key, from, to, amount, validity_around(c.now()));
-            hashes.push(tx.hash());
-            c.submit(Arc::new(tx));
-            assert!(
-                matches!(
-                    await_tx_terminal(c, *hashes.last().expect("just pushed"), epochs(8)),
-                    Some(TransactionStatus::Completed(TransactionDecision::Accept))
-                ),
-                "the payer's leg settles alone and accepts",
-            );
-        }
-
-        assert!(
-            c.run_until(epochs(12), |c| vault_balance(c, recipient_shard, to)
-                == recipient_before + 201),
-            "both deliveries must run, each against a reading that proves its own \
-             record; holds {}",
-            vault_balance(c, recipient_shard, to),
-        );
+        // Two swaps, each through the core's read of its own record.
+        swap_accepts(c, &venue, &caller_key, caller);
+        swap_accepts(c, &venue, &caller_key, caller);
         assert!(
             replayed.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
             "the stale proof has to have been served, or nothing was attacked",
         );
-        // Both deliveries landing is what an unattacked run shows too.
-        // The proof walked over the keys the requester asked about is the
-        // rule under test, and refusing the replay is where it runs.
+        // Both swaps accepting is what an unattacked run shows too. The
+        // proof walked over the keys the requester asked about, and the
+        // values held to what it proves for them, is the rule under
+        // test, and refusing the replay is where it runs.
         assert!(
-            c.metric(
-                "fetch_responses_refused",
-                Some("state_proof:unusable_proof")
-            ) > refused_before,
-            "the replayed proof was never refused on its keys",
+            c.metric("fetch_responses_refused", Some("state_proof")) > refused_before,
+            "the replayed proof was never refused",
         );
     });
 }
 
 /// A record value a served proof does not cover is refused, and the
-/// delivery it was carrying still lands.
+/// swap it was carrying still lands.
 ///
 /// The third shape a responder can take, and the one the other cases
 /// cannot reach: a well-formed answer to the right question, carrying a
@@ -390,14 +410,12 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
 /// encoding.
 #[test]
 fn a_record_value_its_proof_does_not_cover_is_refused() {
-    let mut cluster =
-        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
-    let (payer_key, from, to) = cross_shard_cast();
-    let payer_shard = ShardId::leaf(1, 0);
-    let recipient_shard = ShardId::leaf(1, 1);
-
+    let mut cluster = venue_swap_cluster();
     cluster.run_faultable(|c| {
-        let recipient_before = vault_balance(c, recipient_shard, to);
+        let mut taken = Vec::new();
+        let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
+        let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
+        cut_record_pushes(c);
         let refused_before = c.metric(
             "fetch_responses_refused",
             Some("state_proof:value_off_its_proof"),
@@ -408,7 +426,7 @@ fn a_record_value_its_proof_does_not_cover_is_refused() {
         // the fetch picked and the retry still has somewhere to land.
         let tampered = Arc::new(AtomicUsize::new(0));
         let forged: Vec<FaultHandle> = c
-            .committee_hosts(payer_shard)
+            .committee_hosts(SWAPPER_SHARD)
             .into_iter()
             .map(|host| {
                 let tampered = Arc::clone(&tampered);
@@ -437,24 +455,7 @@ fn a_record_value_its_proof_does_not_cover_is_refused() {
             })
             .collect();
 
-        let tx = build_transfer_tx(&payer_key, from, to, 100, validity_around(c.now()));
-        let hash = tx.hash();
-        c.submit(Arc::new(tx));
-
-        let verdict = await_tx_terminal(c, hash, epochs(8));
-        assert!(
-            matches!(
-                verdict,
-                Some(TransactionStatus::Completed(TransactionDecision::Accept))
-            ),
-            "the payer's leg settles alone and accepts; verdict = {verdict:?}",
-        );
-        assert!(
-            c.run_until(epochs(10), |c| vault_balance(c, recipient_shard, to)
-                == recipient_before + 100),
-            "the delivery must run against a value its proof covers; holds {}",
-            vault_balance(c, recipient_shard, to),
-        );
+        swap_accepts(c, &venue, &caller_key, caller);
         assert!(
             forged.iter().any(|handle| handle.fired() > 0) && tampered.load(Ordering::Relaxed) > 0,
             "the tampered value has to have been served, or nothing was attacked",

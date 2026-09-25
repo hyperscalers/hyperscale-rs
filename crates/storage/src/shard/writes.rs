@@ -12,7 +12,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_kernel::Substates;
 
-use crate::shard::crossings::crossing_settlements;
+use crate::shard::crossings::{crossing_settlements, owed_credits};
 use crate::shard::read_frontier::with_frontier;
 use crate::shard::store::Anchored;
 use crate::shard::sweep::{removals_of, with_sweep};
@@ -65,10 +65,15 @@ pub fn merge_writes_from_receipts(
 
 /// Everything a prepared commit lands.
 ///
-/// The receipts `finalizations` settle, resolved against the parent's
-/// baseline, plus the block's own creations, the sweep's removals, the
-/// crossing settlements its claims license against the same baseline,
-/// and the read frontier's entries.
+/// The receipts `finalizations` settle and the owed credits the block's
+/// claims license, resolved together against the parent's baseline,
+/// plus the block's own creations, the sweep's removals, the crossing
+/// settlements its claims license against the same baseline, and the
+/// read frontier's entries.
+///
+/// The credits fold after the receipts, so a credit composes with any
+/// movement a receipt made on the same vault rather than being
+/// superseded by it.
 ///
 /// One resolution, feeding both the tree and the substate store — they
 /// commit the same values or they disagree about state. It happens once
@@ -104,7 +109,9 @@ pub fn settled_writes_at(
         .iter()
         .flat_map(|fw| fw.settling_receipts())
         .collect();
-    let merged = merge_writes_from_receipts(&settling, baseline);
+    let mut writes = merge_receipts(&settling);
+    fold_state_writes(&mut writes, &owed_credits(state_claims, baseline));
+    let merged = settle_writes(&writes, baseline);
     let settled = crossing_settlements(state_claims, &merged, baseline);
     with_frontier(
         with_sweep(merged, creations, &removals_of(swept, &settled)),

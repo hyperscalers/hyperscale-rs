@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use hyperscale_vm_types::{ARTIFACT_GRACE_MS, COMMITTED_GRACE_MS};
 
-use crate::{CLAIM_WINDOW, MAX_VALIDITY_RANGE, TERMINAL_EVIDENCE_EPOCHS};
+use crate::MAX_VALIDITY_RANGE;
 
 /// The longest a cross-shard transaction may take to finalize, past the
 /// last block that could have included it.
@@ -88,44 +88,6 @@ pub const DEDUP_WINDOW: Duration = RETENTION_HORIZON;
 const _: () = assert!(
     DEDUP_WINDOW.as_secs() == RETENTION_HORIZON.as_secs(),
     "the dedup walk is exactly as deep as the tiers it rebuilds",
-);
-
-/// How long a member waits, from the block that committed it, for the
-/// bundle it cannot run without.
-///
-/// An arrival has no window. The producer offers the crossing again
-/// every [`MAX_FINALIZATION_DELAY`] — one round of the bundle out, the
-/// delivery committed, its certificate back — so nothing is unsafe at
-/// either end of this figure: too short composes the member again from a
-/// fresh admission, too long leaves an entry nobody will provision in
-/// the ledger. What it is sized against is the longest cause of a late
-/// bundle that is not a halt.
-///
-/// The floor is a reshape of the producer. A record migrates to the
-/// successor holding its prefix, and the span before a successor can act
-/// on a handoff is [`TERMINAL_EVIDENCE_EPOCHS`] — two epochs before the
-/// evidence is readable at all, one for the fetch and the commit, two of
-/// slack, as that constant's own derivation states. A delivery whose
-/// producer reshapes waits on exactly that, so a shorter figure would
-/// send every crossing straddling a cut to re-admission by construction.
-///
-/// Nothing shorter is bought by the other causes. Ordinary loss is
-/// answered by the next offer a round later; a producer down longer than
-/// this is a halted shard, out for redraws rather than minutes, and its
-/// recovery arrives as a fresh offer against a fresh admission. And the
-/// condition is correlated — a producer that cannot get one bundle
-/// through cannot get any through — so erring short costs a burst of
-/// licences against one block's
-/// [`MAX_STATE_CLAIMS_BYTES`](crate::MAX_STATE_CLAIMS_BYTES) exactly
-/// when a counterpart is already struggling, where erring long costs
-/// entries nobody will provision.
-pub const BUNDLE_WAIT: Duration =
-    Duration::from_secs(EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS);
-
-const _: () = assert!(
-    BUNDLE_WAIT.as_secs() == CLAIM_WINDOW.as_secs() + MAX_FINALIZATION_DELAY.as_secs(),
-    "a delivery's wait and a record's claim window are one span from two directions, \
-     the first measured from a commit and the second from a deadline",
 );
 
 /// How far back a chain is folded to rebuild the fee reservations the

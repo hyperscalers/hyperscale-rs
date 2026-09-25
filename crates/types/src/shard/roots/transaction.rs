@@ -1,6 +1,5 @@
 //! [`TransactionRoot`] verification.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -25,13 +24,6 @@ pub struct TransactionRootContext<'a> {
     /// a window mismatch here because the proposer applied the same check
     /// during transaction selection.
     pub validity_anchor: WeightedTimestamp,
-    /// Transactions this shard only delivers for — frozen divided with
-    /// this shard outside the core and every leg here a delivery — whose
-    /// records this block proves still present, and which the anchor
-    /// therefore admits past their validity end. The set is the
-    /// caller's, computed against the block's own anchor and the block's
-    /// own claims, so proposer and voters derive one set.
-    pub late_deliveries: &'a HashSet<TxHash>,
 }
 
 /// Failure modes of [`TransactionRoot`] verification.
@@ -111,14 +103,7 @@ impl Verify<&TransactionRootContext<'_>> for TransactionRoot {
         }
         for tx in ctx.transactions {
             let range = tx.validity_range();
-            // A delivery bears no verdict and claims a cell consumed
-            // once, so it is admissible past its transaction's window on
-            // a licence rather than on a clock: the record it consumes
-            // proved present by a claim this block carries, which is
-            // what `late_deliveries` names it for.
-            let admitted =
-                range.contains(ctx.validity_anchor) || ctx.late_deliveries.contains(&tx.hash());
-            if !range.is_well_formed(ctx.validity_anchor) || !admitted {
+            if !range.is_well_formed(ctx.validity_anchor) || !range.contains(ctx.validity_anchor) {
                 return Err(TxRootVerifyError::ValidityWindowExpired {
                     tx_hash: tx.hash(),
                     anchor_ms: ctx.validity_anchor.as_millis(),

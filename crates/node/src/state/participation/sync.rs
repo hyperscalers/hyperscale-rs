@@ -86,10 +86,6 @@ impl ShardParticipation {
             } => {
                 self.execution_coordinator
                     .on_proof_fetched(anchor, &keys, &proof, &values);
-                // A reading just held may complete a parked delivering
-                // body's records, which the pool then offers beside it.
-                self.mempool_coordinator
-                    .on_deliveries_readable(&self.execution_coordinator.readable_deliveries());
                 Vec::new()
             }
             // A predecessor answered which of the queried transactions it

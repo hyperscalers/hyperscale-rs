@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, Member, Side, live_record};
+use hyperscale_engine::legs::{Classified, Member, live_record};
 use hyperscale_types::{
     MAX_FINALIZATION_DELAY, Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry,
     SubstateKey, TxHash, Verified, WeightedTimestamp,
@@ -64,8 +64,7 @@ pub struct WantedRecord {
     /// The committed clock past which the read arms on the clock alone:
     /// one finalization delay past the commit that filed the want, for
     /// a requirement filed here, by when the producer's leg has
-    /// finalized or never will and a push that was coming has come; or
-    /// the body's validity end, for a delivering body the pool holds.
+    /// finalized or never will and a push that was coming has come.
     /// `None` where only the producer's certificate arms it. The
     /// certificate arms either sooner.
     pub arms_at: Option<WeightedTimestamp>,
@@ -76,7 +75,7 @@ pub struct WantedRecord {
 /// crossings the legs it runs consume.
 #[must_use]
 pub fn requirements_of(member: &Member, legs: &[LegShape]) -> BTreeSet<Requirement> {
-    divided_requirements(legs, member.classified(), member.local(), member.side())
+    divided_requirements(legs, member.classified(), member.local())
 }
 
 /// What a divided member of a transaction files: its execution scope
@@ -84,8 +83,8 @@ pub fn requirements_of(member: &Member, legs: &[LegShape]) -> BTreeSet<Requireme
 ///
 /// A member running only its own legs is in no core set and files no
 /// committed state at all; a core member files one per other core shard;
-/// and either files a crossing for every value edge landing on it from a
-/// node it does not run. Nothing else — the engagement exchange a whole
+/// and either files a crossing for every escrowed value edge landing on
+/// it from a node it does not run. Nothing else — the engagement exchange a whole
 /// shape files is not here, since a divided member's inbound escrow is
 /// its engagement and the crossing bundle it consumes is its
 /// counterpart's commitment.
@@ -94,12 +93,11 @@ pub fn divided_requirements(
     legs: &[LegShape],
     classified: &Classified,
     local: ShardId,
-    side: Side,
 ) -> BTreeSet<Requirement> {
     let mut requirements: BTreeSet<Requirement> = BTreeSet::new();
     let core = classified.core();
 
-    if side == Side::Issuing && core.contains(&local) {
+    if core.contains(&local) {
         requirements.extend(
             core.iter()
                 .filter(|&&shard| shard != local)
@@ -112,30 +110,27 @@ pub fn divided_requirements(
     // for the commit-time bundle of every remote shard holding a
     // component the transaction calls, which is where the records it
     // cannot read itself arrive. A principal has no record to read, so a
-    // transaction reaching only accounts waits on nobody here.
+    // transaction reaching only accounts waits on nobody here, and a
+    // shard that only takes delivery commits nothing and sends no bundle.
     if let Some(trie) = classified.placement() {
         requirements.extend(
             legs.iter()
                 .filter(|leg| leg.target.class() == AddressClass::Component)
                 .map(|leg| trie.shard_for_prefix(leg.target))
-                .filter(|&shard| shard != local)
+                .filter(|&shard| shard != local && classified.commits_at(shard))
                 .map(Requirement::CommittedState),
         );
     }
-    // A member waits only on the arrivals its own side's legs consume:
-    // the issuing side on what feeds its core share, the delivering side
-    // on what the core returned. An inbound leg consumes nothing that
-    // crosses, so a shard's issuing member on the far side of a core
-    // waits on nothing at all — which is what lets the core's arrival
-    // exist in the first place.
+    // A member waits only on the escrowed arrivals feeding its core
+    // share: an owed crossing is credited by the consumer's commit fold,
+    // and an inbound leg consumes nothing that crosses, so a member on
+    // the far side of a core waits on nothing at all — which is what
+    // lets the core's arrival exist in the first place.
     requirements.extend(
         classified
             .edges()
             .iter()
-            .filter(|edge| {
-                edge.to.contains(&local)
-                    && (edge.crossing.kind == Kind::Owed) == (side == Side::Delivering)
-            })
+            .filter(|edge| edge.to.contains(&local) && edge.crossing.kind == Kind::Escrowed)
             .map(|edge| Requirement::Crossing {
                 key: edge.crossing.id.record_key(&ProtocolHasher),
             }),
@@ -778,26 +773,21 @@ mod tests {
         let classified = Classified::freeze(&swap, swap[0].target, &[], &trie);
         assert!(classified.decomposed());
 
-        // The caller's issuing member waits on the venue's record and no
-        // crossing: its withdraw is what the venue waits for. Its
-        // delivering member waits on the venue's output as well.
-        assert!(classified.mixed_at(low));
-        let issuing = divided_requirements(&swap, &classified, low, Side::Issuing);
+        // The caller runs one member, which waits on the venue's record
+        // and no crossing: its withdraw is what the venue waits for, and
+        // the venue's output back to it is its commit fold's to credit.
+        assert!(classified.commits_at(low));
         assert_eq!(
-            issuing,
+            divided_requirements(&swap, &classified, low),
             BTreeSet::from([Requirement::CommittedState(high)]),
-            "the caller's issuing member waits on the venue's record and no crossing",
+            "the caller's member waits on the venue's record and no crossing",
         );
-        let delivering = divided_requirements(&swap, &classified, low, Side::Delivering);
-        assert_eq!(
-            delivering,
-            BTreeSet::from([
-                Requirement::CommittedState(high),
-                Requirement::Crossing { key: crossings[1] },
-            ]),
-            "the caller's delivering member waits on the venue's output",
+        assert!(
+            !divided_requirements(&swap, &classified, low)
+                .contains(&Requirement::Crossing { key: crossings[1] }),
+            "and never on the venue's output",
         );
-        let venue = divided_requirements(&swap, &classified, high, Side::Issuing);
+        let venue = divided_requirements(&swap, &classified, high);
         assert_eq!(
             venue,
             BTreeSet::from([
@@ -826,7 +816,7 @@ mod tests {
         assert_eq!(classified.core(), &BTreeSet::from([high, third]));
         let arrival = Requirement::Crossing { key: crossings[0] };
         assert_eq!(
-            divided_requirements(&route, &classified, high, Side::Issuing),
+            divided_requirements(&route, &classified, high),
             BTreeSet::from([
                 Requirement::CommittedState(third),
                 Requirement::CommittedState(low),
@@ -834,7 +824,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            divided_requirements(&route, &classified, third, Side::Issuing),
+            divided_requirements(&route, &classified, third),
             BTreeSet::from([
                 Requirement::CommittedState(high),
                 Requirement::CommittedState(low),
@@ -842,7 +832,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            divided_requirements(&route, &classified, low, Side::Issuing),
+            divided_requirements(&route, &classified, low),
             BTreeSet::from([
                 Requirement::CommittedState(high),
                 Requirement::CommittedState(third),
@@ -992,9 +982,8 @@ mod tests {
     }
 
     /// A requirement is its candidate's: the sweep drops it the moment
-    /// no candidate waits, and keeps it however long one does — a
-    /// delivery is admissible to the delivery window's close, a whole
-    /// validity range past the horizon a stray absorption gets.
+    /// no candidate waits, and keeps it however long one does, past the
+    /// horizon a stray absorption gets.
     #[test]
     fn a_requirement_lives_with_its_candidate_and_no_longer() {
         let mut t = ProvisioningTracker::new();

@@ -8,11 +8,8 @@
 //! Per-artifact deadline maps bound the index by artifact-specific
 //! BFT-attested horizons:
 //!
-//! - **txs**: the delivery window's close on each tx's own
-//!   `end_timestamp_exclusive` — the last anchor a block may carry the
-//!   transaction at, since a delivery-only member is admissible past the
-//!   validity end and a shorter window would leave room to commit one
-//!   twice.
+//! - **txs**: one [`RETENTION_HORIZON`] past the block that carried each
+//!   transaction, which covers its whole validity range.
 //! - **certs**: `vote_anchor_ts + RETENTION_HORIZON` from the tick's local
 //!   EC.
 //! - **provisions**: `local_committed_ts + RETENTION_HORIZON`, a
@@ -181,13 +178,7 @@ impl CommitDedupIndex {
     /// whole of what this tier refuses: a second inclusion of what this
     /// chain already carried. A transaction admitted *inside* its window
     /// has a deadline of its own that sits at or below this instant, so
-    /// for those the figure changes nothing. A delivery admitted past
-    /// that window has no deadline left to be held to, and it is the one
-    /// that needs holding: the claim cell its execution writes is what
-    /// refuses the second run, and that cell is a step behind — it is in
-    /// state only once the delivery's finalization commits. This tier is
-    /// what covers the step, so a replay lands either here or on a
-    /// baseline that already holds the claim.
+    /// for those the figure changes nothing.
     ///
     /// The figure is [`DEDUP_WINDOW`], which is this index's own depth,
     /// so nothing is held that the walk rebuilding it would not reach.

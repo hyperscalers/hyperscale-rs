@@ -56,14 +56,11 @@ use hyperscale_metrics::{
     record_expected_tx_dropped, record_transaction_aborted, record_transaction_rejected,
 };
 use hyperscale_types::{
-    BUNDLE_WAIT, BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
+    BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
     LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId,
-    ShardTrie, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, TxResolution, Verified, WeightedTimestamp, Window, budget_admits_block,
-    caps_admit_transaction,
+    ShardTrie, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxResolution, Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
 };
-use hyperscale_vm_effects::Kind;
-use hyperscale_vm_types::ProtocolHasher;
 use serde::Deserialize;
 use tracing::instrument;
 
@@ -206,9 +203,8 @@ struct PoolEntry {
     /// `tx_phase_times` side cache.
     admitted_at: LocalTimestamp,
     /// The last instant this shard could still include the transaction:
-    /// its validity end, or the delivery window's close where this shard
-    /// may only be delivering for it. What the pool, the tombstone and
-    /// the body are retained to.
+    /// its validity end. What the pool, the tombstone and the body are
+    /// retained to.
     admissible_until: WeightedTimestamp,
     /// The core's verdict on a divided transaction, heard off its
     /// certificates before this shard's own leg finalized here. The
@@ -406,13 +402,26 @@ impl MempoolCoordinator {
             return None;
         }
 
-        // Reject once nothing here could include it: past its validity
-        // end. A transaction this shard only delivers for never reads
-        // past — its figure is measured from now — because no clock here
-        // decides a delivery: the block that admits one carries the
-        // record proof that licenses it.
+        // A body this shard only takes delivery of is never included
+        // here: its owed crossings are the commit fold's to credit off
+        // the records' readings. It is not pooled and gets no status;
+        // gossip carries it on to the shards that commit it.
         let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
-        let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
+        if cross_shard
+            && !Classified::freeze(
+                tx.legs(),
+                tx.fee_payer(),
+                tx.accounts(),
+                topology_snapshot.shard_trie(),
+            )
+            .commits_at(self.local_shard)
+        {
+            return None;
+        }
+
+        // Reject once nothing here could include it: past its validity
+        // end.
+        let admissible_until = tx.validity_range().end_timestamp_exclusive;
         if admissible_until <= self.current_ts {
             tracing::debug!(
                 tx_hash = ?hash,
@@ -809,7 +818,7 @@ impl MempoolCoordinator {
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
             let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
-            let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
+            let admissible_until = tx.validity_range().end_timestamp_exclusive;
             self.pool.entry(hash).or_insert_with(|| {
                 tracing::debug!(
                     tx_hash = ?hash,
@@ -961,9 +970,7 @@ impl MempoolCoordinator {
                     let Some(entry) = self.pool.get_mut(&tx_hash) else {
                         continue;
                     };
-                    // A shard with legs on both sides of the core runs
-                    // them as two members, and the second finalizes
-                    // into the state the first already reported.
+                    // A status already reported is not reported again.
                     if matches!(entry.status, TransactionStatus::LegFinalized) {
                         continue;
                     }
@@ -1015,71 +1022,10 @@ impl MempoolCoordinator {
         actions
     }
 
-    /// Record that local ECs were just formed for these transactions.
-    /// Add a transaction's nodes to the locked set.
-    /// Called when a transaction transitions TO a lock-holding state (Committed/Executed).
-    ///
-    /// Also blocks any ready transactions that conflict with the newly locked nodes.
-    ///
-    /// Scoped to local-shard nodes. A cross-shard tx's remote nodes are not
-    /// owned by this shard's state machine; their lifetime is gated by the
-    /// peer shard's finalization, which can stall independently. Locking
-    /// them here would permanently defer future local cross-shard txs that
-    /// share those remote nodes, cascading the stall.
-    /// Remove a transaction's nodes from the locked set.
-    /// Called when a transaction transitions FROM a lock-holding state (evicted).
-    ///
-    /// Also promotes any blocked transactions that were waiting on these nodes.
-    /// Scoped to local-shard nodes; mirrors [`Self::add_locked_nodes`].
-    /// Add a transaction to ready tracking when it becomes Pending. The
-    /// store decides whether it lands in the ready or deferred set based on
-    /// currently-locked and already-claimed nodes.
-    /// The payer shard a cross-shard transaction must show engagement
-    /// evidence from before entering contention, or `None` when the
-    /// The last instant this shard could still include `tx`.
-    ///
-    /// Its validity end, except where this shard only delivers for it —
-    /// frozen divided against the head trie with this shard outside the
-    /// core and every leg here a delivery — which is held one
-    /// [`BUNDLE_WAIT`] from **now**.
-    ///
-    /// The change of origin is the point, not the figure. A delivery is
-    /// admissible whenever the record it consumes can be proved present,
-    /// which is a question about the producer's chain and not about this
-    /// transaction's window — so a clock read off that window would put
-    /// back the bound this shard just stopped enforcing, and an envelope
-    /// offered again after it would be refused by the pool that should
-    /// have carried it. Measured from admission the pool holds a
-    /// delivering body for as long as a member composed from it would
-    /// wait on its bundle, and takes the same body again whenever it is
-    /// offered.
-    ///
-    /// Retention, and nothing else: what refuses a second delivery is
-    /// the claim cell its execution writes, and what licenses a late one
-    /// is the record proof the admitting block carries. Neither is this.
-    fn admissible_until(
-        &self,
-        topology_snapshot: &TopologySnapshot,
-        tx: &Transaction,
-        cross_shard: bool,
-    ) -> WeightedTimestamp {
-        let delivers = cross_shard
-            && Classified::freeze(
-                tx.legs(),
-                tx.fee_payer(),
-                tx.accounts(),
-                topology_snapshot.shard_trie(),
-            )
-            .only_delivers_at(self.local_shard);
-        if delivers {
-            self.current_ts.plus(BUNDLE_WAIT)
-        } else {
-            tx.validity_range().end_timestamp_exclusive
-        }
-    }
-
-    /// transaction is immediately ready: not VM, not cross-shard, this
-    /// shard is the payer's, or the evidence already arrived.
+    /// Whether `tx` waits for its payer's engagement evidence before
+    /// entering contention: not where it is immediately ready — not
+    /// cross-shard, this shard is the payer's, or the evidence already
+    /// arrived.
     fn parks_for_engagement(
         &mut self,
         topology_snapshot: &TopologySnapshot,
@@ -1101,77 +1047,6 @@ impl MempoolCoordinator {
             return false;
         }
         true
-    }
-
-    /// The records the pool's delivering bodies need, for the execution
-    /// coordinator to read: each body that only delivers here and is
-    /// parked for engagement or past its validity end, with the records
-    /// it consumes and whether its validity end has passed.
-    ///
-    /// **The one thing a consumer in the dark can still do.** A
-    /// cross-shard transaction is admissible on a non-payer shard only
-    /// against a bundle from the payer naming it or a live reading of
-    /// every record it consumes, so a body whose bundle never came
-    /// leaves no ledger entry, no member and no requirement behind —
-    /// every later mechanism is downstream of what it is missing. What
-    /// the shard does have is the body, and that is enough: the
-    /// classification derives the record cells from the transaction and
-    /// the placement alone, and the holder of each is its own prefix.
-    ///
-    /// Only where this shard **only delivers**, which is the same test
-    /// [`Self::admissible_until`] already makes of a parked body. A
-    /// record cell is permanent, which is what lets it be read at a
-    /// later anchor at all.
-    #[must_use]
-    pub fn delivery_records_wanted(
-        &self,
-        topology_snapshot: &TopologySnapshot,
-    ) -> Vec<(TxHash, Vec<SubstateKey>, bool)> {
-        let trie = topology_snapshot.shard_trie();
-        let local = self.local_shard;
-        let now = self.current_ts;
-        let mut wanted: Vec<(TxHash, Vec<SubstateKey>, bool)> = self
-            .pool
-            .iter()
-            .filter(|(hash, entry)| {
-                self.parked_engagement.contains_key(*hash)
-                    || now >= entry.tx.validity_range().end_timestamp_exclusive
-            })
-            .filter_map(|(hash, entry)| {
-                let tx = &entry.tx;
-                let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-                if !classified.only_delivers_at(local) {
-                    return None;
-                }
-                let records: Vec<SubstateKey> = classified
-                    .crossings()
-                    .filter(|(edge, _)| {
-                        edge.crossing.kind == Kind::Owed && edge.to.contains(&local)
-                    })
-                    .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
-                    .collect();
-                (!records.is_empty()).then(|| {
-                    (
-                        *hash,
-                        records,
-                        now >= tx.validity_range().end_timestamp_exclusive,
-                    )
-                })
-            })
-            .collect();
-        wanted.sort_unstable_by_key(|(hash, _, _)| *hash);
-        wanted
-    }
-
-    /// Unpark the delivering bodies whose every record the execution
-    /// coordinator holds a live reading of, to offer beside them: a
-    /// Pending entry no longer parked is selectable by construction, and
-    /// the proposer selects the claims before the transactions, so the
-    /// reading engages the body in the same block.
-    pub fn on_deliveries_readable(&mut self, tx_hashes: &[TxHash]) {
-        for hash in tx_hashes {
-            self.parked_engagement.remove(hash);
-        }
     }
 
     /// The shard whose bundle is `tx`'s engagement evidence under
@@ -1460,9 +1335,8 @@ impl MempoolCoordinator {
     /// Drop tombstones whose own deadline has passed `current_ts`, and
     /// drop the matching bodies from [`Self::tx_store`]. The deadline is
     /// the `admissible_until` that let the transaction in — its validity
-    /// end, or the close of the delivery window that end opens where this
-    /// shard only delivers for it — so a tombstone stops refusing exactly
-    /// where admission stops taking it. Past that the validator-side
+    /// end — so a tombstone stops refusing exactly where admission stops
+    /// taking it. Past that the validator-side
     /// validity check rejects any re-submission, so the tombstone is no
     /// longer load-bearing for correctness and the body is no longer
     /// fetchable. Anchored on `current_ts` (updated in

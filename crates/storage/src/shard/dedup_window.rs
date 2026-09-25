@@ -78,7 +78,7 @@ pub struct DedupWindow {
     ///
     /// Folded over a deeper span than the tiers above
     /// ([`FEE_HOLD_WINDOW`]), because a hold outlives a transaction's
-    /// delivery window. Held as what a payer shard's ledger takes rather
+    /// validity range. Held as what a payer shard's ledger takes rather
     /// than as a dedup tier: nothing here refuses a second inclusion.
     pub fee_holds: Vec<FeeHold>,
     /// Whether the fee-hold fold reached its own floor or the chain's
@@ -216,9 +216,7 @@ impl DedupWindow {
         // keys it: one horizon past the block that carried each, which
         // is this walk's own depth. Read off the block rather than off
         // the body, because what the tier refuses is a second inclusion
-        // of what this chain already carried, and a transaction
-        // admitted past its own window — a delivery licensed by the
-        // record it consumes — has no deadline left to be held to.
+        // of what this chain already carried.
         let deadline = anchor.plus(RETENTION_HORIZON);
         if deadline > now {
             for tx in block.transactions().iter() {

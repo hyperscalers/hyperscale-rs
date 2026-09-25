@@ -25,10 +25,10 @@ use std::sync::Arc;
 use hyperscale_engine::legs::Classified;
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, BUNDLE_WAIT, CommittedAt, Deadline, Finalization, Inclusion,
-    MAX_VALIDITY_RANGE, PriceTable, Probed, Role, RoutePrefix, ShardId, ShardTrie, SubstateKey,
-    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, Verifiable,
-    Verified, WeightedTimestamp, Window,
+    AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE,
+    PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
+    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Answered, Kind};
 use hyperscale_vm_types::ProtocolHasher;
@@ -236,19 +236,6 @@ pub enum Part {
     /// entry is abandonable at its deadline and released by that
     /// verdict.
     Whole,
-    /// This shard only delivers: a leg outside the core that bears no
-    /// verdict and issues nothing. Never abandoned — the crossing it
-    /// claims is owed here from the moment the core committed it, and
-    /// no clock makes giving up on it right — so the entry stands until
-    /// its own finalization releases it, or until the horizon past
-    /// which the record it would claim can no longer be disposed of at
-    /// all.
-    ///
-    /// Keeps the body and the classification its delivery runs under,
-    /// which is what lets the shard compose the member again when no
-    /// candidate is left holding it: a candidate is a tick's, and a
-    /// discarded tick would otherwise take the delivery with it.
-    Delivery(Kept),
     /// A leg outside the core, held for the settlement of what it
     /// issued: never abandoned, probed past the deadline, released by
     /// the reclaim or the retirement.
@@ -278,12 +265,6 @@ pub struct LegEntry {
     /// removed on their consumers' `Taken`: what the entry closes on,
     /// once every one of them is here.
     gone: BTreeSet<SubstateKey>,
-    /// Whether this shard owes no delivery of the transaction: so from
-    /// the start where the classification has it deliver nothing, and
-    /// once its delivering member's finalization commits. A mixed
-    /// shard's entry stays open until then, so a delivery still owed is
-    /// never dropped with it.
-    delivered: bool,
     /// Whether a committed finalization of this shard's settled the
     /// transaction's price: a leg's own, which burned it inside its
     /// writes, or the verdict that made an issuer a remainder.
@@ -296,25 +277,25 @@ pub struct LegEntry {
 }
 
 impl LegEntry {
-    const fn unsettled(kept: Kept, charged: bool, delivered: bool) -> Self {
+    const fn unsettled(kept: Kept, charged: bool) -> Self {
         Self {
             kept,
             reclaiming: false,
             gone: BTreeSet::new(),
             charged,
-            delivered,
         }
     }
 
     /// Whether the commit fold has closed what this entry waited on:
     /// every record it issued here removed on its consumer's `Taken`,
-    /// nothing covering it, no delivery owed here and no reclaim taking
-    /// its records. Every input is committed content.
+    /// nothing covering it and no reclaim taking its records. Every
+    /// input is committed content. A shard's owed crossings arrive by
+    /// its commit fold and owe it nothing, so a shard with legs on both
+    /// sides of the core closes on its records alone.
     fn settled(&self, local: ShardId) -> bool {
         let issued = self.kept.issued(local);
         !issued.is_empty()
             && issued.iter().all(|record| self.gone.contains(record))
-            && self.delivered
             && !self.reclaiming
     }
 }
@@ -325,16 +306,10 @@ impl Part {
         Self::Whole
     }
 
-    /// A delivery, with the body and classification it runs under.
-    pub(crate) const fn delivery(kept: Kept) -> Self {
-        Self::Delivery(kept)
-    }
-
     /// A leg outside the core, with the body and classification its
-    /// settlement is composed from and its price still owed, owing a
-    /// delivery here where `delivers`.
-    pub(crate) const fn leg(kept: Kept, delivers: bool) -> Self {
-        Self::Leg(LegEntry::unsettled(kept, false, !delivers))
+    /// settlement is composed from and its price still owed.
+    pub(crate) const fn leg(kept: Kept) -> Self {
+        Self::Leg(LegEntry::unsettled(kept, false))
     }
 
     /// A member of the core, with the body and classification the
@@ -355,30 +330,22 @@ impl Part {
         matches!(self, Self::Remainder(_))
     }
 
-    /// Whether the entry only delivers.
-    const fn is_delivery(&self) -> bool {
-        matches!(self, Self::Delivery(_))
-    }
-
     /// Whether a core issuer still holds crossings its deliveries owe a
     /// claim for, so its verdict resolves the transaction and leaves the
     /// entry standing for the reclaim.
     fn issued(&self, local: ShardId) -> bool {
         match self {
             Self::Core(kept) => !kept.deliveries(local).is_empty(),
-            Self::Whole | Self::Delivery(_) | Self::Leg(_) | Self::Remainder(_) => false,
+            Self::Whole | Self::Leg(_) | Self::Remainder(_) => false,
         }
     }
 
     /// Keep a core issuer on for the reclaim of what its deliveries
     /// never claimed, its own verdict having resolved the transaction
     /// and settled the price.
-    fn resolve(&mut self, local: ShardId) {
+    fn resolve(&mut self) {
         *self = match std::mem::replace(self, Self::Whole) {
-            Self::Core(kept) => {
-                let delivered = !kept.classified.mixed_at(local);
-                Self::Remainder(LegEntry::unsettled(kept, true, delivered))
-            }
+            Self::Core(kept) => Self::Remainder(LegEntry::unsettled(kept, true)),
             part => part,
         };
     }
@@ -399,14 +366,6 @@ impl Part {
         }
     }
 
-    /// Record that this shard's delivering member for the transaction
-    /// has finalized, so the entry owes no delivery here.
-    const fn mark_delivered(&mut self) {
-        if let Some(held) = self.held_mut() {
-            held.delivered = true;
-        }
-    }
-
     /// Record that the commit fold removed `record`, one this entry
     /// issued, on its consumer's `Taken`.
     fn mark_gone(&mut self, record: SubstateKey) {
@@ -419,14 +378,14 @@ impl Part {
     const fn held(&self) -> Option<&LegEntry> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(held),
-            Self::Whole | Self::Delivery(_) | Self::Core(_) => None,
+            Self::Whole | Self::Core(_) => None,
         }
     }
 
     const fn held_mut(&mut self) -> Option<&mut LegEntry> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(held),
-            Self::Whole | Self::Delivery(_) | Self::Core(_) => None,
+            Self::Whole | Self::Core(_) => None,
         }
     }
 
@@ -436,17 +395,16 @@ impl Part {
     const fn kept(&self) -> Option<&Kept> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(&held.kept),
-            Self::Core(kept) | Self::Delivery(kept) => Some(kept),
+            Self::Core(kept) => Some(kept),
             Self::Whole => None,
         }
     }
 
     /// What an entry that issues crossings of its own composes their
     /// settlement from, and whose core a mirrored verdict and a probe
-    /// are read off. A delivery keeps a body and issues nothing, so it
-    /// settles no records, mirrors no verdict and asks nobody.
-    fn settling(&self) -> Option<&Kept> {
-        self.kept().filter(|_| !self.is_delivery())
+    /// are read off.
+    const fn settling(&self) -> Option<&Kept> {
+        self.kept()
     }
 
     /// The part `local` plays in a transaction frozen as `classified`,
@@ -455,32 +413,18 @@ impl Part {
     /// Read off the classification the committing block froze, at the
     /// same commit, so a rebuilt ledger marks the same entries: the
     /// freeze is a function of the block and the placement it committed
-    /// under, and the replay re-freezes both.
-    ///
-    /// Classifies **a shard's one entry**, which covers both members a
-    /// shard may run, and so asks `only_delivers_at` — every leg here is
-    /// a delivery — rather than any member's side. Not the same question
-    /// as [`Membership::of`](crate::tick_state::Membership::of), whose
-    /// branch looks alike and answers `Delivery` for the delivering
-    /// member of a shard this calls a leg. A shard with legs on both
-    /// sides of the core holds one entry, and it is the leg's: the
-    /// delivering member bears no verdict and owes no reclaim, so an
-    /// entry marked `Delivery` for it would abandon at the delivery
-    /// window's close what the leg is still owed a reclaim of.
+    /// under, and the replay re-freezes both. A shard only ever holds an
+    /// entry for a transaction it commits, so a divided one here is a
+    /// core member or a leg.
     fn of(local: ShardId, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) -> Self {
         if !classified.decomposed() {
             return Self::whole();
         }
         let kept = Kept::of(tx, classified);
-        let in_core = classified.core().contains(&local);
-        if !in_core && classified.only_delivers_at(local) {
-            return Self::delivery(kept);
-        }
-        if in_core {
+        if classified.core().contains(&local) {
             Self::core(kept)
         } else {
-            let delivers = classified.mixed_at(local);
-            Self::leg(kept, delivers)
+            Self::leg(kept)
         }
     }
 }
@@ -536,11 +480,10 @@ impl Kept {
             .collect()
     }
 
-    /// The claim cells deliveries elsewhere write for the crossings
-    /// `local` issued, each under the shard that was to deliver it when
-    /// the transaction committed — what a lapse probe asks about once
-    /// the delivery window has closed. The cell follows its prefix to a
-    /// departed deliverer's successor, which [`Ledger::questions`]
+    /// The claim cells the consumers' folds write for the owed crossings
+    /// `local` issued, each under the shard that held the consumer when
+    /// the transaction committed. The cell follows its prefix to a
+    /// departed consumer's successor, which [`Ledger::questions`]
     /// resolves off the trie it is given.
     fn deliveries(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
         self.answers(local, Kind::Owed, Answered::Taken)
@@ -601,27 +544,6 @@ pub struct Settleable {
     pub(crate) charged: bool,
 }
 
-/// A delivery this shard still owes, with what its member is composed
-/// from.
-///
-/// Everything here is the entry's own: the body and the classification
-/// it keeps, and where its committing block sat. A shard that lost the
-/// candidate — a tick discarded, a chain terminated — reads the same
-/// terms off the ledger that the commit gave the candidate, so the
-/// member it offers again is the member it registered.
-#[derive(Debug, Clone)]
-pub struct Delivering {
-    /// The transaction.
-    pub(crate) tx_hash: TxHash,
-    /// Its body, which the delivering member runs.
-    pub(crate) body: Arc<Verified<Transaction>>,
-    /// The classification its committing block froze.
-    pub(crate) classified: Classified,
-    /// Where this chain committed it: the clock the member executes
-    /// under, and the committee anchor its prices are read off.
-    pub(crate) committed: CommittedAt,
-}
-
 /// One cell a counterpart is asked about for one transaction: which
 /// question it answers, and the terms the answer is read against.
 ///
@@ -663,9 +585,6 @@ enum Meaning {
     /// A leg finalizing here without deciding: it ran, and the core
     /// decides the transaction.
     LegRan,
-    /// A delivery that succeeded claimed what an accepted core issued,
-    /// which is the verdict.
-    Delivered,
     /// The reclaim of what a leg issued, reporting what the evidence
     /// covering it established of the transaction — a departure, or a
     /// core that never took it, aborts it; a delivery that lapsed says
@@ -680,13 +599,7 @@ enum Meaning {
 fn meaning(owed: Option<&Owed>, deciding: bool, decision: TransactionDecision) -> Meaning {
     let accepted = decision == TransactionDecision::Accept;
     match owed {
-        _ if !deciding => {
-            if accepted && owed.is_some_and(|owed| owed.part.is_delivery()) {
-                Meaning::Delivered
-            } else {
-                Meaning::LegRan
-            }
-        }
+        _ if !deciding => Meaning::LegRan,
         Some(owed) if accepted && owed.part.is_leg() => {
             Meaning::Reclaimed(owed.abandoned_verdict())
         }
@@ -984,41 +897,6 @@ impl Ledger {
             }
         }
         questions
-    }
-
-    /// Every delivery this shard still owes, with what each member is
-    /// composed from.
-    ///
-    /// A delivery runs on no clock of its own: the crossing it claims is
-    /// this shard's from the moment the core committed it, so the entry
-    /// stands until the delivery's own finalization commits. What the
-    /// member is composed from is stated on the entry rather than only
-    /// in the candidate beside it, so a delivery whose candidate went is
-    /// offered again off the chain.
-    ///
-    /// Read off committed content alone, like [`Self::reclaimable`], so
-    /// every replica at one frontier offers the same members.
-    ///
-    /// `running` says which transactions something already holds a
-    /// member for, and is asked before the terms are taken off the
-    /// entry: composing one costs a copy of the classification, and at
-    /// a steady tip almost every standing delivery is one a candidate
-    /// or a tick is already carrying.
-    #[must_use]
-    pub(crate) fn standing_deliveries(&self, running: impl Fn(TxHash) -> bool) -> Vec<Delivering> {
-        self.owed
-            .iter()
-            .filter(|&(&tx_hash, _)| !running(tx_hash))
-            .filter_map(|(&tx_hash, owed)| match &owed.part {
-                Part::Delivery(kept) => Some(Delivering {
-                    tx_hash,
-                    body: Arc::clone(&kept.body),
-                    classified: kept.classified.clone(),
-                    committed: owed.figures.committed,
-                }),
-                Part::Whole | Part::Leg(_) | Part::Core(_) | Part::Remainder(_) => None,
-            })
-            .collect()
     }
 
     /// Whether this ledger still holds `tx_hash`.
@@ -1440,7 +1318,6 @@ impl Ledger {
                     deciding.contains(&tx_hash),
                     decision,
                 ) {
-                    Meaning::Delivered => TxResolution::Decided(TransactionDecision::Accept),
                     Meaning::LegRan => TxResolution::LegFinalized,
                     Meaning::Reclaimed(Some(decided)) | Meaning::Verdict(decided) => {
                         TxResolution::Decided(decided)
@@ -1463,23 +1340,10 @@ impl Ledger {
     /// commit fold, which closes it once every record it issued was
     /// taken. A leg that failed is the transaction's end on this shard
     /// — it issued nothing, so there is nothing to reclaim — and its own
-    /// finalization releases it. A delivering member of this shard's
-    /// finalizing marks its entry as owing no delivery here.
+    /// finalization releases it.
     pub(crate) fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         let local = self.local;
         for finalization in finalizations {
-            for delivered in finalization
-                .execution_certificates()
-                .iter()
-                .filter(|certificate| certificate.shard_id() == local)
-                .flat_map(|certificate| certificate.tx_outcomes().iter())
-                .filter(|outcome| outcome.role() == Role::Delivery)
-                .map(TxOutcome::tx_hash)
-            {
-                if let Some(owed) = self.owed.get_mut(&delivered) {
-                    owed.part.mark_delivered();
-                }
-            }
             let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
             for (tx_hash, decision) in finalization.tx_decisions() {
                 let Some(owed) = self.owed.get_mut(&tx_hash) else {
@@ -1500,7 +1364,7 @@ impl Ledger {
                 // the reclaim alone. One that refused issued nothing.
                 let issued = decision == TransactionDecision::Accept && owed.part.issued(local);
                 if issued {
-                    owed.part.resolve(local);
+                    owed.part.resolve();
                 } else {
                     self.owed.remove(&tx_hash);
                 }
@@ -1541,14 +1405,12 @@ impl Ledger {
     ///
     /// A leg entry is never here: its tick attested it and its
     /// certificate settled alone, so there is nothing to abandon. What a
-    /// record licenses on one is a reclaim. Nor is a delivery: it owes
-    /// no verdict and abandoning it would give up a crossing that is
-    /// already this shard's.
+    /// record licenses on one is a reclaim.
     #[must_use]
     pub(crate) fn past_deadline(&self, now: WeightedTimestamp) -> Vec<UnsettledTx> {
         self.owed
             .iter()
-            .filter(|(_, owed)| !owed.part.is_leg() && !owed.part.is_delivery())
+            .filter(|(_, owed)| !owed.part.is_leg())
             .filter(|(_, owed)| {
                 let window = owed.abandon_window();
                 now >= window.start && (owed.covered() || !owed.executed() || now < window.end)
@@ -1611,17 +1473,6 @@ impl Ledger {
         let mut unanswerable = Vec::new();
         let mut entries = std::mem::take(&mut self.owed);
         entries.retain(|tx_hash, owed| {
-            // A delivery waits on an arrival, and an arrival has no
-            // window: it stands [`BUNDLE_WAIT`] past the block that
-            // committed it, which is the longest a bundle can be late
-            // for a cause that is not a halt. Measured from its own
-            // commit and not from a deadline, because a deadline sits
-            // anywhere from one round to one horizon past the commit,
-            // and a figure read off it gives a transaction committed
-            // early in its window no rounds at all.
-            if owed.part.is_delivery() {
-                return owed.figures.committed.anchor.plus(BUNDLE_WAIT) > now;
-            }
             // A core entry no execution of ours took leaves only by an
             // abandonment's committed finalization: no clock bounds an
             // abort that spends nothing, and dropping the entry would be
@@ -1711,14 +1562,11 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_storage::committed_tx_cell_key;
     use hyperscale_types::test_utils::{
-        make_finalization, make_leg_finalization, make_undecided_finalization, stub_transaction,
-        test_prefix, test_principal,
+        make_finalization, make_leg_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        AbortCharge, AggregateSignature, BlockHeight, EPOCH_DURATION, EpochWindows,
-        ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
-        MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, SignerBitfield, TickHalf, TickId,
-        TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
+        AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, MAX_FINALIZATION_DELAY,
+        MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
     };
 
     use super::*;
@@ -1868,12 +1716,6 @@ mod tests {
         assert_eq!(classified.core(), &BTreeSet::from([LOCAL]));
         assert!(classified.decomposed());
         classified
-    }
-
-    /// The part of a shard that only delivers, over the body `tx`
-    /// commits, frozen as a shape with a delivery in it.
-    fn delivery_part(tx: &Verifiable<Transaction>) -> Part {
-        Part::delivery(Kept::of(tx, &delivering()))
     }
 
     /// A transaction paying from `payer` and touching `also`, both given
@@ -2641,70 +2483,6 @@ mod tests {
         );
     }
 
-    /// A delivery-only entry is on no clock of the transaction's: never
-    /// abandoned, whatever the reading, because the crossing it claims
-    /// is this shard's from the moment the core committed it and no
-    /// instant makes giving it up right. Released by its own
-    /// finalization when it runs, and never a leg — nothing to reclaim,
-    /// nothing to probe.
-    ///
-    /// What it does stand on is its own commit. A delivery waits on an
-    /// arrival, and an arrival has no window, so the entry lives
-    /// [`BUNDLE_WAIT`] past the block that committed it rather than a
-    /// span past a deadline — the two differ by where in its validity
-    /// window the transaction happened to be committed, which is the
-    /// whole of why the origin moved.
-    #[test]
-    fn a_delivery_entry_stands_a_bundle_wait_past_its_own_commit() {
-        let mut ledger = Ledger::new(LOCAL);
-        let tx = tx(4, 60_000);
-        commit(&mut ledger, &tx);
-        ledger.seed(tx.hash(), delivery_part(&tx));
-        let deadline = Deadline::of(ms(60_000));
-        let horizon = committed_at(&tx).anchor.plus(BUNDLE_WAIT);
-
-        for at in [
-            deadline.at(),
-            horizon,
-            horizon.plus(MAX_VALIDITY_RANGE),
-            Window::LegEntry.of(deadline).end,
-        ] {
-            assert!(
-                ledger.past_deadline(at).is_empty(),
-                "no reading at {at:?} abandons a delivery"
-            );
-        }
-        assert!(
-            ledger.questions(&ShardTrie::uniform(1)).is_empty(),
-            "and nothing probes for it"
-        );
-
-        assert_eq!(
-            ledger.prune(horizon.minus(Duration::from_millis(1))).len(),
-            0,
-            "short of its wait it stands"
-        );
-        assert_eq!(ledger.len(), 1);
-        ledger.prune(horizon);
-        assert_eq!(
-            ledger.len(),
-            0,
-            "and goes where the record stops being disposable"
-        );
-
-        let mut delivered = Ledger::new(LOCAL);
-        commit(&mut delivered, &tx);
-        delivered.seed(tx.hash(), delivery_part(&tx));
-        delivered.certify(tx.hash(), Certified::ByExecution);
-        let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
-        delivered.release_resolved(&[Arc::new(Verifiable::from(own))]);
-        assert_eq!(
-            delivered.len(),
-            0,
-            "a delivery's own finalization releases it"
-        );
-    }
-
     /// A leg entry is probeable from its deadline and not a moment
     /// before, and only while no record covers it; an entry this shard
     /// ran whole is never probed, since nothing it awaits is a core.
@@ -3052,26 +2830,6 @@ mod tests {
             decided(&leg, TransactionDecision::Aborted),
             "the reclaim of a leg its core never took reports an abort"
         );
-
-        let delivery = tx(3, 60_000);
-        commit(&mut ledger, &delivery);
-        ledger.seed(delivery.hash(), delivery_part(&delivery));
-        assert_eq!(
-            fw(
-                &ledger,
-                make_undecided_finalization(h, delivery.hash(), TransactionDecision::Accept)
-            ),
-            decided(&delivery, TransactionDecision::Accept),
-            "a delivery that succeeded claimed what an accepted core issued"
-        );
-        assert_eq!(
-            fw(
-                &ledger,
-                make_undecided_finalization(h, delivery.hash(), TransactionDecision::Reject)
-            ),
-            vec![(delivery.hash(), TxResolution::LegFinalized)],
-            "a delivery that failed decides nothing, and the value waits for a later claim"
-        );
     }
 
     /// A reconstructed entry answers "who was party" the same as the
@@ -3248,53 +3006,28 @@ mod tests {
         assert_eq!(reclaiming.len(), 1);
     }
 
-    /// A mixed shard's entry, issuing on one side and delivering on the
-    /// other, waits on its delivering member: settled records alone do
-    /// not close it, and the delivery's finalization does.
+    /// A mixed shard's entry, issuing on one side of the core and taking
+    /// delivery on the other, closes on its records alone: what the core
+    /// returns to it is its commit fold's credit and owes the entry
+    /// nothing.
     #[test]
-    fn a_mixed_shards_entry_waits_on_its_delivery() {
+    fn a_mixed_shards_entry_closes_on_its_records_alone() {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.seed(tx.hash(), Part::leg(Kept::of(&tx, &classified()), true));
+        ledger.seed(tx.hash(), Part::leg(Kept::of(&tx, &classified())));
         let record = classified()
             .crossings()
             .find(|(edge, _)| edge.from == LOCAL)
             .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
             .expect("the leg issues one crossing");
         ledger.settled(record);
-        assert!(
-            ledger.closes().is_empty(),
-            "the delivery this shard owes is still owed",
-        );
-
-        let delivery = Finalization::new(
-            TickId::new(LOCAL, BlockHeight::new(3)),
-            TickHalf::Legs,
-            &Capped::from_array([Arc::new(ExecutionCertificate::new(
-                TickId::new(LOCAL, BlockHeight::new(3)),
-                ms(3_000),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(
-                    tx.hash(),
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .as_role(Role::Delivery)]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            ))]),
-            Capped::from_array([]),
-        );
-        ledger.release_resolved(&[Arc::new(Verifiable::from(delivery))]);
         assert_eq!(
             ledger.closes(),
             vec![(
                 tx.hash(),
                 TxResolution::Decided(TransactionDecision::Accept)
             )],
-            "once the delivery has run, the settled records close the entry",
         );
     }
 

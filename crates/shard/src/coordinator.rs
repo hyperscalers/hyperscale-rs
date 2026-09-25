@@ -24,18 +24,6 @@ use hyperscale_types::{
     ready_signal_window,
 };
 
-/// What a proposal's claims license, and what the read frontier judges.
-struct Licensed {
-    /// The delivery-only transactions engaged by a live reading.
-    readable: HashSet<TxHash>,
-    /// Those past their validity end.
-    late: HashSet<TxHash>,
-    /// What the fence judges of the claims and the late deliveries.
-    fence: ReadFence,
-    /// The record keys each readable delivery leaned on.
-    record_licences: BTreeMap<TxHash, Vec<SubstateKey>>,
-}
-
 /// Shard consensus statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShardStats {
@@ -155,7 +143,7 @@ impl ShardMemoryStats {
     }
 }
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -194,9 +182,8 @@ use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::Precut;
 use crate::proposal::{
     Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
-    dispatch_or_defer, late_answers, late_deliveries, readable_deliveries, record_licences,
-    select_abandonment_records, select_finalizations, select_provisions, select_state_claims,
-    select_transactions, trim_local_crossings,
+    dispatch_or_defer, select_abandonment_records, select_finalizations, select_provisions,
+    select_state_claims, select_transactions, trim_local_crossings,
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
@@ -2002,43 +1989,6 @@ impl ShardCoordinator {
         self.owed_determined = owed;
     }
 
-    /// What the claims a block will carry license among `ready_txs`,
-    /// and what the read frontier judges of both.
-    ///
-    /// A delivery past its validity end is admissible only against a
-    /// proof the record it consumes still stands, so the licence is
-    /// read off the claims this block will carry rather than off the
-    /// ones offered: a claim the cap dropped licenses nothing, and the
-    /// voter recomputes the set from the block alone. The fence is for
-    /// the builder to drop against the parent state it alone reads, and
-    /// the record keys each delivery leaned on go with it, so a dropped
-    /// presence takes its transaction along.
-    fn licences_of(
-        &self,
-        topology_schedule: &TopologySchedule,
-        ready_txs: &[Arc<Verified<Transaction>>],
-        state_claims: &[StateClaim],
-        anchor: WeightedTimestamp,
-    ) -> Licensed {
-        let local = self.local_shard;
-        let readable =
-            readable_deliveries(ready_txs, state_claims, topology_schedule, anchor, local);
-        let late = late_deliveries(ready_txs, state_claims, topology_schedule, anchor, local);
-        let fence = read_fence(
-            state_claims,
-            topology_schedule.windows(),
-            late_answers(ready_txs, &late, topology_schedule, anchor, local),
-        );
-        let record_licences =
-            record_licences(ready_txs, &readable, topology_schedule, anchor, local);
-        Licensed {
-            readable,
-            late,
-            fence,
-            record_licences,
-        }
-    }
-
     /// Try to build and broadcast a new block proposal.
     ///
     /// This is the unified proposal entry point, called from:
@@ -2140,7 +2090,6 @@ impl ShardCoordinator {
         // block's own QC may carry a slightly later timestamp) is
         // bounded by MAX_VALIDITY_RANGE.
         let chain = QcChainSets::behind(&self.chain_view(), parent_block_hash);
-        let validity_anchor = parent_qc.weighted_timestamp();
         // The committee governing the block being built, not the schedule's
         // newest entry: package usability, the recovery fences, payer routing
         // and the sweep cap all read it, and a voter judges the block under
@@ -2160,19 +2109,13 @@ impl ShardCoordinator {
         let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
         let state_claims = select_state_claims(&ctx, &mut StateClaimsFold::default(), state_claims);
         let local_crossings = trim_local_crossings(&state_claims, local_crossings);
-        let Licensed {
-            readable,
-            late,
-            fence,
-            record_licences,
-        } = self.licences_of(topology_schedule, ready_txs, &state_claims, validity_anchor);
+        let fence = read_fence(&state_claims, topology_schedule.windows());
         let transactions = select_transactions(
             &ctx,
-            &Prefilter {
+            Prefilter {
                 precut: &self.precut,
-                late_deliveries: &late,
             },
-            &mut TransactionsFold::beside(&provision_fold, &readable),
+            &mut TransactionsFold::beside(&provision_fold),
             ready_txs,
         );
         let mut finalization_fold = FinalizationsFold::from(&ctx);
@@ -2195,7 +2138,6 @@ impl ShardCoordinator {
                 state_claims,
                 local_crossings,
                 fence,
-                record_licences,
             })),
         )
     }
@@ -12914,7 +12856,7 @@ mod tests {
             let provisions = ProvisionsFold::default();
             admit_all::<TransactionsSection<'_>>(
                 &ctx,
-                &mut TransactionsFold::beside(&provisions, &HashSet::new()),
+                &mut TransactionsFold::beside(&provisions),
                 block.transactions().iter().map(unwrapped),
             )
         }

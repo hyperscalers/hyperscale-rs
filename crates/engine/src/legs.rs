@@ -32,11 +32,11 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Answered, Crossing, CrossingCell, CrossingEdge as StarEdge, CrossingId, CrossingLeaf, Kind,
-    Star, running_at, star_at,
+    Star, star_at,
 };
 use hyperscale_vm_kernel::{Arrival, Crossed, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{
-    DeclaredWork, LegRole, LegShape, MAX_CROSSINGS_PER_TX, PriceTable, ProtocolHasher, Quanta,
+    DeclaredWork, LegShape, MAX_CROSSINGS_PER_TX, PriceTable, ProtocolHasher, Quanta,
 };
 
 use crate::sharding::TrieShardResolver;
@@ -75,7 +75,7 @@ impl Placement {
 
 /// What a shard runs of a transaction, frozen at the placement its block
 /// committed: the star its shape implies under the trie the block
-/// committed under, and which of its shards deliver.
+/// committed under, and which of its shards commit it.
 ///
 /// Taken once, at one placement, and carried from there — every consumer
 /// reads this and none re-derives it, so a reshape landing between
@@ -93,49 +93,23 @@ pub struct Classified {
     /// The star: whether the shape divides, each node's settled role and
     /// home, the core set, and every edge that crosses.
     star: Star<ShardId>,
-    delivering: BTreeSet<ShardId>,
-    /// The shards that run an outbound leg beside an inbound one: a
-    /// swap's caller, which withdraws before the venue and banks after
-    /// it. Never a core shard, whose legs are its core member's.
-    mixed: BTreeSet<ShardId>,
-}
-
-/// Which of a shard's legs a member runs.
-///
-/// A shard outside the core may hold legs on both sides of it: inbound
-/// ones that feed it and outbound ones that consume what it returns. The
-/// two cannot be one admission, since the outbound legs wait on a
-/// crossing the core issues only after the inbound ones have crossed to
-/// it. So a shard's work divides into at most two members — an issuing
-/// one that runs its inbound legs, its share of the core, and any
-/// outbound leg whose producer runs beside it, and a delivering one that
-/// runs the outbound legs whose producers run elsewhere, once their
-/// arrivals land — and a shard with legs on one side only has the one.
-/// A node's side is decided by where its edges come from, never by its
-/// role alone, so a member's arrivals are exactly the edges that cross.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Side {
-    /// The inbound legs and the core share: what settles, what issues,
-    /// what a verdict is drawn from.
-    Issuing,
-    /// The outbound legs: a delivery, admitted when what it consumes has
-    /// crossed, deciding nothing and reserving nothing.
-    Delivering,
+    /// The shards that commit the transaction when it divides: every
+    /// shard running a node it does not only take delivery of.
+    committing: BTreeSet<ShardId>,
 }
 
 impl Classified {
     /// Freeze `legs` against `trie`: the classifier's star, and off it
-    /// which shards deliver. Nothing else enters — the trie is the one
+    /// which shards commit. Nothing else enters — the trie is the one
     /// placement fact, and it changes only at a cut, where the shard
     /// leaving it commits nothing more — so every shard and every replica
     /// committing the transaction under one trie freezes one shape.
     ///
     /// The classifier reads no window. A shard scheduled to leave the
     /// trie divides like any other, in its final window too: a record
-    /// cell follows its prefix to the successor, a claim or a delivery
-    /// is a pull on whoever holds the prefix when it is made, and a
-    /// crossing the delivery window closes on unclaimed is reclaimed on
-    /// the successor's own proof of its absence. A rule that read the
+    /// cell follows its prefix to the successor, and a record's reading
+    /// reaches whoever holds its consumer's prefix when it is pushed or
+    /// read. A rule that read the
     /// block's window here would flip at the boundary into that window
     /// while the trie did not, and two shards committing one transaction
     /// on either side of it would freeze different shapes.
@@ -143,7 +117,7 @@ impl Classified {
     /// `payer` and `accounts` are the routing the envelope declares
     /// beyond any node's frame: the fee payer, whose home bears the core
     /// where no node can, and the accounts its intents act as. The two
-    /// are held to different rules — a payer needs a member of any side,
+    /// are held to different rules — a payer needs a shard that commits,
     /// an account a shard the core waits on — which is why they arrive
     /// apart rather than folded into one list.
     #[must_use]
@@ -157,20 +131,15 @@ impl Classified {
         let placement = Placement::Read(Arc::clone(&trie));
         let star = star_at(legs, payer, accounts, &TrieShardResolver { trie: &trie })
             .map_shards(|shard| ShardId::from_heap_index(shard.0));
-        let (delivering, mixed) = if star.decomposes {
-            let (delivers, settles) = delivery_sides(&star);
-            (
-                delivers.difference(&settles).copied().collect(),
-                delivers.intersection(&settles).copied().collect(),
-            )
+        let committing = if star.decomposes {
+            star.committing()
         } else {
-            (BTreeSet::new(), BTreeSet::new())
+            BTreeSet::new()
         };
         Self {
             placement,
             star,
-            delivering,
-            mixed,
+            committing,
         }
     }
 
@@ -180,8 +149,7 @@ impl Classified {
         Self {
             placement: Placement::Whole,
             star: Star::whole(),
-            delivering: BTreeSet::new(),
-            mixed: BTreeSet::new(),
+            committing: BTreeSet::new(),
         }
     }
 
@@ -198,35 +166,26 @@ impl Classified {
         }
     }
 
-    /// Whether `shard` only delivers for this transaction: it sits
-    /// outside the core and every leg it runs is a delivery, so nothing
-    /// it does bears a verdict or issues a crossing. Such a member is
-    /// admissible past the transaction's validity end, since the record
-    /// cell it claims is bounded by its own sweep and not by the window.
+    /// Whether `shard` commits this transaction: every participant of a
+    /// shape that runs whole, and for one that divides, every shard
+    /// running a node it does not only take delivery of.
+    ///
+    /// A shard running nothing but deliveries never includes the
+    /// transaction. Its owed crossings are credited by its commit fold
+    /// off the records' readings, and nothing it does bears a verdict or
+    /// issues a crossing.
     #[must_use]
-    pub fn only_delivers_at(&self, shard: ShardId) -> bool {
-        self.delivering.contains(&shard)
+    pub fn commits_at(&self, shard: ShardId) -> bool {
+        !self.decomposed() || self.committing.contains(&shard)
     }
 
-    /// Whether `shard` runs an outbound leg beside an inbound one, and
-    /// so runs this transaction as two members: an issuing one at its
-    /// commit, and a delivering one once the core's output has crossed
-    /// back to it.
+    /// The shards among `participants` that commit this transaction.
     #[must_use]
-    pub fn mixed_at(&self, shard: ShardId) -> bool {
-        self.mixed.contains(&shard)
-    }
-
-    /// The side `shard`'s first member runs: its delivery where it only
-    /// delivers, and everything that issues otherwise. A mixed shard's
-    /// delivering member is registered by the issuing one's admission.
-    #[must_use]
-    pub fn first_side_at(&self, shard: ShardId) -> Side {
-        if self.only_delivers_at(shard) {
-            Side::Delivering
-        } else {
-            Side::Issuing
-        }
+    pub fn committing(&self, participants: impl IntoIterator<Item = ShardId>) -> BTreeSet<ShardId> {
+        participants
+            .into_iter()
+            .filter(|shard| self.commits_at(*shard))
+            .collect()
     }
 
     /// Whether the legs run where their state lives. Only
@@ -247,28 +206,25 @@ impl Classified {
     ///
     /// What a member bears, which is more than what its shard holds. A
     /// shape that runs whole runs every node on every participant. One
-    /// that divides runs the nodes homed here, and every core node once
-    /// the core reaches here — so a multi-shard core replicates its
-    /// nodes onto each of its shards and each of them burns their
-    /// ceilings.
+    /// that divides runs the nodes homed here that are not delivered
+    /// here, and every core node once the core reaches here — so a
+    /// multi-shard core replicates its nodes onto each of its shards and
+    /// each of them burns their ceilings.
     ///
     /// The count is the caller's because [`Self::whole`] reads no
     /// placement and so holds no node list; a frozen classification's
     /// own is the same figure.
     ///
-    /// Read for what a block reserves against its caps, so it covers
-    /// both members a mixed shard runs: the two sides land in one
-    /// block's budget. Answered for a shard the transaction's routing
-    /// reaches; a shard it does not reach runs nothing and is never
-    /// asked.
+    /// Read for what a block reserves against its caps. Answered for a
+    /// shard the transaction's routing reaches; a shard it does not
+    /// reach runs nothing and is never asked.
     #[must_use]
     pub(crate) fn runs_at(&self, shard: ShardId, nodes: usize) -> Vec<bool> {
         if !self.decomposed() {
             return vec![true; nodes];
         }
-        let star = &self.star;
         (0..u32::try_from(nodes).unwrap_or(u32::MAX))
-            .map(|node| running_at(&star.roles, &star.homes, &star.core, node).contains(&shard))
+            .map(|node| runs(&self.star, node, shard))
             .collect()
     }
 
@@ -392,19 +348,22 @@ impl Classified {
     /// which a core member consumes.
     ///
     /// Whether a consumer may refuse is decided here, off the frozen
-    /// classification and from the member's side. An escrowed edge's
-    /// consumer is a core node, so only a core member consumes one; a
-    /// delivering member consumes only owed edges, which nothing takes
-    /// back, so it never writes a negative answer. The producer writes
-    /// `Terms::Owed` exactly for an owed edge, off the same flag.
+    /// classification. An escrowed edge's consumer is a core node, so
+    /// only a core member consumes one; an owed edge's consumer runs in
+    /// no member, and its fold's credit is never refused. The producer
+    /// writes `Terms::Owed` exactly for an owed edge, off the same flag.
     pub fn refusable_consumed(&self, local: ShardId) -> impl Iterator<Item = &CrossingEdge> {
         self.edges()
             .iter()
             .filter(move |edge| edge.crossing.kind == Kind::Escrowed && edge.to.contains(&local))
     }
 
-    /// What `local` runs of the transaction on `side`, what arrives for
-    /// it, and what departs from it.
+    /// What `local` runs of the transaction, what arrives for it, and
+    /// what departs from it.
+    ///
+    /// Every node that runs here and is not delivered here: an owed
+    /// crossing's consumer runs in no member, since the consumer's
+    /// commit fold credits it.
     ///
     /// `arrivals` is what committed bundles attested for the edges this
     /// member consumes — read, never derived. `validity_end` is the
@@ -417,13 +376,12 @@ impl Classified {
         &self,
         arrivals: &[EscrowedValue],
         local: ShardId,
-        side: Side,
         validity_end: WeightedTimestamp,
     ) -> Result<ShardPlan, PlanDefect> {
         if !self.decomposed() {
             return Ok(ShardPlan::whole());
         }
-        let runs_here = |node: u32| runs(&self.star, node, local, side);
+        let runs_here = |node: u32| runs(&self.star, node, local);
         let mut plan = LegPlan::whole(self.star.homes.len());
         let mut participant = false;
         for node in 0..self.star.nodes() {
@@ -457,7 +415,7 @@ impl Classified {
                             amount: arrived.amount,
                         },
                         claim: id.answer_key(&ProtocolHasher, Answered::Taken),
-                        id,
+                        crossing: edge.crossing,
                         never: (edge.crossing.kind == Kind::Escrowed)
                             .then(|| id.answer_key(&ProtocolHasher, Answered::Never)),
                         validity_end_ms: validity_end.as_millis(),
@@ -532,51 +490,17 @@ pub fn local_work_over<'a>(
         })
 }
 
-/// The side `node` runs on at `local`: a sink whose producers run
-/// elsewhere is a delivery, waiting on their arrival; everything else —
-/// a source, the core, a sink fed beside itself — issues.
-///
-/// `Side` is this crate's naming for the answer [`Star::delivers_at`]
-/// gives: which of a shard's at most two members runs the node.
-fn side_of(star: &Star<ShardId>, node: u32, local: ShardId) -> Side {
-    if star.delivers_at(node, local) {
-        Side::Delivering
-    } else {
-        Side::Issuing
-    }
-}
-
-/// Whether `node` runs in `local`'s member on `side`.
-fn runs(star: &Star<ShardId>, node: u32, local: ShardId, side: Side) -> bool {
-    star.running(node).contains(&local) && side_of(star, node, local) == side
-}
-
-/// The shards running a delivery, and the shards running anything that
-/// issues. A shard in both runs the transaction as two members.
-fn delivery_sides(star: &Star<ShardId>) -> (BTreeSet<ShardId>, BTreeSet<ShardId>) {
-    let mut delivers = BTreeSet::new();
-    let mut settles = BTreeSet::new();
-    for node in 0..star.nodes() {
-        for shard in star.running(node) {
-            match (star.role(node), side_of(star, node, shard)) {
-                (LegRole::Attesting, _) => {}
-                (_, Side::Delivering) => {
-                    delivers.insert(shard);
-                }
-                (_, Side::Issuing) => {
-                    settles.insert(shard);
-                }
-            }
-        }
-    }
-    (delivers, settles)
+/// Whether `node` runs in `local`'s member: it runs on `local`, and is
+/// not an owed crossing's consumer there, which the consumer's commit
+/// fold credits and no member runs.
+fn runs(star: &Star<ShardId>, node: u32, local: ShardId) -> bool {
+    star.running(node).contains(&local) && !star.delivers_at(node, local)
 }
 
 /// One shard's member of a frozen transaction.
 ///
 /// Every per-member quantity is a function of the frozen classification,
-/// where the member runs, which of its shard's legs it takes and what the
-/// transaction reaches. Derived once here and asked by name, so a
+/// where the member runs and what the transaction reaches. Derived once here and asked by name, so a
 /// consumer reads the question it means and cannot reach another's answer
 /// except through its own name.
 ///
@@ -593,7 +517,6 @@ fn delivery_sides(star: &Star<ShardId>) -> (BTreeSet<ShardId>, BTreeSet<ShardId>
 pub struct Member {
     classified: Classified,
     local: ShardId,
-    side: Side,
     /// Every shard the transaction touches. Beside the classification
     /// because a whole shape's member awaits all of them, and no frozen
     /// answer names them.
@@ -601,19 +524,17 @@ pub struct Member {
 }
 
 impl Member {
-    /// The member `local` runs on `side` of a transaction frozen as
-    /// `classified` and reaching `participating`.
+    /// The member `local` runs of a transaction frozen as `classified`
+    /// and reaching `participating`.
     #[must_use]
     pub const fn of(
         classified: Classified,
         local: ShardId,
-        side: Side,
         participating: BTreeSet<ShardId>,
     ) -> Self {
         Self {
             classified,
             local,
-            side,
             participating,
         }
     }
@@ -622,12 +543,7 @@ impl Member {
     /// the whole transaction, on its own shard, reaching nobody else.
     #[must_use]
     pub fn whole(local: ShardId) -> Self {
-        Self::of(
-            Classified::whole(),
-            local,
-            Side::Issuing,
-            BTreeSet::from([local]),
-        )
+        Self::of(Classified::whole(), local, BTreeSet::from([local]))
     }
 
     /// The classification this member was frozen against.
@@ -640,12 +556,6 @@ impl Member {
     #[must_use]
     pub const fn local(&self) -> ShardId {
         self.local
-    }
-
-    /// Which of its shard's legs it runs.
-    #[must_use]
-    pub const fn side(&self) -> Side {
-        self.side
     }
 
     /// Every shard the transaction touches — who this tick's certificate
@@ -692,52 +602,21 @@ impl Member {
     /// decides, whether it executes and whether a counterpart may ask
     /// about it are all read off [`Role`] rather than off predicates
     /// restating it here.
-    ///
-    /// Reads the side, so a shard with legs on both sides of the core is
-    /// a `Delivery` in its delivering member and a `Leg` in its issuing
-    /// one. That is a different question from what such a shard's single
-    /// ledger entry is, which is the leg's — see `Part::of`.
     #[must_use]
     pub fn role(&self) -> Role {
         if !self.classified.decomposed() {
             Role::Whole
         } else if self.in_core() {
             Role::Core
-        } else if self.delivers() {
-            Role::Delivery
         } else {
             Role::Leg
         }
-    }
-
-    /// Whether the member only delivers: a leg that failed is the
-    /// transaction's end on its shard, but a delivery that failed decides
-    /// nothing — the value it claims stays in its cell for a later claim.
-    #[must_use]
-    pub(crate) fn delivers(&self) -> bool {
-        self.classified.decomposed() && self.side == Side::Delivering
     }
 
     /// Whether this shard's nodes sit in the core set.
     #[must_use]
     pub fn in_core(&self) -> bool {
         self.classified.core().contains(&self.local)
-    }
-
-    /// Whether this shard runs an outbound leg beside an inbound one, and
-    /// so runs the transaction as two members.
-    #[must_use]
-    pub fn runs_both_sides(&self) -> bool {
-        self.classified.mixed_at(self.local)
-    }
-
-    /// Whether this is the second member its shard runs of the
-    /// transaction: a mixed shard's delivering one, whose issuing member
-    /// took the block's reservation, settled the price and committed the
-    /// signers' nullifiers, so this one does none of those.
-    #[must_use]
-    pub fn is_second(&self) -> bool {
-        self.side == Side::Delivering && self.runs_both_sides()
     }
 }
 
@@ -752,7 +631,7 @@ impl Member {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Runs {
     /// The transaction as classified at commit — whole, or the legs
-    /// this shard's placement gives it on its side.
+    /// this shard's placement gives it.
     Shape(Member),
     /// No node at all: the records of crossings a producer here issued
     /// that no consumer will take, credited back and removed.
@@ -839,13 +718,12 @@ impl Runs {
     }
 
     /// Whether the transaction's price was levied on this shard already,
-    /// so this member charges nothing: the delivering member of a mixed
-    /// shard, whose issuing member charged; a reclaim on a leg that
-    /// ran, or on a record whose transaction was priced elsewhere.
+    /// so this member charges nothing: a reclaim on a leg that ran, or on
+    /// a record whose transaction was priced elsewhere.
     #[must_use]
-    pub(crate) fn charged_already(&self) -> bool {
+    pub(crate) const fn charged_already(&self) -> bool {
         match self {
-            Self::Shape(member) => member.is_second(),
+            Self::Shape(_) => false,
             Self::Reclaim { charged, .. } => *charged,
         }
     }
@@ -927,12 +805,10 @@ pub enum PlanDefect {
 /// Among the held readings of the key the block carries, the one at
 /// the newest anchor by weighted time, decoded as a crossing leaf.
 /// `Some` only for a record, and a bare presence of the key licenses
-/// nothing — a reading that carries no value says nothing a delivery
+/// nothing — a reading that carries no value says nothing an arrival
 /// can be composed from.
 ///
-/// One statement of it, because the licence to engage a delivery, the
-/// licence to carry one past its validity end and the arrival a
-/// delivering member runs against are one reading. The answer does not
+/// The arrival a consuming core runs against. The answer does not
 /// depend on how many readings of the key a block carries or in what
 /// order.
 #[must_use]
@@ -958,7 +834,7 @@ mod tests {
         Address, AddressClass, LocalKey, MAX_INTENT_VALIDITY_RANGE, SubstateKey,
     };
     use hyperscale_vm_effects::{CrossingAnswer, CrossingId, Hash32, IntentHash};
-    use hyperscale_vm_types::{ResourceAddr, ValueEdge};
+    use hyperscale_vm_types::{LegRole, ResourceAddr, ValueEdge};
 
     use super::*;
 
@@ -1023,15 +899,6 @@ mod tests {
             .filter(|(edge, _)| {
                 edge.from == local && kind.is_none_or(|kind| edge.crossing.kind == kind)
             })
-            .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
-            .collect()
-    }
-
-    /// The record keys of the owed crossings `local` consumes.
-    fn consumed(classified: &Classified, local: ShardId) -> BTreeSet<SubstateKey> {
-        classified
-            .crossings()
-            .filter(|(edge, _)| edge.crossing.kind == Kind::Owed && edge.to.contains(&local))
             .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
             .collect()
     }
@@ -1137,46 +1004,6 @@ mod tests {
         );
     }
 
-    /// A delivering member consumes exactly records some other shard
-    /// owes it, and never one of its own.
-    ///
-    /// The pairing a late delivery's licence rests on: the producer
-    /// names a record still owed a claim and offers the crossing again,
-    /// and the consumer names the same cell as the one a block admitting
-    /// its delivery past the validity end must prove present. Two folds
-    /// over one edge set, so a filter wrong at either end licenses
-    /// nothing or everything.
-    #[test]
-    fn a_delivery_consumes_the_owed_records_issued_to_it() {
-        let mut saw = false;
-        for legs in [transfer(), swap()] {
-            let classified = frozen(&legs);
-            for local in [low(), high()] {
-                let consumed_here = consumed(&classified, local);
-                let issued_here: BTreeSet<SubstateKey> =
-                    issued(&classified, local, None).into_iter().collect();
-                let owed_elsewhere: BTreeSet<SubstateKey> = [low(), high()]
-                    .into_iter()
-                    .filter(|&producer| producer != local)
-                    .flat_map(|producer| issued(&classified, producer, Some(Kind::Owed)))
-                    .collect();
-
-                saw |= !consumed_here.is_empty();
-                assert!(
-                    consumed_here.is_disjoint(&issued_here),
-                    "a member holding both ends reads the cell rather than waiting on \
-                     a bundle, at {local:?}",
-                );
-                assert!(
-                    consumed_here.is_subset(&owed_elsewhere),
-                    "every record a delivery here consumes is one another shard owes \
-                     it, at {local:?}",
-                );
-            }
-        }
-        assert!(saw, "one of these shapes hands a delivery a crossing");
-    }
-
     /// The two kinds partition what a shard issues, exactly.
     ///
     /// Every record a producer here writes is one or the other, and the
@@ -1219,7 +1046,7 @@ mod tests {
                 // The kind each departure carries is the kind the leaf
                 // will state, so the partition above is the one the
                 // kernel writes down.
-                let plan = classified.plan(&[], local, Side::Issuing, VALIDITY_END);
+                let plan = classified.plan(&[], local, VALIDITY_END);
                 if let Ok(plan) = plan {
                     for record in plan.legs.records() {
                         let departing = classified
@@ -1246,7 +1073,7 @@ mod tests {
     #[test]
     fn a_whole_transaction_plans_the_whole_shape() {
         let plan = Classified::whole()
-            .plan(&[], low(), Side::Issuing, VALIDITY_END)
+            .plan(&[], low(), VALIDITY_END)
             .expect("a whole plan needs nothing");
         assert!(plan.legs.is_whole());
         assert!(plan.judges.covers(owner(0x22, true)));
@@ -1271,31 +1098,28 @@ mod tests {
         assert_eq!(divided.core(), &BTreeSet::from([low()]));
 
         let sender = divided
-            .plan(&[], low(), Side::Issuing, VALIDITY_END)
+            .plan(&[], low(), VALIDITY_END)
             .expect("the sender's legs need no arrival");
         assert!(sender.legs.runs(0) && sender.legs.runs(1) && !sender.legs.runs(2));
         assert!(sender.legs.departure(1, 0).is_some());
         assert!(sender.judges.covers(owner(0x11, false)));
         assert!(!sender.judges.covers(owner(0x22, true)));
 
-        let recipient = divided
-            .plan(
-                &[arrival(1, 0, 100)],
-                high(),
-                Side::Delivering,
-                VALIDITY_END,
-            )
-            .expect("the recipient's leg has its arrival");
-        assert!(!recipient.legs.runs(0) && !recipient.legs.runs(1) && recipient.legs.runs(2));
+        // The deposit is the recipient's shard's commit fold, off the
+        // record's reading: that shard commits nothing and plans no
+        // member.
+        assert!(divided.commits_at(low()) && !divided.commits_at(high()));
         assert_eq!(
-            recipient.legs.arrival(1, 0).map(|arrival| arrival.crossed),
-            Some(Crossed {
-                resource: RESOURCE,
-                amount: 100
-            })
+            divided
+                .plan(&[arrival(1, 0, 100)], high(), VALIDITY_END)
+                .err(),
+            Some(PlanDefect::NotAParticipant),
         );
-        assert!(recipient.judges.covers(owner(0x22, true)));
-        assert!(!recipient.judges.covers(owner(0x11, false)));
+        assert_eq!(
+            divided.runs_at(high(), legs.len()),
+            vec![false; legs.len()],
+            "and reserves nothing",
+        );
     }
 
     /// A shard's escrowed records are the escrowed edges it issues, and
@@ -1324,29 +1148,28 @@ mod tests {
     /// is the transaction's: the answer's figure is the record's.
     #[test]
     fn a_departure_carries_the_transactions_validity_end() {
-        let legs = transfer();
+        let legs = swap();
         let divided = frozen(&legs);
-        let edge = &divided.edges()[0];
+        let edge = divided
+            .edges()
+            .iter()
+            .find(|edge| edge.producer == 1)
+            .expect("the withdraw crosses to the venue");
         let later = VALIDITY_END.plus(MAX_INTENT_VALIDITY_RANGE);
         for validity_end in [VALIDITY_END, later] {
             let departure = divided
-                .plan(&[], low(), Side::Issuing, validity_end)
-                .expect("the sender's legs need no arrival")
+                .plan(&[], low(), validity_end)
+                .expect("the caller's legs need no arrival")
                 .legs
                 .departure(edge.producer, edge.output)
                 .expect("the withdraw departs");
             assert_eq!(departure.validity_end_ms, validity_end.as_millis());
             let arrival = divided
-                .plan(
-                    &[arrival(1, 0, 100)],
-                    high(),
-                    Side::Delivering,
-                    validity_end,
-                )
-                .expect("the recipient's leg has its arrival")
+                .plan(&[arrival(1, 0, 100)], high(), validity_end)
+                .expect("the venue has its arrival")
                 .legs
                 .arrival(edge.producer, edge.output)
-                .expect("the deposit takes the crossing");
+                .expect("the venue takes the crossing");
             assert_eq!(
                 arrival.validity_end_ms,
                 validity_end.as_millis(),
@@ -1370,26 +1193,20 @@ mod tests {
         let divided = frozen(&legs);
         assert_eq!(divided.core(), &BTreeSet::from([high()]));
 
-        // The caller runs the transaction as two members: its issuing one
-        // signs in and withdraws, waiting on nothing, and its delivering
-        // one banks the venue's output once that has crossed back.
-        let issuing = divided
-            .plan(&[], low(), Side::Issuing, VALIDITY_END)
-            .expect("the caller's issuing legs take no arrival");
-        assert!(issuing.legs.runs(0) && issuing.legs.runs(1));
-        assert!(!issuing.legs.runs(2) && !issuing.legs.runs(3));
-        assert!(issuing.legs.departure(1, 0).is_some());
-        assert!(issuing.legs.arrival(2, 0).is_none());
-        let delivering = divided
-            .plan(&[arrival(2, 0, 90)], low(), Side::Delivering, VALIDITY_END)
-            .expect("the caller's delivering leg has its arrival");
-        assert!(delivering.legs.runs(3));
-        assert!(!delivering.legs.runs(0) && !delivering.legs.runs(1) && !delivering.legs.runs(2));
-        assert!(delivering.legs.arrival(2, 0).is_some());
-        assert!(delivering.legs.departure(1, 0).is_none());
+        // The caller runs one member: it signs in and withdraws, waiting
+        // on nothing, and the venue's output is banked by its commit fold
+        // once the record's reading lands.
+        let caller = divided
+            .plan(&[], low(), VALIDITY_END)
+            .expect("the caller's legs take no arrival");
+        assert!(caller.legs.runs(0) && caller.legs.runs(1));
+        assert!(!caller.legs.runs(2) && !caller.legs.runs(3));
+        assert!(caller.legs.departure(1, 0).is_some());
+        assert!(caller.legs.arrival(2, 0).is_none());
+        assert!(divided.commits_at(low()));
 
         let venue = divided
-            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing, VALIDITY_END)
+            .plan(&[arrival(1, 0, 100)], high(), VALIDITY_END)
             .expect("the venue has its arrival");
         assert!(venue.legs.runs(2));
         assert!(!venue.legs.runs(0) && !venue.legs.runs(1) && !venue.legs.runs(3));
@@ -1403,11 +1220,9 @@ mod tests {
     /// plan with none is a defect rather than a smaller plan.
     #[test]
     fn a_missing_arrival_is_a_defect() {
-        let legs = transfer();
+        let legs = swap();
         assert_eq!(
-            frozen(&legs)
-                .plan(&[], high(), Side::Delivering, VALIDITY_END)
-                .err(),
+            frozen(&legs).plan(&[], high(), VALIDITY_END).err(),
             Some(PlanDefect::MissingArrival { node: 1, output: 0 }),
         );
     }
@@ -1421,7 +1236,7 @@ mod tests {
         let legs = swap();
         let divided = frozen(&legs);
         let venue = divided
-            .plan(&[arrival(1, 0, 100)], high(), Side::Issuing, VALIDITY_END)
+            .plan(&[arrival(1, 0, 100)], high(), VALIDITY_END)
             .expect("a core issues what it minted");
         assert!(venue.legs.departure(2, 0).is_some());
 
@@ -1449,7 +1264,7 @@ mod tests {
         // venue at path 2, so leaf 1 runs nothing.
         assert_eq!(
             divided_deeper
-                .plan(&[], ShardId::leaf(2, 1), Side::Issuing, VALIDITY_END)
+                .plan(&[], ShardId::leaf(2, 1), VALIDITY_END)
                 .err(),
             Some(PlanDefect::NotAParticipant),
         );
@@ -1479,7 +1294,7 @@ mod tests {
     /// A leg whose home is a core shard is the core member's: the venue's
     /// output to a recipient on the venue's own shard is passed directly
     /// rather than departed into a record the shard could never be
-    /// handed, and the shard has no delivering member at all.
+    /// handed.
     #[test]
     fn an_outbound_leg_on_a_core_shard_runs_in_the_core_member() {
         let bob = owner(0x22, false);
@@ -1492,28 +1307,18 @@ mod tests {
             leg(recipient, LegRole::Outbound, &[(2, 0)], 3),
         ];
         let classified = frozen(&legs);
-        assert!(
-            !classified.mixed_at(high()),
-            "the core shard runs one member"
-        );
-        assert!(!classified.only_delivers_at(high()));
+        assert!(classified.commits_at(high()));
         let edges = classified.edges();
         assert_eq!(edges.len(), 1, "only the withdraw crosses");
         assert_eq!((edges[0].producer, edges[0].output), (1, 0));
 
         let core = classified
-            .plan(&[arrival(1, 0, 5)], high(), Side::Issuing, VALIDITY_END)
+            .plan(&[arrival(1, 0, 5)], high(), VALIDITY_END)
             .expect("the core member runs the venue and the deposit");
         assert!(core.legs.runs(2) && core.legs.runs(3));
         assert!(
             core.legs.departure(2, 0).is_none(),
             "the venue's output stays in the execution"
-        );
-        assert_eq!(
-            classified
-                .plan(&[], high(), Side::Delivering, VALIDITY_END)
-                .err(),
-            Some(PlanDefect::NotAParticipant),
         );
         assert!(issued(&classified, high(), None).is_empty());
     }
@@ -1548,7 +1353,7 @@ mod tests {
         assert_eq!(edges[0].to, BTreeSet::from([leaf1]));
         for shard in [leaf0, leaf2] {
             let plan = classified
-                .plan(&[], shard, Side::Issuing, VALIDITY_END)
+                .plan(&[], shard, VALIDITY_END)
                 .expect("a core shard plans the withdraw beside the venues");
             assert!(
                 plan.legs.runs(0) && plan.legs.runs(1) && plan.legs.runs(2) && plan.legs.runs(3)
@@ -1628,8 +1433,8 @@ mod tests {
         }
         assert_eq!(
             classified.runs_at(leaf1, legs.len()),
-            vec![false, false, false, false, true],
-            "the deliverer runs its own leg and nothing of the core"
+            vec![false; legs.len()],
+            "and the shard taking delivery runs nothing: its fold credits the deposit"
         );
     }
 
@@ -1686,7 +1491,7 @@ mod tests {
 
         for shard in [leaf0, leaf2] {
             let plan = classified
-                .plan(&[arrival(0, 0, 5)], shard, Side::Issuing, VALIDITY_END)
+                .plan(&[arrival(0, 0, 5)], shard, VALIDITY_END)
                 .expect("every core shard plans the whole core");
             assert!(
                 (1..5).all(|node| plan.legs.runs(node)) && !plan.legs.runs(0),
@@ -1701,12 +1506,7 @@ mod tests {
             issued(&classified, leaf0, None).is_empty(),
             "a core shard issues no record for an edge it runs both ends of",
         );
-        assert_eq!(
-            classified
-                .plan(&[], leaf1, Side::Issuing, VALIDITY_END)
-                .err(),
-            None
-        );
+        assert_eq!(classified.plan(&[], leaf1, VALIDITY_END).err(), None);
     }
 
     /// A core member judges its whole core; a leg judges its own shard.
@@ -1749,9 +1549,10 @@ mod tests {
         );
     }
 
-    /// A sink fed beside itself issues: an outbound leg whose producer
-    /// runs on its own shard's issuing member takes the value directly,
-    /// while one fed by the core elsewhere is that shard's delivery.
+    /// A sink fed beside itself runs in the shard's member: an outbound
+    /// leg whose producer runs on its own shard takes the value directly,
+    /// while one fed by the core elsewhere is credited by that shard's
+    /// commit fold.
     #[test]
     fn a_sink_fed_beside_itself_runs_in_the_issuing_member() {
         let alice = owner(0x11, false);
@@ -1766,10 +1567,7 @@ mod tests {
             leg(carol, LegRole::Outbound, &[(4, 0)], 5),
         ];
         let classified = frozen(&legs);
-        assert!(
-            classified.mixed_at(low()),
-            "the venue's return is a delivery"
-        );
+        assert!(classified.commits_at(low()));
         assert_eq!(
             classified
                 .edges()
@@ -1779,17 +1577,16 @@ mod tests {
             vec![1, 2],
             "the local transfer's edge never crosses"
         );
-        let issuing = classified
-            .plan(&[], low(), Side::Issuing, VALIDITY_END)
-            .expect("the issuing member runs both withdraws and the local deposit");
-        assert!(issuing.legs.runs(1) && issuing.legs.runs(4) && issuing.legs.runs(5));
-        assert!(!issuing.legs.runs(3));
-        assert!(issuing.legs.departure(1, 0).is_some());
-        assert!(issuing.legs.departure(4, 0).is_none());
-        let delivering = classified
-            .plan(&[arrival(2, 0, 7)], low(), Side::Delivering, VALIDITY_END)
-            .expect("the delivering member runs the venue's return alone");
-        assert!(delivering.legs.runs(3) && !delivering.legs.runs(5));
+        let member = classified
+            .plan(&[], low(), VALIDITY_END)
+            .expect("the member runs both withdraws and the local deposit");
+        assert!(member.legs.runs(1) && member.legs.runs(4) && member.legs.runs(5));
+        assert!(
+            !member.legs.runs(3),
+            "and not the venue's return, which the fold credits"
+        );
+        assert!(member.legs.departure(1, 0).is_some());
+        assert!(member.legs.departure(4, 0).is_none());
     }
 
     /// A sink fed from both sides of its own shard runs whole: its
@@ -1809,8 +1606,8 @@ mod tests {
         let whole = Classified::freeze(&legs, legs[0].target, &[], &trie());
         assert!(!whole.decomposed());
         assert!(
-            !whole.only_delivers_at(low()) && !whole.mixed_at(low()),
-            "a whole shape gives the sink's shard no second member to wait on it"
+            whole.commits_at(low()),
+            "a whole shape commits on every participant"
         );
         let mut one_sided = legs;
         one_sided[4] = leg(alice, LegRole::Outbound, &[(2, 0)], 4);

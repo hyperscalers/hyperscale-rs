@@ -565,16 +565,9 @@ impl Executor {
             .plan(
                 arrivals,
                 member.local(),
-                member.side(),
                 tx.validity_range().end_timestamp_exclusive,
             )
             .map_err(|defect| format!("no plan for this shard: {defect}"))?;
-        // The second member a shard runs of one transaction commits no
-        // nullifier: the issuing one did, and a second spend of the same
-        // cell would refuse this one before it ran.
-        if member.is_second() {
-            entry.nullifiers.clear();
-        }
         declare_crossing_cells(&mut entry.declaration, &plan.legs)?;
         let Job::Manifest { calls, .. } = entry.job else {
             return Err("a prepared transaction walks its manifest".to_string());
@@ -1605,10 +1598,9 @@ impl Executor {
                 // A second execution of a transaction this shard already
                 // charged burns nothing, so the price is levied exactly
                 // once: the reclaim of a leg that ran, whose own
-                // certificate burned it inside its writes, and the
-                // delivering member of a mixed shard, whose issuing member
-                // did. The reclaim of a leg that never ran is the one
-                // receipt of this shard's that can still carry it.
+                // certificate burned it inside its writes. The reclaim of
+                // a leg that never ran is the one receipt of this shard's
+                // that can still carry it.
                 if shapes
                     .get(&tx.hash())
                     .is_some_and(|input| input.runs.charged_already())

@@ -87,11 +87,7 @@ pub struct Divergence {
 /// transaction: it does unless the member is a leg, whose transaction
 /// its core decides. Not a third awaited case — a leg and a single-shard
 /// core await the same set — but the one fact the wire cannot derive
-/// from that set. And whether the member only **delivers**: a leg that
-/// failed is the transaction's end on its shard, since it could not
-/// issue, but a delivery that failed decides nothing either way — the
-/// value it claims stays in its cell for a later claim. And whether the
-/// member **executes** the transaction or settles what an execution left:
+/// from that set. And whether the member **executes** the transaction or settles what an execution left:
 /// a reclaim, an abandonment, a held record's disposal or a retirement
 /// runs no execution of the transaction's own, and the deadline holds
 /// only what does.
@@ -105,17 +101,6 @@ pub struct Membership {
 impl Membership {
     /// The two sets and the role `member` answers — a cache of its
     /// derivation, in the shape a tick carries.
-    ///
-    /// Classifies **one member**, and so reads the side it runs on. Not
-    /// the same question as [`Part::of`](crate::ledger::Part), which
-    /// classifies a shard's one ledger entry and reads
-    /// [`Classified::only_delivers_at`]: the branches look alike and
-    /// answer differently for a shard with legs on both sides of the
-    /// core, whose delivering member is a `Delivery` here and whose
-    /// single entry is a leg there. Folding either into the other reads
-    /// a delivery's verdict off an entry that bears one.
-    ///
-    /// [`Classified::only_delivers_at`]: hyperscale_engine::legs::Classified::only_delivers_at
     #[must_use]
     pub fn of(member: &Member) -> Self {
         let awaited = member.awaited();
@@ -233,15 +218,12 @@ pub const TICK_OVERDUE_WARN: Duration = Duration::from_secs(MAX_FINALIZATION_DEL
 /// How long past its own anchor a tick can still hold a member something
 /// could settle.
 ///
-/// The widest close a tick holds is a delivery's, and it is two windows
-/// wide rather than one: a delivery is admissible from its transaction's
-/// validity end for a further [`MAX_VALIDITY_RANGE`], and that validity
-/// end is itself at most one `MAX_VALIDITY_RANGE` past the anchor — the
-/// transaction had to be admissible in the block that committed it. A
-/// core member closes far earlier, at `MAX_FINALIZATION_DELAY` past its
-/// validity end, so the delivery bound covers both, and the finalization
-/// delay is carried on top so the span clears the close rather than
-/// landing on it.
+/// Two validity ranges wide, with the finalization delay on top: a
+/// member's validity end is at most one [`MAX_VALIDITY_RANGE`] past the
+/// anchor — the transaction had to be admissible in the block that
+/// committed it — and a core member closes at `MAX_FINALIZATION_DELAY`
+/// past that end, well inside a second range. The delay is carried on top
+/// so the span clears the close rather than landing on it.
 pub const TICK_SETTLEABLE_SPAN: Duration =
     Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2 + MAX_FINALIZATION_DELAY.as_secs());
 
@@ -255,11 +237,10 @@ struct Seat {
     /// owed to.
     membership: Membership,
     /// What the member was charged, where its committing block took a
-    /// place in the drain for it — `None` for the second member a mixed
-    /// shard runs, whose issuing member took the place and settled the
-    /// price. Carried apart from the transaction because an abandoned
-    /// member has no body here and still has to attest exactly what was
-    /// priced.
+    /// place in the drain for it — `None` for a member settling what an
+    /// execution left, which no block took a place for. Carried apart
+    /// from the transaction because an abandoned member has no body here
+    /// and still has to attest exactly what was priced.
     charged: Option<u128>,
     /// Dispatched to the engine and still owing a result. A tick is
     /// votable once no seat is.
@@ -1408,7 +1389,7 @@ impl TickState {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_engine::legs::{Classified, Side};
+    use hyperscale_engine::legs::Classified;
     use hyperscale_types::{
         AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
     };
@@ -1786,12 +1767,7 @@ mod tests {
         assert!(swap.decomposed());
         let participating = BTreeSet::from([low, high]);
         let member_of = |classified: &Classified, local, participating: &BTreeSet<ShardId>| {
-            Member::of(
-                classified.clone(),
-                local,
-                Side::Issuing,
-                participating.clone(),
-            )
+            Member::of(classified.clone(), local, participating.clone())
         };
         let caller = Membership::of(&member_of(&swap, low, &participating));
         assert_eq!(
@@ -1830,83 +1806,6 @@ mod tests {
         assert_eq!(whole, Membership::whole(participating));
     }
 
-    /// A shard outside the core whose every leg is a delivery is frozen
-    /// as delivering; one that also issues is not, and neither is the
-    /// core. A delivering member decides nothing whichever way it went —
-    /// its failure leaves the value in the cell — where a leg that
-    /// failed to issue is the transaction's end on its shard.
-    #[test]
-    fn a_delivering_member_never_decides() {
-        use hyperscale_types::BlockHeight;
-        use hyperscale_vm_types::LegRole;
-
-        use crate::fixtures::{leaf, leg, payer, swap, trie};
-
-        let trie = trie();
-        let placement = &trie;
-        let (sender, recipient) = (leaf(0), leaf(1));
-
-        let transfer = Classified::freeze(
-            &[
-                leg(0, LegRole::Core, &[]),
-                leg(1, LegRole::Outbound, &[(0, 0)]),
-            ],
-            payer(),
-            &[],
-            placement,
-        );
-        assert!(transfer.decomposed());
-        assert!(transfer.only_delivers_at(recipient));
-        assert!(
-            !transfer.only_delivers_at(sender),
-            "the core bears the verdict"
-        );
-        let swap = Classified::freeze(&swap(), payer(), &[], placement);
-        assert!(
-            !swap.only_delivers_at(leaf(0)),
-            "a shard that also issues runs on the transaction's window"
-        );
-
-        let mut tick = TickState::new(
-            TickId::new(recipient, BlockHeight::new(1)),
-            BlockHash::ZERO,
-            WeightedTimestamp::from_millis(1_000),
-        );
-        let participating = BTreeSet::from([sender, recipient]);
-        let delivery = tx(1);
-        let membership = Membership::of(&Member::of(
-            transfer,
-            recipient,
-            Side::Delivering,
-            participating.clone(),
-        ));
-        assert!(membership.role().delivers());
-        assert_eq!(membership.role(), Role::Delivery);
-        tick.admit(delivery, membership, Some(10), Admission::Executes);
-        let issuer = tx(2);
-        tick.admit(
-            issuer,
-            Membership::of(&Member::of(swap, leaf(0), Side::Issuing, participating)),
-            Some(10),
-            Admission::Executes,
-        );
-        tick.record_execution_result(delivery, ExecutionOutcome::Failed);
-        tick.record_execution_result(issuer, ExecutionOutcome::Failed);
-        let (_, _, outcomes) = tick.build_vote_data().expect("both settle alone");
-        let decides = |hash: TxHash| {
-            outcomes
-                .iter()
-                .find(|outcome| outcome.tx_hash() == hash)
-                .expect("attested")
-                .decides()
-        };
-        assert!(!decides(delivery), "a failed delivery decides nothing");
-        assert!(
-            decides(issuer),
-            "a failed issue is the transaction's end here"
-        );
-    }
-
     /// A leg awaiting nobody but itself settles in the determined half on
     /// the tick's own certificate, while that certificate is still owed
     /// to every shard the transaction reaches. A certificate from one of
@@ -1932,7 +1831,6 @@ mod tests {
             Membership::of(&Member::of(
                 classified,
                 local,
-                Side::Issuing,
                 BTreeSet::from([local, venue]),
             )),
             Some(10),

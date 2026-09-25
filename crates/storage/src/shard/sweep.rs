@@ -19,12 +19,12 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
-use crate::shard::crossings::crossing_settlements;
+use crate::shard::crossings::{crossing_settlements, owed_credits};
 use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
 use crate::tree::JmtSnapshot;
 use crate::{
-    Anchored, Substates, filter_state_writes_to_prefix, filter_writes_to_prefix, key_under_prefix,
-    merge_receipts, settle_writes,
+    Anchored, Substates, filter_state_writes_to_prefix, filter_writes_to_prefix, fold_state_writes,
+    key_under_prefix, merge_receipts, settle_writes,
 };
 
 /// When a committed cell stops being needed, or `None` for every cell a
@@ -504,10 +504,9 @@ pub fn followed_block_writes(
     // Restricted before resolving: a follower holds its prefix of the
     // tree and nothing else, so a movement on any other cell reads an
     // empty prior here and is the owning store's to judge, not this one's.
-    let merged = settle_writes(
-        &filter_state_writes_to_prefix(&merge_receipts(&settling), prefix),
-        prior,
-    );
+    let mut writes = merge_receipts(&settling);
+    fold_state_writes(&mut writes, &owed_credits(block.state_claims(), prior));
+    let merged = settle_writes(&filter_state_writes_to_prefix(&writes, prefix), prior);
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
     let settled = crossing_settlements(block.state_claims(), &merged, prior);
     let removals = removals_of(&swept, &settled);

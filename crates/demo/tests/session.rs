@@ -292,8 +292,25 @@ fn run_past_split(seed: u64, count: usize) -> Vec<TraceEvent> {
     events
 }
 
+/// The transactions an owed crossing of reached another shard's fold,
+/// each with the shard it left and the shard that credited it.
+fn credited(events: &[TraceEvent]) -> BTreeMap<String, (String, String)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::CrossingCredited { from, to, txs, .. } if from != to => Some(
+                txs.iter()
+                    .map(|tx| (tx.0.clone(), (from.0.clone(), to.0.clone())))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 #[test]
-fn a_cross_shard_transfer_is_certified_and_finalized_on_each_side() {
+fn a_cross_shard_transfer_is_certified_on_the_payers_side_and_credited_on_the_other() {
     let events = run_past_split(42, 6);
 
     // Which shards signed a certificate covering each transaction.
@@ -332,38 +349,26 @@ fn a_cross_shard_transfer_is_certified_and_finalized_on_each_side() {
         }
     }
 
-    // A record travels as a state claim rather than a bundle, so what a
-    // cross-shard transfer leaves in the trace is a certificate and a
-    // tick on each side.
-    let crossed: Vec<(&String, &BTreeSet<String>)> = certified
-        .iter()
-        .filter(|(_, signers)| signers.len() == 2)
-        .collect();
+    // A transfer's record reaches the recipient's shard as a state claim,
+    // whose fold credits it: the payer's shard certifies and finalizes
+    // it alone, naming itself, and the recipient's certifies nothing.
+    let crossed = credited(&events);
     assert!(
         !crossed.is_empty(),
         "a session past the split must produce cross-shard transfers",
     );
-
-    for (tx, shards) in crossed {
-        // Each side committed a tick of its own, naming itself alone:
-        // the payer's verdict waits on no one, and the delivery is the
-        // recipient's own block's business.
+    for (tx, (payer, _)) in &crossed {
+        assert_eq!(
+            certified.get(tx),
+            Some(&BTreeSet::from([payer.clone()])),
+            "tx {tx} must be certified by its payer's shard alone",
+        );
         let commits = finalized.get(tx).expect("a certified tx is finalized");
         assert_eq!(
-            &commits
-                .iter()
-                .map(|(s, _)| s.clone())
-                .collect::<BTreeSet<_>>(),
-            shards,
-            "tx {tx} must finalize on both shards, saw {commits:?}",
+            commits,
+            &BTreeSet::from([(payer.clone(), vec![payer.clone()])]),
+            "tx {tx} must finalize on its payer's shard alone, naming itself",
         );
-        for (shard, participants) in commits {
-            assert_eq!(
-                participants,
-                &vec![shard.clone()],
-                "the tick {shard} committed must name itself alone",
-            );
-        }
     }
 }
 
@@ -451,27 +456,9 @@ fn the_load_generator_picks_pairs_the_trie_routes_across_shards() {
             _ => None,
         })
         .collect();
-    // A transfer crosses shards when each side certifies it: the record
-    // it carries travels as a state claim, which the trace does not draw.
-    let mut certified: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for e in &events {
-        if let TraceKind::ExecutionCertified {
-            shard, outcomes, ..
-        } = &e.kind
-        {
-            for (tx, _) in outcomes {
-                certified
-                    .entry(tx.0.clone())
-                    .or_default()
-                    .insert(shard.0.clone());
-            }
-        }
-    }
-    let crossed: BTreeSet<String> = certified
-        .into_iter()
-        .filter(|(_, shards)| shards.len() == 2)
-        .map(|(tx, _)| tx)
-        .collect();
+    // A transfer crosses shards when the recipient's shard credits its
+    // record.
+    let crossed: BTreeSet<String> = credited(&events).into_keys().collect();
 
     assert_eq!(submitted.len(), 8, "every submission is reported");
     let local: Vec<_> = submitted.difference(&crossed).collect();

@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn the_set_names_what_a_counterpart_could_ask_about() {
         let (local, remote) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
-        let (jointly_aborted, claim, refusal, abandonment, alone) =
+        let (jointly_aborted, leg, refusal, abandonment, alone) =
             (tx(1), tx(2), tx(3), tx(4), tx(5));
         let fw = finalization(
             local,
@@ -188,7 +188,7 @@ mod tests {
                     vec![
                         TxOutcome::new(jointly_aborted, ExecutionOutcome::Aborted)
                             .awaiting([remote]),
-                        TxOutcome::new(claim, succeeded()).as_role(Role::Delivery),
+                        TxOutcome::new(leg, succeeded()).as_role(Role::Leg),
                         TxOutcome::new(refusal, ExecutionOutcome::Failed).as_role(Role::Leg),
                         TxOutcome::new(abandonment, ExecutionOutcome::Aborted).awaiting([remote]),
                         TxOutcome::new(alone, succeeded()),
@@ -201,7 +201,7 @@ mod tests {
             ],
         );
         let named: BTreeSet<TxHash> = local_settled_tx_hashes([&fw], local).into_iter().collect();
-        assert_eq!(named, BTreeSet::from([jointly_aborted, claim]));
+        assert_eq!(named, BTreeSet::from([jointly_aborted, leg]));
         assert!(
             local_settled_tx_hashes([&fw], remote).is_empty(),
             "a finalization names only its own shard's verdicts",

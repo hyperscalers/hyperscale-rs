@@ -8,27 +8,48 @@
 //! parent. The readings carry the empty proof, and the verifier re-reads
 //! each one from its own parent view instead of walking a proof.
 
+use hyperscale_hbor::Bytes;
 use hyperscale_storage::Substates;
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Inclusion, MAX_PROOFS_PER_QUERY, MerkleInclusionProof, ShardId,
-    StateClaim, SubstateKey, UnclaimedCrossing,
+    StateClaim, Stated, SubstateKey, UnclaimedCrossing,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher};
+use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
 
 /// What `state` says of `key`: the presence hashing to its value, or
-/// its absence. Never the value itself, so a parent-anchored reading has
-/// one weight.
+/// its absence.
 fn read(state: &(impl Substates + ?Sized), key: SubstateKey) -> Inclusion {
     state.cell(key).map_or(Inclusion::Absent, |bytes| {
         Inclusion::Present(jmt_value_hash(&bytes))
     })
 }
 
+/// What a parent-anchored claim states of `key`: an owed record's value,
+/// which the commit fold credits its consumer off, and every other cell
+/// as its presence or absence alone.
+fn stated(state: &(impl Substates + ?Sized), key: SubstateKey) -> Stated {
+    match state.cell(key) {
+        Some(bytes)
+            if matches!(
+                CrossingLeaf::read(&ProtocolHasher, key, &bytes),
+                Some(CrossingLeaf::Record { cell, .. }) if cell.terms == Terms::Owed
+            ) =>
+        {
+            Bytes::new(bytes).map_or_else(|_| Stated::Inclusion(read(state, key)), Stated::Held)
+        }
+        Some(bytes) => Stated::Inclusion(Inclusion::Present(jmt_value_hash(&bytes))),
+        None => Stated::Inclusion(Inclusion::Absent),
+    }
+}
+
 /// The claims a block carries for `local_crossings`, read off `state`,
-/// the parent's, at `parent`: every crossing's three keys, cut into
-/// claims by the section's order rule and each key named for its
-/// crossing.
+/// the parent's, at `parent`.
+///
+/// Every crossing's three keys, cut into claims by the section's order
+/// rule and each key named for its crossing. An owed record rides with
+/// its value, which is what the fold credits a crossing a merge brought
+/// to both its ends off.
 #[must_use]
 pub fn parent_claims(
     local_crossings: &[CrossingId],
@@ -53,7 +74,7 @@ pub fn parent_claims(
         .map(|chunk| {
             StateClaim::new(
                 parent,
-                chunk.iter().map(|(key, _)| (*key, read(state, *key))),
+                chunk.iter().map(|(key, _)| (*key, stated(state, *key))),
                 MerkleInclusionProof::new(Vec::new()),
             )
             .naming(chunk.iter().copied())

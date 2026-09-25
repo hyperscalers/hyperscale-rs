@@ -38,15 +38,16 @@ use crate::support::query::{
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
     build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
-    build_securify_tx, build_stake_tx, build_transfer_at_ceilings, build_transfer_paid_by,
-    build_transfer_tx, build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, lottery_on,
-    native_pq_cast, nullifier_race_cast, overdraw_cast, payment_request, payment_request_for,
-    pool_at, recipient, remote_delegator, securify_cast, sender, shared_recipient_cast,
-    storm_artifact, storm_publishers, unbound_payer_cast, unbound_remote_payer_cast,
-    validity_around,
+    build_securify_tx, build_stake_tx, build_swap_tx, build_transfer_at_ceilings,
+    build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
+    cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast, overdraw_cast,
+    payment_request, payment_request_for, pool_at, recipient, remote_delegator, securify_cast,
+    sender, shared_recipient_cast, storm_artifact, storm_publishers, unbound_payer_cast,
+    unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_folds, await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
+use crate::venue::{SWAP_INPUT, SWAPPER_SHARD, VENUE_SHARD, grind_onto, stand_up_venue};
 
 /// Per-payment amount of the contention scenarios.
 const PAYMENT: u128 = 5;
@@ -413,22 +414,21 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
     (report, span)
 }
 
-/// A cross-shard transfer settles through the payer-first holdback.
+/// A cross-shard transfer settles on the payer's shard alone and is
+/// credited by the recipient's commit fold.
 ///
-/// The reserve leg lives on the payer's shard and the delta leg on the
-/// recipient's; neither leg provisions state (both are commutative), so
-/// the payer's tick records an empty dependency set and
-/// dispatches immediately. The recipient engages only on the transaction
-/// commit proof — the payer's empty-entry bundle, consumable once the
-/// payer's block commit-proves — so its commit trails the payer's by one
-/// cross-shard hop, and its tick's requirement is satisfied by the
-/// bundle committing beside the transaction. Settlement is then the EC
-/// exchange.
+/// The payer's shard runs the withdraw, which issues an owed crossing
+/// and settles on its own verdict. The recipient's shard runs no member:
+/// the record is pushed to it, and the block carrying the reading
+/// credits the recipient's vault and writes the taken answer in its
+/// fold. So the recipient's chain never includes the transaction and no
+/// certificate round runs there.
 ///
 /// # Panics
 ///
-/// Panics if the transfer misses its budget, does not accept, or either
-/// shard's chain never commits it.
+/// Panics if the transfer misses its budget or does not accept, if the
+/// payer's chain never commits it, if the recipient is not credited, or
+/// if the recipient's chain includes it.
 pub fn cross_shard_transfer(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
     let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
@@ -444,8 +444,9 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
         ),
         "cross-shard VM transfer did not accept; status = {status:?}"
     );
-    // The payer's chain settled it alone; the recipient's chain commits
-    // the delivery a hop behind and credits the vault when it does.
+    // The payer's chain settled it alone; the recipient's chain never
+    // includes it, and its commit fold credits the vault and writes the
+    // taken answer off the record's reading.
     let payer_shard = ShardId::leaf(1, 0);
     let recipient_shard = ShardId::leaf(1, 1);
     assert!(
@@ -453,14 +454,14 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
         "payer shard never committed the transfer"
     );
     assert!(
-        c.run_until(epochs(6), |c| c
-            .chain_fate(recipient_shard, hash)
-            .0
-            .is_some()
-            && vault_balance(c, recipient_shard, to) == 10 + 100),
-        "recipient shard never committed and credited the delivery; committed = {:?}, holds {}",
-        c.chain_fate(recipient_shard, hash).0,
+        c.run_until(epochs(6), |c| vault_balance(c, recipient_shard, to)
+            == 10 + 100),
+        "recipient shard never credited the delivery; holds {}",
         vault_balance(c, recipient_shard, to),
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the recipient's chain never includes a transaction it only takes delivery of",
     );
     world.assert_settles_within(c, &charges, epochs(4), "a cross-shard transfer");
 }
@@ -567,32 +568,29 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
     );
 }
 
-/// A cross-shard credit and a later local one over the same vault both
+/// A cross-shard credit and a local one over the same vault both
 /// survive.
 ///
-/// The cross-shard leg's local writes are provisional until its tick
-/// settles — nothing may read them, or an abort would retroactively
-/// change an answer already given. So a transaction the shard commits
-/// afterwards sees the vault as it was before the leg ran, and both
-/// receipts carry an absolute the other's effect is missing from:
-/// whichever settles second overwrites the first, and one credit is
-/// gone.
+/// The crossing is credited by the recipient's commit fold when the
+/// record's reading lands, while the local payment runs in a tick whose
+/// baseline may predate that credit. Both are movements on the vault, so
+/// they compose whichever settles first; an absolute written from a
+/// stale baseline would drop one of them.
 ///
-/// The local payment is submitted only once the recipient's shard has
-/// committed the crossing, so the pair is genuinely ordered across two
-/// ticks with the tick still open between them. The balance is the whole
-/// assertion — both credits or neither.
+/// The local payment is submitted once the payer's shard has committed
+/// the crossing, so the credit lands while the local payment is in
+/// flight. The balance is the whole assertion — both credits or neither.
 ///
 /// # Panics
 ///
 /// Panics if either payment misses its budget or does not accept, if the
-/// recipient's shard never commits the crossing, or if the vault does not
+/// payer's shard never commits the crossing, or if the vault does not
 /// hold both credits.
 pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
     const CROSSING: u128 = 100;
     const LOCAL: u128 = 50;
 
-    let recipient_shard = ShardId::leaf(1, 1);
+    let (payer_shard, recipient_shard) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
     let (remote_payer, remote_from, local_payer, local_from, to) = shared_recipient_cast();
     let before = vault_balance(c, recipient_shard, to);
     let world = World::open(
@@ -612,16 +610,15 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
     );
     let crossing_hash = charges.submit(c, crossing);
 
-    // The recipient's shard has the leg in a tick from the moment it
-    // commits it; the tick cannot settle for several blocks yet, so the
-    // local payment below lands in a later tick with the leg's writes
-    // still provisional.
+    // The record is written at the payer's commit and read by the
+    // recipient's shard a hop behind, so the local payment below is in
+    // flight when the credit lands.
     assert!(
         c.run_until(epochs(16), |c| c
-            .chain_fate(recipient_shard, crossing_hash)
+            .chain_fate(payer_shard, crossing_hash)
             .0
             .is_some()),
-        "the recipient's shard never committed the crossing"
+        "the payer's shard never committed the crossing"
     );
 
     let local = build_transfer_tx(
@@ -665,19 +662,20 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
 }
 
 /// A multi-shard transaction's events land only on their emitters' home
-/// receipts.
+/// receipts, and a crossed credit emits none.
 ///
-/// The withdrawal emits from the payer's account and the deposit from the
-/// recipient's, and the two accounts sit on different shards. Each shard
-/// stores its own event and not the other's, while the receipt hash both
-/// committees agree on covers the union — so attribution splits the
-/// storage without splitting the agreement.
+/// The withdrawal emits from the payer's account, and the payer's shard
+/// stores that event and nothing else. The deposit is the recipient's
+/// shard's commit fold crediting the record's reading: no guest runs
+/// there, so the recipient's shard holds no receipt for the transfer and
+/// no event, and the wallet reads the vault.
 ///
 /// # Panics
 ///
-/// Panics if the transfer does not accept, if either shard never holds a
-/// receipt for it, or if either shard stores an event whose emitter lives
-/// on the other.
+/// Panics if the transfer does not accept, if the payer's shard never
+/// holds a receipt for it or stores an event whose emitter lives on the
+/// other, if the recipient is not credited, or if the recipient's shard
+/// holds a receipt for it.
 pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
     let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
@@ -695,14 +693,12 @@ pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
     );
 
     let (sender_shard, recipient_shard) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
-    // Receipts persist a beat behind the decision, so wait for both.
-    let stored = c.run_until(epochs(8), |c| {
-        c.events(sender_shard, hash).is_some() && c.events(recipient_shard, hash).is_some()
-    });
-    assert!(stored, "both shards must hold a receipt for the transfer");
-
+    // Receipts persist a beat behind the decision.
+    assert!(
+        c.run_until(epochs(8), |c| c.events(sender_shard, hash).is_some()),
+        "the payer's shard must hold a receipt for the transfer"
+    );
     let sender_events = c.events(sender_shard, hash).expect("payer receipt");
-    let recipient_events = c.events(recipient_shard, hash).expect("recipient receipt");
     assert_eq!(
         sender_events
             .iter()
@@ -711,13 +707,15 @@ pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
         vec![from],
         "the payer shard stores its own emission and nothing else"
     );
-    assert_eq!(
-        recipient_events
-            .iter()
-            .map(|event| event.emitter)
-            .collect::<Vec<_>>(),
-        vec![to],
-        "the recipient shard stores its own emission and nothing else"
+    let recipient_before = 10;
+    assert!(
+        c.run_until(epochs(8), |c| vault_balance(c, recipient_shard, to)
+            == recipient_before + 100),
+        "the recipient is credited by its shard's fold",
+    );
+    assert!(
+        c.events(recipient_shard, hash).is_none(),
+        "and a credit that runs no guest leaves no receipt there"
     );
     world.assert_settles_within(c, &charges, epochs(4), "a transfer whose events split");
 }
@@ -726,12 +724,12 @@ pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
 /// counterpart's — the shard the fee never paid.
 ///
 /// Fees never move cross-shard, and this exercises the whole of what
-/// replaces them. A cross-shard transfer
-/// burns its fee at the payer's shard alone, so the counterpart executes
-/// its leg for nothing; the work it did is instead attested as gas on its
-/// own receipts, carried on its own headers, and folded onto its own
-/// boundary record, where the emission weighting reads it. The assertion
-/// that carries the rule is the counterpart's mark moving at all.
+/// replaces them. A swap burns its fee at the caller's shard alone, so
+/// the venue's shard executes the core for nothing; the work it did is
+/// instead attested as gas on its own receipts, carried on its own
+/// headers, and folded onto its own boundary record, where the emission
+/// weighting reads it. The assertion that carries the rule is the
+/// counterpart's mark moving at all.
 ///
 /// The byte level is checked for stability rather than for conservation
 /// across a reshape: without storage bonds there is no conserved
@@ -741,18 +739,25 @@ pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
 ///
 /// # Panics
 ///
-/// Panics if the transfer does not accept, if either shard's mark or byte
-/// level never reaches the beacon within budget, if the counterpart
-/// attests no work for the leg it executed, or if a recorded byte level
+/// Panics if the swap does not accept, if either shard's mark or byte
+/// level never reaches the beacon within budget, if the venue's shard
+/// attests no work for the core it executed, or if a recorded byte level
 /// moves while nothing is executing.
-pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
-    let left = ShardId::leaf(1, 0);
-    let right = ShardId::leaf(1, 1);
-
-    let (payer, from, to) = cross_shard_cast();
-    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
+pub fn attested_load_reaches_the_beacon<C: Cluster>(c: &mut C) {
+    let (left, right) = (SWAPPER_SHARD, VENUE_SHARD);
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
+    let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
     let mut charges = Charges::default();
-    let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
+    let tx = build_swap_tx(
+        &caller_key,
+        caller,
+        &venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        validity_around(c.now()),
+    );
     let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
@@ -760,9 +765,8 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
             status,
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
-        "cross-shard VM transfer did not accept; status = {status:?}"
+        "the swap did not accept; status = {status:?}"
     );
-    world.assert_settles_within(c, &charges, epochs(4), "a transfer whose load is attested");
 
     // Wait for both shards to fold a crossing carrying a non-zero mark.
     let both_attested = |c: &_| {
@@ -776,13 +780,13 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
         recorded_fees(c, right),
     );
 
-    // The counterpart burned no fee and still attested its work — without
-    // this the emission weighting would pay it only the participation
-    // floor, and cross-shard execution would be unfunded.
+    // The venue's shard burned no fee and still attested its work —
+    // without this the emission weighting would pay it only the
+    // participation floor, and cross-shard execution would be unfunded.
     let counterpart_gas = recorded_fees(c, right).expect("counterpart record present");
     assert!(
         counterpart_gas > 0,
-        "the counterpart shard attested no work for a leg it executed"
+        "the venue's shard attested no work for the core it executed"
     );
 
     // The byte levels are recorded, and a quiesced network does not drift:
@@ -1709,15 +1713,14 @@ pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: 
 /// A delivery cut off past its window is owed, not taken back.
 ///
 /// A transfer's payer settles alone: its leg pays, issues the crossing
-/// and accepts, and the recipient's shard delivers a hop behind by
-/// claiming the crossing off the bundle the payer's shard provisions.
-/// Cutting both channels that bundle travels leaves the recipient with
-/// nothing to claim from — the payer is debited and the crossing sits
-/// issued with no claimant.
+/// and accepts, and the recipient's shard credits it a hop behind, when
+/// the record's pushed reading lands in one of its blocks. Cutting the
+/// push leaves the recipient with nothing to credit from — the payer is
+/// debited and the crossing sits issued with no reading of it anywhere.
 ///
 /// The crossing is the recipient's from the moment the core committed
 /// it, so no clock and no proof takes it back: the record stands, the
-/// payer stays debited, and the obligation waits for a bundle that can
+/// payer stays debited, and the obligation waits for a reading that can
 /// reach its consumer. Crediting it anywhere else is what this pins
 /// against — for a transfer the producing frame is the payer's own
 /// vault, but for a multi-hop shape it is the venue's, and a reclaim
@@ -1725,9 +1728,9 @@ pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: 
 ///
 /// # Panics
 ///
-/// Panics if the payer's leg does not accept, if the bundle channels
-/// are never exercised, if the delivery lands despite the cut, if the
-/// payment comes back to the payer, or if the world does not conserve.
+/// Panics if the payer's leg does not accept, if the push is never
+/// exercised, if the credit lands despite the cut, if the payment comes
+/// back to the payer, or if the world does not conserve.
 pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C) {
     let (payer_key, from, to) = cross_shard_cast();
     let payer_shard = ShardId::leaf(1, 0);
@@ -1737,9 +1740,6 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
     let mut world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
-    let broadcast_dropped = c.drop_type("provisions.broadcast");
-    let fetch_dropped = c.drop_type("provision.request");
-    let read_dropped = c.drop_type("state_proof.request");
     let push_dropped = c.drop_type("crossing.readings");
 
     let validity = validity_around(c.now());
@@ -1779,16 +1779,13 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
         "the cut must stand past where the delivery used to lapse",
     );
     assert!(
-        broadcast_dropped.fired() > 0
-            && fetch_dropped.fired() > 0
-            && read_dropped.fired() > 0
-            && push_dropped.fired() > 0,
-        "the payer's bundle channels and the record's push and read channels must actually \
-         have been exercised and cut"
+        push_dropped.fired() > 0,
+        "the record's push must actually have been exercised and cut",
     );
-    assert!(
-        c.chain_fate(recipient_shard, hash).0.is_none(),
-        "the delivery must never have landed while its record was cut off",
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "the credit must never have landed while its record was cut off",
     );
 
     // Nothing takes the crossing back. The payer stays debited for the
@@ -1818,10 +1815,9 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
 /// the case the window used to lose outright. There the cut stands the
 /// whole way and the crossing waits. Here the network is whole again
 /// past the instant the delivery window used to close at — and the
-/// delivery lands, because the crossing is still owed, the entry still
-/// stands for it, and the delivering shard asks the producer for the
-/// record it needs rather than waiting on a bundle whose one offer is
-/// long gone.
+/// credit lands, because the crossing is still owed and the producer
+/// pushes the standing record again on its own pace until the
+/// recipient's fold reads it.
 ///
 /// This is the fix stated end to end: one shard unreachable for a
 /// validity range used to be enough to strand a payment — credited to
@@ -1830,10 +1826,9 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
 ///
 /// # Panics
 ///
-/// Panics if the payer's leg does not accept, if the bundle, push and
-/// read channels are never exercised, if the delivery lands while the cut
-/// stands, if the recipient is not paid once the network heals, or if
-/// the world does not conserve.
+/// Panics if the payer's leg does not accept, if the push is never
+/// exercised, if the credit lands while the cut stands, if the recipient
+/// is not paid once the network heals, or if the world does not conserve.
 pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mut C) {
     let (payer_key, from, to) = cross_shard_cast();
     let payer_shard = ShardId::leaf(1, 0);
@@ -1843,9 +1838,6 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
     let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
-    let broadcast_dropped = c.drop_type("provisions.broadcast");
-    let fetch_dropped = c.drop_type("provision.request");
-    let read_dropped = c.drop_type("state_proof.request");
     let push_dropped = c.drop_type("crossing.readings");
 
     let validity = validity_around(c.now());
@@ -1878,16 +1870,13 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
         "the cut must stand past where the delivery used to lapse",
     );
     assert!(
-        broadcast_dropped.fired() > 0
-            && fetch_dropped.fired() > 0
-            && read_dropped.fired() > 0
-            && push_dropped.fired() > 0,
-        "the payer's bundle channels and the record's push and read channels must actually \
-         have been exercised and cut"
+        push_dropped.fired() > 0,
+        "the record's push must actually have been exercised and cut",
     );
-    assert!(
-        c.chain_fate(recipient_shard, hash).0.is_none(),
-        "the delivery must never have landed while its record was cut off",
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "the credit must never have landed while its record was cut off",
     );
 
     // The network is whole again, well past the old close: the record
@@ -1900,8 +1889,8 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
         vault_balance(c, recipient_shard, to),
     );
     assert!(
-        c.chain_fate(recipient_shard, hash).0.is_some(),
-        "and the delivery is on the recipient's chain",
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "and the recipient's chain never included the transfer: its fold credited it",
     );
     assert_eq!(
         vault_balance(c, payer_shard, from),
@@ -1922,22 +1911,15 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
 /// [`a_healed_network_delivers_past_the_old_window`] holds the same cut
 /// across the deadline and heals a little after it. This one holds it
 /// past the instant that used to close admission for good, and the
-/// delivery lands all the same: the record still stands, the producer
-/// still offers the crossing, and the block that admits the delivery
+/// credit lands all the same: the record still stands, the producer
+/// still pushes it on its own pace, and the block that credits it
 /// carries a proof of the record rather than a clock that permits it.
-///
-/// How long that can run is not the protocol's question any more but
-/// the pool's: a delivering body is held for as long as a member
-/// composed from it would wait on its bundle, measured from when it was
-/// offered here, and a delivery admitted past that needs the envelope
-/// from whoever still holds it.
 ///
 /// # Panics
 ///
-/// Panics if the payer's leg does not accept, if the bundle, push and
-/// read channels are never exercised, if the delivery lands while the cut
-/// stands, if the recipient is not paid once the network heals, or if
-/// any value is left stranded.
+/// Panics if the payer's leg does not accept, if the push is never
+/// exercised, if the credit lands while the cut stands, if the recipient
+/// is not paid once the network heals, or if any value is left stranded.
 pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCluster>(c: &mut C) {
     let (payer_key, from, to) = cross_shard_cast();
     let payer_shard = ShardId::leaf(1, 0);
@@ -1947,9 +1929,6 @@ pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCl
     let mut world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
-    let broadcast_dropped = c.drop_type("provisions.broadcast");
-    let fetch_dropped = c.drop_type("provision.request");
-    let read_dropped = c.drop_type("state_proof.request");
     let push_dropped = c.drop_type("crossing.readings");
 
     let validity = validity_around(c.now());
@@ -1987,16 +1966,13 @@ pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCl
         "the cut must stand well past the transaction's deadline",
     );
     assert!(
-        broadcast_dropped.fired() > 0
-            && fetch_dropped.fired() > 0
-            && read_dropped.fired() > 0
-            && push_dropped.fired() > 0,
-        "the payer's bundle channels and the record's push and read channels must actually \
-         have been exercised and cut",
+        push_dropped.fired() > 0,
+        "the record's push must actually have been exercised and cut",
     );
-    assert!(
-        c.chain_fate(recipient_shard, hash).0.is_none(),
-        "the delivery must never have landed while its record was cut off",
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "the credit must never have landed while its record was cut off",
     );
 
     // Whole again, and not too late. The producer never stopped holding

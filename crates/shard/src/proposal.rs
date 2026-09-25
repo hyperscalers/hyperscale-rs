@@ -14,23 +14,18 @@
 //! emit — full content, empty fallback, empty sync — so a single
 //! build-and-dispatch helper can drive them uniformly.
 
-use std::collections::{BTreeMap, HashSet};
-use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_engine::legs::{Classified, live_record};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
-    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_PROOFS_PER_QUERY,
+    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
     ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateKey, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, state_claims_admit_block,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, TopologySnapshot, Transaction, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, Kind};
-use hyperscale_vm_types::ProtocolHasher;
+use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
 
 use crate::admission::{
@@ -72,12 +67,9 @@ pub struct ProposalPayload {
     /// The crossings whose ends share this shard, for the builder to
     /// read at the parent beside the claims.
     pub(crate) local_crossings: Vec<CrossingId>,
-    /// What the read frontier judges of the claims and transactions
-    /// selected, for the builder to drop against the parent state.
+    /// What the read frontier judges of the claims selected, for the
+    /// builder to drop against the parent state.
     pub(crate) fence: ReadFence,
-    /// The record keys each transaction admitted on a record presence
-    /// leaned on.
-    pub(crate) record_licences: BTreeMap<TxHash, Vec<SubstateKey>>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,25 +166,19 @@ impl ProposalTracker {
 // Payload selection
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// What a proposer answers for itself that its voters answer by
-/// delegation or at the fence: the validity window each transaction is
-/// held to, with the late deliveries the anchor admits past their
-/// validity end, and the predecessors' answers for transactions opening
-/// before the chain's origin.
+/// What a proposer answers for itself that its voters answer at the
+/// fence: the predecessors' answers for transactions opening before the
+/// chain's origin.
 #[derive(Clone, Copy)]
 pub struct Prefilter<'a> {
     /// The predecessors' answers for transactions opening before the
     /// origin.
     pub(crate) precut: &'a Precut,
-    /// Transactions this shard only delivers for, admissible past their
-    /// validity end to the delivery window's close.
-    pub(crate) late_deliveries: &'a HashSet<TxHash>,
 }
 
 /// Filter ready transactions for proposal inclusion. Drops what the
 /// voters' delegated root check refuses — a `validity_range` malformed
-/// against the anchor or not containing it, unless the block licenses
-/// the transaction as a late delivery — and what their fence defers on
+/// against the anchor or not containing it — and what their fence defers on
 /// — a transaction opening before the chain's origin that no
 /// predecessor has proven absent; then keeps what
 /// [`TransactionsSection`] admits, folding into `fold`. A transaction
@@ -203,7 +189,7 @@ pub struct Prefilter<'a> {
 /// Logs the refusals when non-zero.
 pub fn select_transactions(
     ctx: &Admission<'_>,
-    prefilter: &Prefilter<'_>,
+    prefilter: Prefilter<'_>,
     fold: &mut TransactionsFold<'_>,
     ready_txs: &[Arc<Verified<Transaction>>],
 ) -> Vec<Arc<Verified<Transaction>>> {
@@ -214,12 +200,8 @@ pub fn select_transactions(
         .iter()
         .filter(|tx| {
             let h = tx.hash();
-            // A delivery is admissible past its transaction's window on
-            // a licence rather than on a clock — the same rule the
-            // voters' root check reads.
             let range = tx.validity_range();
-            let admitted = range.contains(ctx.anchor) || prefilter.late_deliveries.contains(&h);
-            if !range.is_well_formed(ctx.anchor) || !admitted {
+            if !range.is_well_formed(ctx.anchor) || !range.contains(ctx.anchor) {
                 expired += 1;
                 return false;
             }
@@ -251,155 +233,6 @@ pub fn select_transactions(
         );
     }
     selected
-}
-
-/// The owed crossings `tx` consumes on `local_shard` where it only
-/// delivers there, or `None` where it is not such a transaction or
-/// consumes none.
-fn consumed_here(
-    tx: &Transaction,
-    topology_schedule: &TopologySchedule,
-    anchor: WeightedTimestamp,
-    local_shard: ShardId,
-) -> Option<Vec<CrossingId>> {
-    let window = topology_schedule.at(anchor)?;
-    let classified = Classified::freeze(
-        tx.legs(),
-        tx.fee_payer(),
-        tx.accounts(),
-        window.shard_trie(),
-    );
-    if !classified.only_delivers_at(local_shard) {
-        return None;
-    }
-    let consumed: Vec<CrossingId> = classified
-        .crossings()
-        .filter(|(edge, _)| edge.crossing.kind == Kind::Owed && edge.to.contains(&local_shard))
-        .map(|(edge, _)| edge.crossing.id)
-        .collect();
-    (!consumed.is_empty()).then_some(consumed)
-}
-
-/// The transactions in `txs` that only deliver here and whose every
-/// record consumed here the block's claims read live under the
-/// transaction's own name: what a live held reading engages in place of
-/// a payer bundle, and what a delivery-only transaction is carried on
-/// past its validity end.
-///
-/// Computed against the block's own anchor and the block's own claims,
-/// so proposer and voters derive one set. The licence is the record
-/// read live, in a claim the block carries; the read frontier fences
-/// the presence where the parent state is read, and a claim the budget
-/// dropped licenses nothing.
-#[must_use]
-pub fn readable_deliveries<T: Deref<Target = Transaction>>(
-    txs: &[Arc<T>],
-    state_claims: &[StateClaim],
-    topology_schedule: &TopologySchedule,
-    anchor: WeightedTimestamp,
-    local_shard: ShardId,
-) -> HashSet<TxHash> {
-    if state_claims.iter().all(|claim| !claim.holds_a_value()) {
-        return HashSet::new();
-    }
-    txs.iter()
-        .filter(|tx| {
-            consumed_here(tx, topology_schedule, anchor, local_shard).is_some_and(|consumed| {
-                consumed.iter().all(|id| {
-                    live_record(state_claims, id.record_key(&ProtocolHasher))
-                        .is_some_and(|(_, cell)| cell.tx == tx.hash())
-                })
-            })
-        })
-        .map(|tx| tx.hash())
-        .collect()
-}
-
-/// For each transaction of `txs` that `named` names, the cells `keys`
-/// derives from each owed crossing it consumes here.
-fn licences_of<T: Deref<Target = Transaction>>(
-    txs: &[Arc<T>],
-    named: &HashSet<TxHash>,
-    topology_schedule: &TopologySchedule,
-    anchor: WeightedTimestamp,
-    local_shard: ShardId,
-    keys: impl Fn(&CrossingId) -> Vec<SubstateKey>,
-) -> BTreeMap<TxHash, Vec<SubstateKey>> {
-    txs.iter()
-        .filter(|tx| named.contains(&tx.hash()))
-        .filter_map(|tx| {
-            let consumed = consumed_here(tx, topology_schedule, anchor, local_shard)?;
-            Some((tx.hash(), consumed.iter().flat_map(&keys).collect()))
-        })
-        .collect()
-}
-
-/// The record keys each readable delivery in `txs` leaned on: what the
-/// builder drops the transaction for losing among the claims it keeps.
-#[must_use]
-pub fn record_licences<T: Deref<Target = Transaction>>(
-    txs: &[Arc<T>],
-    readable: &HashSet<TxHash>,
-    topology_schedule: &TopologySchedule,
-    anchor: WeightedTimestamp,
-    local_shard: ShardId,
-) -> BTreeMap<TxHash, Vec<SubstateKey>> {
-    licences_of(
-        txs,
-        readable,
-        topology_schedule,
-        anchor,
-        local_shard,
-        |id| vec![id.record_key(&ProtocolHasher)],
-    )
-}
-
-/// Both answer cells of every crossing each late delivery in `txs`
-/// consumes here. While either stands the delivery is a replay of a
-/// crossing this shard already answered: a re-commit deferred past the
-/// deletion of `Never` would take a record the producer has already
-/// reclaimed, so both count.
-#[must_use]
-pub fn late_answers<T: Deref<Target = Transaction>>(
-    txs: &[Arc<T>],
-    late: &HashSet<TxHash>,
-    topology_schedule: &TopologySchedule,
-    anchor: WeightedTimestamp,
-    local_shard: ShardId,
-) -> BTreeMap<TxHash, Vec<SubstateKey>> {
-    licences_of(txs, late, topology_schedule, anchor, local_shard, |id| {
-        vec![
-            id.answer_key(&ProtocolHasher, Answered::Taken),
-            id.answer_key(&ProtocolHasher, Answered::Never),
-        ]
-    })
-}
-
-/// The readable deliveries in `txs` past their validity end at
-/// `anchor`: admissible on the licence the live reading is, not on the
-/// clock.
-///
-/// A presence answers wherever it was taken, and no recency rule beyond
-/// the claim's age bound is read here: which anchor is newest is a
-/// question each validator answers from its own fetches. What bounds a
-/// late delivery instead is the read frontier, which refuses a presence
-/// below the floor this chain has already read the producer at, and the
-/// answer cells of the crossing it consumes, either of which standing
-/// refuses it as a replay of one this shard already answered.
-#[must_use]
-pub fn late_deliveries<T: Deref<Target = Transaction>>(
-    txs: &[Arc<T>],
-    state_claims: &[StateClaim],
-    topology_schedule: &TopologySchedule,
-    anchor: WeightedTimestamp,
-    local_shard: ShardId,
-) -> HashSet<TxHash> {
-    let readable = readable_deliveries(txs, state_claims, topology_schedule, anchor, local_shard);
-    txs.iter()
-        .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
-        .map(|tx| tx.hash())
-        .filter(|tx_hash| readable.contains(tx_hash))
-        .collect()
 }
 
 /// Select finalizations for inclusion: what [`FinalizationsSection`]
@@ -539,7 +372,10 @@ pub fn trim_local_crossings(
     let spent: usize = selected.iter().map(StateClaim::wire_weight).sum();
     let room = MAX_STATE_CLAIMS_BYTES.saturating_sub(spent);
     let claims_left = MAX_STATE_CLAIMS_PER_BLOCK.saturating_sub(selected.len());
-    let per_crossing = 3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES);
+    // An owed record rides with its value, which a crossing of either
+    // kind is weighed at: the bound is the widest record and its length.
+    let per_crossing =
+        3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES) + MAX_HELD_VALUE_BYTES + 4;
     let per_claim = MAX_PROOFS_PER_QUERY / 3;
     let mut kept = 0;
     while kept < offered.len() {
@@ -665,7 +501,6 @@ pub fn assemble_build_action(
         state_claims,
         local_crossings,
         fence,
-        record_licences,
     } = payload;
     let parent_anchor = Anchor {
         shard: local_shard,
@@ -720,7 +555,6 @@ pub fn assemble_build_action(
         classification_topology_snapshot,
         frontier,
         fence,
-        record_licences,
         parent_anchor,
         local_crossings,
     };
@@ -765,18 +599,19 @@ pub fn dispatch_or_defer(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, make_finalization, make_undecided_finalization,
-        stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
+        install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_abort_charge,
+        stub_transaction, stub_transaction_binding, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, CommittedAt, CommittedTxsRoot, Deadline, Hash,
-        Inclusion, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE,
-        NetworkDefinition, PredecessorTerminal, RoutePrefix, StateRoot, TimestampRange,
-        TransactionDecision, UnsettledTx, ValidatorSet, state_claims_admit_block,
+        Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Deadline, Hash,
+        MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
+        PredecessorTerminal, RoutePrefix, TimestampRange, TopologySchedule, TransactionDecision,
+        TxHash, UnsettledTx, ValidatorSet, state_claims_admit_block,
     };
 
     use super::*;
@@ -974,10 +809,8 @@ mod tests {
     #[test]
     fn select_finalizations_drops_a_committed_offer_that_decided_nothing() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"retired"));
-        let committed: Arc<Verifiable<Finalization>> = Arc::new(
-            make_undecided_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept)
-                .into(),
-        );
+        let committed: Arc<Verifiable<Finalization>> =
+            Arc::new(make_leg_finalization(BlockHeight::new(1), tx_hash).into());
         assert_eq!(
             committed.deciding_tx_hashes().count(),
             0,
@@ -1184,11 +1017,10 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
         );
         assert!(
@@ -1205,11 +1037,10 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &admits_precut(hash),
-                late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
         );
         assert_eq!(
@@ -1240,11 +1071,10 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
         );
 
@@ -1268,11 +1098,10 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
         );
 
@@ -1301,11 +1130,10 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
         );
 
@@ -1334,8 +1162,7 @@ mod tests {
         let cells = MAX_INTENTS + 1;
         let full = 3;
         let provisions = ProvisionsFold::default();
-        let readable = HashSet::new();
-        let mut fold = TransactionsFold::beside(&provisions, &readable);
+        let mut fold = TransactionsFold::beside(&provisions);
         fold.sweepable = MAX_SWEEPABLE_CREATED_PER_BLOCK - full * cells - (cells / 2);
         let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
             .map(|i| {
@@ -1359,9 +1186,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut fold,
             &txs,
@@ -1392,11 +1218,10 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
         );
 
@@ -1556,106 +1381,15 @@ mod tests {
             kept.len(),
         );
         assert_eq!(kept, offered[..kept.len()], "the prefix offered");
+        let per_crossing =
+            3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES) + MAX_HELD_VALUE_BYTES + 4;
         let carried = weight
             + (kept.len() / (MAX_PROOFS_PER_QUERY / 3) + 1) * STATE_CLAIM_BYTES
-            + kept.len() * 3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES);
+            + kept.len() * per_crossing;
         assert!(state_claims_admit_block(carried), "and what is kept fits");
         assert!(
-            !state_claims_admit_block(
-                carried + 3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES)
-            ),
+            !state_claims_admit_block(carried + per_crossing),
             "one more would not",
-        );
-    }
-
-    /// A live record read off a held reading licenses a delivery, and a
-    /// bare presence of the key does not.
-    #[test]
-    fn a_live_record_is_the_one_licence_and_nothing_else_is() {
-        use hyperscale_hbor::Bytes;
-        use hyperscale_types::{MerkleInclusionProof, Stated};
-        use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms, TxHash as VmTxHash};
-        use hyperscale_vm_types::ResourceAddr;
-
-        let id = CrossingId {
-            producer: Address::new([0xAA; 31], AddressClass::Component),
-            consumer: Address::new([0xAB; 31], AddressClass::Component),
-            intent: IntentHash(Hash32([0xAC; 32])),
-            local: 0,
-            output: 0,
-        };
-        let record = id.record_key(&ProtocolHasher);
-        let tx = VmTxHash(Hash32([0xAD; 32]));
-        let cell = |terms: Terms| id.cell(tx, ResourceAddr::new([0xE0; 31]), 5, 9_000, terms);
-        let claim = |height: u64, stated: Stated| {
-            StateClaim::new(
-                Anchor {
-                    shard: ShardId::leaf(1, 1),
-                    height: BlockHeight::new(height),
-                    state_root: StateRoot::from_raw(Hash::ZERO),
-                    ts: ts(height * 1_000),
-                },
-                [(record, stated)],
-                MerkleInclusionProof::dummy(),
-            )
-        };
-        let held = |terms: Terms| Stated::Held(Bytes::new(cell(terms).to_bytes()).unwrap());
-
-        assert!(live_record(&[], record).is_none());
-        assert_eq!(
-            live_record(&[claim(7, held(Terms::Owed))], record).map(|(_, cell)| cell.tx),
-            Some(tx),
-            "the record read live is the whole licence",
-        );
-        assert!(
-            live_record(&[claim(7, Inclusion::Present([0xAB; 32]).into())], record).is_none(),
-            "a bare presence licenses nothing",
-        );
-    }
-
-    /// A transaction named a late delivery is offered past its validity
-    /// end at any anchor; one not named is dropped at the validity end
-    /// as before.
-    #[test]
-    fn select_transactions_offers_a_named_late_delivery_at_any_anchor() {
-        let end = ts(1_000);
-        let range = TimestampRange::new(ts(500), end);
-        let delivery = tx_with_range(7, range);
-        let other = tx_with_range(8, range);
-        let late: HashSet<TxHash> = std::iter::once(delivery.hash()).collect();
-        let txs = vec![delivery.clone(), other];
-
-        let select = |anchor: WeightedTimestamp| -> Vec<TxHash> {
-            select_transactions(
-                &against(
-                    window_listing_no_packages(),
-                    anchor,
-                    WeightedTimestamp::ZERO,
-                    HashSet::new(),
-                    empty_dedup_index(),
-                )
-                .ctx(),
-                &Prefilter {
-                    precut: &refuses_precut(),
-                    late_deliveries: &late,
-                },
-                &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
-                &txs,
-            )
-            .iter()
-            .map(|tx| tx.hash())
-            .collect()
-        };
-        assert_eq!(
-            select(end),
-            vec![delivery.hash()],
-            "at the end only the delivery"
-        );
-        assert_eq!(
-            select(end.plus(Duration::from_hours(24))),
-            vec![delivery.hash()],
-            "and at any anchor past it, since the licence the set stands for is \
-             not on a clock"
         );
     }
 
@@ -1675,11 +1409,10 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
         );
 
@@ -1705,11 +1438,10 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default(), &HashSet::new()),
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &[tx],
         );
         assert!(selected.is_empty());

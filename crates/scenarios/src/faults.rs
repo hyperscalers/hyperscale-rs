@@ -4,19 +4,19 @@ use std::fmt::Write;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, MAX_VALIDITY_RANGE,
-    PrincipalAddr, ShardId, StateRoot, SubstateKey, TransactionDecision, TransactionStatus, TxHash,
-    WeightedTimestamp, Window,
+    BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, PrincipalAddr, ShardId,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash,
 };
 
 use crate::reshape::split_lifecycle;
-use crate::straddler::{STRADDLER_PAYMENT, chain_settled, submit_straddler_recording};
+use crate::straddler::{STRADDLER_PAYMENT, chain_settled};
 use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::{beacon_epoch, vault_balance};
 use crate::support::tx::{
-    HALT_STRADDLER_BATCH, account_shard, build_probe_transfer_tx, build_transfer_tx,
-    cross_shard_fault_cast, halt_straddler_setup, validity_around,
+    HALT_STRADDLER_BATCH, PaymentLeg, account_shard, build_composed_tx, build_probe_transfer_tx,
+    build_transfer_tx, cross_shard_fault_cast, halt_straddler_setup, payment_request_for,
+    validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -195,21 +195,19 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 /// The grown left child freezes exactly as in
 /// [`halted_shard_recovers_by_committee_redraw`], but with cross-child
 /// transfers in flight at every phase of the cut: a settling batch
-/// finalized on both children before any fault installs, a racing batch
+/// settled and credited before any fault installs, a racing batch
 /// submitted at the freeze edge — the last instant with any chance to
 /// commit on the halting shard — and a doomed batch submitted against the
-/// frozen shard. The surviving sibling must drive every tick it engaged to
-/// a terminal verdict on its own deadline clock during the halt, never
-/// hanging on the dead counterparty; a probe whose payer is the dead shard
-/// engages nowhere, because no counterpart can hold evidence of a commit
-/// that never happened, and so has no lock or reservation to resolve.
-/// After the recovery the two chains
-/// must agree probe by probe: no tick applied on one side that the other
-/// refused, with absence on the recovered chain counting as an abort (the
-/// fresh committee resolves pre-halt ticks from certificates alone and
-/// commits no abort finalization of its own). Once the recovery record
-/// clears, a fresh transfer per direction must settle — the recovered
-/// shard's cross-shard rail serves again.
+/// frozen shard. A transfer settles on its payer's chain alone and is
+/// credited by the recipient's commit fold off the record's reading, so
+/// the surviving sibling accepts every transfer it pays for during the
+/// halt, never waiting on the dead counterparty; a probe whose payer is
+/// the dead shard commits nowhere. What the survivor accepted into the
+/// frozen shard is owed, and after the recovery the survivor's pushes of
+/// the standing records reach the fresh committee, which credits each
+/// once. Once the recovery record clears, a fresh transfer per direction
+/// must settle and credit — the recovered shard's cross-shard rail serves
+/// again.
 ///
 /// Requires [`halt_straddler_setup`] at genesis, a dedicated host per
 /// validator, and two committees' worth of pool surplus.
@@ -220,8 +218,9 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 ///
 /// Panics if the halt or recovery misses a lifecycle budget, a redrawn
 /// committee rather than the first one completes the recovery, an
-/// in-flight tick hangs, the chains disagree on any probe's fate, or the
-/// post-recovery transfers fail to settle.
+/// in-flight tick hangs, a recipient is credited other than once for an
+/// accepted transfer, a crossing the survivor accepted is not credited
+/// after the recovery, or the post-recovery transfers fail to settle.
 pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     let (halted, survivor) = ShardId::ROOT.children();
     let setup = halt_straddler_setup();
@@ -236,15 +235,14 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
             .straddlers
             .iter()
             .chain(&setup.post_recovery)
-            .flat_map(|(_, from, to)| [from.address(), to.address()]),
+            .flat_map(|(_, from, _, to)| [from.address(), to.address()]),
         [],
     );
     let mut charges = Charges::default();
     let mut probes: Vec<Probe> = Vec::new();
 
-    // Settling batch: finalized on both children before any fault
-    // installs, so each chain records its half — the payer's verdict and
-    // the recipient's delivery.
+    // Settling batch: settled on its payer's chain and credited to its
+    // recipient before any fault installs.
     for leg in &setup.straddlers[..HALT_STRADDLER_BATCH] {
         probes.push(submit_probe(c, &mut charges, leg));
     }
@@ -252,9 +250,9 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         c.run_until(epochs(12), |c| {
             probes
                 .iter()
-                .all(|p| chain_settled(c, halted, p.hash) && chain_settled(c, survivor, p.hash))
+                .all(|p| chain_settled(c, p.payer_shard, p.hash) && credited_once(c, p))
         }),
-        "the settling batch must finalize on both children before the halt",
+        "the settling batch must settle and credit before the halt",
     );
 
     // Racing batch: submitted at the freeze edge, inside the staged cut —
@@ -269,18 +267,17 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 
     // Doomed batch: submitted against the frozen shard. A survivor-paid
     // probe still settles on the survivor — its payer's chain answers
-    // alone — but its delivery has nowhere to land; a halted-paid probe
-    // never commits anywhere.
+    // alone — but its credit waits for the frozen shard to read the
+    // record; a halted-paid probe never commits anywhere.
     for leg in &setup.straddlers[2 * HALT_STRADDLER_BATCH..] {
         probes.push(submit_probe(c, &mut charges, leg));
     }
 
     // The survivor's verdict waits on no one: a probe it pays for accepts
-    // during the halt, well inside the detection window, and its delivery
-    // to the frozen shard does not land. A probe the *halted* shard pays
-    // for is the opposite case and costs the survivor nothing: a
-    // delivery rides evidence the payer's shard committed, and a frozen
-    // shard commits nothing, so the survivor never engages it. There is
+    // during the halt, well inside the detection window, and its credit
+    // on the frozen shard does not land. A probe the *halted* shard pays
+    // for is the opposite case and costs the survivor nothing: a frozen
+    // shard commits nothing, so there is no record to read. There is
     // nothing to wait on, which is why these are not waited on — doing so
     // would spend the halt's own detection window on probes that were
     // never going to answer.
@@ -312,8 +309,8 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     for probe in &probes[2 * HALT_STRADDLER_BATCH..] {
         if probe.payer_shard == survivor {
             assert!(
-                c.chain_fate(halted, probe.hash).0.is_none(),
-                "a delivery landed on the frozen shard",
+                !credited_once(c, probe),
+                "a credit landed on the frozen shard",
             );
         }
     }
@@ -329,16 +326,15 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 
     await_halt_recovery(c, &halt);
 
-    let undelivered = assert_deliveries_agree(c, halted, survivor, &probes, &at_freeze);
+    assert_credits_agree(c, halted, survivor, &probes, &at_freeze);
 
     // The recovered shard's cross-shard rail serves again: a fresh
-    // transfer per direction settles on both chains and credits its
+    // transfer per direction settles on its payer's chain and credits its
     // recipient once. The budget is generous — a ceiling, not the
     // expected latency: the fresh committee is establishing cross-shard
-    // connectivity from a cold start (routing to the sibling, provision
-    // serving) right after the recovery record cleared, which on a
-    // real-network harness takes longer than a steady-state cross-shard
-    // settlement round.
+    // connectivity from a cold start right after the recovery record
+    // cleared, which on a real-network harness takes longer than a
+    // steady-state cross-shard settlement round.
     let revived: Vec<Probe> = setup
         .post_recovery
         .iter()
@@ -346,61 +342,15 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         .collect();
     assert!(
         c.run_until(epochs(40), |c| {
-            revived.iter().all(|p| {
-                chain_settled(c, halted, p.hash)
-                    && chain_settled(c, survivor, p.hash)
-                    && credited_once(c, p)
-            })
+            revived
+                .iter()
+                .all(|p| chain_settled(c, p.payer_shard, p.hash) && credited_once(c, p))
         }),
-        "a post-recovery transfer per direction must settle on both chains \
-         and credit its recipient once; {}",
+        "a post-recovery transfer per direction must settle and credit its recipient once; {}",
         revival_report(c, halted, survivor, &revived),
     );
 
-    assert_conserved_less_what_is_owed(c, &world, &charges, &probes, &undelivered);
-}
-
-/// Two-sided conservation, less what the halt left owed: a survivor-paid
-/// delivery the recipient was frozen through debited its payer and
-/// issued its record cell, and nothing has claimed it yet. Nothing
-/// takes it back either — the crossing is the recipient's — so the
-/// value sits in the record until the shard holding that prefix
-/// delivers it. A halt that ends while the delivery can still be
-/// admitted lands everything and the figure is zero; one that outruns
-/// that leaves the rest owed.
-///
-/// The conservation equality reads the figure the chains give, not a
-/// bound. What is bounded is which probes may appear in it: the doomed
-/// batch's two survivor-paid deliveries and the racing batch's two —
-/// each landing in whichever bucket it raced into — and nothing from the
-/// settling batch, which finalized on both children before any fault
-/// installed.
-fn assert_conserved_less_what_is_owed<C: Cluster>(
-    c: &mut C,
-    world: &World,
-    charges: &Charges,
-    probes: &[Probe],
-    undelivered: &[usize],
-) {
-    assert!(
-        owed_now(c, probes, undelivered) <= 4 * STRADDLER_PAYMENT,
-        "only the doomed batch's two survivor-paid deliveries and the racing \
-         batch's two can be left owed; nothing from the settling batch can, having \
-         finalized on both children before any fault installed. owed = {}",
-        owed_now(c, probes, undelivered),
-    );
-    let balanced = c.run_until(epochs(8), |c| {
-        world.held(c) + charges.burned(c) + owed_now(c, probes, undelivered) == world.before()
-    });
-    let owed = owed_now(c, probes, undelivered);
-    assert!(
-        balanced,
-        "a halt and its recovery: the world held {} before and {} after, with {} burned \
-         and {owed} still owed across the halt",
-        world.before(),
-        world.held(c),
-        charges.burned(c),
-    );
+    world.assert_settles_within(c, &charges, epochs(8), "a halt and its recovery");
 }
 
 /// Assert one crossing's halves under the severance: the payer settles
@@ -451,47 +401,27 @@ type ChainFate = (
     Option<(BlockHeight, TransactionDecision)>,
 );
 
-/// One straddler probe: where it pays, where it delivers, and when its
-/// delivery window closes.
+/// One straddler probe: where it pays and where it is credited.
 struct Probe {
     hash: TxHash,
     payer_shard: ShardId,
     recipient_shard: ShardId,
     recipient: PrincipalAddr,
-    /// The record cells its crossings write, on the payer's shard —
-    /// where the value it escrowed sits until something disposes of it.
-    records: Vec<SubstateKey>,
-    /// The last instant a delivery of it is admissible: the signed
-    /// window's end plus the delivery allowance past it.
-    delivery_closes: WeightedTimestamp,
-    /// Where the entry standing for its crossing runs to, and so the
-    /// last instant a delivery can still be admitted for it. Past this
-    /// whatever the record holds is owed for good: the record outlives
-    /// it — no arm of the sweep reaches one — but nothing is still
-    /// carrying the obligation.
-    owed_until: WeightedTimestamp,
 }
 
-/// Submit one straddler leg, recording what the assertions read back.
+/// Submit one straddler leg as a transfer, recording what the assertions
+/// read back.
 fn submit_probe<C: Cluster>(
     c: &mut C,
     charges: &mut Charges,
-    (key, from, to): &(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
+    (key, from, _, to): &PaymentLeg,
 ) -> Probe {
-    // The same window the submission builds against the same clock, so
-    // this is the transaction's own range rather than an estimate of it.
-    let window = validity_around(c.now());
-    let (hash, records) = submit_straddler_recording(c, charges, key, *from, *to);
+    let tx = build_transfer_tx(key, *from, *to, STRADDLER_PAYMENT, validity_around(c.now()));
     Probe {
-        hash,
+        hash: charges.submit(c, tx),
         payer_shard: account_shard(*from, 2),
         recipient_shard: account_shard(*to, 2),
         recipient: *to,
-        records,
-        delivery_closes: window.end_timestamp_exclusive.plus(MAX_VALIDITY_RANGE),
-        owed_until: Window::LegEntry
-            .of(Deadline::of(window.end_timestamp_exclusive))
-            .end,
     }
 }
 
@@ -533,204 +463,83 @@ fn credited_once<C: Cluster>(c: &C, probe: &Probe) -> bool {
     vault_balance(c, probe.recipient_shard, probe.recipient) == 10 + STRADDLER_PAYMENT
 }
 
-/// Assert the two chains agree probe by probe once the halted shard has
-/// recovered: a recipient is credited exactly when its chain committed
-/// the delivery, and once; nothing is delivered that no payer accepted;
-/// every settling probe delivered; every doomed probe the frozen shard
-/// paid for committed nowhere. A survivor-paid probe whose delivery
-/// window is still open lands on the recovered shard.
-///
-/// Returns which probes the halt left undelivered: every survivor-paid
-/// one that accepted and whose delivery has not landed. What they are
-/// holding is read where it is used — [`owed_now`] — rather than
-/// carried from here, because a crossing its issuer offers again is
-/// claimed whenever the offer lands.
+/// Assert the probes' credits once the halted shard has recovered: a
+/// recipient is credited at most once, and only for a transfer its payer
+/// accepted; every settling probe was credited; every doomed probe the
+/// frozen shard paid for committed nowhere; and every transfer the
+/// survivor accepted into the frozen shard is credited once the recovered
+/// shard reads the record the survivor keeps pushing.
 ///
 /// `at_freeze` is the halted chain's own view taken before the recovery:
 /// a commit or an accept in either that snapshot or the post-recovery
 /// walk counts, since the snapshot covers heights a fresh member never
 /// synced and the walk covers anything finalized after resume.
-fn assert_deliveries_agree<C: Cluster>(
+fn assert_credits_agree<C: Cluster>(
     c: &mut C,
     halted: ShardId,
     survivor: ShardId,
     probes: &[Probe],
     at_freeze: &[ChainFate],
-) -> Vec<usize> {
-    let fate_on = |c: &C, shard: ShardId, idx: usize, hash: TxHash| {
-        fate_including_freeze(c, halted, at_freeze, shard, idx, hash)
+) {
+    let accepted = |c: &C, idx: usize, probe: &Probe| {
+        matches!(
+            fate_including_freeze(c, halted, at_freeze, probe.payer_shard, idx, probe.hash).1,
+            Some((_, TransactionDecision::Accept))
+        )
     };
-    // A recipient's commit and its credit are two blocks of its chain,
-    // and the crossing its issuer offers anew lands the first before the
-    // second. Recovery completing is therefore not the instant to read
-    // the pair at — a probe caught between them reads as credited
-    // nowhere while its chain says delivered. So settle first, bounded,
-    // and let the walk below report whatever is still astride.
-    let agreed = c.run_until(epochs(10), |c| {
-        probes.iter().enumerate().all(|(idx, probe)| {
-            let delivered = fate_on(c, probe.recipient_shard, idx, probe.hash)
-                .0
-                .is_some();
-            !delivered || credited_once(c, probe)
-        })
+    let credited = c.run_until(epochs(20), |c| {
+        probes
+            .iter()
+            .enumerate()
+            .all(|(idx, probe)| !accepted(c, idx, probe) || credited_once(c, probe))
     });
-    let _ = agreed;
     let mut report = String::new();
-    let mut settled = 0u32;
     let mut doomed_nowhere = 0u32;
     let batch = HALT_STRADDLER_BATCH;
     for (idx, probe) in probes.iter().enumerate() {
-        let payer = fate_on(c, probe.payer_shard, idx, probe.hash);
-        let recipient = fate_on(c, probe.recipient_shard, idx, probe.hash);
-        let accepted = matches!(payer.1, Some((_, TransactionDecision::Accept)));
-        let delivered = recipient.0.is_some();
+        let payer = fate_including_freeze(c, halted, at_freeze, probe.payer_shard, idx, probe.hash);
         let held = vault_balance(c, probe.recipient_shard, probe.recipient);
         let _ = write!(
             report,
-            "\n  #{idx}: payer={:?} {payer:?}; recipient={:?} {recipient:?}; holds {held}",
+            "\n  #{idx}: payer={:?} {payer:?}; recipient={:?}; holds {held}",
             probe.payer_shard, probe.recipient_shard,
         );
+        let was_accepted = accepted(c, idx, probe);
         assert_eq!(
             held,
-            if delivered {
+            if was_accepted {
                 10 + STRADDLER_PAYMENT
             } else {
                 10
             },
-            "a recipient is credited exactly when its chain delivered, and once:{report}",
-        );
-        assert!(
-            accepted || !delivered,
-            "a delivery landed that no payer accepted:{report}",
+            "a recipient is credited exactly when its payer accepted, and once:{report}",
         );
         if idx < batch {
-            assert!(
-                accepted && delivered,
-                "every settling probe must accept and deliver:{report}",
-            );
-            settled += 1;
+            assert!(was_accepted, "every settling probe must accept:{report}");
         } else if idx >= 2 * batch && probe.payer_shard == halted {
             assert!(
-                payer.0.is_none() && recipient.0.is_none(),
+                payer.0.is_none(),
                 "a probe the frozen shard paid for committed somewhere:{report}",
             );
             doomed_nowhere += 1;
         }
     }
-    assert_eq!(
-        settled,
-        u32::try_from(batch).unwrap_or(u32::MAX),
-        "the settling batch is the whole first batch",
+    assert!(
+        credited,
+        "every transfer a payer accepted must be credited once the recovered shard reads \
+         its record:{report}",
     );
     assert!(
         doomed_nowhere > 0,
         "no doomed probe was paid for by the frozen shard — the batches no \
          longer exercise it",
     );
-
-    // Whatever the survivor accepted and the recovered shard has not yet
-    // delivered lands now, if its window is still open; a delivery whose
-    // window closed while the shard was frozen is owed nothing here, and
-    // its payer's reclaim reaches nothing either, the halt having
-    // outlasted the record's grace.
-    let now = WeightedTimestamp::ZERO.plus(c.now());
-    let owed: Vec<&Probe> = undelivered_survivor_paid(c, halted, survivor, probes, at_freeze)
-        .into_iter()
-        .map(|idx| &probes[idx])
-        .filter(|p| now < p.delivery_closes)
-        .collect();
-    let landed = c.run_until(epochs(10), |c| {
-        owed.iter()
-            .all(|p| c.chain_fate(halted, p.hash).0.is_some() && credited_once(c, p))
-    });
     assert!(
-        landed,
-        "a delivery whose window is open must land on the recovered shard and \
-         credit once; owed = {:?}",
-        owed.iter().map(|p| p.hash).collect::<Vec<_>>(),
-    );
-
-    let undelivered = undelivered_survivor_paid(c, halted, survivor, probes, at_freeze);
-    assert!(
-        undelivered.iter().all(|&idx| idx >= HALT_STRADDLER_BATCH),
-        "the settling batch finalized on both children before any fault installed, \
-         so nothing of it can strand; undelivered probes = {undelivered:?}",
-    );
-    owed_left_by(c, probes, &undelivered);
-    undelivered
-}
-
-/// What the halt left owed, of the deliveries it did not land: that
-/// every record either went to its recipient or is still standing, and
-/// none of it came back to the payer.
-///
-/// A record is value, and value is not swept on a clock — no arm of the
-/// sweep reaches a record cell. Nor does anything take one back: a
-/// crossing an outbound leg consumes is owed to that consumer from the
-/// moment the core committed it, so a delivery the halt cost is a
-/// payment still to be made rather than one returned to its payer.
-/// Either the recovered shard delivers it and the recipient is
-/// credited, or the record stands for whoever holds that prefix to
-/// claim whenever it can. The figure itself is [`owed_now`]'s.
-fn owed_left_by<C: Cluster>(c: &mut C, probes: &[Probe], undelivered: &[usize]) {
-    for &idx in undelivered {
-        assert!(
-            !probes[idx].records.is_empty(),
-            "a probe the halt left undelivered crossed to say it: probe {idx}",
-        );
-    }
-
-    // Give the recovered shard room to deliver what it can — until every
-    // record has gone, or until none of them can still be delivered —
-    // then read off the cells rather than inferring from balances or
-    // from the halt's length.
-    let _ = c.run_until(epochs(10), |c| {
-        let now = WeightedTimestamp::ZERO.plus(c.now());
-        undelivered
+        probes
             .iter()
-            .all(|&idx| now >= probes[idx].owed_until || !record_stands(c, &probes[idx]))
-    });
-    for &idx in undelivered {
-        let probe = &probes[idx];
-        assert!(
-            record_stands(c, probe) || credited_once(c, probe),
-            "a record that went took its crossing to the recipient, never back to \
-             the payer: probe {idx} on {:?}",
-            probe.payer_shard,
-        );
-    }
-}
-
-/// What the probes the halt left undelivered are still owed right now:
-/// a payment whose record cell stands and whose recipient it has not
-/// reached.
-///
-/// Both terms, because the two overlap for as long as a delivery takes
-/// to be confirmed back to its issuer. The crossing is the recipient's
-/// the moment its delivery runs, and the record leaf holding its amount
-/// is deleted a step later — when the issuer reads the claim present
-/// and retires it. Counting the leaf across that step would add a
-/// payment the recipient already holds.
-///
-/// Read wherever the figure is used rather than carried from where it
-/// was first taken: a crossing its issuer offers again is claimed
-/// whenever the offer lands, which may be long after the walk that
-/// noticed it was outstanding.
-fn owed_now<C: Cluster>(c: &C, probes: &[Probe], undelivered: &[usize]) -> u128 {
-    let standing = undelivered
-        .iter()
-        .filter(|&&idx| record_stands(c, &probes[idx]) && !credited_once(c, &probes[idx]))
-        .count();
-    u128::try_from(standing).expect("a handful of probes") * STRADDLER_PAYMENT
-}
-
-/// Whether any crossing `probe` issued is still sitting in its record
-/// cell on the shard that wrote it.
-fn record_stands<C: Cluster>(c: &C, probe: &Probe) -> bool {
-    probe.records.iter().any(|record| {
-        c.substate(probe.payer_shard, record.owner, record.local.0)
-            .is_some()
-    })
+            .any(|probe| probe.payer_shard == survivor && probe.recipient_shard == halted),
+        "no probe crossed into the frozen shard — nothing was owed across the halt",
+    );
 }
 
 /// A probe's fate on `shard`, taking the halted shard's reading from
@@ -754,36 +563,6 @@ fn fate_including_freeze<C: Cluster>(
     } else {
         now
     }
-}
-
-/// The probes the survivor accepted and the halted shard has not
-/// committed a delivery of, by index.
-///
-/// Read twice: once to drive whatever can still be delivered onto the
-/// recovered shard, and once after, when what is left is what the halt
-/// left owed.
-fn undelivered_survivor_paid<C: Cluster>(
-    c: &C,
-    halted: ShardId,
-    survivor: ShardId,
-    probes: &[Probe],
-    at_freeze: &[ChainFate],
-) -> Vec<usize> {
-    probes
-        .iter()
-        .enumerate()
-        .filter(|(idx, p)| {
-            p.payer_shard == survivor
-                && matches!(
-                    fate_including_freeze(c, halted, at_freeze, survivor, *idx, p.hash).1,
-                    Some((_, TransactionDecision::Accept))
-                )
-                && fate_including_freeze(c, halted, at_freeze, halted, *idx, p.hash)
-                    .0
-                    .is_none()
-        })
-        .map(|(idx, _)| idx)
-        .collect()
 }
 
 /// A staged shard freeze: the fault rules are installed and the shard has
@@ -1256,7 +1035,7 @@ pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl Faultable
 
     // A second cross-shard transfer submitted under the severance, sourced on
     // the far side so each shard pays for one stranded delivery.
-    let during = submit_crossing_between(c, &mut charges, &cast.right, (left, cast.left.1));
+    let during = submit_crossing_between(c, &mut charges, &cast.right, left, &cast.left);
 
     // A single-shard control per child, on accounts disjoint from the crossing
     // pair — these must settle purely intra-shard while the cross-shard
@@ -1360,8 +1139,8 @@ fn payer_of(crossing: &Crossing, left: ShardId, right: ShardId) -> ShardId {
 /// Assert `crossing` resolved once the severance healed, and report whether
 /// it was ever committed at all.
 ///
-/// A transfer its payer had committed owes an accept there and a delivery
-/// on the recipient's chain. One no shard ever included owes nothing: its
+/// A crossing its payer had committed owes an accept there and on the
+/// recipient's chain, since it runs whole. One no shard ever included owes nothing: its
 /// signed window closed while its half held at the schedule head, so it
 /// expires in the pool.
 fn assert_delivered_after_heal<C: FaultableCluster>(
@@ -1393,7 +1172,7 @@ fn assert_delivered_after_heal<C: FaultableCluster>(
             c.chain_fate(crossing.recipient_shard, crossing.hash).1,
             Some((_, TransactionDecision::Accept))
         )),
-        "the {label} delivery must land on the recipient's chain once the \
+        "the {label} crossing must land on the recipient's chain once the \
          severance heals; recipient = {:?}",
         c.chain_fate(crossing.recipient_shard, crossing.hash),
     );
@@ -1524,17 +1303,17 @@ struct Crossing {
     held_before: u128,
 }
 
-/// Wait for `crossing` to land on the recipient's chain and credit its
+/// Wait for `crossing` to land on both chains and credit its recipient's
 /// vault.
 ///
-/// A divided transfer accepts on its payer's chain alone; the recipient's
-/// shard commits the delivery in a block of its own, a hop behind, and
-/// credits the vault when it does. Read the moment the payer's status
+/// The crossing runs whole, so both shards commit it and the recipient's
+/// credits the vault as it does. Read the moment the payer's status
 /// flips, the recipient shows nothing yet — and a scenario in this family
-/// that never read the recipient at all would pass on a payment that never
-/// left one shard: the DA fetch engages for any dropped gossip, and the
-/// remote-header channel runs as ordinary machinery in a grown cluster, so
-/// neither counter alone distinguishes a crossing from a local payment.
+/// that never read the recipient at all would pass on a payment that
+/// never left one shard: the DA fetch engages for any dropped gossip, and
+/// the remote-header channel runs as ordinary machinery in a grown
+/// cluster, so neither counter alone distinguishes a crossing from a
+/// local payment.
 fn await_crossed<C: Cluster>(c: &mut C, crossing: &Crossing, context: &str) {
     let (left, right) = ShardId::ROOT.children();
     let credited = crossing.held_before + CROSSING_PAYMENT;
@@ -1545,7 +1324,7 @@ fn await_crossed<C: Cluster>(c: &mut C, crossing: &Crossing, context: &str) {
     });
     assert!(
         landed,
-        "the {context} transfer never crossed the split: left={:?}, right={:?}, \
+        "the {context} crossing never landed on both chains: left={:?}, right={:?}, \
          recipient holds {} against {credited} expected",
         c.chain_fate(left, crossing.hash).0,
         c.chain_fate(right, crossing.hash).0,
@@ -1570,24 +1349,36 @@ fn fault_family_world<C: Cluster>(c: &C) -> World {
 fn submit_crossing<C: Cluster>(c: &mut C, charges: &mut Charges) -> Crossing {
     let cast = cross_shard_fault_cast();
     let (_, right) = ShardId::ROOT.children();
-    submit_crossing_between(c, charges, &cast.left, (right, cast.right.1))
+    submit_crossing_between(c, charges, &cast.left, right, &cast.right)
 }
 
-/// Submit a crossing from `payer` into `recipient`'s account on its shard.
+/// Submit a crossing from `payer` into `recipient`'s account on
+/// `recipient_shard`.
+///
+/// The recipient signs the deposit as a request the payer composes, so
+/// the recipient's account is one the transaction acts as. Its shard is
+/// then no mere taker of delivery, and the shape runs whole: both shards
+/// commit it, the payer's bundle crosses to the recipient's shard, and
+/// the recipient's engagement crosses back — the traffic this family
+/// faults. A plain transfer would cross only as a record read, which no
+/// bundle carries.
 fn submit_crossing_between<C: Cluster>(
     c: &mut C,
     charges: &mut Charges,
     payer: &(Ed25519PrivateKey, PrincipalAddr),
-    recipient: (ShardId, PrincipalAddr),
+    recipient_shard: ShardId,
+    recipient: &(Ed25519PrivateKey, PrincipalAddr),
 ) -> Crossing {
-    let (recipient_shard, recipient) = recipient;
+    let (recipient_key, recipient) = (&recipient.0, recipient.1);
     let held_before = vault_balance(c, recipient_shard, recipient);
-    let tx = build_transfer_tx(
+    let validity = validity_around(c.now());
+    let tx = build_composed_tx(
         &payer.0,
         payer.1,
-        recipient,
+        recipient_key,
+        &payment_request_for(recipient, CROSSING_PAYMENT, validity),
         CROSSING_PAYMENT,
-        validity_around(c.now()),
+        validity,
     );
     let hash = charges.submit(c, tx);
     Crossing {

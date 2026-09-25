@@ -13,8 +13,8 @@ use std::time::Duration;
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    Address, BUNDLE_WAIT, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId,
-    SubstateKey, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -226,11 +226,6 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
         "the certificate channel must actually have been exercised and cut",
-    );
-    assert!(
-        clock(c) < validity_end.plus(BUNDLE_WAIT),
-        "the cut has to lift while the delivering member is still waiting on its bundle, \
-         or the core's output has nowhere to land",
     );
     for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
         assert!(

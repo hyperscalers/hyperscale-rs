@@ -43,7 +43,9 @@ pub use committed_txs::{
     prove_committed_tx_absent,
 };
 pub use leaf::{LeafRoot, RootMismatch, SetRoot};
-pub use provision_tx::{ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError};
+pub use provision_tx::{
+    CommittingShards, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+};
 pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal_chain};
 pub use settled_txs::{local_settled_tx_hashes, settled_txs_root_from_hashes};
 pub use state::{SplitChildRoots, StateRootContext, StateRootVerifyError};

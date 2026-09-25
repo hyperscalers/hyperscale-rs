@@ -33,7 +33,7 @@ use hyperscale_types::{
     WeightedTimestamp, budget_admits_block, caps_admit_transaction, evidence_admits_block,
     state_claims_admit_block, sweep_admits_block,
 };
-use hyperscale_vm_effects::CROSSING_CELL_BYTES;
+use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
@@ -247,26 +247,16 @@ pub(crate) struct TransactionsFold<'a> {
     /// The provisions admitted beside them, which engage a cross-shard
     /// transaction's payer.
     pub(crate) provisions: &'a ProvisionsFold,
-    /// The transactions that only deliver here and whose every record
-    /// the block's claims read live under its own name, which engages
-    /// them in place of a payer bundle: a settled record implies that
-    /// the transaction's core committed, and so that its payer engaged.
-    pub(crate) readable: &'a HashSet<TxHash>,
 }
 
 impl<'a> TransactionsFold<'a> {
-    /// A fold beside the admitted `provisions` and the block's
-    /// `readable` deliveries.
+    /// A fold beside the admitted `provisions`.
     #[must_use]
-    pub(crate) const fn beside(
-        provisions: &'a ProvisionsFold,
-        readable: &'a HashSet<TxHash>,
-    ) -> Self {
+    pub(crate) const fn beside(provisions: &'a ProvisionsFold) -> Self {
         Self {
             sweepable: 0,
             budget: DeclaredWork::ZERO,
             provisions,
-            readable,
         }
     }
 }
@@ -275,20 +265,22 @@ impl<'p> Section for TransactionsSection<'p> {
     type Item = Transaction;
     type Fold = TransactionsFold<'p>;
 
-    /// A transaction the chain does not already carry, engaged by its
-    /// payer bundle where its payer is elsewhere, under its own ceilings
-    /// in every dimension, and fitting the block's sweepable-cell cap
-    /// and its per-dimension caps over the share this shard bears.
+    /// A transaction the chain does not already carry and this shard
+    /// commits, engaged by its payer bundle where its payer is
+    /// elsewhere, under its own ceilings in every dimension, and fitting
+    /// the block's sweepable-cell cap and its per-dimension caps over
+    /// the share this shard bears.
     ///
     /// Nothing here asks about the code a transaction runs. A node that
     /// cannot resolve a package never derives the transaction at all, so
     /// it never reaches this gate — and one that did derive it holds the
-    /// metadata, which is what admission reads. Engagement demands the
-    /// transaction commit proof — the payer bundle — ride in the same
-    /// block or a committed one, or a live reading of every record a
-    /// delivery-only transaction consumes ride in the same block, which
-    /// closes the Byzantine-proposer path to engaging counterpart locks
-    /// before the payer shard commits. The sweep cap bounds how
+    /// metadata, which is what admission reads. A shard that only takes
+    /// delivery of the transaction's owed crossings never includes it:
+    /// its commit fold credits them off the records' readings. Engagement
+    /// demands the transaction commit proof — the payer bundle — ride in
+    /// the same block or a committed one, which closes the
+    /// Byzantine-proposer path to engaging counterpart locks before the
+    /// payer shard commits. The sweep cap bounds how
     /// fast a shard can be made to owe cells, counted off the
     /// derivations for this shard plus the one committed cell the chain
     /// writes for every transaction it carries; a transaction that does
@@ -307,6 +299,12 @@ impl<'p> Section for TransactionsSection<'p> {
             ));
         }
         let trie = ctx.snapshot.shard_trie();
+        let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
+        if !classified.commits_at(ctx.local_shard) {
+            return Err(format!(
+                "transaction {tx_hash} only delivers here, which its commit fold credits"
+            ));
+        }
         let payer_shard = trie.shard_for_prefix(tx.fee_payer());
         if !ctx.snapshot.is_single_shard_transaction(tx)
             && payer_shard != ctx.local_shard
@@ -315,7 +313,6 @@ impl<'p> Section for TransactionsSection<'p> {
                 .provisioned
                 .contains(&(payer_shard, tx_hash))
             && !ctx.dedup.contains_provision_tx(payer_shard, tx_hash)
-            && !fold.readable.contains(&tx_hash)
         {
             return Err(format!(
                 "cross-shard VM transaction {tx_hash} lacks its payer bundle from \
@@ -362,10 +359,9 @@ impl<'p> Section for TransactionsSection<'p> {
                 "transaction {tx_hash} declares more than the protocol admits of one transaction"
             ));
         }
-        let budget = fold.budget.saturating_add(
-            Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie)
-                .local_work(tx, ctx.local_shard),
-        );
+        let budget = fold
+            .budget
+            .saturating_add(classified.local_work(tx, ctx.local_shard));
         if !budget_admits_block(&budget) {
             return Err(format!(
                 "transaction {tx_hash} carries the block past a per-block cap on this shard"
@@ -888,6 +884,12 @@ impl Section for StateClaimsSection {
                     at()
                 ));
             }
+            if owed_elsewhere(ctx, claim) {
+                return Err(format!(
+                    "{} carries an owed record whose consumer this shard does not hold",
+                    at()
+                ));
+            }
         }
         if !fold.in_order(claim) {
             return Err(format!("{} repeats or precedes the one before it", at()));
@@ -908,6 +910,26 @@ impl Section for StateClaimsSection {
         fold.weight = weight;
         Ok(())
     }
+}
+
+/// Whether `claim` carries the value of an owed record whose consumer
+/// this shard does not hold.
+///
+/// An owed record's value is the credit this shard's fold lands, so it
+/// is carried only where its consumer routes. Anywhere else it licenses
+/// nothing and spends the budget.
+fn owed_elsewhere(ctx: &Admission<'_>, claim: &StateClaim) -> bool {
+    claim.cells.iter().any(|(key, stated)| {
+        stated.held().is_some_and(|bytes| {
+            matches!(
+                CrossingLeaf::read(&ProtocolHasher, *key, bytes),
+                Some(CrossingLeaf::Record { cell, .. })
+                    if cell.terms == Terms::Owed
+                        && ctx.snapshot.shard_trie().shard_for_prefix(cell.consumer)
+                            != ctx.local_shard
+            )
+        })
+    })
 }
 
 /// Run `S::admit` over `items` in order, refusing on the first item it

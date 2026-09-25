@@ -15,7 +15,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, stake_unit,
     staking_artifact,
 };
-use hyperscale_engine::legs::{Classified, Member, Runs, Side, never_answer};
+use hyperscale_engine::legs::{Classified, Member, Runs, never_answer};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
     TickTxInput, genesis_writes,
@@ -873,7 +873,6 @@ impl DividedStake {
             runs: Runs::Shape(Member::of(
                 self.classified.clone(),
                 local,
-                self.classified.first_side_at(local),
                 BTreeSet::from([self.payer_shard, self.core, self.sibling]),
             )),
             arrivals,
@@ -1085,7 +1084,6 @@ fn a_departure_is_escrowed_exactly_where_its_consumer_may_refuse() {
             .plan(
                 &[],
                 divided.payer_shard,
-                Side::Issuing,
                 divided.tx.validity_range().end_timestamp_exclusive,
             )
             .expect("the payer's shard plans its legs"),
@@ -1094,7 +1092,6 @@ fn a_departure_is_escrowed_exactly_where_its_consumer_may_refuse() {
             .plan(
                 &handed,
                 divided.core,
-                Side::Issuing,
                 divided.tx.validity_range().end_timestamp_exclusive,
             )
             .expect("the core plans on what it was handed"),

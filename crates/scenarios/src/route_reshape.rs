@@ -20,9 +20,8 @@ use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BUNDLE_WAIT, BlockHeight, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId,
-    SubstateKey, TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    WeightedTimestamp,
+    BlockHeight, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
+    TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, WeightedTimestamp,
 };
 
 use crate::reshape::split_lifecycle;
@@ -1000,7 +999,7 @@ fn submit_departing_route<C: Cluster>(
     c: &mut C,
     route: &mut DepartingRoute,
     charges: &mut Charges,
-) -> (TxHash, TxsInFlight, u128, WeightedTimestamp) {
+) -> (TxHash, TxsInFlight, u128) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
     let baseline = c
         .committed_txs_in_flight(survivor)
@@ -1049,7 +1048,6 @@ fn submit_departing_route<C: Cluster>(
         hash,
         baseline,
         held(c, route.trader.address(), *PROTOCOL_RESOURCE),
-        validity.end_timestamp_exclusive,
     )
 }
 
@@ -1594,7 +1592,7 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         isolate_ec_intake(c, survivor, departing),
     ];
     let mut charges = Charges::default();
-    let (hash, baseline, paid, ..) = submit_departing_route(c, &mut route, &mut charges);
+    let (hash, baseline, paid) = submit_departing_route(c, &mut route, &mut charges);
 
     // The cut. The departing venue's cells land under a child, and its
     // settled set reaches the survivor.
@@ -1685,7 +1683,7 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
     let mut route = departing_route(c);
     let cut = isolate_ec_intake(c, survivor, departing);
     let mut charges = Charges::default();
-    let (hash, baseline, paid, validity_end) = submit_departing_route(c, &mut route, &mut charges);
+    let (hash, baseline, paid) = submit_departing_route(c, &mut route, &mut charges);
     assert!(
         c.run_until(epochs(12), |c| matches!(
             c.chain_fate(departing, hash).1,
@@ -1720,37 +1718,16 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
          against {baseline:?}",
         c.committed_txs_in_flight(survivor),
     );
-    // The output is a delivery to the trader, an owed crossing: nothing
-    // closes its window and nothing takes it back. On a clock the
-    // delivery lands on, the trader banks it. On a clock whose epochs
-    // outrun the delivering member's wait the delivery has not landed,
-    // and the output stands in its record, owed to the trader. The
-    // trader is then out its input; the world is not, on either clock.
-    let banked = c.run_until(epochs(8), |c| {
-        held(c, route.trader.address(), *PROTOCOL_RESOURCE) > paid
-    });
-    if !banked {
-        let clock = WeightedTimestamp::ZERO.plus(c.now());
-        assert!(
-            clock >= validity_end.plus(BUNDLE_WAIT),
-            "the route must bank its output for the trader while a delivering member is still \
-             waiting on its bundle; \
-             holds {} against {paid}",
-            held(c, route.trader.address(), *PROTOCOL_RESOURCE),
-        );
-        assert_eq!(
-            held(c, route.trader.address(), *PROTOCOL_RESOURCE),
-            paid,
-            "an output that has not been delivered never reaches the trader",
-        );
-        let standing = route.protocol_resource.standing(c);
-        assert_eq!(
-            standing.len(),
-            1,
-            "the undelivered output must stand in its record, owed to the trader; standing = \
-             {standing:?}",
-        );
-    }
+    // The output is owed to the trader: nothing closes its window and
+    // nothing takes it back, and the trader's fold banks it whenever the
+    // record's reading lands.
+    assert!(
+        c.run_until(epochs(8), |c| {
+            held(c, route.trader.address(), *PROTOCOL_RESOURCE) > paid
+        }),
+        "the route must bank its output for the trader; holds {} against {paid}",
+        held(c, route.trader.address(), *PROTOCOL_RESOURCE),
+    );
     route.protocol_resource.assert_settles_within(
         c,
         &charges,
@@ -1952,18 +1929,17 @@ fn drive_train<C: Cluster>(
 }
 
 /// Every transfer's fate, once `terminating` has reached its terminal and
-/// nothing more can be included: whether it settled the transfer before
-/// its terminal is what decides between a settlement there and the
-/// successor's delivery, and a recipient is credited exactly when its
-/// payer's transfer was accepted and some chain delivered it; a payment
-/// accepted and delivered nowhere stands in its record.
+/// nothing more can be included: a recipient is credited exactly when its
+/// payer's transfer was accepted, by the fold of whichever chain held its
+/// prefix when the record's reading landed — the leaving shard or a
+/// successor — and no chain holding the recipient ever includes the
+/// transfer. Nothing accepted is left standing in its record.
 ///
 /// # Panics
 ///
-/// Panics if a successor is not served within budget, if a transfer sent
-/// while the shard was live was not settled by it, if any transfer
-/// reaches a fate its phase does not allow, if a credit disagrees with a
-/// verdict, or if the train never reached the coast.
+/// Panics if a successor is not served within budget, if a chain holding
+/// the recipient includes a transfer, if a credit disagrees with a
+/// verdict, or if an accepted payment is left standing.
 fn assert_train_fates<C: Cluster>(
     c: &mut C,
     terminating: ShardId,
@@ -1977,124 +1953,36 @@ fn assert_train_fates<C: Cluster>(
             "successor {successor} must be served within budget",
         );
     }
-    // Whether some chain holding the recipient — the leaving shard or a
-    // successor — has settled `hash` in the recipient's favour.
-    let delivered_by = |c: &C, hash: TxHash| {
-        std::iter::once(terminating)
-            .chain(successors.iter().copied())
-            .any(|shard| {
-                c.chain_fate(shard, hash)
-                    .1
-                    .is_some_and(|(_, decision)| decision == TransactionDecision::Accept)
-            })
-    };
-    let mut never_included = 0;
     for (hash, to, phase) in sent {
-        let (included, settled) = c.chain_fate(terminating, *hash);
-        // Settled means settled in the recipient's favour. An abort on
-        // the leaving shard leaves the transfer exactly where a transfer
-        // it never settled is left — no credit given — so it owes
-        // `Carried`, and reading the decision is what tells the two
-        // apart.
-        let settled = settled.is_some_and(|(_, decision)| decision != TransactionDecision::Aborted);
-        assert!(
-            settled || *phase != Phase::Live,
-            "a transfer sent {phase:?} must be settled by the leaving shard",
-        );
-        never_included += usize::from(included.is_none());
-        let taken = match (included.is_some(), settled) {
-            (_, true) => "settled",
-            (true, false) => "included but never settled in the recipient's favour",
-            (false, false) => "never included",
-        };
         let status = await_tx_terminal(c, *hash, epochs(12));
-        // The credit is the recipient's chain's to give: the leaving
-        // shard's or, for a transfer it never settled, whichever
-        // successor took the recipient's prefix. A transfer accepted by
-        // its payer and by no chain holding the recipient is one whose
-        // delivery has not landed yet: the payment stands in its record,
-        // registered when the leg was sent, until the successor lands
-        // it, and nothing reclaims it.
-        let delivered = delivered_by(c, *hash);
-        let credited = match (fate_owed(*phase, settled), status, delivered) {
-            (
-                Fate::Settled | Fate::Carried,
-                Some(TransactionStatus::Completed(TransactionDecision::Accept)),
-                true,
-            ) => 10 + STRADDLER_PAYMENT,
-            // The payment never left, or has not landed yet.
-            (
-                Fate::Carried,
-                Some(TransactionStatus::Completed(
-                    TransactionDecision::Accept | TransactionDecision::Aborted,
-                )),
-                false,
-            ) => 10,
-            (owed, other, delivered) => panic!(
-                "a transfer sent {phase:?} and {taken} by the leaving shard owes {owed:?} and \
-                 reached {other:?}, delivered = {delivered}, tx = {hash}",
-            ),
+        let credited = match status {
+            Some(TransactionStatus::Completed(TransactionDecision::Accept)) => {
+                10 + STRADDLER_PAYMENT
+            }
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted)) => 10,
+            other => panic!("a transfer sent {phase:?} reached {other:?}, tx = {hash}"),
         };
         assert!(
             c.run_until(epochs(8), |c| held(c, to.address(), *PROTOCOL_RESOURCE)
                 == credited),
-            "a recipient of a transfer sent {phase:?} and {taken} by the leaving shard must \
-             hold {credited}; holds {}",
+            "a recipient of a transfer sent {phase:?} and {status:?} must hold {credited}; \
+             holds {}",
             held(c, to.address(), *PROTOCOL_RESOURCE),
         );
+        for shard in std::iter::once(terminating).chain(successors.iter().copied()) {
+            assert!(
+                c.chain_fate(shard, *hash).0.is_none(),
+                "a chain holding the recipient never includes a transfer it only takes \
+                 delivery of; {shard} included one sent {phase:?}",
+            );
+        }
     }
-    assert!(
-        never_included > 0,
-        "the train has to reach the leaving shard's coast, or nothing here crosses the cut",
-    );
-    // Read at one instant, once every credit has been waited for: a
-    // delivery the successor lands after its leg was classified leaves
-    // nothing standing, and one it has not landed leaves its record.
-    let undelivered: Vec<TxHash> = sent
-        .iter()
-        .filter(|(hash, ..)| {
-            matches!(
-                c.tx_status(*hash),
-                Some(TransactionStatus::Completed(TransactionDecision::Accept))
-            ) && !delivered_by(c, *hash)
-        })
-        .map(|(hash, ..)| *hash)
-        .collect();
     let standing = world.standing(c);
-    assert_eq!(
-        standing.len(),
-        undelivered.len(),
-        "every payment accepted by its payer and delivered nowhere stands in its record, and \
-         nothing else does; undelivered = {undelivered:?}, standing = {standing:?}",
+    assert!(
+        standing.is_empty(),
+        "every accepted payment is credited, and nothing stands in its record; \
+         standing = {standing:?}",
     );
-}
-
-/// What a transfer's phase leaves open once the leaving shard has
-/// terminated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fate {
-    /// Settled on a chain that credited the recipient: the leaving shard
-    /// settled it before its terminal, whatever it was doing at the time.
-    Settled,
-    /// Aborted on the payer's chain, or carried by the successor that
-    /// took the recipient's prefix: delivered there, or, if nothing
-    /// delivered it, standing in its record, owed to the recipient.
-    Carried,
-}
-
-/// The fate a phase owes a transfer the leaving shard did or did not
-/// settle.
-///
-/// One shape takes two fates, and it is the one the reshape opens: a
-/// transfer the leaving shard's terminal overtook — never included, or
-/// included and abandoned by the terminal sweep — is the successor's to
-/// deliver. A live shard settles everything it takes, so a run that
-/// crossed no cut satisfies no disjunction here.
-const fn fate_owed(phase: Phase, settled: bool) -> Fate {
-    match (phase, settled) {
-        (Phase::Live, _) | (Phase::Departing | Phase::Draining, true) => Fate::Settled,
-        (Phase::Departing | Phase::Draining, false) => Fate::Carried,
-    }
 }
 
 /// Submit one of the train's legs, recording the leaving shard's phase

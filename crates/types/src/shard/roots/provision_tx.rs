@@ -11,8 +11,13 @@ use crate::{
     Verifiable, Verified, Verify, compute_merkle_root,
 };
 
+/// Which shards commit a transaction: its participants, less any that
+/// only take delivery of its owed crossings, which never include it.
+/// The classification that answers it lives above this crate.
+pub type CommittingShards<'a> = &'a dyn Fn(&Transaction) -> Vec<ShardId>;
+
 /// Inputs the provision-tx-roots verifier reads against.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ProvisionTxRootsContext<'a> {
     /// Source shard the block belongs to — excluded from the per-target
     /// fan-out so each shard's own provision-tx root isn't included in
@@ -23,6 +28,9 @@ pub struct ProvisionTxRootsContext<'a> {
     pub topology_snapshot: &'a TopologySnapshot,
     /// The block's transactions in block order.
     pub transactions: &'a [Arc<Verifiable<Transaction>>],
+    /// The shards that commit each transaction, which are the only ones
+    /// a bundle goes to.
+    pub committing: CommittingShards<'a>,
 }
 
 /// Provision-tx roots map type as carried by [`BlockHeader`](crate::BlockHeader),
@@ -66,7 +74,8 @@ impl Verified<ProvisionTxRootsMap> {
     /// builder stages requests in the same order. Only emits an entry
     /// for targets with ≥1 tx. A block promises read sets only: a
     /// crossing record reaches its consumer as a state claim, never as
-    /// a bundle.
+    /// a bundle. A shard that only takes delivery of the transaction
+    /// never includes it, so no bundle goes there.
     ///
     /// # Panics
     ///
@@ -79,6 +88,7 @@ impl Verified<ProvisionTxRootsMap> {
         local_shard: ShardId,
         topology_snapshot: &TopologySnapshot,
         transactions: &[Arc<Verifiable<Transaction>>],
+        committing: CommittingShards<'_>,
     ) -> Self {
         let mut per_target: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
 
@@ -108,7 +118,7 @@ impl Verified<ProvisionTxRootsMap> {
                     .push(Hash::from(tx.hash()));
                 continue;
             }
-            for shard in topology_snapshot.all_shards_for_transaction(tx) {
+            for shard in committing(tx) {
                 if shard == local_shard {
                     continue;
                 }
@@ -142,8 +152,12 @@ impl Verify<&ProvisionTxRootsContext<'_>> for ProvisionTxRootsMap {
     type Error = ProvisionTxRootsVerifyError;
 
     fn verify(&self, ctx: &ProvisionTxRootsContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        let computed =
-            Verified::<Self>::compute(ctx.local_shard, ctx.topology_snapshot, ctx.transactions);
+        let computed = Verified::<Self>::compute(
+            ctx.local_shard,
+            ctx.topology_snapshot,
+            ctx.transactions,
+            ctx.committing,
+        );
         if computed.as_ref() != self {
             return Err(ProvisionTxRootsVerifyError::Mismatch {
                 expected: self.clone(),
@@ -188,14 +202,24 @@ mod tests {
         let counterpart = ShardId::leaf(1, 0);
         let txs = vec![cross_shard_tx(test_principal(0x81))];
 
-        let at_counterpart = Verified::<ProvisionTxRootsMap>::compute(counterpart, &topo, &txs);
+        let everyone = |tx: &Transaction| topo.all_shards_for_transaction(tx);
+        let at_counterpart =
+            Verified::<ProvisionTxRootsMap>::compute(counterpart, &topo, &txs, &everyone);
         let targets: Vec<ShardId> = at_counterpart.as_ref().keys().copied().collect();
         assert_eq!(targets, vec![payer_shard]);
 
         // The payer still fans out to every participant: its bundle is
         // the engagement evidence.
-        let at_payer = Verified::<ProvisionTxRootsMap>::compute(payer_shard, &topo, &txs);
+        let at_payer =
+            Verified::<ProvisionTxRootsMap>::compute(payer_shard, &topo, &txs, &everyone);
         let targets: Vec<ShardId> = at_payer.as_ref().keys().copied().collect();
         assert_eq!(targets, vec![counterpart]);
+
+        // A participant that only takes delivery commits nothing, so no
+        // bundle goes to it.
+        let only_payer = |_: &Transaction| vec![payer_shard];
+        let delivered =
+            Verified::<ProvisionTxRootsMap>::compute(payer_shard, &topo, &txs, &only_payer);
+        assert!(delivered.as_ref().is_empty());
     }
 }

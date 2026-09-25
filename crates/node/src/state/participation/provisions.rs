@@ -41,14 +41,8 @@ impl ShardParticipation {
                         !fenced
                     })
                     .collect();
-                let actions = self
-                    .execution_coordinator
-                    .on_crossing_readings(sched, claims);
-                // A reading just held may complete a parked delivering
-                // body's records, which the pool then offers beside it.
-                self.mempool_coordinator
-                    .on_deliveries_readable(&self.execution_coordinator.readable_deliveries());
-                actions
+                self.execution_coordinator
+                    .on_crossing_readings(sched, claims)
             }
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
                 // A verified bundle is engagement evidence: promote any

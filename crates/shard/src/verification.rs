@@ -27,7 +27,6 @@ use tracing::{debug, trace, warn};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
-use crate::proposal::{late_answers, late_deliveries};
 use crate::read_fence::read_fence;
 
 /// The cells `block` writes of the chain's own accord.
@@ -893,7 +892,6 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         block: &Block,
-        late_deliveries: HashSet<TxHash>,
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
@@ -907,7 +905,6 @@ impl VerificationPipeline {
             expected_root: block.header().transaction_root(),
             transactions: block.transactions().clone(),
             validity_anchor: block.header().parent_qc().weighted_timestamp(),
-            late_deliveries,
         }]
     }
 
@@ -1610,18 +1607,6 @@ impl VerificationPipeline {
             .into_iter()
             .filter(|&kind| !self.is_root_in_flight(block_hash, kind))
             .collect();
-        // The late deliveries the block carries, read off its claims
-        // and its transactions: the transaction root admits them past
-        // their validity end, and the state root refuses one whose
-        // crossing this shard has already answered.
-        let late = late_deliveries(
-            block.transactions(),
-            block.state_claims(),
-            schedule,
-            anchor,
-            local_shard,
-        );
-
         for kind in wanted {
             match kind {
                 // The state root's own deferred queue is the second
@@ -1629,17 +1614,7 @@ impl VerificationPipeline {
                 VerificationKind::StateRoot => {
                     if self.needs_state_root_verification(block) {
                         let windows = schedule.windows();
-                        let fence = read_fence(
-                            block.state_claims(),
-                            windows,
-                            late_answers(
-                                block.transactions(),
-                                &late,
-                                schedule,
-                                anchor,
-                                local_shard,
-                            ),
-                        );
+                        let fence = read_fence(block.state_claims(), windows);
                         self.initiate_state_root_verification(
                             block_hash,
                             block,
@@ -1653,11 +1628,7 @@ impl VerificationPipeline {
                     }
                 }
                 VerificationKind::TransactionRoot => {
-                    actions.extend(self.initiate_transaction_root_verification(
-                        block_hash,
-                        block,
-                        late.clone(),
-                    ));
+                    actions.extend(self.initiate_transaction_root_verification(block_hash, block));
                 }
                 VerificationKind::ProvisionRoot => {
                     if let Some(pending) = pending_blocks.get(block_hash) {

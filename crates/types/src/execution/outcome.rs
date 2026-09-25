@@ -48,10 +48,6 @@ pub enum Role {
     /// decides, but a leg that could not issue is the transaction's end
     /// on its shard.
     Leg,
-    /// A delivery: claims what crossed to it and decides nothing either
-    /// way, since a delivery that failed leaves the value in its cell
-    /// for a later claim.
-    Delivery,
     /// A member settling what an execution left, with a verdict of its
     /// own: a reclaim, an abandonment, an inherited record's member.
     Settling,
@@ -65,9 +61,8 @@ impl Role {
         match outcome {
             ExecutionOutcome::Succeeded { .. } => self.success_decides(),
             // A member that could not do its part ends the transaction
-            // on this shard whatever its role, except where the role
-            // bears no verdict at all.
-            _ => !matches!(self, Self::Delivery),
+            // on this shard whatever its role.
+            _ => true,
         }
     }
 
@@ -86,13 +81,7 @@ impl Role {
     /// than a member settling what one left.
     #[must_use]
     pub const fn executes(self) -> bool {
-        matches!(self, Self::Whole | Self::Core | Self::Leg | Self::Delivery)
-    }
-
-    /// Whether the member only delivers.
-    #[must_use]
-    pub const fn delivers(self) -> bool {
-        matches!(self, Self::Delivery)
+        matches!(self, Self::Whole | Self::Core | Self::Leg)
     }
 }
 
@@ -152,11 +141,10 @@ pub struct TxOutcome {
     /// Whether the block that committed this member took a place in the
     /// drain for it, which its settlement gives back.
     ///
-    /// False for the second member a mixed shard runs of one
-    /// transaction: its issuing member took the place, settled the price
-    /// and committed the signers' nullifiers, so this one releases
-    /// nothing. Attested for the reason `charged` is: the settling block
-    /// counts what it releases with no history behind it.
+    /// False for a member no committing block took a place for: a
+    /// reclaim, or any other member settling what an execution left, so
+    /// it releases nothing. Attested for the reason `charged` is: the
+    /// settling block counts what it releases with no history behind it.
     reserved: bool,
     /// The other shards party to the transaction — the ones whose
     /// certificates its settlement waits on. Ascending and distinct;
@@ -298,7 +286,7 @@ impl TxOutcome {
     #[must_use]
     pub fn reaches_beyond(&self) -> bool {
         match self.role {
-            Role::Core | Role::Leg | Role::Delivery => true,
+            Role::Core | Role::Leg => true,
             Role::Whole | Role::Settling => !self.counterparts.is_empty(),
         }
     }

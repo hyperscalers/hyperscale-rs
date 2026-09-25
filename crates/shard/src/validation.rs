@@ -27,7 +27,6 @@ use crate::admission::{
     RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_all, unwrapped,
 };
-use crate::proposal::readable_deliveries;
 
 /// True if `qc.signers()` represents at least 2f+1 of the local committee's
 /// voting power. The synced-block apply path and consensus pre-vote path
@@ -352,14 +351,7 @@ pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork
         &mut provisions,
         block.provisions().iter().map(unwrapped),
     )?;
-    let readable = readable_deliveries(
-        block.transactions(),
-        block.state_claims(),
-        ctx.schedule,
-        ctx.anchor,
-        ctx.local_shard,
-    );
-    let mut transactions = TransactionsFold::beside(&provisions, &readable);
+    let mut transactions = TransactionsFold::beside(&provisions);
     admit_all::<TransactionsSection<'_>>(
         ctx,
         &mut transactions,
@@ -483,8 +475,7 @@ pub mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
-        TestCommittee, make_finalization, make_undecided_finalization, stub_abort_charge,
-        test_principal,
+        TestCommittee, make_finalization, make_leg_finalization, stub_abort_charge, test_principal,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
@@ -1066,9 +1057,8 @@ pub mod tests {
             .collect();
         let against = plain();
         let provisions = ProvisionsFold::default();
-        let readable = std::collections::HashSet::new();
         let near_cap = || {
-            let mut fold = TransactionsFold::beside(&provisions, &readable);
+            let mut fold = TransactionsFold::beside(&provisions);
             fold.sweepable = MAX_SWEEPABLE_CREATED_PER_BLOCK - full * cells;
             fold
         };
@@ -1807,10 +1797,9 @@ pub mod tests {
     /// — it resolves none — so identity is the only thing that can.
     #[test]
     fn a_committed_certificate_deciding_nothing_cannot_ride_a_second_block() {
-        let fw = Arc::new(make_undecided_finalization(
+        let fw = Arc::new(make_leg_finalization(
             BlockHeight::new(1),
             TxHash::from(Hash::from_bytes(b"retired")),
-            TransactionDecision::Accept,
         ));
         assert_eq!(fw.deciding_tx_hashes().count(), 0);
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);

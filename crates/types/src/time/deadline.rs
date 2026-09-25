@@ -148,19 +148,9 @@ impl Window {
 /// refusing a second inclusion has to remember it.
 ///
 /// The deadline, for every transaction and every shape. A transaction is
-/// admissible while its validity range contains the anchor; past that a
-/// member consuming an owed crossing may still be admitted, and what
-/// licenses that is the crossing's record proved present in the block
-/// admitting it rather than an instant. So there is no window here, and
-/// the index is a tier deep enough to refuse a second inclusion of what
-/// the chain has already carried and no deeper.
-///
-/// A delivery is not refused by this index past the deadline, and is not
-/// meant to be: nothing tombstones one, so re-admission stays open
-/// indefinitely and the claim cell the delivery writes is what refuses a
-/// second one. An index that tried to be that guard would have to hold
-/// every committed transaction to the widest shape's window, for the
-/// sake of the crossings in it.
+/// admissible while its validity range contains the anchor, and never
+/// past it: an owed crossing's delivery is its consumer's commit fold,
+/// which admits no transaction at all.
 #[must_use]
 pub fn admissible_until(tx: &Transaction) -> WeightedTimestamp {
     Deadline::of_transaction(tx).at()

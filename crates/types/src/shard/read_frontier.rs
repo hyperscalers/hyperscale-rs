@@ -32,7 +32,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     Anchor, Block, BlockHeight, Epoch, EpochWindows, RETENTION_HORIZON, ShardId, ShardTrie,
-    StateClaim, SubstateKey, TxHash, WeightedTimestamp,
+    StateClaim, SubstateKey, WeightedTimestamp,
 };
 
 /// Where an anchor sits in its producer's lineage: the epoch whose
@@ -249,9 +249,8 @@ pub struct Reading {
 
 /// What the read frontier fences in a block beyond its raises.
 ///
-/// The record presences its claims carry, the absences beside them, the
-/// record absences that would delete an answer, and the answer cells
-/// its late deliveries would have to find gone.
+/// The record presences its claims carry, the absences beside them, and
+/// the record absences that would delete an answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadFence {
     /// Every held reading whose bytes decode as a crossing record.
@@ -264,11 +263,6 @@ pub struct ReadFence {
     /// owns the record's prefix, so no deletion below the frontier
     /// reaches the fold.
     pub deletions: Vec<Reading>,
-    /// For each transaction carried past its validity end on a record
-    /// presence, the answer cells of every crossing it consumes here.
-    /// While either answer stands the delivery is a replay of one this
-    /// shard already answered, and is refused.
-    pub late_answers: BTreeMap<TxHash, Vec<SubstateKey>>,
 }
 
 /// Why the read frontier refuses a block.
@@ -289,13 +283,6 @@ pub enum FrontierRefusal {
         reading: Reading,
         /// The absence above it.
         absence: Reading,
-    },
-    /// A late delivery whose crossing this shard has already answered.
-    AnswerStands {
-        /// The delivery refused.
-        tx: TxHash,
-        /// The answer cell standing.
-        answer: SubstateKey,
     },
     /// A record absence that would delete an answer, read below the
     /// floor the parent state left for its producer's lineage.
@@ -339,10 +326,6 @@ impl fmt::Display for FrontierRefusal {
                 absence.mark.epoch.inner(),
                 absence.mark.height.inner(),
             ),
-            Self::AnswerStands { tx, answer } => write!(
-                f,
-                "late delivery {tx:?} consumes a crossing whose answer {answer:?} stands",
-            ),
             Self::DeletionBelowFloor { reading, floor } => write!(
                 f,
                 "record {:?} read absent on {:?} at epoch {} height {}, below the read \
@@ -370,26 +353,18 @@ impl fmt::Display for FrontierRefusal {
 pub struct Refused {
     /// The readings refused: record presences and deleting absences.
     pub readings: Vec<Reading>,
-    /// The late deliveries refused.
-    pub deliveries: Vec<TxHash>,
 }
 
 impl ReadFence {
     /// Judge the block against `parent`, the table as the parent state
-    /// left it, and `standing`, whether an answer cell is present in the
-    /// parent state or written by the block's own finalizations.
+    /// left it.
     ///
     /// # Errors
     ///
     /// The first refusal found: a presence below its lineage's floor, a
-    /// presence below a same-block absence of its key, a deleting
-    /// absence below the floor or off the record's owner, or a late
-    /// delivery either of whose answers stands.
-    pub fn check(
-        &self,
-        parent: &ReadFrontier,
-        standing: impl Fn(SubstateKey) -> bool,
-    ) -> Result<(), Box<FrontierRefusal>> {
+    /// presence below a same-block absence of its key, or a deleting
+    /// absence below the floor or off the record's owner.
+    pub fn check(&self, parent: &ReadFrontier) -> Result<(), Box<FrontierRefusal>> {
         for reading in &self.presences {
             if let Some(refusal) = self.refuses_presence(parent, *reading) {
                 return Err(Box::new(refusal));
@@ -400,21 +375,12 @@ impl ReadFence {
                 return Err(Box::new(refusal));
             }
         }
-        for (tx, answers) in &self.late_answers {
-            if let Some(answer) = answers.iter().copied().find(|answer| standing(*answer)) {
-                return Err(Box::new(FrontierRefusal::AnswerStands { tx: *tx, answer }));
-            }
-        }
         Ok(())
     }
 
     /// Everything [`check`](Self::check) would refuse, all of it.
     #[must_use]
-    pub fn refused(
-        &self,
-        parent: &ReadFrontier,
-        standing: impl Fn(SubstateKey) -> bool,
-    ) -> Refused {
+    pub fn refused(&self, parent: &ReadFrontier) -> Refused {
         Refused {
             readings: self
                 .presences
@@ -427,12 +393,6 @@ impl ReadFence {
                         .copied()
                         .filter(|reading| refuses_deletion(parent, *reading).is_some()),
                 )
-                .collect(),
-            deliveries: self
-                .late_answers
-                .iter()
-                .filter(|(_, answers)| answers.iter().any(|answer| standing(*answer)))
-                .map(|(tx, _)| *tx)
                 .collect(),
         }
     }
@@ -641,11 +601,11 @@ mod tests {
         assert_eq!(table.entry(producer), Some(mark(0, 10)));
     }
 
-    /// The fence refuses a presence below the floor, a presence below a
-    /// same-block absence of its key from the same lineage, and a late
-    /// delivery whose answer stands; and passes everything else.
+    /// The fence refuses a presence below the floor and a presence below
+    /// a same-block absence of its key from the same lineage, and passes
+    /// everything else.
     #[test]
-    fn the_fence_refuses_the_three_cases_and_passes_the_rest() {
+    fn the_fence_refuses_the_presence_cases_and_passes_the_rest() {
         let producer = ShardId::leaf(1, 0);
         let sibling = ShardId::leaf(1, 1);
         let record = test_key(0x10);
@@ -655,14 +615,12 @@ mod tests {
             shard,
             mark: mark(epoch, height),
         };
-        let none = |_| false;
-
         let below = ReadFence {
             presences: vec![reading(producer, 3, 49)],
             ..ReadFence::default()
         };
         assert!(matches!(
-            below.check(&parent, none).err().map(|refusal| *refusal),
+            below.check(&parent).err().map(|refusal| *refusal),
             Some(FrontierRefusal::BelowFloor { .. })
         ));
 
@@ -670,11 +628,7 @@ mod tests {
             presences: vec![reading(producer, 3, 50)],
             ..ReadFence::default()
         };
-        assert_eq!(
-            at.check(&parent, none),
-            Ok(()),
-            "at the floor a presence passes"
-        );
+        assert_eq!(at.check(&parent), Ok(()), "at the floor a presence passes");
 
         let under_absence = ReadFence {
             presences: vec![reading(producer, 3, 60)],
@@ -682,10 +636,7 @@ mod tests {
             ..ReadFence::default()
         };
         assert!(matches!(
-            under_absence
-                .check(&parent, none)
-                .err()
-                .map(|refusal| *refusal),
+            under_absence.check(&parent).err().map(|refusal| *refusal),
             Some(FrontierRefusal::BelowAbsence { .. })
         ));
 
@@ -695,35 +646,20 @@ mod tests {
             ..ReadFence::default()
         };
         assert_eq!(
-            sibling_absence.check(&parent, none),
+            sibling_absence.check(&parent),
             Ok(()),
             "an absence from an unrelated lineage orders nothing",
-        );
-
-        let tx = TxHash::from(Hash::from_bytes(b"late"));
-        let answer = test_key(0x20);
-        let late = ReadFence {
-            late_answers: BTreeMap::from([(tx, vec![test_key(0x21), answer])]),
-            ..ReadFence::default()
-        };
-        assert_eq!(late.check(&parent, none), Ok(()));
-        assert_eq!(
-            late.check(&parent, |key| key == answer),
-            Err(Box::new(FrontierRefusal::AnswerStands { tx, answer })),
         );
 
         let everything = ReadFence {
             presences: vec![reading(producer, 3, 49), reading(producer, 3, 60)],
             absences: vec![reading(producer, 3, 61)],
             deletions: Vec::new(),
-            late_answers: late.late_answers,
         };
-        let refused = everything.refused(&parent, |key| key == answer);
         assert_eq!(
-            refused.readings,
+            everything.refused(&parent).readings,
             vec![reading(producer, 3, 49), reading(producer, 3, 60)]
         );
-        assert_eq!(refused.deliveries, vec![tx]);
     }
 
     /// A record absence that would delete an answer is licensed at or
@@ -740,7 +676,6 @@ mod tests {
             shard,
             mark: mark(epoch, height),
         };
-        let none = |_| false;
         let deleting = |readings: Vec<Reading>| ReadFence {
             deletions: readings,
             ..ReadFence::default()
@@ -748,19 +683,19 @@ mod tests {
 
         assert!(matches!(
             deleting(vec![reading(producer, 3, 49)])
-                .check(&parent, none)
+                .check(&parent)
                 .err()
                 .map(|refusal| *refusal),
             Some(FrontierRefusal::DeletionBelowFloor { .. })
         ));
         assert_eq!(
-            deleting(vec![reading(producer, 3, 50)]).check(&parent, none),
+            deleting(vec![reading(producer, 3, 50)]).check(&parent),
             Ok(()),
             "at the floor, from the owner, the absence is the licence",
         );
         assert!(matches!(
             deleting(vec![reading(sibling, 9, 900)])
-                .check(&parent, none)
+                .check(&parent)
                 .err()
                 .map(|refusal| *refusal),
             Some(FrontierRefusal::DeletionOffOwner { .. })
@@ -770,7 +705,7 @@ mod tests {
             reading(producer, 3, 50),
             reading(sibling, 9, 900),
         ])
-        .refused(&parent, none);
+        .refused(&parent);
         assert_eq!(
             refused.readings,
             vec![reading(producer, 3, 49), reading(sibling, 9, 900)],

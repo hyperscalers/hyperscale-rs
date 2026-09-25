@@ -29,7 +29,7 @@ use std::time::Duration;
 use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Capped;
-use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
+use hyperscale_shard::action_handlers::{build_proposal, committing_shards, verify_and_build_qc};
 use hyperscale_shard::local_crossings::{
     disagreeing_parent_reading, misstated_unclaimed, parent_claims,
 };
@@ -1462,7 +1462,6 @@ impl ShardCoordinatorSim {
                 classification_topology_snapshot: classification_topology,
                 frontier,
                 fence: _,
-                record_licences: _,
                 parent_anchor,
                 local_crossings,
             } => {
@@ -1703,10 +1702,8 @@ impl ShardCoordinatorSim {
                 expected_root,
                 transactions,
                 validity_anchor,
-                late_deliveries,
             } => {
                 let tx_ctx = TransactionRootContext {
-                    late_deliveries: &late_deliveries,
                     transactions: &transactions,
                     validity_anchor,
                 };
@@ -1758,10 +1755,12 @@ impl ShardCoordinatorSim {
                 transactions,
                 topology_snapshot,
             } => {
+                let committing = committing_shards(&topology_snapshot);
                 let ptx_ctx = ProvisionTxRootsContext {
                     local_shard: self.shard,
                     topology_snapshot: &topology_snapshot,
                     transactions: &transactions,
+                    committing: &committing,
                 };
                 let result = expected.verify(&ptx_ctx);
                 self.loopback_q.push_back(Envelope {

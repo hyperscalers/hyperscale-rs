@@ -7,11 +7,10 @@
 //! the store.
 //!
 //! Retention is the deadline the caller passes, which is the same
-//! `admissible_until` that let the transaction in: its validity end,
-//! and for one this shard only ever delivers for, the close of the
-//! delivery window that end opens. A transaction admissible until some
-//! instant has to stay refusable until the same one, or the tombstone
-//! expires while admission would still take it back.
+//! `admissible_until` that let the transaction in: its validity end. A
+//! transaction admissible until some instant has to stay refusable until
+//! the same one, or the tombstone expires while admission would still
+//! take it back.
 //!
 //! Past that point even a re-submission is rejected by block validity
 //! (the validator-side check on `validity_range`), so the tombstone is no

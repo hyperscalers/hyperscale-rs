@@ -13,7 +13,7 @@ use serde_json::{Value, to_value};
 
 /// Every event kind, and the exact keys its payload carries.
 fn expected() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
-    let kinds: [(&str, &[&str]); 12] = [
+    let kinds: [(&str, &[&str]); 13] = [
         (
             "blockCommitted",
             &[
@@ -29,6 +29,10 @@ fn expected() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("topologyChanged", &["shards", "appeared", "retired"]),
         (
             "provisionsVerified",
+            &["from", "fromHeight", "to", "toHeight", "txs"],
+        ),
+        (
+            "crossingCredited",
             &["from", "fromHeight", "to", "toHeight", "txs"],
         ),
         (

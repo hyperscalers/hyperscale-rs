@@ -968,21 +968,9 @@ pub fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> F
 /// the outcome decides nothing, since the transaction's core decides it.
 #[must_use]
 pub fn make_leg_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
-    make_undecided_finalization(block_height, tx_hash, TransactionDecision::Accept)
-}
-
-/// A finalization at `block_height` whose outcome for `tx_hash` decides
-/// nothing whichever way it went: a leg's success, or a delivery's
-/// outcome either way.
-#[must_use]
-pub fn make_undecided_finalization(
-    block_height: BlockHeight,
-    tx_hash: TxHash,
-    decision: TransactionDecision,
-) -> Finalization {
     finalization_of(
         block_height,
-        vec![TxOutcome::new(tx_hash, outcome_of(decision)).as_role(Role::Delivery)],
+        vec![TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)).as_role(Role::Leg)],
     )
 }
 

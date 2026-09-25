@@ -612,8 +612,7 @@ fn events_land_on_their_emitters_home_shard_sim() {
 
 #[test]
 fn attested_load_reaches_the_beacon_sim() {
-    let mut cluster =
-        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    let mut cluster = venue_cluster(42);
     attested_load_reaches_the_beacon(&mut cluster);
 }
 
@@ -800,11 +799,9 @@ fn a_crossing_the_consumer_refuses_is_declined_sim() {
 /// the input stays locked until the cut lifts. Sim-only — the span runs
 /// past the close of `Window::Core`, minutes of weighted time.
 ///
-/// Under the production epoch length only: at the default 30 s epoch
-/// `BUNDLE_WAIT` closes the trader's delivery window 150 s after the
-/// commit, short of the core window's close 240 s past the deadline, so
-/// the route's output is a delivery cut off past its window — the
-/// delivery scenarios' case, not this one's.
+/// Under the production epoch length only: at the default 30 s epoch the
+/// route accepts once the cut lifts, but its output is never banked and
+/// the trader's input record stays locked.
 #[cfg(feature = "production-epochs")]
 #[test]
 fn a_route_whose_core_never_combines_holds_its_input_sim() {

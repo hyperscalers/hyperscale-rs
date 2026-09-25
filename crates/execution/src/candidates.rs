@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_engine::legs::{Classified, Member, Runs, Side};
+use hyperscale_engine::legs::{Classified, Member, Runs};
 use hyperscale_types::{
     EscrowedValue, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
 };
@@ -69,9 +69,10 @@ impl Candidate {
     }
 }
 
-/// What committed claims attested for the edges `tx`'s legs on `local`
-/// consume: each crossing landing here, with the value its record cell
-/// says left.
+/// What committed claims attested for the escrowed edges `tx`'s legs on
+/// `local` consume: each crossing landing here, with the value its
+/// record cell says left. An owed crossing is credited by the commit
+/// fold and never arrives in a member.
 ///
 /// A divided member only. The cell was proven against the producer's
 /// committed root by the claim that carried it, and its bytes are the
@@ -83,7 +84,6 @@ fn arrivals_for(
     classified: &Classified,
     provisioning: &ProvisioningTracker,
     local: ShardId,
-    side: Side,
 ) -> Vec<EscrowedValue> {
     if !classified.decomposed() {
         return Vec::new();
@@ -91,10 +91,7 @@ fn arrivals_for(
     classified
         .edges()
         .iter()
-        .filter(|edge| {
-            edge.to.contains(&local)
-                && (edge.crossing.kind == Kind::Owed) == (side == Side::Delivering)
-        })
+        .filter(|edge| edge.to.contains(&local) && edge.crossing.kind == Kind::Escrowed)
         .filter_map(|edge| {
             let key = edge.crossing.id.record_key(&ProtocolHasher);
             let record = provisioning.arrived().get(&key)?.cell;
@@ -171,19 +168,12 @@ impl TickCandidates {
         committed_prices: PriceTable,
         classified: Classified,
     ) {
-        let side = classified.first_side_at(self.local_shard);
-        let member = Member::of(classified, self.local_shard, side, participating);
+        let member = Member::of(classified, self.local_shard, participating);
         self.register_member(tx, member, committed_ts, committed_prices);
     }
 
     /// Record `member` of `tx` as a candidate, under the clock of the
     /// block that committed it.
-    ///
-    /// A mixed shard's delivering member arrives here once a tick has
-    /// taken its issuing one: this shard runs outbound legs beside the
-    /// inbound ones, and they wait on what the core returns. It waits on
-    /// no engagement — the issuing member settled that — and runs under
-    /// the same committing block's clock.
     pub fn register_member(
         &mut self,
         tx: Arc<Verified<Transaction>>,
@@ -291,12 +281,7 @@ impl TickCandidates {
             // What arrived for the edges this member's legs consume, read
             // off the record cells the committed claims proved. Every
             // requirement is met, so every edge has its cell.
-            let arrivals = arrivals_for(
-                candidate.member.classified(),
-                provisioning,
-                local,
-                candidate.member.side(),
-            );
+            let arrivals = arrivals_for(candidate.member.classified(), provisioning, local);
             // A remote-payer leg executes under the anchor its payer
             // bundle carried; every other member under its own committing
             // block's.
@@ -340,35 +325,6 @@ impl TickCandidates {
         self.candidates.remove(&tx_hash);
     }
 
-    /// Drop every delivering candidate `owed` no longer names.
-    ///
-    /// A delivery runs on no clock of its own — the crossing it claims
-    /// is owed to this shard, and nothing takes it back — so what ends
-    /// its wait is the ledger letting the entry go: at the horizon past
-    /// which the record could not be disposed of anyway, or when the
-    /// delivery's own finalization commits. Read off the ledger rather
-    /// than a deadline here, so the candidate and the obligation end
-    /// together.
-    ///
-    /// A mixed shard's delivering member is the one that reaches this:
-    /// registered beside its issuing member, and removed by nothing
-    /// else, since its ledger entry is the leg's and a leg is never
-    /// abandoned.
-    pub fn drop_unowed_deliveries(&mut self, owed: impl Fn(TxHash) -> bool) -> Vec<TxHash> {
-        let dropped: Vec<TxHash> = self
-            .candidates
-            .iter()
-            .filter(|(tx_hash, candidate)| {
-                candidate.member.side() == Side::Delivering && !owed(**tx_hash)
-            })
-            .map(|(tx_hash, _)| *tx_hash)
-            .collect();
-        for tx_hash in &dropped {
-            self.candidates.remove(tx_hash);
-        }
-        dropped
-    }
-
     /// Whether a transaction is still waiting for a tick.
     #[must_use]
     pub fn contains(&self, tx_hash: TxHash) -> bool {
@@ -401,8 +357,8 @@ impl TickCandidates {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::WeightedTimestamp;
     use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
-    use hyperscale_types::{Deadline, MAX_VALIDITY_RANGE, WeightedTimestamp};
 
     use super::*;
 
@@ -515,92 +471,6 @@ mod tests {
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000));
         assert_eq!(admitted.len(), 1);
         assert!(admitted[0].request.runs.reaches_beyond());
-    }
-
-    /// A delivering candidate is on no clock of its own. The crossing it
-    /// claims is owed to this shard from the moment the core committed
-    /// it, so nothing takes it back and nothing here gives it up: the
-    /// candidate waits however long its provision takes, and joins a
-    /// tick whenever the record arrives. What ends the wait is the
-    /// ledger letting the entry go, never a deadline.
-    #[test]
-    fn a_delivering_candidate_waits_however_late_its_provision_is() {
-        let mut candidates = TickCandidates::new(LOCAL);
-        let remote = ShardId::leaf(1, 1);
-        let delivery = tx(6);
-        let delivered = delivery.hash();
-        let end = delivery.validity_range().end_timestamp_exclusive;
-        candidates.register_member(
-            delivery,
-            Member::of(
-                Classified::whole(),
-                LOCAL,
-                Side::Delivering,
-                BTreeSet::from([LOCAL, remote]),
-            ),
-            ms(1_000),
-            PriceTable::GENESIS,
-        );
-
-        // Past every instant the old delivery window closed at, and past
-        // the transaction's own deadline.
-        let late = Deadline::of(end).at().plus(MAX_VALIDITY_RANGE);
-        let mut provisioning = ProvisioningTracker::new();
-        assert!(
-            candidates
-                .compose(&provisioning, &mut ProvisionalCells::default(), late)
-                .is_empty(),
-            "nothing has arrived for it",
-        );
-        assert!(candidates.contains(delivered), "so it is still waiting");
-
-        assert!(
-            candidates.drop_unowed_deliveries(|_| true).is_empty(),
-            "and nothing drops it while the ledger still owes it",
-        );
-
-        provisioning.record_required(delivered, BTreeSet::new());
-        let admitted = candidates.compose(&provisioning, &mut ProvisionalCells::default(), late);
-        assert_eq!(
-            admitted.len(),
-            1,
-            "and the record arriving is what takes it, whenever that is",
-        );
-        assert!(!candidates.contains(delivered));
-    }
-
-    /// A delivering candidate the ledger has let go of has nothing left
-    /// to run: the entry it stood for is gone, so the record it would
-    /// claim is past the horizon anything could dispose of it in. An
-    /// issuing candidate is not the ledger's to end this way.
-    #[test]
-    fn a_delivering_candidate_goes_when_its_entry_does() {
-        let mut candidates = TickCandidates::new(LOCAL);
-        let remote = ShardId::leaf(1, 1);
-        let delivery = tx(6);
-        let delivered = delivery.hash();
-        candidates.register_member(
-            delivery,
-            Member::of(
-                Classified::whole(),
-                LOCAL,
-                Side::Delivering,
-                BTreeSet::from([LOCAL, remote]),
-            ),
-            ms(1_000),
-            PriceTable::GENESIS,
-        );
-        let issuing = local_only(&mut candidates, tx(7));
-
-        assert_eq!(
-            candidates.drop_unowed_deliveries(|_| false),
-            vec![delivered],
-        );
-        assert!(!candidates.contains(delivered));
-        assert!(
-            candidates.contains(issuing),
-            "an issuing candidate ends with its own outcome",
-        );
     }
 
     /// The payer's leg does not execute until its counterparts have

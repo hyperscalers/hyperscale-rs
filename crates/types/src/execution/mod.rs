@@ -112,8 +112,12 @@ mod tests {
     #[test]
     fn test_compute_provision_tx_roots_empty() {
         let topology_snapshot = two_shard_topology();
-        let map =
-            Verified::<ProvisionTxRootsMap>::compute(ShardId::leaf(1, 0), &topology_snapshot, &[]);
+        let map = Verified::<ProvisionTxRootsMap>::compute(
+            ShardId::leaf(1, 0),
+            &topology_snapshot,
+            &[],
+            &|tx| topology_snapshot.all_shards_for_transaction(tx),
+        );
         assert!(map.is_empty());
     }
 
@@ -130,6 +134,7 @@ mod tests {
             ShardId::leaf(1, 0),
             &topology_snapshot,
             &[tx],
+            &|tx| topology_snapshot.all_shards_for_transaction(tx),
         );
         assert!(map.is_empty(), "single-shard tx must not produce an entry");
     }
@@ -156,6 +161,7 @@ mod tests {
             ShardId::leaf(1, 0),
             &topology_snapshot,
             &[tx_a.clone(), tx_b.clone()],
+            &|tx| topology_snapshot.all_shards_for_transaction(tx),
         );
 
         // Local shard excluded; only shard 1 receives provisions.
