@@ -23,6 +23,7 @@ mod faults;
 mod fees;
 mod liveness;
 mod multi_vnode;
+mod pushes;
 mod reshape;
 mod route;
 mod route_reshape;
@@ -68,6 +69,11 @@ pub use fees::{
 };
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
+pub use pushes::{
+    a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
+    a_rejoined_producer_asks_a_lost_answer, a_withheld_fallback_is_asked_by_an_honest_validator,
+    an_answer_written_past_the_deadline_is_read_on_a_later_ask,
+};
 pub use reshape::{
     MAX_REPLAY_PROBES, grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
     merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,

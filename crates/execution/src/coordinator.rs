@@ -2794,7 +2794,7 @@ impl ExecutionCoordinator {
         // producer block.
         if self
             .counterparts
-            .refuses_pushed(&claim, topology_schedule.windows())
+            .refuse_pushed(&claim, topology_schedule.windows())
         {
             record_crossing_push_dropped("below_floor");
             return vec![];

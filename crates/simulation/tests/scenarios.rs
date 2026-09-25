@@ -35,6 +35,7 @@ use hyperscale_scenarios::{
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
+    a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_priority_is_charged_over_the_table_price,
     a_published_package_runs_where_it_was_never_committed,
@@ -54,7 +55,8 @@ use hyperscale_scenarios::{
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
-    abort_converges, attested_load_reaches_the_beacon,
+    a_withheld_fallback_is_asked_by_an_honest_validator, abort_converges,
+    an_answer_written_past_the_deadline_is_read_on_a_later_ask, attested_load_reaches_the_beacon,
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
@@ -563,6 +565,11 @@ fn cross_shard_transfer_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     cross_shard_transfer(&mut cluster);
+    assert_eq!(
+        cluster.metric("crossing_fallback_asks", None),
+        0,
+        "with no loss the answer and the removal both arrive by push",
+    );
 }
 
 #[test]
@@ -718,6 +725,11 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
 fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
     let mut cluster = venue_cluster(42);
     a_swap_charges_its_caller_its_input_and_one_price(&mut cluster, epochs(40));
+    assert_eq!(
+        cluster.metric("crossing_fallback_asks", None),
+        0,
+        "an escrowed crossing's answers and removals arrive by push",
+    );
 }
 
 #[test]
@@ -745,6 +757,11 @@ fn a_route_settles_across_two_venues_sim() {
     println!(
         "two-venue route: {} routes settled in {:?}",
         report.submitted, report.elapsed,
+    );
+    assert_eq!(
+        cluster.metric("crossing_fallback_asks", None),
+        0,
+        "every hop's answers and removals arrive by push",
     );
 }
 
@@ -858,6 +875,46 @@ fn a_healed_network_delivers_past_the_old_window_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     cluster.run_faultable(a_healed_network_delivers_past_the_old_window);
+}
+
+#[test]
+fn a_lost_answer_push_is_asked_past_the_deadline_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_lost_answer_push_is_asked_past_the_deadline);
+}
+
+#[test]
+fn a_withheld_fallback_is_asked_by_an_honest_validator_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_withheld_fallback_is_asked_by_an_honest_validator);
+}
+
+#[test]
+fn a_lost_removal_push_is_asked_past_the_deadline_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_lost_removal_push_is_asked_past_the_deadline);
+}
+
+#[test]
+fn an_answer_written_past_the_deadline_is_read_on_a_later_ask_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(an_answer_written_past_the_deadline_is_read_on_a_later_ask);
 }
 
 #[test]

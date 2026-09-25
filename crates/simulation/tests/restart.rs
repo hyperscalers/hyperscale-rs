@@ -19,13 +19,14 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
-    HALT_STRADDLER_BATCH, build_swap_tx, build_transfer_tx, genesis_accounts, halt_straddler_setup,
-    recipient, sender, validity_around,
+    HALT_STRADDLER_BATCH, build_swap_tx, build_transfer_tx, cross_shard_genesis_accounts,
+    genesis_accounts, halt_straddler_setup, recipient, sender, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
-    Cluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig, VENUE_SHARD, epochs,
-    grind_onto, split_lifecycle, stand_up_venue, venue_genesis_accounts,
+    Cluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig, VENUE_SHARD,
+    a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
+    venue_genesis_accounts,
 };
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::SimCluster;
@@ -461,4 +462,34 @@ fn payer_reclaims_after_restart(seed: u64, co_hosted: bool) {
         funded - price,
         heights(&cluster, SWAPPER_SHARD),
     );
+}
+
+/// A payer replica restarted past a crossing's deadline asks the answer
+/// whose push was lost at once, carrying no backoff across the restart.
+#[test]
+fn a_restarted_producer_asks_a_lost_answer_at_once() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &venue_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(|c| {
+        a_rejoined_producer_asks_a_lost_answer(c, SimCluster::restart_host);
+    });
+}
+
+/// A payer replica snap-synced past a crossing's deadline asks the
+/// answer whose push was lost at once, off the rows it imported.
+#[test]
+fn a_snap_synced_producer_asks_a_lost_answer_at_once() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &venue_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(|c| {
+        a_rejoined_producer_asks_a_lost_answer(c, |c, host, shard| {
+            c.resync_host(host, shard);
+        });
+    });
 }

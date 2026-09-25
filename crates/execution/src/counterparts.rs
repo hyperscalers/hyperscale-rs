@@ -24,10 +24,10 @@ use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK,
-    MAX_VALIDITY_RANGE, MerkleInclusionProof, ProvenAnchors, RETENTION_HORIZON, ReadFrontier,
-    ReadMark, SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, Stated, SubstateKey,
-    TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UNCLAIMED_CROSSING_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable, Verified,
+    MAX_VALIDITY_RANGE, MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON,
+    ReadFrontier, ReadMark, SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, Stated,
+    SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UNCLAIMED_CROSSING_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
@@ -195,6 +195,13 @@ impl CrossingIndex for TestRows {
 /// question nothing has answered.
 const MAX_ANSWER_ASK_GAP: u64 = 64;
 
+/// The gap, in the counterpart's heights, before the next ask of an
+/// answer asked `asked` times without one: `2^(asked-1)`, capped at
+/// [`MAX_ANSWER_ASK_GAP`], so the asks fall at `h, h+1, h+3, h+7, ...`.
+fn answer_ask_gap(asked: u32) -> u64 {
+    (1u64 << asked.saturating_sub(1).min(6)).min(MAX_ANSWER_ASK_GAP)
+}
+
 /// One question a crossing row of this shard's puts to a counterpart,
 /// with its pacing and nothing that records an answer.
 ///
@@ -300,12 +307,14 @@ fn fenced_readings(asks: &BTreeMap<SubstateKey, Asked>, claim: &StateClaim) -> (
 }
 
 /// A question this validator put to a counterpart: the question, the
-/// header it was asked at, and whether the fetch has returned.
+/// header it was asked at, whether the fetch has returned, and how many
+/// times it has been asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Probe {
     question: Question,
     anchor: Anchor,
     returned: bool,
+    asked: u32,
 }
 
 /// What a commit folded, and what it could not answer for.
@@ -731,11 +740,18 @@ impl Counterparts {
             // answered nothing is moved on, which is how a cell read
             // outside its window is asked again — at a newer header,
             // not of the same one every block.
+            //
+            // An answer is the fallback for a push that did not land, so
+            // it backs off as the leaf's questions do; a core's cell has
+            // no push to stand in for and is asked at every newer header.
+            let answer = matches!(probed, Probed::Claim | Probed::Decline);
+            let prior = self.probes.get(&(shard, key)).copied();
+            let gap = |asked| if answer { answer_ask_gap(asked) } else { 1 };
             if self.holds_answer(shard, key)
-                || self
-                    .probes
-                    .get(&(shard, key))
-                    .is_some_and(|probe| !probe.returned || probe.anchor.height >= anchor.height)
+                || prior.is_some_and(|probe| {
+                    !probe.returned
+                        || anchor.height.inner() < probe.anchor.height.inner() + gap(probe.asked)
+                })
             {
                 continue;
             }
@@ -745,8 +761,12 @@ impl Counterparts {
                     question,
                     anchor,
                     returned: false,
+                    asked: prior.map_or(1, |probe| probe.asked.saturating_add(1)),
                 },
             );
+            if answer {
+                record_crossing_fallback_ask("producer");
+            }
             wanted.entry(anchor).or_default().push(key);
         }
     }
@@ -886,8 +906,9 @@ impl Counterparts {
             let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
                 continue;
             };
-            let gap = (1u64 << step.saturating_sub(1).min(6)).min(MAX_ANSWER_ASK_GAP);
-            if asked_at.is_some_and(|asked| anchor.height.inner() < asked.inner() + gap) {
+            if asked_at
+                .is_some_and(|asked| anchor.height.inner() < asked.inner() + answer_ask_gap(step))
+            {
                 continue;
             }
             // They are two keys under one owner, so this is one fetch and
@@ -1246,61 +1267,84 @@ impl Counterparts {
 
     /// Drop every held claim with a fenced reading below the floor the
     /// frontier now sets for its producer, whether a fetch or a push
-    /// brought it, and start its keys' reads over so the next probe asks
-    /// again at a proven anchor at or above the floor. A claim carrying
-    /// no fenced reading is left to the age bound and the ledger: a
-    /// bare reading below the floor is admissible.
+    /// brought it. A claim carrying no fenced reading is left to the age
+    /// bound and the ledger: a bare reading below the floor is
+    /// admissible.
     fn drop_below_floor(&mut self, windows: EpochWindows) {
-        let frontier = &self.frontier;
-        let asks = &self.asks;
-        let mut reset: Vec<SubstateKey> = Vec::new();
-        let mut reread: Vec<SubstateKey> = Vec::new();
-        self.fetched.retain(|claim, _| {
-            if !frontier.refuses(claim.anchor.shard, ReadMark::of(&claim.anchor, windows)) {
-                return true;
-            }
-            let (record, removed) = fenced_readings(asks, claim);
-            if !record && !removed {
-                return true;
-            }
-            if record {
-                record_fenced_claim("record", false);
-            }
-            if removed {
-                record_fenced_claim("removed", false);
-            }
-            reset.extend(claim.keys());
-            reread.extend(claim.cells.iter().filter_map(|(key, stated)| {
+        let refused: Vec<StateClaim> = self
+            .fetched
+            .keys()
+            .filter(|claim| {
+                self.frontier
+                    .refuses(claim.anchor.shard, ReadMark::of(&claim.anchor, windows))
+            })
+            .filter(|claim| {
+                let (record, removed) = fenced_readings(&self.asks, claim);
+                record || removed
+            })
+            .cloned()
+            .collect();
+        for claim in refused {
+            self.fetched.remove(&claim);
+            self.refuse_fenced(&claim);
+        }
+    }
+
+    /// Whether a pushed claim sits below the read frontier's floor for
+    /// its producer: one every voter refuses, so not worth holding. A
+    /// refused one carrying a fenced reading starts its keys' reads over,
+    /// as a held one the floor rises past does.
+    pub(crate) fn refuse_pushed(&mut self, claim: &StateClaim, windows: EpochWindows) -> bool {
+        if !self
+            .frontier
+            .refuses(claim.anchor.shard, ReadMark::of(&claim.anchor, windows))
+        {
+            return false;
+        }
+        self.refuse_fenced(claim);
+        true
+    }
+
+    /// Count a claim the frontier refused and start its fenced keys'
+    /// reads over, so the next probe asks again at a proven anchor at or
+    /// above the floor.
+    ///
+    /// A record a consumer here waits on is read again at once, and so
+    /// is one whose removal was refused: the push that would have
+    /// settled the answer is gone. A refused presence behind an answer
+    /// keeps its backoff, or every carried reading that raises the floor
+    /// past another validator's held one restarts that validator's asks.
+    fn refuse_fenced(&mut self, claim: &StateClaim) {
+        let (record, removed) = fenced_readings(&self.asks, claim);
+        if record {
+            record_fenced_claim("record", false);
+        }
+        if removed {
+            record_fenced_claim("removed", false);
+        }
+        if !record && !removed {
+            return;
+        }
+        let reread: Vec<SubstateKey> = claim
+            .cells
+            .iter()
+            .filter_map(|(key, stated)| {
                 (stated.inclusion() == Inclusion::Absent
-                    && matches!(asks.get(key), Some(Asked::Record { .. })))
+                    && matches!(self.asks.get(key), Some(Asked::Record { .. })))
                 .then_some(*key)
-            }));
-            false
-        });
-        // A record a consumer here waits on is read again at once, and so
-        // is one whose removal was refused: the push that would have
-        // settled the answer is gone. A refused presence behind an
-        // answer keeps its backoff, or every carried reading that raises
-        // the floor past another validator's held one restarts that
-        // validator's asks.
+            })
+            .collect();
         for key in reread {
             if let Some(Asked::Record { reread, .. }) = self.asks.get_mut(&key) {
                 *reread = true;
             }
             self.records.reset(key);
         }
-        for key in reset {
+        for key in claim.keys() {
             if self.wanted.contains(&key) {
                 self.records.reset(key);
             }
         }
-    }
-
-    /// Whether a pushed claim sits below the read frontier's floor for
-    /// its producer: one every voter refuses, so not worth holding.
-    pub(crate) fn refuses_pushed(&self, claim: &StateClaim, windows: EpochWindows) -> bool {
-        self.frontier
-            .refuses(claim.anchor.shard, ReadMark::of(&claim.anchor, windows))
     }
 
     /// Note the producer anchors a committed claim read a record present
@@ -2650,6 +2694,60 @@ mod tests {
         );
         assert!(producer.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000)));
         assert_eq!(producer.state_claims().len(), 1, "and offered in a block");
+    }
+
+    /// A removal pushed below the read frontier's floor is refused on
+    /// arrival, and the answer behind it reads the record again at once,
+    /// at the newest proven anchor above the floor, well before the
+    /// deadline that would otherwise open the question.
+    #[test]
+    fn a_refused_removal_push_is_reread_at_once() {
+        let Answering {
+            mut counterparts,
+            trie,
+            anchors,
+            record,
+            ..
+        } = answering();
+        let windows = EpochWindows::new(0);
+        let at = |height: u64| Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: WeightedTimestamp::from_millis(height * 1_000),
+        };
+        let (stale, newest) = (at(3), at(9));
+        anchors.record(stale);
+        anchors.record(newest);
+        counterparts.frontier =
+            ReadFrontier::from_entries([(PRODUCER, ReadMark::of(&at(6), windows))]);
+        let early = WeightedTimestamp::from_millis(10_000);
+        assert!(
+            counterparts.probe(&trie, early, &[], windows).is_empty(),
+            "before the deadline the push is the only carrier",
+        );
+
+        let removal = reading(stale, record, Inclusion::Absent);
+        assert!(
+            counterparts.refuse_pushed(&removal, windows),
+            "every voter refuses a removal below the floor",
+        );
+        let asked = counterparts.probe(&trie, early, &[], windows);
+        assert!(
+            matches!(
+                asked.as_slice(),
+                [Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::StateProofs(keys),
+                    shard,
+                    ..
+                })] if *shard == PRODUCER && keys.as_slice() == [(newest, record)],
+            ),
+            "so the record is read again at once, at the newest anchor: {asked:?}",
+        );
+        assert!(
+            counterparts.probe(&trie, early, &[], windows).is_empty(),
+            "once, and not again before the deadline",
+        );
     }
 
     /// A producer asks after both answers at one anchor, and a decline
