@@ -1920,7 +1920,7 @@ pub fn a_healed_network_delivers_past_the_old_window<C: FaultableCluster>(c: &mu
 /// Panics if the payer's leg does not accept, if the push is never
 /// exercised, if the credit lands while the cut stands, if the recipient
 /// is not paid once the network heals, or if any value is left stranded.
-pub fn a_delivery_lands_past_every_window_once_the_bundle_arrives<C: FaultableCluster>(c: &mut C) {
+pub fn a_delivery_lands_past_every_window_once_its_record_arrives<C: FaultableCluster>(c: &mut C) {
     let (payer_key, from, to) = cross_shard_cast();
     let payer_shard = ShardId::leaf(1, 0);
     let recipient_shard = ShardId::leaf(1, 1);

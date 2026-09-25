@@ -21,6 +21,8 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::{
     ScenarioConfig, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
+    a_delivery_lands_past_every_window_once_its_record_arrives,
+    a_healed_network_delivers_past_the_old_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_skip_deferred_split_keeps_every_settlement_in_its_window, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
@@ -253,6 +255,32 @@ fn a_delivery_cut_off_past_its_window_is_owed_prod() {
         cross_shard_genesis_accounts(),
     );
     cluster.run_faultable(a_delivery_cut_off_past_its_window_is_owed);
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_delivery_lands_past_every_window_once_its_record_arrives_prod() {
+    let mut cluster = ProdCluster::start_with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        EPOCH_MS,
+        cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_delivery_lands_past_every_window_once_its_record_arrives);
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_healed_network_delivers_past_the_old_window_prod() {
+    let mut cluster = ProdCluster::start_with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        EPOCH_MS,
+        cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_healed_network_delivers_past_the_old_window);
 }
 
 #[test]

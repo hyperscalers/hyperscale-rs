@@ -35,7 +35,7 @@ mod witnesses;
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use execution::{
     a_delivery_cut_off_past_its_window_is_owed,
-    a_delivery_lands_past_every_window_once_the_bundle_arrives,
+    a_delivery_lands_past_every_window_once_its_record_arrives,
     a_failed_attempt_still_attests_work, a_healed_network_delivers_past_the_old_window,
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
@@ -110,7 +110,8 @@ pub use route_reshape::{
 pub use straddler::{
     a_delivery_is_owed_when_its_deliverer_splits,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
-    a_skip_deferred_split_keeps_every_settlement_in_its_window, isolate_ec_intake,
+    a_skip_deferred_split_keeps_every_settlement_in_its_window,
+    an_owed_crossing_a_merge_converges_is_credited_on_the_successor, isolate_ec_intake,
     merge_straddler_atomic, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
 };

@@ -28,8 +28,8 @@ use crate::support::query::{
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, PaymentLeg,
     STRADDLER_SPLITTER, STRADDLER_SURVIVOR, build_leg_payment_tx, build_reshape_threshold_vote_tx,
-    build_transfer_tx, merge_straddler_setup, pool_operator, split_issuer_straddler_setup,
-    split_straddler_setup, validity_around, voted_split_bytes,
+    build_transfer_tx, merge_convergence_setup, merge_straddler_setup, pool_operator,
+    split_issuer_straddler_setup, split_straddler_setup, validity_around, voted_split_bytes,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor,
@@ -1028,6 +1028,102 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
 
     assert_fence_held(c, merge_left, terminal_b, &probes);
     world.assert_settles_within(c, &charges, epochs(8), "straddlers across a merge");
+}
+
+/// An owed crossing whose two ends a merge puts on one shard is credited
+/// by the successor off its own parent's reading, once.
+///
+/// The payer sits on one merging child and the recipient on the other.
+/// Every record push is cut for the whole run, so the transfer accepts on
+/// the payer's child and its record stands while the recipient's child
+/// never hears of it. The pair merges with the crossing unanswered. The
+/// successor holds both prefixes, reads the record at its own parent as
+/// the value it holds, and its fold credits the recipient and writes the
+/// `Taken` that retires the record. Neither the recipient's child nor the
+/// successor ever includes the transfer. Requires the
+/// [`merge_convergence_setup`] genesis.
+///
+/// # Panics
+///
+/// Panics if the transfer does not accept, if the credit lands before the
+/// merge, if the merge does not execute or its successor never credits,
+/// or if any chain holding the recipient includes the transfer.
+pub fn an_owed_crossing_a_merge_converges_is_credited_on_the_successor<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let merge_left = MERGE_STRADDLER_LEFT;
+    let merge_right = MERGE_STRADDLER_RIGHT;
+    let merge_parent = merge_left.parent().expect("a depth-2 leaf has a parent");
+    let (payer_key, payer, recipient) = merge_convergence_setup().converging;
+    assert!(
+        await_serves(c, merge_left, epochs(4)) && await_serves(c, merge_right, epochs(4)),
+        "the grown four-shard topology must seat the merging pair",
+    );
+
+    let pushes = c.drop_type("crossing.readings");
+    let recipient_before = vault_balance(c, merge_right, recipient);
+    let mut world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [payer.address(), recipient.address()],
+        [],
+    );
+    let mut charges = Charges::default();
+    let tx = build_transfer_tx(&payer_key, payer, recipient, 100, validity_around(c.now()));
+    let records = crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    );
+    let [record] = records.as_slice() else {
+        panic!("a transfer crosses once: {records:?}");
+    };
+    world.owing([*record]);
+    let hash = charges.submit(c, tx);
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's child accepts the transfer; verdict = {verdict:?}",
+    );
+
+    assert!(
+        await_merge_keeper_count(c, merge_parent, 3, epochs(24)),
+        "the light merging pair must pair a keeper quorum within budget",
+    );
+    assert_eq!(
+        vault_balance(c, merge_right, recipient),
+        recipient_before,
+        "the recipient's child is never credited while every push is cut",
+    );
+    assert!(
+        c.run_until(epochs(16), |c| merge_executed(c, merge_parent)),
+        "the merge must gate within budget",
+    );
+    assert!(
+        await_serves(c, merge_parent, epochs(28)),
+        "the merged parent must be served within budget",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| vault_balance(c, merge_parent, recipient)
+            == recipient_before + 100),
+        "the successor credits the converged crossing off its own reading; holds {}",
+        vault_balance(c, merge_parent, recipient),
+    );
+    assert!(
+        pushes.fired() > 0,
+        "the record's push was exercised and cut"
+    );
+    for shard in [merge_right, merge_parent] {
+        assert!(
+            c.chain_fate(shard, hash).0.is_none(),
+            "{shard:?} holds the recipient and never includes the transfer",
+        );
+    }
+    c.clear_drops();
+    world.assert_settles_within(c, &charges, epochs(8), "an owed crossing a merge converged");
 }
 
 /// Whether the merge into `parent` has executed: the reformed parent is seated

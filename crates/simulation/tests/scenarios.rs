@@ -15,19 +15,19 @@ use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
     cross_shard_genesis_accounts, genesis_accounts, halt_recovery_split_bytes,
-    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts, merge_split_bytes,
-    merge_straddler_setup, native_pq_genesis_accounts, nullifier_race_genesis_accounts,
-    overdraw_genesis_accounts, participant_sweep_genesis_accounts, probe_train_genesis_accounts,
-    remote_delegator, reshape_lifecycle_accounts, securify_genesis_accounts,
-    shared_recipient_genesis_accounts, split_issuer_straddler_setup, split_straddler_setup,
-    staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
-    unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
+    merge_convergence_setup, merge_split_bytes, merge_straddler_setup, native_pq_genesis_accounts,
+    nullifier_race_genesis_accounts, overdraw_genesis_accounts, participant_sweep_genesis_accounts,
+    probe_train_genesis_accounts, remote_delegator, reshape_lifecycle_accounts,
+    securify_genesis_accounts, shared_recipient_genesis_accounts, split_issuer_straddler_setup,
+    split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
+    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Budget, Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
-    a_delivery_lands_past_every_window_once_the_bundle_arrives,
+    a_delivery_lands_past_every_window_once_its_record_arrives,
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
     a_healed_network_delivers_past_the_old_window,
@@ -57,10 +57,12 @@ use hyperscale_scenarios::{
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
     a_withheld_fallback_is_asked_by_an_honest_validator, abort_converges,
-    an_answer_written_past_the_deadline_is_read_on_a_later_ask, attested_load_reaches_the_beacon,
-    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
-    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    an_answer_written_past_the_deadline_is_read_on_a_later_ask,
+    an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
+    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
+    cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -852,10 +854,10 @@ fn a_delivery_cut_off_past_its_window_is_owed_sim() {
 }
 
 #[test]
-fn a_delivery_lands_past_every_window_once_the_bundle_arrives_sim() {
+fn a_delivery_lands_past_every_window_once_its_record_arrives_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
-    cluster.run_faultable(a_delivery_lands_past_every_window_once_the_bundle_arrives);
+    cluster.run_faultable(a_delivery_lands_past_every_window_once_its_record_arrives);
 }
 
 #[test]
@@ -1916,6 +1918,14 @@ fn merge_straddler_config() -> ScenarioConfig {
         split_bytes: merge_split_bytes(&GenesisPackages::protocol()),
         latency: Duration::from_millis(150),
     }
+}
+
+#[test]
+fn an_owed_crossing_a_merge_converges_is_credited_on_the_successor_sim() {
+    let setup = merge_convergence_setup();
+    let mut cluster =
+        SimCluster::with_grown_accounts(&merge_straddler_config(), 11, &setup.accounts);
+    cluster.run_faultable(an_owed_crossing_a_merge_converges_is_credited_on_the_successor);
 }
 
 #[test]

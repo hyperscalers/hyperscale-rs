@@ -630,18 +630,22 @@ fn merge_survivor_ballast(packages: &GenesisPackages, accounts: &mut Vec<(Princi
 /// tick names the shard that terminates at the merge.
 #[must_use]
 pub fn merge_straddler_setup() -> MergeStraddlerSetup {
+    merge_setup(&mut Vec::new())
+}
+
+/// The merge-straddler genesis, grinding its accounts past `taken`.
+fn merge_setup(taken: &mut Vec<u8>) -> MergeStraddlerSetup {
     let num_shards = 4;
     let mut accounts = Vec::new();
     merge_survivor_ballast(&GenesisPackages::protocol(), &mut accounts);
 
-    let mut taken = Vec::new();
     let straddlers = (0..MERGE_STRADDLER_COUNT)
         .map(|_| {
             payment_leg(
                 MERGE_STRADDLER_SURVIVOR,
                 MERGE_STRADDLER_LEFT,
                 num_shards,
-                &mut taken,
+                taken,
                 &mut accounts,
             )
         })
@@ -649,6 +653,36 @@ pub fn merge_straddler_setup() -> MergeStraddlerSetup {
     MergeStraddlerSetup {
         accounts,
         straddlers,
+    }
+}
+
+/// The merge-straddler genesis and one more transfer, whose payer sits on
+/// one merging child and whose recipient on the other: a crossing the
+/// merge converges onto one shard.
+pub struct MergeConvergenceSetup {
+    /// Genesis accounts: the merge-straddler set and the transfer's two.
+    pub accounts: Vec<(PrincipalAddr, u128)>,
+    /// The payer's key, the payer on [`MERGE_STRADDLER_LEFT`] and the
+    /// recipient on [`MERGE_STRADDLER_RIGHT`].
+    pub(crate) converging: (Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
+}
+
+/// Build the merge-convergence genesis: [`merge_straddler_setup`]'s,
+/// with one funded transfer across the merging pair.
+#[must_use]
+pub fn merge_convergence_setup() -> MergeConvergenceSetup {
+    let mut taken = Vec::new();
+    let MergeStraddlerSetup { mut accounts, .. } = merge_setup(&mut taken);
+    let converging = transfer_leg(
+        MERGE_STRADDLER_LEFT,
+        MERGE_STRADDLER_RIGHT,
+        4,
+        &mut taken,
+        &mut accounts,
+    );
+    MergeConvergenceSetup {
+        accounts,
+        converging,
     }
 }
 

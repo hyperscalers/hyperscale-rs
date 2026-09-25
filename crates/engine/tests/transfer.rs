@@ -24,7 +24,7 @@ use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
     Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore, crossing_settlements,
 };
-use hyperscale_transactions::{Ceilings, Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
 use hyperscale_types::{
     Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
@@ -1254,6 +1254,119 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
         hash_of(&sender_side[0]),
         hash_of(&recipient_side[0]),
         "under whole locality the hash covers the full fold, so it cannot differ by shard",
+    );
+}
+
+/// A transfer whose fee payer sits on the recipient's shard never leaves
+/// that shard only delivering: the payer's home bears the verdict, so it
+/// commits as the core and the fee burns there, once. The sender's shard
+/// runs the withdrawal and pays the payment alone, and the crossing into
+/// the core is escrowed: the core takes it and credits the recipient.
+#[test]
+fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
+    let graph = client()
+        .transfer_graph(alice(), far(), 100)
+        .expect("an account answers a transfer");
+    let gas_limits = default_gas_limits(graph.nodes.len());
+    let envelope = signing::wrap(
+        &IntentTree::of_one(Intent::leaf(HEADER, alice(), graph)),
+        signing::Terms {
+            fee_payer: far(),
+            max_fee: TRANSFER_FEE,
+            gas_limits: gas_limits
+                .try_into()
+                .expect("one ceiling per node, under the node cap"),
+            priority_bp: 0,
+            message: Bytes::empty(),
+        },
+    )
+    .expect("a transfer fits the tree cap");
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
+        signing::sign(envelope, &key, &ProtocolHasher).expect("a transfer signs"),
+    )));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    assert_eq!(tx.fee_payer(), far().address());
+
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
+    assert!(classified.decomposed());
+    assert_eq!(
+        classified.core(),
+        &BTreeSet::from([far_shard]),
+        "the payer's home is the core"
+    );
+    assert!(classified.commits_at(near_shard) && classified.commits_at(far_shard));
+    let edge = classified.edges()[0].clone();
+    assert_eq!(
+        edge.crossing.kind,
+        Kind::Escrowed,
+        "a consumer on the core is escrowed, never owed",
+    );
+
+    let price = price_of(&executor, &tx);
+    let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
+        let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+        let ctx = TickBatchContext {
+            local_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Shape(Member::of(
+                classified.clone(),
+                local_shard,
+                BTreeSet::from([near_shard, far_shard]),
+            )),
+            arrivals,
+        };
+        let executed = executor
+            .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0);
+        let ConsensusReceipt::Succeeded { writes, .. } = &executed.consensus else {
+            panic!(
+                "{local_shard:?}'s member succeeds: {:?} {:?}",
+                executed.consensus, executed.metadata
+            );
+        };
+        (
+            settled(writes, &[(alice(), 1_000), (far(), 50)]),
+            executed.escrowed.clone(),
+        )
+    };
+
+    let (sender, escrowed) = run(near_shard, &[]);
+    assert_eq!(
+        vault_cell(&sender, alice()),
+        Some(encode_amount(1_000 - 100).to_vec()),
+        "the sender's shard pays the payment and no fee",
+    );
+    assert_eq!(
+        vault_cell(&sender, far()),
+        None,
+        "and burns nothing of the payer's"
+    );
+
+    let (core, _) = run(far_shard, &escrowed);
+    assert_eq!(
+        vault_cell(&core, far()),
+        Some(encode_amount(50 + 100 - price).to_vec()),
+        "the core takes the payment and burns the fee from the payer once",
+    );
+    assert_eq!(
+        vault_cell(&core, alice()),
+        None,
+        "and moves nothing of the sender's"
     );
 }
 
