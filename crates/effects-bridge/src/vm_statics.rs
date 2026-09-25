@@ -23,7 +23,7 @@ use hyperscale_types::{
     MAX_STATE_ENTRIES_PER_TX, MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing,
     TimestampRange, TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
-use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
+use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, vault_cell};
 use hyperscale_vm_effects::{
     Admitted, CROSSING_ANSWER_CELL_BYTES, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingId,
     Intent, IntentHeader, IntentRecord, IntentTree, MARKER_CELL_BYTES, ManifestHash, NodeCall,
@@ -538,13 +538,8 @@ pub static PROTOCOL_RESOURCE: LazyLock<ResourceAddr> =
 /// The vault cell for `resource` under `owner` — the same child key the
 /// stdlib account metadata's effect clauses compute.
 #[must_use]
-pub fn vault_key(owner: impl Into<Address>, resource: impl Into<Address>) -> SubstateKey {
-    child_key(
-        &ProtocolHasher,
-        owner,
-        VAULT,
-        &[Value::Address(resource.into()).canonical_bytes()],
-    )
+pub fn vault_key(owner: impl Into<Address>, resource: ResourceAddr) -> SubstateKey {
+    vault_cell(&ProtocolHasher, owner, resource)
 }
 
 /// The stored-authority cell under `owner` — what `securify` writes,
@@ -1238,10 +1233,10 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg, GraphNode,
-        Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash, ManifestGraph, Member,
-        MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket, StoredRule, ValueRef,
-        child_key, never, nullifier_expiry_ms, nullifier_key,
+        Answered, Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg,
+        GraphNode, Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash,
+        ManifestGraph, Member, MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket,
+        StoredRule, ValueRef, child_key, never, nullifier_expiry_ms, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::wrap_publish;
     use hyperscale_vm_stdlib::account;
@@ -1254,6 +1249,32 @@ mod tests {
 
     const RES_X: ResourceAddr = ResourceAddr::new([0xE1; 31]);
     const RES_Y: ResourceAddr = ResourceAddr::new([0xE2; 31]);
+
+    /// An owed crossing's credit lands in the consumer's own vault for
+    /// the record's resource: the cell a deposit to that consumer
+    /// credits, whoever produced the record.
+    #[test]
+    fn an_owed_credit_lands_in_the_consumers_vault() {
+        for (seed, resource) in [(0x11, RES_X), (0x42, RES_Y), (0x9F, *PROTOCOL_RESOURCE)] {
+            let consumer = Address::new([seed; 31], AddressClass::Component);
+            let id = CrossingId {
+                producer: Address::new([seed ^ 0xFF; 31], AddressClass::Component),
+                consumer,
+                intent: IntentHash(Hash32([seed; 32])),
+                local: u32::from(seed),
+                output: 1,
+            };
+            assert_eq!(
+                id.owed_credit(&ProtocolHasher, resource),
+                vault_key(consumer, resource)
+            );
+            assert_eq!(
+                id.owed_credit(&ProtocolHasher, resource).owner,
+                id.answer_key(&ProtocolHasher, Answered::Taken).owner,
+                "the credit and the answer that guards it sit under one owner",
+            );
+        }
+    }
 
     fn key(seed: u8) -> Ed25519PrivateKey {
         Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap()
