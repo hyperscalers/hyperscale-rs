@@ -141,20 +141,6 @@ impl Membership {
         }
     }
 
-    /// A member that settles nothing about the transaction: a retirement,
-    /// deleting records whose claims committed elsewhere. Awaits nobody,
-    /// decides nothing — the verdict was reached where the claims were,
-    /// and a name that decided here would be a second verdict on a chain
-    /// that may already hold the first — and executes nothing.
-    #[must_use]
-    pub fn housekeeping(local: ShardId) -> Self {
-        Self {
-            awaited: BTreeSet::from([local]),
-            reach: BTreeSet::from([local]),
-            role: Role::Retiring,
-        }
-    }
-
     /// This membership for a member that settles what an execution left
     /// rather than executing the transaction: a reclaim, an abandonment,
     /// a held record's disposal. The awaited set stays as stated; the

@@ -222,7 +222,7 @@ mod tests {
         let store = ExecCertStore::new();
         let hash = tx(9);
         let verdict = attesting(1, vec![outcome(hash, Role::Core)]);
-        let retirement = attesting(2, vec![outcome(hash, Role::Retiring)]);
+        let retirement = attesting(2, vec![outcome(hash, Role::Settling)]);
         store.insert(Arc::clone(&verdict));
         store.insert(Arc::clone(&retirement));
 

@@ -284,6 +284,7 @@ fn a_claims_weight_bounds_its_encoding() {
     let empty = StateClaim {
         anchor: one.anchor,
         cells: Capped::empty(),
+        crossings: Capped::empty(),
         proof: MerkleInclusionProof::new(Vec::new()),
     };
     assert!(hbor_to_vec(&empty).expect("encodes").len() <= STATE_CLAIM_BYTES);

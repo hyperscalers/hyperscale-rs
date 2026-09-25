@@ -4,8 +4,9 @@
 //! The voter judges a block where it reads the parent state, in the
 //! state-root verification: a record presence below the floor the
 //! parent left for its producer's lineage, a presence below a
-//! same-block absence of its key, and a late delivery either of whose
-//! answers stands. The proposer runs the same judgement in dropping
+//! same-block absence of its key, a record absence that would delete an
+//! answer below the floor or off the record's owner, and a late
+//! delivery either of whose answers stands. The proposer runs the same judgement in dropping
 //! form before it builds, so a proposal never refuses itself, and a
 //! transaction admitted on a dropped presence goes with it.
 
@@ -31,8 +32,14 @@ pub fn read_fence(
 ) -> ReadFence {
     let mut presences = Vec::new();
     let mut absences = Vec::new();
+    let mut deletions = Vec::new();
     for claim in claims {
         let mark = ReadMark::of(&claim.anchor, windows);
+        deletions.extend(claim.deleting().map(|key| Reading {
+            key,
+            shard: claim.anchor.shard,
+            mark,
+        }));
         for (key, stated) in claim.cells.iter() {
             let reading = Reading {
                 key: *key,
@@ -59,6 +66,7 @@ pub fn read_fence(
     ReadFence {
         presences,
         absences,
+        deletions,
         late_answers,
     }
 }

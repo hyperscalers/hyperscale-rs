@@ -22,13 +22,23 @@
 //! consumer this way: the bytes ride beside the key, and `verify` holds
 //! them to the presence the proof reconstructs, so no hash travels with
 //! them and none is trusted.
+//!
+//! A reading may name the crossing it speaks for. A crossing key is a
+//! hash only the crossing's identity derives, so a claim carries the
+//! identity beside such a key, and what the reading licenses the commit
+//! fold to remove is read off the identity: a consumer's `Taken` read
+//! present licenses removing the producer's record, and a record read
+//! absent licenses removing both of its answers. The identity is bound
+//! to its key by derivation, checked where the claim's form is.
 
 use hyperscale_hbor::{Bytes, Capped, Hbor};
+use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
 
 use crate::state_key::jmt_value_hash;
 use crate::{
     Anchor, Inclusion, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
-    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, StateProofError, SubstateKey,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, StateProofError,
+    SubstateKey,
 };
 
 /// What a claim states of one cell: whether the anchor's root holds it,
@@ -94,9 +104,25 @@ pub struct StateClaim {
     pub anchor: Anchor,
     /// Each cell asked about, with what the anchor's root says of it.
     pub cells: Capped<Vec<(SubstateKey, Stated)>, MAX_PROOFS_PER_QUERY>,
+    /// The crossings the readings speak for: for each cell key that is
+    /// one of a crossing's three, the identity that derives it, sorted
+    /// by key and without repeats. What such a reading licenses the
+    /// commit fold to remove is read off the identity, never named by
+    /// the proposer. Outside the proof, which proves keys and values;
+    /// the derivation is what binds it.
+    pub crossings: Capped<Vec<(SubstateKey, CrossingId)>, MAX_PROOFS_PER_QUERY>,
     /// The multiproof the readings were taken from, over exactly the
     /// cells' keys.
     pub proof: MerkleInclusionProof,
+}
+
+/// The three keys `id` derives: its record, its `Taken` and its `Never`.
+fn crossing_keys(id: &CrossingId) -> [SubstateKey; 3] {
+    [
+        id.record_key(&ProtocolHasher),
+        id.answer_key(&ProtocolHasher, Answered::Taken),
+        id.answer_key(&ProtocolHasher, Answered::Never),
+    ]
 }
 
 impl StateClaim {
@@ -122,19 +148,94 @@ impl StateClaim {
         Self {
             anchor,
             cells,
+            crossings: Capped::empty(),
             proof,
         }
     }
 
+    /// This claim naming the crossings its readings speak for, in the
+    /// one order it may carry them.
+    #[must_use]
+    pub fn naming(
+        mut self,
+        crossings: impl IntoIterator<Item = (SubstateKey, CrossingId)>,
+    ) -> Self {
+        let mut crossings: Vec<(SubstateKey, CrossingId)> = crossings.into_iter().collect();
+        crossings.sort_unstable();
+        crossings.dedup_by_key(|(key, _)| *key);
+        self.crossings = Capped::new(crossings).unwrap_or_default();
+        self
+    }
+
     /// Whether the claim is in the one form it may take: sorted cells,
-    /// one reading per key, naming something, and no more than the cap.
+    /// one reading per key, naming something, no more than the cap, and
+    /// every crossing named beside a cell of the claim whose key that
+    /// crossing derives.
     ///
     /// A claim naming no cell answers nothing and would cost a block a
     /// leaf for it, so it is not well-formed rather than merely
-    /// pointless.
+    /// pointless. A crossing named against a key it does not derive
+    /// would license removing another crossing's cells, so the
+    /// derivation is checked here, once, with no state read.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        !self.cells.is_empty() && self.cells.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        !self.cells.is_empty()
+            && self.cells.windows(2).all(|pair| pair[0].0 < pair[1].0)
+            && self.crossings.windows(2).all(|pair| pair[0].0 < pair[1].0)
+            && self.crossings.iter().all(|(key, id)| {
+                self.cells
+                    .binary_search_by_key(key, |(cell, _)| *cell)
+                    .is_ok()
+                    && crossing_keys(id).contains(key)
+            })
+    }
+
+    /// The crossing the reading of `key` speaks for, if it names one.
+    #[must_use]
+    pub fn crossing_of(&self, key: SubstateKey) -> Option<CrossingId> {
+        self.crossings
+            .iter()
+            .find(|(named, _)| *named == key)
+            .map(|(_, id)| *id)
+    }
+
+    /// The cells the readings license the commit fold to remove,
+    /// ascending and each once: the record of a crossing whose `Taken`
+    /// is read present, and both answers of a crossing whose record is
+    /// read absent. Every other reading licenses nothing.
+    ///
+    /// The one statement of the rule, read by the root's fold and by
+    /// every mirror of it. Each arm reads one reading, so a claim cut
+    /// into pieces licenses what the whole did; it derives keys and
+    /// decodes nothing.
+    #[must_use]
+    pub fn settles(&self) -> Vec<SubstateKey> {
+        let mut removed: Vec<SubstateKey> = Vec::new();
+        for (key, id) in self.crossings.iter() {
+            let [record, taken, never] = crossing_keys(id);
+            match self.reading(*key) {
+                Some(Inclusion::Present(_)) if *key == taken => removed.push(record),
+                Some(Inclusion::Absent) if *key == record => {
+                    removed.push(taken);
+                    removed.push(never);
+                }
+                _ => {}
+            }
+        }
+        removed.sort_unstable();
+        removed.dedup();
+        removed
+    }
+
+    /// The record keys read absent that name their crossing: the
+    /// readings that would delete an answer, which the read frontier
+    /// licenses at or above its floor from the record's owner.
+    pub fn deleting(&self) -> impl Iterator<Item = SubstateKey> + '_ {
+        self.crossings.iter().filter_map(|(key, id)| {
+            (*key == id.record_key(&ProtocolHasher)
+                && self.reading(*key) == Some(Inclusion::Absent))
+            .then_some(*key)
+        })
     }
 
     /// Whether the proof says of every cell what the claim says, under
@@ -225,12 +326,18 @@ impl StateClaim {
         }
         let keys: Vec<SubstateKey> = cells.iter().map(|(key, _)| *key).collect();
         let proof = self.proof.restrict(&keys).ok()?;
-        Some(Self::new(self.anchor, cells, proof))
+        let crossings: Vec<(SubstateKey, CrossingId)> = self
+            .crossings
+            .iter()
+            .filter(|(key, _)| keys.contains(key))
+            .copied()
+            .collect();
+        Some(Self::new(self.anchor, cells, proof).naming(crossings))
     }
 
     /// The bytes this claim costs a block: the figures the wire budget
-    /// prices its terms and each cell at, every value a cell holds, and
-    /// the proof as it encodes.
+    /// prices its terms, each cell and each crossing named at, every
+    /// value a cell holds, and the proof as it encodes.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
         let values: usize = self
@@ -240,6 +347,7 @@ impl StateClaim {
             .sum();
         STATE_CLAIM_BYTES
             + self.cells.len() * STATE_CLAIM_CELL_BYTES
+            + self.crossings.len() * STATE_CLAIM_CROSSING_BYTES
             + values
             + self.proof.as_bytes().len()
     }
@@ -247,6 +355,9 @@ impl StateClaim {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::to_vec;
+    use hyperscale_vm_effects::{Hash32, IntentHash};
+
     use super::*;
     use crate::test_utils::{proven_claim, test_key};
     use crate::{
@@ -308,6 +419,7 @@ mod tests {
             anchor: anchor(),
             cells: Capped::new(cells.into_iter().map(|(key, i)| (key, i.into())).collect())
                 .expect("a list written out in a test"),
+            crossings: Capped::empty(),
             proof: MerkleInclusionProof::dummy(),
         };
         assert!(!over(Vec::new()).is_well_formed());
@@ -442,5 +554,140 @@ mod tests {
         assert!(whole.restrict(|_| false).is_none());
         assert_eq!(whole.restrict(|_| true), Some(whole.clone()));
         assert!(piece.wire_weight() < whole.wire_weight());
+    }
+
+    fn crossing(seed: u8) -> CrossingId {
+        CrossingId {
+            producer: Address::new([seed; 31], AddressClass::Component),
+            consumer: Address::new([seed.wrapping_add(1); 31], AddressClass::Component),
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 0,
+            output: 0,
+        }
+    }
+
+    /// A claim over `readings`, each named for `id` where the reading
+    /// speaks for it.
+    fn speaking(readings: Vec<(SubstateKey, Inclusion, Option<CrossingId>)>) -> StateClaim {
+        StateClaim::new(
+            anchor(),
+            readings
+                .iter()
+                .map(|(key, inclusion, _)| (*key, *inclusion)),
+            MerkleInclusionProof::dummy(),
+        )
+        .naming(
+            readings
+                .into_iter()
+                .filter_map(|(key, _, id)| id.map(|id| (key, id))),
+        )
+    }
+
+    /// A reading names only a crossing that derives its key, and what
+    /// it licenses is read off the identity: a `Taken` present removes
+    /// the record, a record absent removes both answers, and a record
+    /// present, an answer absent, a `Never` present or a bare reading
+    /// remove nothing.
+    #[test]
+    fn a_reading_speaks_for_the_crossing_that_derives_its_key() {
+        let id = crossing(0x31);
+        let other = crossing(0x32);
+        let [record, taken, never] = crossing_keys(&id);
+        let present = Inclusion::Present([7; 32]);
+
+        assert!(speaking(vec![(taken, present, Some(id))]).is_well_formed());
+        assert!(
+            !speaking(vec![(taken, present, Some(other))]).is_well_formed(),
+            "a crossing is named only beside a key it derives",
+        );
+        assert!(
+            !StateClaim::new(anchor(), [(record, present)], MerkleInclusionProof::dummy())
+                .naming([(taken, id)])
+                .is_well_formed(),
+            "and only beside a cell the claim reads",
+        );
+
+        assert_eq!(
+            speaking(vec![(taken, present, Some(id))]).settles(),
+            vec![record],
+            "the consumer's Taken read present retires the record",
+        );
+        assert_eq!(
+            speaking(vec![(record, Inclusion::Absent, Some(id))]).settles(),
+            {
+                let mut both = vec![taken, never];
+                both.sort_unstable();
+                both
+            },
+            "the record read absent deletes both answers",
+        );
+        assert!(
+            speaking(vec![(record, present, Some(id))])
+                .settles()
+                .is_empty()
+        );
+        assert!(
+            speaking(vec![(taken, Inclusion::Absent, Some(id))])
+                .settles()
+                .is_empty()
+        );
+        assert!(
+            speaking(vec![(never, present, Some(id))])
+                .settles()
+                .is_empty()
+        );
+        assert!(speaking(vec![(taken, present, None)]).settles().is_empty());
+
+        let deleting: Vec<SubstateKey> = speaking(vec![
+            (record, Inclusion::Absent, Some(id)),
+            (taken, Inclusion::Absent, Some(id)),
+        ])
+        .deleting()
+        .collect();
+        assert_eq!(deleting, vec![record], "only the record's absence deletes");
+
+        let named = speaking(vec![(taken, present, Some(id))]);
+        let bare = speaking(vec![(taken, present, None)]);
+        assert_eq!(
+            named.wire_weight(),
+            bare.wire_weight() + STATE_CLAIM_CROSSING_BYTES,
+            "the crossing named is paid for",
+        );
+        assert_eq!(named.crossing_of(taken), Some(id));
+        assert_eq!(bare.crossing_of(taken), None);
+    }
+
+    /// A crossing named beside its key encodes inside the bytes the
+    /// budget prices it at.
+    #[test]
+    fn a_named_crossing_fits_its_priced_bytes() {
+        let id = crossing(0xFF);
+        let encoded = to_vec(&(crossing_keys(&id)[0], id)).expect("a key and an identity encode");
+        assert!(
+            encoded.len() <= STATE_CLAIM_CROSSING_BYTES,
+            "{} bytes over {STATE_CLAIM_CROSSING_BYTES}",
+            encoded.len(),
+        );
+    }
+
+    /// A claim cut by key keeps the crossings named beside the keys it
+    /// keeps and no other.
+    #[test]
+    fn a_cut_claim_keeps_the_crossings_of_the_keys_it_keeps() {
+        let id = crossing(0x33);
+        let [record, taken, _] = crossing_keys(&id);
+        let (a, b) = if record < taken {
+            (record, taken)
+        } else {
+            (taken, record)
+        };
+        let whole = proven_claim(ShardId::ROOT, 3, &[a], &[a, b]).naming([(a, id), (b, id)]);
+        assert!(whole.is_well_formed());
+        let piece = whole.restrict(|key| key == a).expect("one cell kept");
+        assert_eq!(
+            piece.crossings.iter().copied().collect::<Vec<_>>(),
+            vec![(a, id)]
+        );
+        assert!(piece.is_well_formed());
     }
 }

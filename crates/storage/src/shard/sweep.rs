@@ -19,6 +19,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
+use crate::shard::crossings::crossing_settlements;
 use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
 use crate::tree::JmtSnapshot;
 use crate::{
@@ -436,11 +437,11 @@ pub fn with_sweep(
     SettledWrites::from_parts(cells, entries)
 }
 
-/// Everything a block removes, each once: what its sweep retires.
-/// Ascending, so the fold walks one order.
+/// Everything a block removes, each once: what its sweep retires and
+/// what its claims settle. Ascending, so the fold walks one order.
 #[must_use]
-pub(crate) fn removals_of(swept: &[SubstateKey]) -> Vec<SubstateKey> {
-    let removals: BTreeSet<SubstateKey> = swept.iter().copied().collect();
+pub(crate) fn removals_of(swept: &[SubstateKey], settled: &[SubstateKey]) -> Vec<SubstateKey> {
+    let removals: BTreeSet<SubstateKey> = swept.iter().chain(settled).copied().collect();
     removals.into_iter().collect()
 }
 
@@ -473,15 +474,17 @@ pub fn sweep_through(
 /// composed it.
 ///
 /// The receipts its ticks settled, the committed cells its committer
-/// derived, the sweep its header names, and the read frontier its
-/// claims raise.
+/// derived, the sweep its header names, the crossing settlements its
+/// claims license, and the read frontier its claims raise.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
 /// every live cell at or below the header's frontier is one the block
 /// removed, and one the block created sits far above it. The creations
 /// are the caller's, derived under the block's own window as the
-/// committer derived them. The frontier's writes read the copy of the
+/// committer derived them. The settlements read this half of the state:
+/// a key under the other half reads absent here and falls out, and is
+/// the other follower's. The frontier's writes read the copy of the
 /// table this half holds, which is the whole table, and are written for
 /// both halves before the prefix keeps this one's.
 #[must_use]
@@ -506,7 +509,8 @@ pub fn followed_block_writes(
         prior,
     );
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
-    let removals = removals_of(&swept);
+    let settled = crossing_settlements(block.state_claims(), &merged, prior);
+    let removals = removals_of(&swept, &settled);
     let raised = read_frontier_writes(prior, frontier);
     filter_writes_to_prefix(
         &with_frontier(with_sweep(merged, creations, &removals), raised),
@@ -860,8 +864,12 @@ mod tests {
         let (other, _, _) = cell(2, 3, 0xC2);
         let mut expected = vec![swept, other];
         expected.sort_unstable();
-        assert_eq!(removals_of(&[other, swept, swept]), expected);
-        let settled = with_sweep(SettledWrites::default(), &[], &removals_of(&[swept, swept]));
+        assert_eq!(removals_of(&[other, swept], &[swept]), expected);
+        let settled = with_sweep(
+            SettledWrites::default(),
+            &[],
+            &removals_of(&[swept], &[swept]),
+        );
         assert_eq!(settled.cells().get(&swept), Some(&None));
     }
 

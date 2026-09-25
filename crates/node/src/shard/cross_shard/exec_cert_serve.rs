@@ -162,7 +162,7 @@ mod tests {
     fn both_tiers_answer_for_a_transaction_certified_twice() {
         let tx_hash = TxHash::from(Hash::from_bytes(&[3u8; 32]));
         let verdict = cert(1, tx_hash, Role::Core);
-        let settling = cert(2, tx_hash, Role::Retiring);
+        let settling = cert(2, tx_hash, Role::Settling);
 
         // The verdict is on the chain, where its committed finalization
         // put it; the settling certificate is still in the cache.

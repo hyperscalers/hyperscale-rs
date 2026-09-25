@@ -346,6 +346,10 @@ pub const STATE_CLAIM_BYTES: usize = 64;
 /// before any value the reading carries.
 pub const STATE_CLAIM_CELL_BYTES: usize = 83;
 
+/// Bytes one crossing a claim's reading speaks for costs: the key it
+/// names and the identity that derives it, framed.
+pub const STATE_CLAIM_CROSSING_BYTES: usize = 160;
+
 /// The widest value a claim's cell may carry: a crossing record, the
 /// one cell a reading carries the value of. `hyperscale-shard` holds it
 /// to the record cell's own width, which this crate cannot see.
@@ -358,7 +362,7 @@ pub const MAX_HELD_VALUE_BYTES: usize = 256;
 /// Measured by `wire_budget.rs`, which holds the constant to what it
 /// measures, so a change to the encoding or the method moves this and,
 /// through it, the section's budget.
-pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 770;
+pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 771;
 
 /// What the frame leaves for the claims section once every other
 /// section of a proposal is at its cap.

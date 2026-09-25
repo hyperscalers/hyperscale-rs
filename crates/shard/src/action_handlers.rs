@@ -13,9 +13,10 @@ use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    BeaconChainReader, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore,
-    SubstateView, Substates, SweepIndex, TerminalWindow, VersionedStore, colliding_committed_cell,
-    committed_tx_cells, load_read_frontier, sweep_for_block, without_colliding_committed_cells,
+    BeaconChainReader, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage,
+    SubstateStore, SubstateView, Substates, SweepIndex, TerminalWindow, VersionedStore,
+    colliding_committed_cell, committed_tx_cells, load_read_frontier, sweep_for_block,
+    without_colliding_committed_cells,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -45,6 +46,7 @@ use hyperscale_types::{
     verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
+use crate::local_crossings::{disagreeing_parent_reading, parent_claims};
 use crate::read_fence::{Dropped, drop_refused, written_by};
 
 /// Result of QC verification and assembly.
@@ -288,9 +290,12 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
             base_reads: Some(&base_reads),
         },
         &certificates,
-        &creations,
-        &removals,
-        frontier,
+        ChainWrites {
+            creations: &creations,
+            removals: &removals,
+            frontier,
+            state_claims: &state_claims,
+        },
         height,
     );
 
@@ -1026,6 +1031,7 @@ where
             claimed_sweep_frontier,
             frontier,
             fence,
+            state_claims,
         } => {
             // Pre-flight: hash the receipts and compare to the QC'd
             // `local_receipt_root`. If they diverge, JMT recomputation
@@ -1137,6 +1143,24 @@ where
                 });
                 return;
             }
+            // A reading the block takes at its own parent is held to
+            // this replica's own parent view, since it carries no proof.
+            // Which crossings the proposer read there is its choice;
+            // what each reading says is not.
+            if let Some(key) = disagreeing_parent_reading(&state_claims, ctx.shard, &anchored) {
+                tracing::warn!(
+                    ?block_hash,
+                    height = block_height.inner(),
+                    ?key,
+                    "Rejecting block whose parent-anchored reading disagrees with the parent state"
+                );
+                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                    block_hash,
+                    kind: VerificationKind::StateRoot,
+                    outcome: CheckOutcome::Refused,
+                });
+                return;
+            }
             let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                 ParentAnchor {
                     state_root: parent_state_root,
@@ -1146,9 +1170,12 @@ where
                     base_reads: None,
                 },
                 &finalizations,
-                &creations,
-                &removals,
-                &frontier,
+                ChainWrites {
+                    creations: &creations,
+                    removals: &removals,
+                    frontier: &frontier,
+                    state_claims: &state_claims,
+                },
                 block_height,
             );
             // A terminating shard's boundary header carries what it leaves
@@ -1272,6 +1299,8 @@ where
             frontier,
             fence,
             record_licences,
+            parent_anchor,
+            local_crossings,
         } => {
             // Sign the block's randomness reveal here — off the main loop, on
             // the dispatch pool — so the sans-io coordinator holds no key. Its
@@ -1324,6 +1353,12 @@ where
                         "Dropped what the read frontier refuses from the proposal"
                     );
                 }
+                // The crossings whose ends share this shard, read at the
+                // parent through the same anchored view, beside the
+                // claims in the section's order.
+                let mut claims = claims;
+                claims.extend(parent_claims(&local_crossings, parent_anchor, &anchored));
+                claims.sort_unstable();
                 let frontier = FrontierInputs::for_block(
                     &claims,
                     frontier.windows,

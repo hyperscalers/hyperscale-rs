@@ -32,7 +32,7 @@ use hyperscale_vm_effects::{
     Answered, Crossing, CrossingCell, CrossingEdge as StarEdge, CrossingLeaf, Kind, Star,
     running_at, star_at,
 };
-use hyperscale_vm_kernel::{Crossed, Deletion, Departure, LegPlan, OwnerSet, PlanFault};
+use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
 use crate::sharding::TrieShardResolver;
@@ -724,21 +724,10 @@ impl Member {
     }
 }
 
-/// What licenses a member to settle the records a producer here left.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Licence {
-    /// Every consumer claimed, on the evidence of its claim cell proved
-    /// present: the records are deleted.
-    Claimed,
-    /// No consumer ever claimed, on the evidence of a committed record:
-    /// the crossings are credited back and the records deleted.
-    Unclaimed,
-}
-
 /// What a member runs of its transaction: the shape its committing
-/// block froze, or a settlement of the records a producer here left.
+/// block froze, or the reclaim of the records a producer here left.
 ///
-/// A settlement names cells and not a manifest. That is what lets a
+/// A reclaim names cells and not a manifest. That is what lets a
 /// shard holding the record and no body compose one — a reshape
 /// successor, whose store arrives as a prefix of leaves and whose ledger
 /// begins empty: the record leaf says which cells the member touches,
@@ -748,41 +737,23 @@ pub enum Runs {
     /// The transaction as classified at commit — whole, or the legs
     /// this shard's placement gives it on its side.
     Shape(Member),
-    /// No node at all: the records of crossings a producer here issued,
-    /// settled on `on`.
-    Settle {
-        /// The member the settlement runs as: whole, on its own shard,
+    /// No node at all: the records of crossings a producer here issued
+    /// that no consumer will take, credited back and removed.
+    Reclaim {
+        /// The member the reclaim runs as: whole, on its own shard,
         /// reaching nobody else.
         member: Member,
-        /// The record cells to settle.
+        /// The record cells to take back. One the commit fold has
+        /// already removed is skipped, not refused: the consumer took
+        /// that crossing, and the rest are still this member's.
         records: Vec<SubstateKey>,
-        /// What licenses the settlement, and so what it does to each
-        /// record.
-        on: Licence,
         /// Whether this shard settled the transaction's price already.
         /// A leg that ran burned it inside its writes at its own
         /// finalization; one that never ran — held for a bundle that
         /// never came — owes it still, and the reclaim's receipt is the
-        /// one of this shard's left to carry it. A retirement is
-        /// housekeeping on a transaction whose price its leg settled,
-        /// and an inherited record's price was settled by the chain
-        /// that dissolved.
+        /// one of this shard's left to carry it. An inherited record's
+        /// price was settled by the chain that dissolved.
         charged: bool,
-    },
-    /// No node at all: this shard's own answers to crossings whose
-    /// records their producers have since disposed of, taken away.
-    ///
-    /// Housekeeping on cells nobody outside this shard reads. An answer
-    /// is what makes a replayed delivery abort, and a replay needs a
-    /// bundle to run at all — so once no bundle for the record can be
-    /// served the answer defends nothing and goes.
-    Clean {
-        /// The member the cleanup runs as: whole, on its own shard,
-        /// reaching nobody else.
-        member: Member,
-        /// The answer cells to remove, each naming the record its
-        /// licence was established against.
-        answers: Vec<Deletion>,
     },
 }
 
@@ -791,55 +762,40 @@ impl Runs {
     #[must_use]
     pub const fn member(&self) -> &Member {
         match self {
-            Self::Shape(member) | Self::Settle { member, .. } | Self::Clean { member, .. } => {
-                member
-            }
+            Self::Shape(member) | Self::Reclaim { member, .. } => member,
         }
     }
 
     /// Whether the transaction reaches beyond the running shard. A
-    /// settlement reaches nobody: every cell it touches is a record this
+    /// reclaim reaches nobody: every cell it touches is a record this
     /// shard holds.
     #[must_use]
     pub fn reaches_beyond(&self) -> bool {
         match self {
             Self::Shape(member) => member.reaches_beyond(),
-            Self::Settle { .. } | Self::Clean { .. } => false,
+            Self::Reclaim { .. } => false,
         }
     }
 
     /// Whether a counterpart's verdict can still discard this member's
-    /// effects after it executes. Nothing retracts a settlement.
+    /// effects after it executes. Nothing retracts a reclaim.
     #[must_use]
     pub fn abortable(&self) -> bool {
         match self {
             Self::Shape(member) => member.abortable(),
-            Self::Settle { .. } | Self::Clean { .. } => false,
+            Self::Reclaim { .. } => false,
         }
     }
 
     /// Whether the transaction's price was levied on this shard already,
     /// so this member charges nothing: the delivering member of a mixed
-    /// shard, whose issuing member charged; a settlement on a leg that
+    /// shard, whose issuing member charged; a reclaim on a leg that
     /// ran, or on a record whose transaction was priced elsewhere.
     #[must_use]
     pub(crate) fn charged_already(&self) -> bool {
         match self {
             Self::Shape(member) => member.is_second(),
-            Self::Settle {
-                on: Licence::Unclaimed,
-                charged,
-                ..
-            } => *charged,
-            // Housekeeping charges nothing for the reason a retirement
-            // does not: it runs on a transaction this shard never ran
-            // and was never asked to price, so whatever it owed was owed
-            // where it committed.
-            Self::Settle {
-                on: Licence::Claimed,
-                ..
-            }
-            | Self::Clean { .. } => true,
+            Self::Reclaim { charged, .. } => *charged,
         }
     }
 }

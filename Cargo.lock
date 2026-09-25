@@ -2055,6 +2055,7 @@ dependencies = [
  "hyperscale-network",
  "hyperscale-storage",
  "hyperscale-types",
+ "hyperscale-vm-effects",
  "strum",
 ]
 
@@ -2637,6 +2638,7 @@ dependencies = [
  "hyperscale-crypto-bls",
  "hyperscale-hbor",
  "hyperscale-jmt",
+ "hyperscale-vm-effects",
  "hyperscale-vm-types",
  "k256",
  "ml-dsa",

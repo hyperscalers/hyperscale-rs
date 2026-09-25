@@ -30,9 +30,10 @@ use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Capped;
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
+use hyperscale_shard::local_crossings::{disagreeing_parent_reading, parent_claims};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
-    ChainEntry, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
+    ChainEntry, ChainWrites, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
     ShardChainWriter, SubstateStore, TerminalWindow, colliding_committed_cell, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
@@ -41,15 +42,16 @@ use hyperscale_types::{
     AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
     Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
     CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey,
-    ConsensusReceipt, Epoch, Finalization, Hash, HborSigned, LocalReceiptRoot, LocalTimestamp,
-    NetworkDefinition, ProposerTimestamp, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
-    QuorumCertificate, ReadySignal, RootMismatch, Round, ShardId, ShardLoad, ShardVoteEquivocation,
-    ShardWitnessPayload, Signer, SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError,
-    StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight,
-    ValidatorId, Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
+    ConsensusReceipt, Epoch, Finalization, FrontierInputs, Hash, HborSigned, LocalReceiptRoot,
+    LocalTimestamp, NetworkDefinition, ProposerTimestamp, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
+    QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round, ShardId, ShardLoad,
+    ShardVoteEquivocation, ShardWitnessPayload, Signer, SignerBitfield, StateRoot,
+    StateRootContext, StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext,
+    TxHash, TxRootVerifyError, TxsInFlight, ValidatorId, Verifiable, VerificationKind, Verified,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign,
+    signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -874,6 +876,7 @@ impl ShardCoordinatorSim {
             vec![],
             vec![],
             vec![],
+            vec![],
         )
     }
 
@@ -1118,6 +1121,7 @@ impl ShardCoordinatorSim {
                 claimed_sweep_frontier: ready.claimed_sweep_frontier,
                 frontier: ready.frontier,
                 fence: ready.fence,
+                state_claims: ready.state_claims,
             });
         }
         if self.coordinators[to_idx].take_ready_proposal() {
@@ -1201,6 +1205,7 @@ impl ShardCoordinatorSim {
                 block_hash,
                 &qc,
                 &[],
+                vec![],
                 vec![],
                 vec![],
                 vec![],
@@ -1455,6 +1460,8 @@ impl ShardCoordinatorSim {
                 frontier,
                 fence: _,
                 record_licences: _,
+                parent_anchor,
+                local_crossings,
             } => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
                 // whose QC round sits below the honest lock, so honest
@@ -1529,6 +1536,19 @@ impl ShardCoordinatorSim {
                     };
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
+                let mut state_claims = state_claims;
+                state_claims.extend(parent_claims(
+                    &local_crossings,
+                    parent_anchor,
+                    &view.snapshot(),
+                ));
+                state_claims.sort_unstable();
+                let frontier = FrontierInputs::for_block(
+                    &state_claims,
+                    frontier.windows,
+                    frontier.anchor,
+                    frontier.local,
+                );
                 let terminal_roots = carry_terminal_roots.then(|| {
                     self.pending_chains[emitter_idx]
                         .terminal_roots_in_window(
@@ -1841,6 +1861,7 @@ impl ShardCoordinatorSim {
                 claimed_sweep_frontier,
                 frontier,
                 fence: _,
+                state_claims,
             } => {
                 // Mirrors the production handler: receipt-root
                 // pre-flight first, then JMT prep on success.
@@ -1891,6 +1912,11 @@ impl ShardCoordinatorSim {
                     colliding_committed_cell(&creations, &view.snapshot()).is_none(),
                     "the sim's proposer defers a transaction whose committed cell collides",
                 );
+                assert!(
+                    disagreeing_parent_reading(&state_claims, self.shard, &view.snapshot())
+                        .is_none(),
+                    "the sim's proposer reads its parent as its verifiers do",
+                );
                 let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                     ParentAnchor {
                         state_root: parent_state_root,
@@ -1900,9 +1926,12 @@ impl ShardCoordinatorSim {
                         base_reads: None,
                     },
                     &finalizations,
-                    &creations,
-                    &removals,
-                    &frontier,
+                    ChainWrites {
+                        creations: &creations,
+                        removals: &removals,
+                        frontier: &frontier,
+                        state_claims: &state_claims,
+                    },
                     block_height,
                 );
                 let verify_result = expected_root.verify(&StateRootContext {

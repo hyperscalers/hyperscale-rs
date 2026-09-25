@@ -86,6 +86,7 @@ mod deferred_qc;
 mod delay;
 mod fee_ledger;
 mod fence;
+pub mod local_crossings;
 mod lookups;
 mod pending;
 mod precut;

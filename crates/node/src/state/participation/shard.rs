@@ -415,6 +415,7 @@ impl ShardParticipation {
             inputs.provisions,
             inputs.abandonment_records,
             inputs.state_claims,
+            inputs.local_crossings,
         )
     }
 

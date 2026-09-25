@@ -55,10 +55,6 @@ pub enum Role {
     /// A member settling what an execution left, with a verdict of its
     /// own: a reclaim, an abandonment, an inherited record's member.
     Settling,
-    /// Housekeeping deciding nothing: a retirement, deleting records
-    /// whose claims committed elsewhere, where a verdict here would be a
-    /// second one on a chain that may already hold the first.
-    Retiring,
 }
 
 impl Role {
@@ -71,7 +67,7 @@ impl Role {
             // A member that could not do its part ends the transaction
             // on this shard whatever its role, except where the role
             // bears no verdict at all.
-            _ => !matches!(self, Self::Delivery | Self::Retiring),
+            _ => !matches!(self, Self::Delivery),
         }
     }
 
@@ -304,7 +300,7 @@ impl TxOutcome {
 
     /// What the attesting shard was to the transaction.
     #[must_use]
-    pub(crate) const fn role(&self) -> Role {
+    pub const fn role(&self) -> Role {
         self.role
     }
 
@@ -318,7 +314,6 @@ impl TxOutcome {
         match self.role {
             Role::Core | Role::Leg | Role::Delivery => true,
             Role::Whole | Role::Settling => !self.counterparts.is_empty(),
-            Role::Retiring => false,
         }
     }
 

@@ -170,6 +170,7 @@ use hyperscale_types::{
     ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
     missed_proposals_since_prev_commit, ready_leaf_payload,
 };
+use hyperscale_vm_effects::CrossingId;
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
@@ -195,7 +196,7 @@ use crate::proposal::{
     Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
     dispatch_or_defer, late_answers, late_deliveries, readable_deliveries, record_licences,
     select_abandonment_records, select_finalizations, select_provisions, select_state_claims,
-    select_transactions,
+    select_transactions, trim_local_crossings,
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
@@ -1956,29 +1957,37 @@ impl ShardCoordinator {
     // Proposer Logic
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// What a block anchored at `anchor` over `parent_block_hash` is
-    /// admitted against: the chain behind the parent, walked once, and
-    /// the window the block sits in.
+    /// What a block extending `parent_qc` is admitted against: the chain
+    /// behind the parent, walked once, and the window the block sits in.
     fn admission<'a>(
         &'a self,
         snapshot: &'a TopologySnapshot,
         topology_schedule: &'a TopologySchedule,
         chain: &'a QcChainSets,
-        parent_block_hash: BlockHash,
-        anchor: WeightedTimestamp,
-        genesis_parent: bool,
+        parent_qc: &QuorumCertificate,
     ) -> Admission<'a> {
-        let parent_settled_frontier = if genesis_parent {
+        let parent_block_hash = parent_qc.block_hash();
+        let anchor = parent_qc.weighted_timestamp();
+        let parent_settled_frontier = if parent_qc.is_genesis() {
             Some(BlockHeight::GENESIS)
         } else {
             self.chain_view()
                 .parent_settled_frontier_checked(parent_block_hash)
+        };
+        // The parent at the block's own clock, which every replica
+        // holds whether or not the parent's header is still here.
+        let parent = Anchor {
+            shard: self.local_shard,
+            height: parent_qc.height(),
+            state_root: self.chain_view().parent_state_root(parent_block_hash),
+            ts: anchor,
         };
         Admission {
             snapshot,
             schedule: topology_schedule,
             local_shard: self.local_shard,
             anchor,
+            parent,
             chain_origin: self.chain_origin.anchor_wt,
             chain,
             dedup: &self.dedup_index,
@@ -2052,6 +2061,7 @@ impl ShardCoordinator {
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
         state_claims: Vec<StateClaim>,
+        local_crossings: Vec<CrossingId>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -2141,14 +2151,7 @@ impl ShardCoordinator {
         else {
             return vec![];
         };
-        let ctx = self.admission(
-            committee,
-            topology_schedule,
-            &chain,
-            parent_block_hash,
-            validity_anchor,
-            parent_qc.is_genesis(),
-        );
+        let ctx = self.admission(committee, topology_schedule, &chain, &parent_qc);
         // In the order the folds depend on: provisions first, since a
         // cross-shard transaction rides only beside (or after) its payer
         // bundle; the claims before the transactions they license;
@@ -2156,6 +2159,7 @@ impl ShardCoordinator {
         let mut provision_fold = ProvisionsFold::default();
         let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
         let state_claims = select_state_claims(&ctx, &mut StateClaimsFold::default(), state_claims);
+        let local_crossings = trim_local_crossings(&state_claims, local_crossings);
         let Licensed {
             readable,
             late,
@@ -2189,6 +2193,7 @@ impl ShardCoordinator {
                 provisions,
                 abandonment_records,
                 state_claims,
+                local_crossings,
                 fence,
                 record_licences,
             })),
@@ -3863,9 +3868,7 @@ impl ShardCoordinator {
             topology_snapshot,
             topology_schedule,
             &chain,
-            parent,
-            block.header().parent_qc().weighted_timestamp(),
-            block.header().parent_qc().is_genesis(),
+            block.header().parent_qc(),
         );
         if let Err(e) = validate_block_for_vote(
             &ctx,
@@ -4778,6 +4781,7 @@ impl ShardCoordinator {
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
         state_claims: Vec<StateClaim>,
+        local_crossings: Vec<CrossingId>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -4837,6 +4841,7 @@ impl ShardCoordinator {
             provisions,
             abandonment_records,
             state_claims,
+            local_crossings,
         ));
 
         actions
@@ -10565,6 +10570,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
 
         // Should emit BuildProposal for height 4 even with empty content.
@@ -10620,6 +10626,7 @@ mod tests {
             block_3_hash,
             &qc,
             &[],
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -10689,7 +10696,15 @@ mod tests {
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
 
-        let first = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
+        let first = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert!(
             first
                 .iter()
@@ -10701,7 +10716,15 @@ mod tests {
             "defer slot should be recorded"
         );
 
-        let second = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
+        let second = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert!(
             second.is_empty(),
             "second try_propose for same (height, round) must be suppressed"
@@ -10719,7 +10742,15 @@ mod tests {
             "deferred slot should be cleared"
         );
 
-        let third = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
+        let third = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert!(
             third.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -10766,7 +10797,7 @@ mod tests {
         // the sync-commit shape, whose commits carry no byte delta.
         assert_ne!(state.substate_bytes_frontier.0, state.committed_height);
 
-        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![]);
+        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -10785,7 +10816,7 @@ mod tests {
             "the reconcile must latch a proposal retry"
         );
 
-        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![]);
+        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![], vec![]);
         assert!(
             second.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -11077,6 +11108,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
 
         let proposal = actions
@@ -11132,7 +11164,15 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
+        let actions = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         let Some(Action::BuildProposal { timestamp, .. }) = actions
             .iter()
             .find(|a| matches!(a, Action::BuildProposal { .. }))
@@ -11165,7 +11205,15 @@ mod tests {
 
         let height = BlockHeight::new(4);
         let round = Round::new(4);
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
+        let actions = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert!(
             actions
                 .iter()
@@ -11188,7 +11236,15 @@ mod tests {
         assert_eq!(state.last_voted_round(), round);
 
         // The retry at the same view must be a no-op, not a sibling build.
-        let retry = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
+        let retry = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert!(retry.is_empty(), "retry built a sibling: {retry:?}");
     }
 
@@ -11249,7 +11305,7 @@ mod tests {
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
-        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![], vec![]);
+        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![], vec![], vec![]);
         let classification = actions
             .iter()
             .find_map(|a| match a {
@@ -12337,7 +12393,15 @@ mod tests {
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
-        let _ = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
+        let _ = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
 
         assert_eq!(
             state.view_change.last_leader_activity,
@@ -12448,7 +12512,15 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
+        let actions = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert!(
             actions
                 .iter()
@@ -12837,9 +12909,7 @@ mod tests {
                 topology_schedule.head(),
                 topology_schedule,
                 &chain,
-                parent,
-                block.header().parent_qc().weighted_timestamp(),
-                block.header().parent_qc().is_genesis(),
+                block.header().parent_qc(),
             );
             let provisions = ProvisionsFold::default();
             admit_all::<TransactionsSection<'_>>(
@@ -12862,9 +12932,7 @@ mod tests {
                 topology_schedule.head(),
                 topology_schedule,
                 &chain,
-                parent,
-                block.header().parent_qc().weighted_timestamp(),
-                block.header().parent_qc().is_genesis(),
+                block.header().parent_qc(),
             );
             let finalizations = FinalizationsFold::from(&ctx);
             admit_all::<RecordsSection<'_>>(

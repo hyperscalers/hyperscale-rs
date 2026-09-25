@@ -31,8 +31,8 @@ use std::fmt;
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Anchor, Block, BlockHeight, Epoch, EpochWindows, RETENTION_HORIZON, ShardId, StateClaim,
-    SubstateKey, TxHash, WeightedTimestamp,
+    Anchor, Block, BlockHeight, Epoch, EpochWindows, RETENTION_HORIZON, ShardId, ShardTrie,
+    StateClaim, SubstateKey, TxHash, WeightedTimestamp,
 };
 
 /// Where an anchor sits in its producer's lineage: the epoch whose
@@ -247,15 +247,23 @@ pub struct Reading {
     pub mark: ReadMark,
 }
 
-/// What the read frontier fences in a block beyond its raises: the
-/// record presences its claims carry, the absences beside them, and the
-/// answer cells its late deliveries would have to find gone.
+/// What the read frontier fences in a block beyond its raises.
+///
+/// The record presences its claims carry, the absences beside them, the
+/// record absences that would delete an answer, and the answer cells
+/// its late deliveries would have to find gone.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadFence {
     /// Every held reading whose bytes decode as a crossing record.
     pub presences: Vec<Reading>,
     /// Every absent reading the block carries, whichever key.
     pub absences: Vec<Reading>,
+    /// Every absent reading of a record key that names its crossing:
+    /// what licenses the commit fold to delete the answers. Licensed at
+    /// or above the floor for the anchor's shard and from a shard that
+    /// owns the record's prefix, so no deletion below the frontier
+    /// reaches the fold.
+    pub deletions: Vec<Reading>,
     /// For each transaction carried past its validity end on a record
     /// presence, the answer cells of every crossing it consumes here.
     /// While either answer stands the delivery is a replay of one this
@@ -289,6 +297,20 @@ pub enum FrontierRefusal {
         /// The answer cell standing.
         answer: SubstateKey,
     },
+    /// A record absence that would delete an answer, read below the
+    /// floor the parent state left for its producer's lineage.
+    DeletionBelowFloor {
+        /// The reading refused.
+        reading: Reading,
+        /// The floor it fell below.
+        floor: ReadMark,
+    },
+    /// A record absence that would delete an answer, read from a shard
+    /// that does not own the record's prefix.
+    DeletionOffOwner {
+        /// The reading refused.
+        reading: Reading,
+    },
 }
 
 impl fmt::Display for FrontierRefusal {
@@ -321,6 +343,23 @@ impl fmt::Display for FrontierRefusal {
                 f,
                 "late delivery {tx:?} consumes a crossing whose answer {answer:?} stands",
             ),
+            Self::DeletionBelowFloor { reading, floor } => write!(
+                f,
+                "record {:?} read absent on {:?} at epoch {} height {}, below the read \
+                 frontier's floor of epoch {} height {}, licenses no deletion",
+                reading.key,
+                reading.shard,
+                reading.mark.epoch.inner(),
+                reading.mark.height.inner(),
+                floor.epoch.inner(),
+                floor.height.inner(),
+            ),
+            Self::DeletionOffOwner { reading } => write!(
+                f,
+                "record {:?} read absent on {:?}, which does not own its prefix, licenses no \
+                 deletion",
+                reading.key, reading.shard,
+            ),
         }
     }
 }
@@ -329,7 +368,7 @@ impl fmt::Display for FrontierRefusal {
 /// building.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Refused {
-    /// The record presences refused.
+    /// The readings refused: record presences and deleting absences.
     pub readings: Vec<Reading>,
     /// The late deliveries refused.
     pub deliveries: Vec<TxHash>,
@@ -343,7 +382,8 @@ impl ReadFence {
     /// # Errors
     ///
     /// The first refusal found: a presence below its lineage's floor, a
-    /// presence below a same-block absence of its key, or a late
+    /// presence below a same-block absence of its key, a deleting
+    /// absence below the floor or off the record's owner, or a late
     /// delivery either of whose answers stands.
     pub fn check(
         &self,
@@ -352,6 +392,11 @@ impl ReadFence {
     ) -> Result<(), Box<FrontierRefusal>> {
         for reading in &self.presences {
             if let Some(refusal) = self.refuses_presence(parent, *reading) {
+                return Err(Box::new(refusal));
+            }
+        }
+        for reading in &self.deletions {
+            if let Some(refusal) = refuses_deletion(parent, *reading) {
                 return Err(Box::new(refusal));
             }
         }
@@ -376,6 +421,12 @@ impl ReadFence {
                 .iter()
                 .copied()
                 .filter(|reading| self.refuses_presence(parent, *reading).is_some())
+                .chain(
+                    self.deletions
+                        .iter()
+                        .copied()
+                        .filter(|reading| refuses_deletion(parent, *reading).is_some()),
+                )
                 .collect(),
             deliveries: self
                 .late_answers
@@ -403,6 +454,22 @@ impl ReadFence {
             })
             .map(|absence| FrontierRefusal::BelowAbsence { reading, absence })
     }
+}
+
+/// Why a record absence that would delete an answer is refused: below
+/// the floor for its producer's lineage, or read from a shard that does
+/// not own the record's prefix. An absence from the owner at or above
+/// the floor postdates every presence the chain carried, and is the
+/// licence.
+fn refuses_deletion(parent: &ReadFrontier, reading: Reading) -> Option<FrontierRefusal> {
+    if let Some(floor) = parent
+        .floor(reading.shard)
+        .filter(|floor| reading.mark < *floor)
+    {
+        return Some(FrontierRefusal::DeletionBelowFloor { reading, floor });
+    }
+    (!ShardTrie::shard_owns_prefix(reading.shard, reading.key.owner))
+        .then_some(FrontierRefusal::DeletionOffOwner { reading })
 }
 
 #[cfg(test)]
@@ -648,6 +715,7 @@ mod tests {
         let everything = ReadFence {
             presences: vec![reading(producer, 3, 49), reading(producer, 3, 60)],
             absences: vec![reading(producer, 3, 61)],
+            deletions: Vec::new(),
             late_answers: late.late_answers,
         };
         let refused = everything.refused(&parent, |key| key == answer);
@@ -656,5 +724,56 @@ mod tests {
             vec![reading(producer, 3, 49), reading(producer, 3, 60)]
         );
         assert_eq!(refused.deliveries, vec![tx]);
+    }
+
+    /// A record absence that would delete an answer is licensed at or
+    /// above the floor for its producer, from a shard owning the
+    /// record's prefix, and refused below the floor or off the owner.
+    #[test]
+    fn a_deleting_absence_is_licensed_at_the_floor_from_the_owner() {
+        let producer = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let record = test_key(0x10);
+        let parent = ReadFrontier::from_entries([(producer, mark(3, 50))]);
+        let reading = |shard, epoch, height| Reading {
+            key: record,
+            shard,
+            mark: mark(epoch, height),
+        };
+        let none = |_| false;
+        let deleting = |readings: Vec<Reading>| ReadFence {
+            deletions: readings,
+            ..ReadFence::default()
+        };
+
+        assert!(matches!(
+            deleting(vec![reading(producer, 3, 49)])
+                .check(&parent, none)
+                .err()
+                .map(|refusal| *refusal),
+            Some(FrontierRefusal::DeletionBelowFloor { .. })
+        ));
+        assert_eq!(
+            deleting(vec![reading(producer, 3, 50)]).check(&parent, none),
+            Ok(()),
+            "at the floor, from the owner, the absence is the licence",
+        );
+        assert!(matches!(
+            deleting(vec![reading(sibling, 9, 900)])
+                .check(&parent, none)
+                .err()
+                .map(|refusal| *refusal),
+            Some(FrontierRefusal::DeletionOffOwner { .. })
+        ));
+        let refused = deleting(vec![
+            reading(producer, 3, 49),
+            reading(producer, 3, 50),
+            reading(sibling, 9, 900),
+        ])
+        .refused(&parent, none);
+        assert_eq!(
+            refused.readings,
+            vec![reading(producer, 3, 49), reading(sibling, 9, 900)],
+        );
     }
 }

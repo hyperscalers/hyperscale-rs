@@ -1184,7 +1184,7 @@ pub mod tests {
             .iter()
             .map(|seed| test_utils::test_key(*seed))
             .collect();
-        test_utils::proven_claim(ShardId::ROOT, height, &[], &asked)
+        test_utils::proven_claim(ShardId::leaf(1, 0), height, &[], &asked)
     }
 
     /// The section is bound to the header's root and held to one form:
@@ -1239,7 +1239,8 @@ pub mod tests {
             validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
         };
         let (present, absent) = (test_utils::test_key(1), test_utils::test_key(2));
-        let claim = test_utils::proven_claim(ShardId::ROOT, 3, &[present], &[present, absent]);
+        let claim =
+            test_utils::proven_claim(ShardId::leaf(1, 0), 3, &[present], &[present, absent]);
         assert!(held(vec![claim.clone()]).is_ok());
 
         let mut other_root = claim.clone();
@@ -1299,7 +1300,7 @@ pub mod tests {
         };
         let key = test_utils::test_key;
         let at = |height: u64, asked: &[SubstateKey]| {
-            test_utils::proven_claim(ShardId::ROOT, height, &[key(1), key(3)], asked)
+            test_utils::proven_claim(ShardId::leaf(1, 0), height, &[key(1), key(3)], asked)
         };
         assert!(
             held(vec![at(3, &[key(1), key(2)]), at(3, &[key(3), key(4)])]).is_ok(),
@@ -1321,7 +1322,7 @@ pub mod tests {
     /// stand before it.
     #[test]
     fn a_claims_section_past_its_budget_is_refused() {
-        let (leaves, wide) = wide_claims(ShardId::ROOT);
+        let (leaves, wide) = wide_claims(ShardId::leaf(1, 0));
         let mut fold = StateClaimsFold::default();
         let mut carried = 0usize;
         let mut refused = None;

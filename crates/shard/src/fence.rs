@@ -214,6 +214,12 @@ impl VoteFence<'_> {
     pub(crate) fn state_claims(&self, block: &Block) -> Result<(), Withheld> {
         let mut wanted = Vec::new();
         for claim in block.state_claims() {
+            // A claim anchored at the block's own parent is this
+            // chain's, which no commit-proven header of a counterpart
+            // holds: the state-root verification re-reads it.
+            if claim.anchor.shard == self.local_shard {
+                continue;
+            }
             self.anchor_stands(claim, &mut wanted)?;
         }
         if wanted.is_empty() {

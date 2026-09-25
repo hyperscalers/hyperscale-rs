@@ -17,8 +17,8 @@ use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
     QuorumCertificate, ReadFence, ReshapeThresholds, RevealChain, ShardId, SplitChildRoots,
-    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot,
-    TxHash, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
+    StateClaim, StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule,
+    TopologySnapshot, TxHash, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
     VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
@@ -139,6 +139,9 @@ pub struct ReadyStateRootVerification {
     /// What the read frontier judges of the block against the parent
     /// state.
     pub fence: ReadFence,
+    /// The block's claims: what the fold settles on, and among which
+    /// the parent-anchored ones are re-read from the parent view.
+    pub state_claims: Vec<StateClaim>,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -172,6 +175,7 @@ pub struct PendingStateRootVerification {
     pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
     pub(crate) frontier: FrontierInputs,
     pub(crate) fence: ReadFence,
+    pub(crate) state_claims: Vec<StateClaim>,
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
@@ -828,6 +832,7 @@ impl VerificationPipeline {
             settled_txs_window_floor,
             frontier,
             fence,
+            state_claims: block.state_claims().to_vec(),
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -1901,6 +1906,7 @@ impl VerificationPipeline {
             claimed_sweep_frontier: block.header().sweep_frontier(),
             frontier: pending.frontier.clone(),
             fence: pending.fence.clone(),
+            state_claims: pending.state_claims.clone(),
         })
     }
 

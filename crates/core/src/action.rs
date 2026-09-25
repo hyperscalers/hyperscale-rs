@@ -26,6 +26,7 @@ use hyperscale_types::{
     TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
     WeightedTimestamp,
 };
+use hyperscale_vm_effects::CrossingId;
 
 use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
 
@@ -791,6 +792,11 @@ pub enum Action {
         /// state: its record presences, its absences and its late
         /// deliveries' answers. A refusal refuses the state root.
         fence: ReadFence,
+        /// The block's claims, whose readings license the crossing
+        /// settlements folded under the root, and among which the
+        /// parent-anchored ones are re-read from the verifier's own
+        /// parent view.
+        state_claims: Vec<StateClaim>,
     },
 
     /// Verify a block's beacon-witness root + leaf count.
@@ -1035,6 +1041,13 @@ pub enum Action {
         /// Proofs of counterparts' cells this proposer's fetches
         /// answered, for every replica to fold at commit.
         state_claims: Vec<StateClaim>,
+        /// The block's parent as an anchor: the one anchor a crossing
+        /// whose ends share this shard is read at.
+        parent_anchor: Anchor,
+        /// The crossings whose ends share this shard and whose
+        /// settlement the mirrors say is due, for the handler to read
+        /// at the parent and carry beside the claims.
+        local_crossings: Vec<CrossingId>,
         /// Prior fee-reservation demand per local payer among the
         /// candidate transactions — in-flight holds plus the uncommitted
         /// window, excluding the candidates themselves. The builder

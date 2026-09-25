@@ -21,11 +21,13 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::{Classified, live_record};
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
-    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_STATE_CLAIMS_PER_BLOCK,
-    ProposerTimestamp, Provisions, ReadFence, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ShardId, StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
+    AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
+    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_PROOFS_PER_QUERY,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
+    ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateKey, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, state_claims_admit_block,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, Kind};
 use hyperscale_vm_types::ProtocolHasher;
@@ -67,6 +69,9 @@ pub struct ProposalPayload {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
+    /// The crossings whose ends share this shard, for the builder to
+    /// read at the parent beside the claims.
+    pub(crate) local_crossings: Vec<CrossingId>,
     /// What the read frontier judges of the claims and transactions
     /// selected, for the builder to drop against the parent state.
     pub(crate) fence: ReadFence,
@@ -512,6 +517,33 @@ pub fn select_state_claims(
         .collect()
 }
 
+/// The crossings of `offered` the section's budget still carries once
+/// `selected` is in it, read at the parent: three keyed and named
+/// readings each, with the empty proof, cut into claims of
+/// [`MAX_PROOFS_PER_QUERY`] readings. What does not fit waits a block.
+#[must_use]
+pub fn trim_local_crossings(
+    selected: &[StateClaim],
+    mut offered: Vec<CrossingId>,
+) -> Vec<CrossingId> {
+    let spent: usize = selected.iter().map(StateClaim::wire_weight).sum();
+    let room = MAX_STATE_CLAIMS_BYTES.saturating_sub(spent);
+    let claims_left = MAX_STATE_CLAIMS_PER_BLOCK.saturating_sub(selected.len());
+    let per_crossing = 3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES);
+    let per_claim = MAX_PROOFS_PER_QUERY / 3;
+    let mut kept = 0;
+    while kept < offered.len() {
+        let claims = kept / per_claim + 1;
+        let weight = claims * STATE_CLAIM_BYTES + (kept + 1) * per_crossing;
+        if weight > room || claims > claims_left {
+            break;
+        }
+        kept += 1;
+    }
+    offered.truncate(kept);
+    offered
+}
+
 /// Select provisions for inclusion: what [`ProvisionsSection`] admits
 /// from the FIFO queue, folding into `fold`. Oldest batches go first so
 /// the queue drains monotonically; unselected batches remain queued for
@@ -621,9 +653,16 @@ pub fn assemble_build_action(
         provisions,
         abandonment_records,
         state_claims,
+        local_crossings,
         fence,
         record_licences,
     } = payload;
+    let parent_anchor = Anchor {
+        shard: local_shard,
+        height: parent_block_height,
+        state_root: parent_state_root,
+        ts: parent_qc.weighted_timestamp(),
+    };
     let frontier = FrontierInputs::for_block(
         &state_claims,
         windows,
@@ -672,6 +711,8 @@ pub fn assemble_build_action(
         frontier,
         fence,
         record_licences,
+        parent_anchor,
+        local_crossings,
     };
 
     BuildActionPlan {
@@ -913,9 +954,9 @@ mod tests {
     ///
     /// The offer's dedup asks whether the chain already resolved the
     /// names a finalization carries a verdict on. A member that reaches
-    /// no verdict — a retirement, whose `Membership::housekeeping`
-    /// decides nothing — contributes no such name, so a certificate
-    /// carrying only those asks the question of an empty set. `all()` over
+    /// no verdict — a leg whose success bears none, since its core
+    /// decides — contributes no such name, so a certificate carrying
+    /// only those asks the question of an empty set. `all()` over
     /// an empty iterator is true, and the proposer re-offers the same
     /// certificate on every block while the settlement frontier stands
     /// still.
@@ -1360,7 +1401,7 @@ mod tests {
     /// remainder is a claim a next proposal carries.
     #[test]
     fn a_claim_past_the_budget_is_cut_to_its_longest_fitting_prefix() {
-        let (_, wide) = wide_claims(ShardId::ROOT);
+        let (_, wide) = wide_claims(ShardId::leaf(1, 0));
         let ctx = finalizations_against(CommitDedupIndex::new());
         let mut fold = StateClaimsFold::default();
         let selected = select_state_claims(&ctx.ctx(), &mut fold, wide.clone());
@@ -1413,8 +1454,8 @@ mod tests {
     /// reading at `a2` is carried while one at `a1` is held back.
     #[test]
     fn a_producers_older_anchor_rides_before_its_newer_one() {
-        let (_, at_a1) = wide_claims_at(ShardId::ROOT, 3);
-        let (_, at_a2) = wide_claims_at(ShardId::ROOT, 4);
+        let (_, at_a1) = wide_claims_at(ShardId::leaf(1, 0), 3);
+        let (_, at_a2) = wide_claims_at(ShardId::leaf(1, 0), 4);
         let ctx = finalizations_against(CommitDedupIndex::new());
         let is_whole = |carried: &StateClaim, offered: &[StateClaim]| offered.contains(carried);
 
@@ -1458,6 +1499,61 @@ mod tests {
         assert!(
             carried_a2.iter().all(|claim| !is_whole(claim, &offered)),
             "what rides at a2 is a piece cut behind a1's, never the whole",
+        );
+    }
+
+    /// The crossings whose ends share this shard ride in the room the
+    /// section has left: all of them into an empty section, a prefix of
+    /// them behind a section near its budget, and none behind a full
+    /// one. What does not fit waits a block.
+    #[test]
+    fn local_crossings_past_the_section_budget_wait_a_block() {
+        use hyperscale_vm_effects::{Hash32, IntentHash};
+
+        let crossing = |seed: u16| {
+            let [hi, lo] = seed.to_be_bytes();
+            let mut body = [lo; 31];
+            body[0] = hi;
+            CrossingId {
+                producer: Address::new(body, AddressClass::Component),
+                consumer: Address::new([0xC0; 31], AddressClass::Component),
+                intent: IntentHash(Hash32([lo; 32])),
+                local: 0,
+                output: 0,
+            }
+        };
+        let offered: Vec<CrossingId> = (0..200).map(crossing).collect();
+        assert_eq!(
+            trim_local_crossings(&[], offered.clone()),
+            offered,
+            "an empty section carries them all",
+        );
+
+        let (_, wide) = wide_claims(ShardId::leaf(1, 0));
+        let mut selected: Vec<StateClaim> = Vec::new();
+        let mut weight = 0usize;
+        for claim in wide {
+            if state_claims_admit_block(weight + claim.wire_weight()) {
+                weight += claim.wire_weight();
+                selected.push(claim);
+            }
+        }
+        let kept = trim_local_crossings(&selected, offered.clone());
+        assert!(
+            !kept.is_empty() && kept.len() < offered.len(),
+            "a section near its budget carries some and not all: {}",
+            kept.len(),
+        );
+        assert_eq!(kept, offered[..kept.len()], "the prefix offered");
+        let carried = weight
+            + (kept.len() / (MAX_PROOFS_PER_QUERY / 3) + 1) * STATE_CLAIM_BYTES
+            + kept.len() * 3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES);
+        assert!(state_claims_admit_block(carried), "and what is kept fits");
+        assert!(
+            !state_claims_admit_block(
+                carried + 3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES)
+            ),
+            "one more would not",
         );
     }
 

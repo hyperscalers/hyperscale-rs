@@ -118,16 +118,6 @@ pub struct HeldRecord {
     /// The decline cell's key, under the same target the claim's key
     /// sits at and off the same edge, held for the same reason.
     pub(crate) decline: SubstateKey,
-    /// Whether a committed claim read the consumer's claim cell
-    /// present: the consumer holds the crossing, so the record is
-    /// answered and the value is not the producer's to take back.
-    ///
-    /// A presence and nothing else, which is the whole of what this
-    /// phase settled. The cell's *absence* says only that the consumer
-    /// has not run yet — a leaf does not name its consumer's role, so
-    /// no window makes one honest for every record — and the decline
-    /// beside it is what says the crossing will never be taken.
-    pub(crate) claimed: bool,
     /// Whether a committed claim read the consumer's decline cell
     /// present: its own word that it will never take the crossing, so
     /// the value is the producer's to credit back.
@@ -163,23 +153,18 @@ impl HeldRecord {
             decline: id.answer_key(&ProtocolHasher, Answered::Never),
             cell,
             asked_at: None,
-            claimed: false,
             declined: false,
             departed: false,
         }
     }
 
-    /// Whether the consumer has answered this crossing, either way.
-    ///
-    /// Stated once because four sites ask it — the probe that puts the
-    /// question, the fold that records what comes back, the offer that
-    /// applies the pressure, and the retention rule that keeps a
-    /// reading to carry. Both halves are presences: a claim read
-    /// present or a decline read present, and a conjunction copied four
-    /// times is one three of them forget to grow.
+    /// Whether the consumer has answered this crossing while the record
+    /// stands: its decline read present. A claim read present is not a
+    /// state here — the commit fold removes the record on it, and the
+    /// record leaves the mirror with it.
     #[must_use]
     pub(crate) const fn answered(&self) -> bool {
-        self.claimed || self.declined
+        self.declined
     }
 
     /// Whether the crossing this record holds can never be claimed, so
@@ -212,21 +197,24 @@ impl HeldRecord {
 /// absence answers at or above the read frontier's floor.
 #[derive(Debug, Clone)]
 pub struct AnsweredCrossing {
+    /// The crossing this answer answers for, read off the leaf, which
+    /// names it; what a reading of the record is named for.
+    pub(crate) id: CrossingId,
     /// The record cell this claim answers for, under the producing
-    /// node's target. Read off the leaf, which is the only thing that
-    /// names it.
+    /// node's target, derived through the crossing.
     pub(crate) record: SubstateKey,
     /// How far the record has been read gone.
     pub cleanup: Cleanup,
 }
 
 impl AnsweredCrossing {
-    /// The answer as the leaves give it, for the record at `record` on
-    /// the producer's chain: unasked, with nothing yet read of it.
+    /// The answer as the leaves give it, for the crossing `id`: unasked,
+    /// with nothing yet read of its record.
     #[must_use]
-    pub(crate) const fn of(record: SubstateKey) -> Self {
+    pub(crate) fn of(id: CrossingId) -> Self {
         Self {
-            record,
+            id,
+            record: id.record_key(&ProtocolHasher),
             cleanup: Cleanup::Standing(None),
         }
     }
@@ -418,15 +406,11 @@ pub struct Committed {
     /// The transactions let go of because every counterpart has fallen
     /// silent — the tick machine's to discard.
     pub(crate) unanswerable: Vec<Unanswerable>,
-    /// The answers whose record **this commit's own claims** read
-    /// absent, with the producer anchor each was read at.
-    ///
-    /// Read off the block and not off the fold, because it is the whole
-    /// of a deletion's licence: one of these licenses one. A fold would
-    /// make the licence node-local, and a replica that had folded fewer
-    /// readings would compose fewer members and vote a different root —
-    /// a divergence rather than a lag.
-    pub(crate) gone: Vec<(SubstateKey, Anchor)>,
+    /// The leg entries the commit fold closed: every record each
+    /// issued here removed on its consumer's `Taken`, which is the
+    /// transaction accepted. No finalization drives these, so the
+    /// mempool hears them from here.
+    pub(crate) settled: Vec<(TxHash, TxResolution)>,
 }
 
 /// What this validator holds to offer in a block it proposes.
@@ -436,6 +420,11 @@ pub struct Offers {
     pub state_claims: Vec<StateClaim>,
     /// The records it has evidence for and has not yet written down.
     pub abandonment_records: Vec<AbandonmentRecord>,
+    /// The crossings whose two ends share this shard and whose
+    /// settlement the mirrors say is due, for the block to read at its
+    /// parent: a held record whose answer this shard itself holds, and
+    /// an answer whose record routes here and is held no more.
+    pub local_crossings: Vec<CrossingId>,
 }
 
 pub struct Counterparts {
@@ -523,6 +512,13 @@ pub struct Counterparts {
     /// pacing.
     records: RecordReads,
 
+    /// The crossings whose two ends route here that the last probe
+    /// found a settlement due for, offered to the next proposal to read
+    /// at its parent. A proposal choice: the voter re-reads every
+    /// reading it leads to, and a wrong offer costs a claim that
+    /// settles nothing.
+    local_crossings: BTreeSet<CrossingId>,
+
     /// The questions this validator has put to counterparts, by the
     /// shard asked and the cell: the header each was asked at, and
     /// whether the fetch returned. A probe lives while its question is
@@ -566,13 +562,13 @@ impl Counterparts {
                 .iter()
                 .filter_map(|(key, value)| {
                     let answer = CrossingAnswer::from_bytes(value)?;
-                    let record =
-                        CrossingId::of_answer(key.owner, &answer).record_key(&ProtocolHasher);
-                    Some((*key, AnsweredCrossing::of(record)))
+                    let id = CrossingId::of_answer(key.owner, &answer);
+                    Some((*key, AnsweredCrossing::of(id)))
                 })
                 .collect(),
             wanted: BTreeSet::new(),
             records: RecordReads::new(),
+            local_crossings: BTreeSet::new(),
             probes: BTreeMap::new(),
         }
     }
@@ -597,6 +593,18 @@ impl Counterparts {
         let windows = topology_schedule.windows();
         self.gc_settled_sets(topology_schedule, now);
         self.wanted = wanted.iter().map(|wanted| wanted.key).collect();
+        // What the block's claims settle, applied to the mirrors first,
+        // as the fold applies it to state first: a record removed on
+        // its consumer's `Taken` leaves `held` and is marked gone on the
+        // entry that issued it, and an answer removed on its record's
+        // absence leaves `answered`. A key the mirror never held is
+        // nothing to remove, so no presence is read here.
+        for key in block.state_claims().iter().flat_map(StateClaim::settles) {
+            if let Some(record) = self.held.remove(&key) {
+                self.ledger.settled(key, record.cell.tx);
+            }
+            self.answered.remove(&key);
+        }
         // The reads still worth pacing: the records something here
         // waits on, and the records behind the answers this shard holds.
         let live: BTreeSet<SubstateKey> = self
@@ -632,8 +640,7 @@ impl Counterparts {
                 })
                 .collect();
         }
-        let mut gone = Vec::new();
-        let mut actions = self.fold_state_claims(trie, windows, block, &mut gone);
+        let mut actions = self.fold_state_claims(trie, windows, block);
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -648,9 +655,12 @@ impl Counterparts {
         }
         self.cover_recorded(block);
         self.fold_crossing_writes(block);
-        self.cover_held_here(trie);
         self.cover_held(block);
         self.stamp_departures(topology_schedule, now);
+        // The entries the fold has closed, read once the block's own
+        // finalizations and removals are both in: a settled record and
+        // a delivery finalized in one block close together.
+        let settled = self.ledger.closes();
         let unanswerable = self.ledger.prune(now);
         // The frontier as this block leaves it, after the licence above
         // read the floor its parent left; then what the raise refuses
@@ -665,7 +675,7 @@ impl Counterparts {
         Committed {
             actions,
             unanswerable,
-            gone,
+            settled,
         }
     }
 
@@ -719,6 +729,7 @@ impl Counterparts {
         Offers {
             state_claims: self.state_claims(),
             abandonment_records: self.abandonment_records(),
+            local_crossings: self.local_crossings.iter().copied().collect(),
         }
     }
 
@@ -772,6 +783,7 @@ impl Counterparts {
         windows: EpochWindows,
     ) -> Vec<Action> {
         self.wanted = records.iter().map(|record| record.key).collect();
+        self.local_crossings.clear();
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         self.ask_entries(trie, now, &mut wanted);
         self.ask_held_records(trie, now, &mut wanted);
@@ -868,13 +880,21 @@ impl Counterparts {
     ) {
         let local = self.ledger.local();
         let ledger = &self.ledger;
-        for record in self.held.values_mut() {
+        for (key, record) in &mut self.held {
             if record.answered() || ledger.settles_records(record.cell.tx) {
                 continue;
             }
             let claim = record.claim;
             let shard = trie.shard_for_prefix(claim.owner);
             if shard == local {
+                // A consumer on this shard is not asked: its answer, if
+                // it has given one, is in this shard's own state, and
+                // the block reads it at its parent.
+                if self.answered.contains_key(&claim) || self.answered.contains_key(&record.decline)
+                {
+                    self.local_crossings
+                        .insert(CrossingId::of_record(key.owner, &record.cell));
+                }
                 continue;
             }
             let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
@@ -972,6 +992,12 @@ impl Counterparts {
             let record = answer.record;
             let shard = trie.shard_for_prefix(record.owner);
             if shard == local {
+                // A producer on this shard is not asked: whether it still
+                // holds the record is this shard's own state, and the
+                // block reads it at its parent once the record is gone.
+                if !self.held.contains_key(&record) {
+                    self.local_crossings.insert(answer.id);
+                }
                 continue;
             }
             self.records.arm_now(record);
@@ -997,8 +1023,10 @@ impl Counterparts {
     /// the fold over its own finalizations do.
     #[cfg(test)]
     pub(crate) fn note_answer(&mut self, key: SubstateKey, answer: &CrossingAnswer) {
-        let record = CrossingId::of_answer(key.owner, answer).record_key(&ProtocolHasher);
-        self.answered.insert(key, AnsweredCrossing::of(record));
+        self.answered.insert(
+            key,
+            AnsweredCrossing::of(CrossingId::of_answer(key.owner, answer)),
+        );
     }
 
     /// Whether this validator holds an answering reading of `key` on
@@ -1146,10 +1174,34 @@ impl Counterparts {
                     .map(|(_, bytes)| Stated::Held(bytes.clone()));
                 (key, held.unwrap_or(Stated::Inclusion(inclusion)))
             });
+        // Each reading of a crossing's cell names the crossing, off what
+        // the asker holds: a held record's answers, and a held answer's
+        // record. What the reading licenses the fold to remove is read
+        // off the name, by every replica alike.
+        let named: Vec<(SubstateKey, CrossingId)> = kept
+            .iter()
+            .filter_map(|key| self.crossing_of(*key).map(|id| (*key, id)))
+            .collect();
         self.fetched
-            .entry(StateClaim::new(anchor, cells, proof))
+            .entry(StateClaim::new(anchor, cells, proof).naming(named))
             .or_default()
             .extend(speaks_for);
+    }
+
+    /// The crossing a reading of `key` speaks for, where something here
+    /// asked about it: a held record's `Taken` or `Never`, or the record
+    /// behind an answer this shard holds.
+    fn crossing_of(&self, key: SubstateKey) -> Option<CrossingId> {
+        self.held
+            .iter()
+            .find(|(_, record)| record.claim == key || record.decline == key)
+            .map(|(record_key, record)| CrossingId::of_record(record_key.owner, &record.cell))
+            .or_else(|| {
+                self.answered
+                    .values()
+                    .find(|answer| answer.record == key)
+                    .map(|answer| answer.id)
+            })
     }
 
     /// Fold the claims a committed block carries into the answers every
@@ -1174,7 +1226,6 @@ impl Counterparts {
         trie: &ShardTrie,
         windows: EpochWindows,
         block: &Block,
-        gone: &mut Vec<(SubstateKey, Anchor)>,
     ) -> Vec<Action> {
         if block.state_claims().is_empty() {
             return Vec::new();
@@ -1184,7 +1235,7 @@ impl Counterparts {
         for claim in block.state_claims() {
             actions.extend(self.fold_cells(claim, &questions));
             self.fold_held(claim, trie);
-            gone.extend(self.fold_answered(claim, windows));
+            self.fold_answered(claim, windows);
         }
         actions
     }
@@ -1277,9 +1328,14 @@ impl Counterparts {
                     .reading(key)
                     .and_then(|inclusion| probed.read(inclusion))
             };
+            // A claim read present beside the decline is the consumer
+            // holding the crossing: the fold takes the record on it, and
+            // nothing here licenses crediting back what the consumer
+            // demonstrably holds.
             if read(claim, Probed::Claim).is_some() {
-                record.claimed = true;
-            } else if read(record.decline, Probed::Decline).is_some() {
+                continue;
+            }
+            if read(record.decline, Probed::Decline).is_some() {
                 record.declined = true;
             }
         }
@@ -1308,30 +1364,19 @@ impl Counterparts {
     /// exactly its path's prefixes while it is live and a commit-proven
     /// anchor is a header from its live span, so a sibling child's
     /// absence licenses nothing.
-    /// Returns the answers this claim reads gone, which is the licence
-    /// a deletion is composed from.
-    fn fold_answered(
-        &mut self,
-        stated: &StateClaim,
-        windows: EpochWindows,
-    ) -> Vec<(SubstateKey, Anchor)> {
-        let mut gone = Vec::new();
+    fn fold_answered(&mut self, stated: &StateClaim, windows: EpochWindows) {
         let shard = stated.anchor.shard;
         let licensed = !self
             .frontier
             .refuses(shard, ReadMark::of(&stated.anchor, windows));
-        for (&key, answer) in &mut self.answered {
+        for answer in self.answered.values_mut() {
             if !ShardTrie::shard_owns_prefix(shard, answer.record.owner) {
                 continue;
             }
             if let Some(inclusion) = stated.reading(answer.record) {
                 answer.cleanup = answer.cleanup.read(stated.anchor, inclusion, licensed);
-                if inclusion == Inclusion::Absent && licensed {
-                    gone.push((key, stated.anchor));
-                }
             }
         }
-        gone
     }
 
     /// Fold one claim's answers into the questions the ledger is
@@ -1451,9 +1496,9 @@ impl Counterparts {
                                 .or_insert_with(|| HeldRecord::of(*key, cell));
                         }
                         Some(Some(CrossingLeaf::Answer { id, .. })) => {
-                            self.answered.entry(*key).or_insert_with(|| {
-                                AnsweredCrossing::of(id.record_key(&ProtocolHasher))
-                            });
+                            self.answered
+                                .entry(*key)
+                                .or_insert_with(|| AnsweredCrossing::of(id));
                         }
                         None => {
                             self.held.remove(key);
@@ -1468,39 +1513,6 @@ impl Counterparts {
                         Some(None) => {}
                     }
                 }
-            }
-        }
-    }
-
-    /// Answer the records whose consumer sits on this shard, off the
-    /// answer cells this shard itself holds.
-    ///
-    /// [`ask_held_records`](Self::ask_held_records) puts no question to
-    /// a local consumer — there is no counterpart to ask — so no
-    /// [`StateClaim`] about one is ever composed and
-    /// [`fold_held`](Self::fold_held) never reaches it. A reshape
-    /// successor inheriting a producer's prefix holds exactly these:
-    /// both ends of the crossing, and nobody to ask about either.
-    ///
-    /// The evidence is here instead, and it is the same evidence the
-    /// remote path folds. An answer sits at one of two keys under the
-    /// consuming node's target, and which key carries it is which
-    /// answer it is — so this reads a **presence** twice over, at no
-    /// anchor and inside no window, where the licence it replaces read
-    /// the claim cell absent inside one.
-    fn cover_held_here(&mut self, trie: &ShardTrie) {
-        let local = self.ledger.local();
-        for record in self.held.values_mut() {
-            if record.answered() {
-                continue;
-            }
-            if trie.shard_for_prefix(record.claim.owner) != local {
-                continue;
-            }
-            if self.answered.contains_key(&record.claim) {
-                record.claimed = true;
-            } else if self.answered.contains_key(&record.decline) {
-                record.declined = true;
             }
         }
     }
@@ -1955,6 +1967,10 @@ mod tests {
                 local: LocalKey([0x01; 16]),
             },
             AnsweredCrossing {
+                id: CrossingId::of_record(
+                    record.owner,
+                    &producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(60_000))),
+                ),
                 record,
                 cleanup: Cleanup::Standing(None),
             },
@@ -2061,6 +2077,7 @@ mod tests {
                 &StateClaim {
                     anchor: at,
                     cells: Capped::new(vec![(record, Inclusion::Absent.into())]).expect("one cell"),
+                    crossings: Capped::empty(),
                     proof: MerkleInclusionProof::dummy(),
                 },
                 EpochWindows::new(0),
@@ -2308,29 +2325,29 @@ mod tests {
                 ts: WeightedTimestamp::from_millis(7_000),
             },
             cells: Capped::new(vec![(record, Inclusion::Absent.into())]).expect("one cell"),
+            crossings: Capped::empty(),
             proof: MerkleInclusionProof::dummy(),
         };
-        assert!(
-            counterparts
-                .fold_answered(&absent_at(CONSUMER), EpochWindows::new(0))
-                .is_empty(),
-            "the consumer's own anchor does not own the producer's prefix",
-        );
-        assert_eq!(
+        let cleanup = |counterparts: &Counterparts| {
             counterparts
                 .answered
                 .values()
                 .next()
-                .map(|answer| answer.cleanup),
-            Some(Cleanup::Standing(None)),
-            "and nothing of it is remembered",
-        );
+                .map(|answer| answer.cleanup)
+        };
+        counterparts.fold_answered(&absent_at(CONSUMER), EpochWindows::new(0));
         assert_eq!(
-            counterparts
-                .fold_answered(&absent_at(PRODUCER), EpochWindows::new(0))
-                .len(),
-            1,
-            "the owner's absence is the licence",
+            cleanup(&counterparts),
+            Some(Cleanup::Standing(None)),
+            "the consumer's own anchor does not own the producer's prefix, and nothing of \
+             it is remembered",
+        );
+        let owner = absent_at(PRODUCER);
+        counterparts.fold_answered(&owner, EpochWindows::new(0));
+        assert_eq!(
+            cleanup(&counterparts),
+            Some(Cleanup::Gone(owner.anchor)),
+            "the owner's absence is the reading the question ends on",
         );
     }
 
@@ -2352,6 +2369,7 @@ mod tests {
             },
             cells: Capped::new(vec![(record, Inclusion::Present([1; 32]).into())])
                 .expect("one cell"),
+            crossings: Capped::empty(),
             proof: MerkleInclusionProof::dummy(),
         };
         for held in [claim(PRODUCER, 30), claim(other, 20), claim(PRODUCER, 10)] {
@@ -2418,6 +2436,7 @@ mod tests {
                 anchor,
                 cells: Capped::new(vec![(record, Inclusion::Present([9; 32]).into())])
                     .expect("one cell"),
+                crossings: Capped::empty(),
                 proof: MerkleInclusionProof::dummy(),
             },
             EpochWindows::new(0),
@@ -2507,19 +2526,15 @@ mod tests {
         producer_crossing(seed, deadline).answer_key(&ProtocolHasher, Answered::Never)
     }
 
-    /// A producer whose consumer sits on its own shard is answered off
-    /// the answer cells it holds itself, both ways.
-    ///
-    /// The reshape successor's case, and the only one there is for it:
-    /// `ask_held_records` puts no question to a local consumer, so no
-    /// state claim about one is ever composed and nothing else can
-    /// reach these records. A decline present credits the value back; a
-    /// claim present does not, and neither reading is taken at an
-    /// anchor or inside a window.
+    /// A producer whose consumer sits on its own shard offers the
+    /// crossing to the block to read at its parent, once the consumer's
+    /// answer is in this shard's own state, and a parent-anchored
+    /// reading of the decline present is the crossing's answer.
     #[test]
-    fn a_local_consumers_answer_decides_the_record_it_sits_beside() {
+    fn a_local_consumers_answer_is_read_at_the_parent() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
         let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let now = deadline.at();
         let seated = |answer_at: Option<SubstateKey>, answered: Answered| {
             // Seated at the shard the consumer's target routes to, which
             // is what a successor inheriting the producer's prefix
@@ -2548,29 +2563,61 @@ mod tests {
                     },
                 );
             }
-            counterparts.cover_held_here(&trie);
-            let record = counterparts
-                .held
-                .get(&producer_record(0))
-                .expect("the record still stands");
-            (record.claimed, record.declined, record.unclaimable())
+            let asked = counterparts.probe(&trie, now, &[], EpochWindows::new(0));
+            assert!(
+                asked.is_empty(),
+                "nothing is fetched of this shard's own state"
+            );
+            counterparts.offers().local_crossings
         };
 
-        assert_eq!(
-            seated(None, Answered::Never),
-            (false, false, false),
-            "a consumer that has not answered leaves the record waiting",
+        assert!(
+            seated(None, Answered::Never).is_empty(),
+            "a consumer that has not answered leaves the record waiting, and nothing is read",
         );
+        let id = producer_crossing(0, deadline);
         assert_eq!(
             seated(Some(consumer_decline(0, deadline)), Answered::Never),
-            (false, true, true),
-            "its own decline credits the value back, at no anchor and in no window",
+            vec![id],
+            "its own decline has the crossing read at the parent",
         );
         assert_eq!(
             seated(Some(claim_of(0, deadline)), Answered::Taken),
-            (true, false, false),
-            "and its own claim answers without licensing a credit",
+            vec![id],
+            "and so does its own claim, whose reading the fold retires the record on",
         );
+
+        // The parent-anchored reading, folded where both ends route: the
+        // decline present is the answer, and licenses the credit back.
+        let mut counterparts = Counterparts::holding(
+            CONSUMER,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            &CrossingLeaves::default(),
+            ReadFrontier::default(),
+        );
+        counterparts.held.insert(
+            producer_record(0),
+            HeldRecord::of(producer_record(0), producer_cell(0, deadline)),
+        );
+        let decline = consumer_decline(0, deadline);
+        let claim = StateClaim::new(
+            Anchor {
+                shard: CONSUMER,
+                height: BlockHeight::new(7),
+                state_root: StateRoot::from_raw(Hash::ZERO),
+                ts: now,
+            },
+            [(decline, Inclusion::Present([7; 32]))],
+            MerkleInclusionProof::new(Vec::new()),
+        )
+        .naming([(decline, id)]);
+        counterparts.fold_held(&claim, &trie);
+        let held = counterparts
+            .held
+            .get(&producer_record(0))
+            .expect("the record still stands");
+        assert!(held.declined && held.unclaimable());
     }
 
     /// A producer asks after both answers at one anchor, and a decline
@@ -2725,12 +2772,14 @@ mod tests {
     /// consumer's own licence is what makes it impossible. A producer
     /// reading one is not where that is discovered, and of the two
     /// mistakes available here only one is unrecoverable: taking back
-    /// value a consumer demonstrably holds.
+    /// value a consumer demonstrably holds. So the fold takes the record
+    /// on the claim, and the decline beside it licenses nothing.
     #[test]
     fn a_claim_read_present_answers_over_a_decline_beside_it() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
         let (mut producer, trie, _anchors) = producing(1, deadline);
         let record = producer_record(0);
+        let id = producer_crossing(0, deadline);
         let claim = claim_of(0, deadline);
         let decline = consumer_decline(0, deadline);
 
@@ -2746,11 +2795,16 @@ mod tests {
                 (decline, Inclusion::Present([0xCD; 32])),
             ],
             MerkleInclusionProof::dummy(),
+        )
+        .naming([(claim, id), (decline, id)]);
+        assert_eq!(
+            both.settles(),
+            vec![id.record_key(&ProtocolHasher)],
+            "the claim is what the record is answered by: the fold removes it",
         );
         producer.fold_held(&both, &trie);
 
         let held = producer.held.get(&record).expect("the record still stands");
-        assert!(held.claimed, "the claim is what the record is answered by");
         assert!(
             !held.declined && !held.unclaimable(),
             "so nothing licenses crediting back value the consumer holds",

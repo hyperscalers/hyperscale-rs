@@ -49,9 +49,9 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side, never_answer};
+use hyperscale_engine::legs::{Classified, Member, Runs, Side, never_answer};
 use hyperscale_engine::{
-    CodeAvailability, Deletion, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
+    CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
 use hyperscale_metrics::{
     record_batch_unavailable, record_crossing_push_dropped, record_reclaim_admitted,
@@ -310,8 +310,8 @@ impl ExecutionMemoryStats {
     }
 }
 
-/// The name a housekeeping member over held records takes on the chain
-/// disposing of them.
+/// The name a reclaim over held records takes on the chain taking them
+/// back.
 ///
 /// Derived from the transaction that issued the crossings and the record
 /// cells being settled, so every replica at one frontier reaches the same
@@ -329,13 +329,9 @@ fn disposal_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
 /// The record cells a producer on `local` writes for consumers
 /// elsewhere, in edge order: every one, or those of one `kind`.
 ///
-/// What a retirement of the transaction deletes and what a reclaim of
-/// it credits back are the same cells; the two differ in what a
-/// committed record licensed doing with them, which is the ledger's
-/// question. An owed crossing is settled by nobody under the
-/// transaction's name — its only disposal is the deletion its consumer's
-/// claim licenses, composed off the leaf — so the entry's settlements
-/// ask for the escrowed ones alone.
+/// What a reclaim of the transaction credits back. An owed crossing is
+/// taken back by nobody — its only disposal is the commit fold's
+/// removal on its consumer's claim — and the reclaim skips one it names.
 fn issued_records(classified: &Classified, local: ShardId, kind: Option<Kind>) -> Vec<SubstateKey> {
     classified
         .crossings()
@@ -344,15 +340,6 @@ fn issued_records(classified: &Classified, local: ShardId, kind: Option<Kind>) -
         })
         .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
         .collect()
-}
-
-/// The name a housekeeping member over this shard's own answer cells
-/// takes.
-fn deletion_member_name(answers: &[SubstateKey]) -> TxHash {
-    let keys: Vec<Vec<u8>> = answers.iter().map(|key| key.to_bytes().to_vec()).collect();
-    let mut parts: Vec<&[u8]> = vec![b"hyperscale.crossing.deletion"];
-    parts.extend(keys.iter().map(Vec::as_slice));
-    TxHash::from(Hash::from_parts(&parts))
 }
 
 /// Execution state machine.
@@ -402,14 +389,6 @@ pub struct ExecutionCoordinator {
     /// commit after it, so without the latch a candidate unblocked past
     /// the terminal would compose into a tick nothing can certify.
     terminated: bool,
-
-    /// The answers the committing block's own claims read gone, with
-    /// the producer anchor each was read at.
-    ///
-    /// Set where the commit folds and read where the tick composes, in
-    /// the same call — so a deletion's licence is the block's reading
-    /// and never a fold's.
-    gone_this_commit: Vec<(SubstateKey, Anchor)>,
 
     /// What this node can run, asked where a tick dispatches.
     ///
@@ -662,7 +641,6 @@ impl ExecutionCoordinator {
             code,
             tick_in_flight: false,
             terminated: false,
-            gone_this_commit: Vec::new(),
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
             replay_blocks: recovered.replay.blocks.clone(),
@@ -1284,14 +1262,13 @@ impl ExecutionCoordinator {
                 tx_hash,
                 Some(transaction),
                 records,
-                Licence::Unclaimed,
                 charged,
             );
         }
     }
 
-    /// Admit into the tick being composed the records this shard holds
-    /// whose claim it can now read.
+    /// Admit into the tick being composed the reclaim of the records
+    /// this shard holds that no consumer will take.
     ///
     /// One member per issuing transaction, under a name of this chain's
     /// own ([`disposal_member_name`]) rather than the transaction's. A
@@ -1303,25 +1280,13 @@ impl ExecutionCoordinator {
     /// this shard does decide is the housekeeping itself, which is
     /// nobody else's.
     ///
-    /// The member carries the records and no body; whether each is
-    /// credited back or deleted is the engine's to decide against the
-    /// claim cell, which is the only reader holding a snapshot.
-    ///
-    /// What bounds the admission is the answer, and every form of it is
-    /// committed content, so every replica at one frontier admits the
-    /// same set. Where the claim routes here the engine reads the cell
-    /// against its own snapshot, inside the window an absent claim means
-    /// something in. Where it routes elsewhere the answer is the proof a
-    /// block carried, folded before this composes.
-    ///
-    /// The window runs from the close of [`Window::Core`] to the sweep
-    /// of the claim cell itself. A leaf does not name its consumer's
-    /// role, so nothing narrower is honest: only past the core's close
-    /// can no core shard of any arity still commit, whatever its arity
-    /// was, and past the sweep an absence is a swept cell rather than a
-    /// claim that never happened. Every record a delivery consumes is
-    /// already out of this path — it names nobody, and nobody takes it
-    /// back.
+    /// The member carries the records and no body. What licenses it is
+    /// the consumer's own `Never` read present, or a departure that says
+    /// the chain that was to consume the crossing can never settle what
+    /// issued it: committed content, so every replica at one frontier
+    /// admits the same set. A record whose consumer took the crossing is
+    /// never this member's: the commit fold removes it on the `Taken`
+    /// read present, and it leaves the mirror with it.
     fn admit_record_disposals(
         &mut self,
         tick_id: TickId,
@@ -1333,74 +1298,33 @@ impl ExecutionCoordinator {
         if self.counterparts.held.is_empty() {
             return;
         }
-        // One licence per issuing transaction, so records answered the
-        // same way settle together and a record still waiting holds
+        // One member per issuing transaction, so records answered the
+        // same way go back together and a record still waiting holds
         // nothing back.
-        let mut due: BTreeMap<(TxHash, Licence), Vec<SubstateKey>> = BTreeMap::new();
+        let mut due: BTreeMap<TxHash, Vec<SubstateKey>> = BTreeMap::new();
         for (key, record) in &self.counterparts.held {
-            // What licences a record is decided by follows from what
-            // kind of record it is.
-            //
-            // An owed one is the leaf's whoever holds an entry for its
-            // transaction: its only disposal is the deletion its
-            // consumer's claim licenses, and the shard that has to be
-            // able to compose that is one holding the leaf and no entry
-            // — a validator seated after the transaction committed, a
-            // split successor whose ledger begins empty. An entry
-            // settles none of them, so there is no second member over
-            // the cell.
+            // Nothing takes an owed crossing back: its only disposal is
+            // the fold's removal on its consumer's claim, whoever holds
+            // an entry for its transaction.
             //
             // An escrowed one is its entry's while one is here: the
-            // reclaim and the retirement compose from the same leaves
-            // under the transaction's own name, and two members over one
-            // record would leave the second reading a cell the first
-            // deleted. The leaf answers where no such entry does — every
-            // record older than what this chain replays, every one whose
-            // entry has been pruned, and every one an abandonment record
+            // reclaim composes from the same leaves under the
+            // transaction's own name, and two members over one record
+            // would leave the second reading a cell the first deleted.
+            // The leaf answers where no such entry does — every record
+            // older than what this chain replays, every one whose entry
+            // has been pruned, and every one an abandonment record
             // reconstructed an entry for that keeps no classification to
             // settle from.
-            // A claim proved present is the consumer holding the
-            // crossing, and a presence is bounded by no window. It
-            // answers over every other reading here: taking back value a
-            // consumer demonstrably has is the one mistake this cannot
-            // make.
-            let claimed = record.claimed;
-            let licence = match record.cell.terms {
-                // Nothing takes an owed crossing back, so the licences
-                // that credit one say nothing about it: a claim read
-                // absent leaves it owed rather than returned. Only the
-                // presence decides it, and what it licenses is the
-                // deletion.
-                Terms::Owed => claimed.then_some(Licence::Claimed),
-                Terms::Escrowed { .. } => {
-                    if self.counterparts.ledger.settles_records(record.cell.tx) {
-                        continue;
-                    }
-                    if claimed {
-                        Some(Licence::Claimed)
-                    } else if record.unclaimable() {
-                        // The consumer's own decline read present is the
-                        // crossing's answer and is bounded by nothing: it
-                        // says the value will never be taken, so it is
-                        // the producer's to credit back. A departure says
-                        // the chain that was to consume this crossing can
-                        // never settle what issued it. Both are committed
-                        // content read present, and a consumer sitting on
-                        // this shard writes the first of them into this
-                        // shard's own state — which is where
-                        // `cover_held_here` reads it.
-                        Some(Licence::Unclaimed)
-                    } else {
-                        None
-                    }
-                }
-            };
-            let Some(licence) = licence else {
+            if record.cell.terms == Terms::Owed
+                || self.counterparts.ledger.settles_records(record.cell.tx)
+                || !record.unclaimable()
+            {
                 continue;
-            };
-            due.entry((record.cell.tx, licence)).or_default().push(*key);
+            }
+            due.entry(record.cell.tx).or_default().push(*key);
         }
-        for ((issued_by, licence), records) in due {
+        for (issued_by, records) in due {
             let tx_hash = disposal_member_name(issued_by, &records);
             // Taken once: the credit deletes the cell, so a second
             // member over the same record would read nothing and the
@@ -1413,159 +1337,16 @@ impl ExecutionCoordinator {
             // crossing ended at the cut, and the price it owed was
             // settled there.
             self.seat_settling(
-                tick_id, tick_ts, prices, state, requests, tx_hash, None, records, licence, true,
+                tick_id, tick_ts, prices, state, requests, tx_hash, None, records, true,
             );
         }
     }
 
-    /// Admit into the tick being composed the removal of every answer
-    /// this block's own claims read the record gone at, at an anchor at
-    /// or above the read frontier's floor for its producer.
-    ///
-    /// **What the answer defends, and when it stops.** An answer cell is
-    /// what makes a replayed delivery abort, and a replay is licensed by
-    /// a presence of the record, which a block may carry only at or
-    /// above the floor its chain has read the producer to. An absence
-    /// at or above the floor comes after every presence the chain ever
-    /// carried, so no presence can license a replay again and the
-    /// answer defends nothing.
-    ///
-    /// **The licence is the block's, whole.** The absence is a claim the
-    /// committing block carries and the floor is committed state, so a
-    /// fresh seat and a replica running since the crossing was answered
-    /// compose the same member off the same block.
-    ///
-    /// **What stops the member being composed again**: its own name,
-    /// read where the refusal reads it. The removal's write *is* the
-    /// cell going, so until it lands every later block carrying the pair
-    /// composes it again — including blocks other proposers built from
-    /// their own fetches, which no local pacing reaches.
-    fn admit_answer_deletions(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        tick_id: TickId,
-        tick_ts: WeightedTimestamp,
-        prices: PriceTable,
-        state: &mut TickState,
-        requests: &mut Vec<CrossShardExecutionRequest>,
-    ) {
-        let Some(window) = topology_schedule.at(tick_ts) else {
-            return;
-        };
-        let trie = window.shard_trie();
-        let local_shard = self.local_shard;
-        let mut due: Vec<Deletion> = Vec::new();
-        for &(answer, _) in &self.gone_this_commit {
-            // A cut can move the prefix the answer sits under, and a
-            // session writes a crossing cell only where the member's
-            // shard applies its owner — so a deletion composed for a
-            // cell this shard no longer holds would run, succeed and
-            // write nothing, and be composed again at every commit
-            // forever, because the write that would turn the guard over
-            // is the one being dropped.
-            if trie.shard_for_prefix(answer.owner) != local_shard {
-                continue;
-            }
-            let Some(held) = self.counterparts.answered.get(&answer) else {
-                continue;
-            };
-            let deletion = Deletion {
-                answer,
-                producer: held.record.owner,
-            };
-            if !due.contains(&deletion) {
-                due.push(deletion);
-            }
-        }
-        due.sort_unstable_by_key(|deletion| deletion.answer);
-        if due.is_empty() {
-            return;
-        }
-        let answers: Vec<SubstateKey> = due.iter().map(|deletion| deletion.answer).collect();
-        let tx_hash = deletion_member_name(&answers);
-        if self.holds_member_for(tx_hash) {
-            return;
-        }
-        state.admit(
-            tx_hash,
-            Membership::whole(BTreeSet::from([local_shard])).settling(),
-            None,
-            Admission::Executes,
-        );
-        self.ticks.assign_tx(tx_hash, tick_id);
-        requests.push(CrossShardExecutionRequest {
-            tx_hash,
-            transaction: None,
-            provisions: Vec::new(),
-            clock: tick_ts,
-            prices,
-            runs: Runs::Clean {
-                member: Member::whole(local_shard),
-                answers: due,
-            },
-            arrivals: Vec::new(),
-        });
-    }
-
-    /// Admit into the tick being composed every retirement a committed
-    /// record has licensed: a member running no node, awaiting nobody,
-    /// reserving nothing, charged nothing, that deletes the records of
-    /// crossings every consumer has claimed.
-    fn admit_retirements(
-        &mut self,
-        tick_id: TickId,
-        tick_ts: WeightedTimestamp,
-        prices: PriceTable,
-        state: &mut TickState,
-        requests: &mut Vec<CrossShardExecutionRequest>,
-    ) {
-        let local_shard = self.local_shard;
-        for Settleable {
-            tx_hash,
-            body: transaction,
-            classified,
-            charged,
-        } in self.counterparts.ledger.retirable()
-        {
-            // Only once nothing this shard runs of the transaction is
-            // left: a mixed shard's delivering member is still a
-            // candidate while the core's output is on its way, and the
-            // retirement is the last word here, not a word beside it.
-            if self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash) {
-                continue;
-            }
-            // What the entry owns: the escrowed records, which a
-            // consumer claimed through the core. The owed ones are the
-            // leaf's, and an entry whose crossings were all owed has
-            // nothing left to compose — every claim it issued is read
-            // present, so it closes here rather than on a member that
-            // would settle no cell.
-            let records = issued_records(&classified, local_shard, Some(Kind::Escrowed));
-            if records.is_empty() {
-                self.counterparts.ledger.close_retired(tx_hash);
-                continue;
-            }
-            self.counterparts.ledger.admit_retire(tx_hash);
-            self.seat_settling(
-                tick_id,
-                tick_ts,
-                prices,
-                state,
-                requests,
-                tx_hash,
-                Some(transaction),
-                records,
-                Licence::Claimed,
-                charged,
-            );
-        }
-    }
-
-    /// Seat a settling member in the tick: dispatched, awaiting nobody
-    /// but this shard since its own certificate is the whole of its
-    /// settlement, reserving nothing since no block took a reservation
-    /// for it, and running no node since the engine settles the records
-    /// on the licence alone.
+    /// Seat a reclaim in the tick: dispatched, awaiting nobody but this
+    /// shard since its own certificate is the whole of its settlement,
+    /// reserving nothing since no block took a reservation for it, and
+    /// running no node since the engine takes the records back on the
+    /// cells alone. It is this shard's verdict on the transaction.
     #[allow(clippy::too_many_arguments)] // one seat, every term of it
     fn seat_settling(
         &mut self,
@@ -1577,31 +1358,27 @@ impl ExecutionCoordinator {
         tx_hash: TxHash,
         transaction: Option<Arc<Verified<Transaction>>>,
         records: Vec<SubstateKey>,
-        on: Licence,
         charged: bool,
     ) {
         let local_shard = self.local_shard;
-        // A retirement decides nothing: the verdict was reached where
-        // the claims were. Every other settlement is this shard's verdict
-        // on the transaction.
-        let membership = match on {
-            Licence::Claimed => Membership::housekeeping(local_shard),
-            Licence::Unclaimed => Membership::whole(BTreeSet::from([local_shard])).settling(),
-        };
-        state.admit(tx_hash, membership, None, Admission::Executes);
+        state.admit(
+            tx_hash,
+            Membership::whole(BTreeSet::from([local_shard])).settling(),
+            None,
+            Admission::Executes,
+        );
         self.ticks.assign_tx(tx_hash, tick_id);
         requests.push(CrossShardExecutionRequest {
             tx_hash,
             transaction,
             provisions: Vec::new(),
             clock: tick_ts,
-            // The tick's own anchor is this settlement's: nothing
-            // committed it but the block being composed.
+            // The tick's own anchor is this reclaim's: nothing committed
+            // it but the block being composed.
             prices,
-            runs: Runs::Settle {
+            runs: Runs::Reclaim {
                 member: Member::whole(local_shard),
                 records,
-                on,
                 charged,
             },
             arrivals: Vec::new(),
@@ -1744,16 +1521,7 @@ impl ExecutionCoordinator {
         // earlier one, so there is one table for all of them.
         let tick_prices = prices_at(topology_schedule, block.ts);
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
-        self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_record_disposals(tick_id, block.ts, tick_prices, &mut state, &mut requests);
-        self.admit_answer_deletions(
-            topology_schedule,
-            tick_id,
-            block.ts,
-            tick_prices,
-            &mut state,
-            &mut requests,
-        );
 
         if state.is_empty() {
             return (None, Vec::new(), Vec::new());
@@ -2897,11 +2665,9 @@ impl ExecutionCoordinator {
     /// for `tx_hash`, so an execution that would write a claim may yet
     /// run.
     ///
-    /// The pair [`admit_retirements`](Self::admit_retirements) already
-    /// reads for the same question, and for the same reason: the ledger
-    /// is a fold over committed blocks, a tick is released on committed
-    /// content, and the candidate set follows both, so every replica at
-    /// one frontier answers alike.
+    /// The ledger is a fold over committed blocks, a tick is released on
+    /// committed content, and the candidate set follows both, so every
+    /// replica at one frontier answers alike.
     #[must_use]
     pub fn holds_member_for(&self, tx_hash: TxHash) -> bool {
         self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash)
@@ -3278,8 +3044,15 @@ impl ExecutionCoordinator {
         let committed =
             self.counterparts
                 .on_commit(trie, topology_schedule, block, self.committed_ts, &wanted);
-        self.gone_this_commit = committed.gone;
         actions.extend(committed.actions);
+        // The leg entries the fold closed, for the mempool: no
+        // finalization names them, so this is where their acceptance is
+        // reported.
+        if !committed.settled.is_empty() {
+            actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
+                resolutions: committed.settled,
+            }));
+        }
         self.release_unanswerable(&committed.unanswerable);
         // After the prune, so a delivery the ledger has let go of is not
         // offered again, and after the release, so one just resolved is
@@ -8916,14 +8689,7 @@ mod tests {
             })
             .expect("the reclaim is dispatched to the engine");
         assert!(
-            matches!(
-                request.runs,
-                Runs::Settle {
-                    on: Licence::Unclaimed,
-                    charged: true,
-                    ..
-                }
-            ),
+            matches!(request.runs, Runs::Reclaim { charged: true, .. }),
             "the leg's finalization committed here, so its certificate settled the price"
         );
         assert!(!request.runs.abortable(), "nothing retracts a reclaim");
@@ -10424,22 +10190,13 @@ mod tests {
     #[test]
     fn a_held_record_is_decided_against_a_proof_of_its_consumers_answer() {
         assert!(
-            matches!(
-                held_settlement(Proved::Claim, false),
-                Some(Runs::Settle {
-                    on: Licence::Claimed,
-                    ..
-                })
-            ),
-            "a claim proved present retires the record"
+            held_settlement(Proved::Claim, false).is_none(),
+            "a claim proved present composes no member: the fold removes the record",
         );
         assert!(
             matches!(
                 held_settlement(Proved::Decline, false),
-                Some(Runs::Settle {
-                    on: Licence::Unclaimed,
-                    ..
-                })
+                Some(Runs::Reclaim { .. })
             ),
             "a decline proved present takes the crossing back"
         );
@@ -10501,13 +10258,7 @@ mod tests {
             _ => None,
         });
         assert!(
-            matches!(
-                runs,
-                Some(Runs::Settle {
-                    on: Licence::Unclaimed,
-                    ..
-                })
-            ),
+            matches!(runs, Some(Runs::Reclaim { .. })),
             "the departure takes the crossing back; dispatched {runs:?}",
         );
         assert!(
@@ -10568,7 +10319,7 @@ mod tests {
             _ => None,
         });
         assert!(
-            !matches!(runs, Some(Runs::Settle { .. })),
+            !matches!(runs, Some(Runs::Reclaim { .. })),
             "nothing settles it here; dispatched {runs:?}",
         );
         assert!(
@@ -10650,13 +10401,7 @@ mod tests {
             _ => None,
         });
         assert!(
-            matches!(
-                runs,
-                Some(Runs::Settle {
-                    on: Licence::Unclaimed,
-                    ..
-                })
-            ),
+            matches!(runs, Some(Runs::Reclaim { .. })),
             "the cut lands past the entry and the crossing still comes back; \
              dispatched {runs:?}",
         );
@@ -10734,10 +10479,7 @@ mod tests {
         assert!(
             matches!(
                 declined_settlement(at_deadline, true, false),
-                Some(Runs::Settle {
-                    on: Licence::Unclaimed,
-                    ..
-                })
+                Some(Runs::Reclaim { .. })
             ),
             "the consumer's own refusal is the licence, and it needs no clock",
         );
@@ -11235,124 +10977,50 @@ mod tests {
         }
     }
 
-    /// An answer goes on one reading of its record gone at or above the
-    /// read frontier's floor.
-    ///
-    /// The answer is what makes a replayed delivery abort, and a replay
-    /// is licensed by a presence of the record, which a block may carry
-    /// only at or above the floor its chain has read the producer to.
-    /// An absence at or above the floor comes after every presence the
-    /// chain ever carried, so no presence can license a replay again
-    /// and the answer defends nothing. The consumer therefore remembers
-    /// nothing, carries no pair, and asks at one anchor.
-    #[test]
-    fn an_answer_goes_on_one_reading_of_a_dated_record() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, answer_key) = answered_crossing(&mut state, 0x7A);
-        let at = WeightedTimestamp::from_millis(10_000);
-
-        // Nothing read, nothing licensed.
-        state.gone_this_commit = Vec::new();
-        assert!(
-            compose_deletions(&mut state, at).is_empty(),
-            "an answer whose record nothing has read gone stands",
-        );
-
-        // One absence is the whole of it.
-        state.gone_this_commit = vec![(answer_key, anchor_at(at))];
-        assert_eq!(
-            compose_deletions(&mut state, at),
-            vec![Deletion {
-                answer: answer_key,
-                producer: record_key.owner,
-            }],
-            "the record is read gone at or above the floor, so no presence of it \
-             can license a replay",
-        );
-
-        // And the same cell read gone twice in one block is one
-        // removal, not two — asserted on its own state, since the
-        // member the first composition put in flight is what stops a
-        // second of the same name.
-        let mut again = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (_, twice) = answered_crossing(&mut again, 0x7A);
-        again.gone_this_commit = vec![(twice, anchor_at(at)), (twice, anchor_at(at))];
-        assert_eq!(
-            compose_deletions(&mut again, at).len(),
-            1,
-            "a cell is removed once however many readings the block carries",
-        );
-    }
-
-    /// An answer whose cell this shard no longer holds is not composed
-    /// for, however plainly its record is gone.
-    ///
-    /// A cut moves the prefix, and a session writes a crossing cell only
-    /// where the member's shard applies its owner — so a deletion
-    /// composed here would run, succeed and write nothing, and be
-    /// composed again at every commit forever, because the write that
-    /// would turn the guard over is the one being dropped.
-    #[test]
-    fn a_deletion_is_not_composed_where_the_cell_is_not_held() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), PEER);
-        let (_, answer_key) = answered_crossing(&mut state, 0x7B);
-        let at = WeightedTimestamp::from_millis(10_000);
-
-        state.gone_this_commit = vec![(answer_key, anchor_at(at))];
-        assert!(
-            compose_deletions(&mut state, at).is_empty(),
-            "the answer sits under a prefix this shard does not hold",
-        );
-    }
-
-    /// Seat an answered crossing, returning the record and the answer
-    /// cell's key.
-    fn answered_crossing(state: &mut ExecutionCoordinator, seed: u8) -> (SubstateKey, SubstateKey) {
+    /// Seat an answered crossing, returning the record key, the answer
+    /// cell's key and the crossing.
+    fn answered_crossing(
+        state: &mut ExecutionCoordinator,
+        seed: u8,
+    ) -> (SubstateKey, SubstateKey, CrossingId) {
         let (record_key, _, cell) = arrived_record(seed, REFUSED_EXPIRY_MS);
-        let answer_key = CrossingId::of_record(record_key.owner, &cell)
-            .answer_key(&ProtocolHasher, Answered::Taken);
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let answer_key = id.answer_key(&ProtocolHasher, Answered::Taken);
         state
             .counterparts
             .answered
-            .insert(answer_key, AnsweredCrossing::of(record_key));
-        (record_key, answer_key)
+            .insert(answer_key, AnsweredCrossing::of(id));
+        (record_key, answer_key, id)
     }
 
-    /// A producer anchor whose clock is `ts`.
-    fn anchor_at(ts: WeightedTimestamp) -> Anchor {
-        Anchor {
-            shard: PEER,
-            height: BlockHeight::new(9),
-            state_root: StateRoot::ZERO,
-            ts,
-        }
-    }
-
-    /// Run the deletion admitter and hand back what it composed.
-    fn compose_deletions(state: &mut ExecutionCoordinator, at: WeightedTimestamp) -> Vec<Deletion> {
-        let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let mut tick = TickState::new(tick_id, BlockHash::from_raw(Hash::ZERO), at);
-        let mut requests = Vec::new();
-        // A trie with both shards in it, because the guard this walks
-        // through asks which one holds the answer's prefix — and a
-        // one-shard schedule answers `ROOT` for every key, which is
-        // neither of them.
-        state.admit_answer_deletions(
-            &two_shard_topology(),
-            tick_id,
-            at,
-            PriceTable::GENESIS,
-            &mut tick,
-            &mut requests,
+    /// An answer goes in the commit fold on one reading of its record
+    /// absent, named for the crossing, at or above the read frontier's
+    /// floor: no member is composed, and the mirror follows the state.
+    #[test]
+    fn an_answer_goes_in_the_fold_on_one_reading_of_its_record_absent() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, answer_key, id) = answered_crossing(&mut state, 0x7A);
+        let at = WeightedTimestamp::from_millis(10_000);
+        state.committed_ts = at;
+        let (claim, _) = proven_at(&mut state, &schedule, PEER, 9, at, &[], &[record_key]);
+        let actions = commit_carrying(
+            &mut state,
+            &schedule,
+            1,
+            at.as_millis(),
+            vec![claim.naming([(record_key, id)])],
         );
-        requests
-            .into_iter()
-            .filter_map(|request| match request.runs {
-                Runs::Clean { answers, .. } => Some(answers),
-                _ => None,
-            })
-            .flatten()
-            .collect()
+        assert!(
+            !state.counterparts.answered.contains_key(&answer_key),
+            "the record read gone at or above the floor takes the answer out of the mirror",
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            "and no member is composed for it",
+        );
     }
 
     /// A record whose issuing transaction the ledger still holds is the
@@ -11443,17 +11111,39 @@ mod tests {
         );
     }
 
-    /// A consumer's claim proved present is what licenses the
-    /// retirement: the cell is written by the consuming execution and by
-    /// nothing else, so its presence is the consumer holding the
-    /// crossing. The committed claim is the whole of the evidence — it
+    /// A consumer's claim proved present, named for its crossing, is
+    /// what settles the record: the commit fold removes it, the entry
+    /// that issued it closes as the transaction accepted, and no member
+    /// is composed. The committed claim is the whole of the evidence — it
     /// reaches no mirror and no record — and the certificate is still
     /// fetched, since a core's acceptance decides the transaction.
     #[test]
-    fn a_claim_proved_present_licenses_the_retirement_off_the_claim_alone() {
+    fn a_claim_proved_present_settles_the_record_in_the_fold() {
         let schedule = two_shard_topology();
         let (transaction, figures, claim, mut state) = consumer_claim_fixture();
         let tx_hash = transaction.hash();
+        let crossing = leg_classified()
+            .crossings()
+            .find(|(edge, _)| edge.from == HOME)
+            .map(|(edge, _)| edge.crossing.id)
+            .expect("the leg issues one crossing");
+        let record_key = crossing.record_key(&ProtocolHasher);
+        let cell = crossing.cell(
+            tx_hash,
+            *PROTOCOL_RESOURCE,
+            10,
+            figures.deadline.at().as_millis() + 1_000,
+            Terms::Escrowed {
+                credit: SubstateKey {
+                    owner: crossing.producer,
+                    local: LocalKey([0x33; 16]),
+                },
+            },
+        );
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(record_key, cell));
         let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
         let (bundle, opened) = proven_at(
             &mut state,
@@ -11476,7 +11166,7 @@ mod tests {
             &schedule,
             1,
             probed_wt.as_millis(),
-            vec![bundle],
+            vec![bundle.naming([(claim, crossing)])],
         );
         assert!(
             folded.iter().any(|action| matches!(
@@ -11490,99 +11180,29 @@ mod tests {
             "a present claim fetches the consumer's certificate"
         );
         assert!(
-            matches!(
-                reading(&state, PEER, tx_hash, claim),
-                Some(Inclusion::Present(_))
-            ),
-            "the presence is read off the committed claim"
+            !state.counterparts.held.contains_key(&record_key),
+            "the fold removes the record and the mirror follows",
         );
         assert!(
-            state.offers().abandonment_records.is_empty(),
-            "and no record restates it"
+            !folded.iter().any(|action| matches!(
+                action,
+                Action::ExecuteTransactions { requests, .. }
+                    if requests.iter().any(|request| request.tx_hash == tx_hash)
+            )),
+            "no member is composed for it",
         );
-        let request = folded
-            .iter()
-            .find_map(|action| match action {
-                Action::ExecuteTransactions { requests, .. } => {
-                    requests.iter().find(|request| request.tx_hash == tx_hash)
-                }
-                _ => None,
-            })
-            .expect("the same commit composes the retirement into its tick");
-        assert!(matches!(
-            request.runs,
-            Runs::Settle {
-                on: Licence::Claimed,
-                ..
-            }
-        ));
         assert!(
-            state.counterparts.ledger.retirable().is_empty(),
-            "and the ledger has handed it to the tick"
+            folded.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::TransactionsResolved { resolutions })
+                    if resolutions.contains(&(tx_hash, TxResolution::Decided(TransactionDecision::Accept)))
+            )),
+            "and the entry closes as the transaction accepted: {folded:?}",
         );
-    }
-
-    /// A consumer's acceptance opens the probe and nothing else. It
-    /// reaches no mirror and no record: what licenses the retirement is
-    /// the presence its probe reads, and once the claim carrying it
-    /// commits the next commit composes the retirement into its tick —
-    /// a dispatched member running no node, awaiting nobody, charged
-    /// nothing.
-    #[test]
-    fn a_consumers_acceptance_cues_the_probe_and_the_presence_retires() {
-        let schedule = two_shard_topology();
-        let (transaction, figures, claim, mut state) = consumer_claim_fixture();
-        let tx_hash = transaction.hash();
-        let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
-        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-            TickId::new(PEER, BlockHeight::new(5)),
-            probed_wt,
-            GlobalReceiptRoot::ZERO,
-            Capped::from_array([TxOutcome::new(
-                tx_hash,
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
-            )]),
-            AggregateSignature::ZERO,
-            SignerBitfield::new(4),
-        )));
-        state.handle_attestation(&schedule, &certificate);
         assert!(
-            state.offers().abandonment_records.is_empty(),
-            "an acceptance is a cue: the retirement waits on the presence its probe reads"
-        );
-
-        // The probe answers present, which the committed claim writes
-        // to the ledger.
-        state.counterparts.ledger.record_reading(
-            tx_hash,
-            PEER,
-            claim,
-            Probed::Claim,
-            Inclusion::Present([7; 32]),
-        );
-        let actions = commit_carrying(&mut state, &schedule, 2, probed_wt.as_millis(), Vec::new());
-        let request = actions
-            .iter()
-            .find_map(|action| match action {
-                Action::ExecuteTransactions { requests, .. } => {
-                    requests.iter().find(|request| request.tx_hash == tx_hash)
-                }
-                _ => None,
-            })
-            .expect("the retirement is dispatched to the engine");
-        assert!(matches!(
-            request.runs,
-            Runs::Settle {
-                on: Licence::Claimed,
-                ..
-            }
-        ));
-        assert!(!request.runs.abortable(), "nothing retracts a retirement");
-        assert!(
-            state.counterparts.ledger.retirable().is_empty(),
-            "and the ledger has handed it to the tick"
+            state.counterparts.ledger.reclaimable().is_empty()
+                && !state.counterparts.ledger.contains(tx_hash),
+            "the ledger has let the entry go"
         );
     }
 

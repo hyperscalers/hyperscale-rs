@@ -337,8 +337,8 @@ mod tests {
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
         test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
-        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
-        test_the_read_frontier_is_read_off_the_state,
+        test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
+        test_import_gate_reads_the_trie, test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key, committed_tx_cells};
     use hyperscale_types::test_utils::{
@@ -483,6 +483,18 @@ mod tests {
     fn followed_halves_hold_the_read_frontier() {
         let (left, right) = ShardId::ROOT.children();
         test_followed_halves_hold_the_read_frontier(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A split follower on each half folds the settlements landing on
+    /// its half, and the halves recompose the parent's root.
+    #[test]
+    fn followed_halves_fold_the_settlements() {
+        let (left, right) = ShardId::ROOT.children();
+        test_followed_halves_fold_the_settlements(
             &SimShardStorage::default(),
             &SimShardStorage::new(shard_prefix_path(left)),
             &SimShardStorage::new(shard_prefix_path(right)),

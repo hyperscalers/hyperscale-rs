@@ -11,7 +11,7 @@ use hyperscale_storage::test_helpers::{
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_foreign_ticks_finalization_is_stored_and_not_indexed, test_a_fresh_store_holds_nothing,
     test_a_leg_entry_holds_the_floor_to_its_horizon, test_a_legs_own_finalization_keeps_the_floor,
-    test_a_package_cell_lands_in_the_artifact_index,
+    test_a_package_cell_lands_in_the_artifact_index, test_a_settling_claim_folds_its_removals,
     test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_bundle_outlives_sealing, test_committed_receipts_reach_state,
     test_ec_storage_batch as helpers_test_ec_storage_batch,
@@ -35,8 +35,8 @@ use hyperscale_storage::test_helpers::{
     test_witness_window_retention_and_recovery, with_provisions,
 };
 use hyperscale_storage::{
-    BoundaryStore, PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader,
-    ShardChainWriter, SubstateStore, Substates, VersionedStore,
+    BoundaryStore, ChainWrites, PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore,
+    ShardChainReader, ShardChainWriter, SubstateStore, Substates, VersionedStore,
 };
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
@@ -493,6 +493,14 @@ fn a_prepared_commit_writes_its_committed_cells() {
     test_prepared_commit_writes_committed_cells(&storage);
 }
 
+#[test]
+fn a_settling_claim_folds_its_removals() {
+    let temp_dir = TempDir::new().unwrap();
+    test_a_settling_claim_folds_its_removals(
+        &RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap(),
+    );
+}
+
 /// A finalization whose single receipt carries `writes`. Its placeholder
 /// EC refuses nothing, so the whole set settles.
 fn finalization_with_writes(
@@ -534,6 +542,13 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
     let mut writes = StateWrites::default();
     writes.cells.insert(cell, Some(vec![4, 5]));
     writes.entries.insert(entry, Some(vec![1, 2, 3]));
+    let still = FrontierInputs::still(ShardId::ROOT);
+    let chain = ChainWrites {
+        creations: &[],
+        removals: &[],
+        frontier: &still,
+        state_claims: &[],
+    };
 
     // Block 1 writes both values and persists.
     let (root1, _snap1, prepared1) = storage.prepare_block_commit(
@@ -548,9 +563,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             BlockHeight::new(1),
             writes.clone(),
         )],
-        &[],
-        &[],
-        &FrontierInputs::still(ShardId::ROOT),
+        chain,
         BlockHeight::new(1),
     );
     prepared1(
@@ -573,9 +586,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             base_reads: None,
         },
         &[finalization_with_writes(BlockHeight::new(2), tombstones)],
-        &[],
-        &[],
-        &FrontierInputs::still(ShardId::ROOT),
+        chain,
         BlockHeight::new(2),
     );
     let (_root3, _snap3, prepared3) = storage.prepare_block_commit(
@@ -595,9 +606,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             base_reads: None,
         },
         &[finalization_with_writes(BlockHeight::new(3), writes)],
-        &[],
-        &[],
-        &FrontierInputs::still(ShardId::ROOT),
+        chain,
         BlockHeight::new(3),
     );
     prepared2(

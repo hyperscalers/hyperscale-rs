@@ -47,7 +47,7 @@ pub use executor::{
 };
 pub use genesis::{GenesisConfig, PROTOCOL_RESOURCE, World, genesis_world, genesis_writes};
 pub use hyperscale_effects_bridge::{LocalCells, account_address};
-pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, Deletion, ExecutionMode};
+pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, ExecutionMode};
 pub use output::ExecutedTx;
 pub use preview::{
     DeclaredReads, FetchedCells, FetchedEntries, Holds, PreviewGrants, PreviewInputs,

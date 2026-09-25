@@ -7,11 +7,12 @@ use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
     Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, Finalization,
-    LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt,
-    SubstateKey, Verifiable, entry_leaf_key,
+    LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateClaim, StateWrites,
+    StoredReceipt, SubstateKey, Verifiable, entry_leaf_key,
 };
 use hyperscale_vm_kernel::Substates;
 
+use crate::shard::crossings::crossing_settlements;
 use crate::shard::read_frontier::with_frontier;
 use crate::shard::store::Anchored;
 use crate::shard::sweep::{removals_of, with_sweep};
@@ -62,9 +63,12 @@ pub fn merge_writes_from_receipts(
     settle_writes(&merge_receipts(receipts), prior)
 }
 
-/// Everything a prepared commit lands: the receipts `finalizations`
-/// settle, resolved against the parent's baseline, plus the block's own
-/// creations, the sweep's removals and the read frontier's entries.
+/// Everything a prepared commit lands.
+///
+/// The receipts `finalizations` settle, resolved against the parent's
+/// baseline, plus the block's own creations, the sweep's removals, the
+/// crossing settlements its claims license against the same baseline,
+/// and the read frontier's entries.
 ///
 /// One resolution, feeding both the tree and the substate store — they
 /// commit the same values or they disagree about state. It happens once
@@ -89,6 +93,7 @@ pub fn settled_writes_at(
     creations: &[(SubstateKey, Vec<u8>)],
     swept: &[SubstateKey],
     frontier: SettledEntries,
+    state_claims: &[StateClaim],
 ) -> SettledWrites {
     assert_eq!(
         baseline.anchor(),
@@ -99,12 +104,10 @@ pub fn settled_writes_at(
         .iter()
         .flat_map(|fw| fw.settling_receipts())
         .collect();
+    let merged = merge_writes_from_receipts(&settling, baseline);
+    let settled = crossing_settlements(state_claims, &merged, baseline);
     with_frontier(
-        with_sweep(
-            merge_writes_from_receipts(&settling, baseline),
-            creations,
-            &removals_of(swept),
-        ),
+        with_sweep(merged, creations, &removals_of(swept, &settled)),
         frontier,
     )
 }

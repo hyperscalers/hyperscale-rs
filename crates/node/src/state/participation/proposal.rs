@@ -13,6 +13,7 @@ use hyperscale_types::{
     AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId, StateClaim,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
 };
+use hyperscale_vm_effects::CrossingId;
 
 use super::ShardParticipation;
 
@@ -23,6 +24,7 @@ pub(in crate::state) struct ProposalInputs {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
+    pub(crate) local_crossings: Vec<CrossingId>,
 }
 
 impl ShardParticipation {
@@ -56,6 +58,7 @@ impl ShardParticipation {
         let Offers {
             state_claims,
             abandonment_records,
+            local_crossings,
         } = self.execution_coordinator.offers();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
@@ -101,6 +104,7 @@ impl ShardParticipation {
             provisions,
             abandonment_records,
             state_claims,
+            local_crossings,
         }
     }
 
@@ -166,6 +170,7 @@ impl ShardParticipation {
             inputs.provisions,
             inputs.abandonment_records,
             inputs.state_claims,
+            inputs.local_crossings,
         )
     }
 }

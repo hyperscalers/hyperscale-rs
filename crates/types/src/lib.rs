@@ -176,9 +176,10 @@ pub use shard::limits::{
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
     MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
-    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIMS_HEADROOM,
-    TX_CAPS, UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction, drain_admits_block,
-    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TX_CAPS, UNSETTLED_TX_BYTES,
+    budget_admits_block, caps_admit_transaction, drain_admits_block, evidence_admits_block,
+    state_claims_admit_block, sweep_admits_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad};
 pub use shard::manifest::{BlockManifest, BlockMetadata};

@@ -24,7 +24,8 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{
-    ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore, sweep_for_block,
+    ChainEntry, ChainWrites, ParentAnchor, PendingChain, ShardStorage, SubstateStore,
+    sweep_for_block,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
@@ -225,9 +226,12 @@ where
             base_reads: None,
         },
         &finalizations,
-        creations,
-        &removals,
-        &pending.frontier,
+        ChainWrites {
+            creations,
+            removals: &removals,
+            frontier: &pending.frontier,
+            state_claims: block.state_claims(),
+        },
         height,
     );
 

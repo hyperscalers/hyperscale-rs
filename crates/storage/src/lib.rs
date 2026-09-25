@@ -44,8 +44,9 @@ pub use shard::boundary::{
     ImportProgress, Subtree, Vintage, WitnessSeed, adopt_plan, holds_state,
 };
 pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
-pub use shard::chain_writer::{ParentAnchor, ShardChainWriter};
+pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
+pub use shard::crossings::crossing_settlements;
 pub use shard::dedup_window::{DedupWindow, FeeHold};
 pub use shard::derived::{LeafRows, index_leaf};
 pub use shard::genesis::GenesisCommit;

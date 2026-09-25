@@ -7,12 +7,12 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, holds_this_block_at,
-    read_frontier_writes, settled_writes_at,
+    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, crossing_settlements,
+    holds_this_block_at, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, FrontierInputs, PreparedCommit,
-    SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
+    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -23,11 +23,15 @@ impl ShardChainWriter for SimShardStorage {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
-        creations: &[(SubstateKey, Vec<u8>)],
-        removals: &[SubstateKey],
-        frontier: &FrontierInputs,
+        chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
+        let ChainWrites {
+            creations,
+            removals,
+            frontier,
+            state_claims,
+        } = chain;
         // Everything the ticks carried, for storage; only what they
         // decided reaches state.
         let receipts: Vec<StoredReceipt> = finalizations
@@ -35,13 +39,21 @@ impl ShardChainWriter for SimShardStorage {
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
         let frontier = read_frontier_writes(parent.state, frontier);
+        // What the claims settle against the parent state, read once
+        // for the no-op test below; the fold reads it again beside the
+        // receipts, whose writes it defers to.
+        let settled = crossing_settlements(state_claims, &SettledWrites::default(), parent.state);
         // Nothing to write → state root is unchanged. Build a no-op
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet. A block's
         // sweep, its committed cells and its read frontier are writes
         // like any other, so a block that removes, creates or raises
         // something is not one of these however few receipts it carries.
-        if receipts.is_empty() && creations.is_empty() && removals.is_empty() && frontier.is_empty()
+        if receipts.is_empty()
+            && creations.is_empty()
+            && removals.is_empty()
+            && frontier.is_empty()
+            && settled.is_empty()
         {
             let s = read_or_recover(&self.state);
             let snapshot = Arc::new(noop_jmt_snapshot(
@@ -82,6 +94,7 @@ impl ShardChainWriter for SimShardStorage {
             creations,
             removals,
             frontier,
+            state_claims,
         );
 
         let (result_root, collected) = if parent.pending.is_empty() {

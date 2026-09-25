@@ -18,8 +18,8 @@ use hyperscale_storage::test_helpers::{
     test_witness_window_retention_and_recovery,
 };
 use hyperscale_storage::{
-    DedupWindow, ParentAnchor, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
-    VersionedStore, test_helpers,
+    ChainWrites, DedupWindow, ParentAnchor, ShardChainReader, ShardChainWriter, SubstateStore,
+    Substates, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
     StubVmStatics, install_stub_protocol_statics, leg_shape, make_finalization,
@@ -280,6 +280,11 @@ fn a_prepared_commit_writes_its_committed_cells() {
 }
 
 #[test]
+fn a_settling_claim_folds_its_removals() {
+    test_helpers::test_a_settling_claim_folds_its_removals(&SimShardStorage::default());
+}
+
+#[test]
 fn test_prepare_commit_state_root_matches() {
     let storage = Arc::new(SimShardStorage::default());
     let block = make_test_block(BlockHeight::new(1));
@@ -295,9 +300,12 @@ fn test_prepare_commit_state_root_matches() {
             base_reads: None,
         },
         &[],
-        &[],
-        &[],
-        &FrontierInputs::still(ShardId::ROOT),
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+        },
         BlockHeight::new(1),
     );
     let certified = make_test_certified(block);

@@ -13,7 +13,7 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
-use hyperscale_engine::legs::{Classified, Licence, Member, PlanDefect, Runs, Side};
+use hyperscale_engine::legs::{Classified, Member, PlanDefect, Runs, Side};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
@@ -22,21 +22,21 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
-    Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
+    Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore, crossing_settlements,
 };
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
+    Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
-    GlobalReceipt, Hash, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
-    ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
-    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
-    compute_merkle_root,
+    GlobalReceipt, Hash, Inclusion, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof, NetworkId,
+    PriceTable, PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateClaim,
+    StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
+    WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent, IntentHeader,
-    IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource,
-    package_hash,
+    AbiParam, Answered, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent,
+    IntentHeader, IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Totality, Value,
+    issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
@@ -1578,10 +1578,9 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
 
     let asked = run(
         &store,
-        Runs::Settle {
+        Runs::Reclaim {
             member: Member::whole(near_shard),
             records: issued(&classified, near_shard, None),
-            on: Licence::Unclaimed,
             charged: true,
         },
     );
@@ -1603,15 +1602,48 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
     );
 }
 
-/// Once the recipient's claim is on record, the sender's shard retires
-/// the record it held for it: no node, no fee, nothing moved, and the
-/// record deleted. A second retirement finds nothing and is refused
-/// before the kernel runs.
+/// The claim a block of the producer's shard carries once the
+/// consumer's `Taken` for `id` is read present at some anchor of the
+/// consumer's, named for the crossing: what licenses the fold to remove
+/// the record.
+fn taken_read_present(id: CrossingId, consumer: ShardId) -> StateClaim {
+    let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+    StateClaim::new(
+        Anchor {
+            shard: consumer,
+            height: BlockHeight::new(5),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(5_000),
+        },
+        [(taken, Inclusion::Present([7; 32]))],
+        MerkleInclusionProof::dummy(),
+    )
+    .naming([(taken, id)])
+}
+
+/// Apply to `store` what the commit fold removes for `claims`, and
+/// return what it removed.
+fn fold_settlements(store: &mut MapDb, claims: &[StateClaim]) -> Vec<SubstateKey> {
+    let removed = crossing_settlements(claims, &SettledWrites::default(), store);
+    let mut writes = StateWrites::default();
+    for key in &removed {
+        writes.cells.insert(*key, None);
+    }
+    store.apply(&writes);
+    removed
+}
+
+/// Once the recipient's claim is on record, the sender's shard removes
+/// the record it held for it in its commit fold: the block carries the
+/// consumer's `Taken` read present, named for the crossing, and that
+/// reading is the whole licence. No node, no fee, nothing moved, and a
+/// later block with the same reading finds nothing left to remove.
 #[test]
-fn a_retirement_retires_the_record_and_moves_nothing() {
+fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
+    let far_shard = trie.shard_for_prefix(far());
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
@@ -1620,70 +1652,48 @@ fn a_retirement_retires_the_record_and_moves_nothing() {
     let edge = classified.edges()[0].clone();
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
-    let run = |store: &MapDb, runs: Runs| {
-        let ctx = TickBatchContext {
-            local_shard: near_shard,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(1_000),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-        };
-        let input = TickTxInput {
-            prices: PriceTable::GENESIS,
-            tx_hash: tx.hash(),
-            transaction: Some(&tx),
-            provisions: &[],
-            clock: WeightedTimestamp::from_millis(1_000),
-            runs,
-            arrivals: &[],
-        };
-        executor
-            .execute_tick_batch(&ctx, store, &[input])
-            .expect("the harness engine holds every package it runs")
-            .remove(0)
+    let ctx = TickBatchContext {
+        local_shard: near_shard,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
     };
-
-    let sent = run(
-        &store,
-        Runs::Shape(Member::of(
-            classified.clone(),
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash: tx.hash(),
+        transaction: Some(&tx),
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(1_000),
+        runs: Runs::Shape(Member::of(
+            classified,
             near_shard,
             Side::Issuing,
             std::iter::once(near_shard)
                 .chain(edge.to.iter().copied())
                 .collect(),
         )),
-    );
+        arrivals: &[],
+    };
+    let sent = executor
+        .execute_tick_batch(&ctx, &store, &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0);
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
         panic!("the sender's legs must succeed: {:?}", sent.metadata);
     };
     store.apply(writes);
-    assert!(
-        store
-            .cell(edge.crossing.id.record_key(&ProtocolHasher))
-            .is_some(),
-        "the record is written"
-    );
+    let record = edge.crossing.id.record_key(&ProtocolHasher);
+    assert!(store.cell(record).is_some(), "the record is written");
 
-    let retired = run(
-        &store,
-        Runs::Settle {
-            member: Member::whole(near_shard),
-            records: issued(&classified, near_shard, None),
-            on: Licence::Claimed,
-            charged: true,
-        },
+    let claim = taken_read_present(edge.crossing.id, far_shard);
+    assert_eq!(
+        fold_settlements(&mut store, std::slice::from_ref(&claim)),
+        vec![record],
+        "the Taken read present licenses removing the record and nothing else",
     );
-    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
-        panic!("the retirement must succeed: {:?}", retired.metadata);
-    };
-    assert!(retired.escrowed.is_empty(), "a retirement issues nothing");
-    assert!(retired.refusal_receipt.is_none(), "and charges nothing");
-    store.apply(writes);
     assert!(
-        store
-            .cell(edge.crossing.id.record_key(&ProtocolHasher))
-            .is_none(),
+        store.cell(record).is_none(),
         "the record is removed where it is retired; its consumer reads it gone at an \
          anchor at or above its read frontier"
     );
@@ -1692,20 +1702,9 @@ fn a_retirement_retires_the_record_and_moves_nothing() {
         Some(encode_amount(900).to_vec()),
         "and the value stays where the claim took it"
     );
-
-    let again = run(
-        &store,
-        Runs::Settle {
-            member: Member::whole(near_shard),
-            records: issued(&classified, near_shard, None),
-            on: Licence::Claimed,
-            charged: true,
-        },
-    );
     assert!(
-        matches!(again.consensus, ConsensusReceipt::Failed),
-        "a second retirement finds no record and is refused: {:?}",
-        again.metadata
+        fold_settlements(&mut store, &[claim]).is_empty(),
+        "a second block carrying the reading has nothing left to remove",
     );
 }
 
@@ -1718,6 +1717,7 @@ struct Inherited {
     shard: ShardId,
     store: MapDb,
     record: SubstateKey,
+    crossing: CrossingId,
 }
 
 /// Run the sending half over a fresh store, so the record stands with
@@ -1770,12 +1770,13 @@ fn inherited_record() -> Inherited {
         shard,
         store,
         record: edge.crossing.id.record_key(&ProtocolHasher),
+        crossing: edge.crossing.id,
     }
 }
 
-/// Settle the inherited record under `on`, with no body and no clock
-/// that matters: the licence is the whole of the member's input.
-fn settle_inherited(held: &Inherited, on: Licence) -> ExecutedTx {
+/// Take the inherited record back, with no body and no clock that
+/// matters: the record is the whole of the member's input.
+fn reclaim_inherited(held: &Inherited) -> ExecutedTx {
     let ctx = TickBatchContext {
         local_shard: held.shard,
         shard_trie: &held.trie,
@@ -1789,10 +1790,9 @@ fn settle_inherited(held: &Inherited, on: Licence) -> ExecutedTx {
         transaction: None,
         provisions: &[],
         clock: WeightedTimestamp::from_millis(2_000),
-        runs: Runs::Settle {
+        runs: Runs::Reclaim {
             member: Member::whole(held.shard),
             records: vec![held.record],
-            on,
             charged: true,
         },
         arrivals: &[],
@@ -1803,23 +1803,24 @@ fn settle_inherited(held: &Inherited, on: Licence) -> ExecutedTx {
         .remove(0)
 }
 
-/// A record a shard inherited with a prefix, settled where its consumer
-/// claimed: removed, with the value left where the claim took it.
+/// A record a shard inherited with a prefix is removed in the commit
+/// fold where its consumer claimed: the block carries the consumer's
+/// `Taken` read present, named for the crossing, and the value stays
+/// where the claim took it.
 ///
-/// The member runs with no body at all, which is the point — a merge
-/// successor's store arrives as a prefix of leaves and its ledger begins
-/// empty, so the leaf is the whole of what a settlement has to work
-/// from. What it no longer works from is a window or a cell read to
-/// decide the licence: the licence is a presence its own chain
-/// committed.
+/// No member runs at all, which is the point — a merge successor's
+/// store arrives as a prefix of leaves and its ledger begins empty, so
+/// the leaf and the reading are the whole of what the removal works
+/// from. The licence is a presence its own chain committed.
 #[test]
-fn an_inherited_record_is_retired_where_its_consumer_claimed() {
+fn an_inherited_record_is_retired_in_the_fold_where_its_consumer_claimed() {
     let mut held = inherited_record();
-    let retired = settle_inherited(&held, Licence::Claimed);
-    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
-        panic!("the retirement must succeed: {:?}", retired.metadata);
-    };
-    held.store.apply(writes);
+    let consumer = held.trie.shard_for_prefix(far());
+    let claim = taken_read_present(held.crossing, consumer);
+    assert_eq!(
+        fold_settlements(&mut held.store, &[claim]),
+        vec![held.record]
+    );
     assert!(
         Substates::cell(&held.store, held.record).is_none(),
         "a claimed crossing's record is removed"
@@ -1837,7 +1838,7 @@ fn an_inherited_record_is_retired_where_its_consumer_claimed() {
 #[test]
 fn an_inherited_record_with_no_recourse_is_left_standing() {
     let held = inherited_record();
-    let standing = settle_inherited(&held, Licence::Unclaimed);
+    let standing = reclaim_inherited(&held);
     assert_eq!(
         standing.consensus,
         ConsensusReceipt::Failed,
@@ -1886,14 +1887,13 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            runs: Runs::Settle {
+            runs: Runs::Reclaim {
                 member: Member::whole(near_shard),
                 records: issued(
                     &Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie),
                     near_shard,
                     None,
                 ),
-                on: Licence::Unclaimed,
                 charged,
             },
             arrivals: &[],

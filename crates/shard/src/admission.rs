@@ -118,6 +118,12 @@ pub(crate) struct Admission<'a> {
     pub(crate) local_shard: ShardId,
     /// The block's own anchor: its parent QC's weighted timestamp.
     pub(crate) anchor: WeightedTimestamp,
+    /// The block's parent as an anchor: this shard, the parent's height
+    /// and state root, at the block's own clock. The one anchor a
+    /// crossing whose two ends route here is read at, with the empty
+    /// proof, since every voter reads that state through its own
+    /// anchored view.
+    pub(crate) parent: Anchor,
     /// Where this chain began; content anchored before it belongs to a
     /// predecessor.
     pub(crate) chain_origin: WeightedTimestamp,
@@ -767,6 +773,13 @@ impl Section for StateClaimsSection {
     /// carries a value, on the shard that owned the cell at the
     /// anchor's clock.
     ///
+    /// A claim anchored at the block's own parent carries the empty
+    /// proof and reads only keys the block's trie routes here: the
+    /// verifier re-reads each one from its own parent view. A crossing
+    /// reading of a locally routed key at any other anchor is refused,
+    /// as is any other anchor of this shard's, which no voter could
+    /// hold a commit-proven header for.
+    ///
     /// The proof is walked here, so a bad one refuses the block on
     /// every replica alike: every rule is a pure function of the block
     /// and its anchor, nothing this validator fetched. Whether the
@@ -796,17 +809,40 @@ impl Section for StateClaimsSection {
         if !claim.is_well_formed() {
             return Err(format!("{} is empty, over its cap, or out of order", at()));
         }
-        claim
-            .verify()
-            .map_err(|err| format!("{} does not prove its readings: {err}", at()))?;
-        if ctx
-            .snapshot
-            .recovery_fences(claim.anchor.shard, claim.anchor.height)
-        {
-            return Err(format!(
-                "{} is at a height the shard's recovery fences",
-                at()
-            ));
+        let trie = ctx.snapshot.shard_trie();
+        let routed_here = |key: &SubstateKey| trie.shard_for_prefix(key.owner) == ctx.local_shard;
+        if claim.anchor == ctx.parent {
+            if !claim.proof.as_bytes().is_empty() {
+                return Err(format!("{} at the parent carries a proof", at()));
+            }
+            if !claim.keys().iter().all(routed_here) {
+                return Err(format!(
+                    "{} at the parent reads a key this shard does not hold",
+                    at()
+                ));
+            }
+        } else {
+            if claim.anchor.shard == ctx.local_shard {
+                return Err(format!("{} is anchored on this shard off its parent", at()));
+            }
+            if claim.crossings.iter().any(|(key, _)| routed_here(key)) {
+                return Err(format!(
+                    "{} reads a crossing of this shard's away from the parent",
+                    at()
+                ));
+            }
+            claim
+                .verify()
+                .map_err(|err| format!("{} does not prove its readings: {err}", at()))?;
+            if ctx
+                .snapshot
+                .recovery_fences(claim.anchor.shard, claim.anchor.height)
+            {
+                return Err(format!(
+                    "{} is at a height the shard's recovery fences",
+                    at()
+                ));
+            }
         }
         if ctx.anchor.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
             return Err(format!(
@@ -909,7 +945,7 @@ pub(crate) mod fixtures {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, NetworkDefinition,
+        Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, NetworkDefinition,
         ShardAnchor, ShardId, StateRoot, TopologySchedule, TopologySnapshot, ValidatorSet,
         WeightedTimestamp,
     };
@@ -925,6 +961,7 @@ pub(crate) mod fixtures {
         pub(crate) schedule: TopologySchedule,
         pub(crate) local_shard: ShardId,
         pub(crate) anchor: WeightedTimestamp,
+        pub(crate) parent: Anchor,
         pub(crate) chain_origin: WeightedTimestamp,
         pub(crate) chain: QcChainSets,
         pub(crate) dedup: CommitDedupIndex,
@@ -947,6 +984,12 @@ pub(crate) mod fixtures {
                 schedule,
                 local_shard: ShardId::ROOT,
                 anchor: WeightedTimestamp::ZERO,
+                parent: Anchor {
+                    shard: ShardId::ROOT,
+                    height: BlockHeight::GENESIS,
+                    state_root: StateRoot::ZERO,
+                    ts: WeightedTimestamp::ZERO,
+                },
                 chain_origin: WeightedTimestamp::ZERO,
                 chain: QcChainSets::default(),
                 dedup: CommitDedupIndex::new(),
@@ -961,6 +1004,7 @@ pub(crate) mod fixtures {
                 schedule: &self.schedule,
                 local_shard: self.local_shard,
                 anchor: self.anchor,
+                parent: self.parent,
                 chain_origin: self.chain_origin,
                 chain: &self.chain,
                 dedup: &self.dedup,
@@ -1035,9 +1079,11 @@ mod state_claim_tests {
     use hyperscale_hbor::Bytes;
     use hyperscale_types::test_utils::{proven_claim, state_and_proof, test_key};
     use hyperscale_types::{
-        Anchor, BlockHeight, RETENTION_HORIZON, ShardId, StateClaim, Stated, SubstateKey,
+        Anchor, BlockHeight, Inclusion, MerkleInclusionProof, NetworkDefinition, RETENTION_HORIZON,
+        ShardId, StateClaim, Stated, SubstateKey, TopologySnapshot, ValidatorSet,
         WeightedTimestamp,
     };
+    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
     use super::fixtures::{Against, DEPARTURE_CUT_MS, departures};
     use super::{Section, StateClaimsFold, StateClaimsSection};
@@ -1082,6 +1128,83 @@ mod state_claim_tests {
     fn admit(against: &Against, claim: &StateClaim) -> Result<(), String> {
         let mut fold = StateClaimsFold::default();
         StateClaimsSection::admit(&against.ctx(), &mut fold, claim)
+    }
+
+    /// A crossing whose record sits under the producer's prefix.
+    fn crossing() -> CrossingId {
+        CrossingId {
+            producer: producer_key().owner,
+            consumer: test_key(0x12).owner,
+            intent: IntentHash(Hash32([0x77; 32])),
+            local: 0,
+            output: 0,
+        }
+    }
+
+    /// A crossing read at the block's parent, absent, with the empty
+    /// proof, as the proposer reads one whose ends share its shard.
+    fn read_at_the_parent(against: &Against) -> StateClaim {
+        let record = crossing().record_key(&ProtocolHasher);
+        StateClaim::new(
+            against.parent,
+            [(record, Inclusion::Absent)],
+            MerkleInclusionProof::new(Vec::new()),
+        )
+        .naming([(record, crossing())])
+    }
+
+    /// A crossing whose two ends route here is read at the block's own
+    /// parent with the empty proof, and nowhere else: a parent-anchored
+    /// claim carrying a proof, one reading a key this shard does not
+    /// hold, another anchor of this shard's, and a crossing reading of a
+    /// key routed here at a counterpart's anchor are each refused.
+    #[test]
+    fn a_local_crossing_is_read_only_at_the_parent() {
+        // Past the cut every key routes to the root, this shard.
+        let against = against(WeightedTimestamp::from_millis(DEPARTURE_CUT_MS + 9_000));
+        assert_eq!(admit(&against, &read_at_the_parent(&against)), Ok(()));
+
+        let mut proven = read_at_the_parent(&against);
+        proven.proof = MerkleInclusionProof::new(vec![0]);
+        assert!(
+            admit(&against, &proven)
+                .expect_err("a parent-anchored claim carries no proof")
+                .contains("carries a proof"),
+        );
+
+        let mut off_parent = read_at_the_parent(&against);
+        off_parent.anchor.height = BlockHeight::new(3);
+        assert!(
+            admit(&against, &off_parent)
+                .expect_err("only the parent anchors a claim of this shard's")
+                .contains("off its parent"),
+        );
+
+        let record = crossing().record_key(&ProtocolHasher);
+        let remote = proven_claim(PRODUCER, 9, &[], &[record]);
+        assert_eq!(
+            admit(&against, &remote),
+            Ok(()),
+            "a bare reading of the key at a counterpart's anchor is admitted",
+        );
+        assert!(
+            admit(&against, &remote.naming([(record, crossing())]))
+                .expect_err("a crossing of this shard's is read at the parent alone")
+                .contains("away from the parent"),
+        );
+
+        // A shard holding no prefix reads nothing of its own at the
+        // parent.
+        let elsewhere = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        assert!(
+            admit(&elsewhere, &read_at_the_parent(&elsewhere))
+                .expect_err("the key routes to a child, not to the root")
+                .contains("does not hold"),
+        );
     }
 
     /// A claim is admitted at exactly one retention horizon before the
@@ -1140,9 +1263,13 @@ mod state_claim_tests {
             .is_err_and(|err| err.contains("did not own")),
             "a coast anchor of the departed producer owns nothing",
         );
+        // Judged from a shard the root is a counterpart of: a shard
+        // carries no claim anchored on itself but at its parent.
+        let mut from_elsewhere = against(block_anchor);
+        from_elsewhere.local_shard = ShardId::leaf(1, 1);
         assert_eq!(
             admit(
-                &against(block_anchor),
+                &from_elsewhere,
                 &held(
                     ShardId::ROOT,
                     WeightedTimestamp::from_millis(DEPARTURE_CUT_MS + 100),
@@ -1153,12 +1280,11 @@ mod state_claim_tests {
             "the successor's reading past the cut is admitted",
         );
         let unscheduled = WeightedTimestamp::from_millis(1_000_000_000);
+        let mut past_the_schedule = against(unscheduled);
+        past_the_schedule.local_shard = ShardId::leaf(1, 1);
         assert!(
-            admit(
-                &against(unscheduled),
-                &held(ShardId::ROOT, unscheduled, key)
-            )
-            .is_err_and(|err| err.contains("no schedule window covers")),
+            admit(&past_the_schedule, &held(ShardId::ROOT, unscheduled, key))
+                .is_err_and(|err| err.contains("no schedule window covers")),
         );
     }
 }

@@ -16,13 +16,13 @@ use hyperscale_types::test_utils::{
     proven_claim, stub_sweepable_cell, test_key, test_transaction,
 };
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
+    AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
     BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
     CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, EpochWindows, Event,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
-    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
+    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Inclusion, LocalKey, LogLevel,
     MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable,
     ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
     QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFrontier,
@@ -39,8 +39,8 @@ use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BOUNDARY_RETAIN, BoundaryStore, CrossingLeaves, GenesisCommit, ImportCursor,
-    ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState,
+    Anchored, BOUNDARY_RETAIN, BoundaryStore, ChainWrites, CrossingLeaves, GenesisCommit,
+    ImportCursor, ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState,
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
     SweepIndex, VersionedStore, WitnessSeed, committed_tx_cell_key, committed_tx_cells,
     holds_state, sweep_for_block,
@@ -635,9 +635,12 @@ pub fn commit_settled_at<S: TestStore>(
             base_reads: None,
         },
         &block.certificates()[..],
-        creations,
-        removals,
-        &FrontierInputs::still(ShardId::ROOT),
+        ChainWrites {
+            creations,
+            removals,
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+        },
         block.height(),
     );
     commit(SyncHint::FlushNow, certified, witness)
@@ -1398,9 +1401,12 @@ where
             base_reads: None,
         },
         &block_one.certificates()[..],
-        &[],
-        &[],
-        &FrontierInputs::still(ShardId::ROOT),
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+        },
         one,
     );
 
@@ -1419,9 +1425,12 @@ where
             base_reads: None,
         },
         &block_two.certificates()[..],
-        &[],
-        &[],
-        &FrontierInputs::still(ShardId::ROOT),
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+        },
         two,
     );
 
@@ -2183,6 +2192,7 @@ fn commit_raising<S: TestStore>(
     frontier: &FrontierInputs,
 ) -> (StateRoot, StateRoot) {
     let storage = Arc::new(storage.clone());
+    let claims: Vec<StateClaim> = block.state_claims().to_vec();
     let (prepared, _, commit) = storage.prepare_block_commit(
         ParentAnchor {
             state_root: storage.state_root(),
@@ -2192,9 +2202,12 @@ fn commit_raising<S: TestStore>(
             base_reads: None,
         },
         &[],
-        &[],
-        &[],
-        frontier,
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier,
+            state_claims: &claims,
+        },
         block.height(),
     );
     let committed = commit(
@@ -2261,6 +2274,205 @@ pub fn test_the_read_frontier_is_read_off_the_state<S>(
     let (_, committed) = commit_raising(storage, higher, &inputs);
     assert_ne!(committed, before, "a higher reading moves the root again");
     assert_eq!(table(local), frontier_of(producer, 9));
+}
+
+/// A crossing whose producer sits on the left half of the root's
+/// keyspace and whose consumer sits on the right, so its record and its
+/// answers land on different children of a root split.
+const fn straddling_crossing(seed: u8) -> CrossingId {
+    CrossingId {
+        producer: Address::new([seed & 0x7F; 31], AddressClass::Component),
+        consumer: Address::new([seed | 0x80; 31], AddressClass::Component),
+        intent: IntentHash(Hash32([seed; 32])),
+        local: 0,
+        output: 0,
+    }
+}
+
+/// Two crossings the settling fixtures read: one whose record stands
+/// and whose consumer's `Taken` a claim reads present, and one whose
+/// `Taken` stands and whose record a claim reads absent.
+struct Settling {
+    retired: CrossingId,
+    answered: CrossingId,
+}
+
+impl Settling {
+    const fn new() -> Self {
+        Self {
+            retired: straddling_crossing(0x21),
+            answered: straddling_crossing(0x22),
+        }
+    }
+
+    /// The record of the crossing being retired.
+    fn record(&self) -> SubstateKey {
+        self.retired.record_key(&ProtocolHasher)
+    }
+
+    /// The `Taken` of the crossing whose record is gone.
+    fn taken(&self) -> SubstateKey {
+        self.answered.answer_key(&ProtocolHasher, Answered::Taken)
+    }
+
+    /// The two cells as state holds them before the settling block.
+    fn standing(&self) -> BTreeMap<SubstateKey, Option<Vec<u8>>> {
+        BTreeMap::from([
+            (
+                self.record(),
+                Some(
+                    self.retired
+                        .cell(
+                            VmTxHash(Hash32([0xC0; 32])),
+                            ResourceAddr::new([0xE0; 31]),
+                            500,
+                            1_000,
+                            Terms::Owed,
+                        )
+                        .to_bytes(),
+                ),
+            ),
+            (
+                self.taken(),
+                Some(
+                    self.answered
+                        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken)
+                        .to_bytes(),
+                ),
+            ),
+        ])
+    }
+
+    /// A block at `height` carrying the claim that settles both: the
+    /// retired crossing's `Taken` read present and the answered
+    /// crossing's record read absent, each naming its crossing.
+    fn block(&self, height: u64) -> (Block, FrontierInputs) {
+        let taken = self.retired.answer_key(&ProtocolHasher, Answered::Taken);
+        let record = self.answered.record_key(&ProtocolHasher);
+        let claim = StateClaim::new(
+            Anchor {
+                shard: ShardId::leaf(2, 3),
+                height: BlockHeight::new(7),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(7_000),
+            },
+            [
+                (taken, Inclusion::Present([7; 32])),
+                (record, Inclusion::Absent),
+            ],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(taken, self.retired), (record, self.answered)]);
+        let block = with_state_claims(make_test_block(BlockHeight::new(height)), vec![claim]);
+        let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+        (block, inputs)
+    }
+}
+
+/// Shared: a block's claims settle crossings in its commit fold.
+///
+/// A record whose consumer's `Taken` a claim reads present is removed,
+/// and an answer whose record a claim reads absent is removed, under
+/// the root the one commit path prepares and commits; the same block
+/// again, with nothing left to remove, prepares its parent's root.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_settling_claim_folds_its_removals<S: TestStore>(storage: &S) {
+    let settling = Settling::new();
+    commit_writes(storage, &SettledWrites::from_absolutes(settling.standing()));
+    assert!(storage.cell(settling.record()).is_some());
+    assert!(storage.cell(settling.taken()).is_some());
+
+    let (block, inputs) = settling.block(2);
+    let parent_root = storage.state_root();
+    let (prepared, committed) = commit_raising(storage, block, &inputs);
+    assert_ne!(prepared, parent_root, "a settlement moves the root");
+    assert_eq!(committed, prepared);
+    assert!(
+        storage.cell(settling.record()).is_none(),
+        "the Taken read present retires the record",
+    );
+    assert!(
+        storage.cell(settling.taken()).is_none(),
+        "and the record read absent deletes the answer",
+    );
+
+    let (again, inputs) = settling.block(3);
+    let before = storage.state_root();
+    let (prepared, committed) = commit_raising(storage, again, &inputs);
+    assert_eq!(
+        prepared, before,
+        "nothing left to remove prepares the parent's root"
+    );
+    assert_eq!(committed, before);
+}
+
+/// Shared: a split follower on each half folds the settlements of the
+/// parent's block that land on its half, and the halves recompose the
+/// parent's root.
+///
+/// The record sits on the left half and the answer on the right, so
+/// one block settles crossings whose ends are in different children:
+/// each follower removes the key it holds, reads the other absent and
+/// writes nothing for it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_followed_halves_fold_the_settlements<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let settling = Settling::new();
+    let mut writes = StateWrites::default();
+    for (key, value) in settling.standing() {
+        writes.cells.insert(key, value);
+    }
+    let receipt = StoredReceipt::synced(
+        TxHash::from(Hash::from_bytes(b"standing")),
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let standing = block_settling(BlockHeight::new(1), vec![receipt]);
+    commit_writes(parent, &SettledWrites::from_absolutes(settling.standing()));
+    let still = FrontierInputs::still(ShardId::ROOT);
+    left.follow_block_writes(&standing, &[], &still).unwrap();
+    right.follow_block_writes(&standing, &[], &still).unwrap();
+    assert!(
+        left.cell(settling.record()).is_some(),
+        "the record is on the left"
+    );
+    assert!(
+        right.cell(settling.taken()).is_some(),
+        "the answer on the right"
+    );
+
+    let (block, inputs) = settling.block(2);
+    let (_, parent_root) = commit_raising(parent, block.clone(), &inputs);
+    let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
+    let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert!(
+        left.cell(settling.record()).is_none(),
+        "the left half retires the record"
+    );
+    assert!(
+        right.cell(settling.taken()).is_none(),
+        "the right half deletes the answer"
+    );
+    assert!(
+        SplitChildRoots {
+            left: left_root,
+            right: right_root,
+        }
+        .composes_to(parent_root),
+        "the followed halves recompose the parent's root",
+    );
 }
 
 /// Shared: a split observer following the parent's blocks into one half
@@ -2354,9 +2566,12 @@ where
             base_reads: None,
         },
         &[],
-        &creations,
-        &[],
-        &FrontierInputs::still(ShardId::ROOT),
+        ChainWrites {
+            creations: &creations,
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+        },
         BlockHeight::new(1),
     );
     let certified = make_test_certified(block);
@@ -2398,9 +2613,12 @@ where
                 base_reads: None,
             },
             &[],
-            &[],
-            &[],
-            &FrontierInputs::still(ShardId::ROOT),
+            ChainWrites {
+                creations: &[],
+                removals: &[],
+                frontier: &FrontierInputs::still(ShardId::ROOT),
+                state_claims: &[],
+            },
             BlockHeight::new(1),
         );
         commit(
@@ -2452,9 +2670,12 @@ where
             base_reads: None,
         },
         &[],
-        &creations,
-        &[],
-        &FrontierInputs::still(ShardId::ROOT),
+        ChainWrites {
+            creations: &creations,
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+        },
         BlockHeight::new(1),
     );
 

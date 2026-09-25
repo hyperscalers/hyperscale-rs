@@ -40,8 +40,8 @@ use hyperscale_vm_effects::{
     PackageHash, Terms, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchError, BatchTx, Deletion, Disposal, Disposition, EnvInputs, ExecutionMode,
-    FeeBurn, Job, LegPlan, ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
+    Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn, Job, LegPlan,
+    ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -50,7 +50,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Licence, Member, Runs, never_answer};
+use crate::legs::{Member, Runs, never_answer};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -582,83 +582,45 @@ impl Executor {
         Ok(entry)
     }
 
-    /// The entry a settlement runs: no call, no nullifier, and a
-    /// declaration of its own over exactly the cells it touches — each
-    /// record read, and where a crossing is taken back, its claim
-    /// written and the cell it names credited in the resource the record
-    /// names. A record nobody may take back is released rather than
-    /// taken: the producer's account of it closes and the balance
-    /// stands.
+    /// Lower a reclaim: the records it takes back, read off the
+    /// snapshot, each declared with the cell its value goes back to.
     ///
-    /// A settlement derives from the cell, not the manifest, so it
-    /// carries none of the transaction's declaration: no node is
-    /// invoked, so no table position matters, and the transaction's own
-    /// mode on that cell — a reservation, where the value left — is not
-    /// the credit a reclaim makes. Every term is the record's: the edge
-    /// it names, the claim key its expiry derives, the resource, the
-    /// amount and the cell to credit.
-    ///
-    /// What each record takes is the licence's to say. On a
-    /// counterpart's committed evidence every record takes the same arm,
-    /// and a record this shard cannot read is a refusal, since one that
-    /// is not there was retired or taken back already. On this shard's
-    /// own leaf each record takes the arm its claim cell decides —
-    /// present means the crossing was taken and the record is a balance
-    /// for a claim that happened, which is deleted; absent means no
-    /// consumer took it, and none can now, since the member is admitted
-    /// only where an absence answers, which is credited back to the cell
-    /// the record names — and a record already gone is skipped rather
-    /// than refused, since a
-    /// member admitted for several records is one member, and one of
-    /// them having been settled by the shard's own evidence path in
-    /// between is not a reason to strand the rest.
-    ///
-    /// A record naming nobody to credit is left standing wherever the
-    /// licence would take it back: its only disposal is the retirement
-    /// its consumer's claim licenses, and until that claim is there it
-    /// is holding the value for a consumer that may still run. Skipped
-    /// rather than refused, so a member admitted for several records
-    /// settles the ones it can.
+    /// A record that is not there is skipped, not refused: the commit
+    /// fold removes a record once its consumer's `Taken` is read
+    /// present, and a member admitted for several records is one
+    /// member, so one of them having been settled that way in between
+    /// is not a reason to strand the rest. A record naming nobody to
+    /// credit is left standing too: an outbound leg consumes it, so
+    /// nothing takes it back, and it holds the value for a consumer that
+    /// may still run. A member with nothing left is refused.
     ///
     /// The scope is this shard's own subtree, whatever the transaction's
-    /// placement was. Every cell a settlement touches sits under the
+    /// placement was. Every cell a reclaim touches sits under the
     /// record's owner, which is a prefix this shard holds or the record
-    /// would not be here; and a batch of settlements alone reaches
-    /// beyond nothing, so its writes are unfiltered — a credit to a cell
-    /// owned elsewhere has to trap here rather than land in a store that
-    /// does not own it.
-    fn prepare_settle(
+    /// would not be here; and a batch of reclaims alone reaches beyond
+    /// nothing, so its writes are unfiltered — a credit to a cell owned
+    /// elsewhere has to trap here rather than land in a store that does
+    /// not own it.
+    fn prepare_reclaim(
         records: &[SubstateKey],
-        on: Licence,
         ctx: &TickBatchContext<'_>,
         snapshot: &(dyn Substates + Sync),
     ) -> Result<PreparedTx, String> {
         if records.is_empty() {
-            return Err("this shard has no record to settle".to_string());
+            return Err("this shard has no record to reclaim".to_string());
         }
         let mut disposals = Vec::with_capacity(records.len());
         let mut declaration = Declaration::default();
         for key in records {
             let Some(record) = read_record(snapshot, *key) else {
-                return Err(format!("settlement of record {key:?} reads no record"));
-            };
-            // What the record takes, decided before anything is
-            // declared: a record left standing is declared nothing, or
-            // the member would name a cell it never touches. The
-            // licence is the whole of it — no cell is read here to
-            // decide it, because every licence is a presence a
-            // counterpart wrote and this shard's chain committed.
-            let takes_back = on == Licence::Unclaimed;
-            // Nothing takes an owed crossing back, so a licence that
-            // would is not about this record: it stands, holding the
-            // value for whoever may still claim it, and the member goes
-            // on to the rest.
-            if takes_back && record.terms == Terms::Owed {
                 continue;
-            }
+            };
+            let Terms::Escrowed { credit } = record.terms else {
+                continue;
+            };
             let mut declare_here = |effect, holds| {
                 declare(&mut declaration, effect, holds).map_err(|conflict| {
-                    format!("settled cell contradicts the declaration: {conflict}")
+                    format!("reclaimed cell contradicts the declaration: {conflict}")
                 })
             };
             declare_here(
@@ -668,31 +630,17 @@ impl Executor {
                 },
                 None,
             )?;
-            let disposition = match record.terms {
-                // Taken back: the record goes and the value it held is
-                // credited to the cell it left, and nothing else is
-                // written.
-                Terms::Escrowed { credit } if takes_back => {
-                    declare_here(
-                        Effect {
-                            target: EffectTarget::Point(credit),
-                            mode: Mode::Delta { moves: Moves::Both },
-                        },
-                        Some(record.resource),
-                    )?;
-                    Disposition::Reclaim
-                }
-                // A claim that happened: the value moved where the
-                // consumer ran and what is left is a cell saying so.
-                Terms::Escrowed { .. } | Terms::Owed => Disposition::Retire,
-            };
-            disposals.push(Disposal {
-                record: *key,
-                disposition,
-            });
+            declare_here(
+                Effect {
+                    target: EffectTarget::Point(credit),
+                    mode: Mode::Delta { moves: Moves::Both },
+                },
+                Some(record.resource),
+            )?;
+            disposals.push(Disposal { record: *key });
         }
         if disposals.is_empty() {
-            return Err("no inherited record is this member's to settle".to_string());
+            return Err("no record here is this member's to take back".to_string());
         }
         let trie = ctx.shard_trie.clone();
         let local = ctx.local_shard;
@@ -701,55 +649,7 @@ impl Executor {
             declaration,
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
-            // A settlement invokes no node, so nothing of it emits.
-            event_bytes: Vec::new(),
-            work: DeclaredWork::ZERO,
-            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
-        })
-    }
-
-    /// Lower an answer cleanup: the cells it removes, declared, and
-    /// nothing read.
-    ///
-    /// [`Self::prepare_owe`]'s neighbour and the same shape. A removal
-    /// is a write on the cell, so it wants one exclusive declaration and
-    /// the batch screen puts every writer of that cell in one conflict
-    /// group. Nothing is read: the licence was read by the composer off
-    /// the committing block's own claims, and there is nothing in the
-    /// answer to hold it to beyond naming the record it answers for,
-    /// which the kernel checks itself.
-    ///
-    /// # Errors
-    ///
-    /// Work naming nothing, or a declaration two of its cells
-    /// contradict.
-    fn prepare_clean(
-        answers: &[Deletion],
-        ctx: &TickBatchContext<'_>,
-    ) -> Result<PreparedTx, String> {
-        if answers.is_empty() {
-            return Err("this shard has no answer to clean up".to_string());
-        }
-        let mut declaration = Declaration::default();
-        for deletion in answers {
-            declare(
-                &mut declaration,
-                Effect {
-                    target: EffectTarget::Point(deletion.answer),
-                    mode: Mode::Write { moves: Moves::Both },
-                },
-                None,
-            )
-            .map_err(|conflict| format!("cleaned cell contradicts the declaration: {conflict}"))?;
-        }
-        let trie = ctx.shard_trie.clone();
-        let local = ctx.local_shard;
-        Ok(PreparedTx {
-            job: Job::Deletions(answers.to_vec()),
-            declaration,
-            nullifiers: Vec::new(),
-            gas_limits: Vec::new(),
-            // A cleanup invokes no node, so nothing of it emits.
+            // A reclaim invokes no node, so nothing of it emits.
             event_bytes: Vec::new(),
             work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
@@ -1588,10 +1488,7 @@ impl Executor {
             // a derivation that cannot be — every replica reads the same
             // legs and the same arrivals.
             let planned = match &input.runs {
-                Runs::Settle { records, on, .. } => {
-                    Self::prepare_settle(records, *on, ctx, snapshot)
-                }
-                Runs::Clean { answers, .. } => Self::prepare_clean(answers, ctx),
+                Runs::Reclaim { records, .. } => Self::prepare_reclaim(records, ctx, snapshot),
                 Runs::Shape(shape) => input
                     .transaction
                     .ok_or_else(|| "a member running a shape holds no body".to_string())
@@ -2006,18 +1903,22 @@ mod tests {
             holds: &ProvisionalHolds::new(),
         };
 
-        let prepared = Executor::prepare_settle(&[record_key], Licence::Unclaimed, &ctx, &snapshot)
+        // A record the commit fold has already removed is skipped,
+        // and the one still standing is taken back alone.
+        let gone = SubstateKey {
+            owner,
+            local: LocalKey([9; 16]),
+        };
+        let prepared = Executor::prepare_reclaim(&[record_key, gone], &ctx, &snapshot)
             .expect("an unclaimed escrowed record is taken back");
 
         let Job::Records(disposals) = &prepared.job else {
-            panic!("a settlement is a records job: {:?}", prepared.job);
+            panic!("a reclaim is a records job: {:?}", prepared.job);
         };
-        assert_eq!(
-            disposals,
-            &[Disposal {
-                record: record_key,
-                disposition: Disposition::Reclaim,
-            }],
+        assert_eq!(disposals, &[Disposal { record: record_key }]);
+        assert!(
+            Executor::prepare_reclaim(&[gone], &ctx, &snapshot).is_err(),
+            "a reclaim with nothing left to take back is refused",
         );
         let declared: Vec<Effect> = prepared.declaration.set.iter().collect();
         assert_eq!(declared.len(), 2, "{declared:?}");
