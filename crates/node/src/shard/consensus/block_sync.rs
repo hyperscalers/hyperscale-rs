@@ -797,6 +797,7 @@ mod tests {
                     committee_anchor: WeightedTimestamp::from_millis(500),
                 },
                 reach: Capped::empty(),
+                escrowed: Capped::empty(),
             }],
         )
     }

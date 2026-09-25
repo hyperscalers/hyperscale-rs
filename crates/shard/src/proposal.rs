@@ -840,6 +840,7 @@ mod tests {
                 [0x00; 31],
                 AddressClass::Principal,
             ))]),
+            escrowed: Capped::empty(),
         }
     }
 

@@ -18,8 +18,8 @@ use hyperscale_jmt::{
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass, Anchor,
-    BlockHeight, CommittedAt, Deadline, Hash, LocalKey, MAX_ARTIFACT_BYTES, MAX_ENVELOPE_BYTES,
-    MAX_HELD_VALUE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES,
+    BlockHeight, CommittedAt, Deadline, ESCROWED_RECORD_BYTES, Hash, LocalKey, MAX_ARTIFACT_BYTES,
+    MAX_ENVELOPE_BYTES, MAX_HELD_VALUE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, ROUTE_PREFIX_BYTES,
     RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
     STATE_CLAIMS_HEADROOM, SchemeId, ShardId, StateClaim, StateRoot, Stated, SubstateKey,
@@ -116,6 +116,7 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
                 .collect(),
         )
         .expect("a reach written out in a test"),
+        escrowed: Capped::empty(),
     }
 }
 
@@ -126,12 +127,24 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
 /// fixed half into the reach cannot be absorbed by slack in the other.
 #[test]
 fn a_names_weight_bounds_its_encoding() {
-    for routes in [0, 1, 2, 6, 64, 512] {
-        let name = name(1, routes);
+    for (routes, records) in [(0, 0), (1, 1), (2, 2), (6, 0), (64, 128), (512, 128)] {
+        let name = UnsettledTx {
+            escrowed: Capped::new(
+                (0..records)
+                    .map(|at| SubstateKey {
+                        owner: Address::new([0xFF; 31], AddressClass::Component),
+                        local: LocalKey(u128::MAX.wrapping_sub(at).to_be_bytes()),
+                    })
+                    .collect(),
+            )
+            .expect("a list under the cap"),
+            ..name(1, routes)
+        };
         let encoded = hbor_to_vec(&name).expect("a name encodes");
         assert!(
             encoded.len() <= name.wire_weight(),
-            "a name reaching {routes} routes encodes to {} bytes, over the {} its weight claims",
+            "a name reaching {routes} routes with {records} records encodes to {} bytes, over the \
+             {} its weight claims",
             encoded.len(),
             name.wire_weight(),
         );
@@ -145,6 +158,16 @@ fn a_names_weight_bounds_its_encoding() {
         name(1, 4).wire_weight() - name(1, 3).wire_weight(),
         ROUTE_PREFIX_BYTES,
         "and one route more costs one route",
+    );
+    assert_eq!(
+        UnsettledTx {
+            escrowed: Capped::from_array([key(2)]),
+            ..name(1, 0)
+        }
+        .wire_weight()
+            - name(1, 0).wire_weight(),
+        ESCROWED_RECORD_BYTES,
+        "and one escrowed record costs one key",
     );
 }
 

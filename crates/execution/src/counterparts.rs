@@ -1978,6 +1978,7 @@ mod tests {
                     .collect(),
             )
             .expect("a reach written out in a test"),
+            escrowed: Capped::empty(),
         }
     }
 

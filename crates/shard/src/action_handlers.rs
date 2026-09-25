@@ -864,12 +864,14 @@ where
                 // the terms an unheld body already sets.
                 let at =
                     committed_windows.get(&windows.epoch_for(entry.committed.committee_anchor))?;
+                let classified =
+                    Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &at.trie);
                 let restated = committed_at(entry)?
                     && UnsettledTx::for_transaction(
                         tx,
                         entry.committed,
-                        Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &at.trie)
-                            .local_price(tx, ctx.shard, &at.prices),
+                        classified.local_price(tx, ctx.shard, &at.prices),
+                        classified.escrowed_records(ctx.shard),
                         &at.prices,
                     ) == *entry;
                 Some(restated)
@@ -1859,6 +1861,7 @@ mod tests {
                 committee_anchor: WeightedTimestamp::from_millis(committee_anchor),
             },
             reach: Capped::empty(),
+            escrowed: Capped::empty(),
         }
     }
 

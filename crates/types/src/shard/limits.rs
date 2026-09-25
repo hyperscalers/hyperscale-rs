@@ -334,6 +334,10 @@ pub const ABANDONMENT_RECORD_BYTES: usize = 32;
 /// Bytes one [`UnsettledTx`](crate::UnsettledTx) costs before its reach.
 pub const UNSETTLED_TX_BYTES: usize = 160;
 
+/// Bytes one escrowed record of an [`UnsettledTx`](crate::UnsettledTx)
+/// costs: its key.
+pub const ESCROWED_RECORD_BYTES: usize = 48;
+
 /// Bytes one [`UnclaimedCrossing`](crate::UnclaimedCrossing) costs.
 pub const UNCLAIMED_CROSSING_BYTES: usize = 112;
 

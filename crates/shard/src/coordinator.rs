@@ -13131,6 +13131,7 @@ mod tests {
                 committee_anchor: WeightedTimestamp::ZERO,
             },
             reach: Capped::from_array([route(0xAA)]),
+            escrowed: Capped::empty(),
         }
     }
 

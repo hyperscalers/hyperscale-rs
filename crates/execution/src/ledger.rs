@@ -808,6 +808,7 @@ impl Ledger {
                     tx,
                     committed,
                     classified.local_price(tx, self.local, prices),
+                    classified.escrowed_records(self.local),
                     prices,
                 ),
                 certified: Certified::No,
@@ -1999,6 +2000,7 @@ mod tests {
             charge: charge(tx),
             committed: committed_at(tx),
             reach: tx.routing().all_routes(),
+            escrowed: Capped::empty(),
         }
     }
 
@@ -2013,6 +2015,7 @@ mod tests {
             tx,
             committed_at(tx),
             tx.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .charge

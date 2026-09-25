@@ -1364,6 +1364,7 @@ pub mod tests {
                 committee_anchor: WeightedTimestamp::ZERO,
             },
             reach: Capped::from_array([route(0x00), route(0xC0)]),
+            escrowed: Capped::empty(),
         }
     }
 

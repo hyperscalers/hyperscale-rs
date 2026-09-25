@@ -37,13 +37,13 @@
 
 use hyperscale_hbor::{Capped, Hbor};
 use hyperscale_vm_effects::{CrossingCell, Terms};
-use hyperscale_vm_types::Quanta;
+use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Quanta};
 
 use crate::{
-    ABANDONMENT_RECORD_BYTES, BlockHeight, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
-    MAX_VALIDITY_RANGE, PriceTable, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie,
-    SubstateKey, Transaction, TxHash, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES,
-    WeightedTimestamp,
+    ABANDONMENT_RECORD_BYTES, BlockHeight, Deadline, ESCROWED_RECORD_BYTES, MAX_PREFIXES_PER_TX,
+    MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, PriceTable, ROUTE_PREFIX_BYTES, RoutePrefix,
+    ShardId, ShardTrie, SubstateKey, Transaction, TxHash, UNCLAIMED_CROSSING_BYTES,
+    UNSETTLED_TX_BYTES, WeightedTimestamp,
 };
 
 /// Where a chain committed a transaction: the block, the anchor it was
@@ -129,6 +129,14 @@ pub struct UnsettledTx {
     /// Routes rather than addresses, because placement is the only
     /// question asked of them and it reads no further than this.
     pub reach: Capped<Vec<RoutePrefix>, MAX_PREFIXES_PER_TX>,
+    /// The escrowed records the transaction issued on the committing
+    /// shard, ascending: what a departure takes back there.
+    ///
+    /// Stated for the reason the reach is: a replica holding no entry
+    /// composes the departure's reclaim from the record alone. Read off
+    /// the classification the committing block froze, so a voter holding
+    /// the transaction checks it as it checks the charge.
+    pub escrowed: Capped<Vec<SubstateKey>, MAX_CROSSINGS_PER_TX>,
 }
 
 /// The window a name says committed it: what its figures were frozen
@@ -171,6 +179,7 @@ impl UnsettledTx {
         tx: &Transaction,
         committed: CommittedAt,
         charged: Quanta,
+        escrowed: Capped<Vec<SubstateKey>, MAX_CROSSINGS_PER_TX>,
         table: &PriceTable,
     ) -> Self {
         Self {
@@ -183,6 +192,7 @@ impl UnsettledTx {
             },
             committed,
             reach: tx.routing().all_routes(),
+            escrowed,
         }
     }
 
@@ -191,10 +201,13 @@ impl UnsettledTx {
     /// A bound rather than the encoding, so a composer can spend the
     /// section's budget as it fills it and a voter can check the same
     /// figure without re-encoding what it just decoded. Everything but
-    /// the reach is fixed width, and the reach is a route each.
+    /// the reach and the escrowed records is fixed width; the reach is a
+    /// route each and the records a key each.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
-        UNSETTLED_TX_BYTES + self.reach.len() * ROUTE_PREFIX_BYTES
+        UNSETTLED_TX_BYTES
+            + self.reach.len() * ROUTE_PREFIX_BYTES
+            + self.escrowed.len() * ESCROWED_RECORD_BYTES
     }
 
     /// Whether `shard`, leaving at `cut`, was party to this transaction
@@ -611,6 +624,7 @@ mod tests {
                 [seed; 31],
                 AddressClass::Component,
             ))]),
+            escrowed: Capped::empty(),
         }
     }
 
@@ -622,7 +636,8 @@ mod tests {
     /// the record every other builder would have produced.
     /// A holder checks every figure: the same entry is exact, and one
     /// naming another vault, another amount, another reservation,
-    /// another deadline or another commit is wrong.
+    /// another deadline, another commit, or another set of escrowed
+    /// records is wrong.
     #[test]
     fn a_holder_checks_every_figure() {
         let held = |hash: TxHash| (hash == tx(1).tx_hash).then(|| tx(1));
@@ -689,6 +704,27 @@ mod tests {
                 ..tx(1)
             }),
             wrong,
+        );
+        let record = |seed: u8| SubstateKey {
+            owner: Address::new([seed; 31], AddressClass::Component),
+            local: LocalKey([seed; 16]),
+        };
+        let holding = |escrowed: &[SubstateKey]| UnsettledTx {
+            escrowed: Capped::new(escrowed.to_vec()).expect("a list under the cap"),
+            ..tx(1)
+        };
+        let held = holding(&[record(1), record(2)]);
+        let restated = |entry: UnsettledTx| {
+            Resolutions::of([entry], |entry| {
+                (entry.tx_hash == held.tx_hash).then(|| held == *entry)
+            })
+        };
+        assert_eq!(restated(held.clone()), Resolutions::Exact);
+        assert_eq!(restated(holding(&[record(1)])), wrong, "a record missing");
+        assert_eq!(
+            restated(holding(&[record(1), record(2), record(3)])),
+            wrong,
+            "a record added",
         );
     }
 

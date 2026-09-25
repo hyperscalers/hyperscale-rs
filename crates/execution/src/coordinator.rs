@@ -8656,6 +8656,7 @@ mod tests {
                     &transaction,
                     test_committed(),
                     transaction.price(&PriceTable::GENESIS),
+                    Capped::empty(),
                     &PriceTable::GENESIS,
                 )],
             )]);
@@ -9139,6 +9140,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9215,6 +9217,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -9350,6 +9353,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9449,6 +9453,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9585,6 +9590,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -9700,6 +9706,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9785,6 +9792,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9896,6 +9904,7 @@ mod tests {
             transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -9917,6 +9926,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9991,6 +10001,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -10249,6 +10260,7 @@ mod tests {
                     &transaction,
                     test_committed(),
                     transaction.price(&PriceTable::GENESIS),
+                    Capped::empty(),
                     &PriceTable::GENESIS,
                 )],
             )],
@@ -10386,6 +10398,7 @@ mod tests {
                     &transaction,
                     test_committed(),
                     transaction.price(&PriceTable::GENESIS),
+                    Capped::empty(),
                     &PriceTable::GENESIS,
                 )],
             )],
@@ -10468,6 +10481,7 @@ mod tests {
                     &transaction,
                     test_committed(),
                     transaction.price(&PriceTable::GENESIS),
+                    Capped::empty(),
                     &PriceTable::GENESIS,
                 )],
             )],
@@ -11134,6 +11148,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let claim = core_claim(&leg_classified());
@@ -11825,6 +11840,7 @@ mod tests {
                     },
                     committed: test_committed(),
                     reach: Capped::empty(),
+                    escrowed: Capped::empty(),
                 }],
             )]);
     }
@@ -12506,6 +12522,7 @@ mod tests {
             transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline

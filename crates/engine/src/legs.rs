@@ -25,6 +25,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
     Address, EscrowedValue, Role, ShardId, ShardTrie, StateClaim, SubstateKey, Transaction, TxHash,
     WeightedTimestamp,
@@ -34,7 +35,9 @@ use hyperscale_vm_effects::{
     running_at, star_at,
 };
 use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
-use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
+use hyperscale_vm_types::{
+    DeclaredWork, LegRole, LegShape, MAX_CROSSINGS_PER_TX, PriceTable, ProtocolHasher, Quanta,
+};
 
 use crate::sharding::TrieShardResolver;
 
@@ -363,6 +366,26 @@ impl Classified {
         self.edges()
             .iter()
             .map(|edge| (edge, self.home(edge.consumer)))
+    }
+
+    /// The escrowed records `local` issues, ascending: what a departure
+    /// of the transaction's consumers takes back there.
+    ///
+    /// # Panics
+    ///
+    /// Never: a star carries at most [`MAX_CROSSINGS_PER_TX`] edges.
+    #[must_use]
+    pub fn escrowed_records(
+        &self,
+        local: ShardId,
+    ) -> Capped<Vec<SubstateKey>, MAX_CROSSINGS_PER_TX> {
+        let records: BTreeSet<SubstateKey> = self
+            .edges()
+            .iter()
+            .filter(|edge| edge.from == local && edge.crossing.kind == Kind::Escrowed)
+            .map(|edge| edge.crossing.id.record_key(&ProtocolHasher))
+            .collect();
+        Capped::new(records.into_iter().collect()).expect("a star's edges are capped")
     }
 
     /// The edges `local` consumes and may refuse: the escrowed ones,
@@ -1232,6 +1255,27 @@ mod tests {
         );
         assert!(recipient.judges.covers(owner(0x22, true)));
         assert!(!recipient.judges.covers(owner(0x11, false)));
+    }
+
+    /// A shard's escrowed records are the escrowed edges it issues, and
+    /// never an owed one: a transfer's crossing is owed and names none,
+    /// a swap's withdraw into the venue is escrowed and names its record.
+    #[test]
+    fn escrowed_records_are_the_escrowed_edges_a_shard_issues() {
+        assert!(frozen(&transfer()).escrowed_records(low()).is_empty());
+        let swap = frozen(&swap());
+        let escrowed: Vec<SubstateKey> = swap
+            .edges()
+            .iter()
+            .filter(|edge| edge.from == low() && edge.crossing.kind == Kind::Escrowed)
+            .map(|edge| edge.crossing.id.record_key(&ProtocolHasher))
+            .collect();
+        assert!(!escrowed.is_empty(), "the swap escrows into its venue");
+        assert_eq!(swap.escrowed_records(low()).to_vec(), escrowed);
+        assert!(
+            swap.escrowed_records(high()).is_empty(),
+            "the venue issues nothing escrowed"
+        );
     }
 
     /// Every departure a plan files states the validity end the plan
