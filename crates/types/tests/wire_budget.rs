@@ -23,8 +23,8 @@ use hyperscale_types::{
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, ROUTE_PREFIX_BYTES,
     RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
     STATE_CLAIMS_HEADROOM, SchemeId, ShardId, StateClaim, StateRoot, Stated, SubstateKey,
-    TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp,
-    evidence_admits_block, shard_prefix_path,
+    TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnclaimedCrossing, UnsettledTx,
+    WeightedTimestamp, evidence_admits_block, shard_prefix_path,
 };
 
 type Jmt = Tree<Blake3Hasher, 1>;
@@ -173,6 +173,33 @@ fn a_records_weight_bounds_its_encoding() {
     let empty = AbandonmentRecord::new(deep, WeightedTimestamp::ZERO, []);
     assert_eq!(empty.wire_weight(), ABANDONMENT_RECORD_BYTES);
     assert!(hbor_to_vec(&empty).expect("encodes").len() <= ABANDONMENT_RECORD_BYTES);
+
+    // A crossing named off its leaf costs its fixed width, at the widest
+    // values each term encodes to.
+    for crossings in [1usize, 2, 64] {
+        let record = AbandonmentRecord::new(
+            deep,
+            WeightedTimestamp::from_millis(u64::MAX),
+            (0..crossings).map(|at| name(u8::try_from(at % 256).expect("masked"), 64)),
+        )
+        .with_unclaimed((0..crossings).map(|at| UnclaimedCrossing {
+            record: SubstateKey {
+                owner: Address::new([0xFF; 31], AddressClass::Component),
+                local: LocalKey(u128::MAX.wrapping_sub(at as u128).to_be_bytes()),
+            },
+            tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+            consumer: RoutePrefix::of(Address::new([0xFF; 31], AddressClass::Component)),
+            validity_end: WeightedTimestamp::from_millis(u64::MAX),
+        }));
+        let encoded = hbor_to_vec(&record).expect("a record encodes");
+        assert!(
+            encoded.len() <= record.wire_weight(),
+            "a record naming {crossings} crossings encodes to {} bytes, over the {} its weight \
+             claims",
+            encoded.len(),
+            record.wire_weight(),
+        );
+    }
 }
 
 /// A state tree of `leaves` cells for `shard`, spread across as many

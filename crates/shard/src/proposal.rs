@@ -426,8 +426,9 @@ pub fn select_finalizations(
 /// Select the boundary records for inclusion: each trimmed to the names
 /// [`RecordsSection::name_stands`] admits — a name a finalization in
 /// the block resolves, or one the chain already resolved, is refused by
-/// every voter — with an emptied record dropped rather than offered,
-/// then what [`RecordsSection`] admits in canonical order.
+/// every voter — and to the crossings the departed shard was the one to
+/// take, with an emptied record dropped rather than offered, then what
+/// [`RecordsSection`] admits in canonical order.
 ///
 /// A departure's evidence stops answering at the departed shard's
 /// terminal-evidence expiry, read at the block's anchor. The composing
@@ -460,8 +461,17 @@ pub fn select_abandonment_records(
                 })
                 .cloned()
                 .collect();
-            (!kept.is_empty())
-                .then(|| AbandonmentRecord::new(record.shard(), record.terminal_wt(), kept))
+            let unclaimed = record.unclaimed().iter().copied().filter(|crossing| {
+                crossing.party(
+                    ctx.local_shard,
+                    record.shard(),
+                    record.terminal_wt(),
+                    &departures,
+                )
+            });
+            let kept = AbandonmentRecord::new(record.shard(), record.terminal_wt(), kept)
+                .with_unclaimed(unclaimed);
+            (kept.names() > 0).then_some(kept)
         })
         .collect();
     trimmed.sort_by_key(AbandonmentRecord::shard);

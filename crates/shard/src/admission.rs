@@ -608,6 +608,9 @@ impl RecordsSection<'_> {
     /// Whether every name a record carries is one the departed shard was
     /// party to, by [`UnsettledTx::party`]: it held one of the name's
     /// remote routes when the transaction committed, and left afterwards.
+    /// A crossing named off its leaf is held to
+    /// [`UnclaimedCrossing::party`](hyperscale_types::UnclaimedCrossing::party):
+    /// the departed shard was the only one that could have taken it.
     ///
     /// A stranger to the departed shard is absent from its settled set
     /// trivially, and abandoning it would charge a payer for a
@@ -630,6 +633,21 @@ impl RecordsSection<'_> {
                 return Err(format!(
                     "abandonment record names {}, which the departed shard {:?} was not party to",
                     entry.tx_hash,
+                    record.shard()
+                ));
+            }
+        }
+        for crossing in record.unclaimed() {
+            if !crossing.party(
+                ctx.local_shard,
+                record.shard(),
+                record.terminal_wt(),
+                &departures,
+            ) {
+                return Err(format!(
+                    "abandonment record names the crossing at {:?}, which the departed shard {:?} \
+                     was not the one to take",
+                    crossing.record,
                     record.shard()
                 ));
             }
@@ -709,7 +727,7 @@ impl<'f> Section for RecordsSection<'f> {
         for tx_hash in verdict.tx_hashes() {
             Self::name_stands(ctx, fold, tx_hash)?;
         }
-        let named = fold.named.saturating_add(verdict.unsettled().len());
+        let named = fold.named.saturating_add(verdict.names());
         if named > MAX_UNSETTLED_PER_BLOCK {
             return Err(format!(
                 "abandonment records name {named} transactions, over the drain's own bound of \
@@ -1027,6 +1045,17 @@ pub(crate) mod fixtures {
         survivors: &[ShardId],
         handoff_complete: Option<Epoch>,
     ) -> TopologySchedule {
+        departures_cut_at(DEPARTURE_CUT_MS, departed, survivors, handoff_complete)
+    }
+
+    /// [`departures`], with every window `cut_ms` long, so the cut falls
+    /// at `cut_ms`.
+    pub fn departures_cut_at(
+        cut_ms: u64,
+        departed: &[ShardId],
+        survivors: &[ShardId],
+        handoff_complete: Option<Epoch>,
+    ) -> TopologySchedule {
         let window = |shards: &[ShardId], boundaries: HashMap<ShardId, ShardAnchor>| {
             Arc::new(TopologySnapshot::from_explicit_committees(
                 NetworkDefinition::simulator(),
@@ -1050,7 +1079,7 @@ pub(crate) mod fixtures {
                         state_root: StateRoot::ZERO,
                         block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal")),
                         height: BlockHeight::new(9),
-                        weighted_timestamp: WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
+                        weighted_timestamp: WeightedTimestamp::from_millis(cut_ms),
                         witness_base: BeaconWitnessLeafCount::ZERO,
                         terminal_roots: None,
                         handoff_complete,
@@ -1059,11 +1088,8 @@ pub(crate) mod fixtures {
             })
             .collect();
         let after = window(survivors, boundaries);
-        let mut sched = TopologySchedule::new(
-            DEPARTURE_CUT_MS,
-            Epoch::new(0),
-            window(departed, HashMap::new()),
-        );
+        let mut sched =
+            TopologySchedule::new(cut_ms, Epoch::new(0), window(departed, HashMap::new()));
         for epoch in 1..=20u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&after));
         }

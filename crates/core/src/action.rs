@@ -797,6 +797,10 @@ pub enum Action {
         /// parent-anchored ones are re-read from the verifier's own
         /// parent view.
         state_claims: Vec<StateClaim>,
+        /// The block's abandonment records, whose crossings named off
+        /// this shard's leaves are read from the verifier's own parent
+        /// view.
+        abandonment_records: Vec<AbandonmentRecord>,
     },
 
     /// Verify a block's beacon-witness root + leaf count.

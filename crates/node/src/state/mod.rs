@@ -538,6 +538,7 @@ impl StateMachine for NodeStateMachine {
                     frontier: ready.frontier,
                     fence: ready.fence,
                     state_claims: ready.state_claims,
+                    abandonment_records: ready.abandonment_records,
                 });
             }
 

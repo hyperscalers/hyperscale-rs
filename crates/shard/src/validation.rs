@@ -494,13 +494,13 @@ pub mod tests {
         NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
         Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer,
         SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange,
-        Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-        state_claims_admit_block, test_utils,
+        Transaction, TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
+        WitnessSources, state_claims_admit_block, test_utils,
     };
 
     use super::*;
-    use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
+    use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures, departures_cut_at};
     use crate::admission::{Section, StateClaimsFold, StateClaimsSection};
     use crate::commit_dedup::CommitDedupIndex;
 
@@ -1432,6 +1432,58 @@ pub mod tests {
             let err = held_records(&block_with_verdicts(records, root)).unwrap_err();
             assert!(err.contains("repeats or precedes"), "{err}");
         }
+    }
+
+    /// A departure names a crossing off this shard's leaf only where the
+    /// departed shard was the one to take it: it held the consumer's
+    /// route, and the transaction's deadline had passed by the cut. A
+    /// record may name such crossings and nothing else.
+    #[test]
+    fn a_crossing_named_off_its_leaf_is_held_to_its_party_rule() {
+        const CUT_MS: u64 = 60_000;
+        let (left, right) = ShardId::ROOT.children();
+        let (survivors_left, survivors_right) = (left.children(), right.children());
+        let schedule = departures_cut_at(
+            CUT_MS,
+            &[left, right],
+            &[
+                survivors_left.0,
+                survivors_left.1,
+                survivors_right.0,
+                survivors_right.1,
+            ],
+            None,
+        );
+        let mut against = Against::schedule(topology_snapshot(), schedule);
+        against.anchor = WeightedTimestamp::from_millis(CUT_MS + 500);
+        against.local_shard = survivors_right.0;
+
+        let crossing = |consumer: u8, validity_end: u64| UnclaimedCrossing {
+            record: SubstateKey {
+                owner: Address::new([0x80; 31], AddressClass::Component),
+                local: LocalKey([1; 16]),
+            },
+            tx: TxHash::from(Hash::from_bytes(&[7; 32])),
+            consumer: RoutePrefix::of(Address::new([consumer; 31], AddressClass::Component)),
+            validity_end: WeightedTimestamp::from_millis(validity_end),
+        };
+        let held = |crossing: UnclaimedCrossing| {
+            let records = vec![
+                AbandonmentRecord::new(left, WeightedTimestamp::from_millis(CUT_MS), [])
+                    .with_unclaimed([crossing]),
+            ];
+            let root = AbandonmentRoot::over(&records);
+            admit(&against, &block_with_verdicts(records, root))
+        };
+
+        assert!(
+            held(crossing(0x00, 10_000)).is_ok(),
+            "the departed half held the consumer's route past the deadline",
+        );
+        let err = held(crossing(0x00, 50_000)).unwrap_err();
+        assert!(err.contains("was not the one to take"), "{err}");
+        let err = held(crossing(0xC0, 10_000)).unwrap_err();
+        assert!(err.contains("was not the one to take"), "{err}");
     }
 
     /// The budget is one across every record a block carries, and it is

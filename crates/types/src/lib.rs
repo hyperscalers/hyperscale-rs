@@ -146,7 +146,8 @@ pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
 pub use shard::abandonment::{
-    AbandonmentRecord, AbortCharge, CommitWindow, CommittedAt, Resolutions, UnsettledTx,
+    AbandonmentRecord, AbortCharge, CommitWindow, CommittedAt, Resolutions, UnclaimedCrossing,
+    UnsettledTx,
 };
 pub use shard::anchor::Anchor;
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
@@ -177,9 +178,9 @@ pub use shard::limits::{
     MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
     SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TX_CAPS, UNSETTLED_TX_BYTES,
-    budget_admits_block, caps_admit_transaction, drain_admits_block, evidence_admits_block,
-    state_claims_admit_block, sweep_admits_block,
+    STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TX_CAPS, UNCLAIMED_CROSSING_BYTES,
+    UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction, drain_admits_block,
+    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad};
 pub use shard::manifest::{BlockManifest, BlockMetadata};

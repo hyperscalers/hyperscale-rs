@@ -334,6 +334,9 @@ pub const ABANDONMENT_RECORD_BYTES: usize = 32;
 /// Bytes one [`UnsettledTx`](crate::UnsettledTx) costs before its reach.
 pub const UNSETTLED_TX_BYTES: usize = 160;
 
+/// Bytes one [`UnclaimedCrossing`](crate::UnclaimedCrossing) costs.
+pub const UNCLAIMED_CROSSING_BYTES: usize = 112;
+
 /// Bytes one [`RoutePrefix`](crate::RoutePrefix) of a name's reach
 /// costs.
 pub const ROUTE_PREFIX_BYTES: usize = size_of::<RoutePrefix>();

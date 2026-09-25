@@ -11,9 +11,10 @@
 use hyperscale_storage::Substates;
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    Anchor, Inclusion, MAX_PROOFS_PER_QUERY, MerkleInclusionProof, ShardId, StateClaim, SubstateKey,
+    AbandonmentRecord, Anchor, Inclusion, MAX_PROOFS_PER_QUERY, MerkleInclusionProof, ShardId,
+    StateClaim, SubstateKey, UnclaimedCrossing,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
+use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher};
 
 /// What `state` says of `key`: the presence hashing to its value, or
 /// its absence. Never the value itself, so a parent-anchored reading has
@@ -80,6 +81,66 @@ pub fn disagreeing_parent_reading(
         .map(|(key, _)| *key)
 }
 
+/// Whether `state`, the parent's, holds the record `crossing` names, as
+/// the name restates it.
+///
+/// A departure names a crossing off this shard's own leaf, so the
+/// record is read here, at the parent every voter holds, and the name
+/// carries no proof.
+#[must_use]
+pub fn unclaimed_stands(crossing: &UnclaimedCrossing, state: &(impl Substates + ?Sized)) -> bool {
+    state
+        .cell(crossing.record)
+        .and_then(
+            |bytes| match CrossingLeaf::read(&ProtocolHasher, crossing.record, &bytes)? {
+                CrossingLeaf::Record { cell, .. } => Some(cell),
+                CrossingLeaf::Answer { .. } => None,
+            },
+        )
+        .is_some_and(|cell| crossing.restates(&cell))
+}
+
+/// The first crossing among `records` whose record `state`, the
+/// parent's, does not hold as named.
+#[must_use]
+pub fn misstated_unclaimed(
+    records: &[AbandonmentRecord],
+    state: &(impl Substates + ?Sized),
+) -> Option<SubstateKey> {
+    records
+        .iter()
+        .flat_map(AbandonmentRecord::unclaimed)
+        .find(|crossing| !unclaimed_stands(crossing, state))
+        .map(|crossing| crossing.record)
+}
+
+/// `records` keeping only the crossings `state`, the parent's, holds as
+/// named, and dropping a record left naming nothing.
+#[must_use]
+pub fn keep_standing_unclaimed(
+    records: Vec<AbandonmentRecord>,
+    state: &(impl Substates + ?Sized),
+) -> Vec<AbandonmentRecord> {
+    records
+        .into_iter()
+        .filter_map(|record| {
+            let standing: Vec<UnclaimedCrossing> = record
+                .unclaimed()
+                .iter()
+                .filter(|crossing| unclaimed_stands(crossing, state))
+                .copied()
+                .collect();
+            let kept = AbandonmentRecord::new(
+                record.shard(),
+                record.terminal_wt(),
+                record.unsettled().iter().cloned(),
+            )
+            .with_unclaimed(standing);
+            (kept.names() > 0).then_some(kept)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -87,7 +148,8 @@ mod tests {
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CollectionId, StateRoot, WeightedTimestamp,
     };
-    use hyperscale_vm_effects::{Hash32, IntentHash};
+    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash, Terms, TxHash};
+    use hyperscale_vm_types::ResourceAddr;
 
     use super::*;
 
@@ -168,5 +230,58 @@ mod tests {
             None,
             "a claim on another shard is not a parent reading",
         );
+    }
+
+    /// A crossing named off a leaf stands where the parent holds its
+    /// record as named: escrowed, issued by the named transaction, with
+    /// the named consumer and validity end. An absent, misstated or
+    /// owed record is the one the voter refuses and the proposer drops.
+    #[test]
+    fn a_crossing_named_off_a_leaf_is_read_at_the_parent() {
+        let id = crossing(0x41);
+        let record = id.record_key(&ProtocolHasher);
+        let cell = id.cell(
+            TxHash(Hash32([9; 32])),
+            ResourceAddr::new([0xE1; 31]),
+            100,
+            5_000,
+            Terms::Escrowed { credit: record },
+        );
+        let state = Cells(BTreeMap::from([(record, cell.to_bytes())]));
+        let named = UnclaimedCrossing::of(record, &cell);
+        let departed = ShardId::leaf(1, 0);
+        let naming = |crossing: UnclaimedCrossing| {
+            AbandonmentRecord::new(departed, WeightedTimestamp::from_millis(9_000), [])
+                .with_unclaimed([crossing])
+        };
+
+        assert!(unclaimed_stands(&named, &state));
+        assert_eq!(misstated_unclaimed(&[naming(named)], &state), None);
+        assert_eq!(
+            keep_standing_unclaimed(vec![naming(named)], &state),
+            vec![naming(named)]
+        );
+
+        let misstated = UnclaimedCrossing {
+            validity_end: WeightedTimestamp::from_millis(5_001),
+            ..named
+        };
+        assert_eq!(
+            misstated_unclaimed(&[naming(misstated)], &state),
+            Some(record)
+        );
+        assert!(keep_standing_unclaimed(vec![naming(misstated)], &state).is_empty());
+
+        let empty = Cells(BTreeMap::new());
+        assert!(!unclaimed_stands(&named, &empty), "an absent record");
+        let owed = Cells(BTreeMap::from([(
+            record,
+            CrossingCell {
+                terms: Terms::Owed,
+                ..cell
+            }
+            .to_bytes(),
+        )]));
+        assert!(!unclaimed_stands(&named, &owed), "an owed record");
     }
 }

@@ -36,12 +36,14 @@
 //! verdict as its peers.
 
 use hyperscale_hbor::{Capped, Hbor};
+use hyperscale_vm_effects::{CrossingCell, Terms};
 use hyperscale_vm_types::Quanta;
 
 use crate::{
     ABANDONMENT_RECORD_BYTES, BlockHeight, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
-    PriceTable, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
-    TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
+    MAX_VALIDITY_RANGE, PriceTable, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie,
+    SubstateKey, Transaction, TxHash, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES,
+    WeightedTimestamp,
 };
 
 /// Where a chain committed a transaction: the block, the anchor it was
@@ -236,16 +238,98 @@ impl UnsettledTx {
             && self.reach.iter().any(|&route| {
                 !ShardTrie::shard_owns_route(local, route)
                     && ShardTrie::shard_owns_route(shard, route)
-                    && departures
-                        .iter()
-                        .filter(|(departed, departed_at)| {
-                            ShardTrie::shard_owns_route(*departed, route)
-                                && *departed_at > committed
-                        })
-                        .map(|(_, departed_at)| *departed_at)
-                        .min()
-                        .is_none_or(|first| first >= cut)
+                    && first_to_leave(route, committed, departures).is_none_or(|first| first >= cut)
             })
+    }
+}
+
+/// The earliest cut among `departures` over `route` after `after`: the
+/// shard that held the route from `after` on, until it left.
+fn first_to_leave(
+    route: RoutePrefix,
+    after: WeightedTimestamp,
+    departures: &[(ShardId, WeightedTimestamp)],
+) -> Option<WeightedTimestamp> {
+    departures
+        .iter()
+        .filter(|(departed, departed_at)| {
+            ShardTrie::shard_owns_route(*departed, route) && *departed_at > after
+        })
+        .map(|(_, departed_at)| *departed_at)
+        .min()
+}
+
+/// A crossing this shard issued whose consumer's shard departed without
+/// taking it, named off the record leaf rather than off a ledger entry.
+///
+/// A leg entry lives one [`CLAIM_WINDOW`](crate::CLAIM_WINDOW) past its
+/// deadline, and a departure can be cut any number of epochs later, so a
+/// name read off entries misses a crossing whose entry has aged out. The
+/// leaf is still here and states what the rule needs: the consumer's
+/// target and the issuing transaction's validity end, which the name
+/// restates so admission judges the schedule side without the cell and
+/// the voter's parent view checks the restatement.
+///
+/// It resolves nothing and reserves nothing: the leg finalized and
+/// charged long ago. It licenses the record's reclaim alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hbor)]
+pub struct UnclaimedCrossing {
+    /// The record, under this shard's prefix.
+    pub record: SubstateKey,
+    /// The transaction that issued it, which the departed shard's
+    /// settled set must not name.
+    pub tx: TxHash,
+    /// The route of the consumer's target, which the departed shard held.
+    pub consumer: RoutePrefix,
+    /// The issuing transaction's validity end, as the record states it.
+    pub validity_end: WeightedTimestamp,
+}
+
+impl UnclaimedCrossing {
+    /// The name the record at `record` states.
+    #[must_use]
+    pub const fn of(record: SubstateKey, cell: &CrossingCell) -> Self {
+        Self {
+            record,
+            tx: cell.tx,
+            consumer: RoutePrefix::of(cell.consumer),
+            validity_end: WeightedTimestamp::from_millis(cell.validity_end_ms),
+        }
+    }
+
+    /// Whether `cell`, read at this name's record, is an escrowed record
+    /// stating exactly what the name restates.
+    #[must_use]
+    pub fn restates(&self, cell: &CrossingCell) -> bool {
+        matches!(cell.terms, Terms::Escrowed { .. }) && Self::of(self.record, cell) == *self
+    }
+
+    /// Whether `shard`, leaving at `cut`, was the only shard that could
+    /// have taken this crossing, as seen from `local`.
+    ///
+    /// The consumer's route is remote and `shard` held it; the
+    /// transaction's deadline had passed by the cut, so nothing could
+    /// take the crossing after it; and `shard` is the first departure
+    /// over the route after the transaction's validity could have
+    /// opened. That instant bounds from below the producer's commit and
+    /// so the record's write, the date [`UnsettledTx::party`] reads off
+    /// the commit. A predecessor leaving inside the transaction's life
+    /// could have taken the crossing and handed its answer on, and its
+    /// settled set, not `shard`'s, would say so.
+    #[must_use]
+    pub fn party(
+        &self,
+        local: ShardId,
+        shard: ShardId,
+        cut: WeightedTimestamp,
+        departures: &[(ShardId, WeightedTimestamp)],
+    ) -> bool {
+        let route = self.consumer;
+        let opened = self.validity_end.minus(MAX_VALIDITY_RANGE);
+        Deadline::of(self.validity_end).at() <= cut
+            && !ShardTrie::shard_owns_route(local, route)
+            && ShardTrie::shard_owns_route(shard, route)
+            && first_to_leave(route, opened, departures) == Some(cut)
     }
 }
 
@@ -370,6 +454,11 @@ pub struct AbandonmentRecord {
     /// Sorted by hash and duplicate-free on it, so the record has one form
     /// and a validator checking it walks the same order it would build.
     unsettled: Capped<Vec<UnsettledTx>, MAX_UNSETTLED_PER_BLOCK>,
+    /// Crossings this shard issued that `shard` never took, named off
+    /// their record leaves where no entry names their transaction.
+    ///
+    /// Sorted by record key and duplicate-free on it.
+    unclaimed: Capped<Vec<UnclaimedCrossing>, MAX_UNSETTLED_PER_BLOCK>,
 }
 
 impl AbandonmentRecord {
@@ -392,6 +481,19 @@ impl AbandonmentRecord {
             shard,
             terminal_wt,
             unsettled: Capped::new(unsettled).unwrap_or_default(),
+            unclaimed: Capped::empty(),
+        }
+    }
+
+    /// This record naming `unclaimed` as well, in the canonical order.
+    #[must_use]
+    pub fn with_unclaimed(self, unclaimed: impl IntoIterator<Item = UnclaimedCrossing>) -> Self {
+        let mut unclaimed: Vec<UnclaimedCrossing> = unclaimed.into_iter().collect();
+        unclaimed.sort_unstable_by_key(|crossing| crossing.record);
+        unclaimed.dedup_by_key(|crossing| crossing.record);
+        Self {
+            unclaimed: Capped::new(unclaimed).unwrap_or_default(),
+            ..self
         }
     }
 
@@ -423,6 +525,7 @@ impl AbandonmentRecord {
                 .iter()
                 .map(UnsettledTx::wire_weight)
                 .sum::<usize>()
+            + self.unclaimed.len() * UNCLAIMED_CROSSING_BYTES
     }
 
     /// The transactions it can never settle, each with what abandoning
@@ -432,13 +535,26 @@ impl AbandonmentRecord {
         &self.unsettled
     }
 
-    /// Just the transactions named.
+    /// Just the transactions named unsettled.
     pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
         self.unsettled.iter().map(|entry| entry.tx_hash)
     }
 
-    /// Whether the record is in the one form it may take: sorted names
-    /// without repeats, and naming something.
+    /// The crossings named off their record leaves.
+    #[must_use]
+    pub fn unclaimed(&self) -> &[UnclaimedCrossing] {
+        &self.unclaimed
+    }
+
+    /// How many names the record carries between its two lists.
+    #[must_use]
+    pub fn names(&self) -> usize {
+        self.unsettled.len() + self.unclaimed.len()
+    }
+
+    /// Whether the record is in the one form it may take: each list
+    /// sorted without repeats, no crossing issued by a transaction the
+    /// record also names unsettled, and naming something.
     ///
     /// An empty record asserts nothing and would cost a block a leaf for
     /// it, so it is not well-formed rather than merely pointless. The
@@ -447,17 +563,29 @@ impl AbandonmentRecord {
     /// the block's own check applies.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        !self.unsettled.is_empty()
+        self.names() > 0
             && self
                 .unsettled
                 .windows(2)
                 .all(|pair| pair[0].tx_hash < pair[1].tx_hash)
+            && self
+                .unclaimed
+                .windows(2)
+                .all(|pair| pair[0].record < pair[1].record)
+            && self.unclaimed.iter().all(|crossing| {
+                self.unsettled
+                    .binary_search_by_key(&crossing.tx, |entry| entry.tx_hash)
+                    .is_err()
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use hyperscale_vm_effects::{Hash32, IntentHash};
+    use hyperscale_vm_types::ResourceAddr;
 
     use super::*;
     use crate::{Address, AddressClass, Hash, LocalKey};
@@ -621,6 +749,157 @@ mod tests {
         );
     }
 
+    fn unclaimed(seed: u8, consumer: Address, validity_end: u64) -> UnclaimedCrossing {
+        UnclaimedCrossing {
+            record: SubstateKey {
+                owner: Address::new([0x80 | seed; 31], AddressClass::Component),
+                local: LocalKey([seed; 16]),
+            },
+            tx: TxHash::from(Hash::from_bytes(&[seed; 32])),
+            consumer: RoutePrefix::of(consumer),
+            validity_end: WeightedTimestamp::from_millis(validity_end),
+        }
+    }
+
+    /// A departed shard is party to a crossing named off its leaf when it
+    /// held the consumer's route from the transaction's validity opening
+    /// to past its deadline, and was the first over that route to leave.
+    #[test]
+    fn an_unclaimed_crossing_is_dated_by_the_validity_end() {
+        let local = ShardId::leaf(1, 1);
+        let departed = ShardId::leaf(2, 0);
+        let predecessor = ShardId::leaf(1, 0);
+        let consumer = Address::new([0x00; 31], AddressClass::Component);
+        let validity_end = 1_000_000;
+        let crossing = unclaimed(1, consumer, validity_end);
+        let deadline = Deadline::of(crossing.validity_end).at();
+        let cut = deadline.plus(Duration::from_secs(600));
+
+        assert!(
+            crossing.party(local, departed, cut, &[(departed, cut)]),
+            "the one holder of the consumer's route, leaving past the deadline",
+        );
+        assert!(
+            crossing.party(local, departed, deadline, &[(departed, deadline)]),
+            "a cut at the deadline itself leaves nothing to take",
+        );
+        let early = deadline.minus(Duration::from_millis(1));
+        assert!(
+            !crossing.party(local, departed, early, &[(departed, early)]),
+            "a cut before the deadline leaves the crossing takeable by a successor",
+        );
+        assert!(
+            !crossing.party(local, local, cut, &[(local, cut)]),
+            "the consumer has to be somebody else's",
+        );
+        let stranger = ShardId::leaf(2, 1);
+        assert!(
+            !crossing.party(local, stranger, cut, &[(stranger, cut)]),
+            "a shard not holding the consumer's route took nothing",
+        );
+        let inside = crossing
+            .validity_end
+            .minus(MAX_VALIDITY_RANGE)
+            .plus(Duration::from_millis(1));
+        assert!(
+            !crossing.party(
+                local,
+                departed,
+                cut,
+                &[(predecessor, inside), (departed, cut)]
+            ),
+            "a predecessor leaving inside the transaction's life may have taken it",
+        );
+        let before = crossing.validity_end.minus(MAX_VALIDITY_RANGE);
+        assert!(
+            crossing.party(
+                local,
+                departed,
+                cut,
+                &[(predecessor, before), (departed, cut)]
+            ),
+            "one that left before the transaction could open took nothing",
+        );
+    }
+
+    /// A name restates an escrowed record's transaction, consumer and
+    /// validity end, and nothing else passes for it.
+    #[test]
+    fn an_unclaimed_crossing_restates_its_record() {
+        let record = SubstateKey {
+            owner: Address::new([0x81; 31], AddressClass::Component),
+            local: LocalKey([1; 16]),
+        };
+        let cell = CrossingCell {
+            resource: ResourceAddr::new([0xE1; 31]),
+            amount: 5,
+            intent: IntentHash(Hash32([3; 32])),
+            local: 0,
+            output: 0,
+            validity_end_ms: 9_000,
+            tx: TxHash::from(Hash::from_bytes(&[4; 32])),
+            consumer: Address::new([0x10; 31], AddressClass::Component),
+            terms: Terms::Escrowed { credit: record },
+        };
+        let name = UnclaimedCrossing::of(record, &cell);
+        assert!(name.restates(&cell));
+        for misstated in [
+            UnclaimedCrossing {
+                tx: TxHash::from(Hash::from_bytes(&[5; 32])),
+                ..name
+            },
+            UnclaimedCrossing {
+                validity_end: WeightedTimestamp::from_millis(9_001),
+                ..name
+            },
+            UnclaimedCrossing {
+                consumer: RoutePrefix::of(Address::new([0x90; 31], AddressClass::Component)),
+                ..name
+            },
+        ] {
+            assert!(!misstated.restates(&cell), "{misstated:?}");
+        }
+        let owed = CrossingCell {
+            terms: Terms::Owed,
+            ..cell
+        };
+        assert!(!name.restates(&owed), "nothing takes an owed crossing back");
+    }
+
+    /// A record may name crossings alone; its crossings are sorted by
+    /// record, and none may be issued by a transaction it names
+    /// unsettled.
+    #[test]
+    fn a_record_of_unclaimed_crossings_has_one_form() {
+        let consumer = Address::new([0x00; 31], AddressClass::Component);
+        let (one, two) = (unclaimed(1, consumer, 1), unclaimed(2, consumer, 1));
+        let alone = AbandonmentRecord::new(ShardId::ROOT, wt(), []).with_unclaimed([two, one, two]);
+        assert!(alone.is_well_formed());
+        assert_eq!(alone.unclaimed(), &[one, two]);
+        assert_eq!(alone.names(), 2);
+        assert_eq!(
+            alone.wire_weight(),
+            ABANDONMENT_RECORD_BYTES + 2 * UNCLAIMED_CROSSING_BYTES
+        );
+
+        let reversed = AbandonmentRecord {
+            unclaimed: Capped::from_array([two, one]),
+            ..alone
+        };
+        assert!(!reversed.is_well_formed());
+
+        let both = AbandonmentRecord::new(ShardId::ROOT, wt(), [tx(1)]).with_unclaimed([
+            UnclaimedCrossing {
+                tx: tx(1).tx_hash,
+                ..one
+            },
+        ]);
+        assert!(
+            !both.is_well_formed(),
+            "a transaction is named once, in one list",
+        );
+    }
+
     /// A validator that does not hold a transaction cannot say either
     /// way, which is a third answer and not a pass — and a misstatement
     /// elsewhere in the record answers over it.
@@ -705,6 +984,7 @@ mod tests {
             shard: ShardId::ROOT,
             terminal_wt: wt(),
             unsettled: Capped::from_array([tx(2), tx(1)]),
+            unclaimed: Capped::empty(),
         };
         assert!(!reversed.is_well_formed());
 
@@ -712,6 +992,7 @@ mod tests {
             shard: ShardId::ROOT,
             terminal_wt: wt(),
             unsettled: Capped::from_array([tx(1), tx(1)]),
+            unclaimed: Capped::empty(),
         };
         assert!(!repeating.is_well_formed());
     }

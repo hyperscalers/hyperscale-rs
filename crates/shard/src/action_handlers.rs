@@ -46,7 +46,9 @@ use hyperscale_types::{
     verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
-use crate::local_crossings::{disagreeing_parent_reading, parent_claims};
+use crate::local_crossings::{
+    disagreeing_parent_reading, keep_standing_unclaimed, misstated_unclaimed, parent_claims,
+};
 use crate::read_fence::{Dropped, drop_refused, written_by};
 
 /// Result of QC verification and assembly.
@@ -1032,6 +1034,7 @@ where
             frontier,
             fence,
             state_claims,
+            abandonment_records,
         } => {
             // Pre-flight: hash the receipts and compare to the QC'd
             // `local_receipt_root`. If they diverge, JMT recomputation
@@ -1153,6 +1156,23 @@ where
                     height = block_height.inner(),
                     ?key,
                     "Rejecting block whose parent-anchored reading disagrees with the parent state"
+                );
+                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                    block_hash,
+                    kind: VerificationKind::StateRoot,
+                    outcome: CheckOutcome::Refused,
+                });
+                return;
+            }
+            // A crossing a departure names off this shard's leaf carries
+            // no proof: its record is held to this replica's own parent
+            // view, present and as the name restates it.
+            if let Some(key) = misstated_unclaimed(&abandonment_records, &anchored) {
+                tracing::warn!(
+                    ?block_hash,
+                    height = block_height.inner(),
+                    ?key,
+                    "Rejecting block naming a crossing whose record the parent state does not hold"
                 );
                 ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
                     block_hash,
@@ -1367,6 +1387,10 @@ where
                 );
                 (claims, transactions, frontier)
             };
+            // A crossing named off a leaf the parent no longer holds as
+            // named would refuse the block at every voter.
+            let abandonment_records =
+                keep_standing_unclaimed(abandonment_records, &view.snapshot());
             // Drop transactions whose payer cannot cover its cumulative
             // reservation demand — the builder-side form of the voters'
             // reservation verification, reading the same

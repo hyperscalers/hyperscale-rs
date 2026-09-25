@@ -30,7 +30,9 @@ use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Capped;
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
-use hyperscale_shard::local_crossings::{disagreeing_parent_reading, parent_claims};
+use hyperscale_shard::local_crossings::{
+    disagreeing_parent_reading, misstated_unclaimed, parent_claims,
+};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
     ChainEntry, ChainWrites, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
@@ -1122,6 +1124,7 @@ impl ShardCoordinatorSim {
                 frontier: ready.frontier,
                 fence: ready.fence,
                 state_claims: ready.state_claims,
+                abandonment_records: ready.abandonment_records,
             });
         }
         if self.coordinators[to_idx].take_ready_proposal() {
@@ -1862,6 +1865,7 @@ impl ShardCoordinatorSim {
                 frontier,
                 fence: _,
                 state_claims,
+                abandonment_records,
             } => {
                 // Mirrors the production handler: receipt-root
                 // pre-flight first, then JMT prep on success.
@@ -1916,6 +1920,10 @@ impl ShardCoordinatorSim {
                     disagreeing_parent_reading(&state_claims, self.shard, &view.snapshot())
                         .is_none(),
                     "the sim's proposer reads its parent as its verifiers do",
+                );
+                assert!(
+                    misstated_unclaimed(&abandonment_records, &view.snapshot()).is_none(),
+                    "the sim's proposer names only the crossings its parent holds",
                 );
                 let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                     ParentAnchor {

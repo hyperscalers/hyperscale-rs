@@ -4507,8 +4507,8 @@ mod tests {
         MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate,
         RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
         ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
-        SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx,
-        ValidatorInfo, ValidatorSet, Window,
+        SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution, UnclaimedCrossing,
+        UnsettledTx, ValidatorInfo, ValidatorSet, Window,
     };
     use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
@@ -10266,6 +10266,80 @@ mod tests {
         assert!(
             state.counterparts.held.is_empty(),
             "and the record is taken once",
+        );
+    }
+
+    /// A departure names off the leaf a crossing no entry names, once the
+    /// departed shard's settled set is held and says it never settled
+    /// the transaction, and the block carrying the name composes the
+    /// reclaim; a replica that never held an entry composes the same.
+    /// A set naming the transaction offers nothing, and a record already
+    /// named is not offered again.
+    #[test]
+    fn a_departure_names_a_crossing_off_its_leaf_and_reclaims_it() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let validity_end_ms = 400_000;
+        let (record_key, _, cell) = held_record(0x6A, validity_end_ms);
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(record_key, cell));
+        let past = Window::LegEntry
+            .of(Deadline::of(WeightedTimestamp::from_millis(
+                validity_end_ms,
+            )))
+            .end
+            .plus(Duration::from_secs(1));
+        state.committed_ts = past;
+        let named = UnclaimedCrossing::of(record_key, &cell);
+
+        assert!(
+            state.offers().abandonment_records.is_empty(),
+            "no settled set held, nothing to answer for the departure",
+        );
+        state.counterparts.on_settled(
+            PEER,
+            SettledTxSet {
+                txs: BTreeSet::from([cell.tx]),
+                terminal_wt: past,
+            },
+        );
+        assert!(
+            state.offers().abandonment_records.is_empty(),
+            "a set naming the transaction says the departed shard may have taken it",
+        );
+        state.counterparts.on_settled(
+            PEER,
+            SettledTxSet {
+                txs: BTreeSet::new(),
+                terminal_wt: past,
+            },
+        );
+        let offered = state.offers().abandonment_records;
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].shard(), PEER);
+        assert!(offered[0].unsettled().is_empty());
+        assert_eq!(offered[0].unclaimed(), &[named]);
+
+        let actions = commit_recording(&mut state, &schedule, 1, past.as_millis(), offered);
+        let runs = actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => {
+                requests.first().map(|request| request.runs.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            matches!(&runs, Some(Runs::Reclaim { records, .. }) if records == &vec![record_key]),
+            "the departure takes the crossing back; dispatched {runs:?}",
+        );
+        assert!(
+            state.counterparts.held.is_empty(),
+            "and the record is taken once",
+        );
+        assert!(
+            state.offers().abandonment_records.is_empty(),
+            "nothing is left to name",
         );
     }
 

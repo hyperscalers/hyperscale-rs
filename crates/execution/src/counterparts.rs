@@ -23,15 +23,16 @@ use hyperscale_storage::CrossingLeaves;
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
-    EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed,
-    ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark, SettledTxSet, ShardId, ShardTrie,
-    Spoken, StateClaim, Stated, SubstateKey, TerminalEvidence, TopologySchedule,
-    TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, Verifiable, Verified,
+    Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK,
+    MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark,
+    SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, Stated, SubstateKey, TerminalEvidence,
+    TopologySchedule, TransactionDecision, TxHash, TxOutcome, TxResolution,
+    UNCLAIMED_CROSSING_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher,
+    Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher, Terms,
 };
 
 use crate::ledger::{Ledger, Question, Unanswerable};
@@ -68,26 +69,31 @@ impl Budget {
         self.names == 0 || self.bytes == 0
     }
 
-    /// Take as many of `unsettled` as the budget still affords, in the
-    /// order offered, and charge for them. What is left is dropped: a
-    /// name a record does not carry stays uncovered and is offered
-    /// again next block.
-    fn take(&mut self, unsettled: &mut Vec<UnsettledTx>) {
-        let mut taken = 0;
+    /// Take as many of `unsettled` and then of `unclaimed` as the budget
+    /// still affords, in the order offered, and charge for them. What is
+    /// left is dropped: a name a record does not carry stays uncovered
+    /// and is offered again next block.
+    fn take(&mut self, unsettled: &mut Vec<UnsettledTx>, unclaimed: &mut Vec<UnclaimedCrossing>) {
         let mut spend = ABANDONMENT_RECORD_BYTES;
-        for entry in unsettled.iter().take(self.names) {
-            let next = spend + entry.wire_weight();
-            if next > self.bytes {
+        let mut names = 0;
+        let weights = unsettled
+            .iter()
+            .map(UnsettledTx::wire_weight)
+            .chain(unclaimed.iter().map(|_| UNCLAIMED_CROSSING_BYTES));
+        for weight in weights {
+            if names == self.names || spend + weight > self.bytes {
                 break;
             }
-            spend = next;
-            taken += 1;
+            spend += weight;
+            names += 1;
         }
-        unsettled.truncate(taken);
-        if taken == 0 {
+        let from_unsettled = names.min(unsettled.len());
+        unsettled.truncate(from_unsettled);
+        unclaimed.truncate(names - from_unsettled);
+        if names == 0 {
             return;
         }
-        self.names -= taken;
+        self.names -= names;
         self.bytes -= spend;
     }
 }
@@ -1518,7 +1524,8 @@ impl Counterparts {
     }
 
     /// Mark the records this block's departures have licensed a reclaim
-    /// of: those whose issuing transaction a record names unsettled.
+    /// of: those whose issuing transaction a record names unsettled, and
+    /// those a record names off the leaf.
     ///
     /// Every record the transaction issued here, not only one crossing
     /// into the departed shard. A record establishes the transaction was
@@ -1539,11 +1546,18 @@ impl Counterparts {
             .iter()
             .flat_map(AbandonmentRecord::tx_hashes)
             .collect();
-        if named.is_empty() {
+        let crossings: BTreeSet<SubstateKey> = block
+            .abandonment_records()
+            .iter()
+            .flat_map(AbandonmentRecord::unclaimed)
+            .map(|crossing| crossing.record)
+            .collect();
+        if named.is_empty() && crossings.is_empty() {
             return;
         }
-        for record in self.held.values_mut() {
-            record.departed = record.departed || named.contains(&record.cell.tx);
+        for (key, record) in &mut self.held {
+            record.departed =
+                record.departed || named.contains(&record.cell.tx) || crossings.contains(key);
         }
     }
 
@@ -1779,15 +1793,45 @@ impl Counterparts {
                 let settled = &sets[&shard];
                 let mut unsettled = self.ledger.outstanding_with(shard, settled.terminal_wt);
                 unsettled.retain(|entry| !settled.txs.contains(&entry.tx_hash));
-                budget.take(&mut unsettled);
-                if unsettled.is_empty() {
+                let mut unclaimed = self.unclaimed_with(shard, settled.terminal_wt);
+                unclaimed.retain(|crossing| !settled.txs.contains(&crossing.tx));
+                budget.take(&mut unsettled, &mut unclaimed);
+                if unsettled.is_empty() && unclaimed.is_empty() {
                     continue;
                 }
-                let record = AbandonmentRecord::new(shard, settled.terminal_wt, unsettled);
+                let record = AbandonmentRecord::new(shard, settled.terminal_wt, unsettled)
+                    .with_unclaimed(unclaimed);
                 records.insert(shard, record);
             }
         });
         records.into_values().collect()
+    }
+
+    /// The crossings this shard's record leaves hold that `shard`,
+    /// leaving at `cut`, could have taken and no ledger entry names:
+    /// what a departure names off the leaves, because a leg entry is
+    /// gone one claim window past its deadline and a departure can be
+    /// cut later than that.
+    ///
+    /// Escrowed records only, whose consumer's route `shard` holds and
+    /// whose transaction's deadline had passed by the cut; the rest of
+    /// [`UnclaimedCrossing::party`] is the proposer's to apply against
+    /// the schedule. A record a departure already named waits on its
+    /// reclaim and is not offered again.
+    fn unclaimed_with(&self, shard: ShardId, cut: WeightedTimestamp) -> Vec<UnclaimedCrossing> {
+        self.held
+            .iter()
+            .filter(|(_, record)| {
+                !record.departed
+                    && matches!(record.cell.terms, Terms::Escrowed { .. })
+                    && !self.ledger.contains(record.cell.tx)
+            })
+            .map(|(key, record)| UnclaimedCrossing::of(*key, &record.cell))
+            .filter(|crossing| {
+                ShardTrie::shard_owns_route(shard, crossing.consumer)
+                    && Deadline::of(crossing.validity_end).at() <= cut
+            })
+            .collect()
     }
 
     /// Record where each departed shard's chain ended, for the entries
@@ -2828,7 +2872,7 @@ mod tests {
                 break;
             }
             let mut offered = left.clone();
-            Budget::empty().take(&mut offered);
+            Budget::empty().take(&mut offered, &mut Vec::new());
             assert!(!offered.is_empty(), "each block carries something");
             let record =
                 AbandonmentRecord::new(ShardId::ROOT, WeightedTimestamp::ZERO, offered.clone());
@@ -2854,7 +2898,7 @@ mod tests {
         let mut wide: Vec<UnsettledTx> = (0..MAX_UNSETTLED_PER_BLOCK)
             .map(|seed| name(seed, 6))
             .collect();
-        Budget::empty().take(&mut wide);
+        Budget::empty().take(&mut wide, &mut Vec::new());
         assert!(
             wide.len() < MAX_UNSETTLED_PER_BLOCK,
             "the byte budget bites first",
@@ -2879,7 +2923,7 @@ mod tests {
         let mut offered: Vec<UnsettledTx> = (0..MAX_UNSETTLED_PER_BLOCK + 10)
             .map(|seed| name(seed, 0))
             .collect();
-        budget.take(&mut offered);
+        budget.take(&mut offered, &mut Vec::new());
         assert_eq!(offered.len(), MAX_UNSETTLED_PER_BLOCK);
     }
 
@@ -2890,14 +2934,14 @@ mod tests {
     fn a_records_own_terms_are_charged_with_its_first_name() {
         let mut budget = Budget::empty();
         let mut one = vec![name(0, 2)];
-        budget.take(&mut one);
+        budget.take(&mut one, &mut Vec::new());
         assert_eq!(
             MAX_PROPOSAL_EVIDENCE_BYTES - budget.bytes,
             ABANDONMENT_RECORD_BYTES + name(0, 2).wire_weight(),
         );
         let mut none: Vec<UnsettledTx> = Vec::new();
         let before = budget.bytes;
-        budget.take(&mut none);
+        budget.take(&mut none, &mut Vec::new());
         assert_eq!(budget.bytes, before, "an empty take charges nothing");
     }
 }
