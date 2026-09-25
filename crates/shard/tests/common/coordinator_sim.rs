@@ -36,7 +36,8 @@ use hyperscale_shard::local_crossings::{
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
     ChainEntry, ChainWrites, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
-    ShardChainWriter, SubstateStore, TerminalWindow, colliding_committed_cell, sweep_for_block,
+    ShardChainWriter, SubstateStore, TerminalWindow, colliding_committed_cell, creations_of,
+    sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -1428,6 +1429,7 @@ impl ShardCoordinatorSim {
             // bucket below.
             Action::BuildProposal {
                 shard_id,
+                chain_origin,
                 proposer,
                 height,
                 round,
@@ -1580,6 +1582,7 @@ impl ShardCoordinatorSim {
                     &Capped::new(transactions).expect("a selection written out in a test"),
                     Capped::new(finalizations.clone()).expect("a list written out in a test"),
                     shard_id,
+                    chain_origin,
                     &classification_topology,
                     Capped::new(provisions.clone()).expect("a list written out in a test"),
                     Capped::new(abandonment_records).expect("a list written out in a test"),
@@ -1934,7 +1937,7 @@ impl ShardCoordinatorSim {
                     },
                     &finalizations,
                     ChainWrites {
-                        creations: &creations,
+                        creations: &creations_of(&creations),
                         removals: &removals,
                         frontier: &frontier,
                         state_claims: &state_claims,

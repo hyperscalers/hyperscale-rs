@@ -63,6 +63,13 @@ impl<'a> ChainView<'a> {
     /// Borrow a pending block by hash. Used by callers that need to inspect
     /// per-block state (received transactions, finalizations) beyond what
     /// the dedicated header / state-root accessors expose.
+    /// Where this chain begins: a transaction whose range opened before
+    /// its anchor is also judged by the markers a predecessor wrote.
+    #[must_use]
+    pub(crate) const fn chain_origin(&self) -> ChainOrigin {
+        self.chain_origin
+    }
+
     /// The committed height the walks stop at.
     #[must_use]
     pub(crate) const fn committed_height(&self) -> BlockHeight {

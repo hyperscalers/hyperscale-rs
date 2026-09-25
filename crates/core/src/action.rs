@@ -7,7 +7,7 @@ use std::time::Duration;
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
 use hyperscale_engine::legs::{Member, Runs};
-use hyperscale_storage::TickResolution;
+use hyperscale_storage::{CommittedHere, TickResolution};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
@@ -740,10 +740,12 @@ pub enum Action {
         /// the committed-transaction window a terminating boundary header
         /// roots. Carried as hashes because that is all the root needs.
         block_tx_hashes: Vec<TxHash>,
-        /// The committed cells the block writes, derived by the
-        /// coordinator under the block's own window. They fold with the
-        /// receipts' writes under the root being verified.
-        creations: Vec<(SubstateKey, Vec<u8>)>,
+        /// The committed markers the block writes, derived by the
+        /// coordinator from its transactions and the chain's origin. They
+        /// fold with the receipts' writes under the root being verified,
+        /// and a row whose own or inherited key the parent state holds
+        /// refuses the block.
+        creations: Vec<CommittedHere>,
         /// Block height being verified.
         block_height: BlockHeight,
         /// The header's `split_child_roots` claim, verified beside the
@@ -1011,6 +1013,9 @@ pub enum Action {
     BuildProposal {
         /// Local shard producing this proposal.
         shard_id: ShardId,
+        /// Where the shard's chain begins: a transaction whose range
+        /// opened before it is also judged by an inherited marker.
+        chain_origin: WeightedTimestamp,
         /// Validator id of the proposer (this node).
         proposer: ValidatorId,
         /// Height of the new block.

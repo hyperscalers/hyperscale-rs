@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_storage::committed_tx_cells;
+use hyperscale_storage::{CommittedHere, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
@@ -102,9 +102,9 @@ pub struct ReadyStateRootVerification {
     /// Hashes of the block's own transactions — its contribution to the
     /// committed-transaction window a terminating boundary header roots.
     pub block_tx_hashes: Vec<TxHash>,
-    /// The committed cells the block writes, derived under its window,
-    /// folded under the root being verified.
-    pub creations: Vec<(SubstateKey, Vec<u8>)>,
+    /// The committed markers the block writes, each with the inherited
+    /// key its transaction is also judged by.
+    pub creations: Vec<CommittedHere>,
     /// Height of the block being verified.
     pub block_height: BlockHeight,
     /// The header's `split_child_roots` claim, verified beside the
@@ -1860,7 +1860,11 @@ impl VerificationPipeline {
             block.certificates().iter().cloned().collect();
         let block_tx_hashes: Vec<TxHash> =
             block.transactions().iter().map(|tx| tx.hash()).collect();
-        let creations = committed_cells_for(block);
+        let creations = committed_here(
+            block.header().shard_id(),
+            chain.chain_origin().anchor_wt,
+            block.transactions().iter().map(|tx| tx.as_unverified()),
+        );
         Some(ReadyStateRootVerification {
             block_hash: pending.block_hash,
             parent_block_hash: pending.parent_block_hash,

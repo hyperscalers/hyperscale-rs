@@ -540,48 +540,131 @@ pub fn committed_tx_cells<'a>(
 ) -> Vec<(SubstateKey, Vec<u8>)> {
     transactions
         .into_iter()
+        .map(|tx| committed_tx_cell(local_shard, tx))
+        .collect()
+}
+
+fn committed_tx_cell(local_shard: ShardId, tx: &Transaction) -> (SubstateKey, Vec<u8>) {
+    let validity_end = tx.validity_range().end_timestamp_exclusive;
+    let cell = Marker::of(tx.hash(), validity_end.as_millis(), Marked::Committed);
+    (
+        committed_tx_cell_key(local_shard, cell.tx, validity_end),
+        cell.to_bytes(),
+    )
+}
+
+/// One transaction's committed marker as a block that carries it writes
+/// it, and every key whose presence says the transaction was already
+/// committed on this chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedHere {
+    /// The marker this shard writes, under its own owner.
+    pub key: SubstateKey,
+    /// The marker's bytes.
+    pub value: Vec<u8>,
+    /// For a transaction whose range opened before the chain's origin,
+    /// the marker key under the owner of the shard's right half.
+    ///
+    /// A shard's owner is its path padded with zeros, so a left
+    /// predecessor wrote under this chain's own owner and `key` already
+    /// answers for it. A merged parent's right predecessor wrote here, in
+    /// the parent's own state. On a chain not born by a merge nothing
+    /// sits at it, so reading it needs no knowledge of how the chain was
+    /// born.
+    pub inherited: Option<SubstateKey>,
+}
+
+impl CommittedHere {
+    /// The write the block folds.
+    #[must_use]
+    pub fn creation(&self) -> (SubstateKey, Vec<u8>) {
+        (self.key, self.value.clone())
+    }
+}
+
+/// [`committed_tx_cells`], with each row carrying the inherited key a
+/// transaction older than `origin` is also judged by.
+#[must_use]
+pub fn committed_here<'a>(
+    local_shard: ShardId,
+    origin: WeightedTimestamp,
+    transactions: impl IntoIterator<Item = &'a Transaction>,
+) -> Vec<CommittedHere> {
+    transactions
+        .into_iter()
         .map(|tx| {
-            let validity_end = tx.validity_range().end_timestamp_exclusive;
-            let cell = Marker::of(tx.hash(), validity_end.as_millis(), Marked::Committed);
-            (
-                committed_tx_cell_key(local_shard, cell.tx, validity_end),
-                cell.to_bytes(),
-            )
+            let (key, value) = committed_tx_cell(local_shard, tx);
+            let range = tx.validity_range();
+            let inherited = (range.start_timestamp_inclusive < origin).then(|| {
+                committed_tx_cell_key(
+                    local_shard.children().1,
+                    tx.hash(),
+                    range.end_timestamp_exclusive,
+                )
+            });
+            CommittedHere {
+                key,
+                value,
+                inherited,
+            }
         })
         .collect()
 }
 
-/// The first committed cell among `creations` that a block may not
-/// create: one present in the parent state, or one named twice.
+/// The creations a block's rows fold.
+#[must_use]
+pub fn creations_of(rows: &[CommittedHere]) -> Vec<(SubstateKey, Vec<u8>)> {
+    rows.iter().map(CommittedHere::creation).collect()
+}
+
+/// Whether `row` may not be carried over `state`: its own marker or its
+/// inherited one is present, or its own key is in `named` already.
+/// Presence is the answer, whatever value sits at the key.
+fn committed_already(
+    row: &CommittedHere,
+    named: &mut BTreeSet<SubstateKey>,
+    state: &(impl Substates + ?Sized),
+) -> bool {
+    !named.insert(row.key)
+        || state.cell(row.key).is_some()
+        || row.inherited.is_some_and(|key| state.cell(key).is_some())
+}
+
+/// The first row a block may not carry.
+///
+/// A transaction this chain already committed, by its own marker or an
+/// inherited one present in the parent state, or one whose marker
+/// another transaction in the block names.
 ///
 /// One rule, both halves: a block carries no transaction whose committed
 /// key is present in its parent state or named by another transaction in
 /// the same block. Presence is read through `state`, the anchored view,
-/// so a cell an unpersisted ancestor created counts. A sweep removes
-/// only what is live in the parent, so a creation that is also a removal
+/// so a marker an unpersisted ancestor created counts, and a restarted or
+/// snap-synced voter answers as a live one does. A sweep removes only
+/// what is live in the parent, so a creation that is also a removal
 /// breaks the first half on its own and needs no clause.
 ///
-/// What the rule buys is that a live committed cell always names the
-/// transaction that created it, so a probe reading the cell reads about
-/// the transaction it asked about.
-/// A verifier refuses a block that breaks it at vote time, before the
-/// in-block pair reaches [`with_sweep`]'s assert and halts every
-/// replica, and a proposer keeps the first of each colliding set.
+/// What the rule buys is that a transaction is committed once per chain
+/// lineage, and that a live committed cell always names the transaction
+/// that created it, so a probe reading the cell reads about the
+/// transaction it asked about. A verifier refuses a block that breaks it
+/// at vote time, before the in-block pair reaches [`with_sweep`]'s assert
+/// and halts every replica, and a proposer keeps the first of each
+/// colliding set.
 #[must_use]
 pub fn colliding_committed_cell(
-    creations: &[(SubstateKey, Vec<u8>)],
+    rows: &[CommittedHere],
     state: &(impl Substates + ?Sized),
 ) -> Option<SubstateKey> {
     let mut named: BTreeSet<SubstateKey> = BTreeSet::new();
-    creations
-        .iter()
-        .map(|(key, _)| *key)
-        .find(|key| !named.insert(*key) || state.cell(*key).is_some())
+    rows.iter()
+        .find(|row| committed_already(row, &mut named, state))
+        .map(|row| row.key)
 }
 
-/// Drop from `transactions` every one whose committed cell collides:
-/// the first of each set sharing a key is kept, and one whose key is
-/// present in the parent state goes.
+/// Drop from `transactions` every one [`colliding_committed_cell`] would
+/// refuse: the first of each set sharing a key is kept, and one this
+/// chain already committed goes.
 ///
 /// What a proposer builds from. A colliding transaction is deferred to a
 /// block whose parent no longer holds the cell rather than built into a
@@ -590,17 +673,14 @@ pub fn colliding_committed_cell(
 /// later transaction.
 pub fn without_colliding_committed_cells<const N: usize>(
     local_shard: ShardId,
+    origin: WeightedTimestamp,
     transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, N>,
     state: &(impl Substates + ?Sized),
 ) {
     let mut named: BTreeSet<SubstateKey> = BTreeSet::new();
     transactions.retain(|tx| {
-        let key = committed_tx_cell_key(
-            local_shard,
-            tx.hash(),
-            tx.validity_range().end_timestamp_exclusive,
-        );
-        state.cell(key).is_none() && named.insert(key)
+        let row = committed_here(local_shard, origin, [&***tx]);
+        !committed_already(&row[0], &mut named, state)
     });
 }
 
@@ -913,7 +993,17 @@ mod tests {
         }
     }
 
-    /// A parent state holding exactly `present`.
+    /// A row that inherits nothing.
+    fn own(key: SubstateKey, value: Vec<u8>) -> CommittedHere {
+        CommittedHere {
+            key,
+            value,
+            inherited: None,
+        }
+    }
+
+    /// A parent state holding exactly `present`, each at a value that
+    /// names no transaction.
     struct Holding(BTreeSet<SubstateKey>);
 
     impl Substates for Holding {
@@ -964,18 +1054,21 @@ mod tests {
         let (a, b, c) = (committed(1), committed(2), committed(3));
         let absent = Holding(BTreeSet::new());
         assert_eq!(
-            colliding_committed_cell(&[(a, vec![1]), (b, vec![1]), (a, vec![2])], &absent),
+            colliding_committed_cell(
+                &[own(a, vec![1]), own(b, vec![1]), own(a, vec![2])],
+                &absent
+            ),
             Some(a),
             "named twice in the block",
         );
         let holding = Holding(BTreeSet::from([b]));
         assert_eq!(
-            colliding_committed_cell(&[(a, vec![1]), (b, vec![1])], &holding),
+            colliding_committed_cell(&[own(a, vec![1]), own(b, vec![1])], &holding),
             Some(b),
             "present in the parent",
         );
         assert_eq!(
-            colliding_committed_cell(&[(a, vec![1]), (c, vec![1])], &holding),
+            colliding_committed_cell(&[own(a, vec![1]), own(c, vec![1])], &holding),
             None,
             "distinct absent keys",
         );
@@ -1003,7 +1096,12 @@ mod tests {
         // second listing goes.
         let mut listed: Capped<Vec<_>, 4> =
             Capped::new(vec![first.clone(), first.clone(), second.clone()]).expect("three");
-        without_colliding_committed_cells(shard, &mut listed, &Holding(BTreeSet::new()));
+        without_colliding_committed_cells(
+            shard,
+            WeightedTimestamp::ZERO,
+            &mut listed,
+            &Holding(BTreeSet::new()),
+        );
         assert_eq!(
             listed.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
             vec![first.hash(), second.hash()],
@@ -1015,12 +1113,80 @@ mod tests {
             Capped::new(vec![first.clone(), second.clone()]).expect("two");
         without_colliding_committed_cells(
             shard,
+            WeightedTimestamp::ZERO,
             &mut listed,
             &Holding(BTreeSet::from([key_of(&first)])),
         );
         assert_eq!(
             listed.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
             vec![second.hash()],
+        );
+    }
+
+    /// A transaction older than the chain's origin is also judged by the
+    /// marker a merged parent's right predecessor wrote, under the owner
+    /// of the right half; one the chain has seen open is judged by its
+    /// own marker alone. The proposer drops what the voter refuses.
+    #[test]
+    fn an_inherited_marker_refuses_a_transaction_older_than_the_chain() {
+        use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+
+        install_stub_protocol_statics();
+        let shard = ShardId::leaf(1, 0);
+        let tx = test_transaction(1);
+        let validity_end = tx.validity_range().end_timestamp_exclusive;
+        let right = committed_tx_cell_key(shard.children().1, tx.hash(), validity_end);
+        let holding = Holding(BTreeSet::from([right]));
+        let origin = tx
+            .validity_range()
+            .start_timestamp_inclusive
+            .plus(std::time::Duration::from_millis(1));
+
+        let older = committed_here(shard, origin, [&tx]);
+        assert_eq!(older[0].inherited, Some(right));
+        assert_eq!(
+            colliding_committed_cell(&older, &holding),
+            Some(older[0].key),
+            "the right predecessor committed it",
+        );
+        let newer = committed_here(shard, WeightedTimestamp::ZERO, [&tx]);
+        assert_eq!(newer[0].inherited, None);
+        assert_eq!(colliding_committed_cell(&newer, &holding), None);
+
+        let verified = Arc::new(Verified::new_unchecked_for_test(tx));
+        let mut listed: Capped<Vec<_>, 1> = Capped::new(vec![verified]).expect("one");
+        without_colliding_committed_cells(shard, origin, &mut listed, &holding);
+        assert!(listed.is_empty(), "the proposer drops it too");
+    }
+
+    /// Presence refuses, whatever the value at the key: a marker naming
+    /// another transaction at T's key is still T's refusal, so no
+    /// collision can make a committed transaction read absent.
+    #[test]
+    fn presence_refuses_whatever_the_marker_names() {
+        struct Naming(SubstateKey, Vec<u8>);
+        impl Substates for Naming {
+            fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+                (key == self.0).then(|| self.1.clone())
+            }
+            fn entries_in_range(
+                &self,
+                _owner: Address,
+                _collection: CollectionId,
+                _lo: u128,
+                _hi: u128,
+                _limit: usize,
+            ) -> Vec<(u128, Vec<u8>)> {
+                Vec::new()
+            }
+        }
+
+        let key = committed(5);
+        let other = TxHash::from(Hash::from_bytes(&[0xC; 32]));
+        let state = Naming(key, Marker::of(other, 1_000, Marked::Committed).to_bytes());
+        assert_eq!(
+            colliding_committed_cell(&[own(key, vec![1])], &state),
+            Some(key)
         );
     }
 
@@ -1051,7 +1217,7 @@ mod tests {
 
         let holding = Holding(BTreeSet::from([key]));
         assert_eq!(
-            colliding_committed_cell(&[(key, marker(b))], &holding),
+            colliding_committed_cell(&[own(key, marker(b))], &holding),
             Some(key),
             "while the first stands, the second is refused",
         );

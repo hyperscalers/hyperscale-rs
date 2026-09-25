@@ -40,11 +40,11 @@ use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BOUNDARY_RETAIN, BoundaryStore, ChainWrites, GenesisCommit, ImportCursor,
-    ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState,
+    Anchored, BOUNDARY_RETAIN, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit, ImportCursor,
+    ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState,
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
-    SweepIndex, VersionedStore, WitnessSeed, committed_tx_cell_key, committed_tx_cells,
-    holds_state, key_under_prefix, sweep_for_block,
+    SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell, committed_here,
+    committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -1727,6 +1727,37 @@ where
     );
 }
 
+/// Every leaf `serving` holds at `height`, pinned there, as a snap-sync
+/// import receives them.
+fn boundary_leaves<S: BoundaryStore>(serving: &S, height: BlockHeight) -> Vec<SubstateLeaf> {
+    serving.pin_boundary(height).unwrap();
+    let boundary = serving.open_boundary(height).expect("pinned");
+    let root_key = boundary
+        .get_root_key(height.inner())
+        .expect("root resolves");
+    let chunk = Jmt::collect_range(
+        &boundary,
+        &root_key,
+        &[0u8; KEY_BYTES],
+        &[0xFF; KEY_BYTES],
+        1_000,
+    )
+    .unwrap();
+    chunk
+        .leaves
+        .iter()
+        .map(|(leaf_key, _)| {
+            let key =
+                SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address");
+            let value = boundary.cell(key).expect("resolves");
+            SubstateLeaf {
+                key,
+                value: Bytes::new(value).expect("a list written out in a test"),
+            }
+        })
+        .collect()
+}
+
 /// Shared serve → import round trip: leaves enumerated and resolved
 /// from `serving`'s pinned boundary rebuild an identical store in
 /// `fresh`, with the raw substates readable and a second import
@@ -1749,34 +1780,7 @@ where
         &make_settled_entries(7, &[(5, Some(vec![5])), (10, Some(vec![10]))]),
     );
     let source_root = serving.state_root();
-    serving.pin_boundary(BlockHeight::new(6)).unwrap();
-
-    let boundary = serving.open_boundary(BlockHeight::new(6)).expect("pinned");
-    let root_key = boundary.get_root_key(6).expect("root resolves");
-    let chunk = Jmt::collect_range(
-        &boundary,
-        &root_key,
-        &[0u8; KEY_BYTES],
-        &[0xFF; KEY_BYTES],
-        1_000,
-    )
-    .unwrap();
-    let leaves: Vec<SubstateLeaf> = chunk
-        .leaves
-        .iter()
-        .map(|(leaf_key, _)| {
-            let value = boundary
-                .cell(
-                    SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address"),
-                )
-                .expect("resolves");
-            SubstateLeaf {
-                key: SubstateKey::from_bytes(*leaf_key)
-                    .expect("a stored leaf key names an address"),
-                value: Bytes::new(value).expect("a list written out in a test"),
-            }
-        })
-        .collect();
+    let leaves = boundary_leaves(serving, BlockHeight::new(6));
     assert_eq!(leaves.len(), 7);
     let probe = leaves
         .iter()
@@ -2927,6 +2931,112 @@ where
         ),
         "the prepared commit serves the committed cell under its root",
     );
+}
+
+/// Shared: a transaction's committed marker refuses its re-inclusion
+/// through every view a voter reads, whatever the voter remembers.
+///
+/// The voter's rule reads the anchored view and nothing node-local, so
+/// a replica that restarted with nothing folded, one whose store begins
+/// at a snap-sync boundary, and one that has persisted nothing past a
+/// pending ancestor carrying the transaction all refuse it as a live
+/// replica does.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
+    serving: &S,
+    fresh: &S,
+    unpersisted: &S,
+) where
+    S: BoundaryStore + TestStore + VersionedStore + TreeReader + ShardChainReader + Sync + 'static,
+{
+    let tx = test_transaction(1);
+    let block = with_transactions(
+        make_test_block(BlockHeight::new(1)),
+        vec![Arc::new(Verifiable::from(tx.clone()))],
+    );
+    let creations = committed_tx_cells(ShardId::ROOT, [&tx]);
+    let rows = committed_here(ShardId::ROOT, WeightedTimestamp::ZERO, [&tx]);
+    let marker = rows[0].key;
+    let chain_over = |store: &S| {
+        Arc::new(PendingChain::new(
+            Arc::new(store.clone()),
+            ChainOrigin::ROOT,
+        ))
+    };
+
+    commit_settled_at(
+        serving,
+        &make_test_certified(block.clone()),
+        &creations,
+        &[],
+        &empty_witness(),
+    );
+    let restarted = chain_over(serving);
+    assert_eq!(
+        colliding_committed_cell(&rows, &restarted.view_at_committed_tip().snapshot()),
+        Some(marker),
+        "a restarted replica reads the marker off its store",
+    );
+
+    let leaves = boundary_leaves(serving, BlockHeight::new(1));
+    import_boundary_state(fresh, BlockHeight::new(1), &leaves, WitnessSeed::default()).unwrap();
+    let synced = chain_over(fresh);
+    assert_eq!(
+        colliding_committed_cell(&rows, &synced.view_at_committed_tip().snapshot()),
+        Some(marker),
+        "a snap-synced replica reads the marker off the imported state",
+    );
+
+    let pending = chain_over(unpersisted);
+    assert_eq!(
+        colliding_committed_cell(&rows, &pending.view_at_committed_tip().snapshot()),
+        None,
+        "nothing is committed yet",
+    );
+    let base = Arc::new(unpersisted.clone());
+    let (_, jmt_snapshot, _) = base.prepare_block_commit(
+        ParentAnchor {
+            state_root: base.state_root(),
+            height: BlockHeight::GENESIS,
+            state: &base.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &[],
+        ChainWrites {
+            creations: &creations,
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+        },
+        BlockHeight::new(1),
+    );
+    pending.insert(
+        block.hash(),
+        ChainEntry {
+            parent_block_hash: block.header().parent_block_hash(),
+            height: BlockHeight::new(1),
+            settled_txs: Vec::new(),
+            committed_txs: Vec::new(),
+            jmt_snapshot,
+            certified_block: None,
+            certified_uncommitted: None,
+        },
+    );
+    assert_eq!(
+        colliding_committed_cell(
+            &rows,
+            &pending
+                .view_at(block.hash(), BlockHeight::new(1))
+                .snapshot()
+        ),
+        Some(marker),
+        "a pending ancestor's marker is read through the overlay",
+    );
+    assert_eq!(unpersisted.jmt_height(), BlockHeight::GENESIS);
 }
 
 /// A prepared commit whose height the tree already reached refuses when

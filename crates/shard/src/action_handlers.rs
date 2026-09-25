@@ -15,8 +15,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage,
     SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore,
-    colliding_committed_cell, committed_tx_cells, load_read_frontier, sweep_for_block,
-    without_colliding_committed_cells,
+    colliding_committed_cell, committed_tx_cells, creations_of, load_read_frontier,
+    sweep_for_block, without_colliding_committed_cells,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -225,6 +225,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     transactions: &Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
     certificates: Capped<Vec<Arc<Verifiable<Finalization>>>, MAX_FINALIZED_TX_PER_BLOCK>,
     local_shard: ShardId,
+    chain_origin: WeightedTimestamp,
     topology_snapshot: &TopologySnapshot,
     provisions: Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>,
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
@@ -255,13 +256,14 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // validator has persisted, and a movement baseline that moves with
     // persistence progress forks the root against replicas that lag.
     let anchored = view.snapshot();
-    // A transaction whose committed cell would collide — with a cell the
-    // parent state holds, or with another transaction's here — is
-    // deferred: the first of each set is kept, and everything below
-    // reads the kept list, so the block a verifier refuses is never
-    // built. The deferred ones stay pooled.
+    // A transaction this chain already committed — its own or an
+    // inherited marker is present in the parent state — is dropped, and
+    // one whose marker another transaction here names is deferred: the
+    // first of each set is kept, and everything below reads the kept
+    // list, so the block a verifier refuses is never built. The dropped
+    // ones stay pooled.
     let mut transactions = transactions.clone();
-    without_colliding_committed_cells(local_shard, &mut transactions, &anchored);
+    without_colliding_committed_cells(local_shard, chain_origin, &mut transactions, &anchored);
     let transactions = &transactions;
     // The sweep, before the root it moves. Removals are ordinary writes,
     // so they fold in with the block's settling receipts and land under
@@ -1105,14 +1107,15 @@ where
                 });
                 return;
             }
-            // A block carries no transaction whose committed cell is
-            // present in its parent state or named by another of its
-            // transactions. Two creations at one key would halt every
-            // replica in the fold's assert, and a creation over a live
-            // cell would leave a later retraction deleting another
-            // transaction's cell. A validity rule at vote time, judged
-            // against the anchored view: a replica following a certified
-            // block never evaluates it.
+            // A block carries no transaction this chain already
+            // committed — its own or inherited marker present in the
+            // parent state — and none whose marker another of its
+            // transactions names. The first is the re-inclusion rule,
+            // read off state so a restarted or snap-synced voter answers
+            // as a live one does; two creations at one key would halt
+            // every replica in the fold's assert. A validity rule at vote
+            // time, judged against the anchored view: a replica following
+            // a certified block never evaluates it.
             if let Some(key) = colliding_committed_cell(&creations, &anchored) {
                 tracing::warn!(
                     ?block_hash,
@@ -1194,7 +1197,7 @@ where
                 },
                 &finalizations,
                 ChainWrites {
-                    creations: &creations,
+                    creations: &creations_of(&creations),
                     removals: &removals,
                     frontier: &frontier,
                     state_claims: &state_claims,
@@ -1287,6 +1290,7 @@ where
 
         Action::BuildProposal {
             shard_id,
+            chain_origin,
             proposer,
             height,
             round,
@@ -1535,6 +1539,7 @@ where
                 &transactions,
                 finalizations.clone(),
                 shard_id,
+                chain_origin,
                 &classification_topology,
                 provisions.clone(),
                 abandonment_records,

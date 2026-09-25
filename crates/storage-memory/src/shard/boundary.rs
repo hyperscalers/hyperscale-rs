@@ -328,6 +328,7 @@ mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
+        test_a_committed_marker_refuses_its_transaction_on_every_view,
         test_a_presence_below_the_deleting_absence_is_refused,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
@@ -494,6 +495,17 @@ mod tests {
             &SimShardStorage::default(),
             &SimShardStorage::new(shard_prefix_path(left)),
             &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A committed marker refuses its transaction after a restart, after
+    /// a snap sync, and through a pending ancestor alone.
+    #[test]
+    fn a_committed_marker_refuses_its_transaction_on_every_view() {
+        test_a_committed_marker_refuses_its_transaction_on_every_view(
+            &SimShardStorage::default(),
+            &SimShardStorage::default(),
+            &SimShardStorage::default(),
         );
     }
 

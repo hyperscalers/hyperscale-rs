@@ -737,6 +737,7 @@ mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
+        test_a_committed_marker_refuses_its_transaction_on_every_view,
         test_a_presence_below_the_deleting_absence_is_refused,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
@@ -964,6 +965,18 @@ mod tests {
             &open_storage(dirs[0].path()),
             &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A committed marker refuses its transaction after a restart, after
+    /// a snap sync, and through a pending ancestor alone.
+    #[test]
+    fn a_committed_marker_refuses_its_transaction_on_every_view() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        test_a_committed_marker_refuses_its_transaction_on_every_view(
+            &open_storage(dirs[0].path()),
+            &open_storage(dirs[1].path()),
+            &open_storage(dirs[2].path()),
         );
     }
 
