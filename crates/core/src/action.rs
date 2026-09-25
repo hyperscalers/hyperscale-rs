@@ -18,13 +18,12 @@ use hyperscale_types::{
     PcVoteEquivocation, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
     RatifyVote, ReadFence, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee,
-    RevealChain, Round, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
+    RevealChain, Round, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
     SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
     SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot,
-    SubstateEntry, SubstateKey, SweepFrontier, TerminalRoots, TickId, Timeout, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
-    WeightedTimestamp,
+    SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx,
+    ValidatorId, Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -736,10 +735,6 @@ pub enum Action {
         /// root and the state root. The thread pool merges the receipts' writes
         /// from these.
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        /// Hashes of the block's own transactions — its contribution to
-        /// the committed-transaction window a terminating boundary header
-        /// roots. Carried as hashes because that is all the root needs.
-        block_tx_hashes: Vec<TxHash>,
         /// The committed markers the block writes, derived by the
         /// coordinator from its transactions and the chain's origin. They
         /// fold with the receipts' writes under the root being verified,
@@ -755,14 +750,15 @@ pub enum Action {
         /// final epoch before a split), resolved by the coordinator from
         /// the schedule.
         split_child_roots_required: bool,
-        /// Whether the block's window requires terminal roots — set on any
-        /// terminating boundary header (a split parent's or a merge
-        /// child's final epoch), broader than `split_child_roots_required`.
-        terminal_roots_required: bool,
-        /// The header's `terminal_roots` claim, recomputed beside the state
-        /// root over the committed retention window when the block
+        /// Whether the block's window requires the terminal settled root —
+        /// set on any terminating boundary header (a split parent's or a
+        /// merge child's final epoch), broader than
+        /// `split_child_roots_required`.
+        terminal_settled_txs_required: bool,
+        /// The header's `terminal_settled_txs` claim, recomputed beside the
+        /// state root over the committed retention window when the block
         /// terminates the shard at a boundary.
-        claimed_terminal_roots: Option<TerminalRoots>,
+        claimed_terminal_settled_txs: Option<SettledTxsRoot>,
         /// The block's parent-QC weighted timestamp — the anchor the
         /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
@@ -1124,9 +1120,9 @@ pub enum Action {
         /// child, broader than `carry_split_child_roots`. When set, the
         /// handler computes the `settled_txs_root` over the committed
         /// retention window and stamps it into the header.
-        carry_terminal_roots: bool,
+        carry_terminal_settled_txs: bool,
         /// The schedule's settled-window floor for the shard at the block's
-        /// anchor, paired with `carry_terminal_roots` — extends the
+        /// anchor, paired with `carry_terminal_settled_txs` — extends the
         /// committed window walk back to the reshape's admission.
         settled_txs_window_floor: Option<WeightedTimestamp>,
         /// The block's **anchored** committee snapshot, resolved by the

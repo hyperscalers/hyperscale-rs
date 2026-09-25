@@ -106,7 +106,7 @@ impl SettledTxsCache {
 ///
 /// Returns `not_found` when the terminal block isn't held, the stored
 /// block's hash doesn't match the requested terminal, or that block
-/// carries no terminal roots — the requester rotates peers. Returns
+/// carries no terminal settled root — the requester rotates peers. Returns
 /// `not_found` too when the window set exceeds the wire cap (logged
 /// loudly; within-cap for any realistic cross-shard load).
 #[must_use]
@@ -125,12 +125,12 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
         return GetSettledTxsResponse::not_found();
     }
     // The answer is checked against the named block's own
-    // `settled_txs_root`, so a block carrying no terminal roots is one
+    // `settled_txs_root`, so a block carrying no terminal settled root is one
     // whose window no requester can accept — and the walk behind it
     // reaches back epochs. Answering at every height this node holds
     // would hand any peer a multi-epoch fold per request, on a shard that
     // is not terminating at all.
-    if block.header().terminal_roots().is_none() {
+    if block.header().settled_txs_root().is_none() {
         record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
     }
@@ -207,11 +207,11 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, CommittedTxsRoot,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
         Hash, ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SettledTxsRoot,
-        ShardId, SignerBitfield, TerminalRoots, TickHalf, TickId, TxHash, TxOutcome, Verifiable,
-        Verified, WeightedTimestamp, WitnessSources, settled_txs_root_from_hashes,
+        ShardId, SignerBitfield, TickHalf, TickId, TxHash, TxOutcome, Verifiable, Verified,
+        WeightedTimestamp, WitnessSources, settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -290,12 +290,9 @@ mod tests {
             timestamp: ProposerTimestamp::from_millis(1_000 * height),
             certificate_root: *Verified::<CertificateRoot>::compute(certs).as_ref(),
             provision_tx_roots: Capped::default(),
-            // Every block of a terminating window carries the roots; a
-            // block without them is not one this handler answers for.
-            terminal_roots: Some(TerminalRoots {
-                settled_txs: SettledTxsRoot::ZERO,
-                committed_txs: CommittedTxsRoot::ZERO,
-            }),
+            // Every block of a terminating window carries the root; a
+            // block without it is not one this handler answers for.
+            terminal_settled_txs: Some(SettledTxsRoot::ZERO),
             ..Default::default()
         });
         let block = Block::Live {
@@ -396,12 +393,12 @@ mod tests {
         );
     }
 
-    /// A block carrying no terminal roots is one no requester could
+    /// A block carrying no terminal settled root is one no requester could
     /// accept an answer against, and the walk behind that answer reaches
     /// back epochs. Serving at any height a node holds hands any peer a
     /// multi-epoch fold per request, on a shard that is not terminating.
     #[test]
-    fn a_block_with_no_terminal_roots_serves_not_found() {
+    fn a_block_with_no_terminal_settled_txs_serves_not_found() {
         let storage = SimShardStorage::default();
         let parent_qc = QuorumCertificate::new(
             BlockHash::ZERO,

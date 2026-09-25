@@ -9,10 +9,10 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRoot, Anchor, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-    CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot,
-    ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier, TerminalRoots,
-    TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
+    CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionTxRootsMap,
+    ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad,
+    SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier, TransactionRoot, TxsInFlight,
+    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -138,13 +138,13 @@ pub struct BlockHeader {
     /// anchors from the terminal header's pair; it cannot decompose
     /// `state_root` itself.
     split_child_roots: Option<SplitChildRoots>,
-    /// The commitments a terminating shard leaves for the chains that
-    /// outlive it, carried on the boundary header of its final epoch and
-    /// `None` everywhere else. The beacon folds them into
-    /// [`ShardBoundary`](crate::ShardBoundary). One field because both are
-    /// computed over the same committed window and carried by the same
-    /// headers — see [`TerminalRoots`] for what each answers and for whom.
-    terminal_roots: Option<TerminalRoots>,
+    /// Merkle root over the tick-ids a terminating shard settled within
+    /// its retention window, carried on the boundary header of its final
+    /// epoch and `None` everywhere else — what lets a surviving
+    /// counterpart resolve a straddling tick without walking the
+    /// terminated chain. The beacon folds it into
+    /// [`ShardBoundary`](crate::ShardBoundary).
+    terminal_settled_txs: Option<SettledTxsRoot>,
     /// The shard's attested load through this block — attested work as a
     /// running total, and the byte total behind the parent state. The
     /// beacon reads it off the boundary header it already sources and
@@ -194,7 +194,7 @@ pub struct BlockHeaderParts {
     pub beacon_witness_base: BeaconWitnessLeafCount,
     pub reveal_chain: RevealChain,
     pub split_child_roots: Option<SplitChildRoots>,
-    pub terminal_roots: Option<TerminalRoots>,
+    pub terminal_settled_txs: Option<SettledTxsRoot>,
     pub load: ShardLoad,
 }
 
@@ -226,7 +226,7 @@ impl Default for BlockHeaderParts {
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
             reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             load: ShardLoad::ZERO,
         }
     }
@@ -262,7 +262,7 @@ impl BlockHeader {
             beacon_witness_base,
             reveal_chain,
             split_child_roots,
-            terminal_roots,
+            terminal_settled_txs,
             load,
         } = parts;
         Self {
@@ -290,7 +290,7 @@ impl BlockHeader {
             beacon_witness_base,
             reveal_chain,
             split_child_roots,
-            terminal_roots,
+            terminal_settled_txs,
             load,
         }
     }
@@ -659,38 +659,24 @@ impl BlockHeader {
         self.split_child_roots
     }
 
-    /// The commitments this header leaves for the chains that outlive its
-    /// shard — present on a terminating shard's boundary header, `None`
-    /// everywhere else.
-    #[must_use]
-    pub const fn terminal_roots(&self) -> Option<TerminalRoots> {
-        self.terminal_roots
-    }
-
     /// Merkle root over the tick-ids this shard settled within its
-    /// retention window, for a reader that wants only that half.
+    /// retention window — present on a terminating shard's boundary
+    /// header, `None` everywhere else.
     #[must_use]
-    pub fn settled_txs_root(&self) -> Option<SettledTxsRoot> {
-        self.terminal_roots.map(|roots| roots.settled_txs)
-    }
-
-    /// Merkle root over every transaction this shard committed within its
-    /// retention window, for a reader that wants only that half.
-    #[must_use]
-    pub fn committed_txs_root(&self) -> Option<CommittedTxsRoot> {
-        self.terminal_roots.map(|roots| roots.committed_txs)
+    pub const fn settled_txs_root(&self) -> Option<SettledTxsRoot> {
+        self.terminal_settled_txs
     }
 
     /// This header as the terminal a successor succeeds: the state its
     /// markers are proven against.
     ///
-    /// `None` on any header carrying no terminal roots, which is every
-    /// header but a terminating boundary's. A successor handed nothing
+    /// `None` on any header carrying no terminal settled root, which is
+    /// every header but a terminating boundary's. A successor handed nothing
     /// here keeps refusing everything from before its origin until it
     /// reads its predecessors off the schedule.
     #[must_use]
     pub fn as_terminal_anchor(&self) -> Option<Anchor> {
-        self.terminal_roots?;
+        self.terminal_settled_txs?;
         Some(Anchor {
             shard: self.shard_id(),
             height: self.height(),
@@ -752,7 +738,7 @@ impl BlockHeader {
             beacon_witness_base: self.beacon_witness_base,
             reveal_chain: self.reveal_chain,
             split_child_roots: self.split_child_roots,
-            terminal_roots: self.terminal_roots,
+            terminal_settled_txs: self.terminal_settled_txs,
             load: self.load,
         }
     }
@@ -1046,11 +1032,11 @@ mod tests {
         let bare = BlockHeader::new(BlockHeaderParts::default());
         assert!(bare.as_terminal_anchor().is_none());
 
-        let roots = sample_terminal_roots();
+        let roots = sample_terminal_settled_txs();
         let terminal = BlockHeader::new(BlockHeaderParts {
             shard_id: ShardId::leaf(1, 0),
             height: BlockHeight::new(41),
-            terminal_roots: Some(roots),
+            terminal_settled_txs: Some(roots),
             ..Default::default()
         });
         let anchor = terminal
@@ -1061,52 +1047,30 @@ mod tests {
         assert_eq!(anchor.state_root, terminal.state_root());
     }
 
-    fn sample_terminal_roots() -> TerminalRoots {
-        TerminalRoots {
-            settled_txs: SettledTxsRoot::from_raw(Hash::from_bytes(b"settled window")),
-            committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed window")),
-        }
+    fn sample_terminal_settled_txs() -> SettledTxsRoot {
+        SettledTxsRoot::from_raw(Hash::from_bytes(b"settled window"))
     }
 
-    /// `terminal_roots` is hash-affecting header content: the pair
-    /// survives the wire round-trip, changes the block hash, and each half
-    /// moves it independently — they share a field but not a position, so
-    /// neither can stand in for the other.
+    /// `terminal_settled_txs` is hash-affecting header content: it
+    /// survives the wire round-trip and changes the block hash.
     #[test]
-    fn terminal_roots_round_trip_and_hash() {
+    fn terminal_settled_txs_round_trip_and_hash() {
         let bare = BlockHeader::new(BlockHeaderParts::default());
-        let roots = sample_terminal_roots();
+        let root = sample_terminal_settled_txs();
 
         let carrying = BlockHeader::new(BlockHeaderParts {
-            terminal_roots: Some(roots),
+            terminal_settled_txs: Some(root),
             ..Default::default()
         });
         let decoded: BlockHeader = hbor_from_slice(&hbor_to_vec(&carrying).unwrap()).unwrap();
-        assert_eq!(decoded.terminal_roots(), Some(roots));
-        assert_eq!(decoded.settled_txs_root(), Some(roots.settled_txs));
-        assert_eq!(decoded.committed_txs_root(), Some(roots.committed_txs));
+        assert_eq!(decoded.settled_txs_root(), Some(root));
         assert_ne!(carrying.hash(), bare.hash());
 
-        for altered in [
-            TerminalRoots {
-                settled_txs: SettledTxsRoot::from_raw(Hash::from_bytes(b"other settled")),
-                ..roots
-            },
-            TerminalRoots {
-                committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(b"other committed")),
-                ..roots
-            },
-        ] {
-            let other = BlockHeader::new(BlockHeaderParts {
-                terminal_roots: Some(altered),
-                ..Default::default()
-            });
-            assert_ne!(
-                carrying.hash(),
-                other.hash(),
-                "each half occupies its own header position"
-            );
-        }
+        let other = BlockHeader::new(BlockHeaderParts {
+            terminal_settled_txs: Some(SettledTxsRoot::from_raw(Hash::from_bytes(b"other"))),
+            ..Default::default()
+        });
+        assert_ne!(carrying.hash(), other.hash());
     }
 
     /// Forge a `BlockHeader` whose `provision_tx_roots` length claims one

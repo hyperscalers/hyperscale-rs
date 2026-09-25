@@ -6416,7 +6416,7 @@ mod tests {
                 height,
                 weighted_timestamp: WeightedTimestamp::from_millis(1),
                 witness_base: BeaconWitnessLeafCount::ZERO,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 handoff_complete: None,
             },
         );
@@ -7211,7 +7211,7 @@ mod tests {
                     height: BlockHeight::new(9),
                     weighted_timestamp: WeightedTimestamp::from_millis(1_000),
                     witness_base: BeaconWitnessLeafCount::ZERO,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     handoff_complete: None,
                 },
             )])),
@@ -11332,7 +11332,7 @@ mod tests {
                         height: BlockHeight::new(9),
                         weighted_timestamp: WeightedTimestamp::from_millis(1_000),
                         witness_base: BeaconWitnessLeafCount::ZERO,
-                        terminal_roots: None,
+                        terminal_settled_txs: None,
                         handoff_complete: *handoff_complete,
                     },
                 )

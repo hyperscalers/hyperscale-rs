@@ -296,7 +296,6 @@ mod tests {
                 parent_block_hash: block.header().parent_block_hash(),
                 height: BlockHeight::new(1),
                 settled_txs: Vec::new(),
-                committed_txs: Vec::new(),
                 jmt_snapshot: Arc::new(JmtSnapshot::from_collected_writes(
                     CollectedWrites::default(),
                     SettledWrites::default(),

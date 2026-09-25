@@ -1111,13 +1111,12 @@ impl ShardCoordinatorSim {
                 expected_root: ready.expected_root,
                 expected_local_receipt_root: ready.expected_local_receipt_root,
                 finalizations: ready.finalizations,
-                block_tx_hashes: ready.block_tx_hashes,
                 creations: ready.creations,
                 block_height: ready.block_height,
                 claimed_split_child_roots: ready.claimed_split_child_roots,
                 split_child_roots_required: ready.split_child_roots_required,
-                terminal_roots_required: ready.terminal_roots_required,
-                claimed_terminal_roots: ready.claimed_terminal_roots,
+                terminal_settled_txs_required: ready.terminal_settled_txs_required,
+                claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
                 settled_txs_window_floor: ready.settled_txs_window_floor,
                 parent_sweep_frontier: ready.parent_sweep_frontier,
@@ -1459,7 +1458,7 @@ impl ShardCoordinatorSim {
                 parent_committee_anchor_epoch,
                 committee_anchor_epoch,
                 carry_split_child_roots,
-                carry_terminal_roots,
+                carry_terminal_settled_txs,
                 settled_txs_window_floor,
                 classification_topology_snapshot: classification_topology,
                 frontier,
@@ -1553,9 +1552,9 @@ impl ShardCoordinatorSim {
                     frontier.anchor,
                     frontier.local,
                 );
-                let terminal_roots = carry_terminal_roots.then(|| {
+                let terminal_settled_txs = carry_terminal_settled_txs.then(|| {
                     self.pending_chains[emitter_idx]
-                        .terminal_roots_in_window(
+                        .terminal_settled_txs_root(
                             &TerminalWindow {
                                 local_shard: shard_id,
                                 parent_block_hash,
@@ -1564,7 +1563,6 @@ impl ShardCoordinatorSim {
                                 settled_window_floor: settled_txs_window_floor,
                             },
                             &finalizations,
-                            transactions.iter().map(|tx| tx.hash()).collect(),
                         )
                         .expect("the sim's stores hold every height in the window")
                 });
@@ -1611,7 +1609,7 @@ impl ShardCoordinatorSim {
                     parent_committee_anchor_epoch,
                     committee_anchor_epoch,
                     carry_split_child_roots,
-                    terminal_roots,
+                    terminal_settled_txs,
                     &frontier,
                 );
                 let block_hash = result.block_hash;
@@ -1625,12 +1623,6 @@ impl ShardCoordinatorSim {
                         parent_block_hash,
                         height,
                         settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
-                        committed_txs: result
-                            .block
-                            .transactions()
-                            .iter()
-                            .map(|tx| tx.hash())
-                            .collect(),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
                         certified_uncommitted: None,
@@ -1853,13 +1845,12 @@ impl ShardCoordinatorSim {
                 expected_root,
                 expected_local_receipt_root,
                 finalizations,
-                block_tx_hashes,
                 creations,
                 block_height,
                 claimed_split_child_roots,
                 split_child_roots_required,
-                terminal_roots_required,
-                claimed_terminal_roots,
+                terminal_settled_txs_required,
+                claimed_terminal_settled_txs,
                 parent_weighted_timestamp,
                 settled_txs_window_floor,
                 parent_sweep_frontier,
@@ -1888,9 +1879,9 @@ impl ShardCoordinatorSim {
                 if !receipt_ok {
                     return;
                 }
-                let computed_terminal_roots = terminal_roots_required.then(|| {
+                let computed_terminal_settled_txs = terminal_settled_txs_required.then(|| {
                     self.pending_chains[emitter_idx]
-                        .terminal_roots_in_window(
+                        .terminal_settled_txs_root(
                             &TerminalWindow {
                                 local_shard: self.shard,
                                 parent_block_hash,
@@ -1899,7 +1890,6 @@ impl ShardCoordinatorSim {
                                 settled_window_floor: settled_txs_window_floor,
                             },
                             &finalizations,
-                            block_tx_hashes.clone(),
                         )
                         .expect("the sim's stores hold every height in the window")
                 });
@@ -1948,9 +1938,9 @@ impl ShardCoordinatorSim {
                     computed_root: &computed_root,
                     claimed_split_child_roots,
                     split_child_roots_required,
-                    claimed_terminal_roots,
-                    computed_terminal_roots,
-                    terminal_roots_required,
+                    claimed_terminal_settled_txs,
+                    computed_terminal_settled_txs,
+                    terminal_settled_txs_required,
                 });
                 let bytes_delta = jmt_snapshot.bytes_delta;
                 if verify_result.is_ok() {
@@ -1960,7 +1950,6 @@ impl ShardCoordinatorSim {
                             parent_block_hash,
                             height: block_height,
                             settled_txs: local_settled_tx_hashes(&finalizations, self.shard),
-                            committed_txs: block_tx_hashes,
                             jmt_snapshot,
                             certified_block: None,
                             certified_uncommitted: None,

@@ -1098,7 +1098,7 @@ pub(crate) mod fixtures {
                         height: BlockHeight::new(9),
                         weighted_timestamp: WeightedTimestamp::from_millis(cut_ms),
                         witness_base: BeaconWitnessLeafCount::ZERO,
-                        terminal_roots: None,
+                        terminal_settled_txs: None,
                         handoff_complete,
                     },
                 )

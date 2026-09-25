@@ -244,7 +244,7 @@ mod tests {
             height: BlockHeight::new(HEIGHT),
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
         };
         (
@@ -341,7 +341,7 @@ mod tests {
             height: BlockHeight::new(HEIGHT),
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
         };
         let peer = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);

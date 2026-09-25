@@ -650,7 +650,7 @@ impl Counterparts {
             })
             .filter_map(|shard| {
                 let anchor = head.boundary(shard)?;
-                let attested_root = anchor.terminal_roots?.settled_txs;
+                let attested_root = anchor.terminal_settled_txs?;
                 let terminal_wt = topology_schedule.terminal_cut_wt(shard)?;
                 Some(TerminalEvidence {
                     shard,

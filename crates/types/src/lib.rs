@@ -115,10 +115,10 @@ pub use network::{
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
-    CommittedTxsRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
-    GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
-    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
+    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot,
+    FinalizationHash, GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
+    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, RevealChain, SettledTxsRoot, StateClaimsRoot,
+    StateRoot, TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex,
@@ -191,13 +191,13 @@ pub use shard::read_frontier::{
 };
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
-    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CommittedTxAbsence, CommittingShards,
-    LeafRoot, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CommittingShards, LeafRoot,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     REVEAL_CHAIN_DOMAIN_TAG, RootMismatch, SplitChildRoots, StateRootContext, StateRootVerifyError,
-    TerminalRoots, TransactionRootContext, TxRootVerifyError, commit_witness_window,
-    committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves, derive_reshape_trigger,
-    extend_reveal_chain, local_settled_tx_hashes, missed_proposals_since_prev_commit,
-    next_reveal_chain, prove_committed_tx_absent, ready_leaf_payload, settled_txs_root_from_hashes,
+    TransactionRootContext, TxRootVerifyError, commit_witness_window, derive_leaves,
+    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
+    settled_txs_root_from_hashes,
 };
 pub use shard::state_claim::{StateClaim, Stated};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};

@@ -811,7 +811,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         };
         state.boundaries.insert(quiet, record);
@@ -850,7 +850,7 @@ mod tests {
             terminal_epoch: terminal,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         };
 

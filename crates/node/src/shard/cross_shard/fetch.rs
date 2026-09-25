@@ -647,10 +647,10 @@ mod settled_txs_tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, CommittedTxsRoot,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
         Hash, ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, SignerBitfield,
-        TerminalRoots, TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
+        TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -720,10 +720,7 @@ mod settled_txs_tests {
                 timestamp: ProposerTimestamp::from_millis(1_000 * h),
                 certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
                 provision_tx_roots: Capped::default(),
-                terminal_roots: Some(TerminalRoots {
-                    settled_txs: SettledTxsRoot::ZERO,
-                    committed_txs: CommittedTxsRoot::ZERO,
-                }),
+                terminal_settled_txs: Some(SettledTxsRoot::ZERO),
                 ..Default::default()
             });
             let block = Block::Live {

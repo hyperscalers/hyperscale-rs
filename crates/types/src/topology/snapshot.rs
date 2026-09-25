@@ -14,7 +14,7 @@ use hyperscale_vm_types::PriceTable;
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
     DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, SeedRing,
-    ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction, ValidatorId,
+    SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
     ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
@@ -56,16 +56,15 @@ pub struct ShardAnchor {
     /// header's `beacon_witness_root`. Serving shards retain persisted
     /// witness payloads down to this index.
     pub witness_base: BeaconWitnessLeafCount,
-    /// The terminated shard's beacon-attested [`TerminalRoots`], set only
-    /// on a terminal boundary record and `None` for a live shard's anchor.
+    /// The terminated shard's beacon-attested settled-transaction root,
+    /// set only on a terminal boundary record and `None` for a live
+    /// shard's anchor.
     ///
-    /// A surviving counterpart reads the settled half to resolve
-    /// split-straddling ticks; a reshape successor reads the committed
-    /// half to tell a replay of something the predecessor committed from a
-    /// first inclusion it never made. Both also take them off the terminal
-    /// header directly — this is the durable copy a restart, or a
-    /// validator seated after the flip, recovers them from.
-    pub terminal_roots: Option<TerminalRoots>,
+    /// A surviving counterpart reads it to resolve split-straddling
+    /// ticks, and also takes it off the terminal header directly — this
+    /// is the durable copy a restart, or a validator seated after the
+    /// flip, recovers it from.
+    pub terminal_settled_txs: Option<SettledTxsRoot>,
     /// The epoch the beacon fold first observed this terminal shard's
     /// reshape successors live. The terminal-evidence window counts from
     /// here; `None` while the handoff is pending (an open window), and
@@ -1554,7 +1553,7 @@ mod tests {
             height: BlockHeight::new(42),
             weighted_timestamp: WeightedTimestamp::from_millis(42),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
         };
         let mut boundaries = HashMap::new();

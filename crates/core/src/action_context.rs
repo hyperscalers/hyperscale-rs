@@ -164,5 +164,4 @@ pub struct PreparedBlock {
     pub prepared: PreparedCommit,
     pub jmt_snapshot: Arc<JmtSnapshot>,
     pub settled_txs: Vec<TxHash>,
-    pub committed_txs: Vec<TxHash>,
 }

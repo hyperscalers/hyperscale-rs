@@ -1441,17 +1441,14 @@ impl ShardCoordinator {
         }
     }
 
-    /// Whether a header keyed at `wt` carries the two terminal-boundary
-    /// roots — `settled_txs_root` and `committed_txs_root` — set on any
-    /// terminating boundary header (a split parent's *or* a merge child's
-    /// final epoch), identical on the build side (carry) and the vote side
-    /// (required). One bit for both: they answer different readers but are
-    /// carried by the same headers, so nothing distinguishes when to emit
-    /// one from when to emit the other. Broader than
+    /// Whether a header keyed at `wt` carries the terminal settled root —
+    /// set on any terminating boundary header (a split parent's *or* a
+    /// merge child's final epoch), identical on the build side (carry) and
+    /// the vote side (required). Broader than
     /// [`Self::split_child_roots_bit`]: a merge child terminates without
     /// carrying `split_child_roots`. `None` under that helper's retention
     /// condition, and only that one.
-    fn terminal_roots_bit(
+    fn terminal_settled_txs_bit(
         &self,
         topology_schedule: &TopologySchedule,
         wt: WeightedTimestamp,
@@ -2468,8 +2465,8 @@ impl ShardCoordinator {
             );
             return vec![];
         };
-        let Some(carry_terminal_roots) =
-            self.terminal_roots_bit(topology_schedule, parent_qc.weighted_timestamp())
+        let Some(carry_terminal_settled_txs) =
+            self.terminal_settled_txs_bit(topology_schedule, parent_qc.weighted_timestamp())
         else {
             trace!(
                 validator = ?self.me,
@@ -2578,7 +2575,7 @@ impl ShardCoordinator {
             parent_committee_anchor_epoch,
             committee_anchor_epoch,
             carry_split_child_roots,
-            carry_terminal_roots,
+            carry_terminal_settled_txs,
             topology_schedule
                 .settled_window_floor(self.local_shard, parent_qc.weighted_timestamp()),
             Arc::clone(committee),
@@ -3554,7 +3551,7 @@ impl ShardCoordinator {
                 );
                 return vec![];
             };
-            let Some(terminal_roots_required) = self.terminal_roots_bit(
+            let Some(terminal_settled_txs_required) = self.terminal_settled_txs_bit(
                 topology_schedule,
                 block.header().parent_qc().weighted_timestamp(),
             ) else {
@@ -3637,7 +3634,7 @@ impl ShardCoordinator {
                     deltas: &self.pending_bytes_deltas,
                 },
                 split_child_roots_required,
-                terminal_roots_required,
+                terminal_settled_txs_required,
                 fee_demands,
                 fee_read_height,
                 fee_read_ready,
@@ -5722,9 +5719,9 @@ impl ShardCoordinator {
             return;
         }
         let anchor_wt = block.header().parent_qc().weighted_timestamp();
-        let (Some(split_child_roots_required), Some(terminal_roots_required)) = (
+        let (Some(split_child_roots_required), Some(terminal_settled_txs_required)) = (
             self.split_child_roots_bit(topology_schedule, anchor_wt),
-            self.terminal_roots_bit(topology_schedule, anchor_wt),
+            self.terminal_settled_txs_bit(topology_schedule, anchor_wt),
         ) else {
             debug!(
                 validator = ?self.me,
@@ -5743,7 +5740,7 @@ impl ShardCoordinator {
             block,
             block.header().parent_qc().height(),
             split_child_roots_required,
-            terminal_roots_required,
+            terminal_settled_txs_required,
             settled_txs_window_floor,
             FrontierInputs::of_block(block, topology_schedule.windows()),
             ReadFence::default(),
@@ -7069,14 +7066,13 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        BlockHeaderParts, CommittedAt, CommittedTxsRoot, ConsensusSignature, Deadline,
-        DeclaredWork, Epoch, Hash, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        NetworkDefinition, NetworkParams, RoutePrefix, SettledSetVerdict, SettledTxSet,
-        SettledTxsRoot, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
-        TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
-        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
-        ValidatorSet, VoteCount, WeightedTimestamp, WindowLookup, WitnessSources,
-        settled_set_verdict, test_utils,
+        BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, DeclaredWork, Epoch, Hash,
+        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
+        RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TimestampRange, TopologySchedule,
+        TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
+        WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -7357,10 +7353,7 @@ mod tests {
             height: BlockHeight::new(9),
             weighted_timestamp: WeightedTimestamp::from_millis(10_000),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: Some(TerminalRoots {
-                settled_txs: SettledTxsRoot::ZERO,
-                committed_txs: CommittedTxsRoot::ZERO,
-            }),
+            terminal_settled_txs: Some(SettledTxsRoot::ZERO),
             handoff_complete: None,
         };
         let live = |shards: &[ShardId], boundaries: HashMap<ShardId, ShardAnchor>| {
@@ -12692,7 +12685,7 @@ mod tests {
                     height: BlockHeight::new(9),
                     weighted_timestamp: WeightedTimestamp::from_millis(1_000),
                     witness_base: BeaconWitnessLeafCount::ZERO,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     handoff_complete: None,
                 },
             )])),

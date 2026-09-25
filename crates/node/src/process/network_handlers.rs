@@ -861,10 +861,9 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     use hyperscale_engine::Executor;
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetCellsRequest, GetCommittedTxsRequest, GetInstanceRecordsRequest,
-        GetPackageArtifactsRequest, GetProvisionsRequest, GetRemoteHeadersRequest,
-        GetSettledTxsRequest, GetStateProofRequest, GetStateRangeRequest, GetTransactionsRequest,
-        GetWitnessHistoryRequest,
+        GetBlockRequest, GetCellsRequest, GetInstanceRecordsRequest, GetPackageArtifactsRequest,
+        GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest,
+        GetStateRangeRequest, GetTransactionsRequest, GetWitnessHistoryRequest,
     };
     use hyperscale_types::network::response::{
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
@@ -876,10 +875,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        CommittedTxsCache, SettledTxsCache, serve_cells_request, serve_committed_txs_request,
-        serve_execution_certs_request, serve_finalizations_request, serve_local_provisions_request,
-        serve_provision_request, serve_remote_headers_request, serve_settled_txs_request,
-        serve_state_proof_request,
+        SettledTxsCache, serve_cells_request, serve_execution_certs_request,
+        serve_finalizations_request, serve_local_provisions_request, serve_provision_request,
+        serve_remote_headers_request, serve_settled_txs_request, serve_state_proof_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1250,30 +1248,11 @@ pub fn register_shard_request_handlers<S, N, D>(
             serve_settled_txs_request(&pending_chain, &settled_txs_cache, window_floor, &req)
         });
 
-    // ── committed_txs.request → terminated-shard membership answers ──
-    //
-    // A reshape successor resolving a transaction whose validity window
-    // opened before its own origin names our terminal block and the
-    // hashes it wants decided. Absence is proven against the terminal's
-    // `committed_txs_root`, which the successor already commit-proved, so
-    // nothing here is trusted. No window floor: the committed window is
-    // anchor-relative only.
-    let pending_chain = Arc::clone(&io.pending_chain);
-    // The walk behind an answer is the committed window in full, and the
-    // set it produces cannot change once the terminal is committed. One
-    // reconstruction serves every query about that terminal, from every
-    // peer, for as long as anyone is still asking.
-    let committed_txs_cache = Arc::new(CommittedTxsCache::default());
-    process
-        .network
-        .register_request_handler::<GetCommittedTxsRequest>(shard, move |req| {
-            serve_committed_txs_request(&pending_chain, &committed_txs_cache, &req)
-        });
-
     // ── state_proof.request → proof of keys at a committed height ──
     //
     // A shard holding an escrow a core here never claimed asks whether
-    // this shard committed the transaction, against one of our headers
+    // this shard committed the transaction, and a split's right child asks
+    // a terminated parent whether it did, each against one of our headers
     // it has commit-proved. The proof is checked against that header's
     // root on the requester's side, so nothing here is trusted; a
     // height outside the JMT's history answers `not_found` and the

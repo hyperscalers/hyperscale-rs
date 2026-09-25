@@ -1060,7 +1060,7 @@ fn record_boundaries(
                 terminal_epoch: marks.terminal_epoch,
                 handoff_complete: marks.handoff_complete,
                 terminal_delivered: marks.terminal_delivered,
-                terminal_roots: header.terminal_roots(),
+                terminal_settled_txs: header.settled_txs_root(),
                 reshape_admitted_epoch: marks.reshape_admitted_epoch,
             },
         );
@@ -1312,7 +1312,7 @@ fn seed_split_children(
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -1425,7 +1425,7 @@ fn compose_merge_parent(
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         },
     );
@@ -1446,14 +1446,13 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BASIS_POINTS, BeaconProposal, BeaconWitnessLeafCount,
         BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin,
-        CommittedTxsRoot, DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash,
-        MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable,
-        QuorumCertificate, RETENTION_HORIZON, ReshapeThresholds, Round, SettledTxsRoot,
-        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad, ShardRecovery,
-        ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
-        StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots, TopologySchedule, TransitionCause,
-        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root, compute_range_proof,
-        derive_reshape_trigger,
+        DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash, MAX_RANGE_PROOF_NODES,
+        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable, QuorumCertificate,
+        RETENTION_HORIZON, ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
+        ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
+        SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS,
+        TopologySchedule, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
+        compute_merkle_root, compute_range_proof, derive_reshape_trigger,
     };
 
     use super::*;
@@ -1489,7 +1488,7 @@ mod tests {
         root: BeaconWitnessRoot,
         leaf_count: u64,
         split_child_roots: Option<SplitChildRoots>,
-        terminal_roots: Option<TerminalRoots>,
+        terminal_settled_txs: Option<SettledTxsRoot>,
     ) -> BlockHeader {
         let parent_qc = QuorumCertificate::new(
             BlockHash::ZERO,
@@ -1510,7 +1509,7 @@ mod tests {
             beacon_witness_root: root,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
             split_child_roots,
-            terminal_roots,
+            terminal_settled_txs,
             ..Default::default()
         })
     }
@@ -1556,7 +1555,7 @@ mod tests {
         state_root: StateRoot,
         payloads: Vec<ShardWitnessPayload>,
         split_child_roots: Option<SplitChildRoots>,
-        terminal_roots: Option<TerminalRoots>,
+        terminal_settled_txs: Option<SettledTxsRoot>,
     ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let leaf_count = payloads.len() as u64;
         let leaf_hashes: Vec<Hash> = payloads
@@ -1576,7 +1575,7 @@ mod tests {
             root,
             leaf_count,
             split_child_roots,
-            terminal_roots,
+            terminal_settled_txs,
         );
         let range_proof = compute_range_proof(&leaf_hashes, 0, leaf_hashes.len());
         (header, payloads, range_proof)
@@ -1963,7 +1962,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2023,7 +2022,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2420,7 +2419,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2519,7 +2518,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2597,7 +2596,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3177,7 +3176,7 @@ mod tests {
         pair: SplitChildRoots,
         state_root: StateRoot,
         leaf_count: u64,
-        terminal_roots: Option<TerminalRoots>,
+        terminal_settled_txs: Option<SettledTxsRoot>,
     ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
@@ -3192,7 +3191,7 @@ mod tests {
             state_root,
             payloads,
             Some(pair),
-            terminal_roots,
+            terminal_settled_txs,
         )
     }
 
@@ -3220,7 +3219,7 @@ mod tests {
                 terminal_epoch: Some(Epoch::new(1)),
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3243,7 +3242,7 @@ mod tests {
                     terminal_epoch: None,
                     handoff_complete: None,
                     terminal_delivered: false,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3578,7 +3577,7 @@ mod tests {
         );
     }
 
-    /// The evidence window outlives the fold that first carries the roots.
+    /// The evidence window outlives the fold that first carries the root.
     ///
     /// A terminal block satisfies `parent ≤ cut < qc`, so it cannot exist
     /// until the window after the one it closes, and the beacon block for
@@ -3586,27 +3585,24 @@ mod tests {
     /// the contribution folds one window later again. At a production
     /// 300s epoch that is 600s past the cut, so a window measured in
     /// transaction-artifact retention (144s) would drop the record on the
-    /// very fold that first gave it roots to project, and no counterpart
+    /// very fold that first gave it a root to project, and no counterpart
     /// would ever read a departed shard's settled set.
     ///
     /// The successors are live here, so nothing but the window itself is
     /// holding the record.
     #[test]
-    fn terminal_roots_land_inside_the_evidence_window() {
+    fn terminal_settled_txs_land_inside_the_evidence_window() {
         let (mut state, parent, pair, composed) = terminating_state();
         // Production epochs: the cut moves to 600_000ms, and the fold that
-        // carries the roots opens at 900_000ms.
+        // carries the root opens at 900_000ms.
         state.chain_config.epoch_duration_ms = 300_000;
         for child in <[ShardId; 2]>::from(parent.children()) {
             state.advanced.insert(child);
         }
 
-        let roots = TerminalRoots {
-            settled_txs: SettledTxsRoot::from_raw(Hash::from_bytes(b"settled")),
-            committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed")),
-        };
+        let root = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
         let (header, payloads, range_proof) =
-            terminal_block_with_witnesses(parent, 9, 599_000, pair, composed, 3, Some(roots));
+            terminal_block_with_witnesses(parent, 9, 599_000, pair, composed, 3, Some(root));
         let (committed, contributions) = contribution_for(
             parent,
             header,
@@ -3629,11 +3625,11 @@ mod tests {
         let record = state
             .boundaries
             .get(&parent)
-            .expect("the record survives the fold that first carries its roots");
+            .expect("the record survives the fold that first carries its root");
         assert_eq!(
-            record.terminal_roots,
-            Some(roots),
-            "and it carries them, for a surviving counterpart to read",
+            record.terminal_settled_txs,
+            Some(root),
+            "and it carries it, for a surviving counterpart to read",
         );
     }
 
@@ -3803,7 +3799,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3828,7 +3824,7 @@ mod tests {
                     terminal_epoch: Some(Epoch::new(1)),
                     handoff_complete: None,
                     terminal_delivered: true,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3937,13 +3933,8 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let total = MAX_WITNESSES_PER_SHARD as u64 + 6;
         let root = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled transaction"));
-        let roots = TerminalRoots {
-            settled_txs: root,
-            committed_txs: CommittedTxsRoot::ZERO,
-        };
-
         let (header, payloads, _range_proof) =
-            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, Some(roots));
+            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, Some(root));
         let first_chunk = sub_chunk(&payloads, 0, MAX_WITNESSES_PER_SHARD);
         let (committed, contributions) = contribution_for(parent, header, first_chunk, 2_500);
         record_boundaries(
@@ -3957,7 +3948,7 @@ mod tests {
         );
 
         let folded = state.boundaries.get(&parent).expect("lingers mid-drain");
-        assert_eq!(folded.terminal_roots.map(|r| r.settled_txs), Some(root));
+        assert_eq!(folded.terminal_settled_txs, Some(root));
 
         // The projection carries the root onto the anchor regardless of
         // trie membership: a terminated parent leaves the trie, but its
@@ -3966,7 +3957,7 @@ mod tests {
             .derive_topology_snapshot(net())
             .boundary(parent)
             .expect("terminal record projects");
-        assert_eq!(anchor.terminal_roots.map(|r| r.settled_txs), Some(root));
+        assert_eq!(anchor.terminal_settled_txs, Some(root));
     }
 
     // ─── merge parent composition ────────────────────────────────────────
@@ -4000,7 +3991,7 @@ mod tests {
                     terminal_epoch: Some(Epoch::new(1)),
                     handoff_complete: None,
                     terminal_delivered: false,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -4023,7 +4014,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -4425,7 +4416,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             }
         }
@@ -4796,7 +4787,7 @@ mod tests {
                     terminal_epoch: None,
                     handoff_complete: None,
                     terminal_delivered: false,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -5313,7 +5304,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         }
     }

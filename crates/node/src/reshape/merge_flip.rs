@@ -36,7 +36,7 @@ use hyperscale_types::{
 /// merged state, so the parent asks neither of them anything; the pair
 /// is what tells it which chains it succeeds.
 ///
-/// All or nothing. A terminal carrying no terminal roots takes the pair
+/// All or nothing. A terminal carrying no terminal settled root takes the pair
 /// with it, so the successor never judges its shape from part of the set.
 /// Empty is the strict refusal it already runs under.
 ///
@@ -85,9 +85,9 @@ pub(crate) fn merge_genesis_from_terminals(
 mod tests {
 
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin,
-        CommittedTxsRoot, Hash, QuorumCertificate, Round, SettledTxsRoot, ShardId, SignerBitfield,
-        SplitChildRoots, StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
+        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Hash,
+        QuorumCertificate, Round, SettledTxsRoot, ShardId, SignerBitfield, SplitChildRoots,
+        StateRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(genesis.header().state_root(), composed);
         assert_eq!(origin.genesis_height, BlockHeight::new(10));
         assert_eq!(origin.anchor_wt, cut_wt);
-        // Neither terminal carries terminal roots here, so the merged
+        // Neither terminal carries a terminal settled root here, so the merged
         // parent is handed no predecessors and keeps its strict rule.
         assert!(predecessors.is_empty());
     }
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(predecessors[1].state_root, right_terminal.state_root());
     }
 
-    /// And both or neither. A terminal carrying no terminal roots takes
+    /// And both or neither. A terminal carrying no terminal settled root takes
     /// the pair with it, and empty keeps the strict refusal.
     #[test]
     fn one_child_without_a_commitment_takes_the_pair() {
@@ -202,8 +202,8 @@ mod tests {
         }
     }
 
-    /// A terminating child's header at `height`, carrying its own
-    /// committed-transaction commitment when `carries_roots`.
+    /// A terminating child's header at `height`, carrying a terminal
+    /// settled root when `carries_roots`.
     fn child_terminal(shard: ShardId, height: u64, tag: &[u8], carries_roots: bool) -> BlockHeader {
         BlockHeader::new(BlockHeaderParts {
             shard_id: shard,
@@ -213,10 +213,7 @@ mod tests {
             proposer: ValidatorId::new(2),
             round: Round::new(7),
             state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
-            terminal_roots: carries_roots.then(|| TerminalRoots {
-                settled_txs: SettledTxsRoot::ZERO,
-                committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(tag)),
-            }),
+            terminal_settled_txs: carries_roots.then_some(SettledTxsRoot::ZERO),
             ..Default::default()
         })
     }

@@ -273,7 +273,7 @@ mod tests {
                         height: BlockHeight::new(9),
                         weighted_timestamp: wt(CUT_MS),
                         witness_base: BeaconWitnessLeafCount::ZERO,
-                        terminal_roots: None,
+                        terminal_settled_txs: None,
                         handoff_complete: *handoff_complete,
                     },
                 )

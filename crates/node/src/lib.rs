@@ -52,8 +52,7 @@ pub use host::{NodeHost, ShardGenesis};
 pub use process::TxStatusCache;
 pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_request};
 pub use shard::cross_shard::{
-    serve_committed_txs_request, serve_local_certified_headers, serve_settled_txs_request,
-    serve_state_proof_request,
+    serve_local_certified_headers, serve_settled_txs_request, serve_state_proof_request,
 };
 pub use shard::{SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;

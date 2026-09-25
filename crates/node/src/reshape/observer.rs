@@ -303,7 +303,7 @@ pub struct DerivedGenesis {
     pub origin: ChainOrigin,
     /// The parent terminal this child succeeds, carried off the same
     /// header the genesis derives from. `None` when that header carries
-    /// no committed-transaction commitment.
+    /// no terminal settled root.
     pub predecessor: Option<Anchor>,
 }
 
@@ -1018,7 +1018,7 @@ mod tests {
             height: BlockHeight::new(1),
             weighted_timestamp: WeightedTimestamp::from_millis(4_000),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
         };
         // The terminal's own parent QC sits at the cut exactly — the

@@ -41,8 +41,8 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
-    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardFullness, ShardId, ShardTrie,
-    Stake, StakePoolId, StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
+    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, SettledTxsRoot, ShardFullness,
+    ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId, WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -359,20 +359,18 @@ pub struct ShardBoundary {
     /// parent never sets it — its children seed in the same fold that
     /// records its terminal, so there is nothing to wait for.
     pub terminal_delivered: bool,
-    /// The terminal header's [`TerminalRoots`] — the beacon-attested
-    /// commitments this shard left the chains that outlive it. `Some` only
-    /// on a terminated shard's boundary record, `None` for a live shard,
-    /// and projected onto [`ShardAnchor`](crate::ShardAnchor) for both its
-    /// readers.
+    /// The terminal header's settled-transaction root — the
+    /// beacon-attested commitment this shard left the counterparts that
+    /// outlive it. `Some` only on a terminated shard's boundary record,
+    /// `None` for a live shard, and projected onto
+    /// [`ShardAnchor`](crate::ShardAnchor).
     ///
-    /// This projection is the durable delivery. Both readers also take the
-    /// roots straight off the terminal header, which is the only path fast
-    /// enough while the successor's rule is live; but a successor derives
-    /// its `RecoveredState` afresh on every boot and cannot reconstruct
-    /// the roots from its own chain, so a restart inside the window — or a
-    /// validator rotated onto the successor committee after the flip —
-    /// reads them here or not at all.
-    pub terminal_roots: Option<TerminalRoots>,
+    /// This projection is the durable delivery. A counterpart also takes
+    /// the root straight off the terminal header; but a restart, or a
+    /// validator seated after the flip, cannot reconstruct it from its own
+    /// chain and reads it here or not at all. A successor reads its
+    /// presence as the mark of a terminal record.
+    pub terminal_settled_txs: Option<SettledTxsRoot>,
     /// Epoch the reshape that terminates this shard was admitted (split)
     /// or paired (merge), stamped at the reshape's execution alongside
     /// [`terminal_epoch`](Self::terminal_epoch). Floors the shard's
@@ -1860,7 +1858,7 @@ impl BeaconState {
                         height: b.height,
                         weighted_timestamp: b.weighted_timestamp,
                         witness_base: b.witness_base,
-                        terminal_roots: b.terminal_roots,
+                        terminal_settled_txs: b.terminal_settled_txs,
                         handoff_complete: b.handoff_complete,
                     },
                 )
@@ -2227,7 +2225,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         };
         state.boundaries.insert(child, pending(Epoch::new(4)));
@@ -2298,7 +2296,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         };
 
@@ -2601,7 +2599,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             })
             .witness_leaf_count = BeaconWitnessLeafCount::new(7);

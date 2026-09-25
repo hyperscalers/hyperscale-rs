@@ -144,6 +144,20 @@ const _: () = assert!(
 /// walks. Half an epoch is the working margin, not the hard bound.
 const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
 
+/// A transaction predates at most one cut on its lineage.
+///
+/// Cuts on one lineage fall on epoch boundaries at least an epoch apart,
+/// so a transaction still admissible after a cut opened after the one
+/// before it: a successor judges it by its parent's markers alone, never
+/// a grandparent's. The figure is the validity range because the precut
+/// question is only asked at anchors below the range's end. Implied by
+/// the assertion above, and stated because it is the premise the precut
+/// rule reads.
+const _: () = assert!(
+    MAX_VALIDITY_RANGE.as_secs() < EPOCH_DURATION.as_secs(),
+    "a transaction predates at most one cut",
+);
+
 /// A skipped epoch and its recovery must not expire the transactions a
 /// shard is holding. `SKIP_TIMEOUT` bounds the wait before the pool
 /// prevotes a skip, and ratification rounds follow it; a validity window

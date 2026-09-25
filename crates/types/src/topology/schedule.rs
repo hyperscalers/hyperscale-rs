@@ -925,7 +925,7 @@ impl TopologySchedule {
     /// next.
     ///
     /// All or nothing. A candidate whose boundary record is not yet
-    /// folded, or carries no [`TerminalRoots`](crate::TerminalRoots) yet,
+    /// folded, or carries no terminal settled root yet,
     /// takes the whole set with it, so a successor never judges which
     /// shape it was born by from part of the set. Holding none is the
     /// strict refusal the successor already runs under, so nothing is lost
@@ -958,7 +958,7 @@ impl TopologySchedule {
             .filter(|candidate| self.terminal_cut_wt(*candidate) == Some(origin_wt))
             .map(|candidate| {
                 let record = self.head.boundary(candidate)?;
-                record.terminal_roots?;
+                record.terminal_settled_txs?;
                 Some(Anchor {
                     shard: candidate,
                     height: record.height,
@@ -1191,9 +1191,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, CommittedTxsRoot, CompletedRecovery, Hash,
-        NetworkDefinition, RecoveryCause, ReshapeSeat, SettledTxsRoot, ShardAnchor, ShardRecovery,
-        StateRoot, TerminalRoots, ValidatorSet,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, Hash, NetworkDefinition,
+        RecoveryCause, ReshapeSeat, SettledTxsRoot, ShardAnchor, ShardRecovery, StateRoot,
+        ValidatorSet,
     };
 
     fn snapshot() -> Arc<TopologySnapshot> {
@@ -1230,13 +1230,13 @@ mod tests {
 
     fn topology_with(
         live: &[ShardId],
-        terminated: &[(ShardId, Option<CommittedTxsRoot>)],
+        terminated: &[(ShardId, Option<SettledTxsRoot>)],
     ) -> Arc<TopologySnapshot> {
         let committees: HashMap<ShardId, Vec<ValidatorId>> =
             live.iter().map(|shard| (*shard, Vec::new())).collect();
         let boundaries: HashMap<ShardId, ShardAnchor> = terminated
             .iter()
-            .map(|(shard, committed)| {
+            .map(|(shard, settled)| {
                 (
                     *shard,
                     ShardAnchor {
@@ -1247,10 +1247,7 @@ mod tests {
                         height: BlockHeight::new(41),
                         weighted_timestamp: WeightedTimestamp::ZERO,
                         witness_base: BeaconWitnessLeafCount::ZERO,
-                        terminal_roots: committed.map(|committed_txs| TerminalRoots {
-                            settled_txs: SettledTxsRoot::ZERO,
-                            committed_txs,
-                        }),
+                        terminal_settled_txs: *settled,
                         handoff_complete: None,
                     },
                 )
@@ -1270,8 +1267,8 @@ mod tests {
         ))
     }
 
-    fn root_committed() -> CommittedTxsRoot {
-        CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed window"))
+    fn root_settled() -> SettledTxsRoot {
+        SettledTxsRoot::from_raw(Hash::from_bytes(b"settled window"))
     }
 
     /// A two-window schedule cut at 1000ms: `before` governs epoch 0,
@@ -1282,7 +1279,7 @@ mod tests {
     fn cut_at_1000(
         before: &[ShardId],
         after: &[ShardId],
-        terminated: &[(ShardId, Option<CommittedTxsRoot>)],
+        terminated: &[(ShardId, Option<SettledTxsRoot>)],
     ) -> TopologySchedule {
         let head = topology_with(after, terminated);
         let mut sched = TopologySchedule::new(1000, Epoch::new(0), topology_with(before, &[]));
@@ -1301,7 +1298,7 @@ mod tests {
         let sched = cut_at_1000(
             &[ShardId::ROOT],
             &[left, right],
-            &[(ShardId::ROOT, Some(root_committed()))],
+            &[(ShardId::ROOT, Some(root_settled()))],
         );
         let cut = WeightedTimestamp::from_millis(1000);
 
@@ -1320,10 +1317,7 @@ mod tests {
         let sched = cut_at_1000(
             &[left, right],
             &[ShardId::ROOT],
-            &[
-                (left, Some(root_committed())),
-                (right, Some(root_committed())),
-            ],
+            &[(left, Some(root_settled())), (right, Some(root_settled()))],
         );
 
         let predecessors =
@@ -1344,26 +1338,22 @@ mod tests {
     fn a_merged_parent_holds_both_children_or_neither() {
         let (left, right) = ShardId::ROOT.children();
         let cut = WeightedTimestamp::from_millis(1000);
-        let succeeding = |terminated: &[(ShardId, Option<CommittedTxsRoot>)]| {
+        let succeeding = |terminated: &[(ShardId, Option<SettledTxsRoot>)]| {
             cut_at_1000(&[left, right], &[ShardId::ROOT], terminated)
                 .predecessor_terminals(ShardId::ROOT, cut)
         };
 
         assert_eq!(
-            succeeding(&[
-                (left, Some(root_committed())),
-                (right, Some(root_committed())),
-            ])
-            .len(),
+            succeeding(&[(left, Some(root_settled())), (right, Some(root_settled())),]).len(),
             2,
         );
         // The right child's terminal has folded, but without its roots.
         assert!(
-            succeeding(&[(left, Some(root_committed())), (right, None)]).is_empty(),
+            succeeding(&[(left, Some(root_settled())), (right, None)]).is_empty(),
             "one child's commitment is not the merged parent's answer",
         );
         // And the case where its boundary record has not folded at all.
-        assert!(succeeding(&[(left, Some(root_committed()))]).is_empty());
+        assert!(succeeding(&[(left, Some(root_settled()))]).is_empty());
     }
 
     /// The cut is what binds a terminal to a chain, not the shard tree. A
@@ -1376,7 +1366,7 @@ mod tests {
         let sched = cut_at_1000(
             &[ShardId::ROOT],
             &[left, right],
-            &[(ShardId::ROOT, Some(root_committed()))],
+            &[(ShardId::ROOT, Some(root_settled()))],
         );
 
         // The fixture is the one the positive case uses, so this asserts
@@ -1396,9 +1386,9 @@ mod tests {
         );
     }
 
-    /// A candidate whose boundary record carries no terminal roots is left
-    /// out: the successor keeps refusing everything from before its
-    /// origin, which is the rule the roots would have relaxed.
+    /// A candidate whose boundary record carries no terminal settled root
+    /// is left out: the successor keeps refusing everything from before
+    /// its origin until the record completes.
     #[test]
     fn a_terminal_without_roots_is_not_adopted() {
         let (left, right) = ShardId::ROOT.children();
@@ -1410,7 +1400,7 @@ mod tests {
             cut_at_1000(
                 &[ShardId::ROOT],
                 &[left, right],
-                &[(ShardId::ROOT, Some(root_committed()))],
+                &[(ShardId::ROOT, Some(root_settled()))],
             )
             .predecessor_terminals(left, cut)
             .len(),

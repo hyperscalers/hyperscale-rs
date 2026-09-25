@@ -1816,7 +1816,7 @@ mod tests {
             terminal_epoch: terminal.map(Epoch::new),
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         }
     }

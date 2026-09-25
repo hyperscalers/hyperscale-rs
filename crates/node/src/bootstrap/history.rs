@@ -317,7 +317,7 @@ mod tests {
             height: top.height(),
             weighted_timestamp: top.block().header().parent_qc().weighted_timestamp(),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
         }
     }

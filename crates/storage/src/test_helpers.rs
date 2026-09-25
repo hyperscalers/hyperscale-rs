@@ -945,7 +945,7 @@ pub fn pin_snap_sync_replica(
         height: anchor_height,
         weighted_timestamp: WeightedTimestamp::from_millis(anchor_height.inner()),
         witness_base: BeaconWitnessLeafCount::ZERO,
-        terminal_roots: None,
+        terminal_settled_txs: None,
         handoff_complete: None,
     }
 }
@@ -3020,7 +3020,6 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
             parent_block_hash: block.header().parent_block_hash(),
             height: BlockHeight::new(1),
             settled_txs: Vec::new(),
-            committed_txs: Vec::new(),
             jmt_snapshot,
             certified_block: None,
             certified_uncommitted: None,

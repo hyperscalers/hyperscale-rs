@@ -35,9 +35,9 @@ use hyperscale_types::{
     MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions,
-    RevealChain, Round, ShardId, ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot,
-    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey, SweepFrontier,
-    TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
+    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim,
+    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey,
+    SweepFrontier, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
     TransactionRootContext, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
     VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
     WitnessSources, absorb_committed_cells, commit_witness_window, derive_leaves,
@@ -244,7 +244,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     parent_committee_anchor_epoch: Epoch,
     committee_anchor_epoch: Epoch,
     carry_split_child_roots: bool,
-    terminal_roots: Option<TerminalRoots>,
+    terminal_settled_txs: Option<SettledTxsRoot>,
     frontier: &FrontierInputs,
 ) -> ProposalResult {
     // The proposer builds on an anchored view of its parent — the state
@@ -446,7 +446,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         beacon_witness_base,
         reveal_chain,
         split_child_roots,
-        terminal_roots,
+        terminal_settled_txs,
         load,
     });
 
@@ -1028,13 +1028,12 @@ where
             expected_root,
             expected_local_receipt_root,
             finalizations,
-            block_tx_hashes,
             creations,
             block_height,
             claimed_split_child_roots,
             split_child_roots_required,
-            terminal_roots_required,
-            claimed_terminal_roots,
+            terminal_settled_txs_required,
+            claimed_terminal_settled_txs,
             parent_weighted_timestamp,
             settled_txs_window_floor,
             parent_sweep_frontier,
@@ -1204,12 +1203,12 @@ where
                 },
                 block_height,
             );
-            // A terminating shard's boundary header carries what it leaves
-            // its successors and its surviving counterparts; recompute the
-            // pair from the committed chain whenever the shard terminates
-            // at the next boundary, split or merge.
-            let computed_terminal_roots = match terminal_roots_required.then(|| {
-                ctx.pending_chain.terminal_roots_in_window(
+            // A terminating shard's boundary header carries the settled
+            // root its surviving counterparts read; recompute it from the
+            // committed chain whenever the shard terminates at the next
+            // boundary, split or merge.
+            let computed_terminal_settled_txs = match terminal_settled_txs_required.then(|| {
+                ctx.pending_chain.terminal_settled_txs_root(
                     &TerminalWindow {
                         local_shard: ctx.shard,
                         parent_block_hash,
@@ -1218,13 +1217,12 @@ where
                         settled_window_floor: settled_txs_window_floor,
                     },
                     &finalizations,
-                    block_tx_hashes.clone(),
                 )
             }) {
                 None => None,
-                Some(Ok(roots)) => Some(roots),
+                Some(Ok(root)) => Some(root),
                 // The window reaches below what this store answers for, so
-                // the pair is not computable here. Refusing says that;
+                // the root is not computable here. Refusing says that;
                 // carrying a root taken over the prefix would claim a
                 // smaller set than every full-history replica attests, and
                 // read back as a mismatch rather than as a gap.
@@ -1247,9 +1245,9 @@ where
                 computed_root: &computed_root,
                 claimed_split_child_roots,
                 split_child_roots_required,
-                claimed_terminal_roots,
-                computed_terminal_roots,
-                terminal_roots_required,
+                claimed_terminal_settled_txs,
+                computed_terminal_settled_txs,
+                terminal_settled_txs_required,
             });
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let bytes_delta = jmt_snapshot.bytes_delta;
@@ -1265,7 +1263,6 @@ where
                     prepared,
                     jmt_snapshot,
                     settled_txs: local_settled_tx_hashes(&finalizations, ctx.shard),
-                    committed_txs: block_tx_hashes,
                 });
             }
             let outcome = match verify_result {
@@ -1320,7 +1317,7 @@ where
             parent_committee_anchor_epoch,
             committee_anchor_epoch,
             carry_split_child_roots,
-            carry_terminal_roots,
+            carry_terminal_settled_txs,
             settled_txs_window_floor,
             classification_topology_snapshot: classification_topology,
             frontier,
@@ -1460,12 +1457,11 @@ where
                 }
                 kept
             };
-            let block_tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
-            // A terminating shard's boundary header carries what it leaves
-            // its successors and its surviving counterparts — whenever the
-            // shard terminates at the next boundary, split or merge.
-            let terminal_roots = match carry_terminal_roots.then(|| {
-                ctx.pending_chain.terminal_roots_in_window(
+            // A terminating shard's boundary header carries the settled
+            // root its surviving counterparts read — whenever the shard
+            // terminates at the next boundary, split or merge.
+            let terminal_settled_txs = match carry_terminal_settled_txs.then(|| {
+                ctx.pending_chain.terminal_settled_txs_root(
                     &TerminalWindow {
                         local_shard: shard_id,
                         parent_block_hash,
@@ -1474,13 +1470,12 @@ where
                         settled_window_floor: settled_txs_window_floor,
                     },
                     &finalizations,
-                    block_tx_hashes.clone(),
                 )
             }) {
                 None => None,
-                Some(Ok(roots)) => Some(roots),
-                // Nothing to propose: a boundary header carries this pair
-                // or it is not a boundary header, and the pair computed
+                Some(Ok(root)) => Some(root),
+                // Nothing to propose: a boundary header carries this root
+                // or it is not a boundary header, and the root computed
                 // here would be short. Leaving the slot empty rotates it
                 // to a proposer whose store reaches, which is the same
                 // response the round already has for one that cannot
@@ -1558,7 +1553,7 @@ where
                 parent_committee_anchor_epoch,
                 committee_anchor_epoch,
                 carry_split_child_roots,
-                terminal_roots,
+                terminal_settled_txs,
                 &frontier,
             );
             let block_hash = result.block_hash;
@@ -1571,7 +1566,6 @@ where
                 prepared: result.prepared_commit,
                 jmt_snapshot: result.jmt_snapshot,
                 settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
-                committed_txs: block_tx_hashes,
             });
             ctx.notify_protocol(ProtocolEvent::ProposalBuilt {
                 height,

@@ -191,22 +191,6 @@ hash_newtype!(
     "StateClaimsRoot"
 );
 
-hash_newtype!(
-    /// Merkle root over the transactions a shard committed within its
-    /// retention window up to a terminal block.
-    ///
-    /// Carried in [`BlockHeader::committed_txs_root`](crate::BlockHeader)
-    /// on a terminating shard's boundary header, beside
-    /// [`SettledTxsRoot`]. A successor reads it off the terminal it
-    /// commit-proved to tell a replay of something the predecessor
-    /// committed from a first inclusion the predecessor never made.
-    ///
-    /// Leaves are sorted by transaction hash, which is what makes absence
-    /// provable from a bracketing pair rather than the whole set.
-    pub CommittedTxsRoot,
-    "CommittedTxsRoot"
-);
-
 // ── Beacon chain ─────────────────────────────────────────────────────────────
 
 hash_newtype!(

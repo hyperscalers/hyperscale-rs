@@ -16,9 +16,9 @@ use hyperscale_storage::{CommittedHere, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
-    QuorumCertificate, ReadFence, ReshapeThresholds, RevealChain, ShardId, SplitChildRoots,
-    StateClaim, StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule,
-    TopologySnapshot, TxHash, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
+    QuorumCertificate, ReadFence, ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId,
+    SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier, TopologySchedule,
+    TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
     VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
@@ -99,9 +99,6 @@ pub struct ReadyStateRootVerification {
     /// Finalizations from the `PendingBlock` — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    /// Hashes of the block's own transactions — its contribution to the
-    /// committed-transaction window a terminating boundary header roots.
-    pub block_tx_hashes: Vec<TxHash>,
     /// The committed markers the block writes, each with the inherited
     /// key its transaction is also judged by.
     pub creations: Vec<CommittedHere>,
@@ -113,13 +110,13 @@ pub struct ReadyStateRootVerification {
     /// Whether the block's window requires the claim (the shard's final
     /// epoch before a split).
     pub split_child_roots_required: bool,
-    /// Whether the block's window requires terminal roots — set on any
+    /// Whether the block's window requires the terminal settled root — set on any
     /// terminating boundary header (a split parent's or a merge child's
     /// final epoch), broader than [`Self::split_child_roots_required`].
-    pub terminal_roots_required: bool,
-    /// The header's `terminal_roots` claim, verified beside the state root
+    pub terminal_settled_txs_required: bool,
+    /// The header's `terminal_settled_txs` claim, verified beside the state root
     /// over the committed retention window.
-    pub claimed_terminal_roots: Option<TerminalRoots>,
+    pub claimed_terminal_settled_txs: Option<SettledTxsRoot>,
     /// The block's parent-QC weighted timestamp — the settled-transaction window
     /// anchor.
     pub parent_weighted_timestamp: WeightedTimestamp,
@@ -171,8 +168,8 @@ pub struct PendingStateRootVerification {
     pub(crate) block_height: BlockHeight,
     pub(crate) claimed_split_child_roots: Option<SplitChildRoots>,
     pub(crate) split_child_roots_required: bool,
-    pub(crate) terminal_roots_required: bool,
-    pub(crate) claimed_terminal_roots: Option<TerminalRoots>,
+    pub(crate) terminal_settled_txs_required: bool,
+    pub(crate) claimed_terminal_settled_txs: Option<SettledTxsRoot>,
     pub(crate) parent_weighted_timestamp: WeightedTimestamp,
     pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
     pub(crate) frontier: FrontierInputs,
@@ -814,7 +811,7 @@ impl VerificationPipeline {
         block: &Block,
         parent_block_height: BlockHeight,
         split_child_roots_required: bool,
-        terminal_roots_required: bool,
+        terminal_settled_txs_required: bool,
         settled_txs_window_floor: Option<WeightedTimestamp>,
         frontier: FrontierInputs,
         fence: ReadFence,
@@ -829,8 +826,8 @@ impl VerificationPipeline {
             block_height: block.height(),
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
-            terminal_roots_required,
-            claimed_terminal_roots: block.header().terminal_roots(),
+            terminal_settled_txs_required,
+            claimed_terminal_settled_txs: block.header().settled_txs_root(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor,
             frontier,
@@ -1594,7 +1591,7 @@ impl VerificationPipeline {
         block: &Block,
         count_source: SubstateCountSource<'_>,
         split_child_roots_required: bool,
-        terminal_roots_required: bool,
+        terminal_settled_txs_required: bool,
         fee_demands: Vec<FeeDemand>,
         fee_read_height: BlockHeight,
         fee_read_ready: bool,
@@ -1620,7 +1617,7 @@ impl VerificationPipeline {
                             block,
                             h.parent_qc().height(),
                             split_child_roots_required,
-                            terminal_roots_required,
+                            terminal_settled_txs_required,
                             schedule.settled_window_floor(local_shard, anchor),
                             FrontierInputs::of_block(block, windows),
                             fence,
@@ -1858,8 +1855,6 @@ impl VerificationPipeline {
         let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
         let finalizations: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
-        let block_tx_hashes: Vec<TxHash> =
-            block.transactions().iter().map(|tx| tx.hash()).collect();
         let creations = committed_here(
             block.header().shard_id(),
             chain.chain_origin().anchor_wt,
@@ -1873,13 +1868,12 @@ impl VerificationPipeline {
             expected_root: pending.expected_root,
             expected_local_receipt_root: pending.expected_local_receipt_root,
             finalizations,
-            block_tx_hashes,
             creations,
             block_height: pending.block_height,
             claimed_split_child_roots: pending.claimed_split_child_roots,
             split_child_roots_required: pending.split_child_roots_required,
-            terminal_roots_required: pending.terminal_roots_required,
-            claimed_terminal_roots: pending.claimed_terminal_roots,
+            terminal_settled_txs_required: pending.terminal_settled_txs_required,
+            claimed_terminal_settled_txs: pending.claimed_terminal_settled_txs,
             parent_weighted_timestamp: pending.parent_weighted_timestamp,
             settled_txs_window_floor: pending.settled_txs_window_floor,
             parent_sweep_frontier: chain.parent_sweep_frontier(pending.parent_block_hash),
