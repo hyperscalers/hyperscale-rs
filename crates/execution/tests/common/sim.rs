@@ -552,7 +552,7 @@ impl ExecutionSim {
             committed_height: self.height,
             replay: ReplayWindow {
                 blocks: self.committed.clone(),
-                compose_from: BlockHeight::GENESIS,
+                dispatch_from: BlockHeight::GENESIS,
                 anchor_wt: None,
             },
             ..RecoveredState::default()

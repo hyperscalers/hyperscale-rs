@@ -335,7 +335,7 @@ mod tests {
             committed_height: BlockHeight::new(count),
             replay: ReplayWindow {
                 blocks,
-                compose_from: BlockHeight::GENESIS,
+                dispatch_from: BlockHeight::GENESIS,
                 anchor_wt: Some(WeightedTimestamp::ZERO),
             },
             ..RecoveredState::default()

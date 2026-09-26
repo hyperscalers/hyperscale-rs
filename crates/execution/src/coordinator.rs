@@ -203,7 +203,7 @@ struct TickedBatch {
     legs: BTreeSet<TxHash>,
 }
 
-/// One composed-but-undispatched tick: the block's identity anchors plus
+/// One seated but undispatched tick: the block's identity anchors plus
 /// the members that joined at its commit.
 struct PendingTick {
     tick: BlockHeight,
@@ -257,7 +257,7 @@ pub struct CommitEffects {
     /// The folds' actions, in commit order.
     pub actions: Vec<Action>,
     /// Whether a fold here derived the terminal latch: the quiescence
-    /// commit, after which no block composes and nothing in flight can
+    /// commit, after which no block seats a tick and nothing in flight can
     /// be decided.
     pub terminal: bool,
     /// The member lines each folded block's tick seated, in commit order:
@@ -480,7 +480,7 @@ pub struct ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════
     // Tick dispatch
     // ═══════════════════════════════════════════════════════════════════════
-    /// Ticks composed at commit but not yet dispatched, in height order.
+    /// Ticks seated at commit but not yet dispatched, in height order.
     /// Ticks execute serially — each output is the next tick's baseline —
     /// so the head dispatches only when no tick is in flight.
     pending_ticks: VecDeque<PendingTick>,
@@ -492,25 +492,25 @@ pub struct ExecutionCoordinator {
     /// Whether the committed tip is past this chain's terminal window.
     ///
     /// Derived in every fold from the tip header's parent QC, before
-    /// that fold composes, and never cleared. It flips at the quiescence
+    /// that fold seats, and never cleared. It flips at the quiescence
     /// commit, the first coast block, whose parent QC certifies the
-    /// terminal block; the terminal block itself composes as any other.
-    /// Composition is the latch's only reader and runs only inside a
-    /// fold, so nothing seeds it at construction: a restart, a snap-sync
-    /// seat and a reshape adoption each derive it in their first fold.
-    /// Without it a candidate unblocked past the terminal would compose
-    /// into a tick nothing can certify.
+    /// terminal block; the terminal block itself seats as any other.
+    /// Seating is the latch's only reader and runs only inside a fold, so
+    /// nothing seeds it at construction: a restart, a snap-sync seat and
+    /// a reshape adoption each derive it in their first fold. Without it
+    /// a tick past the terminal would be seated where nothing can
+    /// certify it.
     terminated: bool,
 
     /// What this node can run, asked where a tick dispatches.
     ///
     /// A queued tick whose members run code this node cannot resolve
     /// waits at the dispatch head. It cannot be consulted where the tick
-    /// is composed: membership is what the committee's votes are cast
-    /// over, so it has to be a function of committed chain state alone,
-    /// and a node's holdings are not that. Dispatch is where the
-    /// difference is local — the tick still answers for exactly the
-    /// members it was composed with, whenever it runs.
+    /// is seated: membership is what the committee's votes are cast over,
+    /// so it is the block's manifest, and a node's holdings are not
+    /// committed content. Dispatch is where the difference is local — the
+    /// tick still answers for exactly the members it was seated with,
+    /// whenever it runs.
     code: Arc<dyn CodeAvailability>,
 
     /// The group's crossing index slot, held so the host can bind it.
@@ -529,7 +529,7 @@ pub struct ExecutionCoordinator {
 
     /// The blocks a restart has to replay before this coordinator's
     /// account of what is in flight matches its peers'. Construction has
-    /// no schedule to compose against, so they wait for
+    /// no schedule to seat against, so they wait for
     /// [`on_committed_state_restored`](Self::on_committed_state_restored)
     /// and are empty from then on.
     replay_blocks: Vec<Verified<CertifiedBlock>>,
@@ -543,14 +543,13 @@ pub struct ExecutionCoordinator {
     ///
     /// A tick reads its baseline as of the height below it, and a store
     /// answers a historical read only inside its retention horizon — so a
-    /// replay reaching further back than that composes its ticks and runs
-    /// none of them. Composition is what fixes which tick holds a member,
-    /// and every replica of the shard has to agree on that whatever it
-    /// can still execute; the baseline is what the store cannot answer
-    /// for. What such a tick left is seated from the receipts that
+    /// replay reaching further back than that seats its ticks and runs
+    /// none of them. The manifest fixes which tick holds a member, and
+    /// every replica of the shard seats it whatever it can still execute;
+    /// the baseline is what the store cannot answer for. What such a tick left is seated from the receipts that
     /// committed it instead. `GENESIS` on every path but a replay, where
     /// every height qualifies.
-    compose_from: BlockHeight,
+    dispatch_from: BlockHeight,
 
     /// Tick fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
@@ -763,7 +762,7 @@ impl ExecutionCoordinator {
             ticked: BTreeMap::new(),
             replay_blocks: recovered.replay.blocks.clone(),
             awaiting_window: VecDeque::new(),
-            compose_from: recovered.replay.compose_from,
+            dispatch_from: recovered.replay.dispatch_from,
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
             ticks: TickRegistry::new(),
@@ -1005,26 +1004,23 @@ impl ExecutionCoordinator {
     /// halves of what was lost — which tick holds which transaction, and
     /// what each tick's baseline was — are functions of committed content
     /// alone, so re-driving the ordinary commit path over the stored
-    /// blocks reproduces them exactly. A replica that skipped this would
-    /// compose those transactions into a tick of its own, and its peers'
-    /// certificate for that height would come back under a root it never
-    /// computed.
+    /// blocks, each seated from its manifest, reproduces them exactly.
     ///
-    /// Two reaches, because a replay has two jobs. Composition runs over
+    /// Two reaches, because a replay has two jobs. Seating runs over
     /// every block the window holds, which runs back as far as an
     /// undischarged record; execution runs only over what the store can
     /// still anchor a baseline at. Below
-    /// [`compose_from`](Self::compose_from) the ticks compose and none is
-    /// dispatched — nothing is lost there, because such a tick was
+    /// [`dispatch_from`](Self::dispatch_from) the ticks are seated and
+    /// none is dispatched — nothing is lost there, because such a tick was
     /// settled by a fate the replay reads off the chain, and what it left
     /// is seated from the receipts that committed it.
     ///
     /// The blocks arrive with the provision bundles they carried already
-    /// reattached, so a leg composes here on the evidence it composed on
-    /// the first time rather than waiting for a fetch nobody will answer.
+    /// reattached, so a leg runs here on the evidence it ran on the first
+    /// time rather than waiting for a fetch nobody will answer.
     ///
-    /// Deferred to here rather than done at construction because
-    /// composition needs a topology, and there is none until the schedule
+    /// Deferred to here rather than done at construction because seating
+    /// needs a topology, and there is none until the schedule
     /// is up. Idempotent: the payload is taken, and a live commit that
     /// beat this call has already advanced the frontier past it.
     ///
@@ -1062,7 +1058,7 @@ impl ExecutionCoordinator {
             // these on the way in.
             derive_block_transactions(certified.block(), derivation);
             // The fold a live commit runs, releases and terminal latch
-            // included: a finalization the replay recomposes but never
+            // included: a finalization the replay reseats but never
             // releases leaves its members assigned to a tick that has
             // already settled, and a leg's reclaim, admitted only where no
             // tick speaks for the transaction, is then held out for as
@@ -1079,7 +1075,7 @@ impl ExecutionCoordinator {
     /// Seat the ticks the replay runs none of on the chain, from what the
     /// receipts that settled them say they left.
     ///
-    /// A tick composed below [`compose_from`](Self::compose_from) is one
+    /// A tick seated below [`dispatch_from`](Self::dispatch_from) is one
     /// no replay of this replica's re-runs, and its writes reach the base
     /// only at the block that committed its finalization. Every tick the
     /// replay *does* run below that block reads a baseline the base has
@@ -1097,13 +1093,13 @@ impl ExecutionCoordinator {
         let mut resolutions: Vec<(TickId, TickResolution)> = Vec::new();
         for certified in blocks {
             let block = certified.block();
-            if block.height() < self.compose_from {
+            if block.height() < self.dispatch_from {
                 continue;
             }
             for fw in block.certificates().iter() {
                 let fw = fw.as_unverified();
                 let tick_id = *fw.tick_id();
-                if tick_id.block_height() >= self.compose_from {
+                if tick_id.block_height() >= self.dispatch_from {
                     continue;
                 }
                 let writes: Vec<(TxHash, StateWrites)> = fw
@@ -1200,11 +1196,11 @@ impl ExecutionCoordinator {
         lines
     }
 
-    /// Admit into the tick being composed everything this commit
-    /// abandons: past its deadline, with no shard left that could settle
-    /// it.
+    /// Admit into the tick being seated everything this commit abandons:
+    /// what its manifest names `Aborted`, and past its deadline what no
+    /// tick holds and no shard is left to settle.
     ///
-    /// Read after composition's own assignments, so a member that just
+    /// Read after the tick's own member assignments, so a member that just
     /// joined this tick is not taken from it — the tick that holds a
     /// transaction is the one that speaks for it.
     ///
@@ -1521,7 +1517,11 @@ impl ExecutionCoordinator {
         requests.push(request);
     }
 
-    fn compose_tick(
+    /// Seat the tick the committing block names: its members, its aborts
+    /// and its discards, as the lines say, and the reclaims this shard's
+    /// committed content licenses. Seating reads no baseline, so it runs
+    /// whether or not the tick can be dispatched.
+    fn seat_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
         anchored: &TopologySnapshot,
@@ -1566,7 +1566,7 @@ impl ExecutionCoordinator {
         }
 
         self.admit_abandoned(anchored.shard_trie(), tick_id, &mut state, lines);
-        // The tick's own anchor prices what the tick itself composes:
+        // The tick's own anchor prices what the tick itself settles:
         // a settlement is committed by the block being built, not by an
         // earlier one, so there is one table for all of them.
         let tick_prices = prices_at(topology_schedule, block.ts);
@@ -1608,7 +1608,7 @@ impl ExecutionCoordinator {
         // Resolved under the committee that attests the tick, which is
         // the one that will verify the certificate. A window this shard
         // has already left seats nobody, and there is no leader to be:
-        // the tick composes, but no vote it could carry would reach a
+        // the tick is seated, but no vote it could carry would reach a
         // quorum.
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
         if let Some(committee) =
@@ -1732,7 +1732,7 @@ impl ExecutionCoordinator {
     /// goes back whole and waits exactly as a tick composed for code
     /// this node has not fetched waits. What releases it is the same
     /// thing — the engine answering for the package — and what retries
-    /// it is the next commit, which composes and dispatches as every
+    /// it is the next commit, which seats and dispatches as every
     /// commit does.
     pub fn on_execution_batch_unavailable(
         &mut self,
@@ -2647,18 +2647,6 @@ impl ExecutionCoordinator {
         self.counterparts.offers()
     }
 
-    /// Whether a tick or a candidate of this shard still holds a member
-    /// for `tx_hash`, so an execution that would write a claim may yet
-    /// run.
-    ///
-    /// The ledger is a fold over committed blocks, a tick is released on
-    /// committed content, and the candidate set follows both, so every
-    /// replica at one frontier answers alike.
-    #[must_use]
-    pub fn holds_member_for(&self, tx_hash: TxHash) -> bool {
-        self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash)
-    }
-
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
     ///
     /// The anchor is already in the shared mirror — the shard coordinator
@@ -2964,10 +2952,10 @@ impl ExecutionCoordinator {
     /// 3. **Anchor time** — bump `committed_height` and `committed_ts`
     ///    from the header's parent QC; everything below reads them.
     /// 4. **Terminal latch** — derived from the new tip before anything
-    ///    composes.
+    ///    is seated.
     /// 5. **Timeouts, then pruning**, so a retry fires before the tick it
     ///    references is pruned away.
-    /// 6. **Dispatch** — the live path composes and dispatches; the
+    /// 6. **Dispatch** — the live path seats and dispatches; the
     ///    sealed path records tx → tick mappings so late certificates
     ///    route back to the mempool.
     #[instrument(skip(self, certified, topology_schedule), fields(
@@ -3112,7 +3100,7 @@ impl ExecutionCoordinator {
         // pins, and never off the block's own certifying QC, whose
         // timestamp a relay can rewrite. So it flips at the quiescence
         // commit, whose parent QC certifies the terminal block, and
-        // before that commit composes.
+        // before that commit seats.
         let terminal = !self.terminated
             && topology_schedule.past_terminal(self.local_shard, self.committed_ts);
         let mut actions = if terminal {
@@ -3265,11 +3253,11 @@ impl ExecutionCoordinator {
         let height = header.height();
         let mut actions = Vec::new();
 
-        // Below where a baseline is readable a tick composes and never
+        // Below where a baseline is readable a tick is seated and never
         // runs: which tick holds a member is what every replica has to
         // agree on, and the baseline is the only part of it the store
         // cannot answer for.
-        let runnable = height >= self.compose_from;
+        let runnable = height >= self.dispatch_from;
 
         // ── Provision broadcasting (proposer only) ─────────────────────
         // The crossing changes the parent block made go with it: this
@@ -3351,13 +3339,13 @@ impl ExecutionCoordinator {
         if !provisions.is_empty() {
             self.apply_committed_provisions(provisions);
         }
-        // A terminated chain composes nothing: no later block of it can
-        // carry a finalization, so a tick it composed could never reach a
+        // A terminated chain seats nothing: no later block of it can
+        // carry a finalization, so a tick it seated could never reach a
         // verdict.
         let (pending, early_votes, members) = if self.terminated {
             (None, Vec::new(), Vec::new())
         } else {
-            self.compose_tick(topology_schedule, anchored, &block, named, seated)
+            self.seat_tick(topology_schedule, anchored, &block, named, seated)
         };
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology_schedule, vote));
@@ -3380,12 +3368,12 @@ impl ExecutionCoordinator {
                 tracing::debug!(
                     height = height.inner(),
                     members = pending.requests.len(),
-                    "Composed a tick the store can no longer anchor a baseline for"
+                    "Seated a tick the store can no longer anchor a baseline for; not dispatching it"
                 );
             }
         }
-        // What composition abandoned, before the tick it composed reads
-        // the chain: a discarded tick's legs hold cells this one may
+        // What seating abandoned, before the tick it seated reads the
+        // chain: a discarded tick's legs hold cells this one may
         // need, and nothing else is coming to release them.
         actions.extend(self.drain_ready_tick_resolutions());
         actions.extend(self.dispatch_next_tick());
@@ -3849,7 +3837,7 @@ impl ExecutionCoordinator {
         // Asked of the engine rather than read off a set kept in step
         // with it. A set has to be seeded, and a shard seated mid-epoch
         // is handed ticks before anything has seeded it; asking leaves
-        // nothing to seed. The next commit composes and dispatches
+        // nothing to seed. The next commit seats and dispatches
         // again, which is what retries a tick held here.
         if !head.runnable(self.code.as_ref()) {
             tracing::debug!(
@@ -4397,7 +4385,7 @@ impl ExecutionCoordinator {
         // What the chain owes an outcome for goes with the rest. The
         // ledger's entries are abandonable at their deadlines, and a
         // deadline falling after the terminal would have this chain
-        // compose a tick to abandon them in — on a coast block, under a
+        // seat a tick to abandon them in — on a coast block, under a
         // committee it no longer has. Nothing here can reach a verdict
         // either way, which is the same reason the ticks above go.
         self.counterparts.ledger = Ledger::new(self.local_shard);
@@ -4410,8 +4398,8 @@ impl ExecutionCoordinator {
         self.ticked.clear();
         self.tick_in_flight = false;
         // And the candidates behind them, with the latch that keeps
-        // composition from admitting more: a candidate whose cross-shard
-        // provisions land past the terminal would otherwise compose into
+        // seating from admitting more: a candidate whose cross-shard
+        // provisions land past the terminal would otherwise be seated in
         // a tick at a past-terminal anchor, which gets no vote tracker
         // and is never votable — an execution batch dispatched and
         // written into the chain just cleared, for an outcome that can
@@ -4833,7 +4821,7 @@ mod tests {
         assert!(state.ticks.contains_tick(&tick_id.unwrap()));
     }
 
-    /// A tick composes whatever the block committed, and waits at the
+    /// A tick seats whatever the block named, and waits at the
     /// dispatch head for code this node has not fetched.
     ///
     /// Membership is what the committee votes over, so it cannot turn on
@@ -4876,7 +4864,7 @@ mod tests {
             "the tick is composed regardless — only its dispatch waits"
         );
 
-        // The fetch lands. Nothing reports it: the next commit composes
+        // The fetch lands. Nothing reports it: the next commit seats
         // and dispatches as every commit does, and finds the head ready.
         code.release(package);
         let released = state
@@ -8277,7 +8265,7 @@ mod tests {
     /// A replay releases the ticks the blocks it re-drives finalized,
     /// exactly as a commit does.
     ///
-    /// A replay recomposes the tick that held a transaction *and* commits
+    /// A replay reseats the tick that held a transaction *and* commits
     /// the block whose finalization settled it, and the second is what
     /// hands the transaction back. Skipping it leaves the transaction
     /// assigned to a tick that has already settled, which nothing later
@@ -8312,7 +8300,7 @@ mod tests {
             committed_height: BlockHeight::new(3),
             replay: ReplayWindow {
                 blocks: vec![replayable(committing, 2_000), replayable(settling, 3_000)],
-                compose_from: BlockHeight::GENESIS,
+                dispatch_from: BlockHeight::GENESIS,
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -8338,7 +8326,7 @@ mod tests {
         );
     }
 
-    /// A replay reaching below what the store can anchor composes its
+    /// A replay reaching below what the store can anchor seats its
     /// ticks there and dispatches none of them.
     ///
     /// Composition's reach is what the chain is still owed an outcome
@@ -8349,7 +8337,7 @@ mod tests {
     /// which tick holds a member, which every replica of the shard reads
     /// the same however far back its own store reaches.
     #[test]
-    fn a_replay_below_the_stores_reach_composes_without_dispatching() {
+    fn a_replay_below_the_stores_reach_seats_without_dispatching() {
         let schedule = make_test_topology();
         let held = test_transaction(1);
         let held_hash = held.hash();
@@ -8378,7 +8366,7 @@ mod tests {
                 blocks: vec![committing, replayable(above, 3_000)],
                 // The store has retired everything below height 2, so a
                 // tick at 2 would read a baseline at 1 that is gone.
-                compose_from: BlockHeight::new(3),
+                dispatch_from: BlockHeight::new(3),
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -8455,7 +8443,7 @@ mod tests {
             committed_height: BlockHeight::new(4),
             replay: ReplayWindow {
                 blocks: vec![replayable(committing, 2_000), replayable(settling, 4_000)],
-                compose_from: BlockHeight::new(3),
+                dispatch_from: BlockHeight::new(3),
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -8539,7 +8527,7 @@ mod tests {
                     &committing,
                     named,
                 ))],
-                compose_from: BlockHeight::new(3),
+                dispatch_from: BlockHeight::new(3),
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -8625,7 +8613,7 @@ mod tests {
                     &committing,
                     named,
                 ))],
-                compose_from: BlockHeight::GENESIS,
+                dispatch_from: BlockHeight::GENESIS,
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -9004,7 +8992,7 @@ mod tests {
             committed_height: BlockHeight::new(committed_height),
             replay: ReplayWindow {
                 blocks,
-                compose_from: BlockHeight::GENESIS,
+                dispatch_from: BlockHeight::GENESIS,
                 anchor_wt: Some(WeightedTimestamp::from_millis(anchor_ms)),
             },
             ..RecoveredState::default()

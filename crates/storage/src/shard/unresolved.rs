@@ -182,10 +182,10 @@ pub struct ReplayWindow {
     /// whatever its own store still reaches; execution runs over a
     /// baseline, and a baseline is a historical read the store retires at
     /// [`RETENTION_HORIZON`](hyperscale_types::RETENTION_HORIZON). Below
-    /// this a tick composes and never runs, which costs nothing: it was
+    /// this a tick is seated and never runs, which costs nothing: it was
     /// taken by a fate the replay reads off the chain, and what it left
     /// is seated from the receipts that committed it.
-    pub compose_from: BlockHeight,
+    pub dispatch_from: BlockHeight,
     /// The parent-QC weighted timestamp of the block *below* the first
     /// one replayed — the clock execution resumes at, so the block above
     /// it stays on the exact carry path and classifies its ticks under
@@ -245,7 +245,7 @@ pub fn replay_window<R: ShardChainReader + ?Sized>(
     }
     ReplayWindow {
         blocks,
-        compose_from: floor.max(retention_floor.next()),
+        dispatch_from: floor.max(retention_floor.next()),
         anchor_wt,
     }
 }

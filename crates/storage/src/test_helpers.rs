@@ -3539,7 +3539,7 @@ fn assert_replayed_window(storage: &(impl ShardChainReader + TestStore)) {
         "carrying the clock of the block below it, so the first block replayed keeps the carry",
     );
     assert_eq!(
-        window.compose_from,
+        window.dispatch_from,
         BlockHeight::new(2),
         "with nothing retired, composition starts where the fold does",
     );
@@ -3590,7 +3590,7 @@ fn assert_compose_floor_follows_retention(storage: &impl ShardChainReader) {
         "the fold's reach is what is owed an outcome, whatever the store retired",
     );
     assert_eq!(
-        retired.compose_from,
+        retired.dispatch_from,
         BlockHeight::new(3),
         "and composition starts at the first height whose baseline is readable",
     );
