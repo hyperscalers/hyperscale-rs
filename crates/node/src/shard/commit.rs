@@ -406,6 +406,10 @@ pub struct BoundaryMemo {
     /// The candidate's `parent_qc` weighted timestamp — the low side of
     /// the crossing interval its child adjudicates.
     pub(crate) parent_qc_wt: WeightedTimestamp,
+    /// Whether the candidate is its chain's terminal, the one header
+    /// carrying the terminal settled root: the boundary a terminating
+    /// shard's successors seed from, pinned once its child commits.
+    pub(crate) terminal: bool,
 }
 
 /// Pins shard state at epoch-boundary blocks for snap-sync serving.
@@ -881,8 +885,9 @@ impl BlockCommitCoordinator {
         // Adjudicate epoch-boundary crossings: each block's `parent_qc`
         // carries the canonical weighted timestamp for its parent, so a
         // commit decides whether the PREVIOUS block was its shard's
-        // crossing. The pin runs before this block's storage write, while
-        // state is exactly the boundary block's.
+        // crossing, or the terminal a terminating shard records instead.
+        // The pin runs before this block's storage write, while state is
+        // exactly the boundary block's.
         let mut pin_before: Vec<Option<BlockHeight>> = vec![None; ready_commits.len()];
         let pin_hook = self.boundary.as_ref().map(|t| Arc::clone(&t.pin));
         if let Some(trigger) = self.boundary.as_mut() {
@@ -891,8 +896,9 @@ impl BlockCommitCoordinator {
                 let parent_qc = block.header().parent_qc();
                 if let Some(last) = trigger.last
                     && parent_qc.block_hash() == last.hash
-                    && EpochWindows::new(trigger.epoch_duration_ms)
-                        .is_crossing(last.parent_qc_wt, parent_qc.weighted_timestamp())
+                    && (last.terminal
+                        || EpochWindows::new(trigger.epoch_duration_ms)
+                            .is_crossing(last.parent_qc_wt, parent_qc.weighted_timestamp()))
                 {
                     pin_before[i] = Some(last.height);
                 }
@@ -900,6 +906,7 @@ impl BlockCommitCoordinator {
                     hash: block.hash(),
                     height: block.height(),
                     parent_qc_wt: parent_qc.weighted_timestamp(),
+                    terminal: block.header().settled_txs_root().is_some(),
                 });
             }
         }
@@ -1918,6 +1925,7 @@ mod tests {
                 hash: tip_hash,
                 height: BlockHeight::new(2),
                 parent_qc_wt: WeightedTimestamp::from_millis(900),
+                terminal: false,
             }),
         );
         let (tx, _rx) = unbounded();

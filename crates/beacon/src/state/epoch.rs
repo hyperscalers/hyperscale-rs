@@ -15,7 +15,7 @@ use hyperscale_types::{
 };
 
 use crate::rules::{
-    canonical_boundary_qcs, chunk_bounds, crossing_already_recorded, is_boundary_crossing,
+    canonical_boundary_qcs, chunk_bounds, contributed_epoch, crossing_already_recorded,
 };
 use crate::state::committee::{
     diff_shard_committees, recover_committees, resample_beacon_committee,
@@ -699,26 +699,22 @@ struct TerminalMarks {
 }
 
 /// The marks for a shard's rebuilt boundary record, plus whether this
-/// contribution is the chain's terminal block (its crossing lands in an
-/// epoch past the scheduled terminal). The scheduled-terminal marks come
-/// from the prior record. The certifying QC's timestamp is recorded on
-/// the terminal contribution: a merge parent floors it to the cut, and
-/// persisting it lets the parent compose even when its two children's
-/// terminals fold in separate epochs. A split parent seeds in-fold and
-/// never composes, so only merge children (no `split_child_roots`)
-/// carry it.
+/// contribution is the chain's terminal block: the one contributing for
+/// an epoch past the scheduled terminal. The scheduled-terminal marks
+/// come from the prior record. A split parent seeds in-fold and never
+/// composes, so only merge children (no `split_child_roots`) deliver.
 ///
-/// Terminal is judged by the cut the contribution *crosses*, not the
-/// window its QC lands in: the boundary instant counts as not yet
-/// crossed, so the final window's own refresh — which can certify
-/// exactly on the terminal cut — stays non-terminal, and its pre-freeze
-/// state root never reaches a merge compose.
+/// Terminal is judged by the epoch the contribution is for, which
+/// [`contributed_epoch`] reads off the cut its crossing crosses: the
+/// boundary instant counts as not yet crossed, so the final window's own
+/// refresh — which can certify exactly on the terminal cut — stays
+/// non-terminal, and its pre-freeze state root never reaches a merge
+/// compose.
 fn carried_terminal_marks(
     state: &BeaconState,
     shard: ShardId,
     header: &BlockHeader,
-    qc: &QuorumCertificate,
-    windows: EpochWindows,
+    crossed: Epoch,
 ) -> (TerminalMarks, bool) {
     let (terminal_epoch, reshape_admitted_epoch, handoff_complete) = state
         .boundaries
@@ -730,14 +726,7 @@ fn carried_terminal_marks(
                 b.handoff_complete,
             )
         });
-    let is_terminal = terminal_epoch.is_some_and(|t| {
-        windows
-            .crossing_epoch(
-                header.parent_qc().weighted_timestamp(),
-                qc.weighted_timestamp(),
-            )
-            .is_some_and(|crossed| crossed > t)
-    });
+    let is_terminal = terminal_epoch.is_some_and(|t| crossed > t);
     let terminal_delivered = is_terminal && header.split_child_roots().is_none();
     (
         TerminalMarks {
@@ -973,12 +962,11 @@ fn record_boundaries(
         else {
             continue;
         };
-        // Require a genuine epoch crossing: the boundary block is the first
-        // block across some epoch boundary, so its predecessor sits at or
-        // before the cut.
-        if !is_boundary_crossing(header, qc, windows) {
+        // Require a genuine contribution: a crossing, or the terminal the
+        // crossing out of its final window leads to.
+        let Some(crossed) = contributed_epoch(state, *shard, header, qc, windows) else {
             continue;
-        }
+        };
         // Chunk math (0-based, count-aligned): `prior` is the applied
         // watermark, `boundary_count` the boundary block's accumulator
         // count. A boundary whose count regressed below what we've already
@@ -1033,7 +1021,7 @@ fn record_boundaries(
             continue;
         }
         let (marks, is_terminal_contribution) =
-            carried_terminal_marks(state, *shard, header, qc, windows);
+            carried_terminal_marks(state, *shard, header, crossed);
         // Read before the insert replaces the record: the byte level is
         // carried forward when this crossing's header resolved no total.
         let prior_substate_bytes = state
@@ -1097,7 +1085,7 @@ fn record_boundaries(
         // drops it.
         if is_terminal_contribution {
             if header.split_child_roots().is_some() {
-                seed_split_children(state, *shard, header, qc, epoch);
+                seed_split_children(state, *shard, header, epoch);
             } else {
                 terminal_recorded.insert(*shard);
             }
@@ -1265,7 +1253,6 @@ fn seed_split_children(
     state: &mut BeaconState,
     parent: ShardId,
     terminal_header: &BlockHeader,
-    terminal_qc: &QuorumCertificate,
     epoch: Epoch,
 ) {
     let children: [ShardId; 2] = parent.children().into();
@@ -1282,11 +1269,8 @@ fn seed_split_children(
         // A terminal carrying no pair, or one that does not compose to its
         // own committed root, seeds nothing: the children then seed from
         // their own first boundary contributions instead.
-        let Some((genesis, _)) = Block::split_child_genesis_from_terminal(
-            child,
-            terminal_header,
-            terminal_qc.weighted_timestamp(),
-        ) else {
+        let Some((genesis, _)) = Block::split_child_genesis_from_terminal(child, terminal_header)
+        else {
             tracing::warn!(
                 shard = ?parent,
                 "terminal contribution carries no composing split child roots; \
@@ -3169,6 +3153,25 @@ mod tests {
     /// A terminal boundary block: `leaf_count` deposit witnesses plus a
     /// `split_child_roots` pair carried from construction (so the
     /// per-leaf proofs anchor to the final header hash).
+    /// A merging child's terminal: the first block past its cut, carrying
+    /// the terminal settled root and no witness.
+    fn merge_terminal(
+        shard: ShardId,
+        height: u64,
+        pred_wt: u64,
+        state_root: StateRoot,
+    ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
+        boundary_block_with_payloads_full(
+            shard,
+            height,
+            pred_wt,
+            state_root,
+            vec![],
+            None,
+            Some(SettledTxsRoot::ZERO),
+        )
+    }
+
     fn terminal_block_with_witnesses(
         shard: ShardId,
         height: u64,
@@ -3299,8 +3302,15 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let (left, right) = parent.children();
 
-        let (header, payloads, range_proof) =
-            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
+        let (header, payloads, range_proof) = terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            pair,
+            composed,
+            3,
+            Some(SettledTxsRoot::ZERO),
+        );
         let (committed, contributions) = contribution_for(
             parent,
             header.clone(),
@@ -3327,7 +3337,7 @@ mod tests {
                 child,
                 child_root,
                 &header,
-                WeightedTimestamp::from_millis(2_500),
+                header.parent_qc().weighted_timestamp(),
             );
             assert_eq!(record.state_root, child_root);
             assert_eq!(record.block_hash, genesis.hash());
@@ -3343,6 +3353,44 @@ mod tests {
         assert_eq!(record.block_hash, header.hash());
     }
 
+    /// The crossing out of the final window is the block before the
+    /// terminal, which cannot know it is the last: it carries no terminal
+    /// settled root, contributes nothing, and seeds no child.
+    #[test]
+    fn the_block_before_the_terminal_contributes_nothing() {
+        let (mut state, parent, pair, composed) = terminating_state();
+        let (left, _) = parent.children();
+        let before = state.boundaries[&parent];
+
+        let (header, payloads, range_proof) =
+            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
+        let (committed, contributions) = contribution_for(
+            parent,
+            header,
+            (
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
+            ),
+            2_500,
+        );
+        record_boundaries(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(state.boundaries[&parent].block_hash, before.block_hash);
+        assert_eq!(
+            state.boundaries.get(&left).map(|record| record.block_hash),
+            Some(BlockHash::ZERO),
+            "the child stays pending",
+        );
+    }
+
     /// A pair that does not compose to the terminal root leaves the
     /// children pending (they seed from their own first contributions);
     /// the parent's terminal record still lingers past the drain.
@@ -3353,8 +3401,15 @@ mod tests {
             left: StateRoot::from_raw(Hash::from_bytes(b"forged")),
             right: pair.right,
         };
-        let (header, payloads, range_proof) =
-            terminal_block_with_witnesses(parent, 9, 1_900, forged, composed, 3, None);
+        let (header, payloads, range_proof) = terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            forged,
+            composed,
+            3,
+            Some(SettledTxsRoot::ZERO),
+        );
         let (committed, contributions) = contribution_for(
             parent,
             header,
@@ -3456,8 +3511,15 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let total = MAX_WITNESSES_PER_SHARD as u64 + 6;
 
-        let (header, payloads, _range_proof) =
-            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, None);
+        let (header, payloads, _range_proof) = terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            pair,
+            composed,
+            total,
+            Some(SettledTxsRoot::ZERO),
+        );
 
         let first_chunk = sub_chunk(&payloads, 0, MAX_WITNESSES_PER_SHARD);
         let (committed, contributions) =
@@ -3513,8 +3575,15 @@ mod tests {
     #[test]
     fn terminal_record_drops_past_the_evidence_window() {
         let (mut state, parent, pair, composed) = terminating_state();
-        let (header, payloads, range_proof) =
-            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
+        let (header, payloads, range_proof) = terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            pair,
+            composed,
+            3,
+            Some(SettledTxsRoot::ZERO),
+        );
         let (committed, contributions) = contribution_for(
             parent,
             header,
@@ -3692,8 +3761,15 @@ mod tests {
         }
 
         // The terminal contribution finally lands: it seeds both children.
-        let (header, payloads, range_proof) =
-            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
+        let (header, payloads, range_proof) = terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            pair,
+            composed,
+            3,
+            Some(SettledTxsRoot::ZERO),
+        );
         let (committed, contributions) = contribution_for(
             parent,
             header,
@@ -4051,10 +4127,8 @@ mod tests {
         let (mut state, parent, left_root, right_root) = merge_terminating_state();
         let (left, right) = parent.children();
 
-        let (lh, lw, lw_proof) =
-            boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None, None);
-        let (rh, rw, rw_proof) =
-            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
+        let (lh, lw, lw_proof) = merge_terminal(left, 9, 2_100, left_root);
+        let (rh, rw, rw_proof) = merge_terminal(right, 10, 2_100, right_root);
         let proposal = BeaconProposal::new(
             [
                 (left, Some(qc_over(&lh, 2_500))),
@@ -4114,16 +4188,16 @@ mod tests {
     /// A final-window refresh certified exactly on the terminal cut is
     /// not the terminal contribution — the boundary instant counts as
     /// not yet crossed — so its pre-freeze root never composes the
-    /// merge parent. The real coast block past the cut then composes
-    /// with the frozen terminal root.
+    /// merge parent. The real terminal past the cut then composes with
+    /// the frozen terminal root.
     #[test]
     fn exact_cut_refresh_does_not_compose_the_merge_parent() {
         let (mut state, parent, left_root, right_root) = merge_terminating_state();
         let (left, right) = parent.children();
 
-        // Right child: genuine terminal coast (crosses the 2_000 cut).
-        let (rh, rw, rw_proof) =
-            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
+        // Right child: its genuine terminal, the first block past the
+        // 2_000 cut.
+        let (rh, rw, rw_proof) = merge_terminal(right, 10, 2_100, right_root);
         // Left child: spans its whole final window — anchored before the
         // window opens, certified exactly on the terminal cut. A genuine
         // crossing (of the cut INTO the final window), carrying the
@@ -4188,12 +4262,13 @@ mod tests {
             "parent composed early"
         );
 
-        // The real coast block crosses the cut with the frozen root; the
-        // parent composes from it and the lingering right terminal.
+        // The real terminal, the first block past the cut, carries the
+        // frozen root; the parent composes from it and the lingering right
+        // terminal.
         let (coast_header, coast_witnesses, coast_witnesses_proof) =
-            boundary_block_with_payloads_full(left, 10, 2_000, left_root, vec![], None, None);
+            merge_terminal(left, 10, 2_100, left_root);
         let proposal = BeaconProposal::new(
-            std::iter::once((left, Some(qc_over(&coast_header, 2_100)))).collect(),
+            std::iter::once((left, Some(qc_over(&coast_header, 2_200)))).collect(),
             Vec::new(),
             BTreeMap::new(),
             Vec::new(),
@@ -4235,10 +4310,8 @@ mod tests {
         let (left, right) = parent.children();
         // Neither child's boundary block carries a witness leaf, so
         // every contribution below names the empty window.
-        let (lh, ..) =
-            boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None, None);
-        let (rh, ..) =
-            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
+        let (lh, ..) = merge_terminal(left, 9, 2_100, left_root);
+        let (rh, ..) = merge_terminal(right, 10, 2_100, right_root);
 
         // Both children's terminal records, sourced together — the
         // proposer re-sources every lingering terminal record each fold.
@@ -4763,7 +4836,6 @@ mod tests {
             left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
             right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
         };
-        let canonical_wt = WeightedTimestamp::from_millis(7_000);
         let terminal = terminal_header_with_pair(parent, pair);
 
         let mut state = single_pool_state(4);
@@ -4792,18 +4864,11 @@ mod tests {
                 },
             );
         }
-        seed_split_children(
-            &mut state,
-            parent,
-            &terminal,
-            &qc_over(&terminal, canonical_wt.as_millis()),
-            Epoch::new(1),
-        );
+        seed_split_children(&mut state, parent, &terminal, Epoch::new(1));
 
         for child in [left, right] {
-            let (derived, origin) =
-                Block::split_child_genesis_from_terminal(child, &terminal, canonical_wt)
-                    .expect("the pair composes");
+            let (derived, origin) = Block::split_child_genesis_from_terminal(child, &terminal)
+                .expect("the pair composes");
             let seeded = state.boundaries[&child];
             assert_eq!(seeded.block_hash, derived.hash());
             assert_eq!(seeded.height, origin.genesis_height);

@@ -257,8 +257,9 @@ pub enum TailOutcome {
 /// The parent's terminal block, recognised by a follower as it passes,
 /// with the child genesis derived from it.
 ///
-/// A block `B` is the terminal crossing when its parent QC sits at or
-/// before the cut and the QC certifying `B` sits past it. The certifying
+/// A block `B` is the terminal when it is the first block whose parent
+/// QC sits past the cut: the one header carrying the terminal settled
+/// root, since no block before it could know it was the last. The certifying
 /// QC used here is the *canonical* one — carried as the `parent_qc` of
 /// `B`'s committed child, the next block the follow accepts — never the
 /// QC served alongside `B`, which may be a higher-round re-certification
@@ -311,12 +312,8 @@ pub struct DerivedGenesis {
 ///
 /// Thin over [`Block::split_child_genesis_from_terminal`], which is the
 /// one derivation the beacon fold and every successor share.
-fn derive_child_genesis(
-    child: ShardId,
-    terminal: &BlockHeader,
-    canonical_wt: WeightedTimestamp,
-) -> Option<DerivedGenesis> {
-    let (block, origin) = Block::split_child_genesis_from_terminal(child, terminal, canonical_wt)?;
+fn derive_child_genesis(child: ShardId, terminal: &BlockHeader) -> Option<DerivedGenesis> {
+    let (block, origin) = Block::split_child_genesis_from_terminal(child, terminal)?;
     Some(DerivedGenesis {
         block,
         origin,
@@ -543,15 +540,13 @@ impl ObserverTail {
             return TailOutcome::Rejected("block does not extend the attested anchor chain");
         }
         // This block's parent QC is the canonical certificate over its
-        // predecessor, so accepting it is what decides whether that
-        // predecessor was the terminal crossing: the predecessor's own
-        // parent QC sits at or before the cut, and this one past it.
-        let parent_qc_wt = header.parent_qc().weighted_timestamp();
-        if let Some(cut) = self.terminal_cut
+        // predecessor, so accepting it is what seals that predecessor as
+        // the terminal: the first block past the cut, the one header
+        // carrying the terminal settled root.
+        if self.terminal_cut.is_some()
             && self.terminal.is_none()
             && let Some(terminal) = &self.prev
-            && terminal.parent_qc().weighted_timestamp().as_millis() <= cut.as_millis()
-            && parent_qc_wt.as_millis() > cut.as_millis()
+            && terminal.settled_txs_root().is_some()
         {
             // The run the commitment proof walks back down starts at the
             // terminal itself; the coast blocks above it are appended as
@@ -560,7 +555,7 @@ impl ObserverTail {
             self.terminal = Some(TerminalSighting {
                 header: terminal.clone(),
                 canonical_qc: header.parent_qc().clone(),
-                genesis: derive_child_genesis(self.child, terminal, parent_qc_wt),
+                genesis: derive_child_genesis(self.child, terminal),
                 commit_proof: None,
             });
         }
@@ -767,8 +762,8 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BlockHeaderParts, CommitProofVerifyError,
-        ElidedCertifiedBlock, Hash, Inventory, Round, SignerBitfield, SplitChildRoots, VoteCount,
-        WitnessSources,
+        ElidedCertifiedBlock, Hash, Inventory, Round, SettledTxsRoot, SignerBitfield,
+        SplitChildRoots, VoteCount, WitnessSources,
     };
 
     use super::*;
@@ -957,6 +952,20 @@ mod tests {
         state_root: StateRoot,
         pair: Option<SplitChildRoots>,
     ) -> Block {
+        parent_block_settling(height, round, parent, pred_wt, state_root, pair, None)
+    }
+
+    /// [`parent_block`] carrying `terminal_settled_txs`, as the terminal
+    /// alone does.
+    fn parent_block_settling(
+        height: u64,
+        round: u64,
+        parent: BlockHash,
+        pred_wt: u64,
+        state_root: StateRoot,
+        pair: Option<SplitChildRoots>,
+        terminal_settled_txs: Option<SettledTxsRoot>,
+    ) -> Block {
         let parent_qc = QuorumCertificate::new(
             parent,
             ShardId::ROOT,
@@ -975,6 +984,7 @@ mod tests {
             state_root,
             provision_tx_roots: Capped::default(),
             split_child_roots: pair,
+            terminal_settled_txs,
             ..Default::default()
         });
         Block::Live {
@@ -1000,10 +1010,11 @@ mod tests {
         ))
     }
 
-    /// A parent chain straddling the cut: the terminal at height 2 (its
-    /// own `parent_qc` at or before the cut) and the coast block at
-    /// height 3 whose `parent_qc` lands past it. The terminal carries the
-    /// child-root pair composing to its own state root.
+    /// A parent chain across the cut: the anchor block at height 1 is the
+    /// crossing, the terminal at height 2 is the first block whose
+    /// `parent_qc` lands past the cut, and the coast block at height 3
+    /// certifies it. The terminal carries the terminal settled root and
+    /// the child-root pair composing to its own state root.
     ///
     /// Returns the anchor the follow starts from and the two blocks.
     fn straddling_chain() -> (ShardAnchor, Block, Block, SplitChildRoots) {
@@ -1023,9 +1034,16 @@ mod tests {
             handoff_complete: None,
             terminal_epoch: None,
         };
-        // The terminal's own parent QC sits at the cut exactly — the
-        // boundary instant counts as not yet crossed.
-        let terminal = parent_block(2, 2, anchor.block_hash, CUT_MS, terminal_root, Some(pair));
+        // The terminal's parent QC certifies the crossing past the cut.
+        let terminal = parent_block_settling(
+            2,
+            2,
+            anchor.block_hash,
+            CUT_MS + 250,
+            terminal_root,
+            Some(pair),
+            Some(SettledTxsRoot::ZERO),
+        );
         // The coast block's parent QC is the canonical certificate over
         // the terminal, stamped past the cut.
         let coast = parent_block(
@@ -1039,13 +1057,14 @@ mod tests {
         (anchor, terminal, coast, pair)
     }
 
-    /// A recognizing follow walks the parent chain, spots the crossing
-    /// when the coast block's `parent_qc` lands past the cut, and derives
-    /// the child genesis the beacon fold composes from the same terminal.
+    /// A recognizing follow walks the parent chain, spots the terminal
+    /// once the coast block's `parent_qc` certifies it, and derives the
+    /// child genesis the beacon fold composes from the same terminal.
     ///
-    /// The canonical clock is the coast block's `parent_qc`, never the QC
-    /// served alongside either block — a terminal re-certified at a higher
-    /// round during the coast carries a divergent stamp.
+    /// The canonical certificate is the coast block's `parent_qc`, never
+    /// the QC served alongside either block — a terminal re-certified at a
+    /// higher round during the coast carries a divergent stamp — and the
+    /// child's clock is the terminal's own `parent_qc`.
     #[test]
     fn recognizing_follow_derives_the_child_genesis_from_the_terminal() {
         let (anchor, terminal, coast, pair) = straddling_chain();
@@ -1078,15 +1097,16 @@ mod tests {
         assert_eq!(
             sighting.canonical_qc.weighted_timestamp(),
             WeightedTimestamp::from_millis(CUT_MS + 500),
-            "the clock is the coast block's parent QC, not either served QC",
+            "the certificate is the coast block's parent QC, not either served QC",
         );
 
+        // The child's clock is the terminal's own parent QC.
         let derived = sighting.genesis.as_ref().expect("the pair composes");
         let expected = Block::split_child_genesis(
             child,
             pair.left,
             terminal.header(),
-            WeightedTimestamp::from_millis(CUT_MS + 500),
+            WeightedTimestamp::from_millis(CUT_MS + 250),
         );
         assert_eq!(derived.block.hash(), expected.hash());
         assert_eq!(derived.origin.genesis_height, BlockHeight::new(3));

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BeaconBlock, BeaconProposal, BeaconState, BlockHash, BlockHeader, EpochWindows, Hash,
+    BeaconBlock, BeaconProposal, BeaconState, BlockHash, BlockHeader, Epoch, EpochWindows, Hash,
     MAX_WITNESSES_PER_SHARD, QuorumCertificate, ShardId, ShardWitnessPayload, Verifiable,
     verify_range_inclusion,
 };
@@ -179,20 +179,39 @@ pub(crate) fn canonical_boundary_qcs<'a>(
     canonical
 }
 
-/// Whether `boundary_header` is the first block across the epoch cut `qc`
-/// attests: its predecessor sits at or before the largest epoch boundary
-/// below the block's own weighted timestamp (`qc.wt`). Pure over the
-/// chain's epoch windows — the fold applies the same test.
+/// The epoch `header`, certified by `qc`, is `shard`'s contribution for,
+/// or `None` when it is none.
+///
+/// A crossing header, the first block certified past an epoch boundary,
+/// contributes for the boundary its QC crosses. A shard's terminal is the
+/// first block whose parent QC lands past its cut, since the block before
+/// it cannot know it is the last; it alone carries the terminal settled
+/// root, and it contributes for the boundary its parent QC crossed. The
+/// crossing past a shard's terminal epoch is the block before its
+/// terminal, which contributes nothing. Pure over the chain's epoch
+/// windows and the shard's recorded terminal epoch — the proposer's
+/// admission, the receiver's gate and the fold apply the same test.
 #[must_use]
-pub(crate) fn is_boundary_crossing(
-    boundary_header: &BlockHeader,
+pub(crate) fn contributed_epoch(
+    state: &BeaconState,
+    shard: ShardId,
+    header: &BlockHeader,
     qc: &QuorumCertificate,
     windows: EpochWindows,
-) -> bool {
-    windows.is_crossing(
-        boundary_header.parent_qc().weighted_timestamp(),
+) -> Option<Epoch> {
+    if header.settled_txs_root().is_some() {
+        return windows.terminal_crossing_epoch(header.parent_qc().weighted_timestamp());
+    }
+    let crossed = windows.crossing_epoch(
+        header.parent_qc().weighted_timestamp(),
         qc.weighted_timestamp(),
-    )
+    )?;
+    let past_terminal = state
+        .boundaries
+        .get(&shard)
+        .and_then(|record| record.terminal_epoch)
+        .is_some_and(|terminal| crossed > terminal);
+    (!past_terminal).then_some(crossed)
 }
 
 /// Whether `block`'s shard contributions are the faithful canonical
@@ -219,7 +238,9 @@ pub(crate) fn contributions_well_formed(state: &BeaconState, block: &BeaconBlock
     canonical.into_iter().all(|(shard, qc)| {
         contributions.get(&shard).is_some_and(|contribution| {
             let header = &contribution.boundary_header;
-            if header.hash() != qc.block_hash() || !is_boundary_crossing(header, qc, windows) {
+            if header.hash() != qc.block_hash()
+                || contributed_epoch(state, shard, header, qc, windows).is_none()
+            {
                 return false;
             }
             let (prior, chunk_end) = witness_chunk_bounds(state, shard, header);

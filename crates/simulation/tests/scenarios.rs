@@ -672,17 +672,19 @@ fn wide_venue_cluster(seed: u64) -> SimCluster {
     )
 }
 
-/// TEMPORARY seed sweep over the fan-in bar.
 /// The seeds the fan-in bar is read over.
 ///
 /// One reading is not a measurement. Per seed the fanned-in queue lands
 /// anywhere from eight blocks under the single-caller one to sixteen
 /// over, because what either queue costs in blocks depends on where the
-/// last swap falls against the venue's cadence. A bar one seed satisfies
-/// says nothing about the next. Summed, the readings settle — and the
-/// sum is what the claim is about anyway, since a per-caller cost would
-/// show on every seed rather than on some.
-const FAN_IN_SEEDS: [u64; 4] = [42, 7, 11, 1337];
+/// last swap falls against the venue's cadence — and the cadence is the
+/// shard's: the shards of one grown world commit anywhere from forty to
+/// seventy blocks in ten idle seconds, so a few seeds can seat the
+/// fanned venue on a fast one every time. A bar one seed satisfies says
+/// nothing about the next. Summed, the readings settle — and the sum is
+/// what the claim is about anyway, since a per-caller cost would show on
+/// every seed rather than on some.
+const FAN_IN_SEEDS: [u64; 12] = [42, 7, 11, 1337, 1, 2, 3, 4, 5, 6, 8, 9];
 
 /// The fan-in bar: a venue priced from three caller shards clears its
 /// queue no slower than one priced from a single caller shard. A venue's

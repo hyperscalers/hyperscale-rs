@@ -1479,13 +1479,14 @@ impl ShardCoordinator {
     /// keyed at `parent_qc_wt` carries, identical on the build side
     /// (carry) and the vote side (required).
     ///
-    /// A block in a terminating shard's final window carries
-    /// `split_child_roots` (a split) and the terminal settled root (a
-    /// split or a merge), each decided by the window's own frozen
-    /// schedule entry, so a reshape in flight resolves without waiting on
-    /// the local beacon. So does the terminal, judged by the window its
-    /// parent's anchor sits in. A shard past no cut never reads its
-    /// parent's anchor.
+    /// A block in a splitting shard's final window carries
+    /// `split_child_roots`, decided by the window's own frozen schedule
+    /// entry, so a reshape in flight resolves without waiting on the
+    /// local beacon. The terminal, judged by the window its parent's
+    /// anchor sits in, carries them too, and it alone carries the
+    /// terminal settled root (a split or a merge): that root is what names
+    /// a header its chain's terminal to every reader. A shard past no cut
+    /// never reads its parent's anchor.
     ///
     /// `None` when the schedule holds no window for an instant it must
     /// read, or the parent is not held here: the caller defers rather
@@ -1516,7 +1517,10 @@ impl ShardCoordinator {
         if final_window.terminal_settled_txs
             || !topology_schedule.past_terminal(local, parent_qc_wt)
         {
-            return Some(final_window);
+            return Some(TerminalCarry {
+                terminal_settled_txs: false,
+                ..final_window
+            });
         }
         let grandparent_qc_wt = self.block_anchor(parent)?;
         if Self::is_terminal(topology_schedule, local, parent_qc_wt, grandparent_qc_wt)? {
@@ -14187,10 +14191,10 @@ mod tests {
         assert_eq!(terminal(1_600, 1_500), Some(false), "both past");
     }
 
-    /// The final window's blocks and the terminal carry the terminal
-    /// roots, and the coast block after the terminal carries none.
+    /// The terminal alone carries the terminal settled root: neither a
+    /// final-window block nor the coast block after the terminal does.
     #[test]
-    fn the_final_window_and_the_terminal_carry_the_terminal_roots() {
+    fn the_terminal_alone_carries_the_terminal_settled_root() {
         let sched = make_terminating_schedule(4);
         let carry = |parent_qc_ms, grandparent_qc_ms| {
             let state = coordinator_with_committed_anchor(grandparent_qc_ms);
@@ -14202,7 +14206,7 @@ mod tests {
                 )
                 .map(|carry| carry.terminal_settled_txs)
         };
-        assert_eq!(carry(900, 500), Some(true), "a final-window block");
+        assert_eq!(carry(900, 500), Some(false), "a final-window block");
         assert_eq!(carry(1_500, 900), Some(true), "the terminal");
         assert_eq!(carry(1_600, 1_500), Some(false), "a coast block after it");
     }

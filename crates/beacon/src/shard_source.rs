@@ -424,7 +424,8 @@ impl ShardSourceTracker {
                 .iter()
                 .filter_map(|(height, b)| {
                     let c = headers.get(&height.next())?;
-                    let (epoch, crossing) = detect_crossing(b, c, windows)?;
+                    let d = headers.get(&height.next().next());
+                    let (epoch, crossing) = detect_crossing(b, c, d, windows)?;
                     self.commit_established(shard, crossing.boundary_header())
                         .then_some((epoch, crossing))
                 })
@@ -560,9 +561,15 @@ impl ShardSourceTracker {
 /// past it — return that crossing keyed by the crossed epoch. `b`'s own
 /// weighted timestamp is read canonically from `c.parent_qc`, so the
 /// crossed epoch and QC are identical on every node that sees the pair.
+///
+/// Where `c` carries the terminal settled root, `c` is its chain's
+/// terminal — the first block past the cut, which `b` could not know it
+/// was — and the crossing recorded is `c`, certified by `d`'s parent QC,
+/// once `d` is held.
 fn detect_crossing(
     b: &Arc<Verified<CertifiedBlockHeader>>,
     c: &Arc<Verified<CertifiedBlockHeader>>,
+    d: Option<&Arc<Verified<CertifiedBlockHeader>>>,
     windows: EpochWindows,
 ) -> Option<(Epoch, ObservedCrossing)> {
     let canonical_qc = c.header().parent_qc();
@@ -573,13 +580,25 @@ fn detect_crossing(
         b.header().parent_qc().weighted_timestamp(),
         canonical_qc.weighted_timestamp(),
     )?;
-    Some((
-        epoch,
-        ObservedCrossing {
-            boundary_header: Arc::clone(b),
-            canonical_qc: canonical_qc.clone(),
-        },
-    ))
+    if c.header().settled_txs_root().is_none() {
+        return Some((
+            epoch,
+            ObservedCrossing {
+                boundary_header: Arc::clone(b),
+                canonical_qc: canonical_qc.clone(),
+            },
+        ));
+    }
+    let terminal_qc = d?.header().parent_qc();
+    (terminal_qc.block_hash() == c.block_hash()).then(|| {
+        (
+            epoch,
+            ObservedCrossing {
+                boundary_header: Arc::clone(c),
+                canonical_qc: terminal_qc.clone(),
+            },
+        )
+    })
 }
 
 // Flat accessors; names are the documentation.
@@ -634,8 +653,8 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeaderParts, BlockHeight, CertifiedBlockHeader, Hash, LeafIndex, QuorumCertificate,
-        Round, ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, Verified,
-        WeightedTimestamp,
+        Round, SettledTxsRoot, ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId,
+        Verified, WeightedTimestamp,
     };
 
     use super::*;
@@ -658,6 +677,20 @@ mod tests {
         parent_wt: u64,
         leaf_count: u64,
     ) -> Arc<Verified<CertifiedBlockHeader>> {
+        linked_header_settling(s, height, round, parent_hash, parent_wt, leaf_count, None)
+    }
+
+    /// [`linked_header`] carrying `terminal_settled_txs`, as a chain's
+    /// terminal alone does.
+    fn linked_header_settling(
+        s: ShardId,
+        height: u64,
+        round: u64,
+        parent_hash: BlockHash,
+        parent_wt: u64,
+        leaf_count: u64,
+        terminal_settled_txs: Option<SettledTxsRoot>,
+    ) -> Arc<Verified<CertifiedBlockHeader>> {
         let parent_qc = QuorumCertificate::new(
             parent_hash,
             s,
@@ -678,6 +711,7 @@ mod tests {
                 format!("r-{s:?}-{height}").as_bytes(),
             )),
             beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
+            terminal_settled_txs,
             ..Default::default()
         });
         let block_hash = header.hash();
@@ -840,6 +874,40 @@ mod tests {
         );
         assert_eq!(crossing.canonical_qc().block_hash(), b.block_hash());
         assert_eq!(crossing.boundary_header().hash(), b.block_hash());
+    }
+
+    /// Where the first block past the boundary carries the terminal
+    /// settled root, it is its chain's terminal: the crossing recorded is
+    /// that block, certified by its successor's parent QC, once the
+    /// successor is held and commits it — never the block before it.
+    #[test]
+    fn observe_crossing_records_the_terminal_past_the_cut() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 7);
+        let c = linked_header_settling(
+            shard(0),
+            3,
+            2,
+            b.block_hash(),
+            1_500,
+            7,
+            Some(SettledTxsRoot::ZERO),
+        );
+        note(&mut t, &b, 1_000);
+        note(&mut t, &c, 1_000);
+        assert!(
+            t.latest_crossing(shard(0)).is_none(),
+            "the terminal waits for the QC its successor carries",
+        );
+        let d = linked_header(shard(0), 4, 3, c.block_hash(), 1_600, 7);
+        note(&mut t, &d, 1_000);
+        let crossing = t.latest_crossing(shard(0)).expect("terminal observed");
+        assert_eq!(crossing.boundary_header().hash(), c.block_hash());
+        assert_eq!(crossing.canonical_qc().block_hash(), c.block_hash());
+        assert_eq!(
+            crossing.canonical_qc().weighted_timestamp(),
+            WeightedTimestamp::from_millis(1_600),
+        );
     }
 
     /// A `(B, C)` pair whose rounds gap — a view change between them —

@@ -1771,12 +1771,11 @@ fn anchored_split_genesis(
     qc: &QuorumCertificate,
     anchor: &ShardAnchor,
 ) -> Option<(Block, ChainOrigin, Option<Anchor>)> {
-    let (genesis, origin) =
-        split_genesis_from_terminal(child, terminal, qc, anchor.weighted_timestamp)
-            .inspect_err(|error| {
-                tracing::warn!(?child, %error, "split child genesis derivation failed");
-            })
-            .ok()?;
+    let (genesis, origin) = split_genesis_from_terminal(child, terminal, qc)
+        .inspect_err(|error| {
+            tracing::warn!(?child, %error, "split child genesis derivation failed");
+        })
+        .ok()?;
     if genesis.hash() != anchor.block_hash {
         tracing::error!(
             ?child,

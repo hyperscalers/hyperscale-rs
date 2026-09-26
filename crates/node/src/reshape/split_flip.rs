@@ -14,9 +14,7 @@
 //! `parent_qc`'s. A weighted timestamp may therefore only ever be taken
 //! from a `parent_qc`; the served QC confirms only that `B` is certified.
 
-use hyperscale_types::{
-    Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId, WeightedTimestamp,
-};
+use hyperscale_types::{Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId};
 
 /// Derive a split child's genesis block and chain origin from the parent
 /// chain's certified terminal block.
@@ -46,12 +44,11 @@ pub(crate) fn split_genesis_from_terminal(
     child: ShardId,
     terminal_header: &BlockHeader,
     terminal_qc: &QuorumCertificate,
-    canonical_wt: WeightedTimestamp,
 ) -> Result<(Block, ChainOrigin), String> {
     if terminal_qc.block_hash() != terminal_header.hash() {
         return Err("the quorum certificate does not certify the terminal block".to_string());
     }
-    Block::split_child_genesis_from_terminal(child, terminal_header, canonical_wt)
+    Block::split_child_genesis_from_terminal(child, terminal_header)
         .ok_or_else(|| "the terminal carries no composing split child roots".to_string())
 }
 
@@ -99,35 +96,42 @@ mod tests {
     }
 
     /// A terminal carrying a composing child-root pair derives the child's
-    /// genesis, clocked by the canonical timestamp the caller supplies —
-    /// never by the served QC, which carries a higher-round
-    /// re-certification stamp from past the crossing.
+    /// genesis, clocked by the terminal's own parent QC — never by the
+    /// served QC, which carries a higher-round re-certification stamp
+    /// from past the crossing.
     #[test]
-    fn derivation_uses_the_canonical_clock_not_the_served_qc() {
+    fn derivation_uses_the_terminals_own_clock_not_the_served_qc() {
         let parent = ShardId::leaf(1, 0);
         let (left, _) = parent.children();
         let pair = SplitChildRoots {
             left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
             right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
         };
-        let terminal = header_at(
+        let crossing = header_at(
             parent,
-            BlockHeight::new(9),
+            BlockHeight::new(8),
             QuorumCertificate::genesis(parent, ChainOrigin::ROOT),
             pair.composed_root(),
             Some(pair),
         );
-        let canonical_wt = WeightedTimestamp::from_millis(2_500);
+        let terminal = header_at(
+            parent,
+            BlockHeight::new(9),
+            certifying_qc(&crossing, 2_500),
+            pair.composed_root(),
+            Some(pair),
+        );
+        let clock = terminal.parent_qc().weighted_timestamp();
 
         let stale_qc = certifying_qc(&terminal, 9_999);
         let (genesis, origin) =
-            split_genesis_from_terminal(left, &terminal, &stale_qc, canonical_wt).expect("derives");
+            split_genesis_from_terminal(left, &terminal, &stale_qc).expect("derives");
         assert_eq!(
             genesis.hash(),
-            Block::split_child_genesis(left, pair.left, &terminal, canonical_wt).hash(),
+            Block::split_child_genesis(left, pair.left, &terminal, clock).hash(),
         );
         assert_eq!(origin.genesis_height, BlockHeight::new(10));
-        assert_eq!(origin.anchor_wt, canonical_wt);
+        assert_eq!(origin.anchor_wt, clock);
     }
 
     /// A terminal whose child-root pair does not compose to its own
@@ -149,14 +153,6 @@ mod tests {
             Some(pair),
         );
         let qc = certifying_qc(&terminal, 2_500);
-        assert!(
-            split_genesis_from_terminal(
-                left,
-                &terminal,
-                &qc,
-                WeightedTimestamp::from_millis(2_500)
-            )
-            .is_err()
-        );
+        assert!(split_genesis_from_terminal(left, &terminal, &qc).is_err());
     }
 }

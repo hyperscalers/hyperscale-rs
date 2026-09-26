@@ -791,6 +791,7 @@ fn build_shard_io<S: ShardStorage>(
                     hash: header.hash(),
                     height: header.height(),
                     parent_qc_wt: header.parent_qc().weighted_timestamp(),
+                    terminal: header.settled_txs_root().is_some(),
                 }
             });
         // The chain's epoch duration, read from the projected

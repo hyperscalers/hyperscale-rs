@@ -332,9 +332,10 @@ impl Block {
     /// entry for `child`, self-verifying by the composition check below —
     /// collision resistance means a parent cannot name a pair that composes
     /// to its own committed state root without holding those subtrees.
-    /// `canonical_wt` is the weighted timestamp of the canonical
-    /// certificate over the terminal, which is the `parent_qc` of the
-    /// terminal's committed successor and never a QC served alongside it.
+    /// The child's clock starts at the terminal's own parent QC: the
+    /// certificate over the parent's last block that could carry content,
+    /// and the first instant past the cut, read off the terminal header
+    /// itself rather than off whichever certificate over it a party holds.
     ///
     /// `None` when the terminal carries no pair, or one that does not
     /// compose to its own state root.
@@ -342,8 +343,8 @@ impl Block {
     pub fn split_child_genesis_from_terminal(
         child: ShardId,
         terminal: &BlockHeader,
-        canonical_wt: WeightedTimestamp,
     ) -> Option<(Self, ChainOrigin)> {
+        let anchor_wt = terminal.parent_qc().weighted_timestamp();
         let pair = terminal.split_child_roots()?;
         if !pair.composes_to(terminal.state_root()) {
             return None;
@@ -354,10 +355,10 @@ impl Block {
             pair.right
         };
         Some((
-            Self::split_child_genesis(child, child_root, terminal, canonical_wt),
+            Self::split_child_genesis(child, child_root, terminal, anchor_wt),
             ChainOrigin {
                 genesis_height: terminal.height().next(),
-                anchor_wt: canonical_wt,
+                anchor_wt,
             },
         ))
     }

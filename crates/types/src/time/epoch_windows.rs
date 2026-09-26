@@ -162,6 +162,19 @@ impl EpochWindows {
             None => None,
         }
     }
+
+    /// The epoch a chain's terminal contributes for: the boundary its
+    /// parent QC crossed, the largest strictly below `parent_qc_wt`. The
+    /// terminal is the first block whose parent QC lands past the cut, so
+    /// the block before it is the crossing, and this is the epoch
+    /// [`crossing_epoch`](Self::crossing_epoch) names for it.
+    #[must_use]
+    pub const fn terminal_crossing_epoch(self, parent_qc_wt: WeightedTimestamp) -> Option<Epoch> {
+        match self.boundary_below(parent_qc_wt) {
+            Some((epoch, _)) => Some(epoch),
+            None => None,
+        }
+    }
 }
 
 #[cfg(test)]

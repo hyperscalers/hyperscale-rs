@@ -256,7 +256,8 @@ fn boundary_qc_admissible(
         shard_source,
         topology_schedule,
         network,
-    ) && rules::is_boundary_crossing(header, qc, state.chain_config.epoch_windows())
+    ) && rules::contributed_epoch(state, shard, header, qc, state.chain_config.epoch_windows())
+        .is_some()
 }
 
 /// The locally-held header for `block_hash` in `shard`, via the
@@ -290,9 +291,10 @@ fn boundary_header_for(
 ///
 /// Resolution is terminal-clamped and recovery-bridged
 /// (`lookup_for_shard_certified`): a splitting shard's terminal crossing
-/// can be anchored exactly on (or past) its cut — `is_boundary_crossing`
-/// is parent-inclusive at the cut — and the anchor's half-open window no
-/// longer carries the shard; the block is still proposed and signed by
+/// can be anchored exactly on its cut — a crossing is parent-inclusive at
+/// the cut — and a terminal is anchored past it, where the anchor's
+/// half-open window no longer carries the shard; the block is still
+/// proposed and signed by
 /// the shard's final-epoch committee, the same resolution its own
 /// replicas applied when voting it, so the QC must verify against that
 /// committee. A halt recovery's bridge block — the crossing that
