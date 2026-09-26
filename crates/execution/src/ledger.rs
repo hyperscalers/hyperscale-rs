@@ -1419,6 +1419,15 @@ impl Ledger {
             .collect()
     }
 
+    /// Whether a committed departure names `tx_hash`: the one covering a
+    /// member a tick holds is abandoned on.
+    #[must_use]
+    pub(crate) fn departed(&self, tx_hash: TxHash) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.departed_by.is_some())
+    }
+
     /// The figures an abandonment of `tx_hash` restates, where the entry
     /// is one an abandonment can answer for: held, and not a leg's.
     #[must_use]

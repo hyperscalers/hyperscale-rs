@@ -13,9 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
-    Address, CollectionId, Deadline, DeclaredKey, Joins, MAX_HOLDS_PER_MEMBER,
+    Address, CollectionId, Deadline, DeclaredKey, DiscardCause, Joins, MAX_HOLDS_PER_MEMBER,
     MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Role, Settlement, ShardId, ShardTrie, SubstateKey,
-    TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, compatible,
+    TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, compatible,
     tick_manifest_admits_block,
 };
 use hyperscale_vm_effects::Kind;
@@ -384,13 +384,57 @@ pub struct ManifestInputs {
     pub committed: CommittedSets,
 }
 
+/// Where a candidate stands, as its row says, with what judging it
+/// reads.
+#[derive(Debug, Clone, Copy)]
+pub enum Standing<'a> {
+    /// Committed, and named by no tick yet.
+    Pending(&'a MemberFacts),
+    /// Held by the tick at this id, which lets go of it on its abort: a
+    /// member a counterpart's verdict can discard, which a departure
+    /// covers and which the tick does not hold as its own abandonment.
+    /// Its abort reads nothing more than its row.
+    Held(TickId),
+    /// Let go by a discard of the tick that held it.
+    Released {
+        /// Whether a committed departure names it.
+        covered: bool,
+        /// Its facts.
+        facts: &'a MemberFacts,
+    },
+}
+
+impl Standing<'_> {
+    /// Whether the transaction reaches beyond this shard: a held member
+    /// a departure covers does.
+    const fn reaches_beyond(&self) -> bool {
+        match self {
+            Self::Pending(facts) | Self::Released { facts, .. } => facts.reaches_beyond,
+            Self::Held(_) => true,
+        }
+    }
+
+    /// Whether this shard runs a leg of it, which its reclaim resolves:
+    /// a held member a counterpart's verdict can discard is no leg.
+    const fn leg(&self) -> bool {
+        match self {
+            Self::Pending(facts) | Self::Released { facts, .. } => facts.leg,
+            Self::Held(_) => false,
+        }
+    }
+}
+
 /// The member lines a block names over `rows`: the family after the
 /// block's own finalizations, discards, records and transactions.
 ///
-/// Every `Pending` row is a candidate, and every in-flight row's holds
-/// are held. A candidate whose facts `facts` does not have is left
-/// waiting and returned beside the lines, so a voter, which cannot judge
-/// a manifest without them, defers, and a proposer names what it can.
+/// Every `Pending` row is a candidate, and past its deadline so is one a
+/// tick let go of, and one a tick holds that an abort may name on its
+/// row alone; every in-flight row's holds are held. A candidate whose
+/// facts `facts` does not have is left waiting and returned beside the
+/// lines, so a voter, which cannot judge a manifest without them,
+/// defers, and a proposer names what it can. A held row never needs
+/// them, so no member in flight keeps a voter that cannot route it from
+/// judging a manifest.
 #[must_use]
 pub fn member_lines<'f>(
     rows: &MemberIndex,
@@ -402,14 +446,44 @@ pub fn member_lines<'f>(
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
     for row in rows.members.values() {
-        match row.state {
-            RowState::Pending => match facts(row.tx) {
-                Some(known) => candidates.push((row.tx, known, row.deadline)),
-                None => missing.push(row.tx),
-            },
-            RowState::InFlight { .. } => holds.claim(&row.holds),
-            RowState::Released => {}
-        }
+        let passed = row.deadline.passed(anchor);
+        let standing = match row.state {
+            RowState::InFlight {
+                tick,
+                joins,
+                settlement,
+            } => {
+                holds.claim(&row.holds);
+                if !(passed
+                    && row.covered
+                    && joins != Joins::Aborted
+                    && settlement != Settlement::Alone)
+                {
+                    continue;
+                }
+                Standing::Held(TickId::new(rows.shard(), tick))
+            }
+            RowState::Released if !passed => continue,
+            RowState::Pending | RowState::Released => {
+                let Some(known) = facts(row.tx) else {
+                    missing.push(row.tx);
+                    continue;
+                };
+                if row.state == RowState::Pending {
+                    Standing::Pending(known)
+                } else {
+                    Standing::Released {
+                        covered: row.covered,
+                        facts: known,
+                    }
+                }
+            }
+        };
+        candidates.push(Nameable {
+            tx: row.tx,
+            deadline: row.deadline,
+            standing,
+        });
     }
     let lines = select_members(
         anchor,
@@ -431,25 +505,83 @@ pub struct ManifestBudget {
 impl ManifestBudget {
     /// Take `line` if it fits what is left, and say whether it did.
     pub fn take(&mut self, line: &TickLine) -> bool {
-        let spent = self.spent.saturating_add(line.wire_weight());
-        if !tick_manifest_admits_block(spent) || self.lines >= MAX_TICK_LINES_PER_BLOCK {
+        self.take_all([line])
+    }
+
+    /// Take every one of `lines` if all of them fit what is left, and
+    /// none of them otherwise.
+    fn take_all<'l>(&mut self, lines: impl IntoIterator<Item = &'l TickLine>) -> bool {
+        let (mut spent, mut count) = (self.spent, self.lines);
+        for line in lines {
+            spent = spent.saturating_add(line.wire_weight());
+            count += 1;
+        }
+        if !tick_manifest_admits_block(spent) || count > MAX_TICK_LINES_PER_BLOCK {
             return false;
         }
         self.spent = spent;
-        self.lines += 1;
+        self.lines = count;
         true
     }
 }
 
-/// The member lines a block names: every ready candidate, in canonical
-/// order, that no provisional hold refuses, up to the budget.
+/// One transaction a block's lines may name.
+#[derive(Debug, Clone, Copy)]
+pub struct Nameable<'a> {
+    /// The transaction.
+    pub tx: TxHash,
+    /// Its deadline, off its signed validity range.
+    pub deadline: Deadline,
+    /// Where its row stands, with what judging it reads.
+    pub standing: Standing<'a>,
+}
+
+/// What an abort of a candidate lets go of.
+#[derive(Debug, Clone, Copy)]
+enum Abort {
+    /// Nothing: no tick holds it.
+    Unheld,
+    /// The tick that holds it, which a discard beside the abort releases.
+    Held(TickId),
+}
+
+impl Nameable<'_> {
+    /// Whether an abort may name this candidate past its deadline, and
+    /// what the abort lets go of.
+    ///
+    /// A `Pending` row was never certified, so nothing can settle it.
+    /// A row a tick holds is abandoned only once a departure covers it,
+    /// never by the tick that is itself its abandonment, and never where
+    /// no counterpart's verdict can discard it, since its own tick
+    /// decides it: a leg's readings license its reclaim, and a core
+    /// member is named to run only once every sibling's committed bundle
+    /// names it, so a sibling's cell read absent reaches only a `Pending`
+    /// row. A row let go of is aborted once nothing beyond this shard can
+    /// settle it.
+    const fn abortable(&self) -> Option<Abort> {
+        match self.standing {
+            Standing::Pending(_) => Some(Abort::Unheld),
+            Standing::Held(tick) => Some(Abort::Held(tick)),
+            Standing::Released { covered, facts } if covered || !facts.reaches_beyond => {
+                Some(Abort::Unheld)
+            }
+            Standing::Released { .. } => None,
+        }
+    }
+}
+
+/// The lines a block names: every ready candidate, in canonical order,
+/// that no provisional hold refuses, up to the budget, then the discards
+/// its aborts imply.
 ///
 /// A candidate past its deadline at `anchor` is named `Aborted` and
 /// nothing else, whether or not it is ready: a member that awaits nobody
 /// and succeeds decides its transaction, so it is named to run only
 /// while the deadline has not passed, and its success is admissible
 /// whenever it then commits. A leg past its deadline is not named at all:
-/// its reclaim resolves it.
+/// its reclaim resolves it. An abort of a member a tick holds is charged
+/// together with that tick's `Abandoned` discard, so the pair fits or
+/// neither does.
 ///
 /// Canonical order puts the transactions reaching beyond this shard
 /// first, then hash order: theirs are the provisional writes everything
@@ -467,35 +599,55 @@ impl ManifestBudget {
 #[must_use]
 pub fn select_members<'a>(
     anchor: WeightedTimestamp,
-    candidates: impl IntoIterator<Item = (TxHash, &'a MemberFacts, Deadline)>,
+    candidates: impl IntoIterator<Item = Nameable<'a>>,
     inputs: &dyn CommittedInputs,
     holds: &mut ProvisionalCells,
     budget: &mut ManifestBudget,
 ) -> Vec<TickLine> {
-    let mut ordered: Vec<(TxHash, &MemberFacts, Deadline)> = candidates.into_iter().collect();
-    ordered.sort_by_key(|(tx, facts, _)| (!facts.reaches_beyond, *tx));
+    let mut ordered: Vec<Nameable<'a>> = candidates.into_iter().collect();
+    ordered.sort_by_key(|candidate| (!candidate.standing.reaches_beyond(), candidate.tx));
     let mut lines = Vec::new();
-    for (tx, facts, deadline) in ordered {
+    let mut discards = Vec::new();
+    for candidate in ordered {
+        let Nameable {
+            tx,
+            deadline,
+            standing,
+        } = candidate;
         if deadline.passed(anchor) {
-            if facts.leg {
+            if standing.leg() {
                 continue;
             }
+            let Some(abort) = candidate.abortable() else {
+                continue;
+            };
             let line = TickLine::Member {
                 tx,
                 joins: Joins::Aborted,
-                settlement: if facts.reaches_beyond {
+                settlement: if standing.reaches_beyond() {
                     Settlement::Awaited
                 } else {
                     Settlement::Alone
                 },
                 holds: Capped::empty(),
             };
-            if !budget.take(&line) {
+            let discard = match abort {
+                Abort::Unheld => None,
+                Abort::Held(tick) => Some(TickLine::Discard {
+                    tick,
+                    cause: DiscardCause::Abandoned(tx),
+                }),
+            };
+            if !budget.take_all(std::iter::once(&line).chain(&discard)) {
                 break;
             }
             lines.push(line);
+            discards.extend(discard);
             continue;
         }
+        let Standing::Pending(facts) = standing else {
+            continue;
+        };
         let Some(joins) = readiness(tx, facts, anchor, inputs) else {
             continue;
         };
@@ -526,12 +678,18 @@ pub fn select_members<'a>(
         }
         lines.push(line);
     }
+    lines.extend(discards);
     lines
 }
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{AddressClass, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES};
+    use std::time::Duration;
+
+    use hyperscale_storage::MemberRow;
+    use hyperscale_types::{
+        AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES,
+    };
     use hyperscale_vm_types::Moves;
 
     use super::*;
@@ -651,6 +809,14 @@ mod tests {
 
     const PEER: ShardId = ShardId::leaf(1, 1);
 
+    fn pending(tx: TxHash, facts: &MemberFacts, deadline: Deadline) -> Nameable<'_> {
+        Nameable {
+            tx,
+            deadline,
+            standing: Standing::Pending(facts),
+        }
+    }
+
     /// A deadline no fixture reaches.
     fn far() -> Deadline {
         Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 2))
@@ -755,7 +921,10 @@ mod tests {
         let mut holds = ProvisionalCells::default();
         let lines = select_members(
             ms(0),
-            [(tx(1), &local, far()), (tx(9), &reaching, far())],
+            [
+                pending(tx(1), &local, far()),
+                pending(tx(9), &reaching, far()),
+            ],
             &held,
             &mut holds,
             &mut ManifestBudget::default(),
@@ -778,8 +947,8 @@ mod tests {
         let lines = select_members(
             ms(0),
             [
-                (tx(1), &local, far()),
-                (tx(2), &alone(vec![(shared, WRITE)]), far()),
+                pending(tx(1), &local, far()),
+                pending(tx(2), &alone(vec![(shared, WRITE)]), far()),
             ],
             &held,
             &mut holds,
@@ -796,7 +965,7 @@ mod tests {
         assert!(
             select_members(
                 ms(0),
-                [(tx(3), &wide, far())],
+                [pending(tx(3), &wide, far())],
                 &held,
                 &mut ProvisionalCells::default(),
                 &mut ManifestBudget::default(),
@@ -813,8 +982,9 @@ mod tests {
             .map(|at| (interval(9, at as u128, at as u128), RESERVE))
             .collect();
         let wide = leg(declared, &[]);
-        let facts: Vec<(TxHash, &MemberFacts, Deadline)> =
-            (0..8u8).map(|seed| (tx(seed), &wide, far())).collect();
+        let facts: Vec<Nameable<'_>> = (0..8u8)
+            .map(|seed| pending(tx(seed), &wide, far()))
+            .collect();
         let lines = select_members(
             ms(0),
             facts,
@@ -845,7 +1015,10 @@ mod tests {
         assert!(passed.passed(anchor));
         let lines = select_members(
             anchor,
-            [(tx(1), &waiting, passed), (tx(2), &a_leg, passed)],
+            [
+                pending(tx(1), &waiting, passed),
+                pending(tx(2), &a_leg, passed),
+            ],
             &Held::default(),
             &mut holds,
             &mut ManifestBudget::default(),
@@ -858,6 +1031,136 @@ mod tests {
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
             }],
+        );
+    }
+
+    /// A core member waits on every sibling's committed bundle, so one
+    /// whose sibling never engages is never named to run, and its row,
+    /// still `Pending`, is named `Aborted` at the deadline.
+    #[test]
+    fn a_core_member_whose_sibling_never_engages_is_aborted_at_its_deadline() {
+        let core = leg(vec![], &[Requirement::CommittedState(PEER)]);
+        let deadline = Deadline::of(ms(10_000));
+        let named = |at: WeightedTimestamp| {
+            select_members(
+                at,
+                [pending(tx(1), &core, deadline)],
+                &Held::default(),
+                &mut ProvisionalCells::default(),
+                &mut ManifestBudget::default(),
+            )
+        };
+        assert!(
+            named(deadline.at().minus(Duration::from_millis(1))).is_empty(),
+            "no sibling bundle, no run"
+        );
+        assert_eq!(
+            named(deadline.at()),
+            vec![TickLine::Member {
+                tx: tx(1),
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+                holds: Capped::empty(),
+            }],
+        );
+    }
+
+    /// A held row is a candidate only past its deadline, covered by a
+    /// departure, held by a tick that is not its abandonment, and one a
+    /// counterpart's verdict can discard, and it is judged on its row
+    /// alone: no facts are asked for it.
+    #[test]
+    fn member_lines_name_a_held_row_on_the_row_alone() {
+        let deadline = Deadline::of(ms(10_000));
+        let row = |seed: u8, joins, settlement, covered| MemberRow {
+            tx: tx(seed),
+            deadline,
+            committed: ms(0),
+            height: BlockHeight::new(1),
+            state: RowState::InFlight {
+                tick: BlockHeight::new(2),
+                joins,
+                settlement,
+            },
+            holds: Capped::empty(),
+            covered,
+        };
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        for held in [
+            row(1, Joins::Executes, Settlement::Shared, true),
+            row(2, Joins::Executes, Settlement::Shared, false),
+            row(3, Joins::Aborted, Settlement::Awaited, true),
+            row(4, Joins::Executes, Settlement::Alone, true),
+        ] {
+            rows.members.insert(held.tx, held);
+        }
+        let lines = |at: WeightedTimestamp| member_lines(&rows, at, &|_| None, &Held::default());
+        let (before, missing) = lines(deadline.at().minus(Duration::from_millis(1)));
+        assert!(before.is_empty() && missing.is_empty());
+        let (after, missing) = lines(deadline.at());
+        assert!(missing.is_empty(), "a held row asks for no facts");
+        assert_eq!(
+            after,
+            vec![
+                TickLine::Member {
+                    tx: tx(1),
+                    joins: Joins::Aborted,
+                    settlement: Settlement::Awaited,
+                    holds: Capped::empty(),
+                },
+                TickLine::Discard {
+                    tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                    cause: DiscardCause::Abandoned(tx(1)),
+                },
+            ],
+        );
+    }
+
+    /// Past its deadline, a held member is aborted beside its tick's
+    /// discard, and a member let go of is aborted once it reaches no
+    /// other shard or is covered.
+    #[test]
+    fn a_held_or_released_member_is_aborted_by_its_standing() {
+        let reaching = leg(vec![], &[]);
+        let local = alone(vec![]);
+        let held = TickId::new(ShardId::ROOT, BlockHeight::new(5));
+        let passed = Deadline::of(ms(0));
+        let candidate = |seed, deadline, standing| Nameable {
+            tx: tx(seed),
+            deadline,
+            standing,
+        };
+        let released = |covered, facts| Standing::Released { covered, facts };
+        let lines = select_members(
+            ms(60_000),
+            [
+                candidate(1, passed, Standing::Held(held)),
+                candidate(5, passed, released(false, &reaching)),
+                candidate(6, passed, released(false, &local)),
+                candidate(7, passed, released(true, &reaching)),
+                candidate(8, far(), released(true, &reaching)),
+            ],
+            &Held::default(),
+            &mut ProvisionalCells::default(),
+            &mut ManifestBudget::default(),
+        );
+        let aborted = |seed, settlement| TickLine::Member {
+            tx: tx(seed),
+            joins: Joins::Aborted,
+            settlement,
+            holds: Capped::empty(),
+        };
+        assert_eq!(
+            lines,
+            vec![
+                aborted(1, Settlement::Awaited),
+                aborted(7, Settlement::Awaited),
+                aborted(6, Settlement::Alone),
+                TickLine::Discard {
+                    tick: held,
+                    cause: DiscardCause::Abandoned(tx(1)),
+                },
+            ],
         );
     }
 }

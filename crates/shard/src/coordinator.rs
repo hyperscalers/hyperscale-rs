@@ -20,8 +20,8 @@ use hyperscale_types::{
     Deadline, DeferOn, Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
     MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash,
     ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary,
-    StateClaim, StoredReceipt, SubstateKey, TickLine, TxsInFlight, VerificationKind,
-    WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
+    StateClaim, StoredReceipt, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
+    WindowLookup, derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -2070,9 +2070,10 @@ impl ShardCoordinator {
         Some(Ancestry::over(&self.member_rows, &blocks))
     }
 
-    /// Whether `block`'s member lines are the ones the chain up to its
-    /// parent names: every `Pending` row ready at its anchor, in
-    /// canonical order under the hold rule, up to the budget.
+    /// Whether `block`'s lines are the ones the chain up to its parent
+    /// names: every `Pending` row ready at its anchor, in canonical order
+    /// under the hold rule, and every abort due past a deadline, up to
+    /// the budget, then the discards those aborts imply.
     ///
     /// # Errors
     ///
@@ -2085,15 +2086,6 @@ impl ShardCoordinator {
         committee: &TopologySnapshot,
         block: &Block,
     ) -> Result<(), Withheld> {
-        if let Some(line) = block
-            .tick_manifest()
-            .iter()
-            .find(|line| !matches!(line, TickLine::Member { .. }))
-        {
-            return Err(Withheld::Refused(format!(
-                "the block names {line:?}, which no line admits yet"
-            )));
-        }
         let Some(ancestry) = self.ancestry(topology_schedule, block.header().parent_block_hash())
         else {
             return Err(Withheld::deferred(
@@ -2186,7 +2178,11 @@ impl ShardCoordinator {
         let facts = rows
             .members
             .values()
-            .filter(|row| row.state == RowState::Pending)
+            .filter(|row| match row.state {
+                RowState::Pending => true,
+                RowState::Released => row.deadline.passed(anchor),
+                RowState::InFlight { .. } => false,
+            })
             .filter_map(|row| Some((row.tx, self.member_facts.get(row.tx)?.clone())))
             .collect();
         Some(ManifestInputs {
@@ -7459,8 +7455,8 @@ mod tests {
         Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof,
         NetworkDefinition, NetworkParams, ProvisionEntry, RETENTION_HORIZON, RoutePrefix,
         SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx,
+        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickLine, TimestampRange,
+        TopologySchedule, TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx,
         VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
         WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict, test_utils,
     };

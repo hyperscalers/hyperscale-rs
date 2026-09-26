@@ -54,6 +54,7 @@ use hyperscale_engine::tick_select::{ProvisionalCells, Requirement, requirements
 use hyperscale_engine::{
     CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
     record_batch_unavailable, record_crossing_push_dropped, record_reclaim_admitted,
     record_unresolvable_tx,
@@ -63,14 +64,14 @@ use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation,
-    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, Joins,
-    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateClaim, StateWrites, StoredReceipt,
-    SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, WindowView, derive_block_transactions, settled_set_verdict,
-    tick_leader, tick_leader_at,
+    DiscardCause, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
+    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
+    Joins, MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions,
+    ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim,
+    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
+    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
@@ -1119,6 +1120,42 @@ impl ExecutionCoordinator {
         vec![Action::ResolveTicks { resolutions }]
     }
 
+    /// The lines this node's own committed inputs name for the tick at
+    /// `tick_id`: its candidates, then an abort of each member a tick of
+    /// ours holds past its deadline under a departure, then the discard
+    /// of the tick that holds it. What a fixture building a block stands
+    /// in for.
+    fn composed_lines(&self, anchored: &TopologySnapshot, tick_id: TickId) -> Vec<TickLine> {
+        let mut lines = self.candidates.named(
+            anchored.shard_trie(),
+            &self.provisioning,
+            &mut self.provisional_cells(),
+            self.committed_ts,
+        );
+        let mut discards = Vec::new();
+        for entry in self.abandonable(tick_id) {
+            let Some(held_by) = self.ticks.tick_assignment(entry.tx_hash) else {
+                continue;
+            };
+            lines.push(TickLine::Member {
+                tx: entry.tx_hash,
+                joins: Joins::Aborted,
+                settlement: if self.counterparts.ledger.reaches_beyond(entry.tx_hash) {
+                    Settlement::Awaited
+                } else {
+                    Settlement::Alone
+                },
+                holds: Capped::empty(),
+            });
+            discards.push(TickLine::Discard {
+                tick: held_by,
+                cause: DiscardCause::Abandoned(entry.tx_hash),
+            });
+        }
+        lines.extend(discards);
+        lines
+    }
+
     /// Admit into the tick being composed everything this commit
     /// abandons: past its deadline, with no shard left that could settle
     /// it.
@@ -1153,8 +1190,9 @@ impl ExecutionCoordinator {
         lines: &[TickLine],
     ) {
         let local_shard = self.local_shard;
-        // The members the manifest names `Aborted`, then the ones a tick
-        // of ours holds or ran, which this node still lets go of itself.
+        // The members the manifest names `Aborted`, then the ones no tick
+        // of ours holds, which this node still lets go of itself: a held
+        // one is the manifest's to name.
         let mut entries: Vec<UnsettledTx> = lines
             .iter()
             .filter_map(|line| match line {
@@ -1166,9 +1204,11 @@ impl ExecutionCoordinator {
                 _ => None,
             })
             .collect();
-        for held in self.abandonable(tick_id) {
-            if !entries.iter().any(|named| named.tx_hash == held.tx_hash) {
-                entries.push(held);
+        for unheld in self.abandonable(tick_id) {
+            if self.ticks.tick_assignment(unheld.tx_hash).is_none()
+                && !entries.iter().any(|named| named.tx_hash == unheld.tx_hash)
+            {
+                entries.push(unheld);
             }
         }
         for entry in entries {
@@ -1455,12 +1495,7 @@ impl ExecutionCoordinator {
         let lines = match named {
             Named::Lines(lines) => lines,
             Named::Composed => {
-                composed = self.candidates.named(
-                    anchored.shard_trie(),
-                    &self.provisioning,
-                    &mut self.provisional_cells(),
-                    self.committed_ts,
-                );
+                composed = self.composed_lines(anchored, tick_id);
                 &composed[..]
             }
         };
@@ -3610,8 +3645,12 @@ impl ExecutionCoordinator {
                 }
                 // Which clock it runs on is already applied: an entry
                 // reaches here only past its own abandon window's
-                // opening.
-                self.counterparts.ledger.is_covered(tx_hash)
+                // opening. A departure is the only covering a held member
+                // can have: a leg's readings license its reclaim, and a
+                // core member runs only once every sibling's committed
+                // bundle names it, so a sibling's absence reaches only one
+                // no tick took.
+                self.counterparts.ledger.departed(tx_hash)
             }
             // An entry no execution of ours took is re-offered once its
             // tick is gone: it spends nothing to abort at any age, and
@@ -12760,9 +12799,9 @@ mod tests {
     /// A tick released because a sibling member was abandoned keeps the
     /// member whose verdict a counterpart shares.
     ///
-    /// `X` is past its deadline and covered, a committed record saying
-    /// it was left unsettled, so the composing tick abandons it; the tick
-    /// that held it goes with it. `T` sat in the
+    /// `X` is past its deadline and a departure covers it, so the block
+    /// names its abort beside the discard of the tick that held it, and
+    /// the composing tick seats the abort. `T` sat in the
     /// same tick awaiting [`PEER`], whose certificate settles it against
     /// this shard's — out already, and outliving the tick. Dropped with
     /// the tick, `T` is settled by nobody: its entry is certified, so the
@@ -12801,7 +12840,24 @@ mod tests {
             .counterpart_trie(&sched)
             .expect("the fixture holds the window")
             .clone();
+        let named = [
+            TickLine::Member {
+                tx: x,
+                joins: Joins::Aborted,
+                settlement: Settlement::Alone,
+                holds: Capped::empty(),
+            },
+            TickLine::Discard {
+                tick: tick_id,
+                cause: DiscardCause::Abandoned(x),
+            },
+        ];
         state.admit_abandoned(&trie, composing, &mut composing_tick, &[]);
+        assert!(
+            composing_tick.tx_hashes().is_empty(),
+            "a held member is the manifest's to abort",
+        );
+        state.admit_abandoned(&trie, composing, &mut composing_tick, &named);
         assert_eq!(
             composing_tick.tx_hashes(),
             &[x],

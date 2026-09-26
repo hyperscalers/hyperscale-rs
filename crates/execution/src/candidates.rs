@@ -18,7 +18,8 @@ use std::sync::Arc;
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs};
 use hyperscale_engine::tick_select::{
-    CommittedInputs, ManifestBudget, MemberFacts, ProvisionalCells, select_members,
+    CommittedInputs, ManifestBudget, MemberFacts, Nameable, ProvisionalCells, Standing,
+    select_members,
 };
 use hyperscale_types::{
     Deadline, EscrowedValue, Joins, PriceTable, ShardId, ShardTrie, SubstateKey, TickLine,
@@ -217,9 +218,11 @@ impl TickCandidates {
             .collect();
         select_members(
             now,
-            facts
-                .iter()
-                .map(|(tx_hash, facts, deadline)| (*tx_hash, facts, *deadline)),
+            facts.iter().map(|(tx_hash, facts, deadline)| Nameable {
+                tx: *tx_hash,
+                deadline: *deadline,
+                standing: Standing::Pending(facts),
+            }),
             &Absorbed(provisioning),
             held,
             &mut ManifestBudget::default(),
