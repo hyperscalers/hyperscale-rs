@@ -98,10 +98,9 @@ impl ShardChainWriter for RocksDbShardStorage {
             finalizations,
             parent.state,
             parent.height,
-            creations,
-            removals,
+            chain,
             frontier,
-            state_claims,
+            &self.root_path,
         );
 
         let (computed_root, collected) = if parent.pending.is_empty() {

@@ -7,12 +7,14 @@ use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
     Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, Finalization,
-    LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateClaim, StateWrites,
-    StoredReceipt, SubstateKey, Verifiable, entry_leaf_key,
+    LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt,
+    SubstateKey, Verifiable, entry_leaf_key,
 };
 use hyperscale_vm_kernel::Substates;
 
+use crate::shard::chain_writer::ChainWrites;
 use crate::shard::crossings::{crossing_settlements, owed_credits};
+use crate::shard::members::fate_debits;
 use crate::shard::read_frontier::with_frontier;
 use crate::shard::store::Anchored;
 use crate::shard::sweep::{removals_of, with_sweep};
@@ -68,12 +70,14 @@ pub fn merge_writes_from_receipts(
 /// The receipts `finalizations` settle and the owed credits the block's
 /// claims license, resolved together against the parent's baseline,
 /// plus the block's own creations, the sweep's removals, the crossing
-/// settlements its claims license against the same baseline, and the
-/// read frontier's entries.
+/// settlements its claims license against the same baseline, and
+/// `protocol_entries`, the read frontier's and tick membership's.
 ///
 /// The credits fold after the receipts, so a credit composes with any
 /// movement a receipt made on the same vault rather than being
-/// superseded by it.
+/// superseded by it, and so do the terminal's fate debits, restricted to
+/// the store's `prefix`: an abort's floor is burned by the shard holding
+/// the vault.
 ///
 /// One resolution, feeding both the tree and the substate store — they
 /// commit the same values or they disagree about state. It happens once
@@ -95,10 +99,9 @@ pub fn settled_writes_at(
     finalizations: &[Arc<Verifiable<Finalization>>],
     baseline: &dyn Anchored,
     parent_height: BlockHeight,
-    creations: &[(SubstateKey, Vec<u8>)],
-    swept: &[SubstateKey],
-    frontier: SettledEntries,
-    state_claims: &[StateClaim],
+    chain: ChainWrites<'_>,
+    protocol_entries: SettledEntries,
+    prefix: &NibblePath,
 ) -> SettledWrites {
     assert_eq!(
         baseline.anchor(),
@@ -110,12 +113,20 @@ pub fn settled_writes_at(
         .flat_map(|fw| fw.settling_receipts())
         .collect();
     let mut writes = merge_receipts(&settling);
-    fold_state_writes(&mut writes, &owed_credits(state_claims, baseline));
+    fold_state_writes(&mut writes, &owed_credits(chain.state_claims, baseline));
+    fold_state_writes(
+        &mut writes,
+        &filter_state_writes_to_prefix(&fate_debits(&chain.members.manifest), prefix),
+    );
     let merged = settle_writes(&writes, baseline);
-    let settled = crossing_settlements(state_claims, &merged, baseline);
+    let settled = crossing_settlements(chain.state_claims, &merged, baseline);
     with_frontier(
-        with_sweep(merged, creations, &removals_of(swept, &settled)),
-        frontier,
+        with_sweep(
+            merged,
+            chain.creations,
+            &removals_of(chain.removals, &settled),
+        ),
+        protocol_entries,
     )
 }
 

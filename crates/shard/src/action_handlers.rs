@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
-use hyperscale_engine::tick_select::{ManifestInputs, member_lines};
+use hyperscale_engine::tick_select::{ManifestInputs, ManifestKind, member_lines, terminal_fates};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
@@ -320,14 +320,22 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
                 .map(|engagement| (engagement.source, engagement.tx_hash)),
         );
         inputs.arrived.extend(record_arrivals(&state_claims));
-        let (lines, _) = member_lines(
-            &rows,
-            anchor,
-            &|tx| manifest.facts.get(&tx),
-            &inputs,
-            &|shard| inputs.evidence(shard),
-            manifest.recovery,
-        );
+        let facts = |tx| manifest.facts.get(&tx);
+        let lines = match manifest.kind {
+            ManifestKind::Members => {
+                member_lines(
+                    &rows,
+                    anchor,
+                    &facts,
+                    &inputs,
+                    &|shard| inputs.evidence(shard),
+                    manifest.recovery,
+                )
+                .0
+            }
+            ManifestKind::Fates => terminal_fates(&rows, &facts).0,
+            ManifestKind::Empty => Vec::new(),
+        };
         Arc::new(Capped::new(lines).expect("the budget stops at the line cap"))
     };
     let members = content(Arc::clone(&tick_manifest));

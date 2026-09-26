@@ -20,7 +20,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
 use crate::shard::crossings::{crossing_settlements, owed_credits};
-use crate::shard::members::{MemberInputs, member_writes};
+use crate::shard::members::{MemberInputs, fate_debits, member_writes};
 use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
 use crate::tree::JmtSnapshot;
 use crate::{
@@ -508,6 +508,7 @@ pub fn followed_block_writes(
     // empty prior here and is the owning store's to judge, not this one's.
     let mut writes = merge_receipts(&settling);
     fold_state_writes(&mut writes, &owed_credits(block.state_claims(), prior));
+    fold_state_writes(&mut writes, &fate_debits(block.tick_manifest()));
     let merged = settle_writes(&filter_state_writes_to_prefix(&writes, prefix), prior);
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
     let settled = crossing_settlements(block.state_claims(), &merged, prior);

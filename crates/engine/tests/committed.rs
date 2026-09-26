@@ -9,7 +9,10 @@
 
 use hyperscale_hbor::Capped;
 use hyperscale_storage::committed_tx_cells;
-use hyperscale_types::{AddressClass, FrontierInputs, ShardId};
+use hyperscale_types::{
+    AddressClass, Block, FrontierInputs, ShardId, StoredReceipt, SubstateKey, TickManifest,
+    Transaction,
+};
 use hyperscale_vm_effects::Hash32;
 use hyperscale_vm_types::{Address, IntentHash, LegRole, LegShape, ValueEdge};
 
@@ -240,4 +243,166 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
         MemberIndex::empty(parent)
     );
     assert!(children.composes_to(parent_root));
+}
+
+/// A receipt crediting `vault` a hundred of the protocol resource.
+fn funding(vault: SubstateKey) -> StoredReceipt {
+    use std::sync::Arc;
+
+    use hyperscale_types::{
+        ConsensusReceipt, GlobalReceiptHash, Movement, ProtocolHasher, StateWrites, StoredReceipt,
+        TxHash,
+    };
+    use hyperscale_vm_effects::protocol_resource;
+
+    let mut writes = StateWrites::default();
+    writes.movements.insert(
+        vault,
+        Movement {
+            resource: protocol_resource(&ProtocolHasher),
+            credit: 100,
+            debit: 0,
+            unjudged_debit: 0,
+        },
+    );
+    StoredReceipt::synced(
+        TxHash::ZERO,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    )
+}
+
+/// A block of `shard`'s chain at `height` settling `receipts`, carrying
+/// `transactions` and naming `manifest`.
+fn on_chain(
+    shard: ShardId,
+    height: u64,
+    receipts: Vec<StoredReceipt>,
+    transactions: &[Transaction],
+    manifest: TickManifest,
+) -> Block {
+    use std::sync::Arc;
+
+    use hyperscale_storage::test_helpers::block_settling;
+    use hyperscale_types::{BlockHeader, BlockHeaderParts, BlockHeight, Verifiable};
+
+    let Block::Live {
+        header,
+        certificates,
+        provisions,
+        abandonment_records,
+        state_claims,
+        witness_sources,
+        ..
+    } = block_settling(BlockHeight::new(height), receipts)
+    else {
+        unreachable!("the fixture builds a live block");
+    };
+    Block::Live {
+        header: BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            ..header.into_parts()
+        }),
+        transactions: Arc::new(
+            Capped::new(
+                transactions
+                    .iter()
+                    .map(|tx| Arc::new(Verifiable::from(tx.clone())))
+                    .collect(),
+            )
+            .expect("a list written out in a test"),
+        ),
+        certificates,
+        provisions,
+        abandonment_records,
+        state_claims,
+        tick_manifest: Arc::new(manifest),
+        witness_sources,
+    }
+}
+
+/// A split child's follower applies its half of the parent's terminal:
+/// the left child, holding the parent's rows, drops them; the right
+/// child, holding the fated member's vault, burns its charge; and the
+/// halves still recompose the parent's root.
+#[test]
+fn a_follower_applies_its_half_of_the_terminal() {
+    use hyperscale_storage::{BoundaryStore, MemberIndex, SubstateStore};
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::{
+        AbortCharge, Joins, LocalKey, Settlement, SplitChildRoots, TickLine, shard_prefix_path,
+    };
+
+    let parent = ShardId::leaf(2, 2);
+    let (left, right) = parent.children();
+    let tx = test_transaction(1);
+    let charge = AbortCharge {
+        vault: SubstateKey {
+            owner: Address::new([0xA0; 31], AddressClass::Component),
+            local: LocalKey([1; 16]),
+        },
+        amount: 13,
+    };
+    let naming = on_chain(
+        parent,
+        1,
+        vec![funding(charge.vault)],
+        std::slice::from_ref(&tx),
+        Capped::from_array([TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            charge,
+        }]),
+    );
+    let terminal = on_chain(
+        parent,
+        2,
+        Vec::new(),
+        &[],
+        Capped::from_array([TickLine::Fate {
+            tx: tx.hash(),
+            charge,
+        }]),
+    );
+
+    let committed = committed_tx_cells(parent, [&tx]);
+    let still = FrontierInputs::still(ShardId::ROOT);
+    let stores = [parent, left, right].map(|shard| SimShardStorage::new(shard_prefix_path(shard)));
+    let roots = |block: &Block, creations: &[_]| {
+        stores.each_ref().map(|store| {
+            store
+                .follow_block_writes(block, creations, &still)
+                .expect("followed")
+        })
+    };
+    let [_, left_before, right_before] = roots(&naming, &committed);
+    let [whole, left_after, right_after] = roots(&terminal, &[]);
+
+    for store in &stores {
+        assert_eq!(
+            MemberIndex::load(&store.snapshot(), parent),
+            MemberIndex::empty(parent),
+            "the terminal leaves no row on any store",
+        );
+    }
+    assert_ne!(left_after, left_before, "the left child drops the rows");
+    assert_ne!(
+        right_after, right_before,
+        "the right child burns the charge"
+    );
+    assert!(
+        SplitChildRoots {
+            left: left_after,
+            right: right_after,
+        }
+        .composes_to(whole)
+    );
 }

@@ -142,7 +142,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_engine::tick_select::{ManifestInputs, member_lines};
+use hyperscale_engine::tick_select::{ManifestInputs, ManifestKind, member_lines, terminal_fates};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
@@ -153,10 +153,10 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
     HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError,
-    QuorumCertificate, ReadFence, RecoveryCause, Round, SafeVoteRegisters, StateRoot, Timeout,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
-    Verifier, Verify, VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload,
+    QuorumCertificate, ReadFence, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine,
+    Timeout, TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable,
+    Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
+    missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::field::Empty;
@@ -2135,10 +2135,37 @@ impl ShardCoordinator {
         Some(Ancestry::over(&self.member_rows, &blocks))
     }
 
+    /// What the manifest of the block extending `parent` under a parent
+    /// QC keyed at `parent_qc_wt` names: a fate for every row on the
+    /// chain's terminal, nothing on any other coast block or on a
+    /// recovery's bridge, and member lines on every other block. `None`
+    /// where [`Self::terminal_carry`] cannot answer.
+    fn manifest_kind(
+        &self,
+        topology_schedule: &TopologySchedule,
+        parent: BlockHash,
+        parent_qc_wt: WeightedTimestamp,
+    ) -> Option<ManifestKind> {
+        if self
+            .terminal_carry(topology_schedule, parent, parent_qc_wt)?
+            .terminal_settled_txs
+        {
+            return Some(ManifestKind::Fates);
+        }
+        let coasting = topology_schedule.past_terminal(self.local_shard, parent_qc_wt)
+            || self.recovery_bridging(topology_schedule, parent_qc_wt);
+        Some(if coasting {
+            ManifestKind::Empty
+        } else {
+            ManifestKind::Members
+        })
+    }
+
     /// Whether `block`'s lines are the ones the chain up to its parent
     /// names: every `Pending` row ready at its anchor, in canonical order
     /// under the hold rule, and every abort due past a deadline, up to
-    /// the budget, then the discards those aborts imply.
+    /// the budget, then the discards those aborts imply; on the terminal,
+    /// a fate for every row; on any other coast block, nothing.
     ///
     /// # Errors
     ///
@@ -2151,8 +2178,23 @@ impl ShardCoordinator {
         committee: &TopologySnapshot,
         block: &Block,
     ) -> Result<(), Withheld> {
-        let Some(ancestry) = self.ancestry(topology_schedule, block.header().parent_block_hash())
-        else {
+        let parent = block.header().parent_block_hash();
+        let anchor = block.header().parent_qc().weighted_timestamp();
+        let Some(kind) = self.manifest_kind(topology_schedule, parent, anchor) else {
+            return Err(Withheld::deferred(
+                "the schedule does not hold the block's windows".into(),
+            ));
+        };
+        if kind == ManifestKind::Empty {
+            return if block.tick_manifest().is_empty() {
+                Ok(())
+            } else {
+                Err(Withheld::Refused(
+                    "a coast block names tick lines".to_string(),
+                ))
+            };
+        }
+        let Some(ancestry) = self.ancestry(topology_schedule, parent) else {
             return Err(Withheld::deferred(
                 "a block between the committed tip and the parent is not held".into(),
             ));
@@ -2167,15 +2209,47 @@ impl ShardCoordinator {
             manifest: Arc::new(Capped::empty()),
             ..MemberInputs::of(block)
         });
+        let (expected, missing) = if kind == ManifestKind::Fates {
+            let facts = &self.member_facts;
+            terminal_fates(&rows, &|tx| facts.get(tx))
+        } else {
+            self.expected_member_lines(topology_schedule, committee, block, &ancestry, &rows)?
+        };
+        if let Some(tx) = missing.first() {
+            return Err(Withheld::deferred(format!(
+                "no facts held for pending member {tx:?}"
+            )));
+        }
+        if block.tick_manifest()[..] != expected[..] {
+            return Err(Withheld::Refused(format!(
+                "the block names {} tick lines where the chain names {}",
+                block.tick_manifest().len(),
+                expected.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The member lines the chain up to `block`'s parent names over
+    /// `rows`, the family after the block's own content, with the
+    /// pending members whose facts are not held.
+    fn expected_member_lines(
+        &self,
+        topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
+        block: &Block,
+        ancestry: &Ancestry,
+        rows: &MemberIndex,
+    ) -> Result<(Vec<TickLine>, Vec<TxHash>), Withheld> {
         let own = OwnContent::of(
             &block.engagements().iter().copied().collect(),
             record_arrivals(block.state_claims()),
         );
         let anchor = block.header().parent_qc().weighted_timestamp();
         let sets = committed_sets(
-            &rows,
+            rows,
             &self.member_facts,
-            &ancestry,
+            ancestry,
             &own,
             &self.dedup_index,
             anchor,
@@ -2188,27 +2262,14 @@ impl ShardCoordinator {
         let recovery =
             topology_schedule.recovery_frontier(committee, self.local_shard, parent_anchor, anchor);
         let facts = &self.member_facts;
-        let (expected, missing) = member_lines(
-            &rows,
+        Ok(member_lines(
+            rows,
             anchor,
             &|tx| facts.get(tx),
             &sets,
             &|shard| sets.evidence(shard),
             recovery,
-        );
-        if let Some(tx) = missing.first() {
-            return Err(Withheld::deferred(format!(
-                "no facts held for pending member {tx:?}"
-            )));
-        }
-        if block.tick_manifest()[..] != expected[..] {
-            return Err(Withheld::Refused(format!(
-                "the block names {} member lines where the chain names {}",
-                block.tick_manifest().len(),
-                expected.len()
-            )));
-        }
-        Ok(())
+        ))
     }
 
     /// What the builder of a block extending `parent` names members
@@ -2270,6 +2331,7 @@ impl ShardCoordinator {
             facts,
             committed: held,
             recovery,
+            kind: self.manifest_kind(topology_schedule, parent, anchor)?,
         })
     }
 
@@ -3896,29 +3958,28 @@ impl ShardCoordinator {
                 );
                 return vec![];
             }
-            // The member lines are judged over the chain up to the parent,
-            // which a coast block, naming none, never reads.
-            if !coasting {
-                match self.check_tick_manifest(topology_schedule, committee, block) {
-                    Ok(()) => {}
-                    Err(Withheld::Refused(why)) => {
-                        warn!(
-                            validator = ?self.me,
-                            block_hash = ?block_hash,
-                            %why,
-                            "The block's member lines are not the chain's — not voting"
-                        );
-                        return vec![];
-                    }
-                    Err(Withheld::Deferred { why, wanted }) => {
-                        trace!(
-                            validator = ?self.me,
-                            block_hash = ?block_hash,
-                            %why,
-                            "The block's member lines cannot yet be judged — deferring"
-                        );
-                        return wanted;
-                    }
+            // The tick lines are judged over the chain up to the parent: a
+            // member's, or the terminal's fates. A coast block names none
+            // and is judged without reading the chain.
+            match self.check_tick_manifest(topology_schedule, committee, block) {
+                Ok(()) => {}
+                Err(Withheld::Refused(why)) => {
+                    warn!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        %why,
+                        "The block's tick lines are not the chain's — not voting"
+                    );
+                    return vec![];
+                }
+                Err(Withheld::Deferred { why, wanted }) => {
+                    trace!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        %why,
+                        "The block's tick lines cannot yet be judged — deferring"
+                    );
+                    return wanted;
                 }
             }
 
@@ -14227,6 +14288,79 @@ mod tests {
         assert_eq!(carry(900, 500), Some(false), "a final-window block");
         assert_eq!(carry(1_500, 900), Some(true), "the terminal");
         assert_eq!(carry(1_600, 1_500), Some(false), "a coast block after it");
+    }
+
+    /// The terminal names a fate for every row the chain holds, each at
+    /// the charge its facts price, in transaction order, and nothing else;
+    /// a block that is not the terminal names none.
+    #[test]
+    fn terminal_fates_equal_the_family() {
+        let sched = make_terminating_schedule(4);
+        let committee = Arc::clone(sched.head());
+        let from = BlockHash::from_raw(Hash::from_bytes(b"terminal tip"));
+        let mut txs = [test_transaction(1), test_transaction(2)];
+        txs.sort_by_key(Transaction::hash);
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 500),
+            &txs,
+            Vec::new(),
+        );
+        let parent = committing.hash();
+        let mut state = committed_on(make_test_state().0, &sched, from, [committing]);
+        assert_eq!(state.member_rows().members.len(), 2);
+
+        let fate = |tx: &Transaction| TickLine::Fate {
+            tx: tx.hash(),
+            charge: test_utils::genesis_charge(tx),
+        };
+        let at = |parent_qc_ms, lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(2), parent, parent_qc_ms),
+                &[],
+                lines,
+            )
+        };
+        let [a, b] = &txs;
+        assert!(
+            state
+                .check_tick_manifest(&sched, &committee, &at(1_500, vec![fate(a), fate(b)]))
+                .is_ok(),
+            "the terminal fates every row",
+        );
+        for (lines, why) in [
+            (vec![fate(a)], "a row left out"),
+            (vec![fate(b), fate(a)], "out of order"),
+            (
+                vec![fate(a), fate(b), fate(&test_transaction(3))],
+                "a fate no row stands for",
+            ),
+            (
+                vec![
+                    fate(a),
+                    TickLine::Fate {
+                        tx: b.hash(),
+                        charge: stub_abort_charge(9),
+                    },
+                ],
+                "another charge",
+            ),
+            (vec![member(a), member(b)], "member lines on the terminal"),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&sched, &committee, &at(1_500, lines)),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
+        assert!(
+            matches!(
+                state.check_tick_manifest(&sched, &committee, &at(900, vec![fate(a), fate(b)])),
+                Err(Withheld::Refused(_))
+            ),
+            "a block inside the final window names no fate",
+        );
     }
 
     /// [`make_terminating_schedule`] whose head additionally shows both of

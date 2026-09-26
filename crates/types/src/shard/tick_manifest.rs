@@ -122,6 +122,16 @@ pub enum TickLine {
         /// What an abort of it burns, out of whose vault.
         charge: AbortCharge,
     },
+    /// The chain's terminal lets a member go with an abort: its row
+    /// leaves the family, and its charge is burned where its vault lies.
+    /// The terminal names one for every row it inherits, and no other
+    /// block names any.
+    Fate {
+        /// The transaction, whose row the chain still holds.
+        tx: TxHash,
+        /// What its abort burns, out of whose vault.
+        charge: AbortCharge,
+    },
     /// An earlier tick lets go of the members `cause` releases.
     Discard {
         /// The tick, which committed on this chain.
@@ -143,7 +153,7 @@ impl TickLine {
                 Self::Member { holds, reach, .. } => {
                     holds.len() * TICK_HOLD_BYTES + reach.len() * TICK_REACH_BYTES
                 }
-                Self::Discard { .. } => 0,
+                Self::Fate { .. } | Self::Discard { .. } => 0,
             }
     }
 }

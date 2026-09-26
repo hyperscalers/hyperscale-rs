@@ -21,13 +21,14 @@ use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Block, BlockHeight, CollectionId, Deadline,
     DiscardCause, EntryKey, Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK,
-    MAX_VALIDITY_RANGE, Reach, SettledEntries, Settlement, ShardId, ShardTrie, SubstateKey,
-    TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash, TxOutcome, Verifiable, Verified,
-    WeightedTimestamp,
+    MAX_VALIDITY_RANGE, Movement, Reach, SettledEntries, Settlement, ShardId, ShardTrie,
+    StateWrites, SubstateKey, TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash,
+    TxOutcome, Verifiable, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{ProtocolHasher, TICK_MEMBER_SLOT, collection_id};
+use hyperscale_vm_effects::{ProtocolHasher, TICK_MEMBER_SLOT, collection_id, protocol_resource};
 
 use crate::Substates;
+use crate::shard::writes::fold_state_writes;
 
 /// Where a member stands in its tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
@@ -413,6 +414,29 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         self.set_tick(height, remains);
     }
 
+    /// The terminal's fates delete the rows they name, and every tick
+    /// row they leave listing no standing member.
+    fn fate(&mut self, fated: &[TxHash]) {
+        let mut ticks = BTreeSet::new();
+        for &tx in fated {
+            let Some(row) = self.member(tx) else {
+                continue;
+            };
+            if let RowState::InFlight { tick, .. } = row.state {
+                ticks.insert(tick);
+            }
+            self.set_member(tx, None);
+        }
+        for height in ticks {
+            let Some(tick) = self.tick(height) else {
+                continue;
+            };
+            if tick.members.iter().all(|&tx| self.member(tx).is_none()) {
+                self.set_tick(height, None);
+            }
+        }
+    }
+
     /// A record naming a standing row covers it.
     fn cover(&mut self, tx: TxHash) {
         if let Some(mut row) = self.member(tx)
@@ -456,7 +480,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         TickHalf::Legs => composed.legs_unsettled = true,
                     }
                 }
-                TickLine::Discard { .. } => {}
+                TickLine::Fate { .. } | TickLine::Discard { .. } => {}
             }
         }
         if !members.is_empty() {
@@ -537,37 +561,44 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
         );
     }
     family.name(inputs.height, &inputs.manifest);
+    let fated: Vec<TxHash> = inputs
+        .manifest
+        .iter()
+        .filter_map(|line| match line {
+            TickLine::Fate { tx, .. } => Some(*tx),
+            _ => None,
+        })
+        .collect();
+    family.fate(&fated);
 
     let mut writes = SettledEntries::new();
     family.into_writes(&mut writes);
-    clear_predecessors(state, inputs.shard, &mut writes);
     writes
 }
 
-/// Remove whatever stands in `shard`'s parent's or children's
-/// collections: a reshape successor's first fold empties what its
-/// predecessors left, and every later one finds nothing there.
-fn clear_predecessors(
-    state: &(impl Substates + ?Sized),
-    shard: ShardId,
-    writes: &mut SettledEntries,
-) {
-    let children: [ShardId; 2] = shard.children().into();
-    for predecessor in shard.parent().into_iter().chain(children) {
-        for kind in [MEMBERS, TICKS] {
-            let (owner, collection) = collection_of(predecessor, kind);
-            for (order, _) in read_all(state, predecessor, kind) {
-                writes.insert(
-                    EntryKey {
-                        owner,
-                        collection,
-                        order,
-                    },
-                    None,
-                );
-            }
-        }
+/// What the terminal's fates burn: one unjudged debit of each fated
+/// member's charge on its vault, wherever the vault lies.
+///
+/// A store folds
+/// only the debits under its own prefix, since an abort's floor is
+/// settled by the shard holding the vault and by no other; the fold
+/// reads nothing but the carried lines, so a replica that cannot route
+/// the transaction burns what one that can does.
+#[must_use]
+pub fn fate_debits(manifest: &TickManifest) -> StateWrites {
+    let resource = protocol_resource(&ProtocolHasher);
+    let mut debits = StateWrites::default();
+    for line in manifest.iter() {
+        let TickLine::Fate { charge, .. } = line else {
+            continue;
+        };
+        let mut debit = StateWrites::default();
+        debit
+            .movements
+            .insert(charge.vault, Movement::unjudged(resource, charge.amount));
+        fold_state_writes(&mut debits, &debit);
     }
+    debits
 }
 
 /// The first transaction of `transactions` whose member key is taken:
@@ -1026,13 +1057,13 @@ mod tests {
         assert!(!index.members.contains_key(&tx(9)));
     }
 
-    /// A successor's fold clears what its predecessors left, even where
-    /// it shares their owner address, and never reads their rows as its
-    /// own.
+    /// A successor never reads its predecessors' rows as its own, even
+    /// where it shares their owner address, and its fold writes nothing
+    /// under theirs: the terminal already removed them.
     #[test]
-    fn a_successor_clears_its_predecessors_rows() {
+    fn a_successor_never_reads_its_predecessors_rows() {
         let parent = ShardId::ROOT;
-        let (left, right) = parent.children();
+        let (left, _) = parent.children();
         let mut store = Entries::default();
         store.fold(&MemberInputs {
             transactions: vec![(tx(1), Deadline::of(WeightedTimestamp::ZERO))],
@@ -1043,19 +1074,47 @@ mod tests {
             MemberIndex::load(&store, left).members.is_empty(),
             "the left child shares its parent's owner and still reads none of its rows",
         );
+        assert!(member_writes(&store, &MemberInputs::still(left)).is_empty());
+    }
 
-        store.fold(&MemberInputs::still(left));
-        assert!(MemberIndex::load(&store, parent).members.is_empty());
-        assert!(store.0.is_empty());
-
-        store.fold(&MemberInputs {
-            transactions: vec![(tx(2), Deadline::of(WeightedTimestamp::ZERO))],
-            ..MemberInputs::still(right)
-        });
-        store.fold(&MemberInputs::still(parent));
+    /// The terminal's fates delete every row they name and every tick row
+    /// they empty, and burn each member's charge once, composing two
+    /// charges on one vault.
+    #[test]
+    fn terminal_fates_remove_every_row_and_debit_once() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2, 3]));
+        store.fold(&naming(2, vec![member(1, Settlement::Alone)]));
+        let fated = |seed: u8, charge| TickLine::Fate {
+            tx: tx(seed),
+            charge,
+        };
+        let shared = stub_abort_charge(7);
+        let manifest: TickManifest = Capped::new(vec![
+            fated(1, stub_abort_charge(1)),
+            fated(2, shared),
+            fated(3, shared),
+        ])
+        .expect("a list written out in a test");
+        store.fold(&naming(3, manifest.to_vec()));
+        let index = MemberIndex::load(&store, LOCAL);
         assert!(
-            store.0.is_empty(),
-            "a merged parent clears its right child's rows"
+            index.members.is_empty() && index.ticks.is_empty(),
+            "{index:?}"
+        );
+
+        let debits = fate_debits(&manifest);
+        assert!(debits.cells.is_empty() && debits.entries.is_empty());
+        assert_eq!(debits.movements.len(), 2);
+        let debit = |charge: AbortCharge| debits.movements[&charge.vault];
+        assert_eq!(
+            debit(stub_abort_charge(1)),
+            Movement::unjudged(protocol_resource(&ProtocolHasher), 13),
+        );
+        assert_eq!(
+            debit(shared),
+            Movement::unjudged(protocol_resource(&ProtocolHasher), 26),
+            "two fates on one vault burn both charges",
         );
     }
 

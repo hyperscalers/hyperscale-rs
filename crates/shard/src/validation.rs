@@ -474,10 +474,16 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
             block.state_claims().len()
         ));
     }
-    if !block.tick_manifest().is_empty() {
+    // The terminal's fates are the one kind of line a coast block
+    // carries; which coast block may carry them, and exactly which, is
+    // judged over the chain up to its parent.
+    if let Some(line) = block
+        .tick_manifest()
+        .iter()
+        .find(|line| !matches!(line, TickLine::Fate { .. }))
+    {
         return Err(format!(
-            "coast block past the terminal window carries {} tick lines",
-            block.tick_manifest().len()
+            "coast block past the terminal window carries tick lines other than fates: {line:?}"
         ));
     }
     Ok(())
@@ -2826,9 +2832,9 @@ pub mod tests {
     }
 
     /// The header's tick manifest root commits the block's lines, in
-    /// both forms, and a coast block names none.
+    /// both forms, and a coast block names nothing but fates.
     #[test]
-    fn the_tick_manifest_root_commits_its_lines_and_a_coast_block_names_none() {
+    fn the_tick_manifest_root_commits_its_lines_and_a_coast_block_names_nothing_but_fates() {
         let lines: TickManifest = Capped::from_array([TickLine::Discard {
             tick: TickId::new(ShardId::ROOT, BlockHeight::new(3)),
             cause: DiscardCause::Recovery,

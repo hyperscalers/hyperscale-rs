@@ -538,6 +538,17 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         );
         assert_eq!(line.wire_weight(), TICK_LINE_BYTES);
     }
+    let fate = TickLine::Fate {
+        tx: widest_tx,
+        charge: widest_charge,
+    };
+    let encoded = hbor_to_vec(&fate).expect("a fate line encodes");
+    assert!(
+        encoded.len() <= fate.wire_weight(),
+        "a fate encodes to {}",
+        encoded.len()
+    );
+    assert_eq!(fate.wire_weight(), TICK_LINE_BYTES);
     let one = TickLine::Member {
         tx: widest_tx,
         joins: Joins::Executes,

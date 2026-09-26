@@ -323,7 +323,7 @@ pub const MAX_HOLDS_PER_MEMBER: usize = MAX_PREFIXES_PER_TX;
 /// Lines are charged in the order they apply: members first, then
 /// discards, and a proposer stops at the first that does
 /// not fit and leaves the rest to the next block.
-pub const MAX_TICK_MANIFEST_BYTES: usize = 1024 * 1024;
+pub const MAX_TICK_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 
 /// Whether a block may still carry tick lines weighing `weight` between
 /// them.
@@ -345,6 +345,10 @@ pub const TICK_HOLD_BYTES: usize = 160;
 
 /// Bytes one shard of a member line's reach costs.
 pub const TICK_REACH_BYTES: usize = 16;
+
+/// A terminal's fates fit one manifest: one line per row, and a chain
+/// holds no more rows than its tick manifest can name lines.
+const _: () = assert!(MAX_TICK_LINES_PER_BLOCK * TICK_LINE_BYTES <= MAX_TICK_MANIFEST_BYTES);
 
 /// Any single line fits an empty manifest, so no line is ever left
 /// waiting on a budget it can never meet.

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_jmt::TreeReader;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
@@ -95,10 +96,9 @@ impl ShardChainWriter for SimShardStorage {
             finalizations,
             parent.state,
             parent.height,
-            creations,
-            removals,
+            chain,
             frontier,
-            state_claims,
+            &s.tree_store.root_path(),
         );
 
         let (result_root, collected) = if parent.pending.is_empty() {

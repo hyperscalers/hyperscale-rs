@@ -15,7 +15,7 @@ use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
     Address, BlockHash, BlockHeight, ConsensusPublicKey, Deadline, Epoch,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId,
-    ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, Transaction,
+    ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, TickLine, Transaction,
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
     WeightedTimestamp, Window, sweep_admits_block,
 };
@@ -277,9 +277,10 @@ pub(crate) fn owning_shard<C: Cluster + ?Sized>(c: &C, owner: Address) -> ShardI
 ///
 /// Returns the height at which `tx` was committed (rides a block's
 /// `transactions`) and the height plus decision at which it was finalized
-/// (rides a `Finalization` certificate). The decision matters at a reshape
-/// boundary: a counterpart abort finalizes the straddler with `Aborted`,
-/// which a presence-only check would misread as a one-sided apply.
+/// (rides a `Finalization` certificate, or the terminal's fate, which is
+/// a committed abort). The decision matters at a reshape boundary: a
+/// counterpart abort finalizes the straddler with `Aborted`, which a
+/// presence-only check would misread as a one-sided apply.
 #[must_use]
 pub fn chain_fate(
     store: &impl ShardChainReader,
@@ -302,6 +303,13 @@ pub fn chain_fate(
                 if let Some((_, decision)) = fw.tx_decisions().into_iter().find(|(h, _)| *h == tx) {
                     finalized = Some((height, decision));
                 }
+            }
+            if block
+                .tick_manifest()
+                .iter()
+                .any(|line| matches!(line, TickLine::Fate { tx: fated, .. } if *fated == tx))
+            {
+                finalized = Some((height, TransactionDecision::Aborted));
             }
         }
         height = height.next();

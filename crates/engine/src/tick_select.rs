@@ -423,6 +423,44 @@ impl CommittedInputs for CommittedSets {
     }
 }
 
+/// What a block's tick manifest names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManifestKind {
+    /// Member lines and discards: a block the chain carries content in.
+    #[default]
+    Members,
+    /// A fate for every member row: the chain's terminal.
+    Fates,
+    /// Nothing: a coast block past the terminal, or a recovery's bridge.
+    Empty,
+}
+
+/// The fates a chain's terminal names: one per member row, in
+/// transaction order.
+///
+/// Each is priced by what its line kept on its row, or by its facts where
+/// no line named it. A row whose price `facts` does not
+/// have is returned beside the lines, so a voter defers and a proposer
+/// waits, as they do for a pending row's member line.
+#[must_use]
+pub fn terminal_fates<'f>(
+    rows: &MemberIndex,
+    facts: &dyn Fn(TxHash) -> Option<&'f MemberFacts>,
+) -> (Vec<TickLine>, Vec<TxHash>) {
+    let mut lines = Vec::new();
+    let mut missing = Vec::new();
+    for row in rows.members.values() {
+        match row
+            .charge
+            .or_else(|| facts(row.tx).map(|known| known.charge))
+        {
+            Some(charge) => lines.push(TickLine::Fate { tx: row.tx, charge }),
+            None => missing.push(row.tx),
+        }
+    }
+    (lines, missing)
+}
+
 /// What a proposer's coordinator hands the block builder.
 ///
 /// The facts of every member it may name, and what committed content up
@@ -437,6 +475,8 @@ pub struct ManifestInputs {
     /// The frontier of a halt recovery whose ticks the block discards,
     /// where its parent is the fresh committee's.
     pub recovery: Option<BlockHeight>,
+    /// What the block's manifest names.
+    pub kind: ManifestKind,
 }
 
 /// Where a candidate stands, as its row says, with what judging it
@@ -1103,7 +1143,7 @@ mod tests {
             .iter()
             .map(|line| match line {
                 TickLine::Member { tx, .. } => *tx,
-                discard @ TickLine::Discard { .. } => panic!("{discard:?}"),
+                other @ (TickLine::Discard { .. } | TickLine::Fate { .. }) => panic!("{other:?}"),
             })
             .collect();
         assert_eq!(
