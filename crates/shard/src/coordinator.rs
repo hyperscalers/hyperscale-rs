@@ -297,6 +297,15 @@ struct PayerFee {
     attested_by: Option<Vec<PrincipalAddr>>,
 }
 
+/// The terminal roots a header carries.
+#[derive(Clone, Copy, Default)]
+struct TerminalCarry {
+    /// The split children's roots over the block's post-state.
+    split_child_roots: bool,
+    /// The settled root the shard's surviving counterparts read.
+    terminal_settled_txs: bool,
+}
+
 /// Shard consensus state machine (HotStuff-2).
 ///
 /// Handles block proposal, voting, QC formation, commitment, and view changes.
@@ -1445,42 +1454,76 @@ impl ShardCoordinator {
         true
     }
 
-    /// Whether a header keyed at `wt` carries `split_child_roots` — the
-    /// split-pending shard's final-epoch delivery, identical on the
-    /// build side (carry) and the vote side (required).
+    /// Whether a block whose parent QC is keyed at `parent_qc_wt`, and
+    /// whose parent's own parent QC at `grandparent_qc_wt`, is its chain's
+    /// terminal: the first block whose parent QC lands past the shard's
+    /// terminal window. No block sees the QC that certifies it, so this
+    /// is the first block that can know it is the last.
     ///
-    /// `None` only when the schedule doesn't hold `wt`'s window at all
-    /// ([`SplitAtBoundary::Unresolved`]). An admitted split no longer
-    /// defers: its cut is scheduled a window ahead, so the window's own
-    /// frozen projection answers. The committee lookup succeeding is not
-    /// enough to rule this out — it resolves the window by `epoch_for`
-    /// while the predicate steps back to the closing window at a boundary
-    /// instant, so the two can want different entries.
-    fn split_child_roots_bit(
-        &self,
+    /// `None` where the schedule holds no window for either instant.
+    fn is_terminal(
         topology_schedule: &TopologySchedule,
-        wt: WeightedTimestamp,
+        shard: ShardId,
+        parent_qc_wt: WeightedTimestamp,
+        grandparent_qc_wt: WeightedTimestamp,
     ) -> Option<bool> {
-        match topology_schedule.split_at_next_boundary(self.local_shard, wt) {
-            SplitAtBoundary::Children(..) => Some(true),
-            SplitAtBoundary::No => Some(false),
-            SplitAtBoundary::Unresolved => None,
-        }
+        let past = |wt| {
+            topology_schedule
+                .at_for_shard(shard, wt)
+                .map(|(_, past)| past)
+        };
+        Some(past(parent_qc_wt)? && !past(grandparent_qc_wt)?)
     }
 
-    /// Whether a header keyed at `wt` carries the terminal settled root —
-    /// set on any terminating boundary header (a split parent's *or* a
-    /// merge child's final epoch), identical on the build side (carry) and
-    /// the vote side (required). Broader than
-    /// [`Self::split_child_roots_bit`]: a merge child terminates without
-    /// carrying `split_child_roots`. `None` under that helper's retention
-    /// condition, and only that one.
-    fn terminal_settled_txs_bit(
+    /// What the header of the block extending `parent` under a parent QC
+    /// keyed at `parent_qc_wt` carries, identical on the build side
+    /// (carry) and the vote side (required).
+    ///
+    /// A block in a terminating shard's final window carries
+    /// `split_child_roots` (a split) and the terminal settled root (a
+    /// split or a merge), each decided by the window's own frozen
+    /// schedule entry, so a reshape in flight resolves without waiting on
+    /// the local beacon. So does the terminal, judged by the window its
+    /// parent's anchor sits in. A shard past no cut never reads its
+    /// parent's anchor.
+    ///
+    /// `None` when the schedule holds no window for an instant it must
+    /// read, or the parent is not held here: the caller defers rather
+    /// than guess a header replicas would reject. The committee lookup
+    /// succeeding is not enough to rule this out — it resolves the window
+    /// by `epoch_for` while the predicates step back to the closing
+    /// window at a boundary instant, so the two can want different
+    /// entries.
+    fn terminal_carry(
         &self,
         topology_schedule: &TopologySchedule,
-        wt: WeightedTimestamp,
-    ) -> Option<bool> {
-        topology_schedule.terminates_at_next_boundary(self.local_shard, wt)
+        parent: BlockHash,
+        parent_qc_wt: WeightedTimestamp,
+    ) -> Option<TerminalCarry> {
+        let local = self.local_shard;
+        let carried_by = |wt| {
+            let split_child_roots = match topology_schedule.split_at_next_boundary(local, wt) {
+                SplitAtBoundary::Children(..) => true,
+                SplitAtBoundary::No => false,
+                SplitAtBoundary::Unresolved => return None,
+            };
+            Some(TerminalCarry {
+                split_child_roots,
+                terminal_settled_txs: topology_schedule.terminates_at_next_boundary(local, wt)?,
+            })
+        };
+        let final_window = carried_by(parent_qc_wt)?;
+        if final_window.terminal_settled_txs
+            || !topology_schedule.past_terminal(local, parent_qc_wt)
+        {
+            return Some(final_window);
+        }
+        let grandparent_qc_wt = self.block_anchor(parent)?;
+        if Self::is_terminal(topology_schedule, local, parent_qc_wt, grandparent_qc_wt)? {
+            carried_by(grandparent_qc_wt)
+        } else {
+            Some(TerminalCarry::default())
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2744,31 +2787,24 @@ impl ShardCoordinator {
         else {
             return vec![];
         };
-        // The final-epoch headers of a splitting shard carry the root
-        // node's child hashes. Whether this window is the final one is
-        // decided by the window's own frozen schedule entry, so a reshape
-        // in flight resolves here without waiting on the local beacon.
-        // Only a window the schedule has evicted leaves it unanswerable —
-        // stall the build (before the witness preview drains the
-        // ready-signal pool) rather than guess a header replicas would
+        // A terminating shard's final-window headers and its terminal carry
+        // the terminal roots. A window the schedule does not hold leaves it
+        // unanswerable — stall the build (before the witness preview drains
+        // the ready-signal pool) rather than guess a header replicas would
         // reject.
-        let Some(carry_split_child_roots) =
-            self.split_child_roots_bit(topology_schedule, parent_qc.weighted_timestamp())
+        let Some(TerminalCarry {
+            split_child_roots: carry_split_child_roots,
+            terminal_settled_txs: carry_terminal_settled_txs,
+        }) = self.terminal_carry(
+            topology_schedule,
+            parent_block_hash,
+            parent_qc.weighted_timestamp(),
+        )
         else {
             trace!(
                 validator = ?self.me,
                 height = height.inner(),
-                "Split-at-boundary window missing from the schedule; deferring the build"
-            );
-            return vec![];
-        };
-        let Some(carry_terminal_settled_txs) =
-            self.terminal_settled_txs_bit(topology_schedule, parent_qc.weighted_timestamp())
-        else {
-            trace!(
-                validator = ?self.me,
-                height = height.inner(),
-                "Termination-at-boundary window missing from the schedule; deferring the build"
+                "Terminal-carry window missing from the schedule; deferring the build"
             );
             return vec![];
         };
@@ -3922,31 +3958,19 @@ impl ShardCoordinator {
                 InFlightCheck::Abort => return vec![],
             };
 
-            // Whether this window requires the header's split-child-root
-            // pair is decided by the window's own frozen schedule entry,
-            // so the voter and the proposer read the same answer without
-            // either waiting on a beacon fold. A window the schedule has
-            // evicted defers the vote like a missing committee (the block
-            // stays pending) rather than judging the header on a guess.
-            let Some(split_child_roots_required) = self.split_child_roots_bit(
-                topology_schedule,
-                block.header().parent_qc().weighted_timestamp(),
-            ) else {
+            // The voter reads the proposer's answer for the terminal roots.
+            // A window the schedule does not hold defers the vote like a
+            // missing committee (the block stays pending) rather than
+            // judging the header on a guess.
+            let Some(TerminalCarry {
+                split_child_roots: split_child_roots_required,
+                terminal_settled_txs: terminal_settled_txs_required,
+            }) = self.terminal_carry(topology_schedule, parent, anchor_wt)
+            else {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    "Split-at-boundary window missing from the schedule; deferring the vote"
-                );
-                return vec![];
-            };
-            let Some(terminal_settled_txs_required) = self.terminal_settled_txs_bit(
-                topology_schedule,
-                block.header().parent_qc().weighted_timestamp(),
-            ) else {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Termination-at-boundary window missing from the schedule; deferring the vote"
+                    "Terminal-carry window missing from the schedule; deferring the vote"
                 );
                 return vec![];
             };
@@ -6121,10 +6145,15 @@ impl ShardCoordinator {
             return;
         }
         let anchor_wt = block.header().parent_qc().weighted_timestamp();
-        let (Some(split_child_roots_required), Some(terminal_settled_txs_required)) = (
-            self.split_child_roots_bit(topology_schedule, anchor_wt),
-            self.terminal_settled_txs_bit(topology_schedule, anchor_wt),
-        ) else {
+        let Some(TerminalCarry {
+            split_child_roots: split_child_roots_required,
+            terminal_settled_txs: terminal_settled_txs_required,
+        }) = self.terminal_carry(
+            topology_schedule,
+            block.header().parent_block_hash(),
+            anchor_wt,
+        )
+        else {
             debug!(
                 validator = ?self.me,
                 height = block.height().inner(),
@@ -14141,6 +14170,41 @@ mod tests {
         let mut sched = TopologySchedule::new(1000, Epoch::new(0), final_window);
         sched.insert(Epoch::new(1), post_split);
         sched
+    }
+
+    /// The terminal is the first block whose parent QC lands past the
+    /// cut: its grandparent's sits inside the final window. A block with
+    /// both inside, or both past, is not.
+    #[test]
+    fn is_terminal_is_the_first_block_past_the_cut() {
+        let sched = make_terminating_schedule(4);
+        let at = WeightedTimestamp::from_millis;
+        let terminal = |parent, grandparent| {
+            ShardCoordinator::is_terminal(&sched, ShardId::ROOT, at(parent), at(grandparent))
+        };
+        assert_eq!(terminal(1_500, 900), Some(true));
+        assert_eq!(terminal(900, 500), Some(false), "both inside");
+        assert_eq!(terminal(1_600, 1_500), Some(false), "both past");
+    }
+
+    /// The final window's blocks and the terminal carry the terminal
+    /// roots, and the coast block after the terminal carries none.
+    #[test]
+    fn the_final_window_and_the_terminal_carry_the_terminal_roots() {
+        let sched = make_terminating_schedule(4);
+        let carry = |parent_qc_ms, grandparent_qc_ms| {
+            let state = coordinator_with_committed_anchor(grandparent_qc_ms);
+            state
+                .terminal_carry(
+                    &sched,
+                    state.committed_hash,
+                    WeightedTimestamp::from_millis(parent_qc_ms),
+                )
+                .map(|carry| carry.terminal_settled_txs)
+        };
+        assert_eq!(carry(900, 500), Some(true), "a final-window block");
+        assert_eq!(carry(1_500, 900), Some(true), "the terminal");
+        assert_eq!(carry(1_600, 1_500), Some(false), "a coast block after it");
     }
 
     /// [`make_terminating_schedule`] whose head additionally shows both of
