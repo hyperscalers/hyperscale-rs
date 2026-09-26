@@ -743,6 +743,7 @@ mod tests {
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
         test_a_presence_below_the_deleting_absence_is_refused,
+        test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
@@ -1003,6 +1004,13 @@ mod tests {
     fn an_owed_credit_composes_with_a_receipt_on_its_vault() {
         let dir = TempDir::new().unwrap();
         test_an_owed_credit_composes_with_a_receipt_on_its_vault(&open_storage(dir.path()));
+    }
+
+    /// A block whose only write is an owed credit folds it.
+    #[test]
+    fn an_owed_credit_alone_is_a_write() {
+        let dir = TempDir::new().unwrap();
+        test_an_owed_credit_alone_is_a_write(&open_storage(dir.path()));
     }
 
     /// The frontier a credit and its deletion leave refuses a presence

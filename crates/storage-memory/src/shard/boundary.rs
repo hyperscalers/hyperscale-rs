@@ -334,6 +334,7 @@ mod tests {
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
         test_a_presence_below_the_deleting_absence_is_refused,
+        test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
@@ -530,6 +531,12 @@ mod tests {
     #[test]
     fn an_owed_credit_composes_with_a_receipt_on_its_vault() {
         test_an_owed_credit_composes_with_a_receipt_on_its_vault(&SimShardStorage::default());
+    }
+
+    /// A block whose only write is an owed credit folds it.
+    #[test]
+    fn an_owed_credit_alone_is_a_write() {
+        test_an_owed_credit_alone_is_a_write(&SimShardStorage::default());
     }
 
     /// The frontier a credit and its deletion leave refuses a presence

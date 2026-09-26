@@ -2715,6 +2715,40 @@ pub fn test_an_owed_credit_lands_one_root_on_every_path<S>(
     );
 }
 
+/// Shared: a block whose only write is an owed credit folds it.
+///
+/// The first claim at an anchor raises the read frontier, which is a
+/// write of its own; a second claim of the producer at that same anchor
+/// raises nothing, carries no receipt and creates nothing, and still
+/// credits its crossing.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_owed_credit_alone_is_a_write<S: TestStore>(storage: &S) {
+    let first = Owed::new(0x34);
+    let second = Owed {
+        id: CrossingId {
+            local: 1,
+            ..first.id
+        },
+    };
+    let (block, inputs) = owed_block(1, vec![first.claim(7, first.held())], None);
+    commit_raising(storage, block, &inputs);
+    assert_eq!(amount_at(storage, first.vault()), Owed::AMOUNT);
+
+    let before = storage.state_root();
+    let (block, inputs) = owed_block(2, vec![second.claim(7, second.held())], None);
+    let (prepared, committed) = commit_raising(storage, block, &inputs);
+    assert_ne!(prepared, before, "the credit alone moves the root");
+    assert_eq!(committed, prepared);
+    assert_eq!(amount_at(storage, first.vault()), 2 * Owed::AMOUNT);
+    assert!(
+        storage.cell(second.taken()).is_some(),
+        "the second crossing is taken"
+    );
+}
+
 /// Shared: an owed credit composes with a receipt's movement on the
 /// same vault.
 ///
@@ -3079,7 +3113,9 @@ pub fn test_prepared_commit_refuses_a_different_block_at_one_height<S>(storage: 
 where
     S: ShardChainReader + ShardChainWriter + SubstateStore,
 {
-    let commit_at = |block| {
+    // Both prepared off the one parent, as two proposals at one height
+    // are, then committed in turn.
+    let prepare = || {
         let (_, _, commit) = storage.prepare_block_commit(
             ParentAnchor {
                 state_root: storage.state_root(),
@@ -3098,19 +3134,24 @@ where
             },
             BlockHeight::new(1),
         );
-        commit(
-            SyncHint::FlushNow,
-            &make_test_certified(block),
-            &empty_witness(),
-        )
+        commit
     };
 
     let first = make_test_block_at(BlockHeight::new(1), 1_000);
     let other = make_test_block_at(BlockHeight::new(1), 2_000);
     assert_ne!(first.hash(), other.hash(), "the fixture builds two blocks");
 
-    commit_at(first);
-    commit_at(other);
+    let (commit_first, commit_other) = (prepare(), prepare());
+    commit_first(
+        SyncHint::FlushNow,
+        &make_test_certified(first),
+        &empty_witness(),
+    );
+    commit_other(
+        SyncHint::FlushNow,
+        &make_test_certified(other),
+        &empty_witness(),
+    );
 }
 
 /// Shared: a prepared commit whose base root the store has moved off

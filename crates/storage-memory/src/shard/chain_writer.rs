@@ -8,8 +8,8 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, crossing_settlements,
-    holds_this_block_at, member_writes, read_frontier_writes, settled_writes_at,
+    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, holds_this_block_at,
+    member_writes, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
@@ -27,13 +27,6 @@ impl ShardChainWriter for SimShardStorage {
         chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
-        let ChainWrites {
-            creations,
-            removals,
-            frontier,
-            state_claims,
-            members,
-        } = chain;
         // Everything the ticks carried, for storage; only what they
         // decided reaches state.
         let receipts: Vec<StoredReceipt> = finalizations
@@ -42,47 +35,11 @@ impl ShardChainWriter for SimShardStorage {
             .collect();
         // The chain's own protocol families: the read frontier and tick
         // membership, each read off the parent state it advances.
-        let mut frontier = read_frontier_writes(parent.state, frontier);
-        frontier.extend(member_writes(parent.state, members));
-        // What the claims settle against the parent state, read once
-        // for the no-op test below; the fold reads it again beside the
-        // receipts, whose writes it defers to.
-        let settled = crossing_settlements(state_claims, &SettledWrites::default(), parent.state);
-        // Nothing to write → state root is unchanged. Build a no-op
-        // JmtSnapshot directly, avoiding put_at_version which would fail
-        // if the parent's tree nodes aren't in the store yet. A block's
-        // sweep, its committed cells and its read frontier are writes
-        // like any other, so a block that removes, creates or raises
-        // something is not one of these however few receipts it carries.
-        if receipts.is_empty()
-            && creations.is_empty()
-            && removals.is_empty()
-            && frontier.is_empty()
-            && settled.is_empty()
-        {
-            let s = read_or_recover(&self.state);
-            let snapshot = Arc::new(noop_jmt_snapshot(
-                &s.tree_store,
-                parent.pending,
-                parent.state_root,
-                parent.height,
-                block_height,
-            ));
-            drop(s);
-            let prepared = build_prepared_commit(
-                Arc::clone(self),
-                Arc::clone(&snapshot),
-                SettledWrites::default(),
-                Vec::new(),
-            );
-            return (parent.state_root, snapshot, prepared);
-        }
+        let mut frontier = read_frontier_writes(parent.state, chain.frontier);
+        frontier.extend(member_writes(parent.state, chain.members));
 
         // Read lock: compute speculative JMT root.
         let s = read_or_recover(&self.state);
-
-        let parent_version =
-            jmt_parent_height(parent.height, parent.state_root).map(BlockHeight::inner);
 
         // One resolution, feeding both the tree and the substate store —
         // they commit the same values or they disagree about state. It
@@ -100,6 +57,31 @@ impl ShardChainWriter for SimShardStorage {
             frontier,
             &s.tree_store.root_path(),
         );
+        // Nothing to write and nothing to store → state root is
+        // unchanged. Build a no-op JmtSnapshot directly, avoiding
+        // put_at_version which would fail if the parent's tree nodes
+        // aren't in the store yet. Whether the block writes is the
+        // fold's own answer, so no write it makes is missed here.
+        if receipts.is_empty() && settled.is_empty() {
+            let snapshot = Arc::new(noop_jmt_snapshot(
+                &s.tree_store,
+                parent.pending,
+                parent.state_root,
+                parent.height,
+                block_height,
+            ));
+            drop(s);
+            let prepared = build_prepared_commit(
+                Arc::clone(self),
+                Arc::clone(&snapshot),
+                SettledWrites::default(),
+                Vec::new(),
+            );
+            return (parent.state_root, snapshot, prepared);
+        }
+
+        let parent_version =
+            jmt_parent_height(parent.height, parent.state_root).map(BlockHeight::inner);
 
         let (result_root, collected) = if parent.pending.is_empty() {
             put_at_version(

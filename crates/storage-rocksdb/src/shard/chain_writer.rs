@@ -6,12 +6,12 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, crossing_settlements,
-    member_writes, read_frontier_writes, settled_writes_at,
+    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, member_writes,
+    read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
-    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
+    StoredReceipt, SyncHint, Verifiable, Verified,
 };
 use rocksdb::WriteBatch;
 
@@ -29,13 +29,6 @@ impl ShardChainWriter for RocksDbShardStorage {
         chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
-        let ChainWrites {
-            creations,
-            removals,
-            frontier,
-            state_claims,
-            members,
-        } = chain;
         // Everything the ticks carried, for storage; only what they
         // decided reaches state.
         let receipts: Vec<&StoredReceipt> = finalizations
@@ -44,26 +37,30 @@ impl ShardChainWriter for RocksDbShardStorage {
             .collect();
         // The chain's own protocol families: the read frontier and tick
         // membership, each read off the parent state it advances.
-        let mut frontier = read_frontier_writes(parent.state, frontier);
-        frontier.extend(member_writes(parent.state, members));
-        // What the claims settle against the parent state, read once
-        // for the no-op test below; the fold reads it again beside the
-        // receipts, whose writes it defers to.
-        let settled = crossing_settlements(state_claims, &SettledWrites::default(), parent.state);
-        // Nothing to write → state root is unchanged. Build a no-op
-        // JmtSnapshot directly, avoiding put_at_version which would fail
-        // if the parent's tree nodes aren't in the store yet (e.g.,
-        // proposer just exited sync and BlockPersisted hasn't fired).
-        // A block's sweep, its committed cells and its read frontier are
-        // writes like any other, so a block that removes, creates or
-        // raises something is not one of these however few receipts it
-        // carries.
-        if receipts.is_empty()
-            && creations.is_empty()
-            && removals.is_empty()
-            && frontier.is_empty()
-            && settled.is_empty()
-        {
+        let mut frontier = read_frontier_writes(parent.state, chain.frontier);
+        frontier.extend(member_writes(parent.state, chain.members));
+        // One resolution, feeding both the tree and the substate batch —
+        // they commit the same values or they disagree about state. A
+        // receipt says what it moved, and two receipts moving one cell
+        // compose only once something has said what they moved from.
+        // The type says the baseline was fixed when it was made; which
+        // block it was fixed at is this caller's to check, and a movement
+        // resolved against any other is as wrong as one resolved live.
+        let settled = settled_writes_at(
+            finalizations,
+            parent.state,
+            parent.height,
+            chain,
+            frontier,
+            &self.root_path,
+        );
+        // Nothing to write and nothing to store → state root is
+        // unchanged. Build a no-op JmtSnapshot directly, avoiding
+        // put_at_version which would fail if the parent's tree nodes
+        // aren't in the store yet (e.g., proposer just exited sync and
+        // BlockPersisted hasn't fired). Whether the block writes is the
+        // fold's own answer, so no write it makes is missed here.
+        if receipts.is_empty() && settled.is_empty() {
             let jmt_snapshot = Arc::new(noop_jmt_snapshot(
                 &SnapshotTreeStore::new(&self.db, self.root_path.clone()),
                 parent.pending,
@@ -83,25 +80,6 @@ impl ShardChainWriter for RocksDbShardStorage {
         let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
         let parent_version =
             jmt_parent_height(parent.height, parent.state_root).map(BlockHeight::inner);
-
-        // Collect per-receipt writes references — no merge needed.
-        // State locking guarantees no key conflicts between receipts, so
-        // put_at_version can flatten them directly into JMT work items.
-        // One resolution, feeding both the tree and the substate batch —
-        // they commit the same values or they disagree about state. A
-        // receipt says what it moved, and two receipts moving one cell
-        // compose only once something has said what they moved from.
-        // The type says the baseline was fixed when it was made; which
-        // block it was fixed at is this caller's to check, and a movement
-        // resolved against any other is as wrong as one resolved live.
-        let settled = settled_writes_at(
-            finalizations,
-            parent.state,
-            parent.height,
-            chain,
-            frontier,
-            &self.root_path,
-        );
 
         let (computed_root, collected) = if parent.pending.is_empty() {
             put_at_version(
