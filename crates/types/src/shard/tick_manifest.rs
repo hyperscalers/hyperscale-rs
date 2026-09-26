@@ -3,11 +3,11 @@
 //! go.
 
 use hyperscale_hbor::{Capped, Hbor};
-use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode};
+use hyperscale_vm_types::Mode;
 
 use crate::{
-    DeclaredKey, ESCROWED_RECORD_BYTES, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK,
-    SubstateKey, TICK_HOLD_BYTES, TICK_LINE_BYTES, TickHalf, TickId, TxHash,
+    DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, TICK_HOLD_BYTES, TICK_LINE_BYTES,
+    TickHalf, TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -114,14 +114,6 @@ pub enum TickLine {
         /// What it holds while the tick is in flight.
         holds: Holds,
     },
-    /// The block's tick takes back what the records name, under `name`:
-    /// a leg entry's own transaction, or the records' disposal name.
-    Reclaim {
-        /// The member's name on the tick.
-        name: TxHash,
-        /// The records it takes back, at most one transaction's worth.
-        records: Capped<Vec<SubstateKey>, MAX_CROSSINGS_PER_TX>,
-    },
     /// An earlier tick lets go of the members `cause` releases.
     Discard {
         /// The tick, which committed on this chain.
@@ -135,13 +127,12 @@ impl TickLine {
     /// An upper bound on what this line costs the block that carries
     /// it, so a composer spends the section's budget as it fills it and
     /// a voter checks the same figure without re-encoding what it
-    /// decoded. Everything but the holds and the records is fixed width.
+    /// decoded. Everything but the holds is fixed width.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
         TICK_LINE_BYTES
             + match self {
                 Self::Member { holds, .. } => holds.len() * TICK_HOLD_BYTES,
-                Self::Reclaim { records, .. } => records.len() * ESCROWED_RECORD_BYTES,
                 Self::Discard { .. } => 0,
             }
     }

@@ -82,8 +82,6 @@ impl MemberRow {
 pub struct TickRow {
     /// The transactions it holds, in manifest order.
     pub members: Capped<Vec<TxHash>, MAX_TICK_LINES_PER_BLOCK>,
-    /// The reclaims it runs, by member name.
-    pub reclaims: Capped<Vec<TxHash>, MAX_TICK_LINES_PER_BLOCK>,
     /// Whether its determined half is still owed.
     pub determined_unsettled: bool,
     /// Whether its legs half is still owed.
@@ -387,7 +385,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
         let remains = (!kept.is_empty()).then(|| TickRow {
             members: Capped::new(kept).expect("a subset of a capped list"),
-            reclaims: Capped::empty(),
             determined_unsettled: false,
             legs_unsettled: true,
         });
@@ -405,12 +402,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 
     /// The manifest's member lines put their rows in flight in the
-    /// block's own tick, and its reclaims join that tick's determined
-    /// half.
+    /// block's own tick.
     fn name(&mut self, height: BlockHeight, manifest: &TickManifest) {
         let mut composed = TickRow::default();
         let mut members = Vec::new();
-        let mut reclaims = Vec::new();
         for line in manifest.iter() {
             match line {
                 TickLine::Member {
@@ -435,16 +430,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         TickHalf::Legs => composed.legs_unsettled = true,
                     }
                 }
-                TickLine::Reclaim { name, .. } => {
-                    reclaims.push(*name);
-                    composed.determined_unsettled = true;
-                }
                 TickLine::Discard { .. } => {}
             }
         }
-        if !members.is_empty() || !reclaims.is_empty() {
+        if !members.is_empty() {
             composed.members = Capped::new(members).expect("a manifest caps its lines");
-            composed.reclaims = Capped::new(reclaims).expect("a manifest caps its lines");
             self.set_tick(height, Some(composed));
         }
     }

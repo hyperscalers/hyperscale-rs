@@ -11,9 +11,8 @@
 
 use hyperscale_jmt::{MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES};
 use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_CROSSINGS_PER_TX, MAX_ENVELOPE_BYTES,
-    MAX_EVENT_BYTES_PER_TX, MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS,
-    VERIFY_WEIGHT,
+    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
+    MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS, VERIFY_WEIGHT,
 };
 
 use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
@@ -322,7 +321,7 @@ pub const MAX_HOLDS_PER_MEMBER: usize = MAX_PREFIXES_PER_TX;
 ///
 /// Its own term of the frame, outside the evidence and claims budgets.
 /// Lines are charged in the order they apply: members first, then
-/// reclaims, then discards, and a proposer stops at the first that does
+/// discards, and a proposer stops at the first that does
 /// not fit and leaves the rest to the next block.
 pub const MAX_TICK_MANIFEST_BYTES: usize = 1024 * 1024;
 
@@ -336,8 +335,7 @@ pub const fn tick_manifest_admits_block(weight: usize) -> bool {
     weight <= MAX_TICK_MANIFEST_BYTES
 }
 
-/// Bytes one [`TickLine`](crate::TickLine) costs before its holds or its
-/// records.
+/// Bytes one [`TickLine`](crate::TickLine) costs before its holds.
 pub const TICK_LINE_BYTES: usize = 64;
 
 /// Bytes one hold of a member line costs: a declared access and its
@@ -348,9 +346,6 @@ pub const TICK_HOLD_BYTES: usize = 160;
 /// waiting on a budget it can never meet.
 const _: () =
     assert!(TICK_LINE_BYTES + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES <= MAX_TICK_MANIFEST_BYTES);
-const _: () = assert!(
-    TICK_LINE_BYTES + MAX_CROSSINGS_PER_TX * ESCROWED_RECORD_BYTES <= MAX_TICK_MANIFEST_BYTES
-);
 
 /// Byte budget the abandonment records of one block share.
 ///

@@ -764,7 +764,7 @@ mod tests {
             .iter()
             .map(|line| match line {
                 TickLine::Member { tx, .. } => *tx,
-                other => panic!("{other:?}"),
+                discard @ TickLine::Discard { .. } => panic!("{discard:?}"),
             })
             .collect();
         assert_eq!(
