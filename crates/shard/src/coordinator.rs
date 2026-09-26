@@ -5039,7 +5039,7 @@ impl ShardCoordinator {
             || BlockManifest::from_block(block),
             |pending| pending.manifest().clone(),
         );
-        self.register_dedup_artifacts(block, &manifest, commit_ts);
+        self.register_dedup_artifacts(block, &manifest);
         self.register_fee_holds(topology_schedule, block, commit_ts);
 
         // Derive this block's beacon-witness leaves from the same
@@ -5170,18 +5170,13 @@ impl ShardCoordinator {
     /// coordinator seeded short of the horizon reaches it by folding
     /// forward, and these are the blocks a backward walk would otherwise
     /// have had to read.
-    fn register_dedup_artifacts(
-        &mut self,
-        block: &Block,
-        manifest: &BlockManifest,
-        commit_ts: WeightedTimestamp,
-    ) {
+    fn register_dedup_artifacts(&mut self, block: &Block, manifest: &BlockManifest) {
         let anchor = block.header().parent_qc().weighted_timestamp();
         self.dedup_index.cover(anchor);
         self.dedup_index
             .register_committed_certs(block.certificates());
         self.dedup_index
-            .register_committed_provisions(manifest.provision_hashes(), commit_ts);
+            .register_committed_provisions(manifest.provision_hashes(), anchor);
         self.dedup_index
             .register_committed_engagements(&block.engagements(), anchor);
     }
@@ -6498,13 +6493,10 @@ impl ShardCoordinator {
         self.votes.cleanup_committed(committed_height);
         self.commits.cleanup_committed(committed_height);
 
-        // Prune committed tx entries older than the retention window. Used
-        // for proposal dedup — transactions committed far in the past will
-        // have been evicted from mempool already, so stale entries just waste
-        // memory.
-        self.dedup_index.prune(self.clock.now());
-        self.dedup_index
-            .prune_engagements(self.committed_block_anchor_wt);
+        // Prune the dedup tiers at the committed tip's own anchor: every
+        // block this node still judges anchors at or above it, so nothing
+        // pruned here answers a lookup any more.
+        self.dedup_index.prune(self.committed_block_anchor_wt);
 
         // Remote headers are pruned per-shard-tip at insertion time, not by
         // local committed height (remote shards have independent heights).
@@ -6860,7 +6852,7 @@ impl ShardCoordinator {
             pending_commits: self.commits.out_of_order_len(),
             pending_commits_awaiting_data: 0,
             received_votes_by_height: self.votes.received_votes_len(),
-            dedup_window_complete: self.dedup_index.is_complete(self.clock.now()),
+            dedup_window_complete: self.dedup_index.is_complete(self.committed_block_anchor_wt),
             committed_resolution_lookup: self.dedup_index.resolved_tx_retention_len(),
             committed_provision_lookup: self.dedup_index.provision_retention_len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),

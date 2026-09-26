@@ -18,7 +18,11 @@ use std::sync::RwLock;
 
 use hyperscale_types::{ProvisionHash, RETENTION_HORIZON, WeightedTimestamp};
 
-/// `provision_hash → local_committed_ts + RETENTION_HORIZON`.
+/// `provision_hash → anchor + RETENTION_HORIZON`.
+///
+/// `anchor` is the committing block's own `parent_qc` weighted timestamp,
+/// the value every replica reads for that block, so a live commit and a
+/// recovery walk stamp one deadline.
 ///
 /// Past the horizon every transaction the batch carried has expired its
 /// validity range and terminated everywhere, so no future block can
@@ -35,7 +39,7 @@ impl CommittedProvisions {
         Self::default()
     }
 
-    /// Record every hash a block committed at `local_committed_ts`.
+    /// Record every hash a block anchored at `anchor` committed.
     ///
     /// First writer wins: a batch re-registered by a later commit keeps
     /// the deadline of the block that first carried it, so the window
@@ -44,9 +48,9 @@ impl CommittedProvisions {
     pub fn register(
         &self,
         hashes: impl IntoIterator<Item = ProvisionHash>,
-        local_committed_ts: WeightedTimestamp,
+        anchor: WeightedTimestamp,
     ) {
-        let deadline = local_committed_ts.plus(RETENTION_HORIZON);
+        let deadline = anchor.plus(RETENTION_HORIZON);
         let mut seen = self
             .seen
             .write()
@@ -65,7 +69,20 @@ impl CommittedProvisions {
             .extend(entries);
     }
 
-    /// Whether the chain already carries this batch.
+    /// Whether the chain already carries this batch, for an admission
+    /// anchored at `at`: an entry engages the refusal while its deadline
+    /// is past `at`, whatever this node has pruned at or below `at`.
+    #[must_use]
+    pub fn contains_at(&self, hash: &ProvisionHash, at: WeightedTimestamp) -> bool {
+        self.seen
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(hash)
+            .is_some_and(|deadline| *deadline > at)
+    }
+
+    /// Whether the window holds this batch at all: the receipt seam's
+    /// question, which paces verification and judges nothing.
     #[must_use]
     pub fn contains(&self, hash: &ProvisionHash) -> bool {
         self.seen
@@ -74,7 +91,8 @@ impl CommittedProvisions {
             .contains_key(hash)
     }
 
-    /// Drop every entry whose deadline has passed `now`.
+    /// Drop every entry whose deadline is at or below `now`, the committed
+    /// tip's own anchor.
     pub fn prune(&self, now: WeightedTimestamp) {
         self.seen
             .write()

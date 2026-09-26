@@ -12,18 +12,22 @@
 //!
 //! - **certs**: `vote_anchor_ts + RETENTION_HORIZON` from the tick's local
 //!   EC.
-//! - **provisions**: `local_committed_ts + RETENTION_HORIZON`, a
-//!   conservative surrogate for `source_weighted_ts` (the source block was
-//!   committed before we observed these provisions, so
-//!   `local_committed_ts >= source_weighted_ts` always).
+//! - **provisions**: the committing block's own anchor plus
+//!   `RETENTION_HORIZON`, a conservative surrogate for the source block's
+//!   (the source committed before this block carried its batch).
 //! - **engagements**: the committing block's own anchor plus
 //!   `RETENTION_HORIZON`, folded from the engagement list every block
 //!   commits — derived from a live block's bodies, kept by a sealed one —
 //!   so the live commit, a synced commit and a restart's seed fold the
 //!   same entries under the same clock.
 //!
-//! Pruned when `committed_ts >= deadline`. Past expiry, independent rules
-//! reject re-inclusion, so the entry is no longer correctness-bearing.
+//! One clock: every lookup is judged at the anchor of the block being
+//! admitted, an entry answering while its deadline is past that anchor,
+//! and every tier prunes at the committed tip's own anchor. The per-vote
+//! timestamp floor keeps every block a voter judges anchored at or above
+//! the tip's, so a prune never changes an answer, and two voters at
+//! different tips answer alike. Past expiry, independent rules reject
+//! re-inclusion, so the entry is no longer correctness-bearing.
 //!
 //! Registration is synchronous with shard commit (called from
 //! [`crate::coordinator::ShardCoordinator::record_block_committed`]) so the
@@ -129,7 +133,6 @@ impl CommitDedupIndex {
         // this index is a consensus admission gate, so carrying them
         // means refusing artifacts every peer that stayed up admits.
         index.prune(now);
-        index.prune_engagements(now);
         index
     }
 
@@ -204,19 +207,18 @@ impl CommitDedupIndex {
         }
     }
 
-    /// Record a block's provisions in the retention lookup. Anchored on
-    /// `local_committed_ts` (a conservative surrogate for
-    /// `source_weighted_ts`). Keyed by `ProvisionHash` so the caller can
-    /// source from the block's manifest (which is independent of
-    /// `Block::Live`/`Sealed`) rather than depending on `block.provisions()`
-    /// (which is empty for `Sealed`).
+    /// Record a block's provisions in the retention lookup, each until
+    /// the committing block's `anchor` plus the horizon. Keyed by
+    /// `ProvisionHash` so the caller can source from the block's manifest
+    /// (which is independent of `Block::Live`/`Sealed`) rather than
+    /// depending on `block.provisions()` (which is empty for `Sealed`).
     pub(crate) fn register_committed_provisions(
         &self,
         provision_hashes: &[ProvisionHash],
-        local_committed_ts: WeightedTimestamp,
+        anchor: WeightedTimestamp,
     ) {
         self.provision_retention
-            .register(provision_hashes.iter().copied(), local_committed_ts);
+            .register(provision_hashes.iter().copied(), anchor);
     }
 
     /// The committed-provision window, for a coordinator that asks the
@@ -257,25 +259,20 @@ impl CommitDedupIndex {
         }
     }
 
-    /// Drop retention-lookup entries past their deadline. `now` is the
-    /// `weighted_timestamp` of the latest committed block. Past expiry,
-    /// independent rules (tx validity check; finalization-deadline) reject any
-    /// re-inclusion, so the entry is no longer correctness-bearing.
-    pub(crate) fn prune(&mut self, now: WeightedTimestamp) {
-        self.resolved_tx_retention
-            .retain(|_, deadline| *deadline > now);
-        self.finalization_retention
-            .retain(|_, deadline| *deadline > now);
-        self.provision_retention.prune(now);
-    }
-
-    /// Drop engagements whose deadline is at or below `tip_anchor`, the
+    /// Drop every entry whose deadline is at or below `tip_anchor`, the
     /// committed tip's own anchor.
     ///
     /// Every block a voter judges anchors at or above the committed
-    /// tip's anchor, so an entry dropped here engages no admission any
-    /// voter can still make, and the prune never changes a verdict.
-    pub(crate) fn prune_engagements(&mut self, tip_anchor: WeightedTimestamp) {
+    /// tip's anchor, so an entry dropped here answers no lookup any voter
+    /// can still make, and the prune never changes a verdict. Past
+    /// expiry, independent rules (tx validity check;
+    /// finalization-deadline) reject any re-inclusion.
+    pub(crate) fn prune(&mut self, tip_anchor: WeightedTimestamp) {
+        self.resolved_tx_retention
+            .retain(|_, deadline| *deadline > tip_anchor);
+        self.finalization_retention
+            .retain(|_, deadline| *deadline > tip_anchor);
+        self.provision_retention.prune(tip_anchor);
         self.engagements.retain(|_, heights| {
             heights.retain(|(_, deadline)| *deadline > tip_anchor);
             !heights.is_empty()
@@ -283,19 +280,33 @@ impl CommitDedupIndex {
     }
 
     /// Whether a committed finalization already reached a verdict for
-    /// `tx_hash`, within the retention window.
-    pub(crate) fn contains_resolved_tx(&self, tx_hash: &TxHash) -> bool {
-        self.resolved_tx_retention.contains_key(tx_hash)
+    /// `tx_hash`, for an admission anchored at `at`.
+    pub(crate) fn contains_resolved_tx(&self, tx_hash: &TxHash, at: WeightedTimestamp) -> bool {
+        self.resolved_tx_retention
+            .get(tx_hash)
+            .is_some_and(|deadline| *deadline > at)
     }
 
-    /// Whether the chain already carries this exact finalization, within
-    /// the retention window.
-    pub(crate) fn contains_finalization(&self, receipt_hash: &FinalizationHash) -> bool {
-        self.finalization_retention.contains_key(receipt_hash)
+    /// Whether the chain already carries this exact finalization, for an
+    /// admission anchored at `at`.
+    pub(crate) fn contains_finalization(
+        &self,
+        receipt_hash: &FinalizationHash,
+        at: WeightedTimestamp,
+    ) -> bool {
+        self.finalization_retention
+            .get(receipt_hash)
+            .is_some_and(|deadline| *deadline > at)
     }
 
-    pub(crate) fn contains_provision(&self, provision_hash: &ProvisionHash) -> bool {
-        self.provision_retention.contains(provision_hash)
+    /// Whether the chain already carries this batch, for an admission
+    /// anchored at `at`.
+    pub(crate) fn contains_provision(
+        &self,
+        provision_hash: &ProvisionHash,
+        at: WeightedTimestamp,
+    ) -> bool {
+        self.provision_retention.contains_at(provision_hash, at)
     }
 
     /// Whether a committed batch from `source` engages `tx_hash` for an
@@ -387,10 +398,11 @@ mod tests {
 
         let index = CommitDedupIndex::seeded(&window, now);
 
-        assert!(index.contains_resolved_tx(&live));
-        assert!(!index.contains_resolved_tx(&expired));
-        assert!(index.contains_finalization(&receipt_live));
-        assert!(!index.contains_finalization(&receipt_expired));
+        let before = WeightedTimestamp::ZERO;
+        assert!(index.contains_resolved_tx(&live, before));
+        assert!(!index.contains_resolved_tx(&expired, before));
+        assert!(index.contains_finalization(&receipt_live, before));
+        assert!(!index.contains_finalization(&receipt_expired, before));
     }
 
     fn make_fw(height: u64) -> Arc<Verifiable<Finalization>> {
@@ -433,11 +445,11 @@ mod tests {
         let fw = make_fw(1);
         let tx_hash = fw.tx_hashes().next().expect("a tick names its members");
         idx.register_committed_certs(std::slice::from_ref(&fw));
-        assert!(idx.contains_resolved_tx(&tx_hash));
+        assert!(idx.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO));
 
         idx.prune(WeightedTimestamp::ZERO);
         assert!(
-            idx.contains_resolved_tx(&tx_hash),
+            idx.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO),
             "still within the window"
         );
 
@@ -446,7 +458,7 @@ mod tests {
                 .deadline()
                 .plus(std::time::Duration::from_millis(1)),
         );
-        assert!(!idx.contains_resolved_tx(&tx_hash));
+        assert!(!idx.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO));
     }
 
     // ─── Engagements ────────────────────────────────────────────────────
@@ -509,10 +521,10 @@ mod tests {
         for tip in [anchor, before] {
             let mut pruned = CommitDedupIndex::new();
             pruned.register_committed_engagements(&[entry], anchor);
-            pruned.prune_engagements(tip);
+            pruned.prune(tip);
             assert!(pruned.engaged(source, entry.tx_hash, before, &snapshot));
         }
-        idx.prune_engagements(deadline);
+        idx.prune(deadline);
         assert!(
             !idx.engaged(source, entry.tx_hash, WeightedTimestamp::ZERO, &snapshot),
             "the prune at the deadline drops it"
@@ -569,7 +581,7 @@ mod tests {
         let mut live = CommitDedupIndex::new();
         live.register_committed_engagements(&[old], old_anchor);
         live.register_committed_engagements(&[young], young_anchor);
-        live.prune_engagements(now);
+        live.prune(now);
 
         let window = DedupWindow {
             engagements: vec![
@@ -591,25 +603,91 @@ mod tests {
         let idx = CommitDedupIndex::new();
         let p = make_provisions(1);
         idx.register_committed_provisions(&[p.hash()], WeightedTimestamp::from_millis(1_000));
-        assert!(idx.contains_provision(&p.hash()));
+        assert!(idx.contains_provision(&p.hash(), WeightedTimestamp::ZERO));
         assert_eq!(idx.provision_retention_len(), 1);
     }
 
+    /// A batch is held until its committing block's anchor plus the
+    /// horizon, and a prune at the tip's anchor drops it there.
     #[test]
     fn prune_drops_provisions_past_their_deadline() {
         let mut idx = CommitDedupIndex::new();
         let p = make_provisions(1);
-        let now = WeightedTimestamp::from_millis(1_000);
-        idx.register_committed_provisions(&[p.hash()], now);
+        let anchor = WeightedTimestamp::from_millis(1_000);
+        idx.register_committed_provisions(&[p.hash()], anchor);
 
-        idx.prune(now);
-        assert!(idx.contains_provision(&p.hash()));
+        idx.prune(anchor);
+        assert!(idx.contains_provision(&p.hash(), anchor));
 
-        let past = now
-            .plus(RETENTION_HORIZON)
-            .plus(std::time::Duration::from_millis(1));
-        idx.prune(past);
-        assert!(!idx.contains_provision(&p.hash()));
+        let deadline = anchor.plus(RETENTION_HORIZON);
+        idx.prune(deadline);
+        assert!(!idx.contains_provision(&p.hash(), WeightedTimestamp::ZERO));
+    }
+
+    /// Every tier answers a lookup at `a` the same way whether or not
+    /// the index was pruned at any tip anchor at or below `a`: an entry
+    /// answers while its deadline is past `a`, so a voter at a lower tip
+    /// and one at a higher tip agree.
+    #[test]
+    fn a_dedup_lookup_is_judged_at_the_admitting_anchor() {
+        let fw = make_fw(1);
+        let tx_hash = fw.tx_hashes().next().expect("a tick names its members");
+        let deadline = fw.local_ec().deadline();
+        let p = make_provisions(1);
+        let batch_anchor = deadline.minus(RETENTION_HORIZON);
+        let build = || {
+            let mut idx = CommitDedupIndex::new();
+            idx.register_committed_certs(std::slice::from_ref(&fw));
+            idx.register_committed_provisions(&[p.hash()], batch_anchor);
+            idx
+        };
+        let answers = |idx: &CommitDedupIndex, at| {
+            (
+                idx.contains_resolved_tx(&tx_hash, at),
+                idx.contains_finalization(&fw.receipt_hash(), at),
+                idx.contains_provision(&p.hash(), at),
+            )
+        };
+        let before = deadline.minus(std::time::Duration::from_millis(1));
+        for at in [WeightedTimestamp::ZERO, before, deadline] {
+            let unpruned = answers(&build(), at);
+            for tip in [WeightedTimestamp::ZERO, at] {
+                let mut pruned = build();
+                pruned.prune(tip);
+                assert_eq!(answers(&pruned, at), unpruned, "at {at:?}, tip {tip:?}");
+            }
+        }
+        assert_eq!(answers(&build(), before), (true, true, true));
+        assert_eq!(answers(&build(), deadline), (false, false, false));
+    }
+
+    /// A batch registered by the live commit and one seeded from the
+    /// recovery walk carry one deadline: both stamp the committing
+    /// block's own anchor plus the horizon.
+    #[test]
+    fn a_live_and_a_seeded_provision_window_stamp_alike() {
+        let p = make_provisions(1);
+        let anchor = WeightedTimestamp::from_millis(7_000);
+        let live = CommitDedupIndex::new();
+        live.register_committed_provisions(&[p.hash()], anchor);
+        let window = DedupWindow {
+            provisions: vec![(p.hash(), anchor.plus(RETENTION_HORIZON))],
+            ..DedupWindow::default()
+        };
+        let seeded = CommitDedupIndex::seeded(&window, anchor);
+        let deadline = anchor.plus(RETENTION_HORIZON);
+        for at in [
+            anchor,
+            deadline.minus(std::time::Duration::from_millis(1)),
+            deadline,
+        ] {
+            assert_eq!(
+                live.contains_provision(&p.hash(), at),
+                seeded.contains_provision(&p.hash(), at),
+                "at {at:?}"
+            );
+        }
+        assert!(!live.contains_provision(&p.hash(), deadline));
     }
 
     /// A leg's finalization names its hash without resolving it, so the
@@ -626,7 +704,7 @@ mod tests {
             tx_hash,
         )))]);
         assert!(
-            !index.contains_resolved_tx(&tx_hash),
+            !index.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO),
             "the leg decided nothing"
         );
 
@@ -636,7 +714,7 @@ mod tests {
             TransactionDecision::Accept,
         )))]);
         assert!(
-            index.contains_resolved_tx(&tx_hash),
+            index.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO),
             "the reclaim's finalization does"
         );
     }

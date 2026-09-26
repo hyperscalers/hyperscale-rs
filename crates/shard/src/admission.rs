@@ -211,7 +211,7 @@ impl Section for ProvisionsSection {
                 "provisions batch {provision_hash:?} already in QC chain ancestor"
             ));
         }
-        if ctx.dedup.contains_provision(&provision_hash) {
+        if ctx.dedup.contains_provision(&provision_hash, ctx.anchor) {
             return Err(format!(
                 "provisions batch {provision_hash:?} already committed within its retention window"
             ));
@@ -465,7 +465,7 @@ impl Section for FinalizationsSection {
                 "finalization {receipt_hash:?} is already carried by a QC chain ancestor"
             ));
         }
-        if ctx.dedup.contains_finalization(&receipt_hash) {
+        if ctx.dedup.contains_finalization(&receipt_hash, ctx.anchor) {
             return Err(format!(
                 "finalization {receipt_hash:?} was already committed within its retention window"
             ));
@@ -537,7 +537,7 @@ fn already_resolved(ctx: &Admission<'_>, tx_hash: TxHash) -> Result<(), String> 
             "transaction {tx_hash} already resolved by a QC chain ancestor"
         ));
     }
-    if ctx.dedup.contains_resolved_tx(&tx_hash) {
+    if ctx.dedup.contains_resolved_tx(&tx_hash, ctx.anchor) {
         return Err(format!(
             "transaction {tx_hash} already resolved within its retention window"
         ));
