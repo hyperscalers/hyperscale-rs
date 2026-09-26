@@ -416,6 +416,7 @@ impl RocksDbShardStorage {
             engagements: Arc::new(engagements),
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
+            tick_manifest: Arc::new(manifest.tick_manifest().clone()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
         };
 
@@ -552,6 +553,7 @@ impl RocksDbShardStorage {
             engagements: Arc::new(engagements),
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
+            tick_manifest: Arc::new(manifest.tick_manifest().clone()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
         };
         let provision_hashes = provision_hashes_bounded;

@@ -40,9 +40,10 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash, FrontierInputs,
-    GlobalReceiptHash, Hash, QuorumCertificate, Round, ShardId, StateWrites, StoredReceipt,
-    SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable, WeightedTimestamp, WitnessSources,
+    ConsensusReceipt, DiscardCause, ExecutionCertificate, Finalization, FinalizationHash,
+    FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Round, ShardId, StateWrites,
+    StoredReceipt, SyncHint, TickHalf, TickId, TickLine, TickManifest, TxHash, ValidatorId,
+    Verifiable, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -416,6 +417,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             engagements: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
@@ -427,6 +429,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -438,6 +441,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 provisions,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             }
         }
@@ -449,6 +453,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             engagements,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -461,6 +466,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 engagements,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             }
         }
@@ -670,6 +676,7 @@ fn test_commit_block_stores_certificates() {
             provisions,
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -686,6 +693,7 @@ fn test_commit_block_stores_certificates() {
             engagements,
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -1330,6 +1338,61 @@ fn a_stored_block_keeps_its_engagements() {
         .expect("the committed block is servable");
     assert!(!served.is_live());
     assert_eq!(*served.engagements(), expected[..]);
+}
+
+/// A stored block keeps its tick manifest across a reopen, on both read
+/// paths: every seat folds the lines the block named, whichever form it
+/// reads the block in.
+#[test]
+fn a_stored_block_keeps_its_tick_manifest() {
+    let temp_dir = TempDir::new().unwrap();
+    let lines: TickManifest = Capped::from_array([TickLine::Discard {
+        tick: TickId::new(ShardId::ROOT, BlockHeight::new(1)),
+        cause: DiscardCause::Recovery,
+    }]);
+    {
+        let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } = make_test_block(BlockHeight::new(1))
+        else {
+            unreachable!("the fixture builds a live block")
+        };
+        let block = Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest: Arc::new(lines.clone()),
+            witness_sources,
+        };
+        commit_settled_at(
+            &storage,
+            &make_test_certified(block),
+            &[],
+            &[],
+            &no_witness(),
+        );
+    }
+
+    let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let stored = reopened
+        .get_block(BlockHeight::new(1))
+        .expect("the committed block is stored");
+    assert_eq!(*stored.block().tick_manifest(), lines);
+    let (served, _, _) = reopened
+        .get_block_for_sync(BlockHeight::new(1))
+        .expect("the committed block is servable");
+    assert_eq!(*served.tick_manifest(), lines);
 }
 
 #[test]

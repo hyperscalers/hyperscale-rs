@@ -19,8 +19,8 @@ use std::sync::Arc;
 use hyperscale_types::{
     AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, EngagementRoot, LeafRoot,
     LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate,
-    SetRoot, ShardId, ShardLoad, StateClaimsRoot, TopologySnapshot, Transaction, Verifiable,
-    VoteCount,
+    SetRoot, ShardId, ShardLoad, StateClaimsRoot, TickLine, TickManifestRoot, TopologySnapshot,
+    Transaction, Verifiable, VoteCount, tick_manifest_admits_block,
 };
 
 use crate::admission::{
@@ -381,11 +381,18 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<RecordsSection<'_>>(ctx, &mut records, block.abandonment_records())?;
     let mut state_claims = StateClaimsFold::default();
     admit_all::<StateClaimsSection>(ctx, &mut state_claims, block.state_claims())?;
+    if !block.tick_manifest().is_empty() {
+        return Err(format!(
+            "block names {} tick lines, and no line is admissible yet",
+            block.tick_manifest().len()
+        ));
+    }
     Ok(transactions.budget)
 }
 
-/// The header's abandonment, state-claims and engagement roots commit
-/// the sections they claim.
+/// The header's abandonment, state-claims, engagement and tick manifest
+/// roots commit the sections they claim, and the tick manifest fits its
+/// byte budget.
 ///
 /// What this establishes is that every replica reads the same section:
 /// the root binds the items to the header, and the canonical order the
@@ -416,6 +423,23 @@ pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
              {computed:?}"
         ));
     }
+    let computed = TickManifestRoot::over(block.tick_manifest());
+    let claimed = block.header().tick_manifest_root();
+    if computed != claimed {
+        return Err(format!(
+            "tick manifest root {claimed:?} does not commit the block's lines {computed:?}"
+        ));
+    }
+    let weight: usize = block
+        .tick_manifest()
+        .iter()
+        .map(TickLine::wire_weight)
+        .sum();
+    if !tick_manifest_admits_block(weight) {
+        return Err(format!(
+            "tick manifest weighs {weight} bytes, over its budget"
+        ));
+    }
     Ok(())
 }
 
@@ -423,8 +447,8 @@ pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
 /// the shard's terminal window — exists only to certify the crossing. It
 /// must carry no content of any kind, so state stays frozen at the
 /// crossing's root: no transactions, no certificates, no provisions, and
-/// no boundary records, which a chain whose own capacity to resolve
-/// anything ended at its cut has nothing left to write down.
+/// no boundary records or tick lines, which a chain whose own capacity to
+/// resolve anything ended at its cut has nothing left to write down.
 fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
     if !block.transactions().is_empty() {
         return Err(format!(
@@ -454,6 +478,12 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
         return Err(format!(
             "coast block past the terminal window carries {} state claims",
             block.state_claims().len()
+        ));
+    }
+    if !block.tick_manifest().is_empty() {
+        return Err(format!(
+            "coast block past the terminal window carries {} tick lines",
+            block.tick_manifest().len()
         ));
     }
     Ok(())
@@ -502,15 +532,16 @@ pub mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
-        BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, Engagement,
-        ExecutionOutcome, Finalization, Hash, Inclusion, LegRole, LocalKey, MAX_INTENTS,
-        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
-        ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot,
-        SubstateKey, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
-        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, WeightedTimestamp, WitnessSources, state_claims_admit_block, test_utils,
+        BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, DiscardCause,
+        Engagement, ExecutionOutcome, Finalization, Hash, Inclusion, LegRole, LocalKey,
+        MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+        MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition, PriceTable,
+        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate,
+        RETENTION_HORIZON, Round, RoutePrefix, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TickId, TickManifest, TimestampRange,
+        Transaction, TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
+        WitnessSources, state_claims_admit_block, test_utils,
     };
 
     use super::*;
@@ -1025,6 +1056,7 @@ pub mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -1042,6 +1074,7 @@ pub mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -1180,6 +1213,7 @@ pub mod tests {
                 Capped::new(verdicts).expect("a list written out in a test"),
             ),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1204,6 +1238,7 @@ pub mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1883,6 +1918,7 @@ pub mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -2031,6 +2067,7 @@ pub mod tests {
             certificates: Arc::new(Capped::from_array([Arc::new((*settled).clone().into())])),
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::from_array([AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
@@ -2121,6 +2158,7 @@ pub mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -2271,6 +2309,7 @@ pub mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -2500,6 +2539,7 @@ pub mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -2701,6 +2741,7 @@ pub mod tests {
                 ),
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -2719,6 +2760,56 @@ pub mod tests {
         let sealed = live.into_sealed();
         assert_eq!(sealed.engagements().len(), 2);
         assert!(validate_roots_commit_sections(&sealed).is_ok());
+    }
+
+    /// The header's tick manifest root commits the block's lines, in
+    /// both forms, and a coast block names none.
+    #[test]
+    fn the_tick_manifest_root_commits_its_lines_and_a_coast_block_names_none() {
+        let lines: TickManifest = Capped::from_array([TickLine::Discard {
+            tick: TickId::new(ShardId::ROOT, BlockHeight::new(3)),
+            cause: DiscardCause::Recovery,
+        }]);
+        let with_root = |root: TickManifestRoot| {
+            let base = header_at_height(BlockHeight::new(6), 100_000);
+            Block::Live {
+                header: BlockHeader::new(BlockHeaderParts {
+                    height: base.height(),
+                    parent_block_hash: base.parent_block_hash(),
+                    parent_qc: base.parent_qc().clone().into(),
+                    proposer: base.proposer(),
+                    timestamp: base.timestamp(),
+                    round: base.round(),
+                    provision_tx_roots: Capped::default(),
+                    tick_manifest_root: root,
+                    ..Default::default()
+                }),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(lines.clone()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            }
+        };
+
+        let err = validate_roots_commit_sections(&with_root(TickManifestRoot::ZERO))
+            .expect_err("a root claiming nothing does not commit a line");
+        assert!(err.contains("tick manifest root"), "{err}");
+
+        let honest = with_root(TickManifestRoot::over(&lines));
+        assert!(validate_roots_commit_sections(&honest).is_ok());
+        let sealed = honest.clone().into_sealed();
+        assert_eq!(
+            sealed.tick_manifest().len(),
+            1,
+            "sealing keeps the manifest"
+        );
+        assert!(validate_roots_commit_sections(&sealed).is_ok());
+
+        let err = validate_coast_block_for_vote(&honest, Some(ShardLoad::ZERO)).unwrap_err();
+        assert!(err.contains("tick lines"), "{err}");
     }
 
     /// The signed ceiling is the payer shard's verdict and no other

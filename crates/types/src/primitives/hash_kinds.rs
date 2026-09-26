@@ -203,6 +203,17 @@ hash_newtype!(
     "EngagementRoot"
 );
 
+hash_newtype!(
+    /// Root over a block's [`TickLine`](crate::TickLine)s, in manifest
+    /// order.
+    ///
+    /// Carried in
+    /// [`BlockHeader::tick_manifest_root`](crate::BlockHeader), so both
+    /// block forms keep one manifest and every commit path folds it.
+    pub TickManifestRoot,
+    "TickManifestRoot"
+);
+
 // ── Beacon chain ─────────────────────────────────────────────────────────────
 
 hash_newtype!(

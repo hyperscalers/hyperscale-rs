@@ -11,8 +11,9 @@
 
 use hyperscale_jmt::{MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES};
 use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
-    MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS, VERIFY_WEIGHT,
+    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_CROSSINGS_PER_TX, MAX_ENVELOPE_BYTES,
+    MAX_EVENT_BYTES_PER_TX, MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS,
+    VERIFY_WEIGHT,
 };
 
 use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
@@ -306,6 +307,51 @@ const _: () = assert!(MAX_CELLS_RESPONSE_BYTES + CELLS_ANSWER_FIXED_BYTES < MAX_
 /// each a single cell at the measured size carries this many of them.
 pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
 
+/// The decode cap on the lines a block's tick manifest carries: a tick
+/// holds at most what the drain admits.
+pub const MAX_TICK_LINES_PER_BLOCK: usize = MAX_UNSETTLED_PER_BLOCK;
+
+/// The decode cap on the holds one member line carries.
+///
+/// One per declared access, and a declared access costs its owner and
+/// its local half inside the call body, the same division that bounds
+/// [`MAX_PREFIXES_PER_TX`].
+pub const MAX_HOLDS_PER_MEMBER: usize = MAX_PREFIXES_PER_TX;
+
+/// Byte budget a block's tick manifest spends.
+///
+/// Its own term of the frame, outside the evidence and claims budgets.
+/// Lines are charged in the order they apply: members first, then
+/// reclaims, then discards, and a proposer stops at the first that does
+/// not fit and leaves the rest to the next block.
+pub const MAX_TICK_MANIFEST_BYTES: usize = 1024 * 1024;
+
+/// Whether a block may still carry tick lines weighing `weight` between
+/// them.
+///
+/// The one reading of the budget, so the composer that fills the
+/// section and the admission that checks it stop at the same place.
+#[must_use]
+pub const fn tick_manifest_admits_block(weight: usize) -> bool {
+    weight <= MAX_TICK_MANIFEST_BYTES
+}
+
+/// Bytes one [`TickLine`](crate::TickLine) costs before its holds or its
+/// records.
+pub const TICK_LINE_BYTES: usize = 64;
+
+/// Bytes one hold of a member line costs: a declared access and its
+/// mode.
+pub const TICK_HOLD_BYTES: usize = 160;
+
+/// Any single line fits an empty manifest, so no line is ever left
+/// waiting on a budget it can never meet.
+const _: () =
+    assert!(TICK_LINE_BYTES + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES <= MAX_TICK_MANIFEST_BYTES);
+const _: () = assert!(
+    TICK_LINE_BYTES + MAX_CROSSINGS_PER_TX * ESCROWED_RECORD_BYTES <= MAX_TICK_MANIFEST_BYTES
+);
+
 /// Byte budget the abandonment records of one block share.
 ///
 /// The one section a block carries verbatim whose per-item cost varies:
@@ -384,7 +430,8 @@ pub const STATE_CLAIMS_HEADROOM: usize = MAX_WIRE_MESSAGE_BYTES
     - MAX_TXS_PER_BLOCK * HASH_BYTES
     - MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
     - MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
-    - MAX_PROPOSAL_EVIDENCE_BYTES;
+    - MAX_PROPOSAL_EVIDENCE_BYTES
+    - MAX_TICK_MANIFEST_BYTES;
 
 /// The granularity the claims budget is rounded to.
 const STATE_CLAIMS_ROUNDING: usize = 16 * 1024;
@@ -438,7 +485,7 @@ const HASH_BYTES: usize = 32;
 const PROPOSAL_FIXED_BYTES: usize = 64 * 1024;
 
 /// The widest a proposal can encode: every section at its own cap, and
-/// the record and claim sections at their byte budgets.
+/// the record, claim and tick manifest sections at their byte budgets.
 ///
 /// The per-item figures above are upper bounds on the real encoding,
 /// which `wire_budget.rs` holds them to by encoding a maximal value of
@@ -449,7 +496,8 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
     + MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
     + MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
     + MAX_PROPOSAL_EVIDENCE_BYTES
-    + MAX_STATE_CLAIMS_BYTES;
+    + MAX_STATE_CLAIMS_BYTES
+    + MAX_TICK_MANIFEST_BYTES;
 
 /// INV-WIRE-1: a proposal every section of which is at its cap still
 /// fits the frame that carries it. The transports drop an oversize

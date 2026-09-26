@@ -284,6 +284,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
+        tick_manifest: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -527,6 +528,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -538,6 +540,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
                 provisions,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             }
         }
@@ -549,6 +552,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             engagements,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -561,6 +565,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
                 engagements,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             }
         }
@@ -576,6 +581,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             certificates,
             provisions,
             state_claims,
+            tick_manifest,
             witness_sources,
             ..
         } => Block::Live {
@@ -585,6 +591,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             provisions,
             abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
+            tick_manifest,
             witness_sources,
         },
         Block::Sealed {
@@ -594,6 +601,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             provision_hashes,
             engagements,
             state_claims,
+            tick_manifest,
             witness_sources,
             ..
         } => Block::Sealed {
@@ -604,6 +612,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             engagements,
             abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
+            tick_manifest,
             witness_sources,
         },
     }
@@ -821,6 +830,7 @@ pub fn commit_block_with_witnesses(
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
+        tick_manifest: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -877,6 +887,7 @@ pub fn commit_block_with_witness_window(
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
+        tick_manifest: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -2119,6 +2130,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -2143,6 +2155,7 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -2172,6 +2185,7 @@ pub fn with_state_claims(block: Block, claims: Vec<StateClaim>) -> Block {
             provisions,
             abandonment_records,
             state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,

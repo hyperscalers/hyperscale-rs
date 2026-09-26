@@ -27,8 +27,8 @@ use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
     Engagements, Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, StateClaim, Transaction,
-    TxHash, Verifiable, WitnessSources,
+    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, StateClaim, TickManifest,
+    Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -117,6 +117,9 @@ pub struct ElidedCertifiedBlock {
     /// section is bounded by its own byte budget, and the receiver
     /// checks and folds them from the block at commit.
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    /// The block's tick manifest, always inline: both forms keep it, and
+    /// the receiver folds it at commit.
+    tick_manifest: TickManifest,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
@@ -265,6 +268,7 @@ impl ElidedCertifiedBlock {
             provisions,
             abandonment_records: block.abandonment_records().clone(),
             state_claims: block.state_claims().clone(),
+            tick_manifest: block.tick_manifest().clone(),
             witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
@@ -357,6 +361,7 @@ impl ElidedCertifiedBlock {
                     provisions: Arc::new(provisions),
                     abandonment_records: Arc::new(self.abandonment_records.clone()),
                     state_claims: Arc::new(self.state_claims.clone()),
+                    tick_manifest: Arc::new(self.tick_manifest.clone()),
                     witness_sources: Arc::new(self.witness_sources.clone()),
                 }
             }
@@ -374,6 +379,7 @@ impl ElidedCertifiedBlock {
                 engagements: Arc::new(engagements.clone()),
                 abandonment_records: Arc::new(self.abandonment_records.clone()),
                 state_claims: Arc::new(self.state_claims.clone()),
+                tick_manifest: Arc::new(self.tick_manifest.clone()),
                 witness_sources: Arc::new(self.witness_sources.clone()),
             },
             (None, ElidedProvisions::Live(_)) => {
@@ -499,6 +505,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -552,6 +559,7 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         }
     }
@@ -793,6 +801,7 @@ mod tests {
             provisions: Arc::new(Capped::new(provisions).expect("a list written out in a test")),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let live = live_with(batches.clone());

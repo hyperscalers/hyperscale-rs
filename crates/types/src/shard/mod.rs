@@ -24,6 +24,8 @@
 //!   closure, [`SyncHint`](storage_commit::SyncHint), and
 //!   [`BeaconWitnessCommit`](storage_commit::BeaconWitnessCommit) payload
 //!   threaded through shard block commits.
+//! - [`tick_manifest`]: [`TickLine`](tick_manifest::TickLine), what a
+//!   block's tick holds and what it lets go, named by the proposer.
 //! - [`timeout`]: [`Timeout`] view-change share that drives the pacemaker.
 //! - [`vote`]: [`BlockVote`] shard consensus vote.
 //! - [`vote_registers`]: snapshot type for the two monotone safe-vote
@@ -57,6 +59,7 @@ pub mod roots;
 pub mod state_claim;
 pub mod storage_commit;
 pub mod sweep;
+pub mod tick_manifest;
 pub mod timeout;
 pub mod vote;
 pub mod vote_registers;

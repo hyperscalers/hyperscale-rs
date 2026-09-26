@@ -191,6 +191,7 @@ mod tests {
             engagements: Arc::new(Capped::empty()),
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         };
         commit_settled_at(
@@ -233,6 +234,7 @@ mod tests {
             provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         }
     }

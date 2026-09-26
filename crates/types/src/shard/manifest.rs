@@ -7,7 +7,7 @@ use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
     Engagements, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    QuorumCertificate, StateClaim, TxHash, Verifiable, WitnessSources,
+    QuorumCertificate, StateClaim, TickManifest, TxHash, Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -33,6 +33,10 @@ pub struct BlockManifest {
     /// checked from the block rather than against anything a voter
     /// could fetch back from a later source.
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    /// The block's tick manifest, mirrored verbatim: a voter checks each
+    /// line against committed content, and every seat folds the lines
+    /// the block names.
+    tick_manifest: TickManifest,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
@@ -50,6 +54,7 @@ impl Default for BlockManifest {
             provision_hashes: Capped::empty(),
             abandonment_records: Capped::empty(),
             state_claims: Capped::empty(),
+            tick_manifest: Capped::empty(),
             witness_sources: WitnessSources::empty(),
         }
     }
@@ -65,6 +70,7 @@ impl BlockManifest {
         provision_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
         abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
         state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+        tick_manifest: TickManifest,
         witness_sources: WitnessSources,
     ) -> Self {
         Self {
@@ -73,6 +79,7 @@ impl BlockManifest {
             provision_hashes,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         }
     }
@@ -114,6 +121,12 @@ impl BlockManifest {
         &self.state_claims
     }
 
+    /// The block's tick manifest.
+    #[must_use]
+    pub const fn tick_manifest(&self) -> &TickManifest {
+        &self.tick_manifest
+    }
+
     /// The block's beacon-witness inputs.
     #[must_use]
     pub const fn witness_sources(&self) -> &WitnessSources {
@@ -149,6 +162,7 @@ impl BlockManifest {
             provision_hashes,
             block.abandonment_records().clone(),
             block.state_claims().clone(),
+            block.tick_manifest().clone(),
             block.witness_sources().as_ref().clone(),
         )
     }

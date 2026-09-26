@@ -1510,6 +1510,7 @@ mod tests {
                 provisions: Arc::new(Capped::from_array([Arc::new(provision.into())])),
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             },
             sealed @ Block::Sealed { .. } => sealed,

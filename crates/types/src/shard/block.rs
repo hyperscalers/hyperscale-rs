@@ -17,8 +17,8 @@ use crate::{
     Engagement, Engagements, ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, ShardId, SharedWitnessSources,
-    SplitChildRoots, StateClaim, StateRoot, Transaction, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    SplitChildRoots, StateClaim, StateRoot, TickManifest, Transaction, TxHash, TxOutcome,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -135,6 +135,10 @@ pub enum Block {
         /// the header's `state_claims_root`, checked from the block at
         /// admission and folded by every replica at commit.
         state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
+        /// What the block's tick holds and what it lets go, named by the
+        /// proposer and checked line by line against committed content.
+        /// Committed via the header's `tick_manifest_root`.
+        tick_manifest: Arc<TickManifest>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -173,6 +177,10 @@ pub enum Block {
         /// at every stage, and no stage has a claim form without its
         /// proof.
         state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
+        /// The tick manifest, retained through sealing: a replica that
+        /// syncs the block sealed seats the same ticks as one that syncs
+        /// it live.
+        tick_manifest: Arc<TickManifest>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -247,6 +255,7 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -274,6 +283,7 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -304,6 +314,7 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -448,6 +459,14 @@ impl Block {
     pub fn state_claims(&self) -> &Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK> {
         match self {
             Self::Live { state_claims, .. } | Self::Sealed { state_claims, .. } => state_claims,
+        }
+    }
+
+    /// The block's tick manifest, regardless of variant.
+    #[must_use]
+    pub fn tick_manifest(&self) -> &TickManifest {
+        match self {
+            Self::Live { tick_manifest, .. } | Self::Sealed { tick_manifest, .. } => tick_manifest,
         }
     }
 
@@ -611,6 +630,7 @@ impl Block {
                 provisions,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             } => {
                 // One hash per body, so the list keeps the cap the
@@ -627,6 +647,7 @@ impl Block {
                     engagements: Arc::new(engagements),
                     abandonment_records,
                     state_claims,
+                    tick_manifest,
                     witness_sources,
                 }
             }
@@ -652,6 +673,7 @@ impl Block {
                 certificates,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
                 ..
             } => Self::Live {
@@ -661,6 +683,7 @@ impl Block {
                 provisions,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             },
             Self::Live { .. } => {

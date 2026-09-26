@@ -18,14 +18,14 @@ use std::sync::Arc;
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs};
 use hyperscale_types::{
-    EscrowedValue, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
+    EscrowedValue, Joins, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
 
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
-use crate::tick_state::{Admission, Membership};
+use crate::tick_state::Membership;
 
 /// One committed transaction awaiting a tick.
 #[derive(Debug)]
@@ -125,7 +125,7 @@ pub struct Admitted {
     /// The terms it joins on. Everything composition admits runs; the
     /// payer's leg whose counterparts never engaged runs and is attested
     /// `Aborted` regardless.
-    pub admission: Admission,
+    pub joins: Joins,
     /// The table the block that committed this member named.
     ///
     /// What its own share is priced at: the abandonment of a member that
@@ -303,10 +303,10 @@ impl TickCandidates {
                     arrivals,
                 },
                 membership,
-                admission: if candidate.engagement_pending.is_empty() {
-                    Admission::Executes
+                joins: if candidate.engagement_pending.is_empty() {
+                    Joins::Executes
                 } else {
-                    Admission::ExecutesAborted
+                    Joins::ExecutesAborted
                 },
                 committed_prices: candidate.committed_prices,
             });
@@ -527,8 +527,8 @@ mod tests {
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(60_000));
         assert_eq!(admitted.len(), 1);
         assert_eq!(
-            admitted[0].admission,
-            Admission::ExecutesAborted,
+            admitted[0].joins,
+            Joins::ExecutesAborted,
             "it executes to build the charge, and is attested aborted",
         );
     }

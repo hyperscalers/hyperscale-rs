@@ -612,6 +612,7 @@ impl PendingBlock {
             Capped::new(provision_hashes).expect("a rebuilt block keeps the caps its source met"),
             block.abandonment_records().clone(),
             block.state_claims().clone(),
+            block.tick_manifest().clone(),
             block.witness_sources().as_ref().clone(),
         );
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
@@ -815,6 +816,7 @@ impl PendingBlock {
             ),
             abandonment_records: Arc::new(self.manifest.abandonment_records().clone()),
             state_claims: Arc::new(self.manifest.state_claims().clone()),
+            tick_manifest: Arc::new(self.manifest.tick_manifest().clone()),
             witness_sources: Arc::new(self.manifest.witness_sources().clone()),
         });
 
@@ -989,6 +991,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1025,6 +1028,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1056,6 +1060,7 @@ mod tests {
             BlockManifest::new(
                 Capped::from_array([]),
                 Capped::from_array([fw.receipt_hash()]),
+                Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
@@ -1097,6 +1102,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1133,6 +1139,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         };
 
         let pending = PendingBlock::from_complete_block(
@@ -1160,6 +1167,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([prov_a, prov_b]),
+                Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
                 WitnessSources::empty(),
@@ -1212,6 +1220,7 @@ mod tests {
                 Capped::from_array([shared, only_stale]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1222,6 +1231,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([shared]),
+                Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
                 WitnessSources::empty(),
@@ -1253,6 +1263,7 @@ mod tests {
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
+                Capped::from_array([]),
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1262,6 +1273,7 @@ mod tests {
             make_header(BlockHeight::new(8)),
             BlockManifest::new(
                 Capped::from_array([shared]),
+                Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),
                 Capped::from_array([]),

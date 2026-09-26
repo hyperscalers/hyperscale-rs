@@ -449,12 +449,12 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash,
-        ShardId, SignerBitfield,
+        Joins, ShardId, SignerBitfield,
     };
     use proptest::collection::vec as prop_vec;
 
     use super::*;
-    use crate::tick_state::{Admission, Membership};
+    use crate::tick_state::Membership;
 
     fn shard() -> ShardId {
         ShardId::ROOT
@@ -474,7 +474,7 @@ mod tests {
             test_transaction(tx_seed).hash(),
             Membership::whole(BTreeSet::from([shard()])),
             Some(1),
-            Admission::Executes,
+            Joins::Executes,
         );
         state
     }

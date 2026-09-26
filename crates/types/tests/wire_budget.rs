@@ -460,3 +460,100 @@ fn the_drains_name_count_alone_would_overrun_the_frame() {
          transactions can open",
     );
 }
+
+/// A tick line's weight bounds its encoding, at the widest values each
+/// kind's terms encode to: a member at every count of holds up to a
+/// transaction's worth, a reclaim at every count of records up to its
+/// cap, and a discard at each cause.
+#[test]
+fn a_tick_lines_weight_bounds_its_encoding() {
+    use hyperscale_types::{
+        CollectionId, DeclaredKey, DeclaredRange, DiscardCause, Joins, MAX_HOLDS_PER_MEMBER,
+        TICK_HOLD_BYTES, TICK_LINE_BYTES, TickId, TickLine,
+    };
+    use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode, Moves};
+
+    let widest_tx = TxHash::from(Hash::from_bytes(&[0xFF; 32]));
+    let widest_owner = Address::new([0xFF; 31], AddressClass::Component);
+    let hold = |at: usize| {
+        (
+            DeclaredKey::Range(DeclaredRange {
+                owner: widest_owner,
+                collection: CollectionId([0xFF; 16]),
+                lo: u128::MAX - at as u128,
+                hi: u128::MAX,
+                cap: u32::MAX,
+            }),
+            Mode::Reserve { amount: u128::MAX },
+        )
+    };
+    for holds in [0usize, 1, 2, 64, MAX_HOLDS_PER_MEMBER] {
+        for mode in [
+            Mode::Reserve { amount: u128::MAX },
+            Mode::Write { moves: Moves::Both },
+        ] {
+            let line = TickLine::Member {
+                tx: widest_tx,
+                joins: Joins::ExecutesAborted,
+                holds: Capped::new((0..holds).map(|at| (hold(at).0, mode)).collect())
+                    .expect("a list under the cap"),
+            };
+            let encoded = hbor_to_vec(&line).expect("a member line encodes");
+            assert!(
+                encoded.len() <= line.wire_weight(),
+                "a member line of {holds} holds encodes to {} bytes, over the {} its weight \
+                 claims",
+                encoded.len(),
+                line.wire_weight(),
+            );
+        }
+    }
+    for records in [0usize, 1, MAX_CROSSINGS_PER_TX] {
+        let line = TickLine::Reclaim {
+            name: widest_tx,
+            records: Capped::new(
+                (0..records)
+                    .map(|at| SubstateKey {
+                        owner: widest_owner,
+                        local: LocalKey(u128::MAX.wrapping_sub(at as u128).to_be_bytes()),
+                    })
+                    .collect(),
+            )
+            .expect("a list under the cap"),
+        };
+        let encoded = hbor_to_vec(&line).expect("a reclaim line encodes");
+        assert!(
+            encoded.len() <= line.wire_weight(),
+            "a reclaim line of {records} records encodes to {} bytes, over the {} its weight \
+             claims",
+            encoded.len(),
+            line.wire_weight(),
+        );
+    }
+    let deep = TickId::new(ShardId::leaf(9, 300), BlockHeight::new(u64::MAX));
+    for cause in [
+        DiscardCause::Abandoned(widest_tx),
+        DiscardCause::Unanswerable(widest_tx),
+        DiscardCause::Rejected,
+        DiscardCause::Recovery,
+    ] {
+        let line = TickLine::Discard { tick: deep, cause };
+        let encoded = hbor_to_vec(&line).expect("a discard line encodes");
+        assert!(
+            encoded.len() <= line.wire_weight(),
+            "{cause:?} encodes to {}",
+            encoded.len()
+        );
+        assert_eq!(line.wire_weight(), TICK_LINE_BYTES);
+    }
+    let one = TickLine::Member {
+        tx: widest_tx,
+        joins: Joins::Executes,
+        holds: Capped::from_array([hold(0)]),
+    };
+    assert_eq!(
+        one.wire_weight(),
+        TICK_LINE_BYTES + TICK_HOLD_BYTES,
+        "one hold costs one hold"
+    );
+}

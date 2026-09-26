@@ -772,6 +772,7 @@ mod tests {
             Capped::from_array([]),
             Capped::from_array([]),
             Capped::from_array([]),
+            Capped::from_array([]),
             WitnessSources::empty(),
         );
 

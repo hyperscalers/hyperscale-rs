@@ -63,7 +63,7 @@ use hyperscale_types::{
     AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey,
     Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
+    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, Joins,
     MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions, ScheduleLookup,
     SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateClaim, StateWrites, StoredReceipt,
     SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot, Transaction,
@@ -91,7 +91,7 @@ use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
 use crate::parked_claims::ParkedClaims;
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, WantedRecord, requirements_of};
-use crate::tick_state::{Admission, Divergence, Membership, TickState};
+use crate::tick_state::{Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::vote_tracker::VoteTracker;
 
@@ -1196,7 +1196,7 @@ impl ExecutionCoordinator {
                 tx_hash,
                 Membership::whole(participating).settling(),
                 Some(charged),
-                Admission::Aborted,
+                Joins::Aborted,
             );
             // The floor is owed whether or not the transaction ever ran:
             // the reservation engaged when its block committed it, and an
@@ -1363,7 +1363,7 @@ impl ExecutionCoordinator {
             tx_hash,
             Membership::whole(BTreeSet::from([local_shard])).settling(),
             None,
-            Admission::Executes,
+            Joins::Executes,
         );
         self.ticks.assign_tx(tx_hash, tick_id);
         requests.push(CrossShardExecutionRequest {
@@ -1420,7 +1420,7 @@ impl ExecutionCoordinator {
                 }
                 _ => None,
             },
-            member.admission,
+            member.joins,
         );
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
         self.counterparts
@@ -4584,7 +4584,7 @@ mod tests {
                 tx.hash(),
                 Membership::whole(participating),
                 Some(tx.price(&PriceTable::GENESIS)),
-                Admission::Executes,
+                Joins::Executes,
             );
         }
         state
@@ -5498,7 +5498,7 @@ mod tests {
                 BTreeSet::from([local, venue]),
             )),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         state.ticks.insert_tick(tick_id, tick);
 
@@ -9320,6 +9320,7 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         };
         state
@@ -9363,6 +9364,7 @@ mod tests {
                 Capped::new(records).expect("a list written out in a test"),
             ),
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         };
         state

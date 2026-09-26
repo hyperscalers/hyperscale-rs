@@ -12,7 +12,8 @@ use crate::{
     CertificateRoot, ChainOrigin, EngagementRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
     ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot,
     ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier,
-    TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
+    TickManifestRoot, TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify,
+    WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -87,6 +88,10 @@ pub struct BlockHeader {
     /// same entries and the engagement tier folds them on every commit
     /// path.
     engagement_root: EngagementRoot,
+    /// Commits the block's tick manifest: which members its tick holds,
+    /// and which earlier ticks it lets go of. Both block forms keep the
+    /// manifest, so every commit path folds the same lines.
+    tick_manifest_root: TickManifestRoot,
     txs_in_flight: TxsInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
@@ -193,6 +198,7 @@ pub struct BlockHeaderParts {
     pub abandonment_root: AbandonmentRoot,
     pub state_claims_root: StateClaimsRoot,
     pub engagement_root: EngagementRoot,
+    pub tick_manifest_root: TickManifestRoot,
     pub txs_in_flight: TxsInFlight,
     pub settled_tick_frontier: BlockHeight,
     pub sweep_frontier: SweepFrontier,
@@ -226,6 +232,7 @@ impl Default for BlockHeaderParts {
             abandonment_root: AbandonmentRoot::ZERO,
             state_claims_root: StateClaimsRoot::ZERO,
             engagement_root: EngagementRoot::ZERO,
+            tick_manifest_root: TickManifestRoot::ZERO,
             txs_in_flight: TxsInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -263,6 +270,7 @@ impl BlockHeader {
             abandonment_root,
             state_claims_root,
             engagement_root,
+            tick_manifest_root,
             txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -292,6 +300,7 @@ impl BlockHeader {
             abandonment_root,
             state_claims_root,
             engagement_root,
+            tick_manifest_root,
             txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -591,6 +600,12 @@ impl BlockHeader {
         self.engagement_root
     }
 
+    /// Root over the block's tick manifest.
+    #[must_use]
+    pub const fn tick_manifest_root(&self) -> TickManifestRoot {
+        self.tick_manifest_root
+    }
+
     /// Approximate number of in-flight transactions on this shard at proposal time.
     ///
     /// "In-flight" = committed + executed transactions in the proposer's mempool,
@@ -749,6 +764,7 @@ impl BlockHeader {
             abandonment_root: self.abandonment_root,
             state_claims_root: self.state_claims_root,
             engagement_root: self.engagement_root,
+            tick_manifest_root: self.tick_manifest_root,
             txs_in_flight: self.txs_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,

@@ -41,7 +41,7 @@ use hyperscale_engine::legs::Member;
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY,
+    GlobalReceiptRoot, Joins, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY,
     MAX_VALIDITY_RANGE, Role, Settles, ShardId, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome,
     Verified, WeightedTimestamp, compute_global_receipt_root, refused_transactions, settles,
 };
@@ -183,39 +183,6 @@ impl Membership {
     }
 }
 
-/// How a member joins its tick.
-///
-/// The three cases are the whole of it: what the tick answers for is its
-/// membership, and what the VM runs is its batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Admission {
-    /// In the batch, attested with whatever execution returns.
-    Executes,
-    /// In the batch and attested `Aborted` whatever it returns — the
-    /// payer's leg whose counterparts never engaged. It still executes,
-    /// because the charge that abort settles is what the execution
-    /// builds.
-    ExecutesAborted,
-    /// Not in the batch. Past the deadline that bounds it, so no
-    /// execution here can reach an outcome, and the tick attests
-    /// `Aborted` on nothing but the hash and the reservation its
-    /// committing block took.
-    Aborted,
-}
-
-impl Admission {
-    /// Whether the member goes to the engine, and so whether the tick
-    /// waits for a result before it can vote.
-    const fn dispatched(self) -> bool {
-        matches!(self, Self::Executes | Self::ExecutesAborted)
-    }
-
-    /// Whether the tick attests `Aborted` whatever execution says.
-    const fn aborts(self) -> bool {
-        matches!(self, Self::ExecutesAborted | Self::Aborted)
-    }
-}
-
 /// Age at which a still-unresolved tick emits a single diagnostic warning.
 ///
 /// Every committed transaction is supposed to reach a certificate — its
@@ -292,14 +259,14 @@ struct Seat {
 }
 
 impl Seat {
-    /// A seat on the terms `admission` names.
-    const fn new(membership: Membership, charged: Option<u128>, admission: Admission) -> Self {
+    /// A seat on the terms `joins` names.
+    const fn new(membership: Membership, charged: Option<u128>, joins: Joins) -> Self {
         Self {
             membership,
             charged,
-            awaiting_result: admission.dispatched(),
-            aborted: admission.aborts(),
-            abandons: matches!(admission, Admission::Aborted),
+            awaiting_result: joins.dispatched(),
+            aborted: joins.aborts(),
+            abandons: matches!(joins, Joins::Aborted),
             result: None,
             receipt: None,
             refusal_receipt: None,
@@ -408,11 +375,11 @@ impl TickState {
         }
     }
 
-    /// Admit a member, on the terms `admission` names.
+    /// Admit a member, on the terms `joins` names.
     ///
     /// One entry point for all three, because they differ only in what
     /// the tick waits for and what it will say. An
-    /// [`Aborted`](Admission::Aborted) member joins with no body at all:
+    /// [`Aborted`](Joins::Aborted) member joins with no body at all:
     /// the ledger names it by hash, by the shards party to it, and by the
     /// work its committing block reserved, which is everything an abort
     /// has to state. A member the tick already holds keeps the terms it
@@ -422,14 +389,14 @@ impl TickState {
         tx_hash: TxHash,
         membership: Membership,
         charged: Option<u128>,
-        admission: Admission,
+        joins: Joins,
     ) {
         if self.seats.contains_key(&tx_hash) {
             return;
         }
         self.order.push(tx_hash);
         self.seats
-            .insert(tx_hash, Seat::new(membership, charged, admission));
+            .insert(tx_hash, Seat::new(membership, charged, joins));
     }
 
     // ── Identity getters ────────────────────────────────────────────────
@@ -1391,13 +1358,13 @@ mod tests {
                 shared,
                 Membership::whole(BTreeSet::from([local, peer])),
                 None,
-                Admission::Executes,
+                Joins::Executes,
             );
             tick.admit(
                 alone,
                 Membership::whole(BTreeSet::from([local])),
                 None,
-                Admission::Executes,
+                Joins::Executes,
             );
             tick
         };
@@ -1469,13 +1436,13 @@ mod tests {
             determined,
             Membership::whole(BTreeSet::from([local])),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.admit(
             leg,
             Membership::whole(BTreeSet::from([local, shard(1)])),
             Some(20),
-            Admission::Executes,
+            Joins::Executes,
         );
         for tx_hash in [determined, leg] {
             tick.record_execution_result(
@@ -1517,7 +1484,7 @@ mod tests {
             member,
             Membership::whole(BTreeSet::from([local, peer])),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         let from_peer = |counterparts: Vec<ShardId>| {
             Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
@@ -1569,13 +1536,13 @@ mod tests {
             determined,
             Membership::whole(BTreeSet::from([local])),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.admit(
             leg,
             Membership::whole(BTreeSet::from([local, shard(1)])),
             Some(20),
-            Admission::Executes,
+            Joins::Executes,
         );
         for tx_hash in [determined, leg] {
             tick.record_execution_result(
@@ -1705,7 +1672,7 @@ mod tests {
             tx(1),
             Membership::whole(BTreeSet::from([local])),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.record_execution_result(
             tx(1),
@@ -1818,13 +1785,13 @@ mod tests {
             leg,
             membership([local], [local, venue], Role::Leg),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.admit(
             core,
             membership([local, venue], [local, venue], Role::Core),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
 
         assert_eq!(tick.counterpart_shards(), vec![venue]);
@@ -1874,7 +1841,7 @@ mod tests {
                 BTreeSet::from([local, venue]),
             )),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
 
         assert_eq!(tick.determined_members(), vec![leg], "it settles alone");
@@ -1979,7 +1946,7 @@ mod tests {
             member,
             Membership::whole(participating),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.record_execution_result(
             member,

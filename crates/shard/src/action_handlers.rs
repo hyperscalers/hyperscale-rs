@@ -37,11 +37,11 @@ use hyperscale_types::{
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, Resolutions, RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad,
     SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext, Stopwatch,
-    StoredReceipt, SubstateKey, SweepFrontier, Timeout, TimeoutContext, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight, UnsettledTx,
-    ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
-    derive_leaves, fees_over_certificates, local_settled_tx_hashes,
+    StoredReceipt, SubstateKey, SweepFrontier, TickManifest, TickManifestRoot, Timeout,
+    TimeoutContext, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash,
+    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells,
+    commit_witness_window, derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
     signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
@@ -420,6 +420,9 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // What the provisions engage, committed so a sealed form keeps the
     // entries the engagement tier folds after the bodies are gone.
     let engagement_root = EngagementRoot::over(&Engagement::of_provisions(&provisions));
+    // The lines naming what this block's tick holds and lets go.
+    let tick_manifest: TickManifest = Capped::empty();
+    let tick_manifest_root = Verified::<TickManifestRoot>::compute(&tick_manifest).into_inner();
 
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
@@ -439,6 +442,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         abandonment_root,
         state_claims_root,
         engagement_root,
+        tick_manifest_root,
         txs_in_flight,
         settled_tick_frontier,
         sweep_frontier,
@@ -458,6 +462,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         provisions: Arc::new(provisions),
         abandonment_records: Arc::new(abandonment_records),
         state_claims: Arc::new(state_claims),
+        tick_manifest: Arc::new(tick_manifest),
         witness_sources,
     };
 

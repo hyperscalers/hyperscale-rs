@@ -119,7 +119,8 @@ pub use primitives::hash_kinds::{
     AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
     EngagementRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
-    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
+    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TickManifestRoot, TransactionRoot,
+    TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex,
@@ -175,15 +176,16 @@ pub use shard::limits::{
     MAX_BLOCK_FOOTPRINT, MAX_BLOCK_READ_BYTES, MAX_BLOCK_RETENTION_BYTES, MAX_BLOCK_WRITE_BYTES,
     MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
     MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
-    MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
-    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TX_CAPS, UNCLAIMED_CROSSING_BYTES,
-    UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction, drain_admits_block,
-    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES, MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES,
+    MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS,
+    MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
+    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TICK_HOLD_BYTES,
+    TICK_LINE_BYTES, TX_CAPS, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES, budget_admits_block,
+    caps_admit_transaction, drain_admits_block, evidence_admits_block, state_claims_admit_block,
+    sweep_admits_block, tick_manifest_admits_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad};
 pub use shard::manifest::{BlockManifest, BlockMetadata};
@@ -205,6 +207,7 @@ pub use shard::roots::{
 pub use shard::state_claim::{StateClaim, Stated};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
+pub use shard::tick_manifest::{DiscardCause, Holds, Joins, TickLine, TickManifest};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
