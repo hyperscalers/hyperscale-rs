@@ -888,12 +888,13 @@ pub fn select_members<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use hyperscale_storage::{MemberRow, TickRow};
+    use hyperscale_storage::{MemberInputs, MemberRow, SettledHalf, TickRow};
     use hyperscale_types::test_utils::stub_abort_charge;
     use hyperscale_types::{
-        AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES,
+        AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES, TickHalf,
     };
     use hyperscale_vm_types::Moves;
 
@@ -1060,6 +1061,54 @@ mod tests {
             engagement: None,
             charge: CHARGE,
         }
+    }
+
+    /// A multi-core member in flight at the terminal is one no
+    /// finalization settled here: settling a member deletes its row, so
+    /// the terminal fates exactly the members still outside the settled
+    /// set, each at the charge its line kept.
+    #[test]
+    fn in_flight_multi_core_at_the_terminal_is_unsettled() {
+        let shard = ShardId::ROOT;
+        let at = |height: u64| BlockHeight::new(height);
+        let mut rows = MemberIndex::empty(shard);
+        rows.advance(&MemberInputs {
+            height: at(1),
+            transactions: vec![(tx(1), far()), (tx(2), far())],
+            ..MemberInputs::still(shard)
+        });
+        let in_flight = |seed: u8| TickLine::Member {
+            tx: tx(seed),
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+            holds: Capped::empty(),
+            reach: Capped::from_array([PEER]),
+            charge: stub_abort_charge(seed),
+        };
+        rows.advance(&MemberInputs {
+            height: at(2),
+            manifest: Arc::new(Capped::from_array([in_flight(1), in_flight(2)])),
+            ..MemberInputs::still(shard)
+        });
+        rows.advance(&MemberInputs {
+            height: at(3),
+            settled: vec![SettledHalf {
+                tick: TickId::new(shard, at(2)),
+                half: TickHalf::Legs,
+                members: vec![tx(1)],
+            }],
+            ..MemberInputs::still(shard)
+        });
+
+        let (fates, missing) = terminal_fates(&rows, &|_| None);
+        assert!(missing.is_empty(), "a named row prices its own fate");
+        assert_eq!(
+            fates,
+            vec![TickLine::Fate {
+                tx: tx(2),
+                charge: stub_abort_charge(2),
+            }],
+        );
     }
 
     /// A member waits on every bundle and crossing it requires, and a

@@ -405,4 +405,17 @@ fn a_follower_applies_its_half_of_the_terminal() {
         }
         .composes_to(whole)
     );
+
+    // A replica syncing the terminal sealed recomputes the same root: the
+    // sealed form keeps the manifest its fates ride.
+    let synced = SimShardStorage::new(shard_prefix_path(parent));
+    synced
+        .follow_block_writes(&naming, &committed, &still)
+        .expect("followed");
+    assert_eq!(
+        synced
+            .follow_block_writes(&terminal.into_sealed(), &[], &still)
+            .expect("followed"),
+        whole,
+    );
 }

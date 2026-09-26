@@ -4385,12 +4385,13 @@ impl ExecutionCoordinator {
             .on_txs_terminated(tx_hashes.iter().copied());
     }
 
-    /// Drop every pending tick and EC expectation, in the fold that
-    /// derives the terminal latch: finalization is a finalization in a
-    /// later block, and no later content block exists, so every pending
-    /// tick here is permanently undecidable. Serving state (aggregated
-    /// ECs, finalizations) stays — peers still fetch what this chain
-    /// produced.
+    /// Flush the node-local execution state on the terminal's commit, the
+    /// fold that derives the terminal latch. It is a cache of what the
+    /// chain committed, and the terminal committed a fate for every
+    /// member still in flight, so nothing here is owed an outcome any
+    /// more: no later content block exists to finalize a tick in. Serving
+    /// state (aggregated ECs, finalizations) stays — peers still fetch
+    /// what this chain produced.
     fn terminate(&mut self) -> Vec<Action> {
         let counts = self.ticks.drain_all();
         let mut expected = self.expected_certs.drain_expected();
@@ -4403,12 +4404,11 @@ impl ExecutionCoordinator {
             unresolved = self.counterparts.ledger.len(),
             "Chain terminated — dropped pending execution state"
         );
-        // What the chain owes an outcome for goes with the rest. The
-        // ledger's entries are abandonable at their deadlines, and a
-        // deadline falling after the terminal would have this chain
-        // seat a tick to abandon them in — on a coast block, under a
-        // committee it no longer has. Nothing here can reach a verdict
-        // either way, which is the same reason the ticks above go.
+        // The ledger goes with the rest: the terminal's fates are every
+        // entry's committed exit, and a deadline falling after the
+        // terminal would otherwise have this chain seat a tick to abandon
+        // an entry in — on a coast block, under a committee it no longer
+        // has.
         self.counterparts.ledger = Ledger::new(self.local_shard);
         // The terminated chain's tick outputs die with it: successors seed
         // from settled state, and pending resolutions have nothing left to

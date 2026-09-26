@@ -1138,7 +1138,9 @@ impl Ledger {
     /// record covers yet, so a departure is answered once. And never a
     /// remainder: its verdict is in, and a departed deliverer's
     /// successor still delivers what it was owed — only the lapse says a
-    /// delivery never will.
+    /// delivery never will. A consumer the departed shard's terminal
+    /// fated is one it left unsettled: the fate commits no finalization,
+    /// so the transaction stays outside its terminal settled set.
     #[must_use]
     pub(crate) fn outstanding_with(
         &self,
@@ -1998,6 +2000,67 @@ mod tests {
 
         ledger.prune(expiry(cut).plus(Duration::from_millis(1)));
         assert_eq!(ledger.len(), 0, "and never again past it");
+    }
+
+    /// A consumer fated at its terminal leaves its transaction outside
+    /// the terminal's settled set, so the producer's departure road names
+    /// it once: the certified leg entry is outstanding with the departed
+    /// consumer until a record covers it, which licenses the reclaim, and
+    /// never again after.
+    #[test]
+    fn a_fated_consumer_is_named_once_by_its_producer() {
+        let mut ledger = Ledger::new(LOCAL);
+        let tx = tx(40, 300_000);
+        commit_as(&mut ledger, &tx, &classified());
+        ledger.certify(tx.hash(), Certified::ByExecution);
+        let cut = ms(500_000);
+        ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
+
+        let named = |ledger: &Ledger| {
+            ledger
+                .outstanding_with(PARTNER, cut)
+                .iter()
+                .map(|entry| entry.tx_hash)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(named(&ledger), vec![tx.hash()]);
+        assert!(ledger.reclaimable().is_empty(), "nothing covers it yet");
+
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(PARTNER, cut, [names(&tx)])]);
+        assert!(named(&ledger).is_empty(), "a covered entry is named once");
+        assert_eq!(
+            ledger
+                .reclaimable()
+                .iter()
+                .map(|settleable| settleable.tx_hash)
+                .collect::<Vec<_>>(),
+            vec![tx.hash()],
+            "and the record licenses its reclaim",
+        );
+    }
+
+    /// A producer that committed its leg at or after the consumer's cut
+    /// was issued nothing the departed consumer held: no departure names
+    /// the entry, so no record reaches it.
+    #[test]
+    fn a_producer_committed_past_the_cut_names_no_departure() {
+        let mut ledger = Ledger::new(LOCAL);
+        let tx = tx(41, 300_000);
+        commit_as(&mut ledger, &tx, &classified());
+        ledger.certify(tx.hash(), Certified::ByExecution);
+        let committed = committed_at(&tx).anchor;
+        for cut in [committed, committed.minus(Duration::from_secs(50))] {
+            assert!(
+                ledger.outstanding_with(PARTNER, cut).is_empty(),
+                "a cut at {cut:?}, no later than the commit at {committed:?}",
+            );
+        }
+        assert!(
+            !ledger
+                .outstanding_with(PARTNER, committed.plus(Duration::from_millis(1)))
+                .is_empty(),
+            "a cut after the commit names it",
+        );
     }
 
     /// Two cuts over one prefix inside one entry's life name the entry
