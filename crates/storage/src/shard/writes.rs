@@ -14,7 +14,8 @@ use hyperscale_vm_kernel::Substates;
 
 use crate::shard::chain_writer::ChainWrites;
 use crate::shard::crossings::{crossing_settlements, owed_credits};
-use crate::shard::members::fate_debits;
+use crate::shard::fee_holds::with_fee_holds;
+use crate::shard::members::fate_writes;
 use crate::shard::read_frontier::with_frontier;
 use crate::shard::store::Anchored;
 use crate::shard::sweep::{removals_of, with_sweep};
@@ -116,9 +117,14 @@ pub fn settled_writes_at(
     fold_state_writes(&mut writes, &owed_credits(chain.state_claims, baseline));
     fold_state_writes(
         &mut writes,
-        &filter_state_writes_to_prefix(&fate_debits(&chain.members.manifest), prefix),
+        &filter_state_writes_to_prefix(&fate_writes(&chain.members.manifest), prefix),
     );
-    let merged = settle_writes(&writes, baseline);
+    let merged = with_fee_holds(
+        settle_writes(&writes, baseline),
+        &chain.members.fees,
+        baseline,
+        prefix,
+    );
     let settled = crossing_settlements(chain.state_claims, &merged, baseline);
     with_frontier(
         with_sweep(

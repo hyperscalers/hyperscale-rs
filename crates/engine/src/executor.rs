@@ -37,7 +37,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Admitted, Answered, ChainRecords, CrossingCell, Declaration, DeclaredAccess, IntentRecord,
-    PackageHash, Terms, legs_of, package_hash,
+    PackageHash, Terms, fee_hold_key, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn, Job, LegPlan,
@@ -830,6 +830,15 @@ fn vm_metadata(charged: u128, error: Option<String>) -> ExecutionMetadata {
         error,
     )
 }
+/// End the fee hold `tx` placed on `vault`, in the write set that burns
+/// its price: a hold stands from the block committing the transaction
+/// to the one settling this write, whatever the burn comes to.
+fn release_fee_hold(writes: &mut StateWrites, vault: SubstateKey, tx: TxHash) {
+    writes
+        .cells
+        .insert(fee_hold_key(&ProtocolHasher, vault, tx), None);
+}
+
 /// Debit the payer's vault by `amount`, held to the signed ceiling: a
 /// publish's burn, priced by its artifact, on the one path that runs no
 /// kernel session to record it inside the receipt.
@@ -1002,14 +1011,18 @@ pub fn build_refusal_receipt(
     let amount = charge.as_ref().map_or(0, |(_, movement)| {
         movement.debit.saturating_add(movement.unjudged_debit)
     });
-    let writes = StateWrites {
+    let mut writes = StateWrites {
         cells: nevers
             .iter()
             .map(|(key, value)| (*key, Some(value.clone())))
             .collect(),
-        movements: charge.into_iter().collect(),
+        movements: BTreeMap::new(),
         entries: BTreeMap::new(),
     };
+    if let Some((vault, movement)) = charge {
+        writes.movements.insert(vault, movement);
+        release_fee_hold(&mut writes, vault, tx_hash);
+    }
     let receipt_hash = GlobalReceipt::new(
         true,
         EventRoot::ZERO,
@@ -1116,6 +1129,9 @@ fn assemble_published_tx(
                 writes.cells.insert(cell, Some(artifact.to_vec()));
             }
             if locality.covers(publisher.address()) {
+                if let Some(payer) = fee {
+                    release_fee_hold(&mut writes, payer.vault, tx_hash);
+                }
                 apply_fee_burn(&mut writes, fee);
             }
             let receipt_hash = GlobalReceipt::new(
@@ -1277,10 +1293,16 @@ fn assemble_executed_tx(
         // everything commutative as the movement it was. Unresolved,
         // because the state this lands on is not the state it ran
         // against — that is settlement's question.
-        let writes = receipt
+        let mut writes = receipt
             .delta
             .project(locality)
             .expect("kernel-produced movements compose");
+        // The charging member's run burns the price inside these writes,
+        // or apart in its refusal receipt; the hold ends in whichever of
+        // the two its finalization settles.
+        if let Some(payer) = fee {
+            release_fee_hold(&mut writes, payer.vault, tx_hash);
+        }
         // The batch's own fold is the one reader whose baseline really is
         // this one: a later transaction in this tick must see what an
         // earlier one left. It mirrors the kernel's store, so it takes

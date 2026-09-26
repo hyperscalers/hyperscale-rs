@@ -26,10 +26,10 @@ use hyperscale_types::{
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, vault_cell};
 use hyperscale_vm_effects::{
     Admitted, CROSSING_ANSWER_CELL_BYTES, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingId,
-    Intent, IntentHeader, IntentRecord, IntentTree, MARKER_CELL_BYTES, ManifestHash, NodeCall,
-    PackageHash, Value, admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes,
-    effect_units, legs_of, package_hash, package_key as canonical_package_key, principal_address,
-    protocol_resource,
+    FEE_HOLD_CELL_BYTES, Intent, IntentHeader, IntentRecord, IntentTree, MARKER_CELL_BYTES,
+    ManifestHash, NodeCall, PackageHash, Value, admit_tree, auth_cell_admits, child_key,
+    decode_tree as decode_tree_bytes, effect_units, legs_of, package_hash,
+    package_key as canonical_package_key, principal_address, protocol_resource,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
@@ -482,9 +482,14 @@ pub struct DeclaredVector {
 
 /// What every shard that commits a transaction bears whatever it holds:
 /// the verification of every signature, the committed cell it writes,
-/// and the retention every validator keeps — the envelope, what the
-/// writes leave behind, the auth material, and the events its packages
-/// may emit.
+/// the fee hold and held total its payer's shard writes, and the
+/// retention every validator keeps — the envelope, what the writes leave
+/// behind, the auth material, and the events its packages may emit.
+///
+/// The hold and the total carry no retention: the burn deletes the
+/// hold, and a total is deleted at zero. The total is priced once per
+/// transaction though a block writes it once per vault, which errs
+/// toward charging more.
 ///
 /// `retained` is what the declaration's writes keep, not what they cost.
 /// The write dimension carries `WRITE_LEAF_BYTES` of tree-path reads per
@@ -503,7 +508,9 @@ fn everywhere(
     let committed_cell = u64::from(MARKER_CELL_BYTES);
     DeclaredWork {
         compute: signatures.compute,
-        write_bytes: written_leaf(committed_cell),
+        write_bytes: written_leaf(committed_cell)
+            .saturating_add(written_leaf(u64::from(FEE_HOLD_CELL_BYTES)))
+            .saturating_add(written_leaf(AMOUNT_CELL_BYTES as u64)),
         retention: envelope_bytes
             .saturating_add(retained)
             .saturating_add(committed_cell)
@@ -1880,8 +1887,12 @@ mod tests {
         let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
         assert_eq!(
             derived.everywhere.write_bytes,
-            WRITE_LEAF_BYTES + u64::from(MARKER_CELL_BYTES),
-            "the committed cell is one leaf written, not {MARKER_CELL_BYTES} bytes of value"
+            3 * WRITE_LEAF_BYTES
+                + u64::from(MARKER_CELL_BYTES)
+                + u64::from(FEE_HOLD_CELL_BYTES)
+                + AMOUNT_CELL_BYTES as u64,
+            "the committed cell, the fee hold and the held total are one leaf written each, \
+             not their bytes of value"
         );
 
         // And the floor stays out of what is kept: dropping one vault

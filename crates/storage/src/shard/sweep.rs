@@ -20,7 +20,8 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
 use crate::shard::crossings::{crossing_settlements, owed_credits};
-use crate::shard::members::{MemberInputs, fate_debits, member_writes};
+use crate::shard::fee_holds::with_fee_holds;
+use crate::shard::members::{MemberInputs, fate_writes, member_writes};
 use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
 use crate::tree::JmtSnapshot;
 use crate::{
@@ -506,15 +507,21 @@ pub fn followed_block_writes(
     // Restricted before resolving: a follower holds its prefix of the
     // tree and nothing else, so a movement on any other cell reads an
     // empty prior here and is the owning store's to judge, not this one's.
+    let members = MemberInputs::of(block);
     let mut writes = merge_receipts(&settling);
     fold_state_writes(&mut writes, &owed_credits(block.state_claims(), prior));
-    fold_state_writes(&mut writes, &fate_debits(block.tick_manifest()));
-    let merged = settle_writes(&filter_state_writes_to_prefix(&writes, prefix), prior);
+    fold_state_writes(&mut writes, &fate_writes(block.tick_manifest()));
+    let merged = with_fee_holds(
+        settle_writes(&filter_state_writes_to_prefix(&writes, prefix), prior),
+        &members.fees,
+        prior,
+        prefix,
+    );
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
     let settled = crossing_settlements(block.state_claims(), &merged, prior);
     let removals = removals_of(&swept, &settled);
     let mut raised = read_frontier_writes(prior, frontier);
-    raised.extend(member_writes(prior, &MemberInputs::of(block)));
+    raised.extend(member_writes(prior, &members));
     filter_writes_to_prefix(
         &with_frontier(with_sweep(merged, creations, &removals), raised),
         prefix,

@@ -14,6 +14,7 @@ pub mod committed_provisions;
 pub mod crossings;
 pub mod dedup_window;
 pub mod derived;
+pub mod fee_holds;
 pub mod genesis;
 pub mod members;
 pub mod packages;

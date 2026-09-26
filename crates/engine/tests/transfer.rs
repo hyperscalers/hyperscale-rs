@@ -1239,20 +1239,9 @@ fn events_of(executed: &ExecutedTx) -> Vec<(Address, u32)> {
         .collect()
 }
 
-fn hash_of(executed: &ExecutedTx) -> Hash {
-    let ConsensusReceipt::Succeeded { receipt_hash, .. } = &executed.consensus else {
-        panic!("transfer must succeed");
-    };
-    *receipt_hash.as_raw()
-}
-
 /// A transfer's withdrawal emits from an account on another shard than
 /// its recipient. Each shard's receipt keeps only the events its own
-/// instances emitted,
-/// while the receipt hash stays identical under whole locality — this
-/// batch has no abortable member, so the writes root covers the full
-/// fold on both sides. On the abortable path the roots are per shard by
-/// design; the union event root is what both paths share.
+/// instances emitted.
 #[test]
 fn an_event_lands_only_on_its_emitters_home_shard() {
     let executor = executor(ExecutionMode::Serial);
@@ -1263,9 +1252,6 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
         "the two accounts must sit on different shards"
     );
 
-    // A zero ceiling: the fee burn is a payer-shard write, so a nonzero
-    // fee would make the union differ by exactly that cell between the
-    // two sides. Events are the subject here; the fee stays out of it.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
@@ -1276,11 +1262,6 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
     // shard keeps no event: the withdrawal's is not its emitter's to hold.
     assert_eq!(events_of(&sender_side[0]), vec![(alice().address(), 0)]);
     assert_eq!(events_of(&recipient_side[0]), vec![]);
-    assert_eq!(
-        hash_of(&sender_side[0]),
-        hash_of(&recipient_side[0]),
-        "under whole locality the hash covers the full fold, so it cannot differ by shard",
-    );
 }
 
 /// A transfer whose fee payer sits on the recipient's shard never leaves

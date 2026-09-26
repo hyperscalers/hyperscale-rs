@@ -25,9 +25,12 @@ use hyperscale_types::{
     StateWrites, SubstateKey, TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash,
     TxOutcome, Verifiable, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{ProtocolHasher, TICK_MEMBER_SLOT, collection_id, protocol_resource};
+use hyperscale_vm_effects::{
+    ProtocolHasher, TICK_MEMBER_SLOT, collection_id, fee_hold_key, protocol_resource,
+};
 
 use crate::Substates;
+use crate::shard::fee_holds::FeeTerms;
 use crate::shard::writes::fold_state_writes;
 
 /// Where a member stands in its tick.
@@ -137,6 +140,9 @@ pub struct MemberInputs {
     pub committed: WeightedTimestamp,
     /// Each transaction the block carries, with its deadline.
     pub transactions: Vec<(TxHash, Deadline)>,
+    /// What each transaction the block carries reserves against its
+    /// payer's vault, in the same order.
+    pub fees: Vec<FeeTerms>,
     /// What each of its finalizations settles.
     pub settled: Vec<SettledHalf>,
     /// The transactions its abandonment records name.
@@ -170,6 +176,7 @@ impl MemberInputs {
             height: BlockHeight::GENESIS,
             committed: WeightedTimestamp::ZERO,
             transactions: Vec::new(),
+            fees: Vec::new(),
             settled: Vec::new(),
             covered: Vec::new(),
             manifest: Arc::new(Capped::empty()),
@@ -187,10 +194,12 @@ impl MemberInputs {
         records: &[AbandonmentRecord],
         manifest: Arc<TickManifest>,
     ) -> Self {
+        let transactions: Vec<&Transaction> = transactions.into_iter().collect();
         Self {
             shard,
             height,
             committed,
+            fees: transactions.iter().map(|tx| FeeTerms::of(tx)).collect(),
             transactions: transactions
                 .into_iter()
                 .map(|tx| (tx.hash(), Deadline::of_transaction(tx)))
@@ -577,28 +586,29 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
 }
 
 /// What the terminal's fates burn: one unjudged debit of each fated
-/// member's charge on its vault, wherever the vault lies.
+/// member's charge on its vault, wherever the vault lies, beside the
+/// deletion of the fee hold the charge ends.
 ///
-/// A store folds
-/// only the debits under its own prefix, since an abort's floor is
-/// settled by the shard holding the vault and by no other; the fold
-/// reads nothing but the carried lines, so a replica that cannot route
-/// the transaction burns what one that can does.
+/// A store folds only the writes under its own prefix, since an abort's
+/// floor is settled by the shard holding the vault and by no other; the
+/// fold reads nothing but the carried lines, so a replica that cannot
+/// route the transaction burns what one that can does.
 #[must_use]
-pub fn fate_debits(manifest: &TickManifest) -> StateWrites {
+pub fn fate_writes(manifest: &TickManifest) -> StateWrites {
     let resource = protocol_resource(&ProtocolHasher);
-    let mut debits = StateWrites::default();
+    let mut writes = StateWrites::default();
     for line in manifest.iter() {
-        let TickLine::Fate { charge, .. } = line else {
+        let TickLine::Fate { tx, charge } = line else {
             continue;
         };
-        let mut debit = StateWrites::default();
-        debit
-            .movements
+        let mut fate = StateWrites::default();
+        fate.movements
             .insert(charge.vault, Movement::unjudged(resource, charge.amount));
-        fold_state_writes(&mut debits, &debit);
+        fate.cells
+            .insert(fee_hold_key(&ProtocolHasher, charge.vault, *tx), None);
+        fold_state_writes(&mut writes, &fate);
     }
-    debits
+    writes
 }
 
 /// The first transaction of `transactions` whose member key is taken:
@@ -1079,7 +1089,7 @@ mod tests {
 
     /// The terminal's fates delete every row they name and every tick row
     /// they empty, and burn each member's charge once, composing two
-    /// charges on one vault.
+    /// charges on one vault, each deleting its own fee hold.
     #[test]
     fn terminal_fates_remove_every_row_and_debit_once() {
         let mut store = Entries::default();
@@ -1103,9 +1113,23 @@ mod tests {
             "{index:?}"
         );
 
-        let debits = fate_debits(&manifest);
-        assert!(debits.cells.is_empty() && debits.entries.is_empty());
+        let debits = fate_writes(&manifest);
+        assert!(debits.entries.is_empty());
         assert_eq!(debits.movements.len(), 2);
+        let released = |seed: u8, charge: AbortCharge| {
+            (fee_hold_key(&ProtocolHasher, charge.vault, tx(seed)), None)
+        };
+        assert_eq!(
+            debits.cells,
+            [
+                released(1, stub_abort_charge(1)),
+                released(2, shared),
+                released(3, shared),
+            ]
+            .into_iter()
+            .collect(),
+            "each fate deletes its own hold beside its debit",
+        );
         let debit = |charge: AbortCharge| debits.movements[&charge.vault];
         assert_eq!(
             debit(stub_abort_charge(1)),
