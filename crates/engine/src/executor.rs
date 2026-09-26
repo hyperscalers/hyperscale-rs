@@ -16,7 +16,7 @@
 //! transaction in a different block may abort differently.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::records::{PackageCache, record_address};
@@ -1023,7 +1023,6 @@ pub fn build_refusal_receipt(
         vm_metadata(amount, None),
         Vec::new(),
         Vec::new(),
-        Vec::new(),
     );
     Some(project_to_shard(&cached, tx_hash, local_shard, shard_trie).consensus)
 }
@@ -1135,7 +1134,6 @@ fn assemble_published_tx(
                 vm_metadata(charged, None),
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
             )
         },
         |reason| CachedOutput::failed(vm_metadata(charged, Some(reason.clone()))),
@@ -1159,13 +1157,6 @@ fn assemble_published_tx(
     executed.refusal_receipt = refusal_receipt;
     executed
 }
-
-/// The plan a member that ran the whole shape ran under, for a receipt
-/// with no prepared entry to read one off.
-static WHOLE_JOB: LazyLock<Job> = LazyLock::new(|| Job::Manifest {
-    calls: Vec::new(),
-    legs: LegPlan::whole(0),
-});
 
 /// Declare the record and claim cells a divided member's plan writes,
 /// as exclusive writes appended to its declaration.
@@ -1223,16 +1214,6 @@ fn declare(
     Ok(())
 }
 
-/// What the kernel reported for one transaction: the effect record every
-/// participant derives identically, and this shard's own attested share.
-#[derive(Clone, Copy)]
-struct KernelOutput<'a> {
-    receipt: &'a Receipt,
-    /// What the member did: whose plan names the record cell of each
-    /// edge the receipt says it issued.
-    job: &'a Job,
-}
-
 /// What every transaction in a batch assembles against: the pre-read
 /// baseline its receipts fold over, the share of the world this shard
 /// applies, and what the witness lift needs to decide whether an emitted
@@ -1252,13 +1233,12 @@ fn assemble_executed_tx(
     inputs: BatchInputs<'_>,
     fold: &mut FoldState,
     vm_tx: TxHash,
-    kernel: KernelOutput<'_>,
+    receipt: &Receipt,
     fee: Option<PayerFee>,
     input: Option<&TickTxInput<'_>>,
 ) -> ExecutedTx {
     let runs = input.map(|input| &input.runs);
     let BatchInputs { base, locality, .. } = inputs;
-    let KernelOutput { receipt, job } = kernel;
     let tx_hash = vm_tx;
     let charged = fee.map_or(0, |payer| payer.burned());
     let charge = fee
@@ -1357,31 +1337,12 @@ fn assemble_executed_tx(
             writes_root(&writes),
         )
         .receipt_hash();
-        // What left on each departing edge, with the record cell the plan
-        // filed for it. The kernel issues only what the plan departs, so
-        // an edge the plan has no site for is a kernel defect, not a
-        // silently shorter list.
-        let escrowed: Vec<EscrowedValue> = receipt
-            .escrow
-            .issues()
-            .map(|((node, output), crossed)| EscrowedValue {
-                node,
-                output,
-                resource: crossed.resource,
-                amount: crossed.amount,
-                record: job
-                    .departure(node, output)
-                    .expect("the kernel issues only what the plan departs")
-                    .record,
-            })
-            .collect();
         CachedOutput::succeeded(
             writes,
             receipt_hash,
             vm_metadata(charged, None),
             events,
             witnesses,
-            escrowed,
         )
     } else {
         CachedOutput::failed(vm_metadata(charged, Some(abort_reason(&receipt.outcome))))
@@ -1685,10 +1646,6 @@ impl Executor {
             // the receipts were applied through, so nothing here re-derives
             // it — a workspace-side filter would be a second opinion on a
             // quantity that must agree.
-            let kernel = KernelOutput {
-                receipt,
-                job: prepared.get(vm_tx).map_or(&WHOLE_JOB, |entry| &entry.job),
-            };
             let executed = assemble_executed_tx(
                 ctx,
                 BatchInputs {
@@ -1700,7 +1657,7 @@ impl Executor {
                 },
                 &mut fold,
                 *vm_tx,
-                kernel,
+                receipt,
                 fee_by_tx.get(vm_tx).copied(),
                 shapes.get(vm_tx).copied(),
             );

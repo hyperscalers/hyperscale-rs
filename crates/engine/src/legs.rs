@@ -558,8 +558,8 @@ impl Member {
         self.local
     }
 
-    /// Every shard the transaction touches — who this tick's certificate
-    /// is owed to, since any of them may need what a member escrowed.
+    /// Every shard the transaction touches. Who of them is owed this
+    /// member's certificate is the tick's membership's question.
     #[must_use]
     pub const fn reach(&self) -> &BTreeSet<ShardId> {
         &self.participating

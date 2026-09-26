@@ -25,6 +25,7 @@
 //!    transaction reached the same verdict everywhere, plus the local
 //!    receipts: everything a block needs to commit the outcome
 
+pub mod arrival;
 pub mod computation;
 pub mod execution_certificate;
 pub mod finalization;

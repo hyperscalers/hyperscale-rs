@@ -6,8 +6,7 @@
 //! system uses (see [`StoredReceipt`](hyperscale_types::StoredReceipt)).
 
 use hyperscale_types::{
-    ConsensusReceipt, EscrowedValue, ExecutionMetadata, ExecutionOutcome, StoredReceipt, TxHash,
-    TxOutcome,
+    ConsensusReceipt, ExecutionMetadata, ExecutionOutcome, StoredReceipt, TxHash, TxOutcome,
 };
 
 /// Engine output for one transaction — a [`ConsensusReceipt`] paired with
@@ -34,10 +33,6 @@ pub struct ExecutedTx {
     /// receipts. Present only where this shard pays for the outcome or
     /// holds a decline cell to write.
     pub refusal_receipt: Option<ConsensusReceipt>,
-    /// What this execution escrowed out, one entry per departing edge.
-    /// Empty for a member that ran the whole shape, which hands nothing
-    /// to anyone.
-    pub escrowed: Vec<EscrowedValue>,
 }
 
 impl ExecutedTx {
@@ -55,7 +50,6 @@ impl ExecutedTx {
             consensus,
             metadata,
             refusal_receipt: None,
-            escrowed: Vec::new(),
         }
     }
 
@@ -67,7 +61,6 @@ impl ExecutedTx {
             consensus: ConsensusReceipt::Failed,
             metadata: ExecutionMetadata::empty(),
             refusal_receipt: None,
-            escrowed: Vec::new(),
         }
     }
 
@@ -80,7 +73,7 @@ impl ExecutedTx {
     /// Project the small, copyable [`TxOutcome`] used in execution votes
     /// — drops `database_updates`, `application_events`, and metadata.
     #[must_use]
-    pub fn outcome(&self) -> TxOutcome {
+    pub const fn outcome(&self) -> TxOutcome {
         let outcome = match &self.consensus {
             ConsensusReceipt::Succeeded { receipt_hash, .. } => ExecutionOutcome::Succeeded {
                 receipt_hash: *receipt_hash,
@@ -88,7 +81,6 @@ impl ExecutedTx {
             ConsensusReceipt::Failed => ExecutionOutcome::Failed,
         };
         TxOutcome::new(self.tx_hash, outcome)
-            .escrowing(self.escrowed.iter().map(|issued| issued.record))
     }
 }
 

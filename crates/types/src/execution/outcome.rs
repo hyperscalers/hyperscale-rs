@@ -2,35 +2,8 @@
 //! carried inside execution certificates.
 
 use hyperscale_hbor::{Capped, Hbor};
-use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, ResourceAddr, SubstateKey};
 
 use crate::{GlobalReceiptHash, MAX_PROVISION_TARGET_SHARDS, ShardId, TxHash};
-
-/// What one value edge escrowed out of this shard's execution.
-///
-/// Per edge, not per resource: a sum over the outcome would leave two
-/// edges carrying one resource with no way to say which value fed which
-/// consumer, and the consuming shard claims its own argument rather than
-/// a share of a total.
-///
-/// Self-describing: the record cell rides the entry, so a validator
-/// holding the certificate and not the transaction can build, serve and
-/// match the bundle that proves it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hbor)]
-pub struct EscrowedValue {
-    /// The producing node.
-    pub node: u32,
-    /// Which of its outputs left.
-    pub output: u32,
-    /// The resource that left.
-    pub resource: ResourceAddr,
-    /// How much of it.
-    pub amount: u128,
-    /// The record cell the value left into, under the producing node's
-    /// target — what the bundle carrying it proves, and what the
-    /// consumer's requirement names.
-    pub record: SubstateKey,
-}
 
 /// Per-transaction execution outcome within a tick.
 ///
@@ -163,21 +136,6 @@ pub struct TxOutcome {
     /// happens to carry, and a set with the refusal dropped reads as
     /// unanimous.
     counterparts: Capped<Vec<ShardId>, MAX_PROVISION_TARGET_SHARDS>,
-    /// The record cell this shard's execution wrote for each value edge
-    /// it escrowed out. Ascending and distinct.
-    ///
-    /// The cell and not what is in it: a claiming shard reads the
-    /// crossing's resource and amount off the record itself, which
-    /// arrives under a provisions root that authenticates it. What this
-    /// names is which cells to ask for, which the certificate carries a
-    /// block earlier than the bundle answering them.
-    escrowed: Capped<Vec<SubstateKey>, MAX_CROSSINGS_PER_TX>,
-    /// The shards those crossings land on. Ascending and distinct.
-    ///
-    /// Derivable from `escrowed` and the trie, and attested anyway: the
-    /// shard promising a bundle reads this a block earlier than it can
-    /// resolve the trie the issuer used.
-    crossing_targets: Capped<Vec<ShardId>, MAX_PROVISION_TARGET_SHARDS>,
     /// What the attesting shard was to the transaction: the one fact
     /// that says whether this outcome bears the verdict, whether it is
     /// the transaction's own execution, and whether a counterpart could
@@ -202,8 +160,6 @@ impl TxOutcome {
             outcome,
             refusal_receipt: None,
             counterparts: Capped::empty(),
-            escrowed: Capped::empty(),
-            crossing_targets: Capped::empty(),
             role: Role::Whole,
         }
     }
@@ -231,37 +187,6 @@ impl TxOutcome {
         counterparts.dedup();
         self.counterparts =
             Capped::new(counterparts).expect("a list under the cap its source already met");
-        self
-    }
-
-    /// Bind what this execution escrowed out, in its one form: sorted on
-    /// the whole entry, one per edge.
-    ///
-    /// # Panics
-    ///
-    /// If a list runs past the cap its type states, which a committee's own vote cannot.
-    #[must_use]
-    pub fn escrowing(mut self, escrowed: impl IntoIterator<Item = SubstateKey>) -> Self {
-        let mut escrowed: Vec<SubstateKey> = escrowed.into_iter().collect();
-        escrowed.sort_unstable();
-        escrowed.dedup();
-        self.escrowed = Capped::new(escrowed).expect("a list under the cap its source already met");
-        self
-    }
-
-    /// Bind the shards this execution's crossings land on, in the one
-    /// form the set may take: ascending and distinct.
-    ///
-    /// # Panics
-    ///
-    /// If a list runs past the cap its type states, which a committee's own vote cannot.
-    #[must_use]
-    pub fn crossing_to(mut self, targets: impl IntoIterator<Item = ShardId>) -> Self {
-        let mut targets: Vec<ShardId> = targets.into_iter().collect();
-        targets.sort_unstable();
-        targets.dedup();
-        self.crossing_targets =
-            Capped::new(targets).expect("a list under the cap its source already met");
         self
     }
 
@@ -328,8 +253,6 @@ impl TxOutcome {
             outcome,
             refusal_receipt: Some(refusal_receipt),
             counterparts: Capped::empty(),
-            escrowed: Capped::empty(),
-            crossing_targets: Capped::empty(),
             role: Role::Whole,
         }
     }
@@ -358,18 +281,6 @@ impl TxOutcome {
     #[must_use]
     pub fn counterparts(&self) -> &[ShardId] {
         &self.counterparts
-    }
-
-    /// What this shard's execution escrowed out, one entry per edge.
-    #[must_use]
-    pub fn escrowed(&self) -> &[SubstateKey] {
-        &self.escrowed
-    }
-
-    /// The shards this execution's crossings land on.
-    #[must_use]
-    pub fn crossing_targets(&self) -> &[ShardId] {
-        &self.crossing_targets
     }
 
     /// Transaction hash.

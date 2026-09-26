@@ -35,7 +35,10 @@ enum Evidence {
     /// want was filed, or the body it serves is past its validity end.
     Clock,
     /// A verified execution certificate from the record's holder named
-    /// the transaction.
+    /// the transaction. Only a producer whose member is not a leg sends
+    /// one: a pure leg's certificate stays home, so its consumer arms on
+    /// the clock, which is when the leg has finalized or never will. The
+    /// push carries the happy path, so this delays only the fallback.
     Certificate,
 }
 
@@ -254,6 +257,35 @@ mod tests {
             reads.due(key, anchor(9, much_later)),
             "but never longer than one finalization delay of the holder's clock",
         );
+    }
+
+    /// A pure leg's consumer hears no certificate from its producer and
+    /// no push, and still reads: the want filed at commit arms one
+    /// finalization delay later on the clock alone.
+    #[test]
+    fn a_pure_legs_consumer_arms_on_the_finalization_delay() {
+        use crate::provisioning::{ProvisioningTracker, Requirement};
+
+        let filed = WeightedTimestamp::from_millis(7_000);
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.advance_clock(filed);
+        provisioning.record_required(
+            TxHash::from(Hash::from_bytes(b"tx")),
+            BTreeSet::from([Requirement::Crossing { key: test_key(1) }]),
+        );
+        let [want] = provisioning.wanted_records().try_into().expect("one want");
+
+        let mut reads = RecordReads::new();
+        let armed = filed.plus(MAX_FINALIZATION_DELAY);
+        reads.arm(
+            &want,
+            HOLDER,
+            armed.minus(std::time::Duration::from_millis(1)),
+        );
+        assert!(!reads.is_armed(want.key), "not before the delay");
+        reads.arm(&want, HOLDER, armed);
+        assert!(reads.is_armed(want.key));
+        assert!(reads.due(want.key, anchor(1, armed.as_millis())));
     }
 
     /// A holder's certificate arms a read the clock has not, resets the

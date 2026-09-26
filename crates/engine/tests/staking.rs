@@ -31,8 +31,8 @@ use hyperscale_types::{
     absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    Answered, ChainRecords, Composed, CrossingEdge, IntentHeader, Kind, holdings_collection,
-    instance_data_key, package_hash, resource_record_key,
+    Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, IntentHeader, Kind,
+    holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{IntentBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, instantiate, staking};
@@ -883,16 +883,32 @@ impl DividedStake {
             .remove(0)
     }
 
-    /// What the payer's shard hands across: one withdraw per pool.
+    /// What the payer's shard hands across: one withdraw per pool, read
+    /// off the record cells its legs wrote, as a consumer's arrival index
+    /// reads the proven record.
     fn handed(&self, store: &MapDb) -> Vec<EscrowedValue> {
         let legs = self.run(store, self.payer_shard, &[], &[]);
-        assert!(
-            matches!(legs.consensus, ConsensusReceipt::Succeeded { .. }),
-            "the payer's legs must succeed: {:?}",
-            legs.metadata,
-        );
-        assert_eq!(legs.escrowed.len(), 2, "one withdraw crosses to each pool");
-        legs.escrowed
+        let ConsensusReceipt::Succeeded { writes, .. } = &legs.consensus else {
+            panic!("the payer's legs must succeed: {:?}", legs.metadata);
+        };
+        let handed: Vec<EscrowedValue> = self
+            .classified
+            .edges()
+            .iter()
+            .filter_map(|edge| {
+                let record = edge.crossing.id.record_key(&ProtocolHasher);
+                let cell = CrossingCell::from_bytes(writes.cells.get(&record)?.as_deref()?)?;
+                Some(EscrowedValue {
+                    node: edge.producer,
+                    output: edge.output,
+                    resource: cell.resource,
+                    amount: cell.amount,
+                    record,
+                })
+            })
+            .collect();
+        assert_eq!(handed.len(), 2, "one withdraw crosses to each pool");
+        handed
     }
 
     /// The edge `core` consumes whose decline cell it holds: the

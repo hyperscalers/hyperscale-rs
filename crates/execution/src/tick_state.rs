@@ -42,9 +42,8 @@ use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptRoot, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY,
-    MAX_VALIDITY_RANGE, Role, Settles, ShardId, StoredReceipt, SubstateKey, TickHalf, TickId,
-    TxHash, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
-    refused_transactions, settles,
+    MAX_VALIDITY_RANGE, Role, Settles, ShardId, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome,
+    Verified, WeightedTimestamp, compute_global_receipt_root, refused_transactions, settles,
 };
 
 /// A tick whose local execution disagreed with the quorum's.
@@ -75,11 +74,10 @@ pub struct Divergence {
 /// every participant, since every one of them runs it. Two cases and no
 /// third; a shape needing one is a shape the classifier should refuse.
 ///
-/// **Reach** is every shard the transaction touches — who this tick's
-/// certificate is owed to, because any of them may need what a member
-/// escrowed. Waiting on reach would hold a leg behind the core it feeds;
-/// routing on awaited would withhold a crossing from the shard that
-/// claims it.
+/// **Reach** is every shard the transaction touches. Who this tick's
+/// certificate is owed to is [`Membership::owes_certificate_to`]'s
+/// question, asked of reach: waiting on reach would hold a leg behind the
+/// core it feeds.
 ///
 /// Both include this shard, and awaited is a subset of reach.
 ///
@@ -161,6 +159,19 @@ impl Membership {
     #[must_use]
     pub fn abortable(&self, local: ShardId) -> bool {
         self.awaited.iter().any(|&shard| shard != local)
+    }
+
+    /// Whether `shard` is owed this member's outcome: it awaits this
+    /// shard's certificate for the transaction, or reads a verdict off it
+    /// — a core success it folds, or a refusal it relays.
+    ///
+    /// A leg's outcome meets neither at any shard: a core awaits the core
+    /// alone, and a leg speaks no verdict a producer or sibling reads. A
+    /// consumer reads a leg's crossing off the record it pushed, never
+    /// off its certificate, so a leg's certificate stays home.
+    #[must_use]
+    pub fn owes_certificate_to(&self, shard: ShardId, local: ShardId) -> bool {
+        shard != local && self.reach.contains(&shard) && self.role != Role::Leg
     }
 
     /// Whether the transaction touches a shard besides this one — off
@@ -268,15 +279,6 @@ struct Seat {
     /// settles it: the transaction's own effects are discarded, the
     /// floor and the answers are not.
     refusal_receipt: Option<StoredReceipt>,
-    /// What this shard attests it did for the member, carried from
-    /// execution onto the outcome it votes.
-    /// What the member's execution escrowed out, carried from execution
-    /// onto the outcome it votes.
-    escrowed: Vec<SubstateKey>,
-    /// The shards the member's crossings land on, read off the frozen
-    /// classification at admission. Attested on the outcome only where
-    /// the execution escrowed something.
-    crossing_targets: BTreeSet<ShardId>,
     /// Which shards have reported on the member via a certificate.
     covered_by: BTreeSet<ShardId>,
     /// A certificate reported abort. Terminal — an aborted transaction
@@ -301,8 +303,6 @@ impl Seat {
             result: None,
             receipt: None,
             refusal_receipt: None,
-            escrowed: Vec::new(),
-            crossing_targets: BTreeSet::new(),
             covered_by: BTreeSet::new(),
             aborted_anywhere: false,
             settled: false,
@@ -513,18 +513,20 @@ impl TickState {
             .is_some_and(|seat| seat.membership.awaited().contains(&shard))
     }
 
-    /// The shards other than this one that the tick's members reach —
-    /// who its certificate is owed to. Reach rather than awaited: a
-    /// shard this tick waits on nothing from may still need what a
-    /// member escrowed.
+    /// The shards other than this one that some member owes its
+    /// outcome to — who this tick's certificate is projected to.
     #[must_use]
     pub fn counterpart_shards(&self) -> Vec<ShardId> {
         let local = self.tick_id.shard_id();
         self.seats
             .values()
-            .flat_map(|seat| seat.membership.reach())
-            .copied()
-            .filter(|&s| s != local)
+            .flat_map(|seat| {
+                seat.membership
+                    .reach()
+                    .iter()
+                    .copied()
+                    .filter(|&shard| seat.membership.owes_certificate_to(shard, local))
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -590,13 +592,14 @@ impl TickState {
             .filter(move |&tx_hash| self.awaits(tx_hash, shard))
     }
 
-    /// The tick's members `shard` is party to — what its copy of this
-    /// tick's certificate carries.
+    /// The tick's members that owe `shard` their outcome — what its copy
+    /// of this tick's certificate carries.
     pub fn txs_reaching(&self, shard: ShardId) -> impl Iterator<Item = TxHash> + '_ {
+        let local = self.tick_id.shard_id();
         self.order.iter().copied().filter(move |tx_hash| {
             self.seats
                 .get(tx_hash)
-                .is_some_and(|seat| seat.membership.reach().contains(&shard))
+                .is_some_and(|seat| seat.membership.owes_certificate_to(shard, local))
         })
     }
 
@@ -618,20 +621,6 @@ impl TickState {
     pub fn record_receipt(&mut self, receipt: StoredReceipt) {
         if let Some(seat) = self.seats.get_mut(&receipt.tx_hash) {
             seat.receipt.get_or_insert(receipt);
-        }
-    }
-
-    /// Record what a member's execution escrowed out.
-    pub fn record_escrowed(&mut self, tx_hash: TxHash, escrowed: Vec<SubstateKey>) {
-        if let Some(seat) = self.seats.get_mut(&tx_hash) {
-            seat.escrowed = escrowed;
-        }
-    }
-
-    /// Record the shards a member's crossings land on.
-    pub fn record_crossing_targets(&mut self, tx_hash: TxHash, targets: BTreeSet<ShardId>) {
-        if let Some(seat) = self.seats.get_mut(&tx_hash) {
-            seat.crossing_targets = targets;
         }
     }
 
@@ -803,14 +792,6 @@ impl TickState {
                     .refusal_receipt
                     .as_ref()
                     .map(|fee| fee.consensus.receipt_hash());
-                // What left, and where it lands. The targets are attested
-                // only beside something escrowed: a member that issued
-                // nothing promises no bundle to anyone.
-                let targets = if seat.escrowed.is_empty() {
-                    BTreeSet::new()
-                } else {
-                    seat.crossing_targets.clone()
-                };
                 let attested = match refusal {
                     Some(receipt) => TxOutcome::with_refusal(*tx_hash, outcome, receipt),
                     None => TxOutcome::new(*tx_hash, outcome),
@@ -824,8 +805,6 @@ impl TickState {
                     None => attested,
                 }
                 .awaiting(counterparts)
-                .escrowing(seat.escrowed.clone())
-                .crossing_to(targets)
                 .as_role(seat.membership.role())
             })
             .collect();
@@ -1806,13 +1785,74 @@ mod tests {
         assert_eq!(whole, Membership::whole(participating));
     }
 
-    /// A leg awaiting nobody but itself settles in the determined half on
-    /// the tick's own certificate, while that certificate is still owed
-    /// to every shard the transaction reaches. A certificate from one of
-    /// those shards is neither coverage for the leg nor part of its
-    /// finalization: its verdict is not the leg's to apply.
+    /// A membership stated outright, for the routing pins.
+    fn membership(
+        awaited: impl IntoIterator<Item = ShardId>,
+        reach: impl IntoIterator<Item = ShardId>,
+        role: Role,
+    ) -> Membership {
+        Membership {
+            awaited: awaited.into_iter().collect(),
+            reach: reach.into_iter().collect(),
+            role,
+        }
+    }
+
+    /// A tick holding a leg and a core member routes per member: the
+    /// venue's copy carries the core outcome it awaits and leaves out the
+    /// leg beside it.
     #[test]
-    fn a_leg_certifies_alone_and_is_still_routed_to_its_reach() {
+    fn a_mixed_tick_routes_its_core_outcome_and_withholds_its_leg() {
+        use hyperscale_types::BlockHeight;
+
+        use crate::fixtures::leaf;
+
+        let (local, venue) = (leaf(0), leaf(1));
+        let (leg, core) = (tx(1), tx(2));
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        tick.admit(
+            leg,
+            membership([local], [local, venue], Role::Leg),
+            Some(10),
+            Admission::Executes,
+        );
+        tick.admit(
+            core,
+            membership([local, venue], [local, venue], Role::Core),
+            Some(10),
+            Admission::Executes,
+        );
+
+        assert_eq!(tick.counterpart_shards(), vec![venue]);
+        assert_eq!(tick.txs_reaching(venue).collect::<Vec<_>>(), vec![core]);
+    }
+
+    /// A core member reaching a leg's producer owes it its outcome: the
+    /// producer reads the core's verdict off it, relaying a refusal and
+    /// folding a success.
+    #[test]
+    fn a_core_outcome_is_owed_to_its_leg_producer() {
+        use crate::fixtures::leaf;
+
+        let (local, producer) = (leaf(1), leaf(0));
+        let core = membership([local], [local, producer], Role::Core);
+        assert!(core.owes_certificate_to(producer, local));
+        assert!(!core.owes_certificate_to(local, local));
+        let leg = membership([producer], [local, producer], Role::Leg);
+        assert!(!leg.owes_certificate_to(local, producer));
+    }
+
+    /// A leg awaiting nobody but itself settles in the determined half on
+    /// the tick's own certificate, and owes that certificate to nobody:
+    /// the venue reads the leg's crossing off the record it was pushed.
+    /// A certificate from the venue is neither coverage for the leg nor
+    /// part of its finalization: its verdict is not the leg's to apply.
+    #[test]
+    fn a_leg_certifies_alone_and_owes_its_certificate_to_nobody() {
         use hyperscale_types::BlockHeight;
 
         use crate::fixtures::{leaf, payer, swap, trie};
@@ -1844,12 +1884,11 @@ mod tests {
             0,
             "and expects no certificate"
         );
-        assert_eq!(
-            tick.counterpart_shards(),
-            vec![venue],
-            "yet its own is owed to the venue"
+        assert!(
+            tick.counterpart_shards().is_empty(),
+            "and owes its own to nobody"
         );
-        assert_eq!(tick.txs_reaching(venue).collect::<Vec<_>>(), vec![leg]);
+        assert_eq!(tick.txs_reaching(venue).count(), 0);
         assert_eq!(tick.txs_awaiting(venue).count(), 0);
 
         tick.record_execution_result(

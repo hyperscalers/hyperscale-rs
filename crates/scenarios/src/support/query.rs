@@ -413,8 +413,6 @@ pub struct RanAs {
     /// member this shard composed for itself — a reclaim or a
     /// retirement.
     pub(crate) reaches_beyond: bool,
-    /// The shards this execution's crossings were issued to.
-    pub(crate) crossing_targets: Vec<ShardId>,
 }
 
 impl RanAs {
@@ -450,7 +448,6 @@ pub fn chain_membership(store: &impl ShardChainReader, tx: TxHash) -> Vec<RanAs>
                             awaited: outcome.counterparts().to_vec(),
                             decides: outcome.decides(),
                             reaches_beyond: outcome.reaches_beyond(),
-                            crossing_targets: outcome.crossing_targets().to_vec(),
                         }),
                 );
             }

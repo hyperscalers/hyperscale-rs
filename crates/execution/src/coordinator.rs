@@ -1384,21 +1384,6 @@ impl ExecutionCoordinator {
             },
             member.admission,
         );
-        // Where this member's crossings land, off the frozen
-        // classification: the shards its outcome promises a bundle
-        // to, if it issues anything. A reclaim promises nobody a
-        // bundle.
-        let targets: BTreeSet<ShardId> = match &shape {
-            Some((shape, _)) => shape
-                .classified()
-                .edges()
-                .iter()
-                .filter(|edge| edge.from == local_shard)
-                .flat_map(|edge| edge.to.iter().copied())
-                .collect(),
-            _ => BTreeSet::new(),
-        };
-        state.record_crossing_targets(member.request.tx_hash, targets);
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
         self.counterparts
             .ledger
@@ -1674,7 +1659,6 @@ impl ExecutionCoordinator {
                 state.record_refusal_receipt(fee);
             }
             for wr in tx_outcomes {
-                state.record_escrowed(wr.tx_hash(), wr.escrowed().to_vec());
                 let (tx_hash, outcome) = wr.into_parts();
                 state.record_execution_result(tx_hash, outcome);
             }
@@ -2164,18 +2148,17 @@ impl ExecutionCoordinator {
         let head = topology_schedule.head();
 
         // Who should receive this certificate is a question about the
-        // batch's transactions, not about its identity: the shards they
-        // reach, less our own — reach rather than awaited, since a shard
-        // this tick waits on nothing from may still claim what a member
-        // escrowed. Read off the batch's own record rather than the
-        // provision accumulator, which may have been pruned by the time
-        // the certificate is aggregated.
+        // batch's transactions, not about its identity: a copy goes where
+        // some member owes its outcome, which the frozen membership
+        // decides per member. A leg owes nobody, so a tick of legs alone
+        // projects nowhere and tracks nothing. Read off the batch's own
+        // record rather than the provision accumulator, which may have
+        // been pruned by the time the certificate is aggregated.
         //
-        // The same record answers what each of them receives. A shard is
-        // party to the transactions naming it and to no others, so that
-        // is what its copy carries — the certificate a remote shard gets
-        // is sized by its own stake in the batch rather than by the
-        // batch.
+        // The same record answers what each of them receives: the members
+        // that owe that shard their outcome, and no others — the
+        // certificate a remote shard gets is sized by its own stake in the
+        // batch rather than by the batch.
         let per_target: Vec<(ShardId, HashSet<TxHash>)> =
             self.ticks.get_tick(tick_id).map_or_default(|tick| {
                 tick.counterpart_shards()
@@ -5401,6 +5384,65 @@ mod tests {
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
+    }
+
+    /// A tick of pure legs owes its certificate to nobody: the venue reads
+    /// each leg's crossing off the record pushed to it. The certificate
+    /// goes to this shard's own peers alone, and nothing is tracked for
+    /// re-broadcast.
+    #[test]
+    fn a_leg_only_tick_projects_nothing_and_tracks_nothing() {
+        use hyperscale_types::compute_global_receipt_root;
+
+        use crate::fixtures::{leaf, payer, swap, trie};
+
+        let (local, venue) = (leaf(0), leaf(1));
+        let tick_id = TickId::new(local, BlockHeight::new(1));
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+        let leg = TxHash::from(Hash::from_bytes(b"leg"));
+        let mut tick = TickState::new(tick_id, BlockHash::ZERO, WeightedTimestamp::ZERO);
+        tick.admit(
+            leg,
+            Membership::of(&Member::of(
+                Classified::freeze(&swap(), payer(), &[], &trie()),
+                local,
+                BTreeSet::from([local, venue]),
+            )),
+            Some(10),
+            Admission::Executes,
+        );
+        state.ticks.insert_tick(tick_id, tick);
+
+        let outcomes = vec![TxOutcome::new(
+            leg,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        )];
+        let cert = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            compute_global_receipt_root(&outcomes),
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let actions = state.on_certificate_aggregated(
+            &topo,
+            &tick_id,
+            &Arc::new(Verified::new_unchecked_for_test(cert)),
+        );
+
+        let broadcasts: Vec<ShardId> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::BroadcastExecutionCertificate { shard, .. } => Some(*shard),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(broadcasts, vec![state.local_shard], "local peers only");
+        assert_eq!(state.outbound_certs.memory_stats().tracked_certificates, 0);
     }
 
     /// A shard receives the outcomes for the transactions it is party to

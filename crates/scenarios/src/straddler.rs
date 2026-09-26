@@ -210,16 +210,16 @@ pub fn a_skip_deferred_split_keeps_every_settlement_in_its_window<C: FaultableCl
     run.assert_conserved(c);
 }
 
-/// Verify a split straddler settles atomically when the terminating splitter is
-/// isolated from the survivor's execution certificate.
+/// Verify a split straddler settles atomically when the survivor is isolated
+/// from the terminating splitter's execution certificate.
 ///
-/// The same choreography as [`split_straddler_atomic`], but with the splitter's
-/// EC intake cut ([`isolate_ec_intake`]) once committees stabilize: provisions
-/// still flow, so the splitter executes each straddler and produces its own EC,
-/// but never receives the survivor's and so settles none. The pre-boundary
-/// settlement fence must hold atomicity anyway — the survivor cannot finalize a
-/// straddler naming the splitter while the splitter has an admitted terminating
-/// reshape, so no straddler resolves one-sided.
+/// The same choreography as [`split_straddler_atomic`], but with the
+/// survivor's EC intake cut ([`isolate_ec_intake`]) once committees stabilize.
+/// The splitter is each straddler's core and the survivor runs its leg, whose
+/// certificate stays home; what crosses is the core's verdict to the leg's
+/// producer, and that is what the cut withholds. The survivor never hears the
+/// splitter's verdict, and the pre-boundary settlement fence must hold
+/// atomicity anyway, so no straddler resolves one-sided.
 ///
 /// Requires disjoint splitter/survivor committees (no shared host), or a
 /// co-hosted vnode bridges the EC across in-process, which no network rule
@@ -234,7 +234,7 @@ pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
     let run = split_straddler_run(
         c,
         |c| {
-            cut = Some(isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR));
+            cut = Some(isolate_ec_intake(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER));
         },
         |_, _| {},
     );
@@ -242,7 +242,7 @@ pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
     let one_sided = straddler_one_sided_count(c, run.splitter, run.terminal_b, &run.probes);
     assert!(
         cut.fired() > 0,
-        "the splitter's certificate intake must actually have been exercised and cut, or no \
+        "the survivor's certificate intake must actually have been exercised and cut, or no \
          straddler was ever held one-sided to begin with",
     );
     assert_eq!(
@@ -1262,7 +1262,7 @@ fn straddler_tally<C: Cluster>(
 ///
 /// A one-sided straddler is one the survivor finalized on a decision the
 /// splitter never settled by its terminal block. Zero when the fence holds; a
-/// probe that cuts the survivor→splitter EC channel across the boundary watches
+/// probe that cuts the splitter→survivor EC channel across the boundary watches
 /// whether it goes positive.
 #[must_use]
 pub fn straddler_one_sided_count<C: Cluster>(

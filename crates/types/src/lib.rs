@@ -77,6 +77,7 @@ pub use beacon::{
 };
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
 pub use crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
+pub use execution::arrival::EscrowedValue;
 pub use execution::computation::{tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError, Spoken,
@@ -86,7 +87,7 @@ pub use execution::finalization::{
     MAX_EXECUTION_CERTIFICATES_PER_TICK, ReceiptValidationError, Settles, TickHalf,
     refused_transactions, settles,
 };
-pub use execution::outcome::{EscrowedValue, ExecutionOutcome, Role, TxOutcome};
+pub use execution::outcome::{ExecutionOutcome, Role, TxOutcome};
 pub use execution::receipt_tree::{
     compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
 };

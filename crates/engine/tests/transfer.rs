@@ -684,6 +684,32 @@ fn settled_on(writes: &StateWrites, state: &impl Substates) -> SettledWrites {
         .expect("the debit fits")
 }
 
+/// The arrivals `consumer` takes, read off the record cells the
+/// producer's `writes` hold, as a consumer's arrival index reads the
+/// proven record.
+fn arrivals_written(
+    classified: &Classified,
+    writes: &StateWrites,
+    consumer: ShardId,
+) -> Vec<EscrowedValue> {
+    classified
+        .edges()
+        .iter()
+        .filter(|edge| edge.to.contains(&consumer))
+        .filter_map(|edge| {
+            let record = edge.crossing.id.record_key(&ProtocolHasher);
+            let cell = CrossingCell::from_bytes(writes.cells.get(&record)?.as_deref()?)?;
+            Some(EscrowedValue {
+                node: edge.producer,
+                output: edge.output,
+                resource: cell.resource,
+                amount: cell.amount,
+                record,
+            })
+        })
+        .collect()
+}
+
 fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
     eprintln!(
         "SETTLEDBG cells={:?} movements={:?} accounts={:?}",
@@ -1341,7 +1367,7 @@ fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
         };
         (
             settled(writes, &[(alice(), 1_000), (far(), 50)]),
-            executed.escrowed.clone(),
+            arrivals_written(&classified, writes, far_shard),
         )
     };
 
@@ -1493,8 +1519,8 @@ fn local_shares_cover_what_the_committing_shard_runs() {
 }
 
 /// A transfer executed divided, end to end through the engine: the
-/// sender's shard runs the withdraw, escrows the value into the record
-/// cell the plan filed, and attests exactly that. The recipient's shard
+/// sender's shard runs the withdraw and escrows the value into the record
+/// cell the plan filed, which is what the recipient reads. The recipient's shard
 /// runs nothing: its fold credits the deposit off the record.
 #[test]
 fn a_transfer_executes_divided_on_the_payers_shard() {
@@ -1543,7 +1569,7 @@ fn a_transfer_executes_divided_on_the_payers_shard() {
         panic!("the sender's legs must succeed: {:?}", sender.metadata);
     };
     assert_eq!(
-        sender.escrowed,
+        arrivals_written(&classified, writes, far_shard),
         vec![EscrowedValue {
             node: edge.producer,
             output: edge.output,
@@ -1551,7 +1577,7 @@ fn a_transfer_executes_divided_on_the_payers_shard() {
             amount: 100,
             record: edge.crossing.id.record_key(&ProtocolHasher),
         }],
-        "the withdraw's value left into the record cell the plan filed",
+        "the withdraw's value left into the record cell the plan filed, and the recipient reads it there",
     );
     let record = writes
         .cells
@@ -1577,7 +1603,7 @@ fn a_transfer_executes_divided_on_the_payers_shard() {
         "the sender ran no leg of the recipient's"
     );
 
-    let recipient = run(far_shard, &sender.escrowed);
+    let recipient = run(far_shard, &arrivals_written(&classified, writes, far_shard));
     assert_eq!(
         recipient.consensus,
         ConsensusReceipt::Failed,
