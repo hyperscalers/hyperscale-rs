@@ -141,12 +141,23 @@ fn committed_members(
         .collect()
 }
 
+/// Count a transaction let go of with no outcome, by whether a
+/// committed record had covered it.
+fn record_unanswerable(covered_by_record: bool) {
+    record_unresolvable_tx(if covered_by_record {
+        "record_covered"
+    } else {
+        "no_record"
+    });
+}
+
 /// The members a commit's tick seats: the manifest's lines, or what
-/// this node's own inputs name.
+/// this node's own inputs name, with the strands its ledger let go of at
+/// this commit.
 #[derive(Clone, Copy)]
 enum Named<'a> {
     Lines(&'a [TickLine]),
-    Composed,
+    Composed(&'a [Unanswerable]),
 }
 
 /// Where a commit's tick takes its members from.
@@ -1123,9 +1134,15 @@ impl ExecutionCoordinator {
     /// The lines this node's own committed inputs name for the tick at
     /// `tick_id`: its candidates, then an abort of each member a tick of
     /// ours holds past its deadline under a departure, then the discard
-    /// of the tick that holds it. What a fixture building a block stands
-    /// in for.
-    fn composed_lines(&self, anchored: &TopologySnapshot, tick_id: TickId) -> Vec<TickLine> {
+    /// of the tick that holds it, then the discard of each member of
+    /// `unanswerable` a tick holds. What a fixture building a block
+    /// stands in for.
+    fn composed_lines(
+        &self,
+        anchored: &TopologySnapshot,
+        tick_id: TickId,
+        unanswerable: &[Unanswerable],
+    ) -> Vec<TickLine> {
         let mut lines = self.candidates.named(
             anchored.shard_trie(),
             &self.provisioning,
@@ -1160,6 +1177,12 @@ impl ExecutionCoordinator {
             });
         }
         lines.extend(discards);
+        lines.extend(unanswerable.iter().filter_map(|entry| {
+            Some(TickLine::Discard {
+                tick: self.ticks.tick_assignment(entry.tx_hash)?,
+                cause: DiscardCause::Unanswerable(entry.tx_hash),
+            })
+        }));
         lines
     }
 
@@ -1501,12 +1524,21 @@ impl ExecutionCoordinator {
         let composed;
         let lines = match named {
             Named::Lines(lines) => lines,
-            Named::Composed => {
-                composed = self.composed_lines(anchored, tick_id);
+            Named::Composed(unanswerable) => {
+                composed = self.composed_lines(anchored, tick_id, unanswerable);
                 &composed[..]
             }
         };
         seated.extend(lines.iter().cloned());
+        for line in lines {
+            if let TickLine::Discard {
+                tick,
+                cause: DiscardCause::Unanswerable(tx_hash),
+            } = line
+            {
+                self.drop_unanswerable(*tick, *tx_hash);
+            }
+        }
         let admitted = self.candidates.take_named(lines, &self.provisioning);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
@@ -3095,7 +3127,10 @@ impl ExecutionCoordinator {
                 resolutions: committed.settled,
             }));
         }
-        self.release_unanswerable(&committed.unanswerable);
+        let unanswerable = committed.unanswerable;
+        for entry in &unanswerable {
+            record_unanswerable(entry.covered_by_record);
+        }
 
         // Timeout checks + pruning run every block, not just commits that
         // carry txs.
@@ -3171,7 +3206,7 @@ impl ExecutionCoordinator {
                 block.certificates(),
                 match naming {
                     Naming::Manifest => Named::Lines(block.tick_manifest()),
-                    Naming::Composed => Named::Composed,
+                    Naming::Composed => Named::Composed(&unanswerable),
                 },
             )),
             Block::Sealed {
@@ -3678,8 +3713,10 @@ impl ExecutionCoordinator {
             || self.counterparts.ledger.is_covered(tx_hash)
     }
 
-    /// Let go of what this shard holds against transactions no shard can
-    /// settle any more.
+    /// Let go of what this shard holds against a transaction no shard
+    /// can settle any more, on the committed line that names it: its
+    /// ledger entry goes with no outcome, and the tick holding it is
+    /// released.
     ///
     /// Every counterpart has left and every settled set that could have
     /// spoken for them has stopped reading, so the tick holding one will
@@ -3698,24 +3735,19 @@ impl ExecutionCoordinator {
     /// Each of these is also a reservation the drain never gets back —
     /// only a committed certificate returns one, and by here none is
     /// coming. Counted by cause, because the drain's baseline rises with
-    /// them and a shard that accumulates enough admits nothing at all.
-    fn release_unanswerable(&mut self, unanswerable: &[Unanswerable]) {
-        for entry in unanswerable {
-            record_unresolvable_tx(if entry.covered_by_record {
-                "record_covered"
-            } else {
-                "no_record"
-            });
-            if let Some(tick_id) = self.ticks.tick_assignment(entry.tx_hash) {
-                tracing::info!(
-                    tx = %entry.tx_hash,
-                    tick = %tick_id,
-                    covered_by_record = entry.covered_by_record,
-                    "Releasing a strand whose counterparts have all fallen silent"
-                );
-                self.release_tick(tick_id, Some(entry.tx_hash));
-            }
+    /// them and a shard that accumulates enough admits nothing at all;
+    /// the ledger may drop the entry first, and counts it there.
+    fn drop_unanswerable(&mut self, tick_id: TickId, tx_hash: TxHash) {
+        if self.counterparts.ledger.contains(tx_hash) {
+            record_unanswerable(self.counterparts.ledger.departed(tx_hash));
+            self.counterparts.ledger.forget(tx_hash);
         }
+        tracing::info!(
+            tx = %tx_hash,
+            tick = %tick_id,
+            "Releasing a strand whose counterparts have all fallen silent"
+        );
+        self.release_tick(tick_id, Some(tx_hash));
     }
 
     /// Record a tick's fate for the tick chain.
@@ -13189,19 +13221,6 @@ mod tests {
             "and nothing answers for it",
         );
 
-        state.release_unanswerable(&[Unanswerable {
-            tx_hash,
-            covered_by_record: false,
-        }]);
-        assert!(
-            state
-                .counterparts
-                .ledger
-                .abandonment_answers(tx_hash)
-                .is_none(),
-            "no exit past the window writes anything",
-        );
-
         // Covered by the departed sibling's record, the entry is
         // abandoned inside its window and settles the charge alone.
         state.counterparts.ledger.record_terminal(
@@ -13320,20 +13339,21 @@ mod tests {
         );
     }
 
-    /// A release through an unanswerable member abandons that member
-    /// and keeps its siblings a counterpart can settle.
+    /// A committed `Unanswerable` discard drops that member, entry and
+    /// all, and keeps its siblings a counterpart can settle.
     #[test]
     fn a_release_through_an_unanswerable_member_keeps_its_siblings() {
         let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(5);
 
-        state.release_unanswerable(&[Unanswerable {
-            tx_hash: x,
-            covered_by_record: false,
-        }]);
+        state.drop_unanswerable(tick_id, x);
 
         assert!(
             state.ticks.tick_assignment(x).is_none(),
-            "the unanswerable member falls to its deadline",
+            "the unanswerable member is let go of",
+        );
+        assert!(
+            !state.counterparts.ledger.contains(x),
+            "with no outcome: nothing will ever abort it",
         );
         assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
     }

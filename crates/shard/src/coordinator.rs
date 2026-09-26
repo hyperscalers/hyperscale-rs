@@ -2115,9 +2115,13 @@ impl ShardCoordinator {
             &self.dedup_index,
             anchor,
             committee,
+            topology_schedule,
         );
         let facts = &self.member_facts;
-        let (expected, missing) = member_lines(&rows, anchor, &|tx| facts.get(tx), &sets);
+        let (expected, missing) =
+            member_lines(&rows, anchor, &|tx| facts.get(tx), &sets, &|shard| {
+                sets.evidence(shard)
+            });
         if let Some(tx) = missing.first() {
             return Err(Withheld::deferred(format!(
                 "no facts held for pending member {tx:?}"
@@ -2174,6 +2178,7 @@ impl ShardCoordinator {
             &self.dedup_index,
             anchor,
             committee,
+            topology_schedule,
         );
         let facts = rows
             .members

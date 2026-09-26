@@ -361,7 +361,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// A discard releases every member of the tick that shares no
     /// verdict with a counterpart, and the one it abandons whatever that
     /// shares; a recovery discard releases the whole tick. What stays is
-    /// owed only its legs half.
+    /// owed only its legs half. The member an `Unanswerable` discard
+    /// names is deleted rather than released: no counterpart is left to
+    /// answer for it, nothing will ever abort it, and a released row an
+    /// abort named would stand in flight for good.
     fn discard(&mut self, tick: TickId, cause: DiscardCause) {
         if tick.shard_id() != self.shard {
             return;
@@ -373,6 +376,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         let abandoned = match cause {
             DiscardCause::Abandoned(tx) | DiscardCause::Unanswerable(tx) => Some(tx),
             DiscardCause::Rejected | DiscardCause::Recovery => None,
+        };
+        let dropped = match cause {
+            DiscardCause::Unanswerable(tx) => Some(tx),
+            _ => None,
         };
         let whole = matches!(cause, DiscardCause::Recovery);
         let mut kept = Vec::new();
@@ -388,6 +395,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             });
             if keeps && !whole && Some(tx) != abandoned {
                 kept.push(tx);
+            } else if Some(tx) == dropped {
+                self.set_member(tx, None);
             } else {
                 self.release(tx);
             }
@@ -948,6 +957,42 @@ mod tests {
         ));
         assert_eq!(state_of(&store, 2), released(Settlement::Shared));
         assert!(MemberIndex::load(&store, LOCAL).ticks.is_empty());
+    }
+
+    /// An `Unanswerable` discard deletes the member it names, which
+    /// nothing will ever abort, and releases the rest as any discard does.
+    #[test]
+    fn an_unanswerable_discard_deletes_its_member() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2, 3]));
+        store.fold(&naming(
+            2,
+            vec![
+                member(1, Settlement::Shared),
+                member(2, Settlement::Shared),
+                member(3, Settlement::Awaited),
+            ],
+        ));
+        store.fold(&naming(
+            3,
+            vec![TickLine::Discard {
+                tick: TickId::new(LOCAL, BlockHeight::new(2)),
+                cause: DiscardCause::Unanswerable(tx(1)),
+            }],
+        ));
+        assert_eq!(state_of(&store, 1), None, "deleted, never released");
+        assert!(matches!(
+            state_of(&store, 2),
+            Some(RowState::InFlight { .. })
+        ));
+        assert_eq!(
+            state_of(&store, 3),
+            Some(RowState::Released {
+                settlement: Settlement::Awaited
+            }),
+        );
+        let tick = &MemberIndex::load(&store, LOCAL).ticks[&BlockHeight::new(2)];
+        assert_eq!(tick.members[..], [tx(2)]);
     }
 
     /// A record covers the row it names, and nothing else.

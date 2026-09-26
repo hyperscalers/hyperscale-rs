@@ -249,7 +249,8 @@ pub use topology::schedule::{
     RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{
-    SettledSetVerdict, SettledTxSet, TerminalEvidence, TxClaim, settled_set_verdict,
+    Evidence, SettledSetVerdict, SettledTxSet, TerminalEvidence, TxClaim, partner_evidence,
+    settled_set_verdict,
 };
 pub use topology::shard_prefix::shard_prefix_path;
 pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};

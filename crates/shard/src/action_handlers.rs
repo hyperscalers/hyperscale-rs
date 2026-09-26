@@ -320,7 +320,13 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
                 .map(|engagement| (engagement.source, engagement.tx_hash)),
         );
         inputs.arrived.extend(record_arrivals(&state_claims));
-        let (lines, _) = member_lines(&rows, anchor, &|tx| manifest.facts.get(&tx), &inputs);
+        let (lines, _) = member_lines(
+            &rows,
+            anchor,
+            &|tx| manifest.facts.get(&tx),
+            &inputs,
+            &|shard| inputs.evidence(shard),
+        );
         Arc::new(Capped::new(lines).expect("the budget stops at the line cap"))
     };
     let members = content(Arc::clone(&tick_manifest));

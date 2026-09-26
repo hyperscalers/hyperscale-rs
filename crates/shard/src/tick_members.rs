@@ -11,8 +11,8 @@ use std::collections::{BTreeSet, HashMap};
 use hyperscale_engine::tick_select::{CommittedSets, EngagementWait, MemberFacts, Requirement};
 use hyperscale_storage::{MemberIndex, MemberInputs, RowState, record_arrivals};
 use hyperscale_types::{
-    Block, BlockHeight, Deadline, Engagement, ShardId, SubstateKey, TopologySnapshot, Transaction,
-    TxHash, WeightedTimestamp,
+    Block, BlockHeight, Deadline, Engagement, ShardId, SubstateKey, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, WeightedTimestamp, partner_evidence,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -127,7 +127,8 @@ impl OwnContent {
 
 /// What committed content up to the parent, and the block's own, says
 /// each `Pending` row of `rows` has in hand, for the rows whose facts are
-/// held: judged at `anchor` under `committee`, the block's.
+/// held, and what each shard an in-flight row reaches says of its
+/// evidence: judged at `anchor` under `committee`, the block's.
 #[allow(clippy::too_many_arguments)] // the tier, the ancestry and the block's own content, each judged at one anchor
 pub fn committed_sets(
     rows: &MemberIndex,
@@ -137,9 +138,17 @@ pub fn committed_sets(
     dedup: &CommitDedupIndex,
     anchor: WeightedTimestamp,
     committee: &TopologySnapshot,
+    schedule: &TopologySchedule,
 ) -> CommittedSets {
     let mut sets = CommittedSets::default();
     for row in rows.members.values() {
+        if matches!(row.state, RowState::InFlight { .. }) {
+            for &shard in row.reach.iter() {
+                sets.evidence
+                    .entry(shard)
+                    .or_insert_with(|| partner_evidence(schedule, shard, anchor));
+            }
+        }
         if row.state != RowState::Pending {
             continue;
         }

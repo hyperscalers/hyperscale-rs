@@ -1419,6 +1419,12 @@ impl Ledger {
             .collect()
     }
 
+    /// Let go of `tx_hash` with no outcome: a committed line said no
+    /// counterpart is left to answer for it.
+    pub(crate) fn forget(&mut self, tx_hash: TxHash) {
+        self.owed.remove(&tx_hash);
+    }
+
     /// Whether a committed departure names `tx_hash`: the one covering a
     /// member a tick holds is abandoned on.
     #[must_use]

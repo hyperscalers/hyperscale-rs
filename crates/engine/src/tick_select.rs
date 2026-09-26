@@ -13,10 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
-    Address, CollectionId, Deadline, DeclaredKey, DiscardCause, Joins, MAX_HOLDS_PER_MEMBER,
-    MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Reach, Role, Settlement, ShardId, ShardTrie,
-    SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
-    compatible, tick_manifest_admits_block,
+    Address, CollectionId, Deadline, DeclaredKey, DiscardCause, Evidence, Joins,
+    MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Reach, Role, Settlement,
+    ShardId, ShardTrie, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
+    WeightedTimestamp, compatible, tick_manifest_admits_block,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -378,6 +378,21 @@ pub struct CommittedSets {
     /// `(record, tx)` for every record read live naming `tx`, at or after
     /// the block that committed `tx`.
     pub arrived: BTreeSet<(SubstateKey, TxHash)>,
+    /// What each shard a held member reaches says of its evidence at the
+    /// block's anchor.
+    pub evidence: BTreeMap<ShardId, Evidence>,
+}
+
+impl CommittedSets {
+    /// What `shard`'s evidence says at the block's anchor: unknown where
+    /// the coordinator did not read it.
+    #[must_use]
+    pub fn evidence(&self, shard: ShardId) -> Evidence {
+        self.evidence
+            .get(&shard)
+            .copied()
+            .unwrap_or(Evidence::Unknown)
+    }
 }
 
 impl CommittedInputs for CommittedSets {
@@ -468,10 +483,12 @@ pub fn member_lines<'f>(
     anchor: WeightedTimestamp,
     facts: &dyn Fn(TxHash) -> Option<&'f MemberFacts>,
     inputs: &dyn CommittedInputs,
+    evidence: &dyn Fn(ShardId) -> Evidence,
 ) -> (Vec<TickLine>, Vec<TxHash>) {
     let mut holds = ProvisionalCells::default();
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
+    let mut unanswerable = Vec::new();
     for row in rows.members.values() {
         let passed = row.deadline.passed(anchor);
         let standing = match row.state {
@@ -481,6 +498,23 @@ pub fn member_lines<'f>(
                 settlement,
             } => {
                 holds.claim(&row.holds);
+                let tick = TickId::new(rows.shard(), tick);
+                if joins != Joins::Aborted && settlement != Settlement::Alone {
+                    match answerable(&row.reach, evidence) {
+                        Some(true) => {}
+                        Some(false) => {
+                            unanswerable.push(TickLine::Discard {
+                                tick,
+                                cause: DiscardCause::Unanswerable(row.tx),
+                            });
+                            continue;
+                        }
+                        None => {
+                            missing.push(row.tx);
+                            continue;
+                        }
+                    }
+                }
                 if !(passed
                     && row.covered
                     && joins != Joins::Aborted
@@ -489,7 +523,7 @@ pub fn member_lines<'f>(
                     continue;
                 }
                 Standing::Held {
-                    tick: TickId::new(rows.shard(), tick),
+                    tick,
                     reach: &row.reach,
                 }
             }
@@ -517,14 +551,34 @@ pub fn member_lines<'f>(
             standing,
         });
     }
-    let lines = select_members(
-        anchor,
-        candidates,
-        inputs,
-        &mut holds,
-        &mut ManifestBudget::default(),
-    );
+    let mut budget = ManifestBudget::default();
+    let mut lines = select_members(anchor, candidates, inputs, &mut holds, &mut budget);
+    for discard in unanswerable {
+        if !budget.take(&discard) {
+            break;
+        }
+        lines.push(discard);
+    }
     (lines, missing)
+}
+
+/// Whether a counterpart of a held member can still answer for it: `Some(false)`
+/// once every shard of its `reach` has departed with its settled set
+/// unreadable, `None` while a window that could say is not yet folded.
+/// A member reaching nobody has no counterpart to fall silent.
+fn answerable(reach: &Reach, evidence: &dyn Fn(ShardId) -> Evidence) -> Option<bool> {
+    if reach.is_empty() {
+        return Some(true);
+    }
+    let mut unknown = false;
+    for &shard in reach.iter() {
+        match evidence(shard) {
+            Evidence::Live { .. } | Evidence::Readable => return Some(true),
+            Evidence::Unknown => unknown = true,
+            Evidence::Unreadable => {}
+        }
+    }
+    (!unknown).then_some(false)
 }
 
 /// What a manifest has spent of its byte budget and its line cap.
@@ -1137,7 +1191,9 @@ mod tests {
         ] {
             rows.members.insert(held.tx, held);
         }
-        let lines = |at: WeightedTimestamp| member_lines(&rows, at, &|_| None, &Held::default());
+        let live = |_| Evidence::Live { terminating: false };
+        let lines =
+            |at: WeightedTimestamp| member_lines(&rows, at, &|_| None, &Held::default(), &live);
         let (before, missing) = lines(deadline.at().minus(Duration::from_millis(1)));
         assert!(before.is_empty() && missing.is_empty());
         let (after, missing) = lines(deadline.at());
@@ -1157,6 +1213,69 @@ mod tests {
                     cause: DiscardCause::Abandoned(tx(1)),
                 },
             ],
+        );
+    }
+
+    /// A held member a counterpart's verdict can discard is dropped by an
+    /// `Unanswerable` discard once every shard it reaches has departed
+    /// with its settled set unreadable, ahead of any abort, at any age;
+    /// one whose evidence is not yet readable at the anchor holds the
+    /// voter back, and one a shard can still answer for stays.
+    #[test]
+    fn a_held_member_nobody_can_answer_for_is_dropped() {
+        let deadline = Deadline::of(ms(10_000));
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        rows.members.insert(
+            tx(1),
+            MemberRow {
+                tx: tx(1),
+                deadline,
+                committed: ms(0),
+                height: BlockHeight::new(1),
+                state: RowState::InFlight {
+                    tick: BlockHeight::new(2),
+                    joins: Joins::Executes,
+                    settlement: Settlement::Shared,
+                },
+                holds: Capped::empty(),
+                reach: Capped::from_array([PEER]),
+                covered: true,
+            },
+        );
+        let lines = |evidence: Evidence| {
+            member_lines(&rows, deadline.at(), &|_| None, &Held::default(), &|_| {
+                evidence
+            })
+        };
+        assert_eq!(
+            lines(Evidence::Unreadable),
+            (
+                vec![TickLine::Discard {
+                    tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                    cause: DiscardCause::Unanswerable(tx(1)),
+                }],
+                vec![],
+            ),
+        );
+        assert_eq!(lines(Evidence::Unknown), (vec![], vec![tx(1)]));
+        let (answered, missing) = lines(Evidence::Readable);
+        assert!(missing.is_empty());
+        assert!(
+            matches!(
+                answered[..],
+                [
+                    TickLine::Member {
+                        joins: Joins::Aborted,
+                        ..
+                    },
+                    TickLine::Discard {
+                        cause: DiscardCause::Abandoned(_),
+                        ..
+                    },
+                ]
+            ),
+            "a covered member a shard can still answer for is aborted at its deadline: \
+             {answered:?}",
         );
     }
 
