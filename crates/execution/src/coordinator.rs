@@ -8511,6 +8511,131 @@ mod tests {
         );
     }
 
+    /// The receipt of `tx`'s floor burned on `ROOT`, as an abort
+    /// settles it.
+    fn floor_receipt(
+        state: &ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        tx: &Transaction,
+    ) -> GlobalReceiptHash {
+        build_refusal_receipt(
+            ShardId::ROOT,
+            state
+                .counterpart_trie(schedule)
+                .expect("the fixture holds the window"),
+            tx.hash(),
+            Some((
+                tx.fee_vault(),
+                Movement::unjudged(*PROTOCOL_RESOURCE, tx.price(&PriceTable::GENESIS)),
+            )),
+            &[],
+        )
+        .expect("a charge names a receipt")
+        .receipt_hash()
+    }
+
+    /// Each outcome's transaction and the charge its receipt settles.
+    fn charged(outcomes: &[TxOutcome]) -> Vec<(TxHash, Option<GlobalReceiptHash>)> {
+        outcomes
+            .iter()
+            .map(|outcome| (outcome.tx_hash(), outcome.refusal_receipt()))
+            .collect()
+    }
+
+    /// A discard charges nothing: of two members of one tick, the one an
+    /// abort names is charged its floor by that abort, the tick-mate the
+    /// discard lets go of is charged by its own abort later, and the
+    /// discard itself settles no outcome for either.
+    #[test]
+    fn a_discard_charges_nothing() {
+        let schedule = make_test_topology();
+        let mut pair = [test_transaction(1), test_transaction(2)];
+        pair.sort_by_key(Transaction::hash);
+        let [abandoned, mate] = pair;
+        let line = |tx: &Transaction, joins| TickLine::Member {
+            tx: tx.hash(),
+            joins,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+        };
+        let mut state = make_test_state();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        state.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Manifest);
+        let holding = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(abandoned.clone()), Arc::new(mate.clone())],
+        );
+        state.commit_block_carrying(
+            &schedule,
+            &naming(
+                &test_certify(holding, 2_000),
+                vec![
+                    line(&abandoned, Joins::Executes),
+                    line(&mate, Joins::Executes),
+                ],
+            ),
+            Naming::Manifest,
+        );
+        let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        assert_eq!(state.ticks.tick_assignment(mate.hash()), Some(held_by));
+
+        let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+        let settle = |state: &mut ExecutionCoordinator, height, now_ms, lines| {
+            let block = make_live_block(
+                BlockHeight::new(height),
+                now_ms,
+                ValidatorId::new(0),
+                vec![],
+            );
+            state.commit_block_carrying(
+                &schedule,
+                &naming(&test_certify(block, now_ms), lines),
+                Naming::Manifest,
+            );
+            state
+                .scan_votable_ticks(&schedule)
+                .into_iter()
+                .flat_map(|completion| completion.tx_outcomes)
+                .collect::<Vec<TxOutcome>>()
+        };
+        let expected = floor_receipt(&state, &schedule, &abandoned);
+        let outcomes = settle(
+            &mut state,
+            3,
+            deadline_ms,
+            vec![
+                line(&abandoned, Joins::Aborted),
+                TickLine::Discard {
+                    tick: held_by,
+                    cause: DiscardCause::Abandoned(abandoned.hash()),
+                },
+            ],
+        );
+        assert_eq!(
+            charged(&outcomes),
+            vec![(abandoned.hash(), Some(expected))],
+            "the abort charges its member once, and the discard charges nobody",
+        );
+        assert!(!state.ticks.contains_tick(&held_by));
+        assert_eq!(state.ticks.tick_assignment(mate.hash()), None);
+
+        let expected = floor_receipt(&state, &schedule, &mate);
+        let outcomes = settle(
+            &mut state,
+            4,
+            deadline_ms + 1_000,
+            vec![line(&mate, Joins::Aborted)],
+        );
+        assert_eq!(
+            charged(&outcomes),
+            vec![(mate.hash(), Some(expected))],
+            "the let-go tick-mate is charged by its own abort alone",
+        );
+    }
+
     /// A replay reaching below what the store can anchor seats its
     /// ticks there and dispatches none of them.
     ///

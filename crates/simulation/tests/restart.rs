@@ -29,6 +29,7 @@ use hyperscale_scenarios::{
     a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
     venue_genesis_accounts,
 };
+use hyperscale_storage::BoundaryStore;
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::SimCluster;
 
@@ -274,6 +275,121 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
 fn a_committee_advances_after_all_of_it_restarts() {
     for seed in SEEDS {
         restart_and_advance(4, seed);
+    }
+}
+
+/// The lowest tick any host's store holds in flight on `shard`, with its
+/// members.
+fn a_tick_in_flight(c: &SimCluster, shard: ShardId) -> Option<(BlockHeight, Vec<TxHash>)> {
+    let runner = c.runner();
+    (0..runner.num_hosts())
+        .filter_map(|host| runner.hosts_shard(host, shard))
+        .filter_map(|storage| {
+            let family = storage.member_index(shard);
+            let (height, tick) = family.ticks.first_key_value()?;
+            Some((*height, tick.members.to_vec()))
+        })
+        .min_by_key(|(height, _)| *height)
+}
+
+/// More than f of four replicas restart while a tick is in flight, and
+/// the tick still settles.
+///
+/// With a quorum down at once no survivor carries the tick for the
+/// restarted replicas: each comes back to the rows its store holds and
+/// seats the tick its manifest named, and a certificate not yet formed
+/// needs their votes. Every member then reaches an outcome, every store
+/// lets the tick's row go, and every replica holds one state at a height
+/// they all reached.
+fn a_tick_in_flight_survives(restarted: usize, seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
+    let shard = ShardId::ROOT;
+    let (payer, from) = sender(0);
+    for index in 0..4u8 {
+        let tx = build_transfer_tx(
+            &payer,
+            from,
+            recipient(index),
+            10,
+            validity_around(cluster.now()),
+        );
+        cluster.submit(Arc::new(tx));
+    }
+    assert!(
+        cluster.run_until(epochs(8), |c| a_tick_in_flight(c, shard).is_some()),
+        "seed {seed}: a tick must be in flight for the restart to land in",
+    );
+    let (tick, members) = a_tick_in_flight(&cluster, shard).expect("just seen");
+    for &host in cluster.committee_hosts(shard).iter().take(restarted) {
+        cluster.restart_host(host, shard);
+    }
+
+    for tx in members {
+        let status = await_tx_terminal(&mut cluster, tx, epochs(24));
+        assert!(
+            matches!(status, Some(TransactionStatus::Completed(_))),
+            "seed {seed}: a member of tick {tick:?} must reach an outcome after {restarted} \
+             of four restart; status = {status:?}, hosts at {:?}",
+            heights(&cluster, shard),
+        );
+    }
+    let hosts = cluster.committee_hosts(shard);
+    let settled_everywhere = |c: &SimCluster| {
+        hosts.iter().all(|&host| {
+            c.runner()
+                .hosts_shard(u32::try_from(host).expect("a host index"), shard)
+                .is_some_and(|storage| !storage.member_index(shard).ticks.contains_key(&tick))
+        })
+    };
+    assert!(
+        cluster.run_until(epochs(24), settled_everywhere),
+        "seed {seed}: every replica must commit the settlement of tick {tick:?} after \
+         {restarted} of four restart; hosts at {:?}",
+        heights(&cluster, shard),
+    );
+    let height = hosts
+        .iter()
+        .map(|&host| {
+            cluster
+                .host_committed_height(host, shard)
+                .expect("every member commits again")
+        })
+        .min()
+        .expect("a committee");
+    let runner = cluster.runner();
+    let replicas: Vec<_> = hosts
+        .iter()
+        .map(|&host| {
+            let storage = runner
+                .hosts_shard(u32::try_from(host).expect("a host index"), shard)
+                .expect("every member stores the shard");
+            let root = cluster
+                .host_block(host, shard, height)
+                .map(|certified| certified.block().header().state_root());
+            (root, storage.member_index(shard))
+        })
+        .collect();
+    for (root, family) in &replicas {
+        assert!(root.is_some(), "seed {seed}: every member holds {height:?}");
+        assert!(
+            !family.ticks.contains_key(&tick),
+            "seed {seed}: the settled tick's row is gone: {family:?}",
+        );
+    }
+    assert!(
+        replicas.windows(2).all(|pair| pair[0].0 == pair[1].0),
+        "seed {seed}: every replica holds one state at {height:?}",
+    );
+}
+
+/// [`a_tick_in_flight_survives`] with two and with three of four
+/// restarted, across the seeds.
+#[test]
+fn a_tick_in_flight_survives_more_than_f_restarting() {
+    for seed in SEEDS {
+        for restarted in 2..=3 {
+            a_tick_in_flight_survives(restarted, seed);
+        }
     }
 }
 

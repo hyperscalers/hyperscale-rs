@@ -7501,6 +7501,7 @@ mod tests {
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_engine::tick_select::{MemberFacts, Requirement};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{DedupWindow, TickRow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
@@ -8277,20 +8278,31 @@ mod tests {
         from: BlockHash,
         blocks: impl IntoIterator<Item = Block>,
     ) -> (ShardCoordinator, TopologySchedule) {
-        let (mut state, schedule) = make_test_state();
+        let (state, schedule) = make_test_state();
+        (committed_on(state, &schedule, from, blocks), schedule)
+    }
+
+    /// Commit `blocks` on `state`, its tip set to `from`, each through the
+    /// commit path a certified block takes.
+    fn committed_on(
+        mut state: ShardCoordinator,
+        schedule: &TopologySchedule,
+        from: BlockHash,
+        blocks: impl IntoIterator<Item = Block>,
+    ) -> ShardCoordinator {
         state.committed_height = BlockHeight::GENESIS;
         state.committed_hash = from;
         for block in blocks {
             let qc = make_test_qc(block.hash(), block.height());
             let _ = state.on_block_ready_to_commit(
-                &schedule,
+                schedule,
                 Arc::new(Verified::new_unchecked_for_test(
                     CertifiedBlock::new_unchecked(block, qc),
                 )),
                 CommitSource::Aggregator,
             );
         }
-        (state, schedule)
+        state
     }
 
     /// A voter reads the ticks the chain owes a determined half off the
@@ -8382,6 +8394,234 @@ mod tests {
                 .engaged(ENGAGING_PAYER, engaged_tx(1), at, snapshot),
             "the first block's transaction was engaged again inside the horizon"
         );
+    }
+
+    /// A coordinator on the left of two shards.
+    fn left_of_two() -> ShardCoordinator {
+        ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            ShardId::leaf(1, 0),
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        )
+    }
+
+    /// Two shards under one four-validator committee.
+    fn two_shards() -> TopologySchedule {
+        let validators = ValidatorSet::new(
+            (0..4)
+                .map(|i| ValidatorInfo {
+                    validator_id: ValidatorId::new(i),
+                    public_key: BlsSigner::generate().public_key(),
+                })
+                .collect(),
+        );
+        TopologySchedule::single(Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            validators,
+        )))
+    }
+
+    /// A transaction writing on `local` whose fee payer and one read sit
+    /// on [`ENGAGING_PAYER`], so its member here waits for that shard's
+    /// bundle.
+    fn remotely_paid(committee: &TopologySnapshot, local: ShardId) -> Transaction {
+        let on = |shard: ShardId| {
+            (0u8..=255)
+                .map(test_utils::test_prefix)
+                .find(|&prefix| committee.shard_for_prefix(prefix) == shard)
+                .expect("a prefix routes to each shard")
+        };
+        (0u8..=255)
+            .map(|seed| {
+                test_utils::stub_transaction_with_reads(
+                    PrincipalAddr::new([seed; 31]),
+                    &[on(ENGAGING_PAYER)],
+                    &[on(local)],
+                    1_000,
+                    test_utils::test_validity_range(),
+                )
+            })
+            .find(|tx| committee.shard_for_prefix(tx.fee_payer()) == ENGAGING_PAYER)
+            .expect("a payer routes to the other shard")
+    }
+
+    /// A voter that committed a payer's bundle sealed, as a sync delivers
+    /// it, names what a voter that committed it live names: the member the
+    /// bundle engages, committed in the next block with its payer remote,
+    /// is ready to both, and each admits the manifest naming it and
+    /// refuses the one leaving it out.
+    #[test]
+    fn a_sealed_synced_voter_names_what_a_live_one_does() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let tx = remotely_paid(&committee, local);
+        let facts = MemberFacts::of(&tx, &committee, local);
+        assert!(
+            facts
+                .requires
+                .contains(&Requirement::CommittedState(ENGAGING_PAYER)),
+            "the member waits for its payer's bundle",
+        );
+
+        let from = BlockHash::from_raw(Hash::from_bytes(b"sealed voter tip"));
+        let bare = block_on_chained_on(local, BlockHeight::new(1), from, 1_000);
+        let engaging = with_bundle(bare.clone(), &[tx.hash()]);
+        let parent = engaging.hash();
+        let mut live = committed_on(left_of_two(), &schedule, from, [engaging.clone()]);
+        let mut sealed = committed_on(left_of_two(), &schedule, from, [engaging.into_sealed()]);
+        assert_eq!(live.committed_height(), BlockHeight::new(1));
+        assert_eq!(sealed.committed_height(), BlockHeight::new(1));
+
+        let named = TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: facts.settlement,
+            holds: if facts.abortable() {
+                Capped::new(facts.declared.clone()).expect("a test declaration fits")
+            } else {
+                Capped::empty()
+            },
+            reach: facts.reach,
+        };
+        let child = |lines: Vec<TickLine>| {
+            carrying(
+                block_on_chained_on(local, BlockHeight::new(2), parent, 2_000),
+                std::slice::from_ref(&tx),
+                lines,
+            )
+        };
+        for (lines, admitted) in [(vec![named.clone()], true), (Vec::new(), false)] {
+            for (voter, form) in [(&mut live, "live"), (&mut sealed, "sealed")] {
+                assert_eq!(
+                    voter
+                        .check_tick_manifest(&schedule, &committee, &child(lines.clone()))
+                        .is_ok(),
+                    admitted,
+                    "a voter holding the bundle {form}, over {} lines",
+                    lines.len(),
+                );
+            }
+        }
+
+        // The bundle is what makes the member ready: over a chain without
+        // it, the same member waits.
+        let bare_hash = bare.hash();
+        let mut unengaged = committed_on(left_of_two(), &schedule, from, [bare]);
+        let unengaged_child = |lines: Vec<TickLine>| {
+            carrying(
+                block_on_chained_on(local, BlockHeight::new(2), bare_hash, 2_000),
+                std::slice::from_ref(&tx),
+                lines,
+            )
+        };
+        assert!(
+            unengaged
+                .check_tick_manifest(&schedule, &committee, &unengaged_child(Vec::new()))
+                .is_ok()
+        );
+        assert!(
+            unengaged
+                .check_tick_manifest(&schedule, &committee, &unengaged_child(vec![named]))
+                .is_err()
+        );
+    }
+
+    /// A member committed and never ready is aborted by the first block
+    /// past its deadline, and a block leaving the abort out is refused:
+    /// no row outlives its deadline by more than a block.
+    #[test]
+    fn a_due_abort_is_named_by_the_next_block() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let tx = remotely_paid(&committee, local);
+        let facts = MemberFacts::of(&tx, &committee, local);
+        let from = BlockHash::from_raw(Hash::from_bytes(b"due abort tip"));
+        let committing = carrying(
+            block_on_chained_on(local, BlockHeight::new(1), from, 1_000),
+            std::slice::from_ref(&tx),
+            Vec::new(),
+        );
+        let parent = committing.hash();
+        let mut state = committed_on(left_of_two(), &schedule, from, [committing]);
+        assert_eq!(
+            state.member_rows().members[&tx.hash()].state,
+            RowState::Pending,
+            "no bundle ever engages it",
+        );
+
+        let past = Deadline::of_transaction(&tx).at().as_millis() + 1;
+        let child = |lines: Vec<TickLine>| {
+            carrying(
+                block_on_chained_on(local, BlockHeight::new(2), parent, past),
+                &[],
+                lines,
+            )
+        };
+        let aborted = TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Aborted,
+            settlement: Settlement::Awaited,
+            holds: Capped::empty(),
+            reach: facts.reach,
+        };
+        assert!(
+            state
+                .check_tick_manifest(&schedule, &committee, &child(vec![aborted]))
+                .is_ok(),
+            "the abort is due",
+        );
+        assert!(
+            matches!(
+                state.check_tick_manifest(&schedule, &committee, &child(Vec::new())),
+                Err(Withheld::Refused(_))
+            ),
+            "a block past the deadline that leaves the abort out is refused",
+        );
+    }
+
+    /// `block` carrying one bundle from [`ENGAGING_PAYER`] naming `txs`.
+    fn with_bundle(block: Block, txs: &[TxHash]) -> Block {
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            witness_sources,
+            ..
+        } = block
+        else {
+            unreachable!("a chained block is live")
+        };
+        let bundle = Arc::new(Verifiable::from(Provisions::new(
+            ENGAGING_PAYER,
+            ShardId::ROOT,
+            header.height(),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::new(
+                txs.iter()
+                    .map(|&tx| ProvisionEntry::new(tx, Capped::empty()))
+                    .collect(),
+            )
+            .expect("a list written out in a test"),
+        )));
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions: Arc::new(Capped::from_array([bundle])),
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            witness_sources,
+        }
     }
 
     /// A voter that restarts over its store seeds the tier from the
@@ -8594,13 +8834,23 @@ mod tests {
         parent_hash: BlockHash,
         parent_weighted_ms: u64,
     ) -> Block {
+        block_on_chained_on(ShardId::ROOT, height, parent_hash, parent_weighted_ms)
+    }
+
+    /// [`block_chained_on`] on `shard`'s chain.
+    fn block_on_chained_on(
+        shard: ShardId,
+        height: BlockHeight,
+        parent_hash: BlockHash,
+        parent_weighted_ms: u64,
+    ) -> Block {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
         signers.set(2);
         let parent_qc = QuorumCertificate::new(
             parent_hash,
-            ShardId::ROOT,
+            shard,
             BlockHeight::new(height.inner() - 1),
             BlockHash::ZERO,
             Round::new(0),
@@ -8609,6 +8859,7 @@ mod tests {
             WeightedTimestamp::from_millis(parent_weighted_ms),
         );
         let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
             height,
             parent_block_hash: parent_qc.block_hash(),
             parent_qc: parent_qc.into(),
