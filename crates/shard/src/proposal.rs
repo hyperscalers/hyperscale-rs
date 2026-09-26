@@ -326,8 +326,10 @@ pub fn select_abandonment_records(
 /// that piece is kept and the spending ends there: a claim is split by
 /// key, never dropped whole, and the composer offers the remainder at
 /// the next proposal once the commit retires what this block carried.
-/// What was kept is then sorted into the section's order and admitted,
-/// and what the order rule refuses is dropped.
+/// What was kept is then sorted into the section's order and admitted.
+/// What the order rule refuses waits a block, with every claim of its
+/// producer's lineage anchored above it, so the frontier this block
+/// raises never passes a claim it held back.
 #[must_use]
 pub fn select_state_claims(
     ctx: &Committed<'_>,
@@ -357,8 +359,27 @@ pub fn select_state_claims(
     }
     kept.sort_unstable();
     kept.dedup();
+    // A claim the order rule refuses rides a later block, and so does
+    // every claim of its producer's lineage anchored above it: a carried
+    // claim raises its producer's read frontier, and a floor raised past
+    // a held claim retires it unread.
+    let mut refused: Vec<Anchor> = Vec::new();
     kept.into_iter()
-        .filter(|claim| fold.in_order(claim) && StateClaimsSection::admit(ctx, fold, claim).is_ok())
+        .filter(|claim| {
+            let behind = |anchor: &Anchor| {
+                claim.anchor.height > anchor.height
+                    && (anchor.shard.is_ancestor_of(claim.anchor.shard)
+                        || claim.anchor.shard.is_ancestor_of(anchor.shard))
+            };
+            if refused.iter().any(behind) {
+                return false;
+            }
+            if !fold.in_order(claim) {
+                refused.push(claim.anchor);
+                return false;
+            }
+            StateClaimsSection::admit(ctx, fold, claim).is_ok()
+        })
         .collect()
 }
 
@@ -1354,6 +1375,36 @@ mod tests {
             carried_a2.iter().all(|claim| !is_whole(claim, &offered)),
             "what rides at a2 is a piece cut behind a1's, never the whole",
         );
+    }
+
+    /// Two claims of one producer at one anchor whose keys interleave
+    /// cannot both ride: the order rule keeps the first and the second
+    /// waits a block. Nothing of that producer's lineage anchored above
+    /// it rides beside the first, since the frontier the block raises
+    /// would retire the held claim unread; another producer's claim is
+    /// untouched.
+    #[test]
+    fn a_claim_the_order_rule_refuses_holds_its_producer_back() {
+        use hyperscale_types::SubstateKey;
+        use hyperscale_types::test_utils::{proven_claim, test_key};
+
+        let producer = ShardId::leaf(1, 0);
+        let other = ShardId::leaf(1, 1);
+        let mut keys: Vec<SubstateKey> = (1u8..=4).map(test_key).collect();
+        keys.sort_unstable();
+        let first = proven_claim(producer, 3, &[], &[keys[1], keys[3]]);
+        let interleaved = proven_claim(producer, 3, &[], &[keys[2]]);
+        let newer = proven_claim(producer, 4, &[], &[keys[0]]);
+        let elsewhere = proven_claim(other, 4, &[], &[test_key(0x81)]);
+        let ctx = finalizations_against(CommitDedupIndex::new());
+
+        let mut fold = StateClaimsFold::default();
+        let selected = select_state_claims(
+            &ctx.ctx(),
+            &mut fold,
+            vec![first.clone(), interleaved, newer, elsewhere.clone()],
+        );
+        assert_eq!(selected, vec![first, elsewhere]);
     }
 
     /// The crossings whose ends share this shard ride in the room the
