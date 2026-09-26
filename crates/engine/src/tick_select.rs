@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
-    Address, BlockHeight, CollectionId, Deadline, DeclaredKey, DiscardCause, Evidence, Joins,
-    MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Reach, Role, Settlement,
+    AbortCharge, Address, BlockHeight, CollectionId, Deadline, DeclaredKey, DiscardCause, Evidence,
+    Joins, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Reach, Role, Settlement,
     ShardId, ShardTrie, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
     WeightedTimestamp, compatible, tick_manifest_admits_block,
 };
@@ -227,6 +227,9 @@ pub struct MemberFacts {
     pub requires: BTreeSet<Requirement>,
     /// The payer's engagement wait, where this shard pays and waits.
     pub engagement: Option<EngagementWait>,
+    /// What an abort of it burns, priced under the committee it is
+    /// classified under.
+    pub charge: AbortCharge,
 }
 
 impl MemberFacts {
@@ -241,7 +244,16 @@ impl MemberFacts {
             .into_iter()
             .collect();
         let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-        Self::of_member(&Member::of(classified, local, participating), tx, trie)
+        let charge = AbortCharge {
+            vault: tx.fee_vault(),
+            amount: tx.price(&committee.prices()),
+        };
+        Self::of_member(
+            &Member::of(classified, local, participating),
+            tx,
+            trie,
+            charge,
+        )
     }
 
     /// The facts of `member`, `tx`'s member classified under `trie`.
@@ -251,7 +263,12 @@ impl MemberFacts {
     /// Never: a transaction reaches no more shards than its routing
     /// names prefixes, which caps the reach.
     #[must_use]
-    pub fn of_member(member: &Member, tx: &Transaction, trie: &ShardTrie) -> Self {
+    pub fn of_member(
+        member: &Member,
+        tx: &Transaction,
+        trie: &ShardTrie,
+        charge: AbortCharge,
+    ) -> Self {
         let local = member.local();
         let reaches_beyond = member.reaches_beyond();
         let settlement = if !member.abortable() {
@@ -307,6 +324,7 @@ impl MemberFacts {
             declared: tx.routing().declared_modes.clone(),
             requires,
             engagement,
+            charge,
         }
     }
 
@@ -458,6 +476,16 @@ impl Standing<'_> {
         }
     }
 
+    /// What an abort of it burns: its facts' price while it is pending,
+    /// and `named`, the price its row kept from the line that named it,
+    /// once a line has.
+    const fn charge(&self, named: Option<AbortCharge>) -> Option<AbortCharge> {
+        match self {
+            Self::Pending(facts) => Some(facts.charge),
+            Self::Held { .. } | Self::Released { .. } => named,
+        }
+    }
+
     /// Whether this shard runs a leg of it, which its reclaim resolves.
     /// A held row is never one; a released one is judged by
     /// [`Nameable::abortable`] on its row.
@@ -573,10 +601,14 @@ pub fn member_lines<'f>(
                 Standing::Pending(known)
             }
         };
+        let Some(charge) = standing.charge(row.charge) else {
+            continue;
+        };
         candidates.push(Nameable {
             tx: row.tx,
             deadline: row.deadline,
             standing,
+            charge,
         });
     }
     let mut budget = ManifestBudget::default();
@@ -652,6 +684,9 @@ pub struct Nameable<'a> {
     pub deadline: Deadline,
     /// Where its row stands, with what judging it reads.
     pub standing: Standing<'a>,
+    /// What an abort of it burns: priced by its facts while it is
+    /// pending, and read off its row once a line has named it.
+    pub charge: AbortCharge,
 }
 
 /// What an abort of a candidate lets go of.
@@ -737,6 +772,7 @@ pub fn select_members<'a>(
             tx,
             deadline,
             standing,
+            charge,
         } = candidate;
         if deadline.passed(anchor) {
             if standing.leg() {
@@ -755,6 +791,7 @@ pub fn select_members<'a>(
                 },
                 holds: Capped::empty(),
                 reach: standing.reach().clone(),
+                charge,
             };
             let discard = match abort {
                 Abort::Unheld => None,
@@ -793,6 +830,7 @@ pub fn select_members<'a>(
                 Capped::empty()
             },
             reach: facts.reach.clone(),
+            charge,
         };
         if !budget.take(&line) {
             break;
@@ -813,6 +851,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_storage::{MemberRow, TickRow};
+    use hyperscale_types::test_utils::stub_abort_charge;
     use hyperscale_types::{
         AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES,
     };
@@ -935,11 +974,14 @@ mod tests {
 
     const PEER: ShardId = ShardId::leaf(1, 1);
 
+    const CHARGE: AbortCharge = stub_abort_charge(0);
+
     fn pending(tx: TxHash, facts: &MemberFacts, deadline: Deadline) -> Nameable<'_> {
         Nameable {
             tx,
             deadline,
             standing: Standing::Pending(facts),
+            charge: CHARGE,
         }
     }
 
@@ -964,6 +1006,7 @@ mod tests {
             declared,
             requires: BTreeSet::new(),
             engagement: None,
+            charge: CHARGE,
         }
     }
 
@@ -975,6 +1018,7 @@ mod tests {
             declared,
             requires: requires.iter().copied().collect(),
             engagement: None,
+            charge: CHARGE,
         }
     }
 
@@ -1157,6 +1201,7 @@ mod tests {
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
+                charge: CHARGE,
             }],
         );
     }
@@ -1189,6 +1234,7 @@ mod tests {
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
+                charge: CHARGE,
             }],
         );
     }
@@ -1213,6 +1259,7 @@ mod tests {
             holds: Capped::empty(),
             reach: Capped::from_array([PEER]),
             covered,
+            charge: Some(CHARGE),
         };
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         for held in [
@@ -1240,6 +1287,7 @@ mod tests {
                     settlement: Settlement::Awaited,
                     holds: Capped::empty(),
                     reach: Capped::from_array([PEER]),
+                    charge: CHARGE,
                 },
                 TickLine::Discard {
                     tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
@@ -1273,6 +1321,7 @@ mod tests {
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 covered: true,
+                charge: Some(CHARGE),
             },
         );
         let lines = |evidence: Evidence| {
@@ -1339,6 +1388,7 @@ mod tests {
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 covered: true,
+                charge: Some(CHARGE),
             },
         );
         rows.ticks.insert(
@@ -1400,6 +1450,7 @@ mod tests {
             tx: tx(seed),
             deadline,
             standing,
+            charge: CHARGE,
         };
         let released = |covered, settlement, reach| Standing::Released {
             covered,
@@ -1433,6 +1484,7 @@ mod tests {
             settlement,
             holds: Capped::empty(),
             reach: reach.clone(),
+            charge: CHARGE,
         };
         assert_eq!(
             lines,

@@ -163,7 +163,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
     use hyperscale_storage::test_helpers::{block_settling, make_state_writes};
     use hyperscale_storage::{BoundaryStore, MemberIndex, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::test_utils::{stub_abort_charge, test_transaction};
     use hyperscale_types::{
         Block, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusReceipt, GlobalReceiptHash,
         Joins, Settlement, SplitChildRoots, StoredReceipt, TickLine, TxHash, Verifiable,
@@ -211,6 +211,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            charge: stub_abort_charge(1),
         }])),
         witness_sources,
     };

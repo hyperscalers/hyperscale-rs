@@ -582,6 +582,7 @@ pub mod tests {
             state,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            charge: Some(stub_abort_charge(0)),
             covered: false,
         };
         let in_flight = |tick: u64, settlement| RowState::InFlight {

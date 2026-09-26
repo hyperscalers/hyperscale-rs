@@ -22,8 +22,8 @@ use hyperscale_engine::tick_select::{
     select_members,
 };
 use hyperscale_types::{
-    Deadline, EscrowedValue, Joins, PriceTable, ShardId, ShardTrie, SubstateKey, TickLine,
-    Transaction, TxHash, Verified, WeightedTimestamp,
+    AbortCharge, Deadline, EscrowedValue, Joins, PriceTable, ShardId, ShardTrie, SubstateKey,
+    TickLine, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
@@ -53,6 +53,17 @@ struct Candidate {
     /// a member that reaches an engine has to attest what a member that
     /// never does would have restated.
     committed_prices: PriceTable,
+}
+
+impl Candidate {
+    /// What an abort of the member burns, at the prices its committing
+    /// block named: the figure its abandonment restates.
+    fn charge(&self) -> AbortCharge {
+        AbortCharge {
+            vault: self.tx.fee_vault(),
+            amount: self.tx.price(&self.committed_prices),
+        }
+    }
 }
 
 /// What committed claims attested for the escrowed edges `tx`'s legs on
@@ -211,7 +222,12 @@ impl TickCandidates {
             .map(|(tx_hash, candidate)| {
                 (
                     *tx_hash,
-                    MemberFacts::of_member(&candidate.member, &candidate.tx, trie),
+                    MemberFacts::of_member(
+                        &candidate.member,
+                        &candidate.tx,
+                        trie,
+                        candidate.charge(),
+                    ),
                     Deadline::of_transaction(&candidate.tx),
                 )
             })
@@ -222,6 +238,7 @@ impl TickCandidates {
                 tx: *tx_hash,
                 deadline: *deadline,
                 standing: Standing::Pending(facts),
+                charge: facts.charge,
             }),
             &Absorbed(provisioning),
             held,
@@ -265,7 +282,12 @@ impl TickCandidates {
                 continue;
             };
             if *joins == Joins::Executes {
-                let facts = MemberFacts::of_member(&candidate.member, &candidate.tx, trie);
+                let facts = MemberFacts::of_member(
+                    &candidate.member,
+                    &candidate.tx,
+                    trie,
+                    candidate.charge(),
+                );
                 in_hand &= readiness(*tx_hash, &facts, anchor, &Absorbed(provisioning))
                     == Some(Joins::Executes);
             }
@@ -340,7 +362,9 @@ impl TickCandidates {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
+    use hyperscale_types::test_utils::{
+        stub_abort_charge, test_prefix, test_transaction_with_prefixes,
+    };
     use hyperscale_types::{Settlement, WeightedTimestamp};
 
     use super::*;
@@ -400,6 +424,7 @@ mod tests {
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                charge: stub_abort_charge(0),
             }],
             &ProvisioningTracker::new(),
             &ShardTrie::uniform(0),
@@ -430,6 +455,7 @@ mod tests {
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                charge: stub_abort_charge(0),
             }],
             &ProvisioningTracker::new(),
             &ShardTrie::uniform(0),
@@ -470,6 +496,7 @@ mod tests {
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                charge: stub_abort_charge(0),
             }],
             &ProvisioningTracker::new(),
             &trie,

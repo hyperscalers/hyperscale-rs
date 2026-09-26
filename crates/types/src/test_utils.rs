@@ -20,12 +20,12 @@ use crate::{
     ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
     DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt, ExecutionCertificate,
     ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins, MerkleInclusionProof,
-    NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Role,
-    Round, Routing, Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, StateClaim,
-    StateRoot, StateWrites, StoredReceipt, TickHalf, TickId, TickLine, TimestampRange,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, install_protocol_statics,
+    NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp, ProtocolStatics,
+    QuorumCertificate, Role, Round, Routing, Settlement, ShardForkProof, ShardId, ShardLoad,
+    SignerBitfield, StateClaim, StateRoot, StateWrites, StoredReceipt, TickHalf, TickId, TickLine,
+    TimestampRange, TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope,
+    TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, install_protocol_statics,
     protocol_statics_installed, signed_bytes,
 };
 
@@ -383,26 +383,37 @@ pub fn make_live_block(
 /// every one ready in the block that commits it.
 #[must_use]
 pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
-    let mut hashes: Vec<TxHash> = certified
+    let mut named: Vec<(TxHash, AbortCharge)> = certified
         .block()
         .transactions()
         .iter()
-        .map(|tx| tx.hash())
+        .map(|tx| (tx.hash(), genesis_charge(tx.as_unverified())))
         .collect();
-    hashes.sort_unstable();
+    named.sort_unstable_by_key(|(tx, _)| *tx);
     naming(
         certified,
-        hashes
+        named
             .into_iter()
-            .map(|tx| TickLine::Member {
+            .map(|(tx, charge)| TickLine::Member {
                 tx,
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                charge,
             })
             .collect(),
     )
+}
+
+/// What an abort of `tx` burns at the genesis prices: the charge a
+/// fixture's member line names.
+#[must_use]
+pub fn genesis_charge(tx: &Transaction) -> AbortCharge {
+    AbortCharge {
+        vault: tx.fee_vault(),
+        amount: tx.price(&PriceTable::GENESIS),
+    }
 }
 
 /// `certified` with its tick manifest replaced by `lines`, header and

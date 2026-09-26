@@ -6,8 +6,8 @@ use hyperscale_hbor::{Capped, Hbor};
 use hyperscale_vm_types::Mode;
 
 use crate::{
-    DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK, ShardId,
-    TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TickHalf, TickId, TxHash,
+    AbortCharge, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK,
+    ShardId, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TickHalf, TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -104,7 +104,9 @@ pub enum TickLine {
     /// discard its writes, and nothing otherwise. It and `reach` ride
     /// the line because every replica folds them and only a replica that
     /// can route the transaction can derive them: what a row is judged
-    /// on after naming is what its line named.
+    /// on after naming is what its line named. So is `charge`, the
+    /// floor an abort of the member burns, priced where the line is
+    /// named: a terminal fates the member off its row alone.
     Member {
         /// The transaction, which this chain committed and has not
         /// resolved.
@@ -117,6 +119,8 @@ pub enum TickLine {
         holds: Holds,
         /// The remote shards it reaches.
         reach: Reach,
+        /// What an abort of it burns, out of whose vault.
+        charge: AbortCharge,
     },
     /// An earlier tick lets go of the members `cause` releases.
     Discard {

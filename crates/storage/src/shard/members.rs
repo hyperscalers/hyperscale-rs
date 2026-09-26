@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::{
-    AbandonmentRecord, Address, Block, BlockHeight, CollectionId, Deadline, DiscardCause, EntryKey,
-    Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, Reach,
-    SettledEntries, Settlement, ShardId, ShardTrie, SubstateKey, TickHalf, TickId, TickLine,
-    TickManifest, Transaction, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
+    AbandonmentRecord, AbortCharge, Address, Block, BlockHeight, CollectionId, Deadline,
+    DiscardCause, EntryKey, Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK,
+    MAX_VALIDITY_RANGE, Reach, SettledEntries, Settlement, ShardId, ShardTrie, SubstateKey,
+    TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash, TxOutcome, Verifiable, Verified,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::{ProtocolHasher, TICK_MEMBER_SLOT, collection_id};
 
@@ -71,6 +72,9 @@ pub struct MemberRow {
     /// The remote shards it reaches, as its line named them; empty until
     /// a line names it.
     pub reach: Reach,
+    /// What an abort of it burns, as its line priced it; `None` until a
+    /// line names it.
+    pub charge: Option<AbortCharge>,
     /// Whether a committed abandonment record names it.
     pub covered: bool,
 }
@@ -432,10 +436,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     settlement,
                     holds,
                     reach,
+                    charge,
                 } => {
                     let Some(mut row) = self.member(*tx) else {
                         continue;
                     };
+                    row.charge = Some(*charge);
                     row.state = RowState::InFlight {
                         tick: height,
                         joins: *joins,
@@ -525,6 +531,7 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
                 state: RowState::Pending,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                charge: None,
                 covered: false,
             }),
         );
@@ -750,6 +757,7 @@ impl Substates for MemberIndex {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::Hash;
+    use hyperscale_types::test_utils::stub_abort_charge;
 
     use super::*;
 
@@ -841,6 +849,7 @@ mod tests {
             settlement,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            charge: stub_abort_charge(seed),
         }
     }
 
@@ -872,11 +881,13 @@ mod tests {
         let mut store = Entries::default();
         store.fold(&committing(1, &[1, 2]));
         assert_eq!(state_of(&store, 1), Some(RowState::Pending));
+        let pending = &MemberIndex::load(&store, LOCAL).members[&tx(1)];
         assert_eq!(
-            MemberIndex::load(&store, LOCAL).members[&tx(1)].committed,
+            pending.committed,
             WeightedTimestamp::from_millis(1_000),
             "the row carries its committing block's clock",
         );
+        assert_eq!(pending.charge, None, "no line has priced it yet");
 
         store.fold(&naming(
             2,
@@ -888,6 +899,11 @@ mod tests {
                 if tick == BlockHeight::new(2)
         ));
         let index = MemberIndex::load(&store, LOCAL);
+        assert_eq!(
+            index.members[&tx(1)].charge,
+            Some(stub_abort_charge(1)),
+            "the row keeps the charge its line named",
+        );
         let tick = &index.ticks[&BlockHeight::new(2)];
         assert!(tick.determined_unsettled && tick.legs_unsettled);
         assert_eq!(

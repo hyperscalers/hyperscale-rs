@@ -8112,6 +8112,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            charge: test_utils::genesis_charge(tx),
         }
     }
 
@@ -8227,6 +8228,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            charge: test_utils::genesis_charge(tx),
         };
         let holding_tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
 
@@ -8264,6 +8266,20 @@ mod tests {
             (
                 vec![member(&second), member(&first)],
                 "lines out of canonical order",
+            ),
+            (
+                vec![
+                    TickLine::Member {
+                        tx: first.hash(),
+                        joins: Joins::Executes,
+                        settlement: Settlement::Alone,
+                        holds: Capped::empty(),
+                        reach: Capped::empty(),
+                        charge: stub_abort_charge(9),
+                    },
+                    member(&second),
+                ],
+                "a line pricing its abort at another charge",
             ),
             (vec![member(&first)], "an incomplete manifest"),
             (
@@ -8519,6 +8535,7 @@ mod tests {
                 Capped::empty()
             },
             reach: facts.reach,
+            charge: facts.charge,
         };
         let child = |lines: Vec<TickLine>| {
             carrying(
@@ -8601,6 +8618,7 @@ mod tests {
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
             reach: facts.reach,
+            charge: facts.charge,
         };
         assert!(
             state

@@ -1203,6 +1203,7 @@ impl ExecutionCoordinator {
                 },
                 holds: Capped::empty(),
                 reach: Capped::new(reach).expect("no more counterparts than prefixes"),
+                charge: entry.charge,
             });
             discards.extend(held_by.map(|tick| TickLine::Discard {
                 tick,
@@ -4595,10 +4596,11 @@ mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
-        StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
-        make_finalization_leaving, make_leg_finalization,
-        make_live_block as helpers_make_live_block, naming, proven_claim, state_and_proof,
-        test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
+        StubVmStatics, certify as test_certify, genesis_charge,
+        make_finalization as helpers_make_finalization, make_finalization_leaving,
+        make_leg_finalization, make_live_block as helpers_make_live_block, naming, proven_claim,
+        state_and_proof, stub_abort_charge, test_prefix, test_transaction,
+        test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
@@ -8389,6 +8391,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            charge: genesis_charge(&named_tx),
         }];
         let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
         let sealed = naming(&test_certify(committing.into_sealed(), 2_000), lines);
@@ -8432,6 +8435,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            charge: genesis_charge(tx),
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -8558,6 +8562,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            charge: genesis_charge(tx),
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -8667,6 +8672,7 @@ mod tests {
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                charge: stub_abort_charge(1),
             }],
         ));
 
@@ -13197,6 +13203,7 @@ mod tests {
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                charge: stub_abort_charge(2),
             },
             TickLine::Discard {
                 tick: tick_id,

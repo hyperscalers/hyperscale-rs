@@ -467,13 +467,21 @@ fn the_drains_name_count_alone_would_overrun_the_frame() {
 #[test]
 fn a_tick_lines_weight_bounds_its_encoding() {
     use hyperscale_types::{
-        CollectionId, DeclaredKey, DeclaredRange, DiscardCause, Joins, MAX_HOLDS_PER_MEMBER,
-        MAX_PREFIXES_PER_TX, Settlement, TICK_HOLD_BYTES, TICK_LINE_BYTES, TickId, TickLine,
+        AbortCharge, CollectionId, DeclaredKey, DeclaredRange, DiscardCause, Joins, LocalKey,
+        MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, Settlement, SubstateKey, TICK_HOLD_BYTES,
+        TICK_LINE_BYTES, TickId, TickLine,
     };
     use hyperscale_vm_types::{Mode, Moves};
 
     let widest_tx = TxHash::from(Hash::from_bytes(&[0xFF; 32]));
     let widest_owner = Address::new([0xFF; 31], AddressClass::Component);
+    let widest_charge = AbortCharge {
+        vault: SubstateKey {
+            owner: widest_owner,
+            local: LocalKey([0xFF; 16]),
+        },
+        amount: u128::MAX,
+    };
     let hold = |at: usize| {
         (
             DeclaredKey::Range(DeclaredRange {
@@ -503,6 +511,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                         .collect(),
                 )
                 .expect("a list under the cap"),
+                charge: widest_charge,
             };
             let encoded = hbor_to_vec(&line).expect("a member line encodes");
             assert!(
@@ -535,6 +544,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         settlement: Settlement::Alone,
         holds: Capped::from_array([hold(0)]),
         reach: Capped::empty(),
+        charge: widest_charge,
     };
     assert_eq!(
         one.wire_weight(),
