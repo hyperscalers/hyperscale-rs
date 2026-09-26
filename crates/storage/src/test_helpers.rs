@@ -41,9 +41,9 @@ use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
     Anchored, BOUNDARY_RETAIN, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit, ImportCursor,
-    ImportProgress, JmtSnapshot, PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState,
-    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
-    SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell, committed_here,
+    ImportProgress, JmtSnapshot, MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain,
+    RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
+    Substates, SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell, committed_here,
     committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix, sweep_for_block,
 };
 
@@ -654,6 +654,7 @@ pub fn commit_settled_at<S: TestStore>(
             removals,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
         },
         block.height(),
     );
@@ -1423,6 +1424,7 @@ where
             removals: &[],
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
         },
         one,
     );
@@ -1447,6 +1449,7 @@ where
             removals: &[],
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
         },
         two,
     );
@@ -2246,6 +2249,7 @@ fn commit_raising<S: TestStore>(
             removals: &[],
             frontier,
             state_claims: &claims,
+            members: &MemberInputs::still(ShardId::ROOT),
         },
         block.height(),
     );
@@ -2936,6 +2940,7 @@ where
             removals: &[],
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
         },
         BlockHeight::new(1),
     );
@@ -3030,6 +3035,7 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
             removals: &[],
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
         },
         BlockHeight::new(1),
     );
@@ -3088,6 +3094,7 @@ where
                 removals: &[],
                 frontier: &FrontierInputs::still(ShardId::ROOT),
                 state_claims: &[],
+                members: &MemberInputs::still(ShardId::ROOT),
             },
             BlockHeight::new(1),
         );
@@ -3145,6 +3152,7 @@ where
             removals: &[],
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
         },
         BlockHeight::new(1),
     );

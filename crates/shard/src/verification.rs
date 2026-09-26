@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_storage::{CommittedHere, committed_here, committed_tx_cells};
+use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
@@ -132,6 +132,9 @@ pub struct ReadyStateRootVerification {
     /// What the block's claims do to the read frontier, folded under
     /// the root being verified.
     pub frontier: FrontierInputs,
+    /// What the block writes to tick membership, folded under the root
+    /// being verified.
+    pub members: MemberInputs,
     /// What the read frontier judges of the block against the parent
     /// state.
     pub fence: ReadFence,
@@ -1879,6 +1882,7 @@ impl VerificationPipeline {
             parent_sweep_frontier: chain.parent_sweep_frontier(pending.parent_block_hash),
             claimed_sweep_frontier: block.header().sweep_frontier(),
             frontier: pending.frontier.clone(),
+            members: MemberInputs::of(block),
             fence: pending.fence.clone(),
             state_claims: pending.state_claims.clone(),
             abandonment_records: pending.abandonment_records.clone(),

@@ -20,6 +20,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
 use crate::shard::crossings::{crossing_settlements, owed_credits};
+use crate::shard::members::{MemberInputs, member_writes};
 use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
 use crate::tree::JmtSnapshot;
 use crate::{
@@ -475,7 +476,8 @@ pub fn sweep_through(
 ///
 /// The receipts its ticks settled, the committed cells its committer
 /// derived, the sweep its header names, the crossing settlements its
-/// claims license, and the read frontier its claims raise.
+/// claims license, the read frontier its claims raise, and the tick
+/// membership its content moves.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
@@ -510,7 +512,8 @@ pub fn followed_block_writes(
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
     let settled = crossing_settlements(block.state_claims(), &merged, prior);
     let removals = removals_of(&swept, &settled);
-    let raised = read_frontier_writes(prior, frontier);
+    let mut raised = read_frontier_writes(prior, frontier);
+    raised.extend(member_writes(prior, &MemberInputs::of(block)));
     filter_writes_to_prefix(
         &with_frontier(with_sweep(merged, creations, &removals), raised),
         prefix,

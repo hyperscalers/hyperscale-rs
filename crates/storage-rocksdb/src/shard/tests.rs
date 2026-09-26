@@ -35,8 +35,9 @@ use hyperscale_storage::test_helpers::{
     test_witness_window_retention_and_recovery, with_provisions,
 };
 use hyperscale_storage::{
-    BoundaryStore, ChainWrites, PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore,
-    ShardChainReader, ShardChainWriter, SubstateStore, Substates, VersionedStore,
+    BoundaryStore, ChainWrites, MemberInputs, PackageArtifactStore, ParentAnchor,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
+    VersionedStore,
 };
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
@@ -552,11 +553,13 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
     writes.cells.insert(cell, Some(vec![4, 5]));
     writes.entries.insert(entry, Some(vec![1, 2, 3]));
     let still = FrontierInputs::still(ShardId::ROOT);
+    let members = MemberInputs::still(ShardId::ROOT);
     let chain = ChainWrites {
         creations: &[],
         removals: &[],
         frontier: &still,
         state_claims: &[],
+        members: &members,
     };
 
     // Block 1 writes both values and persists.

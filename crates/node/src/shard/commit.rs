@@ -24,7 +24,7 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{
-    ChainEntry, ChainWrites, ParentAnchor, PendingChain, ShardStorage, SubstateStore,
+    ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage, SubstateStore,
     sweep_for_block,
 };
 use hyperscale_types::{
@@ -241,6 +241,7 @@ where
             removals: &removals,
             frontier: &pending.frontier,
             state_claims: block.state_claims(),
+            members: &MemberInputs::of(block),
         },
         height,
     );

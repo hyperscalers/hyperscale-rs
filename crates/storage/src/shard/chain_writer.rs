@@ -12,7 +12,7 @@ use hyperscale_types::{
     Verifiable,
 };
 
-use crate::{Anchored, BaseReadCache, JmtSnapshot};
+use crate::{Anchored, BaseReadCache, JmtSnapshot, MemberInputs};
 
 /// The block a new one builds on: what it committed, and the state it
 /// left behind.
@@ -70,8 +70,9 @@ pub struct ParentAnchor<'a> {
 ///
 /// What the chain itself writes for a block beyond its receipts: the
 /// committed cells it creates, the cells its sweep retires, what its
-/// claims do to the read frontier, and the claims themselves, whose
-/// readings license the crossing settlements the fold removes.
+/// claims do to the read frontier, the claims themselves, whose
+/// readings license the crossing settlements the fold removes, and
+/// what it does to tick membership.
 ///
 /// Derived from the block and the schedule by whoever prepares the
 /// commit, so every reader of the root derives one set.
@@ -86,6 +87,8 @@ pub struct ChainWrites<'a> {
     pub frontier: &'a FrontierInputs,
     /// The block's claims.
     pub state_claims: &'a [StateClaim],
+    /// What the block writes to the tick membership family.
+    pub members: &'a MemberInputs,
 }
 
 /// All methods take `&self` — implementations use interior mutability.

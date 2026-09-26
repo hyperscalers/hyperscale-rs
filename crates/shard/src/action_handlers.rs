@@ -13,10 +13,11 @@ use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    BeaconChainReader, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage,
-    SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore,
-    colliding_committed_cell, committed_tx_cells, creations_of, load_read_frontier,
-    sweep_for_block, without_colliding_committed_cells,
+    BeaconChainReader, ChainWrites, JmtSnapshot, MemberInputs, ParentAnchor, ShardChainWriter,
+    ShardStorage, SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore,
+    colliding_committed_cell, colliding_member_row, committed_tx_cells, creations_of,
+    load_read_frontier, sweep_for_block, without_colliding_committed_cells,
+    without_colliding_member_rows,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -264,6 +265,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // ones stay pooled.
     let mut transactions = transactions.clone();
     without_colliding_committed_cells(local_shard, chain_origin, &mut transactions, &anchored);
+    // The same for a transaction whose member row key another's takes.
+    without_colliding_member_rows(local_shard, &mut transactions, &anchored);
     let transactions = &transactions;
     // The sweep, before the root it moves. Removals are ordinary writes,
     // so they fold in with the block's settling receipts and land under
@@ -285,6 +288,18 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // proposer's voters, a replica committing on the certificate alone,
     // a split child following the block — derives the same set.
     let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
+    // The lines naming what this block's tick holds and lets go, and
+    // what the block does to tick membership.
+    let tick_manifest: Arc<TickManifest> = Arc::new(Capped::empty());
+    let members = MemberInputs::from_parts(
+        local_shard,
+        height,
+        parent_qc.weighted_timestamp(),
+        transactions.iter().map(|tx| &***tx),
+        &certificates,
+        &abandonment_records,
+        Arc::clone(&tick_manifest),
+    );
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,
@@ -299,6 +314,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
             removals: &removals,
             frontier,
             state_claims: &state_claims,
+            members: &members,
         },
         height,
     );
@@ -420,8 +436,6 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // What the provisions engage, committed so a sealed form keeps the
     // entries the engagement tier folds after the bodies are gone.
     let engagement_root = EngagementRoot::over(&Engagement::of_provisions(&provisions));
-    // The lines naming what this block's tick holds and lets go.
-    let tick_manifest: TickManifest = Capped::empty();
     let tick_manifest_root = Verified::<TickManifestRoot>::compute(&tick_manifest).into_inner();
 
     let header = BlockHeader::new(BlockHeaderParts {
@@ -462,7 +476,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         provisions: Arc::new(provisions),
         abandonment_records: Arc::new(abandonment_records),
         state_claims: Arc::new(state_claims),
-        tick_manifest: Arc::new(tick_manifest),
+        tick_manifest,
         witness_sources,
     };
 
@@ -1045,6 +1059,7 @@ where
             parent_sweep_frontier,
             claimed_sweep_frontier,
             frontier,
+            members,
             fence,
             state_claims,
             abandonment_records,
@@ -1135,6 +1150,26 @@ where
                 });
                 return;
             }
+            // Nor one whose member row key a standing row or another
+            // of its transactions takes: one row would stand for two.
+            if let Some(tx) = colliding_member_row(
+                members.shard,
+                members.transactions.iter().map(|(tx, _)| *tx),
+                &anchored,
+            ) {
+                tracing::warn!(
+                    ?block_hash,
+                    height = block_height.inner(),
+                    ?tx,
+                    "Rejecting block whose member row key is already taken"
+                );
+                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                    block_hash,
+                    kind: VerificationKind::StateRoot,
+                    outcome: CheckOutcome::Refused,
+                });
+                return;
+            }
             // The read frontier's fence, judged against the parent
             // state: a record presence below the floor its producer's
             // lineage has been read to, one below a same-block absence
@@ -1206,6 +1241,7 @@ where
                     removals: &removals,
                     frontier: &frontier,
                     state_claims: &state_claims,
+                    members: &members,
                 },
                 block_height,
             );

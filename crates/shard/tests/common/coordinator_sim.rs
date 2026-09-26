@@ -36,8 +36,8 @@ use hyperscale_shard::local_crossings::{
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
     ChainEntry, ChainWrites, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
-    ShardChainWriter, SubstateStore, TerminalWindow, colliding_committed_cell, creations_of,
-    sweep_for_block,
+    ShardChainWriter, SubstateStore, TerminalWindow, colliding_committed_cell,
+    colliding_member_row, creations_of, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -1122,6 +1122,7 @@ impl ShardCoordinatorSim {
                 parent_sweep_frontier: ready.parent_sweep_frontier,
                 claimed_sweep_frontier: ready.claimed_sweep_frontier,
                 frontier: ready.frontier,
+                members: ready.members,
                 fence: ready.fence,
                 state_claims: ready.state_claims,
                 abandonment_records: ready.abandonment_records,
@@ -1856,6 +1857,7 @@ impl ShardCoordinatorSim {
                 parent_sweep_frontier,
                 claimed_sweep_frontier,
                 frontier,
+                members,
                 fence: _,
                 state_claims,
                 abandonment_records,
@@ -1909,6 +1911,15 @@ impl ShardCoordinatorSim {
                     "the sim's proposer defers a transaction whose committed cell collides",
                 );
                 assert!(
+                    colliding_member_row(
+                        members.shard,
+                        members.transactions.iter().map(|(tx, _)| *tx),
+                        &view.snapshot(),
+                    )
+                    .is_none(),
+                    "the sim's proposer defers a transaction whose member row collides",
+                );
+                assert!(
                     disagreeing_parent_reading(&state_claims, self.shard, &view.snapshot())
                         .is_none(),
                     "the sim's proposer reads its parent as its verifiers do",
@@ -1931,6 +1942,7 @@ impl ShardCoordinatorSim {
                         removals: &removals,
                         frontier: &frontier,
                         state_claims: &state_claims,
+                        members: &members,
                     },
                     block_height,
                 );

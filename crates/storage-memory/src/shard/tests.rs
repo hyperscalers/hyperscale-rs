@@ -18,8 +18,8 @@ use hyperscale_storage::test_helpers::{
     test_witness_window_retention_and_recovery,
 };
 use hyperscale_storage::{
-    ChainWrites, DedupWindow, ParentAnchor, ShardChainReader, ShardChainWriter, SubstateStore,
-    Substates, VersionedStore, test_helpers,
+    ChainWrites, DedupWindow, MemberInputs, ParentAnchor, ShardChainReader, ShardChainWriter,
+    SubstateStore, Substates, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
     install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_transaction,
@@ -309,6 +309,7 @@ fn test_prepare_commit_state_root_matches() {
             removals: &[],
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
         },
         BlockHeight::new(1),
     );

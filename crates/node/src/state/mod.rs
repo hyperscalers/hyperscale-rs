@@ -541,6 +541,7 @@ impl StateMachine for NodeStateMachine {
                     parent_sweep_frontier: ready.parent_sweep_frontier,
                     claimed_sweep_frontier: ready.claimed_sweep_frontier,
                     frontier: ready.frontier,
+                    members: ready.members,
                     fence: ready.fence,
                     state_claims: ready.state_claims,
                     abandonment_records: ready.abandonment_records,

@@ -8,7 +8,7 @@ use hyperscale_storage::tree::{
 };
 use hyperscale_storage::{
     ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, crossing_settlements,
-    holds_this_block_at, read_frontier_writes, settled_writes_at,
+    holds_this_block_at, member_writes, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
@@ -31,6 +31,7 @@ impl ShardChainWriter for SimShardStorage {
             removals,
             frontier,
             state_claims,
+            members,
         } = chain;
         // Everything the ticks carried, for storage; only what they
         // decided reaches state.
@@ -38,7 +39,10 @@ impl ShardChainWriter for SimShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let frontier = read_frontier_writes(parent.state, frontier);
+        // The chain's own protocol families: the read frontier and tick
+        // membership, each read off the parent state it advances.
+        let mut frontier = read_frontier_writes(parent.state, frontier);
+        frontier.extend(member_writes(parent.state, members));
         // What the claims settle against the parent state, read once
         // for the no-op test below; the fold reads it again beside the
         // receipts, whose writes it defers to.

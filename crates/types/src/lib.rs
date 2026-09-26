@@ -207,7 +207,7 @@ pub use shard::roots::{
 pub use shard::state_claim::{StateClaim, Stated};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
-pub use shard::tick_manifest::{DiscardCause, Holds, Joins, TickLine, TickManifest};
+pub use shard::tick_manifest::{DiscardCause, Holds, Joins, Settlement, TickLine, TickManifest};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};

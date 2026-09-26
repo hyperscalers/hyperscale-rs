@@ -469,7 +469,7 @@ fn the_drains_name_count_alone_would_overrun_the_frame() {
 fn a_tick_lines_weight_bounds_its_encoding() {
     use hyperscale_types::{
         CollectionId, DeclaredKey, DeclaredRange, DiscardCause, Joins, MAX_HOLDS_PER_MEMBER,
-        TICK_HOLD_BYTES, TICK_LINE_BYTES, TickId, TickLine,
+        Settlement, TICK_HOLD_BYTES, TICK_LINE_BYTES, TickId, TickLine,
     };
     use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode, Moves};
 
@@ -495,6 +495,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
             let line = TickLine::Member {
                 tx: widest_tx,
                 joins: Joins::ExecutesAborted,
+                settlement: Settlement::Awaited,
                 holds: Capped::new((0..holds).map(|at| (hold(at).0, mode)).collect())
                     .expect("a list under the cap"),
             };
@@ -549,6 +550,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
     let one = TickLine::Member {
         tx: widest_tx,
         joins: Joins::Executes,
+        settlement: Settlement::Alone,
         holds: Capped::from_array([hold(0)]),
     };
     assert_eq!(

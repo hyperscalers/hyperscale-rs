@@ -50,6 +50,10 @@ pub use shard::crossings::crossing_settlements;
 pub use shard::dedup_window::{DedupWindow, FeeHold};
 pub use shard::derived::{Indexed, LeafRows, RowChange, index_leaf};
 pub use shard::genesis::GenesisCommit;
+pub use shard::members::{
+    MemberIndex, MemberInputs, MemberRow, RowState, SettledHalf, TickRow, colliding_member_row,
+    member_order, member_writes, without_colliding_member_rows,
+};
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
     BaseReadCache, ChainEntry, PendingChain, SubstateView, TerminalWindow,

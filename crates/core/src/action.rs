@@ -7,7 +7,7 @@ use std::time::Duration;
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
 use hyperscale_engine::legs::{Member, Runs};
-use hyperscale_storage::{CommittedHere, TickResolution};
+use hyperscale_storage::{CommittedHere, MemberInputs, TickResolution};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
@@ -786,6 +786,9 @@ pub enum Action {
         /// What the block's claims do to the read frontier, folded under
         /// the root being verified.
         frontier: FrontierInputs,
+        /// What the block writes to tick membership, folded under the
+        /// root being verified.
+        members: MemberInputs,
         /// What the read frontier judges of the block against the parent
         /// state: its record presences, its absences and its late
         /// deliveries' answers. A refusal refuses the state root.

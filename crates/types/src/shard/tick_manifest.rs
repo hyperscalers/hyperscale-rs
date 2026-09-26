@@ -7,7 +7,7 @@ use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode};
 
 use crate::{
     DeclaredKey, ESCROWED_RECORD_BYTES, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK,
-    SubstateKey, TICK_HOLD_BYTES, TICK_LINE_BYTES, TickId, TxHash,
+    SubstateKey, TICK_HOLD_BYTES, TICK_LINE_BYTES, TickHalf, TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -39,6 +39,33 @@ impl Joins {
     #[must_use]
     pub const fn aborts(self) -> bool {
         matches!(self, Self::ExecutesAborted | Self::Aborted)
+    }
+}
+
+/// How a member's settlement stands to its counterparts: which half of
+/// its tick settles it, and whether a discard keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Hbor)]
+pub enum Settlement {
+    /// On this shard's certificate alone: the determined half.
+    Alone,
+    /// The legs half, and a counterpart settles it against this shard's
+    /// certificate, which may already be out: a whole or core member. A
+    /// discard keeps it.
+    Shared,
+    /// The legs half, awaiting counterparts that settle nothing against
+    /// this shard's certificate: a leg, or a member this tick settles
+    /// rather than runs. A discard releases it.
+    Awaited,
+}
+
+impl Settlement {
+    /// The finalization half that settles a member of this kind.
+    #[must_use]
+    pub const fn half(self) -> TickHalf {
+        match self {
+            Self::Alone => TickHalf::Determined,
+            Self::Shared | Self::Awaited => TickHalf::Legs,
+        }
     }
 }
 
@@ -82,6 +109,8 @@ pub enum TickLine {
         tx: TxHash,
         /// The terms it joins on.
         joins: Joins,
+        /// Which half settles it, and whether a discard keeps it.
+        settlement: Settlement,
         /// What it holds while the tick is in flight.
         holds: Holds,
     },

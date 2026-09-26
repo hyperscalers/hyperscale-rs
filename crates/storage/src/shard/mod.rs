@@ -15,6 +15,7 @@ pub mod crossings;
 pub mod dedup_window;
 pub mod derived;
 pub mod genesis;
+pub mod members;
 pub mod packages;
 pub mod pending_chain;
 pub mod read_frontier;
