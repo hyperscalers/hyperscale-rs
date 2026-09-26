@@ -29,6 +29,7 @@ use hyperscale_scenarios::{
     a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
     a_departing_venue_clears_swaps_and_carries_on,
+    a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
     a_fee_hold_stands_until_its_burn, a_healed_network_delivers_past_the_old_window,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
@@ -1699,6 +1700,23 @@ fn a_departing_venues_terminal_hands_on_what_it_never_took_sim() {
         GenesisPackages::with_fixtures(),
     );
     a_departing_venues_terminal_hands_on_what_it_never_took(&mut cluster, epochs(24));
+}
+
+#[test]
+fn a_departing_venues_terminal_fates_what_it_could_not_run_sim() {
+    let mut accounts = departing_venue_ballast();
+    accounts.extend(venue_genesis_accounts_on(
+        STRADDLER_SPLITTER,
+        &[STRADDLER_SURVIVOR],
+    ));
+    let mut cluster = SimCluster::with_packages(
+        &departing_venue_config(),
+        11,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    cluster
+        .run_faultable(|c| a_departing_venues_terminal_fates_what_it_could_not_run(c, epochs(24)));
 }
 
 #[test]

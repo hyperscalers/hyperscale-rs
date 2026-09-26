@@ -93,6 +93,7 @@ pub use route::{
 };
 pub use route_reshape::{
     MERGE_TRAIN, SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,
+    a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,

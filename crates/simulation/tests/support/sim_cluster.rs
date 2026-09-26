@@ -29,7 +29,7 @@ use hyperscale_scenarios::{
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
-use hyperscale_storage::{ShardChainReader, SubstateStore};
+use hyperscale_storage::{MemberIndex, ShardChainReader, SubstateStore};
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock,
     ConsensusReceipt, Derivation, Event, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId,
@@ -735,6 +735,19 @@ impl Cluster for SimCluster {
             .max_by_key(|store| ShardChainReader::committed_height(*store))
             .and_then(|store| store.get_certified_header(store.committed_height()))
             .map(|header| header.header().txs_in_flight())
+    }
+
+    fn member_rows(&self, shard: ShardId) -> Option<Vec<TxHash>> {
+        // Tallest chain, as the in-flight count reads it.
+        let store = (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .max_by_key(|store| ShardChainReader::committed_height(*store))?;
+        Some(
+            MemberIndex::load(&store.snapshot(), shard)
+                .members
+                .into_keys()
+                .collect(),
+        )
     }
 
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {

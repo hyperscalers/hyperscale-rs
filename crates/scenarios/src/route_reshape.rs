@@ -32,7 +32,7 @@ use crate::straddler::{
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, clock, epoch_duration_ms, held, held_at,
+    anchored_genesis_height, beacon_epoch, clock, declared_price, epoch_duration_ms, held, held_at,
     merge_keeper_count, scheduled_terminal_epoch, split_admitted,
 };
 use crate::support::tx::{
@@ -670,6 +670,124 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
         "swaps across the venue's terminal",
     );
 }
+
+/// A swap the departing venue included but could not run is fated at
+/// its terminal, and its caller's input comes home once.
+///
+/// The venue sits on the splitter and its callers on the survivor. Every
+/// crossing reading the survivor pushes is dropped, and so is every
+/// proof the venue could ask for in its place, so a swap the venue
+/// includes stands as a member waiting on its input. The venue coasts
+/// from its drain on blocks that name no line, so nothing ends the
+/// member before its terminal, which fates it: an abort committed in the
+/// terminal's own manifest, with the member's floor charge burned there.
+/// No child reads the member's row as its own. Once the cut lifts, the
+/// survivor reads the venue's settled set without the swap, names it in
+/// an abandonment record, and the escrowed input comes back to the
+/// caller exactly once; both worlds are conserved with nothing locked.
+///
+/// # Panics
+///
+/// Panics as [`departing_callers`] does, and if the venue does not
+/// include the swap before its terminal, if the terminal does not fate
+/// it, if a child holds its row, if the readings were never cut, if the
+/// input does not come home once, or if either world is not conserved.
+pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let (venue_shard, caller_shard) = (STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+    let (set, cut) = callers_against_a_scheduled_cut(c, venue_shard, caller_shard, budget);
+    let mut charges = Charges::default();
+    let (key, caller) = &set.swappers[0];
+    // A window closing past the cut, so no deadline ends the member
+    // before the terminal does; submitted as it opens, while the venue
+    // still includes.
+    let window = TimestampRange::new(
+        cut.minus(FATED_OPENS_BEFORE_THE_CUT),
+        cut.plus(FATED_CLOSES_AFTER_THE_CUT),
+    );
+    assert!(
+        c.run_until(budget, |c| clock(c) >= window.start_timestamp_inclusive),
+        "the swap's window must open before the cut",
+    );
+
+    let held_back = [
+        c.drop_type("crossing.readings"),
+        c.drop_type("state_proof.request"),
+        c.drop_type("remote_header.request"),
+    ];
+    let funded = held(c, caller.address(), *PROTOCOL_RESOURCE);
+    let swap = build_swap_tx(
+        key,
+        *caller,
+        &set.venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        window,
+    );
+    let price = declared_price(c, &swap);
+    let hash = charges.submit(c, swap);
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(venue_shard, hash).0.is_some()),
+        "the venue must include the swap before its terminal",
+    );
+    await_cut(c, venue_shard);
+
+    let fate = c.chain_fate(venue_shard, hash).1;
+    let (left, right) = venue_shard.children();
+    let terminal = anchored_genesis_height(c, left).and_then(BlockHeight::prev);
+    assert!(
+        matches!(fate, Some((at, TransactionDecision::Aborted)) if Some(at) == terminal),
+        "the venue's terminal at {terminal:?} must fate the swap it held; fate = {fate:?}",
+    );
+    for child in [left, right] {
+        assert!(
+            c.member_rows(child)
+                .is_none_or(|rows| !rows.contains(&hash)),
+            "{child:?} reads the fated swap's row as its own",
+        );
+    }
+    assert!(
+        held_back.iter().any(|handle| handle.fired() > 0),
+        "the readings must actually have been cut, or the venue ran the swap",
+    );
+    c.clear_drops();
+
+    let home = funded - price;
+    assert!(
+        c.run_until(budget, |c| held(c, caller.address(), *PROTOCOL_RESOURCE)
+            == home),
+        "the caller's input must come home, less the price: holds {} against {home}",
+        held(c, caller.address(), *PROTOCOL_RESOURCE),
+    );
+    let locked = set.protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        budget,
+        "a swap fated at the venue's terminal",
+    );
+    assert!(locked.is_empty(), "nothing stays locked: {locked:?}");
+    set.units.assert_settles_within(
+        c,
+        &Charges::default(),
+        budget,
+        "a swap fated at the venue's terminal",
+    );
+    assert_eq!(
+        held(c, caller.address(), *PROTOCOL_RESOURCE),
+        home,
+        "the input comes home once",
+    );
+}
+
+/// How far before the venue's cut the fated swap's window opens, and how
+/// far past it the window closes: together one validity range less a
+/// margin, so the venue can include it before it coasts and its deadline
+/// falls after the terminal.
+const FATED_OPENS_BEFORE_THE_CUT: Duration = Duration::from_secs(110);
+const FATED_CLOSES_AFTER_THE_CUT: Duration = Duration::from_secs(10);
 
 /// How far before the venue's cut the post-cut swap's window opens, and
 /// how far past it the window closes: together one validity range less

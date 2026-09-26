@@ -199,6 +199,16 @@ pub trait Cluster {
     /// level itself, and no transaction status reports it.
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight>;
 
+    /// The transactions `shard`'s own member collection holds rows for at
+    /// its tip, or `None` where this cluster cannot read state entries.
+    ///
+    /// An observation seam, like [`Self::committed_txs_in_flight`]: a
+    /// terminal fates every row it holds, and whether a successor reads
+    /// one as its own is a fact about committed state no status reports.
+    fn member_rows(&self, _shard: ShardId) -> Option<Vec<TxHash>> {
+        None
+    }
+
     /// The status of `tx`, if any hosted mempool or execution still tracks it.
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus>;
 
