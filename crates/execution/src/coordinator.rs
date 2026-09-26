@@ -62,16 +62,16 @@ use hyperscale_metrics::{
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
-    CertifiedBlock, CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation,
-    DiscardCause, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
-    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    Joins, MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions,
-    ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim,
-    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
-    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CertifiedBlock,
+    CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
+    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, Joins,
+    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions, ScheduleLookup,
+    SettledSetVerdict, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim, StateWrites,
+    StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, WindowView, derive_block_transactions,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
@@ -2955,9 +2955,8 @@ impl ExecutionCoordinator {
     ///    is seated.
     /// 5. **Timeouts, then pruning**, so a retry fires before the tick it
     ///    references is pruned away.
-    /// 6. **Dispatch** — the live path seats and dispatches; the
-    ///    sealed path records tx → tick mappings so late certificates
-    ///    route back to the mempool.
+    /// 6. **Seat, then dispatch** — both forms seat the tick the block
+    ///    names; only a live one within the store's reach dispatches it.
     #[instrument(skip(self, certified, topology_schedule), fields(
         height = certified.block().height().inner(),
         block_hash = ?certified.block().hash(),
@@ -3189,39 +3188,16 @@ impl ExecutionCoordinator {
         actions.extend(self.drain_ready_tick_resolutions());
 
         let mut named = Vec::new();
-        match block {
-            Block::Live {
-                header,
-                transactions,
-                provisions,
-                ..
-            } => actions.extend(self.on_live_block_committed(
-                &mut named,
-                topology_schedule,
-                anchored,
-                block.hash(),
-                header,
-                transactions,
-                provisions,
-                block.state_claims(),
-                block.abandonment_records(),
-                block.certificates(),
-                match naming {
-                    Naming::Manifest => Named::Lines(block.tick_manifest()),
-                    Naming::Composed => Named::Composed(&unanswerable),
-                },
-            )),
-            Block::Sealed {
-                header,
-                transactions,
-                ..
-            } => actions.extend(self.on_sealed_block_committed(
-                topology_schedule,
-                anchored,
-                header,
-                transactions,
-            )),
-        }
+        actions.extend(self.on_block_committed(
+            &mut named,
+            topology_schedule,
+            anchored,
+            block,
+            match naming {
+                Naming::Manifest => Named::Lines(block.tick_manifest()),
+                Naming::Composed => Named::Composed(&unanswerable),
+            },
+        ));
 
         CommitEffects {
             resolutions,
@@ -3231,40 +3207,28 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Live path: still within the cross-shard execution window. Proposer
-    /// broadcasts provisions, setup+dispatch runs for the block's txs, and
-    /// inline provisions are applied so newly-created ticks can transition
-    /// to `Provisioned` immediately.
-    #[allow(clippy::too_many_arguments)] // one section of the committing block per argument
-    fn on_live_block_committed(
+    /// What this commit sends out: the provisions its proposer
+    /// broadcasts, the crossing readings the parent's commit made go with
+    /// it, and the pushes queued for the next. Nothing on a block this
+    /// replica cannot run.
+    fn pushes(
         &mut self,
-        seated: &mut Vec<TickLine>,
-        topology_schedule: &TopologySchedule,
         anchored: &TopologySnapshot,
-        block_hash: BlockHash,
-        header: &BlockHeader,
-        transactions: &[Arc<Verifiable<Transaction>>],
-        provisions: &[Arc<Verifiable<Provisions>>],
-        state_claims: &[StateClaim],
-        abandonment_records: &[AbandonmentRecord],
-        finalizations: &[Arc<Verifiable<Finalization>>],
-        named: Named<'_>,
+        committed: &Block,
+        runnable: bool,
     ) -> Vec<Action> {
+        let block_hash = committed.hash();
+        let header = committed.header();
+        let transactions = committed.transactions();
+        let finalizations = committed.certificates();
         let height = header.height();
-        let mut actions = Vec::new();
-
-        // Below where a baseline is readable a tick is seated and never
-        // runs: which tick holds a member is what every replica has to
-        // agree on, and the baseline is the only part of it the store
-        // cannot answer for.
-        let runnable = height >= self.dispatch_from;
-
         // ── Provision broadcasting (proposer only) ─────────────────────
         // The crossing changes the parent block made go with it: this
         // block's certified header is what proves the parent to a
         // reader, and its proposer sends both. Taken whether or not this
         // replica proposes, so nothing older than one commit is ever
         // pushed.
+        let mut actions = Vec::new();
         let pending_push = self.pending_push.take();
         if runnable && self.me == header.proposer() {
             let local_shard = self.local_shard;
@@ -3319,6 +3283,42 @@ impl ExecutionCoordinator {
             };
             self.pending_push = Some((block_hash, anchor, targets));
         }
+        actions
+    }
+
+    /// One commit path for both block forms: register what the block
+    /// commits, apply the bundles it carries, and seat the tick it names.
+    ///
+    /// A `Sealed` block is seated exactly as a `Live` one is, since both
+    /// keep the transactions, the claims, the records and the manifest
+    /// seating reads, but its tick is never dispatched: it carries no
+    /// bundles to run a cross-shard member over, and its proposer's pushes
+    /// went out when it was live.
+    fn on_block_committed(
+        &mut self,
+        seated: &mut Vec<TickLine>,
+        topology_schedule: &TopologySchedule,
+        anchored: &TopologySnapshot,
+        committed: &Block,
+        named: Named<'_>,
+    ) -> Vec<Action> {
+        let block_hash = committed.hash();
+        let header = committed.header();
+        let transactions = committed.transactions();
+        let provisions = committed.provisions();
+        let state_claims = committed.state_claims();
+        let abandonment_records = committed.abandonment_records();
+        let height = header.height();
+        let mut actions = Vec::new();
+
+        // Below where a baseline is readable, or on a sealed block with
+        // no bundles to run over, a tick is seated and never runs: which
+        // tick holds a member is what every replica has to agree on, and
+        // the baseline and the bundles are what this replica may not
+        // hold.
+        let runnable = committed.is_live() && height >= self.dispatch_from;
+
+        actions.extend(self.pushes(anchored, committed, runnable));
 
         let block = CommittingBlock {
             hash: block_hash,
@@ -3859,27 +3859,6 @@ impl ExecutionCoordinator {
         }]
     }
 
-    /// Sealed path: past the cross-shard execution window. Ticks will
-    /// finalize from the already-aggregated cert + receipts included
-    /// downstream, so we skip `TickState` creation, dispatch, and vote
-    /// tracking. Only the tx → tick mapping is recorded (plus any early
-    /// ECs replayed) so a late-arriving cert still routes back to each
-    /// tx for mempool terminal-state bookkeeping.
-    fn on_sealed_block_committed(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        anchored: &TopologySnapshot,
-        header: &BlockHeader,
-        transactions: &[Arc<Verifiable<Transaction>>],
-    ) -> Vec<Action> {
-        if transactions.is_empty() {
-            return Vec::new();
-        }
-        self.register_sealed_assignments(anchored, header.height(), transactions);
-        let tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
-        self.replay_early_attestations(topology_schedule, &tx_hashes)
-    }
-
     /// Replay buffered certificates for transactions that have just
     /// gained a tick assignment.
     ///
@@ -3906,27 +3885,6 @@ impl ExecutionCoordinator {
             actions.extend(self.handle_attestation(topology_schedule, ec));
         }
         actions
-    }
-
-    /// Register tx → tick assignments for a `Sealed` block without any of
-    /// the execution-side state setup (`TickState`, vote tracker, conflict
-    /// detector, required-provision tracking). The block's ticks are
-    /// already settled; we only need the mapping so a future cert can
-    /// route back to the tx for mempool terminal-state bookkeeping.
-    fn register_sealed_assignments(
-        &mut self,
-        topology_snapshot: &TopologySnapshot,
-        block_height: BlockHeight,
-        transactions: &[Arc<Verifiable<Transaction>>],
-    ) {
-        let _ = topology_snapshot;
-        let tick_id = TickId::new(self.local_shard, block_height);
-        for tx in transactions {
-            self.ticks.assign_tx(tx.hash(), tick_id);
-            self.counterparts
-                .ledger
-                .certify(tx.hash(), Certified::ByExecution);
-        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -8323,6 +8281,53 @@ mod tests {
             None,
             "the replayed finalization hands the transaction back, so nothing \
              speaks for it",
+        );
+    }
+
+    /// A sealed block seats exactly what its live form does: the tick its
+    /// manifest names, and nothing its manifest does not name. It is
+    /// never dispatched, since it carries no bundles to run over.
+    #[test]
+    fn a_sealed_block_seats_what_its_live_form_does() {
+        let schedule = make_test_topology();
+        let named_tx = test_transaction(1);
+        let unnamed_tx = test_transaction(2);
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        let committing = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(named_tx.clone()), Arc::new(unnamed_tx.clone())],
+        );
+        let lines = vec![TickLine::Member {
+            tx: named_tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+        }];
+        let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
+        let sealed = naming(&test_certify(committing.into_sealed(), 2_000), lines);
+        let seat = |certified: &CertifiedBlock| {
+            let mut state = make_test_state();
+            state.commit_block_carrying(
+                &schedule,
+                &test_certify(seed.clone(), 1_000),
+                Naming::Manifest,
+            );
+            state.commit_block_carrying(&schedule, certified, Naming::Manifest);
+            state
+        };
+        let (live, sealed) = (seat(&live), seat(&sealed));
+        let tick = Some(TickId::new(ShardId::ROOT, BlockHeight::new(2)));
+        for state in [&live, &sealed] {
+            assert_eq!(state.ticks.tick_assignment(named_tx.hash()), tick);
+            assert_eq!(state.ticks.tick_assignment(unnamed_tx.hash()), None);
+        }
+        assert!(live.tick_in_flight || !live.pending_ticks.is_empty());
+        assert!(
+            !sealed.tick_in_flight && sealed.pending_ticks.is_empty(),
+            "a sealed tick is seated, never dispatched",
         );
     }
 
