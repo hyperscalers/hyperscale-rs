@@ -703,6 +703,27 @@ pub struct VenueReport {
     /// the regression it exists to catch. The venue's chain commits many
     /// times a second and its height is exact.
     pub blocks: u64,
+    /// Blocks the venue's shard committed across [`IDLE_SPAN`] with
+    /// nothing queued, just before the queue opened: its own pace.
+    pub idle_blocks: u64,
+}
+
+/// How long the venue's shard is watched idle before its queue opens.
+const IDLE_SPAN: Duration = Duration::from_secs(10);
+
+impl VenueReport {
+    /// What the queue took in thousandths of the venue's idle pace.
+    ///
+    /// The shards of one world commit at their own pace whatever their
+    /// load — forty blocks in ten idle seconds on one, seventy on
+    /// another — so a raw block count says as much about which shard
+    /// the venue landed on as about the queue. Divided by the shard's
+    /// own idle count it keeps the chain's resolution and loses its
+    /// pace.
+    #[must_use]
+    pub fn paced(&self) -> u64 {
+        self.blocks * 1_000 / self.idle_blocks.max(1)
+    }
 }
 
 /// Stand a venue up and drive every swapper at it at once.
@@ -744,6 +765,12 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
     let worlds = venue_worlds(c, &venue, swappers.iter().map(|(_, account)| *account));
     let mut charges = Charges::default();
 
+    let idle_from = c.now();
+    let idle_opened = c
+        .committed_height(venue_shard)
+        .expect("the venue's shard commits")
+        .inner();
+    let _ = c.run_until(budget, |c| c.now() >= idle_from + IDLE_SPAN);
     // Every swapper at once: the venue's cells are what they contend
     // for, so what the run measures is how fast that queue drains.
     let start = c.now();
@@ -765,7 +792,10 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
         submissions.push(charges.submit(c, tx));
     }
 
-    let report = settle_swaps(c, &submissions, (start, opened), venue_shard, budget);
+    let report = VenueReport {
+        idle_blocks: opened.saturating_sub(idle_opened),
+        ..settle_swaps(c, &submissions, (start, opened), venue_shard, budget)
+    };
     assert_pair_conserved(c, &worlds, &charges, budget, "a hot venue's queue");
     report
 }
@@ -820,5 +850,6 @@ fn settle_swaps<C: Cluster>(
         elapsed: last.saturating_sub(start),
         latency_p50: latencies[latencies.len() / 2],
         blocks: closed.saturating_sub(opened),
+        idle_blocks: 0,
     }
 }

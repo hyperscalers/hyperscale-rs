@@ -677,14 +677,11 @@ fn wide_venue_cluster(seed: u64) -> SimCluster {
 /// One reading is not a measurement. Per seed the fanned-in queue lands
 /// anywhere from eight blocks under the single-caller one to sixteen
 /// over, because what either queue costs in blocks depends on where the
-/// last swap falls against the venue's cadence — and the cadence is the
-/// shard's: the shards of one grown world commit anywhere from forty to
-/// seventy blocks in ten idle seconds, so a few seeds can seat the
-/// fanned venue on a fast one every time. A bar one seed satisfies says
-/// nothing about the next. Summed, the readings settle — and the sum is
-/// what the claim is about anyway, since a per-caller cost would show on
-/// every seed rather than on some.
-const FAN_IN_SEEDS: [u64; 12] = [42, 7, 11, 1337, 1, 2, 3, 4, 5, 6, 8, 9];
+/// last swap falls against the venue's cadence. A bar one seed satisfies
+/// says nothing about the next. Summed, the readings settle — and the sum
+/// is what the claim is about anyway, since a per-caller cost would show
+/// on every seed rather than on some.
+const FAN_IN_SEEDS: [u64; 4] = [42, 7, 11, 1337];
 
 /// The fan-in bar: a venue priced from three caller shards clears its
 /// queue no slower than one priced from a single caller shard. A venue's
@@ -696,7 +693,9 @@ const FAN_IN_SEEDS: [u64; 12] = [42, 7, 11, 1337, 1, 2, 3, 4, 5, 6, 8, 9];
 /// of those, so a clock bar loose enough to survive the two epoch clocks
 /// is loose enough to admit the whole regression it exists to catch. The
 /// venue's chain commits many times a second, so its own height is the
-/// finer instrument.
+/// finer instrument — read against its own idle pace
+/// (`VenueReport::paced`), since the shards of one world commit at
+/// their own pace whatever their load.
 ///
 /// The bar is the design table's own figure: a round trip per caller
 /// would cost a third of the queue, and three callers would show it
@@ -707,7 +706,7 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
     let mut fanned = 0;
     for seed in FAN_IN_SEEDS {
         let mut narrow = venue_cluster(seed);
-        single += hot_venue_clears_swaps(&mut narrow, epochs(40)).blocks;
+        single += hot_venue_clears_swaps(&mut narrow, epochs(40)).paced();
         let mut wide = wide_venue_cluster(seed);
         fanned += hot_venue_clears_swaps_on(
             &mut wide,
@@ -715,12 +714,12 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
             &wide_swapper_shards(),
             epochs(40),
         )
-        .blocks;
+        .paced();
     }
     assert!(
         fanned * 3 <= single * 4,
         "fan-in from three caller shards must not cost a third of the queue: \
-         {fanned} blocks against {single} over {} seeds",
+         {fanned} against {single} thousandths of each venue's idle pace over {} seeds",
         FAN_IN_SEEDS.len(),
     );
 }
