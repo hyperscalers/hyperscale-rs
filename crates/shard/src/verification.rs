@@ -11,7 +11,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FeeDemand};
+use hyperscale_core::{Action, FeeDemand, FeeSpan};
 use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
@@ -972,27 +972,27 @@ impl VerificationPipeline {
 
     /// Initiate payer-shard fee-reservation verification for a block.
     /// `demands` comes from the coordinator's chain-content derivation;
-    /// callers skip the dispatch entirely when it is empty. `read_height`
-    /// is the balance-read anchor: the height the block's own ancestry
+    /// callers skip the dispatch entirely when it is empty. `span` holds
+    /// the balance-read anchor, the height the block's own ancestry
     /// proves committed, so every replica verifying the block reads the
     /// same vault version.
     pub(crate) fn initiate_reservations_verification(
         &mut self,
         block_hash: BlockHash,
         demands: Vec<FeeDemand>,
-        read_height: BlockHeight,
+        span: FeeSpan,
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
             payer_count = demands.len(),
-            read_height = read_height.inner(),
+            read_height = span.read_height.inner(),
             "Initiating VM fee-reservation verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::Reservations);
         vec![Action::VerifyReservations {
             block_hash,
             demands,
-            read_height,
+            span,
         }]
     }
 
@@ -1592,7 +1592,7 @@ impl VerificationPipeline {
         split_child_roots_required: bool,
         terminal_settled_txs_required: bool,
         fee_demands: Vec<FeeDemand>,
-        fee_read_height: BlockHeight,
+        fee_span: FeeSpan,
         fee_read_ready: bool,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -1686,7 +1686,7 @@ impl VerificationPipeline {
                 actions.extend(self.initiate_reservations_verification(
                     block_hash,
                     fee_demands,
-                    fee_read_height,
+                    fee_span,
                 ));
             } else {
                 // The anchor height isn't materialized locally yet — the

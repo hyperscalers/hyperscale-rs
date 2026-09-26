@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
     Address, ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
     TransactionStatus, TxHash,
@@ -23,7 +24,7 @@ use hyperscale_types::{
 
 use super::query::{
     Locked, MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at, locked_at,
-    owed_at, unclaimable_at,
+    owed_at, stands_at, unclaimable_at,
 };
 use super::tx::{LEFT_PROBE_SENDER, recipient, sender};
 use super::{Budget, Cluster};
@@ -296,6 +297,15 @@ impl World {
                 "value was stranded"
             },
         );
+        // A burn deletes the fee hold its transaction's commit placed, so
+        // a hold standing for a charged transaction is a charge that
+        // never ended its reservation.
+        let unreleased = charges.standing_holds(c);
+        assert!(
+            unreleased.is_empty(),
+            "{context}: {} charged transaction(s) still hold their payer's fee — {unreleased:?}",
+            unreleased.len(),
+        );
         let locked = self.locked(c, charges);
         let holding: u128 = locked.iter().map(|lock| lock.amount).sum();
         println!(
@@ -402,6 +412,22 @@ impl Charges {
             .filter(|(hash, _)| self.is_charged(c, **hash))
             .map(|(_, tx)| declared_price(c, tx))
             .sum()
+    }
+
+    /// Every charged transaction whose fee hold still stands on its
+    /// payer's shard.
+    #[must_use]
+    pub fn standing_holds<C: Cluster + ?Sized>(&self, c: &C) -> Vec<TxHash> {
+        let derivation = c.derivation();
+        self.owed
+            .iter()
+            .filter(|(hash, _)| self.is_charged(c, **hash))
+            .filter(|(_, tx)| {
+                tx.try_declared(derivation.as_ref())
+                    .is_ok_and(|_| stands_at(c, FeeTerms::of(tx).hold_key()))
+            })
+            .map(|(hash, _)| *hash)
+            .collect()
     }
 
     /// Assert that a full block of every charged transaction's shape fits

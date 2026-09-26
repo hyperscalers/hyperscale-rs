@@ -20,11 +20,9 @@
 //! refuses nothing at all. Empty is the safe answer there and the unsafe
 //! one here, so the gap is reported instead of erasing the window.
 
-use std::collections::HashSet;
-
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Engagement, FEE_HOLD_WINDOW, FinalizationHash,
-    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, SubstateKey, TxHash, WeightedTimestamp,
+    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Engagement, FinalizationHash, ProvisionHash,
+    RETENTION_HORIZON, SubstateKey, TxHash, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
@@ -82,34 +80,6 @@ pub struct DedupWindow {
     /// however short its span — which is what a young chain has, and what
     /// keeps it from being treated as a chain with a hole in it.
     pub reached_origin: bool,
-    /// Every fee reservation the window's blocks engaged and no committed
-    /// finalization in them released.
-    ///
-    /// Folded over a deeper span than the tiers above
-    /// ([`FEE_HOLD_WINDOW`]), because a hold outlives a transaction's
-    /// validity range. Held as what a payer shard's ledger takes rather
-    /// than as a dedup tier: nothing here refuses a second inclusion.
-    pub fee_holds: Vec<FeeHold>,
-    /// Whether the fee-hold fold reached its own floor or the chain's
-    /// origin. False means the ledger it seeds is short, and a short
-    /// ledger under-counts what a payer has engaged.
-    pub fee_holds_whole: bool,
-}
-
-/// One reservation a committed block engaged, as the recovery walk reads
-/// it back: the payer's own terms, since a hold is a statement about the
-/// transaction and not about the block that carried it.
-#[derive(Debug, Clone, Copy)]
-pub struct FeeHold {
-    /// The transaction whose commit engaged it.
-    pub tx_hash: TxHash,
-    /// The fee payer, whose shard decides whether this hold is its own.
-    pub payer: PrincipalAddr,
-    /// The ceiling held against the payer's vault.
-    pub max_fee: u128,
-    /// Validity end plus [`RETENTION_HORIZON`] — where the hold prunes if
-    /// nothing ever resolves it.
-    pub deadline: WeightedTimestamp,
 }
 
 impl DedupWindow {
@@ -143,23 +113,9 @@ impl DedupWindow {
         committed_ts: WeightedTimestamp,
         origin: ChainOrigin,
     ) -> Self {
-        let dedup_floor = committed_ts.minus(DEDUP_WINDOW);
-        let fee_floor = committed_ts.minus(FEE_HOLD_WINDOW);
+        let floor = committed_ts.minus(DEDUP_WINDOW);
         let mut window = Self::default();
         let mut height = committed_height;
-        // One descent, each tier stopping at its own floor, and the walk
-        // ending where both have. The fee tier reaches deeper — a hold
-        // ends one settlement window past its transaction's, where a
-        // committed transaction is held one horizon past the block that
-        // carried it — so neither floor alone can end the descent.
-        let mut dedup_done = false;
-        let mut fee_done = false;
-        // What a finalization already released, gathered descending — a
-        // block's certificates are read before its transactions, and a
-        // finalization always sits at or above the block that committed
-        // what it names.
-        let mut released: HashSet<TxHash> = HashSet::new();
-
         loop {
             if height < origin.genesis_height {
                 // The bottom of this chain. Nothing beneath it was ever
@@ -169,7 +125,6 @@ impl DedupWindow {
                 // reads, so there is nothing down there for this window
                 // to hold.
                 window.reached_origin = true;
-                window.fee_holds_whole = true;
                 return window;
             }
             let Some(certified) = reader.get_block(height) else {
@@ -179,35 +134,17 @@ impl DedupWindow {
             };
             let block = certified.block();
             let anchor = block.header().parent_qc().weighted_timestamp();
-            if !fee_done && anchor < fee_floor {
-                // Below the fee floor: every hold this walk seeds is
-                // folded, and the descent continues for the dedup tiers
-                // alone.
-                window.fee_holds_whole = true;
-                fee_done = true;
-            }
-            if !dedup_done && anchor < dedup_floor {
-                // Below the dedup floor: everything those tiers have to
-                // cover is already folded, and this block is the proof of
-                // it.
+            if anchor < floor {
+                // Below the floor: everything the tiers have to cover is
+                // already folded, and this block is the proof of it.
                 window.covered_from = Some(anchor);
-                dedup_done = true;
-            }
-            if dedup_done && fee_done {
-                // Below every floor: nothing this walk seeds reaches here.
                 return window;
             }
-            if !dedup_done {
-                window.fold_block(block, anchor);
-            }
-            if !fee_done {
-                window.fold_fee_holds(block, committed_ts, &mut released);
-            }
+            window.fold_block(block, anchor);
 
             let Some(previous) = height.prev() else {
                 // Height zero: there is no block beneath it anywhere.
                 window.reached_origin = true;
-                window.fee_holds_whole = true;
                 return window;
             };
             height = previous;
@@ -249,50 +186,6 @@ impl DedupWindow {
                 .into_iter()
                 .map(|arrival| (arrival, height, anchored_deadline)),
         );
-    }
-
-    /// Fold one committed block's fee reservations in: what its
-    /// finalizations released, then what its transactions engaged and
-    /// nothing above it released.
-    ///
-    /// Reads the same two events the live ledger does — a commit engages,
-    /// a committed finalization releases — so a seeded ledger and one
-    /// that ran the chain hold the same set. `released` accumulates
-    /// across the descent because a finalization sits at or above the
-    /// block that committed what it names, so the walk meets it first.
-    ///
-    /// A hold already past its deadline at `committed_ts` is dropped
-    /// here rather than carried: the live ledger's prune would have taken
-    /// it at the same instant.
-    fn fold_fee_holds(
-        &mut self,
-        block: &Block,
-        committed_ts: WeightedTimestamp,
-        released: &mut HashSet<TxHash>,
-    ) {
-        for finalization in block.certificates().iter() {
-            released.extend(finalization.tx_hashes());
-        }
-        for tx in block.transactions().iter() {
-            let tx_hash = tx.hash();
-            if released.contains(&tx_hash) {
-                continue;
-            }
-            let terms = tx.terms();
-            let deadline = tx
-                .validity_range()
-                .end_timestamp_exclusive
-                .plus(RETENTION_HORIZON);
-            if deadline <= committed_ts {
-                continue;
-            }
-            self.fee_holds.push(FeeHold {
-                tx_hash,
-                payer: terms.fee_payer,
-                max_fee: terms.max_fee,
-                deadline,
-            });
-        }
     }
 
     /// A window covering nothing, and saying so.

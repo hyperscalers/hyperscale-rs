@@ -22,14 +22,14 @@ use hyperscale_storage::{
     SubstateStore, Substates, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
-    install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_transaction,
-    test_prefix, test_principal, test_transaction,
+    install_stub_protocol_statics, make_leg_finalization, stub_transaction, test_prefix,
+    test_principal, test_transaction,
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, DEDUP_WINDOW, Engagement, FEE_HOLD_WINDOW, FrontierInputs, Hash, LocalKey,
-    RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange,
-    Transaction, TransactionDecision, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
+    ChainOrigin, Engagement, FrontierInputs, Hash, LocalKey, RETENTION_HORIZON, SettledWrites,
+    ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction, TxHash, Verifiable,
+    WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -734,121 +734,6 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
         window.covered_from,
         Some(WeightedTimestamp::from_millis(400_001)),
         "coverage reaches as deep as the oldest block it read",
-    );
-}
-
-/// The fee tier reaches deeper than the dedup tier, and the descent is
-/// floored at the deeper of the two.
-///
-/// A hold ends at its validity end plus `RETENTION_HORIZON`, and the
-/// block committing it sits no earlier than one `MAX_VALIDITY_RANGE`
-/// before that end — `FEE_HOLD_WINDOW` past the tip. The dedup tiers
-/// reach `DEDUP_WINDOW`, which is `RETENTION_HORIZON` and shallower. A
-/// walk floored at the dedup tiers' depth would seed a ledger that
-/// under-counts what the payer shard still holds engaged.
-#[test]
-fn the_fee_tier_is_folded_below_the_dedup_floor() {
-    let storage = SimShardStorage::default();
-    let dedup_ms = u64::try_from(DEDUP_WINDOW.as_millis()).unwrap();
-    let fee_ms = u64::try_from(FEE_HOLD_WINDOW.as_millis()).unwrap();
-    assert!(fee_ms > dedup_ms, "the fee tier is the deeper of the two");
-    let tip_ms = fee_ms + 100_000;
-
-    // Height 1 sits between the two floors: below the dedup tier's
-    // reach, inside the fee tier's.
-    let below_dedup = tip_ms - dedup_ms - 1_000;
-    let deep = dedup_tx(1, tip_ms + 1_000);
-    let deep_hash = deep.hash();
-    commit_empty(
-        &storage,
-        &block_with_txs(BlockHeight::new(1), below_dedup, vec![deep]),
-    );
-    let near = dedup_tx(2, tip_ms + 1_000);
-    let near_hash = near.hash();
-    commit_empty(
-        &storage,
-        &block_with_txs(BlockHeight::new(2), tip_ms, vec![near]),
-    );
-
-    let window = DedupWindow::from_reader(
-        &storage,
-        BlockHeight::new(2),
-        WeightedTimestamp::from_millis(tip_ms),
-        ChainOrigin {
-            genesis_height: BlockHeight::new(1),
-            anchor_wt: WeightedTimestamp::ZERO,
-        },
-    );
-
-    assert_eq!(
-        window.covered_from,
-        Some(WeightedTimestamp::from_millis(below_dedup)),
-        "the dedup tiers stop at their own floor",
-    );
-    let held: Vec<TxHash> = window.fee_holds.iter().map(|hold| hold.tx_hash).collect();
-    assert_eq!(
-        held,
-        vec![near_hash, deep_hash],
-        "and the fee tier reaches the block below it",
-    );
-    assert!(window.fee_holds_whole, "and the descent reached the origin");
-}
-
-/// A hold a committed finalization released is not seeded, and neither is
-/// one whose own deadline has already passed. The walk reads the same two
-/// events the live ledger does.
-#[test]
-fn the_fee_tier_seeds_only_what_is_still_engaged() {
-    let storage = SimShardStorage::default();
-    let tip_ms = 300_000u64;
-    let rh_ms = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap();
-
-    let settled = dedup_tx(1, tip_ms + 100_000);
-    let settled_hash = settled.hash();
-    let standing = dedup_tx(2, tip_ms + 100_000);
-    let standing_hash = standing.hash();
-    // Its own deadline — validity end plus the retention horizon — sits
-    // below the tip, so the live ledger's prune would already have taken
-    // it.
-    let expired = dedup_tx(3, tip_ms - rh_ms - 1_000);
-
-    commit_empty(
-        &storage,
-        &block_with_txs(
-            BlockHeight::new(1),
-            40_000,
-            vec![settled, standing, expired],
-        ),
-    );
-    let tick = Arc::new(Verifiable::from(make_finalization(
-        BlockHeight::new(2),
-        settled_hash,
-        TransactionDecision::Accept,
-    )));
-    commit_empty(
-        &storage,
-        &push_certificate(block_with_txs(BlockHeight::new(2), 50_000, vec![]), tick),
-    );
-    commit_empty(
-        &storage,
-        &block_with_txs(BlockHeight::new(3), tip_ms, vec![]),
-    );
-
-    let window = DedupWindow::from_reader(
-        &storage,
-        BlockHeight::new(3),
-        WeightedTimestamp::from_millis(tip_ms),
-        ChainOrigin {
-            genesis_height: BlockHeight::new(1),
-            anchor_wt: WeightedTimestamp::ZERO,
-        },
-    );
-
-    let held: Vec<TxHash> = window.fee_holds.iter().map(|hold| hold.tx_hash).collect();
-    assert_eq!(
-        held,
-        vec![standing_hash],
-        "the finalization released one and the deadline took the other",
     );
 }
 

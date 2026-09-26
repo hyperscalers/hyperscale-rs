@@ -13,13 +13,15 @@
 
 use std::sync::Arc;
 
+use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
     NetworkParams, PriceBounds, PriceTable, ReshapeThresholds, TransactionDecision,
     TransactionStatus,
 };
+use hyperscale_vm_effects::{ProtocolHasher, fee_hold_total_key};
 
 use crate::support::conservation::{Charges, probe_world};
-use crate::support::query::{beacon_epoch, declared_price};
+use crate::support::query::{beacon_epoch, declared_price, held_at, owning_shard, stands_at};
 use crate::support::tx::{
     build_transfer_at_priority, build_transfer_tx, pool_operator, recipient, sender,
     validity_around,
@@ -211,6 +213,66 @@ pub fn a_priority_is_charged_over_the_table_price<C: Cluster>(c: &mut C) {
     // The ledger closes against both declared prices together, which is
     // the burn agreeing with what the priority was quoted at.
     world.assert_settles_within(c, &charges, epochs(4), "a plain and a prioritised transfer");
+}
+
+/// A committed transaction's fee is held in state from the block that
+/// commits it to the block that burns its price.
+///
+/// The hold is a cell under the payer's own prefix, beside a total per
+/// vault, so every replica of the payer's shard judges a later
+/// reservation from state whatever it remembers. What this walks end to
+/// end is the hold's life: it stands, and the vault's total carries it,
+/// once the payer's shard has committed the transfer; and once the world
+/// settles neither stands, which the conservation check asserts of every
+/// charged transaction.
+///
+/// # Panics
+///
+/// Panics if the payer's shard never commits the transfer, if it commits
+/// without holding the fee, if the transfer does not settle, or if the
+/// hold outlives the burn.
+pub fn a_fee_hold_stands_until_its_burn<C: Cluster>(c: &mut C) {
+    let (payer, from) = sender(0);
+    let to = recipient(0);
+    let world = probe_world(c);
+    let mut charges = Charges::default();
+
+    let transfer = build_transfer_tx(&payer, from, to, 1, validity_around(c.now()));
+    transfer
+        .try_declared(c.derivation().as_ref())
+        .expect("a transfer declares its terms");
+    let hold = FeeTerms::of(&transfer);
+    let total = fee_hold_total_key(&ProtocolHasher, hold.vault);
+    let payer_shard = owning_shard(c, hold.vault.owner);
+    let hash = charges.submit(c, transfer);
+
+    assert!(
+        c.run_until(epochs(8), |c| c.chain_fate(payer_shard, hash).0.is_some()),
+        "the payer's shard never committed the transfer"
+    );
+    assert!(
+        stands_at(c, hold.hold_key()),
+        "the payer's shard committed the transfer without holding its fee"
+    );
+    assert!(
+        held_at(c, total) >= hold.max_fee,
+        "the vault's total does not carry the hold: {}",
+        held_at(c, total)
+    );
+
+    let status = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the transfer must settle; status = {status:?}",
+    );
+    world.assert_settles_within(c, &charges, epochs(4), "a held fee burned");
+    assert!(
+        !stands_at(c, total),
+        "the vault's total outlives its last hold"
+    );
 }
 
 /// A vote moves the row it names and no other, in both directions.

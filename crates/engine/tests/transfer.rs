@@ -18,7 +18,7 @@ use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
     PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
-    TickEnvironment, TickTxInput, genesis_writes,
+    TickEnvironment, TickTxInput, build_refusal_receipt, genesis_writes,
 };
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
@@ -28,15 +28,15 @@ use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
 use hyperscale_types::{
     Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
-    GlobalReceipt, Hash, Inclusion, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof, NetworkId,
-    PriceTable, PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateClaim,
-    StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
+    GlobalReceipt, Hash, Inclusion, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof, Movement,
+    NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie,
+    StateClaim, StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
     WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Answered, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent,
     IntentHeader, IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Value,
-    issued_resource, package_hash,
+    fee_hold_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
@@ -1264,16 +1264,8 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
     assert_eq!(events_of(&recipient_side[0]), vec![]);
 }
 
-/// A transfer whose fee payer sits on the recipient's shard never leaves
-/// that shard only delivering: the payer's home bears the verdict, so it
-/// commits as the core and the fee burns there, once. The sender's shard
-/// runs the withdrawal and pays the payment alone, and the crossing into
-/// the core is escrowed: the core takes it and credits the recipient.
-#[test]
-fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
-    let executor = executor(ExecutionMode::Serial);
-    let trie = ShardTrie::uniform(1);
-    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+/// A hundred from alice to `far()`, whose fee `far()` pays.
+fn transfer_paid_by_the_recipient() -> Arc<Verified<Transaction>> {
     let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
     let graph = client()
         .transfer_graph(alice(), far(), 100)
@@ -1292,9 +1284,22 @@ fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
         },
     )
     .expect("a transfer fits the tree cap");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
+    Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
         signing::sign(envelope, &key, &ProtocolHasher).expect("a transfer signs"),
-    )));
+    )))
+}
+
+/// A transfer whose fee payer sits on the recipient's shard never leaves
+/// that shard only delivering: the payer's home bears the verdict, so it
+/// commits as the core and the fee burns there, once. The sender's shard
+/// runs the withdrawal and pays the payment alone, and the crossing into
+/// the core is escrowed: the core takes it and credits the recipient.
+#[test]
+fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let tx = transfer_paid_by_the_recipient();
     derived_through(&executor, std::slice::from_ref(&tx));
     assert_eq!(tx.fee_payer(), far().address());
 
@@ -1346,13 +1351,31 @@ fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
                 executed.consensus, executed.metadata
             );
         };
+        // A completed abortable run carries its hold's release in its
+        // writes and in its refusal receipt, of which its finalization
+        // settles one.
+        let released = releases_hold(writes, far(), tx.hash());
+        let refusal = executed
+            .refusal_receipt
+            .as_ref()
+            .and_then(ConsensusReceipt::writes);
+        assert_eq!(
+            refusal.is_some_and(|writes| releases_hold(writes, far(), tx.hash())),
+            released && refusal.is_some(),
+            "{local_shard:?}'s refusal receipt releases exactly where its run does",
+        );
         (
             settled(writes, &[(alice(), 1_000), (far(), 50)]),
             arrivals_written(&classified, writes, far_shard),
+            released,
         )
     };
 
-    let (sender, escrowed) = run(near_shard, &[]);
+    let (sender, escrowed, sender_released) = run(near_shard, &[]);
+    assert!(
+        !sender_released,
+        "the sender's shard charges nothing and releases nothing"
+    );
     assert_eq!(
         vault_cell(&sender, alice()),
         Some(encode_amount(1_000 - 100).to_vec()),
@@ -1364,7 +1387,11 @@ fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
         "and burns nothing of the payer's"
     );
 
-    let (core, _) = run(far_shard, &escrowed);
+    let (core, _, core_released) = run(far_shard, &escrowed);
+    assert!(
+        core_released,
+        "the charging member releases its payer's hold"
+    );
     assert_eq!(
         vault_cell(&core, far()),
         Some(encode_amount(50 + 100 - price).to_vec()),
@@ -3495,4 +3522,96 @@ fn a_resubmit_at_a_higher_ceiling_runs_the_declaration_once() {
         Some(encode_amount(150).to_vec()),
         "the recipient is paid once",
     );
+}
+
+/// Whether `writes` delete the fee hold `tx` placed on `payer`'s vault.
+fn releases_hold(writes: &StateWrites, payer: PrincipalAddr, tx: TxHash) -> bool {
+    let hold = fee_hold_key(&ProtocolHasher, vault_key(payer, *PROTOCOL_RESOURCE), tx);
+    writes.cells.get(&hold) == Some(&None)
+}
+
+/// Every write set that burns a transaction's price deletes the hold its
+/// commit placed, whatever the burn comes to: a completed run's own
+/// writes, a refused run's refusal receipt, a publish, and a charge built
+/// apart.
+#[test]
+fn every_charge_carries_its_hold_release() {
+    let executor = executor(ExecutionMode::Serial);
+    let payer = fee_payer(7);
+
+    let completed = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(7, payer, bob(), 100, 10),
+    ));
+    let executed = execute_on(
+        &[(payer, 1_000), (bob(), 50)],
+        &executor,
+        std::slice::from_ref(&completed),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!("the transfer succeeds: {:?}", executed[0].consensus);
+    };
+    assert!(releases_hold(writes, payer, completed.hash()));
+
+    let refused = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
+        BOB_SEED,
+        bob(),
+        alice(),
+        500,
+    )));
+    let executed = execute(&executor, std::slice::from_ref(&refused));
+    assert!(matches!(executed[0].consensus, ConsensusReceipt::Failed));
+    let charge = executed[0]
+        .refusal_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("a refused run settles its price apart");
+    assert!(releases_hold(charge, bob(), refused.hash()));
+
+    let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
+        7,
+        published_artifact(),
+    )));
+    let executed = execute_on(
+        &[(payer, 1_000_000)],
+        &executor,
+        std::slice::from_ref(&publish),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!("a publish succeeds: {:?}", executed[0].consensus);
+    };
+    assert!(releases_hold(writes, payer, publish.hash()));
+
+    let vault = vault_key(payer, *PROTOCOL_RESOURCE);
+    let apart = build_refusal_receipt(
+        ShardId::ROOT,
+        &ShardTrie::single(),
+        TxHash::ZERO,
+        Some((vault, Movement::unjudged(*PROTOCOL_RESOURCE, 0))),
+        &[],
+    )
+    .expect("a charge names a receipt");
+    assert!(
+        apart
+            .writes()
+            .is_some_and(|writes| releases_hold(writes, payer, TxHash::ZERO)),
+        "a charge of nothing still ends the hold"
+    );
+}
+
+/// A receipt that charges nothing ends no hold: a member answering its
+/// refusable crossings apart, with its price burned elsewhere or already.
+#[test]
+fn a_member_that_charges_nothing_releases_nothing() {
+    let never = (vault_key(alice(), *PROTOCOL_RESOURCE), vec![1, 2, 3]);
+    let receipt = build_refusal_receipt(
+        ShardId::ROOT,
+        &ShardTrie::single(),
+        TxHash::ZERO,
+        None,
+        std::slice::from_ref(&never),
+    )
+    .expect("a Never names a receipt");
+    let writes = receipt.writes().expect("a receipt of writes");
+    assert_eq!(writes.cells.len(), 1, "{:?}", writes.cells);
+    assert!(writes.movements.is_empty());
 }

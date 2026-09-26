@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FeeDemand};
+use hyperscale_core::{Action, FeeDemand, FeeSpan};
 use hyperscale_engine::tick_select::ManifestInputs;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
@@ -460,7 +460,7 @@ pub fn assemble_build_action(
     settled_txs_window_floor: Option<WeightedTimestamp>,
     classification_topology_snapshot: Arc<TopologySnapshot>,
     fee_checks: Vec<FeeDemand>,
-    fee_read_height: BlockHeight,
+    fee_span: FeeSpan,
     substate_bytes: Option<u64>,
     windows: EpochWindows,
     manifest: ManifestInputs,
@@ -540,7 +540,7 @@ pub fn assemble_build_action(
         abandonment_records,
         state_claims,
         fee_checks,
-        fee_read_height,
+        fee_span,
         parent_in_flight,
         parent_settled_frontier,
         parent_sweep_frontier,

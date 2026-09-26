@@ -218,9 +218,11 @@ pub struct FeeDemand {
     /// same anchored height: the reservation engages only for signers
     /// the payer's rule admits.
     pub auth_cell: SubstateKey,
-    /// The total reservation the payer must cover: this block's newly
-    /// engaged fee ceilings plus the in-flight holds derived from chain
-    /// content.
+    /// The reservation the payer must cover before the committed ones:
+    /// this block's newly engaged fee ceilings plus those of its
+    /// uncommitted ancestors above the span's walk floor. The handler
+    /// adds the vault's held total at the read height and the ceilings
+    /// the span's committed blocks engaged.
     pub demand: u128,
     /// The distinct attesting sets behind this block's demands on this
     /// payer, one per transaction, each of which the payer's rule must
@@ -231,6 +233,21 @@ pub struct FeeDemand {
     /// Empty when the demand seeds a proposal builder, whose candidate
     /// transactions carry their own sets.
     pub attesting_sets: BTreeSet<Vec<PrincipalAddr>>,
+}
+
+/// Where a block's fee demand reads the chain's committed reservations.
+///
+/// The held totals at `read_height`, which the block's ancestry proves
+/// committed, and the ceilings each committed block in
+/// `(read_height, walk_floor]` engaged. What lies above `walk_floor` is
+/// the coordinator's to sum from the uncommitted ancestors, so every
+/// replica covers `(read_height, parent]` exactly once whatever its tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeSpan {
+    /// The height balances and totals are read at.
+    pub read_height: BlockHeight,
+    /// The highest committed height whose ceilings the handler reads.
+    pub walk_floor: BlockHeight,
 }
 
 /// Actions the state machine wants to perform.
@@ -965,8 +982,8 @@ pub enum Action {
         block_hash: BlockHash,
         /// Per-payer demands; empty demands never dispatch.
         demands: Vec<FeeDemand>,
-        /// The ancestry-proven committed height balances are read at.
-        read_height: BlockHeight,
+        /// Where the committed reservations are read.
+        span: FeeSpan,
     },
 
     /// Check the figures a block's abandonment records restate against
@@ -1048,16 +1065,16 @@ pub enum Action {
         /// at the parent and carry beside the claims.
         local_crossings: Vec<CrossingId>,
         /// Prior fee-reservation demand per local payer among the
-        /// candidate transactions — in-flight holds plus the uncommitted
-        /// window, excluding the candidates themselves. The builder
-        /// accumulates candidate ceilings on top and drops transactions
-        /// their payer cannot cover, so a proposal never self-rejects
-        /// the voters' reservation verification.
+        /// candidate transactions — the uncommitted window, excluding the
+        /// candidates themselves. The builder adds the committed
+        /// reservations over `fee_span`, accumulates candidate ceilings on
+        /// top and drops transactions their payer cannot cover, so a
+        /// proposal never self-rejects the voters' reservation
+        /// verification.
         fee_checks: Vec<FeeDemand>,
-        /// The height the builder reads payer balances at — the height
-        /// its parent QC's chain proves committed, matching the anchor
-        /// voters verify the reservations against.
-        fee_read_height: BlockHeight,
+        /// Where the builder reads payer balances and committed
+        /// reservations — the span voters verify the reservations over.
+        fee_span: FeeSpan,
         /// Parent block's in-flight count (for deterministic computation).
         parent_in_flight: TxsInFlight,
         /// Parent block's settlement frontier — the highest tick whose

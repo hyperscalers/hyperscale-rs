@@ -134,6 +134,12 @@ pub(crate) fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
         })
 }
 
+/// Whether any value stands at `cell`, on the shard owning its prefix.
+pub(crate) fn stands_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> bool {
+    let shard = owning_shard(c, cell.owner);
+    c.substate(shard, cell.owner, cell.local.0).is_some()
+}
+
 /// What a crossing record standing at `cell` still owes, in `resource`.
 ///
 /// Zero where the cell holds nothing, holds something that is not a

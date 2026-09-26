@@ -7,18 +7,18 @@
 use std::collections::{HashMap, hash_map};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, FeeSpan, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{ManifestInputs, ManifestKind, member_lines, terminal_fates};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    BeaconChainReader, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs, ParentAnchor,
-    ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex, TerminalWindow,
-    VersionedStore, colliding_committed_cell, colliding_member_row, committed_tx_cells,
-    creations_of, load_read_frontier, record_arrivals, sweep_for_block,
-    without_colliding_committed_cells, without_colliding_member_rows,
+    BeaconChainReader, ChainWrites, FeeTerms, JmtSnapshot, MemberIndex, MemberInputs, ParentAnchor,
+    PendingChain, ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex,
+    TerminalWindow, VersionedStore, colliding_committed_cell, colliding_member_row,
+    committed_tx_cells, creations_of, decode_total, load_read_frontier, record_arrivals,
+    sweep_for_block, without_colliding_committed_cells, without_colliding_member_rows,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -47,6 +47,7 @@ use hyperscale_types::{
     missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
     signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
+use hyperscale_vm_effects::{ProtocolHasher, fee_hold_total_key};
 
 use crate::local_crossings::{
     disagreeing_parent_reading, keep_standing_unclaimed, misstated_unclaimed, parent_claims,
@@ -556,6 +557,51 @@ fn split_child_roots_for_header(
 /// after it commits, and this is where that becomes true.
 /// The completion event for one check on `block_hash`: a pass, or a
 /// refusal logged with the verifier's reason.
+/// What the chain's committed reservations add to each of `vaults`'
+/// demand over `span`: its held total at the read height, and the
+/// ceilings each committed block in `(read_height, walk_floor]` engaged
+/// against it. Releases above the read height are not subtracted, so
+/// every replica reading the span sums one figure whatever its tip.
+///
+/// # Errors
+///
+/// Where the store no longer answers for the read height, or a
+/// committed block in the span is not held.
+fn held_demands<S: ShardStorage>(
+    view: &SubstateView<S>,
+    pending_chain: &PendingChain<S>,
+    vaults: impl IntoIterator<Item = SubstateKey>,
+    span: FeeSpan,
+) -> Result<HashMap<SubstateKey, u128>, String> {
+    let mut held = HashMap::new();
+    for vault in vaults {
+        let total = view
+            .get_substate_at_height(fee_hold_total_key(&ProtocolHasher, vault), span.read_height)
+            .ok_or_else(|| {
+                format!(
+                    "payer {:?}: held total unavailable at height {}",
+                    vault.owner,
+                    span.read_height.inner()
+                )
+            })?;
+        held.insert(vault, total.as_deref().map_or(0, decode_total));
+    }
+    let mut height = span.read_height.next();
+    while height <= span.walk_floor {
+        let transactions = pending_chain
+            .transactions_for_block(height)
+            .ok_or_else(|| format!("committed block {} is not held", height.inner()))?;
+        for tx in &transactions {
+            let terms = FeeTerms::of(tx.as_unverified());
+            if let Some(demand) = held.get_mut(&terms.vault) {
+                *demand = demand.saturating_add(terms.max_fee);
+            }
+        }
+        height = height.next();
+    }
+    Ok(held)
+}
+
 fn check_completed<T, E: std::fmt::Display>(
     block_hash: BlockHash,
     kind: VerificationKind,
@@ -815,16 +861,26 @@ where
         Action::VerifyReservations {
             block_hash,
             demands,
-            read_height,
+            span,
         } => {
+            let read_height = span.read_height;
             // Balance reads anchor at the height the block's ancestry
             // proves committed — the coordinator dispatches only once
             // its own commit pipeline has materialized it — so every
             // replica reads identical state regardless of local commit
             // or persistence progress.
             let view = ctx.pending_chain.view_at_committed_tip();
-            let mut result: Result<(), String> = Ok(());
-            'demands: for demand in &demands {
+            let (mut result, held) = match held_demands(
+                &view,
+                ctx.pending_chain,
+                demands.iter().map(|demand| demand.vault),
+                span,
+            ) {
+                Ok(held) => (Ok(()), held),
+                Err(why) => (Err(why), HashMap::new()),
+            };
+            let judged = if result.is_ok() { demands } else { Vec::new() };
+            'demands: for demand in &judged {
                 // The reservation engages only for signers the payer's
                 // rule admits — the stored rule, read beside the balance
                 // at the same anchored height, through the statics seam
@@ -865,10 +921,13 @@ where
                 let balance = cell
                     .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
                     .map_or(0u128, u128::from_le_bytes);
-                if balance < demand.demand {
+                let wanted = demand
+                    .demand
+                    .saturating_add(held.get(&demand.vault).copied().unwrap_or(0));
+                if balance < wanted {
                     result = Err(format!(
-                        "payer {:?}: balance {balance} under reservation demand {}",
-                        demand.vault.owner, demand.demand
+                        "payer {:?}: balance {balance} under reservation demand {wanted}",
+                        demand.vault.owner
                     ));
                     break;
                 }
@@ -1362,7 +1421,7 @@ where
             abandonment_records,
             state_claims,
             fee_checks,
-            fee_read_height,
+            fee_span,
             parent_in_flight,
             parent_settled_frontier,
             parent_sweep_frontier,
@@ -1449,9 +1508,23 @@ where
             let transactions = if fee_checks.is_empty() {
                 transactions
             } else {
+                let fee_read_height = fee_span.read_height;
+                // A span this node cannot read covers nothing: every payer
+                // it names is dropped, as a voter refuses the block.
+                let held = held_demands(
+                    &view,
+                    ctx.pending_chain,
+                    fee_checks.iter().map(|check| check.vault),
+                    fee_span,
+                );
                 let mut running: HashMap<SubstateKey, u128> = fee_checks
                     .iter()
-                    .map(|check| (check.vault, check.demand))
+                    .map(|check| {
+                        let held = held.as_ref().map_or(u128::MAX, |held| {
+                            held.get(&check.vault).copied().unwrap_or(0)
+                        });
+                        (check.vault, check.demand.saturating_add(held))
+                    })
                     .collect();
                 let auth_cells: HashMap<SubstateKey, Option<Vec<u8>>> = fee_checks
                     .iter()
@@ -2035,6 +2108,66 @@ mod tests {
     }
 
     // ─── verify_vote_batch ──────────────────────────────────────────────
+
+    /// A demand's committed reservations read the store over its span:
+    /// the ceilings the payer's transactions engaged in a committed block
+    /// above the read height count, and a block of the span the store
+    /// does not hold is an error, never a zero.
+    #[test]
+    fn a_span_the_store_cannot_read_is_an_error() {
+        use hyperscale_storage::test_helpers::{commit_settled_at, make_test_block, make_test_qc};
+        use hyperscale_storage_memory::SimShardStorage;
+        use hyperscale_types::test_utils::stub_transaction;
+        use hyperscale_types::{
+            BeaconWitnessCommit, CertifiedBlock, ChainOrigin, PrincipalAddr, TimestampRange,
+            Verifiable, WeightedTimestamp,
+        };
+
+        let payer = PrincipalAddr::new([0x42; 31]);
+        let tx = stub_transaction(
+            payer,
+            &[payer.address()],
+            300,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let vault = FeeTerms::of(&tx).vault;
+        let storage = SimShardStorage::default();
+        for height in 1..=2 {
+            let mut block = make_test_block(BlockHeight::new(height));
+            if let (Block::Live { transactions, .. }, 2) = (&mut block, height) {
+                *transactions =
+                    Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx.clone()))]));
+            }
+            let qc = make_test_qc(&block);
+            commit_settled_at(
+                &storage,
+                &Arc::new(Verified::new_unchecked_for_test(
+                    CertifiedBlock::new_unchecked(block, qc),
+                )),
+                &[],
+                &[],
+                &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            );
+        }
+        let chain = Arc::new(PendingChain::new(Arc::new(storage), ChainOrigin::ROOT));
+        let view = chain.view_at_committed_tip();
+        let span = |read: u64, floor: u64| FeeSpan {
+            read_height: BlockHeight::new(read),
+            walk_floor: BlockHeight::new(floor),
+        };
+
+        let held = held_demands(&view, &chain, [vault], span(1, 2)).expect("the span is held");
+        assert_eq!(held[&vault], 300, "the committed block's ceiling counts");
+        let held = held_demands(&view, &chain, [vault], span(2, 2)).expect("the span is held");
+        assert_eq!(held[&vault], 0, "nothing above the read height");
+        assert!(
+            held_demands(&view, &chain, [vault], span(1, 3)).is_err(),
+            "a committed block the store does not hold",
+        );
+    }
 
     #[test]
     fn verify_vote_batch_empty_input_returns_already_verified_unchanged() {

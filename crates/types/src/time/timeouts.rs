@@ -91,28 +91,6 @@ const _: () = assert!(
     "the dedup walk is exactly as deep as the tiers it rebuilds",
 );
 
-/// How far back a chain is folded to rebuild the fee reservations the
-/// payer shard still holds engaged.
-///
-/// A hold lives to its transaction's validity end plus
-/// [`RETENTION_HORIZON`], and the block that committed it sits no earlier
-/// than a whole [`MAX_VALIDITY_RANGE`] before that end — a transaction is
-/// only admissible inside its own window, and the window is no wider than
-/// that. So a hold still engaged can come from a block that far back, and
-/// the walk has to reach it or the ledger it seeds under-counts.
-///
-/// Deeper than [`DEDUP_WINDOW`], whose deepest entry stands to its
-/// transaction's own deadline where a hold ends one settlement window
-/// past it. The two walks share a descent and each tier stops at its own
-/// floor, so this is the figure the descent is floored at.
-pub const FEE_HOLD_WINDOW: Duration =
-    Duration::from_secs(RETENTION_HORIZON.as_secs() + MAX_VALIDITY_RANGE.as_secs());
-
-const _: () = assert!(
-    FEE_HOLD_WINDOW.as_secs() >= DEDUP_WINDOW.as_secs(),
-    "the recovery descent is floored at the deepest tier it seeds",
-);
-
 /// The VM keys and values each sweepable family by an expiry it derives
 /// from the family alone, and this is where the spellings are held
 /// together. A grace each, so an assert each.

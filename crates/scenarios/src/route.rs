@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
     Address, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
     TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
@@ -21,7 +22,9 @@ use hyperscale_vm_types::{LegRole, LegShape};
 
 use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
-use crate::support::query::{assert_reclaimed_leg, declared_price, held, held_at, vault_balance};
+use crate::support::query::{
+    assert_reclaimed_leg, declared_price, held, held_at, stands_at, vault_balance,
+};
 use crate::support::tx::{build_route_tx, build_swap_tx, validity_around};
 use crate::support::wait::await_blocks;
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
@@ -377,6 +380,10 @@ pub fn a_route_whose_core_never_combines_holds_its_input<C: FaultableCluster>(c:
         0,
         validity,
     );
+    route
+        .try_declared(c.derivation().as_ref())
+        .expect("a route declares its terms");
+    let fee_hold = FeeTerms::of(&route).hold_key();
     let hash = charges.submit(c, route);
 
     assert!(
@@ -393,6 +400,13 @@ pub fn a_route_whose_core_never_combines_holds_its_input<C: FaultableCluster>(c:
         "the certificate channel must actually have been exercised and cut",
     );
     assert_nothing_spoke(c, hash, *trader, paid);
+    // The trader's leg burned the price, and the burn ends the hold: a
+    // reservation lasts until the payer's shard charges, not until the
+    // verdict the held core still owes.
+    assert!(
+        !stands_at(c, fee_hold),
+        "the leg's burn ends its payer's fee hold whatever the core still owes",
+    );
     let locked = protocol_resource.locked(c, &charges);
     assert_eq!(
         locked.len(),

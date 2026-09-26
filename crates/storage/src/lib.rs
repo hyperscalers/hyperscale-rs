@@ -47,8 +47,9 @@ pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_a
 pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
 pub use shard::crossings::{crossing_settlements, live_record, record_arrivals};
-pub use shard::dedup_window::{DedupWindow, FeeHold};
+pub use shard::dedup_window::DedupWindow;
 pub use shard::derived::{Indexed, LeafRows, RowChange, index_leaf};
+pub use shard::fee_holds::{FeeTerms, decode_total};
 pub use shard::genesis::GenesisCommit;
 pub use shard::members::{
     MemberIndex, MemberInputs, MemberRow, RowState, SettledHalf, TickRow, colliding_member_row,

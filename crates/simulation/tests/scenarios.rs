@@ -30,7 +30,7 @@ use hyperscale_scenarios::{
     a_delivery_lands_past_every_window_once_its_record_arrives,
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
-    a_healed_network_delivers_past_the_old_window,
+    a_fee_hold_stands_until_its_burn, a_healed_network_delivers_past_the_old_window,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_inside_its_window,
@@ -484,6 +484,14 @@ fn a_priority_is_charged_over_the_table_price_sim() {
     let mut cluster =
         SimCluster::with_accounts(&liveness_config(), 0xF33E, &genesis_accounts(1, 1));
     a_priority_is_charged_over_the_table_price(&mut cluster);
+}
+
+/// A fee is held in state from the commit to the burn.
+#[test]
+fn a_fee_hold_stands_until_its_burn_sim() {
+    let mut cluster =
+        SimCluster::with_accounts(&liveness_config(), 0xF33F, &genesis_accounts(1, 1));
+    a_fee_hold_stands_until_its_burn(&mut cluster);
 }
 
 #[test]

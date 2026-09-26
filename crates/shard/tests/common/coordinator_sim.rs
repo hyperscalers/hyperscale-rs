@@ -1445,7 +1445,7 @@ impl ShardCoordinatorSim {
                 state_claims,
                 provisions,
                 fee_checks: _,
-                fee_read_height: _,
+                fee_span: _,
                 parent_in_flight,
                 parent_settled_frontier,
                 parent_sweep_frontier,

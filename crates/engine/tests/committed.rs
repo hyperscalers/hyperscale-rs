@@ -419,3 +419,117 @@ fn a_follower_applies_its_half_of_the_terminal() {
         whole,
     );
 }
+
+/// A split child following its parent's block folds the parent's fee
+/// holds over its own half: a hold and its vault's total sit under the
+/// vault's owner, so a cut puts each on its vault's side, and the halves
+/// recompose the parent's root through an inclusion on one child and a
+/// release on the other.
+#[test]
+fn a_split_child_recomposes_the_parents_fee_holds() {
+    use std::sync::Arc;
+
+    use hyperscale_storage::test_helpers::{block_settling, make_state_writes};
+    use hyperscale_storage::{BoundaryStore, FeeTerms, SubstateStore, Substates};
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::test_utils::stub_transaction;
+    use hyperscale_types::{
+        BlockHeight, ConsensusReceipt, GlobalReceiptHash, PrincipalAddr, SplitChildRoots,
+        StateWrites, TimestampRange, TxHash, Verifiable, WeightedTimestamp, shard_prefix_path,
+    };
+
+    let parent = ShardId::leaf(2, 2);
+    let (left, right) = parent.children();
+    // Payers on each child's half of the parent's `10` prefix.
+    let payer = |top: u8| {
+        let mut body = [0x11; 31];
+        body[0] = top;
+        PrincipalAddr::new(body)
+    };
+    let validity = TimestampRange::new(
+        WeightedTimestamp::ZERO,
+        WeightedTimestamp::from_millis(60_000),
+    );
+    let on_right = payer(0xA1);
+    let on_left = payer(0x81);
+    let t0 = stub_transaction(on_right, &[on_right.address()], 500, validity);
+    let t1 = stub_transaction(on_left, &[on_left.address()], 700, validity);
+    let t0_hold = FeeTerms::of(&t0);
+    let t1_hold = FeeTerms::of(&t1);
+
+    let carrying = |height: u64, tx: &Transaction, receipts: Vec<StoredReceipt>| {
+        let Block::Live {
+            header,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } = block_settling(BlockHeight::new(height), receipts)
+        else {
+            unreachable!("the fixture builds a live block");
+        };
+        let block = Block::Live {
+            header,
+            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx.clone()))])),
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest: Arc::new(TickManifest::empty()),
+            witness_sources,
+        };
+        (block, committed_tx_cells(parent, [tx]))
+    };
+    // The release: T0's burn deletes its hold in the receipt that
+    // settles it; a write on each half keeps both subtrees populated.
+    let mut release = make_state_writes(0xA0, 1, vec![1; 4]);
+    release.cells.insert(t0_hold.hold_key(), None);
+    let settling = |writes: StateWrites| {
+        StoredReceipt::synced(
+            TxHash::ZERO,
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes,
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        )
+    };
+    let first = carrying(
+        1,
+        &t0,
+        vec![settling(make_state_writes(0x80, 1, vec![1; 4]))],
+    );
+    let second = carrying(2, &t1, vec![settling(release)]);
+
+    let still = FrontierInputs::still(ShardId::ROOT);
+    let stores = [parent, left, right].map(|shard| SimShardStorage::new(shard_prefix_path(shard)));
+    let mut roots = Vec::new();
+    for (block, committed) in [&first, &second] {
+        roots = stores
+            .iter()
+            .map(|store| {
+                store
+                    .follow_block_writes(block, committed, &still)
+                    .expect("each store follows")
+            })
+            .collect();
+    }
+    let [parent_store, left_store, right_store] = &stores;
+    assert!(
+        parent_store.snapshot().cell(t1_hold.hold_key()).is_some()
+            && parent_store.snapshot().cell(t0_hold.hold_key()).is_none(),
+        "the parent holds T1's fee and has released T0's",
+    );
+    assert!(left_store.snapshot().cell(t1_hold.hold_key()).is_some());
+    assert!(right_store.snapshot().cell(t0_hold.hold_key()).is_none());
+    assert!(
+        SplitChildRoots {
+            left: roots[1],
+            right: roots[2],
+        }
+        .composes_to(roots[0])
+    );
+}
