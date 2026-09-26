@@ -24,6 +24,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Member};
+use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
     Finalization, FinalizationHash, MAX_ENGAGEMENTS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
@@ -148,6 +149,9 @@ pub(crate) struct Committed<'a> {
     pub(crate) chain: &'a QcChainSets,
     /// What committed blocks within the retention window carry.
     pub(crate) dedup: &'a CommitDedupIndex,
+    /// Tick membership at the parent: which tick holds each member, and
+    /// in which half.
+    pub(crate) members: &'a MemberIndex,
     /// The settlement frontier the parent left, which a determined half
     /// must settle above. `None` where the parent is pruned, which
     /// leaves the order unjudged here: such a block is verified but not
@@ -508,8 +512,21 @@ impl Section for FinalizationsSection {
                 "finalization {receipt_hash:?} was already committed within its retention window"
             ));
         }
+        let own_tick = fw.tick_id().shard_id() == ctx.local_shard;
         for outcome in fw.local_ec().tx_outcomes() {
             let tx_hash = outcome.tx_hash();
+            // A half settles only members its tick holds in that half: a
+            // discarded one is released or gone, and a later finalization
+            // of it is refused. A member no committing block reserved a
+            // place for, a reclaim, has no row to hold it.
+            if own_tick && outcome.reserved() && !in_flight_in(ctx.members, fw, tx_hash) {
+                return Err(format!(
+                    "finalization {receipt_hash:?} settles transaction {tx_hash}, which tick {} \
+                     does not hold in its {:?} half",
+                    fw.tick_id(),
+                    fw.half(),
+                ));
+            }
             if fold.resolved_here.contains(&tx_hash) {
                 return Err(format!(
                     "transaction {tx_hash} resolved twice within the same block"
@@ -564,6 +581,20 @@ impl Section for FinalizationsSection {
         fold.tx_count = tx_count;
         Ok(())
     }
+}
+
+/// Whether `members` holds `tx_hash` in flight in `fw`'s tick, in the
+/// half `fw` settles.
+fn in_flight_in(members: &MemberIndex, fw: &Finalization, tx_hash: TxHash) -> bool {
+    members
+        .members
+        .get(&tx_hash)
+        .is_some_and(|row| match row.state {
+            RowState::InFlight {
+                tick, settlement, ..
+            } => tick == fw.tick_id().block_height() && settlement.half() == fw.half(),
+            RowState::Pending | RowState::Released { .. } => false,
+        })
 }
 
 /// Refuse `tx_hash` if the chain has already reached a verdict on it —
@@ -1025,6 +1056,7 @@ pub(crate) mod fixtures {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
 
+    use hyperscale_storage::MemberIndex;
     use hyperscale_types::{
         Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, NetworkDefinition,
         ShardAnchor, ShardId, StateRoot, TopologySchedule, TopologySnapshot, ValidatorSet,
@@ -1047,6 +1079,7 @@ pub(crate) mod fixtures {
         pub(crate) chain: QcChainSets,
         pub(crate) dedup: CommitDedupIndex,
         pub(crate) parent_settled_frontier: Option<BlockHeight>,
+        pub(crate) members: MemberIndex,
         pub(crate) owed_determined: BTreeSet<BlockHeight>,
     }
 
@@ -1076,6 +1109,7 @@ pub(crate) mod fixtures {
                 chain: QcChainSets::default(),
                 dedup: CommitDedupIndex::new(),
                 parent_settled_frontier: Some(BlockHeight::GENESIS),
+                members: MemberIndex::empty(ShardId::ROOT),
                 owed_determined: BTreeSet::new(),
             }
         }
@@ -1100,6 +1134,7 @@ pub(crate) mod fixtures {
                 chain: &self.chain,
                 dedup: &self.dedup,
                 parent_settled_frontier: self.parent_settled_frontier,
+                members: &self.members,
                 owed_determined: &self.owed_determined,
             }
         }

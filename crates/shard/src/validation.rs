@@ -521,31 +521,99 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 pub mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::Capped;
+    use hyperscale_storage::{MemberRow, RowState};
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_leg_finalization, stub_abort_charge, test_principal,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
         BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, DiscardCause,
-        Engagement, ExecutionOutcome, Finalization, Hash, Inclusion, LegRole, LocalKey,
-        MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition, PriceTable,
-        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate,
-        RETENTION_HORIZON, Round, RoutePrefix, ShardId, ShardLoad, Signer, SignerBitfield,
-        StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TickId, TickManifest, TimestampRange,
-        Transaction, TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
-        WitnessSources, state_claims_admit_block, test_utils,
+        Engagement, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
+        LegRole, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
+        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
+        Provisions, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, Settlement, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
+        TickId, TickManifest, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
+        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+        Verified, WeightedTimestamp, WitnessSources, state_claims_admit_block, test_utils,
     };
 
     use super::*;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures, departures_cut_at};
-    use crate::admission::{Section, StateClaimsFold, StateClaimsSection};
+    use crate::admission::{
+        FinalizationsFold, FinalizationsSection, Section, StateClaimsFold, StateClaimsSection,
+    };
     use crate::commit_dedup::CommitDedupIndex;
 
     /// Admit `block`'s sections against `against`.
     fn admit(against: &Against, block: &Block) -> Result<(), String> {
         admit_sections(&against.ctx(), block).map(|_| ())
+    }
+
+    /// A half settles only members its own tick holds in flight in that
+    /// half: one the rows never named, one a discard let go of, and one
+    /// held in the other half are refused. A member no committing block
+    /// reserved a place for — a reclaim — holds no row and needs none.
+    #[test]
+    fn a_half_settles_only_members_its_tick_holds_in_that_half() {
+        let tx = TxHash::from(Hash::from_bytes(b"held member"));
+        let reserved = test_utils::finalization_of(
+            BlockHeight::new(2),
+            vec![
+                TxOutcome::new(
+                    tx,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .reserving(0),
+            ],
+        );
+        let settles = |against: &Against, fw: &Finalization| {
+            let ctx = against.ctx();
+            FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), fw)
+        };
+        let row = |state| MemberRow {
+            tx,
+            deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
+            committed: WeightedTimestamp::ZERO,
+            height: BlockHeight::new(1),
+            state,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            covered: false,
+        };
+        let in_flight = |tick: u64, settlement| RowState::InFlight {
+            tick: BlockHeight::new(tick),
+            joins: Joins::Executes,
+            settlement,
+        };
+
+        let mut against = plain();
+        assert!(settles(&against, &reserved).is_err(), "no row names it");
+        for refused in [
+            in_flight(3, Settlement::Alone),
+            in_flight(2, Settlement::Shared),
+            RowState::Released {
+                settlement: Settlement::Alone,
+            },
+        ] {
+            against.members.members.insert(tx, row(refused));
+            assert!(settles(&against, &reserved).is_err(), "{refused:?}");
+        }
+        against
+            .members
+            .members
+            .insert(tx, row(in_flight(2, Settlement::Alone)));
+        assert_eq!(settles(&against, &reserved), Ok(()));
+
+        let reclaim = test_utils::make_settling_finalization(BlockHeight::new(2), tx);
+        assert_eq!(
+            settles(&plain(), &reclaim),
+            Ok(()),
+            "a reclaim holds no row"
+        );
     }
 
     /// Admission under the test committee, with nothing behind the parent.

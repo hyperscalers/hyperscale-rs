@@ -1957,7 +1957,7 @@ impl ShardCoordinator {
         snapshot: &'a TopologySnapshot,
         topology_schedule: &'a TopologySchedule,
         chain: &'a QcChainSets,
-        owed_determined: &'a BTreeSet<BlockHeight>,
+        (members, owed_determined): (&'a MemberIndex, &'a BTreeSet<BlockHeight>),
         parent_qc: &QuorumCertificate,
     ) -> Option<Committed<'a>> {
         let parent_block_hash = parent_qc.block_hash();
@@ -1999,25 +1999,25 @@ impl ShardCoordinator {
             chain,
             dedup: &self.dedup_index,
             parent_settled_frontier,
+            members,
             owed_determined,
         })
     }
 
-    /// The ticks whose determined half the chain up to `parent` still
-    /// owes: the rows' flags at the parent, beside execution's report for
-    /// the ticks that run nothing but reclaims, which no row names. `None`
-    /// while a block between the committed tip and the parent is not held.
-    fn owed_determined_at(
+    /// Tick membership at `parent`, and the ticks whose determined half
+    /// the chain up to it still owes: the rows' flags, beside execution's
+    /// report for the ticks that run nothing but reclaims, which no row
+    /// names. `None` while a block between the committed tip and the
+    /// parent is not held.
+    fn rows_at(
         &mut self,
         topology_schedule: &TopologySchedule,
         parent: BlockHash,
-    ) -> Option<BTreeSet<BlockHeight>> {
-        let mut owed = self
-            .ancestry(topology_schedule, parent)?
-            .rows
-            .owed_determined();
+    ) -> Option<(MemberIndex, BTreeSet<BlockHeight>)> {
+        let rows = self.ancestry(topology_schedule, parent)?.rows;
+        let mut owed = rows.owed_determined();
         owed.extend(self.owed_determined.iter().copied());
-        Some(owed)
+        Some((rows, owed))
     }
 
     /// Classify the transactions of `block`, about to commit on the
@@ -2340,7 +2340,7 @@ impl ShardCoordinator {
         else {
             return vec![];
         };
-        let Some(owed_determined) = self.owed_determined_at(topology_schedule, parent_block_hash)
+        let Some((members, owed_determined)) = self.rows_at(topology_schedule, parent_block_hash)
         else {
             return vec![];
         };
@@ -2348,7 +2348,7 @@ impl ShardCoordinator {
             committee,
             topology_schedule,
             &chain,
-            &owed_determined,
+            (&members, &owed_determined),
             &parent_qc,
         ) else {
             return vec![];
@@ -3806,7 +3806,7 @@ impl ShardCoordinator {
                 validate_coast_block_for_vote(block, parent_load)
             } else {
                 let chain = QcChainSets::behind(&self.chain_view(), parent);
-                let Some(owed_determined) = self.owed_determined_at(topology_schedule, parent)
+                let Some((members, owed_determined)) = self.rows_at(topology_schedule, parent)
                 else {
                     trace!(
                         validator = ?self.me,
@@ -3819,7 +3819,7 @@ impl ShardCoordinator {
                     committee,
                     topology_schedule,
                     &chain,
-                    &owed_determined,
+                    (&members, &owed_determined),
                     block.header().parent_qc(),
                 ) else {
                     trace!(
@@ -8177,13 +8177,15 @@ mod tests {
             },
         );
         assert!(state.owed_determined.is_empty());
+        let owed =
+            |state: &mut ShardCoordinator| state.rows_at(&schedule, from).map(|(_, owed)| owed);
         assert_eq!(
-            state.owed_determined_at(&schedule, from),
-            Some(BTreeSet::from([BlockHeight::new(5)])),
+            owed(&mut state),
+            Some(BTreeSet::from([BlockHeight::new(5)]))
         );
         state.owed_determined = BTreeSet::from([BlockHeight::new(7)]);
         assert_eq!(
-            state.owed_determined_at(&schedule, from),
+            owed(&mut state),
             Some(BTreeSet::from([BlockHeight::new(5), BlockHeight::new(7)])),
         );
     }
@@ -13867,7 +13869,7 @@ mod tests {
                     topology_schedule.head(),
                     topology_schedule,
                     &chain,
-                    &self.owed_determined,
+                    (&self.member_rows, &self.owed_determined),
                     block.header().parent_qc(),
                 )
                 .ok_or("the block's anchor window is not held")?;
@@ -13893,7 +13895,7 @@ mod tests {
                     topology_schedule.head(),
                     topology_schedule,
                     &chain,
-                    &self.owed_determined,
+                    (&self.member_rows, &self.owed_determined),
                     block.header().parent_qc(),
                 )
                 .ok_or("the block's anchor window is not held")?;

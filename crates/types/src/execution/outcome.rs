@@ -266,7 +266,7 @@ impl TxOutcome {
     /// Whether this member's committing block took a place in the drain
     /// for it, which its settlement gives back.
     #[must_use]
-    pub(crate) const fn reserved(&self) -> bool {
+    pub const fn reserved(&self) -> bool {
         self.reserved
     }
 
