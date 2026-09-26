@@ -215,7 +215,7 @@ impl NodeStateMachine {
 
     /// Get a reference to the execution coordinator.
     #[must_use]
-    pub(crate) const fn execution_coordinator(&self) -> &ExecutionCoordinator {
+    pub const fn execution_coordinator(&self) -> &ExecutionCoordinator {
         &self.participation().execution_coordinator
     }
 

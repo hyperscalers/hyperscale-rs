@@ -1152,9 +1152,9 @@ impl ExecutionCoordinator {
     }
 
     /// The lines this node's own committed inputs name for the tick at
-    /// `tick_id`: its candidates, then an abort of each member a tick of
-    /// ours holds past its deadline under a departure, then the discard
-    /// of the tick that holds it, then the discard of each member of
+    /// `tick_id`: its candidates, then an abort of each entry past its
+    /// deadline no shard is left to settle, with the discard of the tick
+    /// that holds it where one does, then the discard of each member of
     /// `unanswerable` a tick holds. What a fixture building a block
     /// stands in for.
     fn composed_lines(
@@ -1178,12 +1178,10 @@ impl ExecutionCoordinator {
         };
         let mut discards = Vec::new();
         for entry in self.abandonable(tick_id) {
-            let Some(held_by) = self
-                .ticks
-                .tick_assignment(entry.tx_hash)
-                .filter(settled_first)
-            else {
-                continue;
+            let held_by = match self.ticks.tick_assignment(entry.tx_hash) {
+                Some(held_by) if settled_first(&held_by) => Some(held_by),
+                Some(_) => continue,
+                None => None,
             };
             let reach: Vec<ShardId> = self
                 .counterparts
@@ -1202,10 +1200,10 @@ impl ExecutionCoordinator {
                 holds: Capped::empty(),
                 reach: Capped::new(reach).expect("no more counterparts than prefixes"),
             });
-            discards.push(TickLine::Discard {
-                tick: held_by,
+            discards.extend(held_by.map(|tick| TickLine::Discard {
+                tick,
                 cause: DiscardCause::Abandoned(entry.tx_hash),
-            });
+            }));
         }
         lines.extend(discards);
         lines.extend(unanswerable.iter().filter_map(|entry| {
@@ -1220,9 +1218,8 @@ impl ExecutionCoordinator {
         lines
     }
 
-    /// Admit into the tick being seated everything this commit abandons:
-    /// what its manifest names `Aborted`, and past its deadline what no
-    /// tick holds and no shard is left to settle.
+    /// Admit into the tick being seated everything its manifest names
+    /// `Aborted`.
     ///
     /// Read after the tick's own member assignments, so a member that just
     /// joined this tick is not taken from it — the tick that holds a
@@ -1254,10 +1251,10 @@ impl ExecutionCoordinator {
         lines: &[TickLine],
     ) {
         let local_shard = self.local_shard;
-        // The members the manifest names `Aborted`, then the ones no tick
-        // of ours holds, which this node still lets go of itself: a held
-        // one is the manifest's to name.
-        let mut entries: Vec<UnsettledTx> = lines
+        // The members the manifest names `Aborted`, and nothing else: an
+        // abort the manifest does not name has no row in flight in this
+        // tick, so no finalization of it could commit.
+        let entries: Vec<UnsettledTx> = lines
             .iter()
             .filter_map(|line| match line {
                 TickLine::Member {
@@ -1268,13 +1265,6 @@ impl ExecutionCoordinator {
                 _ => None,
             })
             .collect();
-        for unheld in self.abandonable(tick_id) {
-            if self.ticks.tick_assignment(unheld.tx_hash).is_none()
-                && !entries.iter().any(|named| named.tx_hash == unheld.tx_hash)
-            {
-                entries.push(unheld);
-            }
-        }
         for entry in entries {
             let UnsettledTx {
                 tx_hash,
@@ -4263,6 +4253,12 @@ impl ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
     // Query Methods
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// The height of the last block this coordinator folded.
+    #[must_use]
+    pub const fn committed_height(&self) -> BlockHeight {
+        self.committed_height
+    }
 
     /// Get the local tick assignment for a transaction.
     #[must_use]
