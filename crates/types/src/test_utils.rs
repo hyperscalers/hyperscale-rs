@@ -399,6 +399,7 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                reach: Capped::empty(),
             })
             .collect(),
     )

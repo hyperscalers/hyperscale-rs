@@ -387,6 +387,7 @@ mod tests {
                 joins: Joins::ExecutesAborted,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                reach: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
         );
@@ -412,6 +413,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                reach: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
         );
@@ -448,6 +450,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                reach: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
         );

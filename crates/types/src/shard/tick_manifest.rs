@@ -6,8 +6,8 @@ use hyperscale_hbor::{Capped, Hbor};
 use hyperscale_vm_types::Mode;
 
 use crate::{
-    DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, TICK_HOLD_BYTES, TICK_LINE_BYTES,
-    TickHalf, TickId, TxHash,
+    DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK, ShardId,
+    TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TickHalf, TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -93,6 +93,10 @@ pub enum DiscardCause {
 /// flight: its declared accesses, each under the mode it takes.
 pub type Holds = Capped<Vec<(DeclaredKey, Mode)>, MAX_HOLDS_PER_MEMBER>;
 
+/// The remote shards a member's transaction reaches, as its committing
+/// block's committee placed them.
+pub type Reach = Capped<Vec<ShardId>, MAX_PREFIXES_PER_TX>;
+
 /// One line of a block's tick manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub enum TickLine {
@@ -100,9 +104,10 @@ pub enum TickLine {
     ///
     /// `holds` is what the member claims while its tick is in flight:
     /// its declared accesses when a counterpart's verdict can still
-    /// discard its writes, and nothing otherwise. It rides the line
-    /// because every replica folds it and only a replica that can route
-    /// the transaction can derive it.
+    /// discard its writes, and nothing otherwise. It and `reach` ride
+    /// the line because every replica folds them and only a replica that
+    /// can route the transaction can derive them: what a row is judged
+    /// on after naming is what its line named.
     Member {
         /// The transaction, which this chain committed and has not
         /// resolved.
@@ -113,6 +118,8 @@ pub enum TickLine {
         settlement: Settlement,
         /// What it holds while the tick is in flight.
         holds: Holds,
+        /// The remote shards it reaches.
+        reach: Reach,
     },
     /// An earlier tick lets go of the members `cause` releases.
     Discard {
@@ -127,12 +134,14 @@ impl TickLine {
     /// An upper bound on what this line costs the block that carries
     /// it, so a composer spends the section's budget as it fills it and
     /// a voter checks the same figure without re-encoding what it
-    /// decoded. Everything but the holds is fixed width.
+    /// decoded. Everything but the holds and the reach is fixed width.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
         TICK_LINE_BYTES
             + match self {
-                Self::Member { holds, .. } => holds.len() * TICK_HOLD_BYTES,
+                Self::Member { holds, reach, .. } => {
+                    holds.len() * TICK_HOLD_BYTES + reach.len() * TICK_REACH_BYTES
+                }
                 Self::Discard { .. } => 0,
             }
     }

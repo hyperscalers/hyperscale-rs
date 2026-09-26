@@ -20,9 +20,9 @@ use std::sync::Arc;
 use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::{
     AbandonmentRecord, Address, Block, BlockHeight, CollectionId, Deadline, DiscardCause, EntryKey,
-    Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, SettledEntries,
-    Settlement, ShardId, ShardTrie, SubstateKey, TickHalf, TickId, TickLine, TickManifest,
-    Transaction, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
+    Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, Reach,
+    SettledEntries, Settlement, ShardId, ShardTrie, SubstateKey, TickHalf, TickId, TickLine,
+    TickManifest, Transaction, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{ProtocolHasher, TICK_MEMBER_SLOT, collection_id};
 
@@ -44,7 +44,10 @@ pub enum RowState {
     },
     /// Let go by a discard of the tick that held it, and not yet
     /// aborted.
-    Released,
+    Released {
+        /// Which half its line said settles it.
+        settlement: Settlement,
+    },
 }
 
 /// One committed, unresolved member.
@@ -65,6 +68,9 @@ pub struct MemberRow {
     /// What it holds while in flight, as its line named them; empty in
     /// every other state.
     pub holds: Holds,
+    /// The remote shards it reaches, as its line named them; empty until
+    /// a line names it.
+    pub reach: Reach,
     /// Whether a committed abandonment record names it.
     pub covered: bool,
 }
@@ -324,7 +330,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// Release `tx` from its tick: `Released`, holding nothing.
     fn release(&mut self, tx: TxHash) {
         if let Some(mut row) = self.member(tx) {
-            row.state = RowState::Released;
+            let RowState::InFlight { settlement, .. } = row.state else {
+                return;
+            };
+            row.state = RowState::Released { settlement };
             row.holds = Capped::empty();
             self.set_member(tx, Some(row));
         }
@@ -413,6 +422,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     joins,
                     settlement,
                     holds,
+                    reach,
                 } => {
                     let Some(mut row) = self.member(*tx) else {
                         continue;
@@ -423,6 +433,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         settlement: *settlement,
                     };
                     row.holds = holds.clone();
+                    row.reach = reach.clone();
                     self.set_member(*tx, Some(row));
                     members.push(*tx);
                     match settlement.half() {
@@ -504,6 +515,7 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
                 height: inputs.height,
                 state: RowState::Pending,
                 holds: Capped::empty(),
+                reach: Capped::empty(),
                 covered: false,
             }),
         );
@@ -819,6 +831,7 @@ mod tests {
             joins: Joins::Executes,
             settlement,
             holds: Capped::empty(),
+            reach: Capped::empty(),
         }
     }
 
@@ -910,15 +923,16 @@ mod tests {
                 cause: DiscardCause::Abandoned(tx(4)),
             }],
         ));
-        assert_eq!(state_of(&store, 1), Some(RowState::Released));
+        let released = |settlement| Some(RowState::Released { settlement });
+        assert_eq!(state_of(&store, 1), released(Settlement::Alone));
         assert!(matches!(
             state_of(&store, 2),
             Some(RowState::InFlight { .. })
         ));
-        assert_eq!(state_of(&store, 3), Some(RowState::Released));
+        assert_eq!(state_of(&store, 3), released(Settlement::Awaited));
         assert_eq!(
             state_of(&store, 4),
-            Some(RowState::Released),
+            released(Settlement::Shared),
             "the abandoned member goes whatever it shares",
         );
         let tick = &MemberIndex::load(&store, LOCAL).ticks[&BlockHeight::new(2)];
@@ -932,7 +946,7 @@ mod tests {
                 cause: DiscardCause::Recovery,
             }],
         ));
-        assert_eq!(state_of(&store, 2), Some(RowState::Released));
+        assert_eq!(state_of(&store, 2), released(Settlement::Shared));
         assert!(MemberIndex::load(&store, LOCAL).ticks.is_empty());
     }
 

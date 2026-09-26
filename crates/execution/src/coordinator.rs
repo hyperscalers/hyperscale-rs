@@ -1137,15 +1137,22 @@ impl ExecutionCoordinator {
             let Some(held_by) = self.ticks.tick_assignment(entry.tx_hash) else {
                 continue;
             };
+            let reach: Vec<ShardId> = self
+                .counterparts
+                .ledger
+                .counterparts(entry.tx_hash, anchored.shard_trie())
+                .into_iter()
+                .collect();
             lines.push(TickLine::Member {
                 tx: entry.tx_hash,
                 joins: Joins::Aborted,
-                settlement: if self.counterparts.ledger.reaches_beyond(entry.tx_hash) {
-                    Settlement::Awaited
-                } else {
+                settlement: if reach.is_empty() {
                     Settlement::Alone
+                } else {
+                    Settlement::Awaited
                 },
                 holds: Capped::empty(),
+                reach: Capped::new(reach).expect("no more counterparts than prefixes"),
             });
             discards.push(TickLine::Discard {
                 tick: held_by,
@@ -8317,6 +8324,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                reach: Capped::empty(),
             }],
         ));
 
@@ -12846,6 +12854,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                reach: Capped::empty(),
             },
             TickLine::Discard {
                 tick: tick_id,

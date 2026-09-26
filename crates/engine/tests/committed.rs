@@ -210,6 +210,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            reach: Capped::empty(),
         }])),
         witness_sources,
     };

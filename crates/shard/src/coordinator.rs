@@ -2178,11 +2178,7 @@ impl ShardCoordinator {
         let facts = rows
             .members
             .values()
-            .filter(|row| match row.state {
-                RowState::Pending => true,
-                RowState::Released => row.deadline.passed(anchor),
-                RowState::InFlight { .. } => false,
-            })
+            .filter(|row| row.state == RowState::Pending)
             .filter_map(|row| Some((row.tx, self.member_facts.get(row.tx)?.clone())))
             .collect();
         Some(ManifestInputs {
@@ -8021,6 +8017,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            reach: Capped::empty(),
         }
     }
 

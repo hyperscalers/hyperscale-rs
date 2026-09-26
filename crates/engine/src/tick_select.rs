@@ -14,9 +14,9 @@ use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
     Address, CollectionId, Deadline, DeclaredKey, DiscardCause, Joins, MAX_HOLDS_PER_MEMBER,
-    MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Role, Settlement, ShardId, ShardTrie, SubstateKey,
-    TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, compatible,
-    tick_manifest_admits_block,
+    MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Reach, Role, Settlement, ShardId, ShardTrie,
+    SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
+    compatible, tick_manifest_admits_block,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -214,8 +214,8 @@ pub struct EngagementWait {
 /// block was classified under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberFacts {
-    /// Whether the transaction reaches beyond this shard.
-    pub reaches_beyond: bool,
+    /// The remote shards the transaction reaches.
+    pub reach: Reach,
     /// Whether this shard runs a leg of it, which its reclaim resolves
     /// if it never runs, and never an abort.
     pub leg: bool,
@@ -245,6 +245,11 @@ impl MemberFacts {
     }
 
     /// The facts of `member`, `tx`'s member classified under `trie`.
+    ///
+    /// # Panics
+    ///
+    /// Never: a transaction reaches no more shards than its routing
+    /// names prefixes, which caps the reach.
     #[must_use]
     pub fn of_member(member: &Member, tx: &Transaction, trie: &ShardTrie) -> Self {
         let local = member.local();
@@ -288,13 +293,27 @@ impl MemberFacts {
             (requires, engagement)
         };
         Self {
-            reaches_beyond,
+            reach: Capped::new(
+                member
+                    .reach()
+                    .iter()
+                    .copied()
+                    .filter(|&shard| shard != local)
+                    .collect(),
+            )
+            .expect("a transaction reaches no more shards than it names prefixes"),
             leg: member.role() == Role::Leg,
             settlement,
             declared: tx.routing().declared_modes.clone(),
             requires,
             engagement,
         }
+    }
+
+    /// Whether the transaction reaches beyond this shard.
+    #[must_use]
+    pub fn reaches_beyond(&self) -> bool {
+        !self.reach.is_empty()
     }
 
     /// Whether a counterpart's verdict can still discard the member's
@@ -388,38 +407,46 @@ pub struct ManifestInputs {
 /// reads.
 #[derive(Debug, Clone, Copy)]
 pub enum Standing<'a> {
-    /// Committed, and named by no tick yet.
+    /// Committed, and named by no tick yet: judged on its facts.
     Pending(&'a MemberFacts),
-    /// Held by the tick at this id, which lets go of it on its abort: a
-    /// member a counterpart's verdict can discard, which a departure
-    /// covers and which the tick does not hold as its own abandonment.
-    /// Its abort reads nothing more than its row.
-    Held(TickId),
-    /// Let go by a discard of the tick that held it.
+    /// Held by a tick that lets go of it on its abort: a member a
+    /// counterpart's verdict can discard, which a departure covers and
+    /// which the tick does not hold as its own abandonment. Judged on
+    /// its row alone.
+    Held {
+        /// The tick holding it.
+        tick: TickId,
+        /// The remote shards its line named.
+        reach: &'a Reach,
+    },
+    /// Let go by a discard of the tick that held it. Judged on its row
+    /// alone.
     Released {
         /// Whether a committed departure names it.
         covered: bool,
-        /// Its facts.
-        facts: &'a MemberFacts,
+        /// Which half its line said settles it.
+        settlement: Settlement,
+        /// The remote shards its line named.
+        reach: &'a Reach,
     },
 }
 
 impl Standing<'_> {
-    /// Whether the transaction reaches beyond this shard: a held member
-    /// a departure covers does.
-    const fn reaches_beyond(&self) -> bool {
+    /// The remote shards the transaction reaches.
+    const fn reach(&self) -> &Reach {
         match self {
-            Self::Pending(facts) | Self::Released { facts, .. } => facts.reaches_beyond,
-            Self::Held(_) => true,
+            Self::Pending(facts) => &facts.reach,
+            Self::Held { reach, .. } | Self::Released { reach, .. } => reach,
         }
     }
 
-    /// Whether this shard runs a leg of it, which its reclaim resolves:
-    /// a held member a counterpart's verdict can discard is no leg.
+    /// Whether this shard runs a leg of it, which its reclaim resolves.
+    /// A held row is never one; a released one is judged by
+    /// [`Nameable::abortable`] on its row.
     const fn leg(&self) -> bool {
         match self {
-            Self::Pending(facts) | Self::Released { facts, .. } => facts.leg,
-            Self::Held(_) => false,
+            Self::Pending(facts) => facts.leg,
+            Self::Held { .. } | Self::Released { .. } => false,
         }
     }
 }
@@ -461,22 +488,27 @@ pub fn member_lines<'f>(
                 {
                     continue;
                 }
-                Standing::Held(TickId::new(rows.shard(), tick))
+                Standing::Held {
+                    tick: TickId::new(rows.shard(), tick),
+                    reach: &row.reach,
+                }
             }
-            RowState::Released if !passed => continue,
-            RowState::Pending | RowState::Released => {
+            RowState::Released { settlement } => {
+                if !passed {
+                    continue;
+                }
+                Standing::Released {
+                    covered: row.covered,
+                    settlement,
+                    reach: &row.reach,
+                }
+            }
+            RowState::Pending => {
                 let Some(known) = facts(row.tx) else {
                     missing.push(row.tx);
                     continue;
                 };
-                if row.state == RowState::Pending {
-                    Standing::Pending(known)
-                } else {
-                    Standing::Released {
-                        covered: row.covered,
-                        facts: known,
-                    }
-                }
+                Standing::Pending(known)
             }
         };
         candidates.push(Nameable {
@@ -556,13 +588,19 @@ impl Nameable<'_> {
     /// decides it: a leg's readings license its reclaim, and a core
     /// member is named to run only once every sibling's committed bundle
     /// names it, so a sibling's cell read absent reaches only a `Pending`
-    /// row. A row let go of is aborted once nothing beyond this shard can
-    /// settle it.
-    const fn abortable(&self) -> Option<Abort> {
+    /// row. A row let go of is aborted once it reaches no other shard, or
+    /// once a departure covers it and a counterpart's verdict could have
+    /// discarded it: one that is `Alone` with a reach is a leg, which its
+    /// reclaim resolves, or a core member its own tick decides.
+    fn abortable(&self) -> Option<Abort> {
         match self.standing {
             Standing::Pending(_) => Some(Abort::Unheld),
-            Standing::Held(tick) => Some(Abort::Held(tick)),
-            Standing::Released { covered, facts } if covered || !facts.reaches_beyond => {
+            Standing::Held { tick, .. } => Some(Abort::Held(tick)),
+            Standing::Released {
+                covered,
+                settlement,
+                reach,
+            } if reach.is_empty() || (covered && !matches!(settlement, Settlement::Alone)) => {
                 Some(Abort::Unheld)
             }
             Standing::Released { .. } => None,
@@ -605,7 +643,7 @@ pub fn select_members<'a>(
     budget: &mut ManifestBudget,
 ) -> Vec<TickLine> {
     let mut ordered: Vec<Nameable<'a>> = candidates.into_iter().collect();
-    ordered.sort_by_key(|candidate| (!candidate.standing.reaches_beyond(), candidate.tx));
+    ordered.sort_by_key(|candidate| (candidate.standing.reach().is_empty(), candidate.tx));
     let mut lines = Vec::new();
     let mut discards = Vec::new();
     for candidate in ordered {
@@ -624,12 +662,13 @@ pub fn select_members<'a>(
             let line = TickLine::Member {
                 tx,
                 joins: Joins::Aborted,
-                settlement: if standing.reaches_beyond() {
-                    Settlement::Awaited
-                } else {
+                settlement: if standing.reach().is_empty() {
                     Settlement::Alone
+                } else {
+                    Settlement::Awaited
                 },
                 holds: Capped::empty(),
+                reach: standing.reach().clone(),
             };
             let discard = match abort {
                 Abort::Unheld => None,
@@ -667,6 +706,7 @@ pub fn select_members<'a>(
             } else {
                 Capped::empty()
             },
+            reach: facts.reach.clone(),
         };
         if !budget.take(&line) {
             break;
@@ -832,7 +872,7 @@ mod tests {
 
     fn alone(declared: Vec<(DeclaredKey, Mode)>) -> MemberFacts {
         MemberFacts {
-            reaches_beyond: false,
+            reach: Capped::empty(),
             leg: false,
             settlement: Settlement::Alone,
             declared,
@@ -843,7 +883,7 @@ mod tests {
 
     fn leg(declared: Vec<(DeclaredKey, Mode)>, requires: &[Requirement]) -> MemberFacts {
         MemberFacts {
-            reaches_beyond: true,
+            reach: Capped::from_array([PEER]),
             leg: false,
             settlement: Settlement::Shared,
             declared,
@@ -1030,6 +1070,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                reach: Capped::from_array([PEER]),
             }],
         );
     }
@@ -1061,6 +1102,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                reach: Capped::from_array([PEER]),
             }],
         );
     }
@@ -1083,6 +1125,7 @@ mod tests {
                 settlement,
             },
             holds: Capped::empty(),
+            reach: Capped::from_array([PEER]),
             covered,
         };
         let mut rows = MemberIndex::empty(ShardId::ROOT);
@@ -1107,6 +1150,7 @@ mod tests {
                     joins: Joins::Aborted,
                     settlement: Settlement::Awaited,
                     holds: Capped::empty(),
+                    reach: Capped::from_array([PEER]),
                 },
                 TickLine::Discard {
                     tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
@@ -1117,12 +1161,13 @@ mod tests {
     }
 
     /// Past its deadline, a held member is aborted beside its tick's
-    /// discard, and a member let go of is aborted once it reaches no
-    /// other shard or is covered.
+    /// discard, and a member let go of is aborted on its row once it
+    /// reaches no other shard, or once a departure covers it and it is
+    /// not `Alone`: an `Alone` member with a reach is a leg.
     #[test]
     fn a_held_or_released_member_is_aborted_by_its_standing() {
-        let reaching = leg(vec![], &[]);
-        let local = alone(vec![]);
+        let peer: Reach = Capped::from_array([PEER]);
+        let none: Reach = Capped::empty();
         let held = TickId::new(ShardId::ROOT, BlockHeight::new(5));
         let passed = Deadline::of(ms(0));
         let candidate = |seed, deadline, standing| Nameable {
@@ -1130,32 +1175,45 @@ mod tests {
             deadline,
             standing,
         };
-        let released = |covered, facts| Standing::Released { covered, facts };
+        let released = |covered, settlement, reach| Standing::Released {
+            covered,
+            settlement,
+            reach,
+        };
         let lines = select_members(
             ms(60_000),
             [
-                candidate(1, passed, Standing::Held(held)),
-                candidate(5, passed, released(false, &reaching)),
-                candidate(6, passed, released(false, &local)),
-                candidate(7, passed, released(true, &reaching)),
-                candidate(8, far(), released(true, &reaching)),
+                candidate(
+                    1,
+                    passed,
+                    Standing::Held {
+                        tick: held,
+                        reach: &peer,
+                    },
+                ),
+                candidate(5, passed, released(false, Settlement::Awaited, &peer)),
+                candidate(6, passed, released(false, Settlement::Alone, &none)),
+                candidate(7, passed, released(true, Settlement::Awaited, &peer)),
+                candidate(8, far(), released(true, Settlement::Awaited, &peer)),
+                candidate(9, passed, released(true, Settlement::Alone, &peer)),
             ],
             &Held::default(),
             &mut ProvisionalCells::default(),
             &mut ManifestBudget::default(),
         );
-        let aborted = |seed, settlement| TickLine::Member {
+        let aborted = |seed, settlement, reach: &Reach| TickLine::Member {
             tx: tx(seed),
             joins: Joins::Aborted,
             settlement,
             holds: Capped::empty(),
+            reach: reach.clone(),
         };
         assert_eq!(
             lines,
             vec![
-                aborted(1, Settlement::Awaited),
-                aborted(7, Settlement::Awaited),
-                aborted(6, Settlement::Alone),
+                aborted(1, Settlement::Awaited, &peer),
+                aborted(7, Settlement::Awaited, &peer),
+                aborted(6, Settlement::Alone, &none),
                 TickLine::Discard {
                     tick: held,
                     cause: DiscardCause::Abandoned(tx(1)),

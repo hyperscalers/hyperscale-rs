@@ -342,10 +342,17 @@ pub const TICK_LINE_BYTES: usize = 64;
 /// mode.
 pub const TICK_HOLD_BYTES: usize = 160;
 
+/// Bytes one shard of a member line's reach costs.
+pub const TICK_REACH_BYTES: usize = 16;
+
 /// Any single line fits an empty manifest, so no line is ever left
 /// waiting on a budget it can never meet.
-const _: () =
-    assert!(TICK_LINE_BYTES + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES <= MAX_TICK_MANIFEST_BYTES);
+const _: () = assert!(
+    TICK_LINE_BYTES
+        + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES
+        + MAX_PREFIXES_PER_TX * TICK_REACH_BYTES
+        <= MAX_TICK_MANIFEST_BYTES
+);
 
 /// Byte budget the abandonment records of one block share.
 ///

@@ -183,9 +183,9 @@ pub use shard::limits::{
     MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS,
     MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
     STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TICK_HOLD_BYTES,
-    TICK_LINE_BYTES, TX_CAPS, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES, budget_admits_block,
-    caps_admit_transaction, drain_admits_block, evidence_admits_block, state_claims_admit_block,
-    sweep_admits_block, tick_manifest_admits_block,
+    TICK_LINE_BYTES, TICK_REACH_BYTES, TX_CAPS, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES,
+    budget_admits_block, caps_admit_transaction, drain_admits_block, evidence_admits_block,
+    state_claims_admit_block, sweep_admits_block, tick_manifest_admits_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad};
 pub use shard::manifest::{BlockManifest, BlockMetadata};
@@ -207,7 +207,9 @@ pub use shard::roots::{
 pub use shard::state_claim::{StateClaim, Stated};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
-pub use shard::tick_manifest::{DiscardCause, Holds, Joins, Settlement, TickLine, TickManifest};
+pub use shard::tick_manifest::{
+    DiscardCause, Holds, Joins, Reach, Settlement, TickLine, TickManifest,
+};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};

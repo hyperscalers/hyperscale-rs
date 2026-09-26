@@ -468,7 +468,7 @@ fn the_drains_name_count_alone_would_overrun_the_frame() {
 fn a_tick_lines_weight_bounds_its_encoding() {
     use hyperscale_types::{
         CollectionId, DeclaredKey, DeclaredRange, DiscardCause, Joins, MAX_HOLDS_PER_MEMBER,
-        Settlement, TICK_HOLD_BYTES, TICK_LINE_BYTES, TickId, TickLine,
+        MAX_PREFIXES_PER_TX, Settlement, TICK_HOLD_BYTES, TICK_LINE_BYTES, TickId, TickLine,
     };
     use hyperscale_vm_types::{Mode, Moves};
 
@@ -497,12 +497,18 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                 settlement: Settlement::Awaited,
                 holds: Capped::new((0..holds).map(|at| (hold(at).0, mode)).collect())
                     .expect("a list under the cap"),
+                reach: Capped::new(
+                    (0..holds.min(MAX_PREFIXES_PER_TX))
+                        .map(|at| ShardId::leaf(63, (u64::MAX >> 1) - at as u64))
+                        .collect(),
+                )
+                .expect("a list under the cap"),
             };
             let encoded = hbor_to_vec(&line).expect("a member line encodes");
             assert!(
                 encoded.len() <= line.wire_weight(),
-                "a member line of {holds} holds encodes to {} bytes, over the {} its weight \
-                 claims",
+                "a member line of {holds} holds and as many reached shards encodes to {} bytes, \
+                 over the {} its weight claims",
                 encoded.len(),
                 line.wire_weight(),
             );
@@ -529,6 +535,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         joins: Joins::Executes,
         settlement: Settlement::Alone,
         holds: Capped::from_array([hold(0)]),
+        reach: Capped::empty(),
     };
     assert_eq!(
         one.wire_weight(),
