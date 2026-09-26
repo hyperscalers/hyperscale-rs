@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs};
 use hyperscale_engine::tick_select::{
-    CommittedInputs, ManifestBudget, MemberFacts, Nameable, ProvisionalCells, Standing,
+    CommittedInputs, ManifestBudget, MemberFacts, Nameable, ProvisionalCells, Standing, readiness,
     select_members,
 };
 use hyperscale_types::{
@@ -236,14 +236,20 @@ impl TickCandidates {
     /// The line is the decision: this node seats what the chain named
     /// whatever its own inputs would have said. A line naming a
     /// transaction this node holds no candidate for — one it could not
-    /// route — seats nothing here.
+    /// route — seats nothing here, and one named to run on bundles this
+    /// node has not absorbed runs on less than its peers did. Either is a
+    /// gap in what this node can execute, and the second value says
+    /// whether there is none: a tick with one is seated and never run.
     pub fn take_named(
         &mut self,
         lines: &[TickLine],
         provisioning: &ProvisioningTracker,
-    ) -> Vec<Admitted> {
+        trie: &ShardTrie,
+        anchor: WeightedTimestamp,
+    ) -> (Vec<Admitted>, bool) {
         let local = self.local_shard;
         let mut admitted = Vec::new();
+        let mut in_hand = true;
         for line in lines {
             let TickLine::Member {
                 tx: tx_hash, joins, ..
@@ -255,8 +261,14 @@ impl TickCandidates {
                 continue;
             }
             let Some(candidate) = self.candidates.remove(tx_hash) else {
+                in_hand = false;
                 continue;
             };
+            if *joins == Joins::Executes {
+                let facts = MemberFacts::of_member(&candidate.member, &candidate.tx, trie);
+                in_hand &= readiness(*tx_hash, &facts, anchor, &Absorbed(provisioning))
+                    == Some(Joins::Executes);
+            }
             let reaches_beyond = candidate.member.reaches_beyond();
             // What arrived for the edges this member's legs consume, read
             // off the record cells the committed claims proved.
@@ -286,7 +298,7 @@ impl TickCandidates {
                 committed_prices: candidate.committed_prices,
             });
         }
-        admitted
+        (admitted, in_hand)
     }
 
     /// Drop a candidate no tick will take — abandoned at its deadline, or
@@ -381,7 +393,7 @@ mod tests {
             Classified::whole(),
         );
 
-        let admitted = candidates.take_named(
+        let (admitted, in_hand) = candidates.take_named(
             &[TickLine::Member {
                 tx: hash,
                 joins: Joins::ExecutesAborted,
@@ -390,7 +402,10 @@ mod tests {
                 reach: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
+            &ShardTrie::uniform(0),
+            ms(1_000),
         );
+        assert!(in_hand, "a member run attested aborted needs no bundle");
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].request.tx_hash, hash);
         assert_eq!(admitted[0].joins, Joins::ExecutesAborted);
@@ -402,12 +417,13 @@ mod tests {
     }
 
     /// A line naming a transaction this node holds no candidate for seats
-    /// nothing here, and a candidate no line names stays.
+    /// nothing here and leaves the tick short, and a candidate no line
+    /// names stays.
     #[test]
     fn only_a_named_candidate_is_seated() {
         let mut candidates = TickCandidates::new(LOCAL);
         let waiting = local_only(&mut candidates, tx(2));
-        let admitted = candidates.take_named(
+        let (admitted, in_hand) = candidates.take_named(
             &[TickLine::Member {
                 tx: tx(3).hash(),
                 joins: Joins::Executes,
@@ -416,8 +432,11 @@ mod tests {
                 reach: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
+            &ShardTrie::uniform(0),
+            ms(1_000),
         );
         assert!(admitted.is_empty());
+        assert!(!in_hand, "a named member with no body is a gap");
         assert!(candidates.contains(waiting));
     }
 
@@ -444,7 +463,7 @@ mod tests {
             PriceTable::GENESIS,
             classified,
         );
-        let admitted = candidates.take_named(
+        let (admitted, _) = candidates.take_named(
             &[TickLine::Member {
                 tx: hash,
                 joins: Joins::Executes,
@@ -453,6 +472,8 @@ mod tests {
                 reach: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
+            &trie,
+            ms(1_000),
         );
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].membership.awaited(), &BTreeSet::from([local]));

@@ -141,6 +141,15 @@ fn committed_members(
         .collect()
 }
 
+/// What each member a finalization's receipts name left, as the receipts
+/// state it.
+fn receipt_writes(fw: &Finalization) -> Vec<(TxHash, StateWrites)> {
+    fw.receipts()
+        .iter()
+        .filter_map(|receipt| Some((receipt.tx_hash, receipt.consensus.writes()?.clone())))
+        .collect()
+}
+
 /// Count a transaction let go of with no outcome, by whether a
 /// committed record had covered it.
 fn record_unanswerable(covered_by_record: bool) {
@@ -210,6 +219,21 @@ struct PendingTick {
     tick_ts: WeightedTimestamp,
     env: TickEnvironment,
     requests: Vec<CrossShardExecutionRequest>,
+    /// Whether this node holds everything the tick's lines name: a body
+    /// for each member and the bundles each one named to run needs.
+    in_hand: bool,
+}
+
+/// One seated tick in dispatch order.
+enum Queued {
+    /// A tick this node runs.
+    Run(PendingTick),
+    /// A tick this node seated and cannot run: sealed, below the store's
+    /// reach, or short a body or a bundle. Every later tick reads a
+    /// baseline its readable writes belong in, so none dispatches until
+    /// its determined half has settled and the receipts that settled it
+    /// are seated on the chain in its place.
+    Held(TickId),
 }
 
 impl PendingTick {
@@ -483,7 +507,12 @@ pub struct ExecutionCoordinator {
     /// Ticks seated at commit but not yet dispatched, in height order.
     /// Ticks execute serially — each output is the next tick's baseline —
     /// so the head dispatches only when no tick is in flight.
-    pending_ticks: VecDeque<PendingTick>,
+    pending_ticks: VecDeque<Queued>,
+
+    /// The seated ticks this node never runs, whose settlements it seats
+    /// from their receipts as they commit. Kept until the tick leaves
+    /// the registry.
+    held: BTreeSet<TickId>,
 
     /// Whether a dispatched tick's `ExecutionBatchCompleted` is still
     /// outstanding.
@@ -755,6 +784,7 @@ impl ExecutionCoordinator {
             committed_ts: committed_block_anchor_wt,
             committed_committee_anchor_wt,
             pending_ticks: VecDeque::new(),
+            held: BTreeSet::new(),
             code,
             tick_in_flight: false,
             terminated: false,
@@ -1102,13 +1132,7 @@ impl ExecutionCoordinator {
                 if tick_id.block_height() >= self.dispatch_from {
                     continue;
                 }
-                let writes: Vec<(TxHash, StateWrites)> = fw
-                    .receipts()
-                    .iter()
-                    .filter_map(|receipt| {
-                        Some((receipt.tx_hash, receipt.consensus.writes()?.clone()))
-                    })
-                    .collect();
+                let writes = receipt_writes(fw);
                 if writes.is_empty() {
                     continue;
                 }
@@ -1553,7 +1577,9 @@ impl ExecutionCoordinator {
                 self.drop_unanswerable(*tick, *tx_hash);
             }
         }
-        let admitted = self.candidates.take_named(lines, &self.provisioning);
+        let (admitted, in_hand) =
+            self.candidates
+                .take_named(lines, &self.provisioning, anchored.shard_trie(), block.ts);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
@@ -1642,6 +1668,7 @@ impl ExecutionCoordinator {
             // folded the beacon rather than on what the block committed.
             env: TickEnvironment::governing(anchored, topology_schedule.windows()),
             requests,
+            in_hand,
         });
         (pending, votes_to_replay, members)
     }
@@ -1750,12 +1777,13 @@ impl ExecutionCoordinator {
         );
         record_batch_unavailable();
         self.tick_in_flight = false;
-        self.pending_ticks.push_front(PendingTick {
+        self.pending_ticks.push_front(Queued::Run(PendingTick {
             tick,
             tick_ts,
             env,
             requests,
-        });
+            in_hand: true,
+        }));
         Vec::new()
     }
 
@@ -3164,9 +3192,18 @@ impl ExecutionCoordinator {
 
         // Tick fates the block's committed certificates decide. Emitted
         // ahead of the block-specific work, so a tick dispatched below
-        // reads the resolved chain.
+        // reads the resolved chain. A held tick never ran here, so what
+        // its half left is seated from the receipts that settled it, at
+        // or above where the store reaches; below it the base carries it.
+        let mut restored: Vec<(TickId, TickResolution)> = Vec::new();
         for fw in block.certificates().iter() {
             let fw = fw.as_unverified();
+            if self.held.contains(fw.tick_id()) && height >= self.dispatch_from {
+                let writes = receipt_writes(fw);
+                if !writes.is_empty() {
+                    restored.push((*fw.tick_id(), TickResolution::Restored { height, writes }));
+                }
+            }
             let aborted: BTreeSet<TxHash> = fw
                 .tx_decisions()
                 .into_iter()
@@ -3185,6 +3222,13 @@ impl ExecutionCoordinator {
                 },
             );
         }
+        if !restored.is_empty() {
+            actions.push(Action::ResolveTicks {
+                resolutions: restored,
+            });
+        }
+        let ticks = &self.ticks;
+        self.held.retain(|tick_id| ticks.contains_tick(tick_id));
         actions.extend(self.drain_ready_tick_resolutions());
 
         let mut named = Vec::new();
@@ -3357,19 +3401,23 @@ impl ExecutionCoordinator {
             actions.extend(self.replay_early_attestations(topology_schedule, &members));
         }
         if let Some(pending) = pending {
-            if runnable {
+            if runnable && pending.in_hand {
                 tracing::debug!(
                     height = height.inner(),
                     members = pending.requests.len(),
                     "Dispatching this commit's tick"
                 );
-                self.pending_ticks.push_back(pending);
+                self.pending_ticks.push_back(Queued::Run(pending));
             } else {
+                let tick_id = TickId::new(self.local_shard, height);
                 tracing::debug!(
                     height = height.inner(),
                     members = pending.requests.len(),
-                    "Seated a tick the store can no longer anchor a baseline for; not dispatching it"
+                    in_hand = pending.in_hand,
+                    "Seated a tick this node cannot run; holding dispatch behind it"
                 );
+                self.held.insert(tick_id);
+                self.pending_ticks.push_back(Queued::Held(tick_id));
             }
         }
         // What seating abandoned, before the tick it seated reads the
@@ -3822,14 +3870,26 @@ impl ExecutionCoordinator {
         if self.tick_in_flight {
             return Vec::new();
         }
-        let Some(head) = self.pending_ticks.front() else {
+        // A held tick blocks until its determined half has settled: its
+        // readable writes are in the chain then, seated from the receipts.
+        while let Some(Queued::Held(tick_id)) = self.pending_ticks.front() {
+            if self
+                .ticks
+                .get_tick(tick_id)
+                .is_some_and(TickState::determined_unsettled)
+            {
+                return Vec::new();
+            }
+            self.pending_ticks.pop_front();
+        }
+        let Some(Queued::Run(head)) = self.pending_ticks.front() else {
             return Vec::new();
         };
         // Running a member whose code this node lacks would reach the
         // engine's no-code refusal while every replica holding the bytes
         // settles it — one tick, two receipt roots. Waiting is the whole
         // of the fix: the fetch heals, and the tick that runs then is the
-        // tick that was composed now. Ticks are serial, so this shard's
+        // tick that was seated now. Ticks are serial, so this shard's
         // execution stops here until the bytes land — the trade a
         // withheld artifact is meant to draw, liveness rather than a
         // fork.
@@ -3847,7 +3907,7 @@ impl ExecutionCoordinator {
             );
             return Vec::new();
         }
-        let Some(tick) = self.pending_ticks.pop_front() else {
+        let Some(Queued::Run(tick)) = self.pending_ticks.pop_front() else {
             return Vec::new();
         };
         self.tick_in_flight = true;
@@ -3865,8 +3925,8 @@ impl ExecutionCoordinator {
     /// Driven by assignment rather than by commit, because those are no
     /// longer the same moment: a member waits in the candidate pool until
     /// a tick can take it, and a counterpart's certificate arriving in
-    /// that window has nowhere to route. Composition is what gives it
-    /// one, so composition is what replays.
+    /// that window has nowhere to route. Seating is what gives it one,
+    /// so seating is what replays.
     fn replay_early_attestations(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -4353,6 +4413,7 @@ impl ExecutionCoordinator {
         // chain, so its completion must be able to release the queue.
         self.pending_tick_resolutions.clear();
         self.pending_ticks.clear();
+        self.held.clear();
         self.ticked.clear();
         self.tick_in_flight = false;
         // And the candidates behind them, with the latch that keeps
@@ -8326,8 +8387,104 @@ mod tests {
         }
         assert!(live.tick_in_flight || !live.pending_ticks.is_empty());
         assert!(
-            !sealed.tick_in_flight && sealed.pending_ticks.is_empty(),
-            "a sealed tick is seated, never dispatched",
+            !sealed.tick_in_flight
+                && matches!(
+                    sealed.pending_ticks.front(),
+                    Some(Queued::Held(held)) if *held == TickId::new(ShardId::ROOT, BlockHeight::new(2))
+                ),
+            "a sealed tick is seated, never dispatched, and holds dispatch behind it",
+        );
+    }
+
+    /// A tick this node cannot run holds every later tick until its
+    /// determined half settles; the settling commit seats what its
+    /// receipts say it left on the chain, then the later tick runs.
+    #[test]
+    fn a_held_tick_holds_dispatch_until_it_settles() {
+        let schedule = make_test_topology();
+        let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
+        let member = |tx: &Transaction| TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+        };
+        let mut state = make_test_state();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        state.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Manifest);
+        let sealed = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(held_tx.clone())],
+        )
+        .into_sealed();
+        state.commit_block_carrying(
+            &schedule,
+            &naming(&test_certify(sealed, 2_000), vec![member(&held_tx)]),
+            Naming::Manifest,
+        );
+        let later = make_live_block(
+            BlockHeight::new(3),
+            3_000,
+            ValidatorId::new(0),
+            vec![Arc::new(later_tx.clone())],
+        );
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &naming(&test_certify(later, 3_000), vec![member(&later_tx)]),
+            Naming::Manifest,
+        );
+        let executes = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        };
+        assert!(
+            !executes(&effects.actions),
+            "the held tick holds tick 3 back"
+        );
+
+        let mut writes = StateWrites::default();
+        writes.cells.insert(
+            SubstateKey {
+                owner: Address::new([7; 31], AddressClass::Component),
+                local: LocalKey([1; 16]),
+            },
+            Some(vec![1]),
+        );
+        let finalization: Arc<Verifiable<Finalization>> =
+            Arc::new(make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), writes).into());
+        let settling = helpers_make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(4),
+            4_000,
+            ValidatorId::new(0),
+            vec![],
+            vec![finalization],
+        );
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &test_certify(settling, 4_000),
+            Naming::Manifest,
+        );
+        let restored = effects.actions.iter().position(|action| {
+            matches!(action, Action::ResolveTicks { resolutions }
+            if resolutions.iter().any(|(tick, resolution)| {
+                tick.block_height() == BlockHeight::new(2)
+                    && matches!(resolution, TickResolution::Restored { .. })
+            }))
+        });
+        let dispatched = effects
+            .actions
+            .iter()
+            .position(|action| matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3)));
+        assert!(restored.is_some(), "the settled half's writes are seated");
+        assert!(dispatched.is_some(), "and tick 3 then runs");
+        assert!(
+            restored < dispatched,
+            "seated before the tick that reads them"
         );
     }
 
