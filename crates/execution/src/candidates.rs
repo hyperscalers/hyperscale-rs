@@ -21,8 +21,8 @@ use hyperscale_engine::tick_select::{
     CommittedInputs, ManifestBudget, MemberFacts, ProvisionalCells, select_members,
 };
 use hyperscale_types::{
-    EscrowedValue, Joins, PriceTable, ShardId, ShardTrie, SubstateKey, TickLine, Transaction,
-    TxHash, Verified, WeightedTimestamp,
+    Deadline, EscrowedValue, Joins, PriceTable, ShardId, ShardTrie, SubstateKey, TickLine,
+    Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
@@ -204,27 +204,31 @@ impl TickCandidates {
         held: &mut ProvisionalCells,
         now: WeightedTimestamp,
     ) -> Vec<TickLine> {
-        let facts: Vec<(TxHash, MemberFacts)> = self
+        let facts: Vec<(TxHash, MemberFacts, Deadline)> = self
             .candidates
             .iter()
             .map(|(tx_hash, candidate)| {
                 (
                     *tx_hash,
                     MemberFacts::of_member(&candidate.member, &candidate.tx, trie),
+                    Deadline::of_transaction(&candidate.tx),
                 )
             })
             .collect();
         select_members(
             now,
-            facts.iter().map(|(tx_hash, facts)| (*tx_hash, facts)),
+            facts
+                .iter()
+                .map(|(tx_hash, facts, deadline)| (*tx_hash, facts, *deadline)),
             &Absorbed(provisioning),
             held,
             &mut ManifestBudget::default(),
         )
     }
 
-    /// Take the members a committed manifest names, in its order, each on
-    /// the terms its line gives.
+    /// Take the members a committed manifest names to run, in its order,
+    /// each on the terms its line gives. A member named `Aborted` runs
+    /// nothing, and is seated by its abandonment instead.
     ///
     /// The line is the decision: this node seats what the chain named
     /// whatever its own inputs would have said. A line naming a
@@ -244,6 +248,9 @@ impl TickCandidates {
             else {
                 continue;
             };
+            if !joins.dispatched() {
+                continue;
+            }
             let Some(candidate) = self.candidates.remove(tx_hash) else {
                 continue;
             };

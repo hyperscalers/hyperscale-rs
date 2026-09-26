@@ -532,24 +532,6 @@ impl TickState {
         self.seats.get(&tx_hash).is_some_and(|seat| seat.abandons)
     }
 
-    /// Whether a success this tick attests for `tx_hash` is one no block
-    /// will carry past the transaction's deadline.
-    ///
-    /// The three terms the deadline fence reads, off the membership the
-    /// outcome's own are derived from: the success bears the verdict, it
-    /// is this shard's execution of the transaction rather than a member
-    /// settling what one left, and it waits on nobody — so no
-    /// counterpart's certificate is coming to close its coverage either.
-    #[must_use]
-    pub fn decided_alone(&self, tx_hash: TxHash) -> bool {
-        self.seats.get(&tx_hash).is_some_and(|seat| {
-            let role = seat.membership.role();
-            role.success_decides()
-                && role.executes()
-                && !seat.membership.abortable(self.tick_id.shard_id())
-        })
-    }
-
     /// The tick's members whose settlement waits on `shard` — what this
     /// tick is waiting on that shard for.
     pub fn txs_awaiting(&self, shard: ShardId) -> impl Iterator<Item = TxHash> + '_ {

@@ -1145,9 +1145,33 @@ impl ExecutionCoordinator {
     /// answer never reached an executing tick, so nothing wrote its
     /// claim or decline key, and a second abandonment writes the same
     /// bytes to a key that still holds nothing.
-    fn admit_abandoned(&mut self, trie: &ShardTrie, tick_id: TickId, state: &mut TickState) {
+    fn admit_abandoned(
+        &mut self,
+        trie: &ShardTrie,
+        tick_id: TickId,
+        state: &mut TickState,
+        lines: &[TickLine],
+    ) {
         let local_shard = self.local_shard;
-        for entry in self.abandonable(tick_id) {
+        // The members the manifest names `Aborted`, then the ones a tick
+        // of ours holds or ran, which this node still lets go of itself.
+        let mut entries: Vec<UnsettledTx> = lines
+            .iter()
+            .filter_map(|line| match line {
+                TickLine::Member {
+                    tx,
+                    joins: Joins::Aborted,
+                    ..
+                } => self.counterparts.ledger.abandonment_figures(*tx),
+                _ => None,
+            })
+            .collect();
+        for held in self.abandonable(tick_id) {
+            if !entries.iter().any(|named| named.tx_hash == held.tx_hash) {
+                entries.push(held);
+            }
+        }
+        for entry in entries {
             let UnsettledTx {
                 tx_hash,
                 deadline,
@@ -1453,7 +1477,7 @@ impl ExecutionCoordinator {
             self.admit_member(tick_id, member, &mut state, &mut ticked, &mut requests);
         }
 
-        self.admit_abandoned(anchored.shard_trie(), tick_id, &mut state);
+        self.admit_abandoned(anchored.shard_trie(), tick_id, &mut state, lines);
         // The tick's own anchor prices what the tick itself composes:
         // a settlement is committed by the block being built, not by an
         // earlier one, so there is one table for all of them.
@@ -3362,6 +3386,9 @@ impl ExecutionCoordinator {
             .ledger
             .past_deadline(self.committed_ts)
             .into_iter()
+            // A candidate still waiting for a tick is the manifest's to
+            // abort.
+            .filter(|entry| !self.candidates.contains(entry.tx_hash))
             .filter(|entry| self.beyond_every_shard(composing, entry.tx_hash))
             .collect()
     }
@@ -3581,16 +3608,10 @@ impl ExecutionCoordinator {
                 if held_by.is_some_and(|tick| tick.abandons(tx_hash)) {
                     return false;
                 }
-                // One fence refuses the finalization a tick is waiting
-                // to commit, and past it the tick has nothing left to
-                // say: a success that decides alone at the deadline.
-                // Left to, such a tick holds a member nothing can
-                // resolve while every proposer offers a finalization
-                // every voter refuses. Which clock it runs on is already
-                // applied — an entry reaches here only past its own
-                // abandon window's opening.
+                // Which clock it runs on is already applied: an entry
+                // reaches here only past its own abandon window's
+                // opening.
                 self.counterparts.ledger.is_covered(tx_hash)
-                    || held_by.is_some_and(|tick| tick.decided_alone(tx_hash))
             }
             // An entry no execution of ours took is re-offered once its
             // tick is gone: it spends nothing to abort at any age, and
@@ -8395,7 +8416,8 @@ mod tests {
     /// certificate of this shard's covers it, and both are composition's
     /// output: a replay that composed nothing there would have to assert
     /// them, and either answer diverges from the replica that never went
-    /// down.
+    /// down. The fixture's member is held and decides alone, so both keep
+    /// it past the deadline; a replay that lost its tick would abandon it.
     #[test]
     fn a_replay_abandons_what_a_seated_replica_at_the_same_frontier_does() {
         let schedule = make_test_topology();
@@ -8451,17 +8473,20 @@ mod tests {
                 .map(|outcome| outcome.tx_hash())
                 .collect::<Vec<_>>()
         };
+        let holder = Some(TickId::new(ShardId::ROOT, BlockHeight::new(2)));
         assert_eq!(
             aborted(abandonment_vote(&mut seated, &schedule, 3, deadline_ms)),
-            vec![held_hash],
-            "fixture precondition: past the deadline the seated replica abandons it",
+            Vec::<TxHash>::new(),
+            "fixture precondition: past the deadline the seated replica keeps it",
         );
+        assert_eq!(seated.ticks.tick_assignment(held_hash), holder);
         assert_eq!(
             aborted(abandonment_vote(&mut restarted, &schedule, 3, deadline_ms)),
-            vec![held_hash],
-            "and the restarted one abandons it too, or the ticks the two \
+            Vec::<TxHash>::new(),
+            "and the restarted one keeps it too, or the ticks the two \
              compose carry different receipt roots",
         );
+        assert_eq!(restarted.ticks.tick_assignment(held_hash), holder);
     }
 
     /// A restart replays the chain it lost execution state for, so it
@@ -11851,15 +11876,15 @@ mod tests {
         let _ = tx_hash;
     }
 
-    /// A tick holding a member whose success decides alone is not left to
-    /// past the transaction's deadline.
+    /// A tick holding a member whose success decides alone keeps it past
+    /// the transaction's deadline.
     ///
-    /// Past it no block carries such a finalization — the deadline fence
-    /// refuses it, which is what licenses a leg's reclaim — so a tick
-    /// left to would hold a member nothing can resolve while every
-    /// proposer offers a finalization every voter refuses.
+    /// The member was named to run while the deadline had not passed, so
+    /// its success is admissible whenever its finalization commits: a
+    /// producer reclaims only on the consumer's own `Never`, which no
+    /// block carries beside the success.
     #[test]
-    fn a_tick_holding_a_success_that_decides_alone_is_abandoned_at_the_deadline() {
+    fn a_tick_holding_a_success_that_decides_alone_keeps_it_past_the_deadline() {
         let schedule = make_test_topology();
         let mut state = make_test_state();
         let tx = test_transaction(1);
@@ -11891,14 +11916,13 @@ mod tests {
 
         let outcomes = abandonment_vote(&mut state, &schedule, 3, deadline_ms);
         assert!(
-            outcomes
-                .iter()
-                .any(|outcome| outcome.tx_hash() == tx_hash && outcome.is_aborted()),
-            "at the deadline the member is abandoned: {outcomes:?}"
+            outcomes.iter().all(|outcome| outcome.tx_hash() != tx_hash),
+            "at the deadline nothing abandons the member: {outcomes:?}"
         );
-        assert!(
-            !state.ticks.contains_tick(&held_by),
-            "and the tick that could no longer speak for it is discarded"
+        assert_eq!(
+            state.ticks.tick_assignment(tx_hash),
+            Some(held_by),
+            "and the tick that holds it still speaks for it"
         );
     }
 
@@ -12736,8 +12760,9 @@ mod tests {
     /// A tick released because a sibling member was abandoned keeps the
     /// member whose verdict a counterpart shares.
     ///
-    /// `X` is past its deadline and decided alone, so the composing tick
-    /// abandons it; the tick that held it goes with it. `T` sat in the
+    /// `X` is past its deadline and covered, a committed record saying
+    /// it was left unsettled, so the composing tick abandons it; the tick
+    /// that held it goes with it. `T` sat in the
     /// same tick awaiting [`PEER`], whose certificate settles it against
     /// this shard's — out already, and outliving the tick. Dropped with
     /// the tick, `T` is settled by nobody: its entry is certified, so the
@@ -12745,6 +12770,25 @@ mod tests {
     #[test]
     fn a_release_through_an_abandoned_sibling_keeps_the_member_a_counterpart_can_settle() {
         let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(1);
+        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(2)),
+        ));
+        assert_eq!(alone.hash(), x);
+        state
+            .counterparts
+            .ledger
+            .record_abandonment_records(&[AbandonmentRecord::new(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                [UnsettledTx::for_transaction(
+                    &alone,
+                    test_committed(),
+                    alone.price(&PriceTable::GENESIS),
+                    Capped::empty(),
+                    &PriceTable::GENESIS,
+                )],
+            )]);
+        assert!(state.counterparts.ledger.is_covered(x));
         let sched = two_shard_topology();
         let composing = TickId::new(HOME, BlockHeight::new(9));
         let mut composing_tick = TickState::new(
@@ -12757,7 +12801,7 @@ mod tests {
             .counterpart_trie(&sched)
             .expect("the fixture holds the window")
             .clone();
-        state.admit_abandoned(&trie, composing, &mut composing_tick);
+        state.admit_abandoned(&trie, composing, &mut composing_tick, &[]);
         assert_eq!(
             composing_tick.tx_hashes(),
             &[x],

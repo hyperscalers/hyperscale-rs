@@ -347,31 +347,21 @@ impl UnclaimedCrossing {
 }
 
 /// How a block's resolutions stand against the transactions they name:
-/// the figures its records restate, and the successes its finalizations
-/// decide.
+/// the figures its records restate.
 ///
 /// The voter's answer, read off committed bodies and blocks. A
 /// validator whose store holds a transaction and the block a name says
-/// committed it answers for it — a figure exactly or wrongly, a success
-/// inside its deadline or past it — and one whose store never held them,
+/// committed it answers for it, a figure exactly or wrongly, and one
+/// whose store never held them,
 /// having synced past the block, cannot say, which is a third answer and
 /// not a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolutions {
-    /// Every figure of every name is the one its transaction fixes and
-    /// no success is overdue.
+    /// Every figure of every name is the one its transaction fixes.
     Exact,
     /// A figure of this name differs from the one its transaction fixes:
     /// the block is refused.
     Wrong(TxHash),
-    /// A finalization decides this transaction with success, by its own
-    /// execution, at an anchor at or past its deadline, where a leg that
-    /// issued for it may already have taken the crossing back against
-    /// the consumer's decline.
-    /// Only a member that awaits nobody is held to it: one with a sibling
-    /// to stay atomic with settles on the sibling's clock. The block is
-    /// refused.
-    Overdue(TxHash),
     /// This validator does not hold this name's transaction, so it cannot
     /// say: the vote is deferred.
     Unknown(TxHash),
@@ -396,49 +386,6 @@ impl Resolutions {
                 Some(false) => return Self::Wrong(entry.tx_hash),
                 None => {
                     unknown.get_or_insert(entry.tx_hash);
-                }
-            }
-        }
-        unknown.map_or(Self::Exact, Self::Unknown)
-    }
-
-    /// This answer folded with the successes the block's finalizations
-    /// decide for members that await nobody, `overdue` saying whether
-    /// each sits at or past its deadline at the block's anchor, `None`
-    /// for one this validator does not hold.
-    ///
-    /// A refusal answers over a deferral: a block carrying an overdue
-    /// success is refused whatever else this validator cannot say.
-    #[must_use]
-    pub fn and_successes(
-        self,
-        successes: impl IntoIterator<Item = TxHash>,
-        overdue: impl Fn(TxHash) -> Option<bool>,
-    ) -> Self {
-        self.and_each(successes, overdue, Self::Overdue)
-    }
-
-    /// One fold for every name a finalization is held to: a refusal
-    /// already reached stands, the first name `judge` answers `true` for
-    /// is refused as `refuse` names it, and a name it cannot answer for
-    /// defers unless something refuses.
-    fn and_each(
-        self,
-        names: impl IntoIterator<Item = TxHash>,
-        judge: impl Fn(TxHash) -> Option<bool>,
-        refuse: fn(TxHash) -> Self,
-    ) -> Self {
-        let mut unknown = match self {
-            Self::Wrong(_) | Self::Overdue(_) => return self,
-            Self::Unknown(tx_hash) => Some(tx_hash),
-            Self::Exact => None,
-        };
-        for tx_hash in names {
-            match judge(tx_hash) {
-                Some(true) => return refuse(tx_hash),
-                Some(false) => {}
-                None => {
-                    unknown.get_or_insert(tx_hash);
                 }
             }
         }
@@ -964,35 +911,6 @@ mod tests {
             Resolutions::Wrong(tx(1).tx_hash)
         );
         assert_eq!(Resolutions::of([], held), Resolutions::Exact);
-
-        // Deliveries fold after the figures: a lapsed one refuses over an
-        // unknown name, an unknown delivery defers, and a wrong figure
-        // stands whatever the deliveries say.
-        let lapsed = |tx_hash: TxHash| {
-            if tx_hash == tx(3).tx_hash {
-                Some(true)
-            } else if tx_hash == tx(1).tx_hash {
-                Some(false)
-            } else {
-                None
-            }
-        };
-        assert_eq!(
-            Resolutions::Exact.and_successes([tx(1).tx_hash], lapsed),
-            Resolutions::Exact
-        );
-        assert_eq!(
-            Resolutions::Exact.and_successes([tx(2).tx_hash], lapsed),
-            Resolutions::Unknown(tx(2).tx_hash)
-        );
-        assert_eq!(
-            Resolutions::Unknown(tx(2).tx_hash).and_successes([tx(3).tx_hash], lapsed),
-            Resolutions::Overdue(tx(3).tx_hash)
-        );
-        assert_eq!(
-            Resolutions::Wrong(tx(1).tx_hash).and_successes([tx(3).tx_hash], lapsed),
-            Resolutions::Wrong(tx(1).tx_hash)
-        );
     }
 
     #[test]

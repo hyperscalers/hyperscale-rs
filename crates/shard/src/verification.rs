@@ -1032,19 +1032,15 @@ impl VerificationPipeline {
             .flat_map(AbandonmentRecord::unsettled)
             .cloned()
             .collect();
-        let successes = block.successes_decided_alone();
         debug!(
             ?block_hash,
             names = entries.len(),
-            successes = successes.len(),
             "Initiating resolutions verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::Resolutions);
         vec![Action::VerifyResolutions {
             block_hash,
             entries,
-            successes,
-            anchor,
             windows: schedule.windows(),
         }]
     }
@@ -2226,14 +2222,11 @@ mod tests {
     use super::*;
     use crate::pending::PendingBlock;
 
-    /// The deadline holds only an execution's success decided alone. A
-    /// member with a sibling to stay atomic with settles on the sibling's
-    /// clock, a refusal writes no claim to reclaim against, a member
-    /// settling what an execution left is past the deadline by
-    /// construction, and a leg's own success decides nothing — that one
-    /// is a delivery's question.
+    /// A leg's own success decides nothing, so it is the one name the
+    /// block's finalizations resolve without deciding: a decision, a
+    /// refusal, a member with a sibling and a settlement all decide.
     #[test]
-    fn only_an_executions_success_decided_alone_is_held_to_the_deadline() {
+    fn only_a_legs_finalization_names_what_it_does_not_decide() {
         let alone = test_transaction(1).hash();
         let with_sibling = test_transaction(2).hash();
         let refused = test_transaction(3).hash();
@@ -2265,7 +2258,6 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
-        assert_eq!(block.successes_decided_alone(), vec![alone]);
         assert_eq!(block.undecided_names(), vec![leg]);
     }
 

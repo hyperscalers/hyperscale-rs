@@ -216,6 +216,9 @@ pub struct EngagementWait {
 pub struct MemberFacts {
     /// Whether the transaction reaches beyond this shard.
     pub reaches_beyond: bool,
+    /// Whether this shard runs a leg of it, which its reclaim resolves
+    /// if it never runs, and never an abort.
+    pub leg: bool,
     /// Which half settles it, and whether a discard keeps it.
     pub settlement: Settlement,
     /// Its declared accesses, each under the mode it takes.
@@ -286,6 +289,7 @@ impl MemberFacts {
         };
         Self {
             reaches_beyond,
+            leg: member.role() == Role::Leg,
             settlement,
             declared: tx.routing().declared_modes.clone(),
             requires,
@@ -400,7 +404,7 @@ pub fn member_lines<'f>(
     for row in rows.members.values() {
         match row.state {
             RowState::Pending => match facts(row.tx) {
-                Some(known) => candidates.push((row.tx, known)),
+                Some(known) => candidates.push((row.tx, known, row.deadline)),
                 None => missing.push(row.tx),
             },
             RowState::InFlight { .. } => holds.claim(&row.holds),
@@ -440,6 +444,13 @@ impl ManifestBudget {
 /// The member lines a block names: every ready candidate, in canonical
 /// order, that no provisional hold refuses, up to the budget.
 ///
+/// A candidate past its deadline at `anchor` is named `Aborted` and
+/// nothing else, whether or not it is ready: a member that awaits nobody
+/// and succeeds decides its transaction, so it is named to run only
+/// while the deadline has not passed, and its success is admissible
+/// whenever it then commits. A leg past its deadline is not named at all:
+/// its reclaim resolves it.
+///
 /// Canonical order puts the transactions reaching beyond this shard
 /// first, then hash order: theirs are the provisional writes everything
 /// else has to be compatible with, and a determined member is the
@@ -456,15 +467,35 @@ impl ManifestBudget {
 #[must_use]
 pub fn select_members<'a>(
     anchor: WeightedTimestamp,
-    candidates: impl IntoIterator<Item = (TxHash, &'a MemberFacts)>,
+    candidates: impl IntoIterator<Item = (TxHash, &'a MemberFacts, Deadline)>,
     inputs: &dyn CommittedInputs,
     holds: &mut ProvisionalCells,
     budget: &mut ManifestBudget,
 ) -> Vec<TickLine> {
-    let mut ordered: Vec<(TxHash, &MemberFacts)> = candidates.into_iter().collect();
-    ordered.sort_by_key(|(tx, facts)| (!facts.reaches_beyond, *tx));
+    let mut ordered: Vec<(TxHash, &MemberFacts, Deadline)> = candidates.into_iter().collect();
+    ordered.sort_by_key(|(tx, facts, _)| (!facts.reaches_beyond, *tx));
     let mut lines = Vec::new();
-    for (tx, facts) in ordered {
+    for (tx, facts, deadline) in ordered {
+        if deadline.passed(anchor) {
+            if facts.leg {
+                continue;
+            }
+            let line = TickLine::Member {
+                tx,
+                joins: Joins::Aborted,
+                settlement: if facts.reaches_beyond {
+                    Settlement::Awaited
+                } else {
+                    Settlement::Alone
+                },
+                holds: Capped::empty(),
+            };
+            if !budget.take(&line) {
+                break;
+            }
+            lines.push(line);
+            continue;
+        }
         let Some(joins) = readiness(tx, facts, anchor, inputs) else {
             continue;
         };
@@ -620,6 +651,11 @@ mod tests {
 
     const PEER: ShardId = ShardId::leaf(1, 1);
 
+    /// A deadline no fixture reaches.
+    fn far() -> Deadline {
+        Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 2))
+    }
+
     fn tx(seed: u8) -> TxHash {
         TxHash::from(Hash::from_bytes(&[seed; 32]))
     }
@@ -631,6 +667,7 @@ mod tests {
     fn alone(declared: Vec<(DeclaredKey, Mode)>) -> MemberFacts {
         MemberFacts {
             reaches_beyond: false,
+            leg: false,
             settlement: Settlement::Alone,
             declared,
             requires: BTreeSet::new(),
@@ -641,6 +678,7 @@ mod tests {
     fn leg(declared: Vec<(DeclaredKey, Mode)>, requires: &[Requirement]) -> MemberFacts {
         MemberFacts {
             reaches_beyond: true,
+            leg: false,
             settlement: Settlement::Shared,
             declared,
             requires: requires.iter().copied().collect(),
@@ -717,7 +755,7 @@ mod tests {
         let mut holds = ProvisionalCells::default();
         let lines = select_members(
             ms(0),
-            [(tx(1), &local), (tx(9), &reaching)],
+            [(tx(1), &local, far()), (tx(9), &reaching, far())],
             &held,
             &mut holds,
             &mut ManifestBudget::default(),
@@ -739,7 +777,10 @@ mod tests {
         let mut holds = ProvisionalCells::default();
         let lines = select_members(
             ms(0),
-            [(tx(1), &local), (tx(2), &alone(vec![(shared, WRITE)]))],
+            [
+                (tx(1), &local, far()),
+                (tx(2), &alone(vec![(shared, WRITE)]), far()),
+            ],
             &held,
             &mut holds,
             &mut ManifestBudget::default(),
@@ -755,7 +796,7 @@ mod tests {
         assert!(
             select_members(
                 ms(0),
-                [(tx(3), &wide)],
+                [(tx(3), &wide, far())],
                 &held,
                 &mut ProvisionalCells::default(),
                 &mut ManifestBudget::default(),
@@ -772,7 +813,8 @@ mod tests {
             .map(|at| (interval(9, at as u128, at as u128), RESERVE))
             .collect();
         let wide = leg(declared, &[]);
-        let facts: Vec<(TxHash, &MemberFacts)> = (0..8u8).map(|seed| (tx(seed), &wide)).collect();
+        let facts: Vec<(TxHash, &MemberFacts, Deadline)> =
+            (0..8u8).map(|seed| (tx(seed), &wide, far())).collect();
         let lines = select_members(
             ms(0),
             facts,
@@ -783,5 +825,39 @@ mod tests {
         let fits = MAX_TICK_MANIFEST_BYTES / lines[0].wire_weight();
         assert_eq!(lines.len(), fits.min(8));
         assert!(lines.len() < 8, "the fixture must reach the budget");
+    }
+
+    /// Past its deadline a candidate is named `Aborted`, whether or not
+    /// it is ready and whatever holds stand, and a leg is not named at
+    /// all: its reclaim resolves it.
+    #[test]
+    fn a_candidate_past_its_deadline_is_named_aborted() {
+        let shared = cell(1, 1);
+        let passed = Deadline::of(ms(0));
+        let waiting = leg(vec![(shared, WRITE)], &[Requirement::CommittedState(PEER)]);
+        let a_leg = MemberFacts {
+            leg: true,
+            ..alone(vec![])
+        };
+        let mut holds = ProvisionalCells::default();
+        holds.claim(&[(shared, WRITE)]);
+        let anchor = ms(60_000);
+        assert!(passed.passed(anchor));
+        let lines = select_members(
+            anchor,
+            [(tx(1), &waiting, passed), (tx(2), &a_leg, passed)],
+            &Held::default(),
+            &mut holds,
+            &mut ManifestBudget::default(),
+        );
+        assert_eq!(
+            lines,
+            vec![TickLine::Member {
+                tx: tx(1),
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+                holds: Capped::empty(),
+            }],
+        );
     }
 }

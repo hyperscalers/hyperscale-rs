@@ -987,13 +987,6 @@ pub enum Action {
         block_hash: BlockHash,
         /// Every name the block's records carry.
         entries: Vec<UnsettledTx>,
-        /// Every transaction the block's finalizations decide with
-        /// success by its own execution, for a member that awaits
-        /// nobody, checked against the deadline: past it a leg may
-        /// already have taken its crossing back.
-        successes: Vec<TxHash>,
-        /// The block's own anchor, which the deadline is read against.
-        anchor: WeightedTimestamp,
         /// The epoch grid, which places each name's stated commit anchor
         /// in the window that froze its figures. Carried rather than
         /// read off the store because it is a property of the chain

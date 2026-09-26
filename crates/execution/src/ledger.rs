@@ -1419,6 +1419,16 @@ impl Ledger {
             .collect()
     }
 
+    /// The figures an abandonment of `tx_hash` restates, where the entry
+    /// is one an abandonment can answer for: held, and not a leg's.
+    #[must_use]
+    pub(crate) fn abandonment_figures(&self, tx_hash: TxHash) -> Option<UnsettledTx> {
+        self.owed
+            .get(&tx_hash)
+            .filter(|owed| !owed.part.is_leg())
+            .map(|owed| owed.figures.clone())
+    }
+
     /// Drop the entries nothing can still decide.
     ///
     /// An entry lives as long as the question that decides it is still

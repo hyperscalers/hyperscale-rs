@@ -14,11 +14,11 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
-    Engagement, Engagements, ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, ShardId, SharedWitnessSources,
-    SplitChildRoots, StateClaim, StateRoot, TickManifest, Transaction, TxHash, TxOutcome,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    Engagement, Engagements, Finalization, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
+    StateRoot, TickManifest, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -483,35 +483,12 @@ impl Block {
             .collect()
     }
 
-    /// Every transaction the block's finalizations decide with success
-    /// by its own execution, for a member that awaits nobody — the only
-    /// successes the deadline bounds. One with a sibling to stay atomic
-    /// with settles on the sibling's clock, however late; a member
-    /// settling what an execution left is past the deadline by
-    /// construction.
-    #[must_use]
-    pub fn successes_decided_alone(&self) -> Vec<TxHash> {
-        self.certificates()
-            .iter()
-            .flat_map(|fw| fw.local_ec().tx_outcomes().iter())
-            .filter(|outcome| {
-                outcome.decides()
-                    && outcome.executes()
-                    && outcome.counterparts().is_empty()
-                    && matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. })
-            })
-            .map(TxOutcome::tx_hash)
-            .collect()
-    }
-
     /// Whether the block carries anything the resolutions check reads:
     /// a record's figures, or a finalization resolving a name it does
-    /// not decide, or one it decides with success alone.
+    /// not decide.
     #[must_use]
     pub(crate) fn resolves_anything(&self) -> bool {
-        !self.abandonment_records().is_empty()
-            || !self.undecided_names().is_empty()
-            || !self.successes_decided_alone().is_empty()
+        !self.abandonment_records().is_empty() || !self.undecided_names().is_empty()
     }
 
     /// The checks this block demands before a vote.

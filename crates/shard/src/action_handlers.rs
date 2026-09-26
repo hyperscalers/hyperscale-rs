@@ -31,7 +31,7 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
-    Deadline, DeferOn, Derivation, Engagement, EngagementRoot, Epoch, EpochWindows, Finalization,
+    DeferOn, Derivation, Engagement, EngagementRoot, Epoch, EpochWindows, Finalization,
     FrontierInputs, Hash, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit,
@@ -868,8 +868,6 @@ where
         Action::VerifyResolutions {
             block_hash,
             entries,
-            successes,
-            anchor,
             windows,
         } => {
             // A resolution names a transaction committed before it — a
@@ -878,11 +876,7 @@ where
             // name, and a body lifted out of it carries no derivation of
             // its own: this node derives it, and one it cannot derive it
             // does not hold.
-            let hashes: Vec<TxHash> = entries
-                .iter()
-                .map(|entry| entry.tx_hash)
-                .chain(successes.iter().copied())
-                .collect();
+            let hashes: Vec<TxHash> = entries.iter().map(|entry| entry.tx_hash).collect();
             let derivation = ctx.executor.derivation();
             let held: HashMap<TxHash, Verified<Transaction>> = ctx
                 .pending_chain
@@ -925,18 +919,10 @@ where
                         &at.prices,
                     ) == *entry;
                 Some(restated)
-            })
-            .and_successes(successes, |tx_hash| {
-                // A success at or past the deadline is one a leg may
-                // already have reclaimed against. That the members held
-                // to it awaited nobody is the outcome's own attestation,
-                // read where the names were gathered.
-                held.get(&tx_hash)
-                    .map(|tx| Deadline::of_transaction(tx).passed(anchor))
             });
-            // An exact answer passes; a wrong figure or an overdue
-            // success refuses the block; a name this validator's store
-            // never held is neither — the check waits for the body.
+            // An exact answer passes; a wrong figure refuses the block; a
+            // name this validator's store never held is neither — the
+            // check waits for the body.
             let outcome = match verdict {
                 Resolutions::Exact => CheckOutcome::Checked { bytes_delta: 0 },
                 Resolutions::Wrong(tx_hash) => {
@@ -944,14 +930,6 @@ where
                         ?block_hash,
                         ?tx_hash,
                         "Resolutions verification FAILED: a record misstates a figure"
-                    );
-                    CheckOutcome::Refused
-                }
-                Resolutions::Overdue(tx_hash) => {
-                    tracing::warn!(
-                        ?block_hash,
-                        ?tx_hash,
-                        "Resolutions verification FAILED: a finalization succeeds past the deadline"
                     );
                     CheckOutcome::Refused
                 }
@@ -1856,7 +1834,7 @@ mod tests {
     };
     use hyperscale_types::{
         BeaconBlockHash, BeaconChainConfig, BeaconState, CertificateRoot, CertifiedBeaconBlock,
-        CommittedAt, LocalReceiptRoot, PriceTable, ProposerTimestamp, ProvisionsRoot,
+        CommittedAt, Deadline, LocalReceiptRoot, PriceTable, ProposerTimestamp, ProvisionsRoot,
         ShardCommittee, Signer, StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
     };
 
