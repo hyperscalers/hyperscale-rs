@@ -20,6 +20,10 @@
 //!   commits — derived from a live block's bodies, kept by a sealed one —
 //!   so the live commit, a synced commit and a restart's seed fold the
 //!   same entries under the same clock.
+//! - **arrivals**: the committing block's own anchor plus
+//!   `RETENTION_HORIZON`, one per record a committed claim read live,
+//!   kept at the height of the block that carried the claim, since an
+//!   arrival counts for a transaction only from its own block on.
 //!
 //! One clock: every lookup is judged at the anchor of the block being
 //! admitted, an entry answering while its deadline is past that anchor,
@@ -43,7 +47,8 @@ use std::sync::Arc;
 use hyperscale_storage::{CommittedProvisions, DedupWindow};
 use hyperscale_types::{
     BlockHeight, DEDUP_WINDOW, Engagement, Finalization, FinalizationHash, ProvisionHash,
-    RETENTION_HORIZON, ShardId, TopologySnapshot, TxHash, Verifiable, WeightedTimestamp,
+    RETENTION_HORIZON, ShardId, SubstateKey, TopologySnapshot, TxHash, Verifiable,
+    WeightedTimestamp,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
@@ -76,6 +81,11 @@ pub struct CommitDedupIndex {
     /// expired unfenced entry and a live fenced one must not combine into
     /// an engagement neither gives alone.
     engagements: HashMap<(ShardId, TxHash), Vec<(BlockHeight, WeightedTimestamp)>>,
+    /// `(record, issuer) → [(height, deadline)]`: every committed claim
+    /// that read `record` live naming `issuer`, one element per local
+    /// block height that carried one, each at that block's anchor plus
+    /// [`RETENTION_HORIZON`].
+    arrivals: HashMap<(SubstateKey, TxHash), Vec<(BlockHeight, WeightedTimestamp)>>,
     /// The oldest block anchor this index has folded, or `None` before it
     /// has folded any.
     ///
@@ -100,6 +110,7 @@ impl CommitDedupIndex {
             finalization_retention: HashMap::new(),
             provision_retention: Arc::new(CommittedProvisions::new()),
             engagements: HashMap::new(),
+            arrivals: HashMap::new(),
             covered_from: None,
             reached_origin: false,
         }
@@ -124,6 +135,9 @@ impl CommitDedupIndex {
             .seed(window.provisions.iter().copied());
         for (engagement, deadline) in &window.engagements {
             index.engage(*engagement, *deadline);
+        }
+        for (arrival, height, deadline) in &window.arrivals {
+            index.arrive(*arrival, *height, *deadline);
         }
         index.covered_from = window.covered_from;
         index.reached_origin = window.reached_origin;
@@ -259,6 +273,49 @@ impl CommitDedupIndex {
         }
     }
 
+    /// Record the records a committed block's claims read live, each at
+    /// the block's `height` until its `anchor` plus [`RETENTION_HORIZON`].
+    pub(crate) fn register_committed_arrivals(
+        &mut self,
+        arrivals: impl IntoIterator<Item = (SubstateKey, TxHash)>,
+        height: BlockHeight,
+        anchor: WeightedTimestamp,
+    ) {
+        let deadline = anchor.plus(RETENTION_HORIZON);
+        for arrival in arrivals {
+            self.arrive(arrival, height, deadline);
+        }
+    }
+
+    fn arrive(
+        &mut self,
+        arrival: (SubstateKey, TxHash),
+        height: BlockHeight,
+        deadline: WeightedTimestamp,
+    ) {
+        let heights = self.arrivals.entry(arrival).or_default();
+        if !heights.iter().any(|(held, _)| *held == height) {
+            heights.push((height, deadline));
+        }
+    }
+
+    /// Whether a committed claim read `record` live naming `tx` in a
+    /// block at or above `since`, for an admission anchored at `at`.
+    #[cfg(test)]
+    pub(crate) fn arrived(
+        &self,
+        record: SubstateKey,
+        tx: TxHash,
+        since: BlockHeight,
+        at: WeightedTimestamp,
+    ) -> bool {
+        self.arrivals.get(&(record, tx)).is_some_and(|heights| {
+            heights
+                .iter()
+                .any(|(height, deadline)| *height >= since && *deadline > at)
+        })
+    }
+
     /// Drop every entry whose deadline is at or below `tip_anchor`, the
     /// committed tip's own anchor.
     ///
@@ -274,6 +331,10 @@ impl CommitDedupIndex {
             .retain(|_, deadline| *deadline > tip_anchor);
         self.provision_retention.prune(tip_anchor);
         self.engagements.retain(|_, heights| {
+            heights.retain(|(_, deadline)| *deadline > tip_anchor);
+            !heights.is_empty()
+        });
+        self.arrivals.retain(|_, heights| {
             heights.retain(|(_, deadline)| *deadline > tip_anchor);
             !heights.is_empty()
         });
@@ -363,8 +424,8 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::make_finalization;
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, NetworkDefinition, ProvisionEntry, Provisions,
-        ShardId, TransactionDecision, ValidatorSet,
+        Address, AddressClass, BlockHeight, Hash, LocalKey, MerkleInclusionProof,
+        NetworkDefinition, ProvisionEntry, Provisions, ShardId, TransactionDecision, ValidatorSet,
     };
 
     use super::*;
@@ -594,6 +655,46 @@ mod tests {
         assert_eq!(seeded.engagements, live.engagements);
         assert!(!seeded.engaged(source, old.tx_hash, now, &plain()));
         assert!(seeded.engaged(source, young.tx_hash, now, &plain()));
+    }
+
+    /// An arrival counts from the block that carried its claim on: not
+    /// for a transaction committed above it, and not past its deadline.
+    /// A seeded index arrives what the live feed did.
+    #[test]
+    fn an_arrival_counts_from_its_block_and_seeds_as_it_arrived() {
+        let record = SubstateKey {
+            owner: Address::new([7; 31], AddressClass::Component),
+            local: LocalKey([7; 16]),
+        };
+        let tx = TxHash::from(Hash::from_bytes(b"issuer"));
+        let anchor = WeightedTimestamp::from_millis(2_000);
+        let mut live = CommitDedupIndex::new();
+        live.register_committed_arrivals([(record, tx)], BlockHeight::new(5), anchor);
+
+        assert!(live.arrived(record, tx, BlockHeight::new(5), anchor));
+        assert!(live.arrived(record, tx, BlockHeight::new(3), anchor));
+        assert!(
+            !live.arrived(record, tx, BlockHeight::new(6), anchor),
+            "a transaction committed above the reading has not had it arrive",
+        );
+        assert!(
+            !live.arrived(
+                record,
+                TxHash::from(Hash::from_bytes(b"other")),
+                BlockHeight::new(1),
+                anchor
+            ),
+            "a reading naming another issuer arrives nothing for this one",
+        );
+        let expiry = anchor.plus(RETENTION_HORIZON);
+        assert!(!live.arrived(record, tx, BlockHeight::new(5), expiry));
+
+        let window = DedupWindow {
+            arrivals: vec![((record, tx), BlockHeight::new(5), expiry)],
+            ..DedupWindow::default()
+        };
+        let seeded = CommitDedupIndex::seeded(&window, anchor);
+        assert_eq!(seeded.arrivals, live.arrivals);
     }
 
     // ─── Provisions ─────────────────────────────────────────────────────

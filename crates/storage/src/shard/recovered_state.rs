@@ -13,6 +13,7 @@ use hyperscale_types::{
 use super::chain_reader::ShardChainReader;
 use super::dedup_window::DedupWindow;
 use super::unresolved::ReplayWindow;
+use crate::MemberIndex;
 
 /// How many committed headers a restart replays into the delay estimate.
 ///
@@ -192,6 +193,11 @@ pub struct RecoveredState {
     /// copy from here with the same rule the fold writes it by.
     pub read_frontier: ReadFrontier,
 
+    /// The tick membership the committed state holds, read off it on
+    /// every path that builds one, as the read frontier is. `None` on a
+    /// fresh start, which holds no rows.
+    pub members: Option<MemberIndex>,
+
     /// The uncommitted blocks the store kept beside the safe-vote
     /// registers, above the committed tip and in height order.
     ///
@@ -235,6 +241,7 @@ impl RecoveredState {
         witness_leaf_hashes: Vec<Hash>,
         substate_bytes: u64,
         read_frontier: ReadFrontier,
+        members: MemberIndex,
     ) -> Self {
         Self {
             committed_height: anchor.height,
@@ -279,6 +286,7 @@ impl RecoveredState {
             },
             safe_vote_registers: BTreeMap::new(),
             read_frontier,
+            members: Some(members),
             voted_blocks: Vec::new(),
             recent_headers: Vec::new(),
         }

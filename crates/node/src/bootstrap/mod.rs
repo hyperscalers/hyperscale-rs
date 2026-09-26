@@ -30,7 +30,7 @@ pub mod witness_history_serve;
 
 use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_storage::{
-    GenesisCommit, ImportProgress, RecoveredState, ShardChainReader, WitnessSeed,
+    GenesisCommit, ImportProgress, MemberIndex, RecoveredState, ShardChainReader, WitnessSeed,
 };
 use hyperscale_types::network::request::{
     GetBlockRequest, GetStateRangeRequest, GetWitnessHistoryRequest,
@@ -504,7 +504,11 @@ impl ShardBootstrap {
     ///
     /// Panics unless [`Self::is_complete`].
     #[must_use]
-    pub fn into_recovered_state(self, read_frontier: ReadFrontier) -> RecoveredState {
+    pub fn into_recovered_state(
+        self,
+        read_frontier: ReadFrontier,
+        members: MemberIndex,
+    ) -> RecoveredState {
         assert!(
             matches!(self.phase, Phase::Complete),
             "bootstrap recovery taken before completion",
@@ -519,6 +523,7 @@ impl ShardBootstrap {
             window.hashes,
             self.imported_substate_bytes,
             read_frontier,
+            members,
         )
     }
 }
@@ -671,7 +676,8 @@ mod tests {
             &PendingChain::new(Arc::clone(&first), ChainOrigin::ROOT),
             &second,
         );
-        let recovered = bootstrap.into_recovered_state(ReadFrontier::default());
+        let recovered = bootstrap
+            .into_recovered_state(ReadFrontier::default(), MemberIndex::empty(ShardId::ROOT));
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(second.state_root(), anchor.state_root);
         assert_eq!(
@@ -702,7 +708,8 @@ mod tests {
                 height: BlockHeight::new(40),
             },
         )]);
-        let recovered = bootstrap.into_recovered_state(read_frontier.clone());
+        let recovered = bootstrap
+            .into_recovered_state(read_frontier.clone(), MemberIndex::empty(ShardId::ROOT));
         assert_eq!(recovered.read_frontier, read_frontier);
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
@@ -813,7 +820,8 @@ mod tests {
         resumed.on_imported(root).unwrap();
         finish_history(&mut resumed, &pending_chain, &fresh);
 
-        let recovered = resumed.into_recovered_state(ReadFrontier::default());
+        let recovered = resumed
+            .into_recovered_state(ReadFrontier::default(), MemberIndex::empty(ShardId::ROOT));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
         assert_eq!(fresh.state_root(), anchor.state_root);
         // The byte frontier covers the pre-crash chunks too.

@@ -143,7 +143,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
-use hyperscale_storage::{CommittedProvisions, RecoveredState};
+use hyperscale_storage::{
+    CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, record_arrivals,
+};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
@@ -480,6 +482,11 @@ pub struct ShardCoordinator {
     /// provides a bounded retention window for historical dedup.
     dedup_index: CommitDedupIndex,
 
+    /// Tick membership as the committed state holds it: loaded at the
+    /// seat and advanced by the fold every commit runs, so it is the
+    /// state's own rows without a read of the store.
+    member_rows: MemberIndex,
+
     /// Ticks whose determined half the chain still owes, mirrored from
     /// the execution fold so the proposer and the vote path judge
     /// settlement order by one rule. Empty until the node reports one,
@@ -755,6 +762,10 @@ impl ShardCoordinator {
             block_sync: BlockSyncManager::new(),
             proposal: ProposalTracker::new(),
             dedup_index,
+            member_rows: recovered
+                .members
+                .clone()
+                .unwrap_or_else(|| MemberIndex::empty(local_shard)),
             owed_determined: BTreeSet::new(),
             ready_signal_pool: ReadySignalPool::new(),
             detected_equivocators: BTreeSet::new(),
@@ -1973,6 +1984,12 @@ impl ShardCoordinator {
             parent_settled_frontier,
             owed_determined: &self.owed_determined,
         })
+    }
+
+    /// Tick membership at the committed tip.
+    #[must_use]
+    pub const fn member_rows(&self) -> &MemberIndex {
+        &self.member_rows
     }
 
     /// The heights whose determined half the execution fold says the
@@ -5229,6 +5246,12 @@ impl ShardCoordinator {
             .register_committed_provisions(manifest.provision_hashes(), anchor);
         self.dedup_index
             .register_committed_engagements(&block.engagements(), anchor);
+        self.dedup_index.register_committed_arrivals(
+            record_arrivals(block.state_claims()),
+            block.height(),
+            anchor,
+        );
+        self.member_rows.advance(&MemberInputs::of(block));
     }
 
     /// Commit-time fee-ledger bookkeeping: engage the block's

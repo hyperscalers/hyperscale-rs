@@ -221,10 +221,10 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_storage::test_helpers::{commit_block_with_witnesses, stake_deposit};
-    use hyperscale_storage::{PendingChain, RecoveredState};
+    use hyperscale_storage::{MemberIndex, PendingChain, RecoveredState};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, ChainOrigin, ReadFrontier,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, ChainOrigin, ReadFrontier, ShardId,
         ShardWitnessPayload, StateRoot, WeightedTimestamp,
     };
 
@@ -294,6 +294,7 @@ mod tests {
             hashes,
             0,
             ReadFrontier::default(),
+            MemberIndex::empty(ShardId::ROOT),
         );
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
@@ -367,6 +368,7 @@ mod tests {
             hashes,
             0,
             ReadFrontier::default(),
+            MemberIndex::empty(ShardId::ROOT),
         );
         assert_eq!(
             recovered.beacon_witness_start,

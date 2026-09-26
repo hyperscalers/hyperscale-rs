@@ -9,7 +9,7 @@
 //! selection, and the acceptance check — so both harnesses call one gate
 //! rather than re-deriving any part of it.
 
-use hyperscale_storage::{AdoptSource, BoundaryStore, RecoveredState};
+use hyperscale_storage::{AdoptSource, BoundaryStore, MemberIndex, RecoveredState};
 use hyperscale_types::{Anchor, Block, ChainOrigin, ReadFrontier, ShardId, StateRoot};
 
 use super::orchestrator::AdoptKind;
@@ -54,6 +54,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
         .substate_bytes_at_version(origin.genesis_height.inner())
         .unwrap_or(0);
     let read_frontier = storage.read_frontier(shard);
+    let members = storage.member_index(shard);
     verified_recovered_state(
         adopted,
         genesis.header().state_root(),
@@ -61,6 +62,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
         substate_bytes,
         predecessors,
         read_frontier,
+        members,
     )
 }
 
@@ -76,6 +78,7 @@ fn verified_recovered_state(
     substate_bytes: u64,
     predecessors: Vec<Anchor>,
     read_frontier: ReadFrontier,
+    members: MemberIndex,
 ) -> Result<RecoveredState, String> {
     if adopted != expected {
         return Err(format!(
@@ -87,12 +90,14 @@ fn verified_recovered_state(
         chain_origin: origin,
         predecessors,
         read_frontier,
+        members: Some(members),
         ..RecoveredState::default()
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_storage::MemberIndex;
     use hyperscale_types::{
         BlockHeight, ChainOrigin, Epoch, Hash, ReadFrontier, ReadMark, ShardId, StateRoot,
         WeightedTimestamp,
@@ -126,6 +131,7 @@ mod tests {
             4_096,
             Vec::new(),
             read_frontier.clone(),
+            MemberIndex::empty(ShardId::ROOT),
         )
         .expect("matches");
         assert_eq!(recovered.substate_bytes, 4_096);
@@ -145,6 +151,7 @@ mod tests {
                 0,
                 Vec::new(),
                 ReadFrontier::default(),
+                MemberIndex::empty(ShardId::ROOT),
             )
             .is_err()
         );

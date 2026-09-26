@@ -35,9 +35,9 @@ use hyperscale_shard::local_crossings::{
 };
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
-    ChainEntry, ChainWrites, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
-    ShardChainWriter, SubstateStore, TerminalWindow, colliding_committed_cell,
-    colliding_member_row, creations_of, sweep_for_block,
+    ChainEntry, ChainWrites, MemberIndex, ParentAnchor, PendingChain, RecoveredState,
+    SafeVoteRegisterStore, ShardChainWriter, SubstateStore, TerminalWindow,
+    colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -1928,6 +1928,16 @@ impl ShardCoordinatorSim {
                     misstated_unclaimed(&abandonment_records, &view.snapshot()).is_none(),
                     "the sim's proposer names only the crossings its parent holds",
                 );
+                // The coordinator's rows are the state's own: at a parent
+                // that is its committed tip, the two read one family.
+                let coordinator = &self.coordinators[emitter_idx];
+                if coordinator.committed_hash() == parent_block_hash {
+                    assert_eq!(
+                        coordinator.member_rows(),
+                        &MemberIndex::load(&view.snapshot(), self.shard),
+                        "the coordinator's tick membership drifted from state",
+                    );
+                }
                 let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                     ParentAnchor {
                         state_root: parent_state_root,

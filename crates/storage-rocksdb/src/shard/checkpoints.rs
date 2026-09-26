@@ -19,8 +19,8 @@ use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, SubstateStore, Substates,
-    SweepRows, WitnessSeed, followed_block_writes, holds_state, key_under_prefix,
+    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, MemberIndex, SubstateStore,
+    Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, key_under_prefix,
     load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
@@ -535,6 +535,10 @@ impl BoundaryStore for RocksDbShardStorage {
 
     fn read_frontier(&self, shard: ShardId) -> ReadFrontier {
         load_read_frontier(self, shard)
+    }
+
+    fn member_index(&self, shard: ShardId) -> MemberIndex {
+        MemberIndex::load(self, shard)
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {

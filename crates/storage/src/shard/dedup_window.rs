@@ -24,10 +24,11 @@ use std::collections::HashSet;
 
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Engagement, FEE_HOLD_WINDOW, FinalizationHash,
-    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp,
+    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, SubstateKey, TxHash, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
+use super::crossings::record_arrivals;
 
 /// One rebuild of the committed-artifact window, and whether it covers the
 /// whole of it.
@@ -59,6 +60,12 @@ pub struct DedupWindow {
     /// built. Read off the block's own list, which a stored sealed block
     /// keeps, so no provision body is read.
     pub engagements: Vec<(Engagement, WeightedTimestamp)>,
+    /// `((record, issuer), height, deadline)` for every record a
+    /// committed claim in the window read live, at the height of the
+    /// block that carried the claim and that block's anchor plus
+    /// [`RETENTION_HORIZON`]: the arrivals tier's seed, on the clock the
+    /// live commit stamps with.
+    pub arrivals: Vec<((SubstateKey, TxHash), BlockHeight, WeightedTimestamp)>,
     /// The oldest block anchor the walk folded, or `None` when it folded
     /// nothing.
     ///
@@ -235,6 +242,12 @@ impl DedupWindow {
                 .engagements()
                 .iter()
                 .map(|engagement| (*engagement, anchored_deadline)),
+        );
+        let height = block.height();
+        self.arrivals.extend(
+            record_arrivals(block.state_claims())
+                .into_iter()
+                .map(|arrival| (arrival, height, anchored_deadline)),
         );
     }
 

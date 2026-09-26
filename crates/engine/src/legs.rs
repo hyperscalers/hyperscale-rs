@@ -27,12 +27,11 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    Address, EscrowedValue, Role, ShardId, ShardTrie, StateClaim, SubstateKey, Transaction, TxHash,
+    Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction, TxHash,
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    Answered, Crossing, CrossingCell, CrossingEdge as StarEdge, CrossingId, CrossingLeaf, Kind,
-    Star, star_at,
+    Answered, CrossingCell, CrossingEdge as StarEdge, CrossingId, Kind, Star, star_at,
 };
 use hyperscale_vm_kernel::{Arrival, Crossed, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{
@@ -797,35 +796,6 @@ pub enum PlanDefect {
     /// outcome can state a verdict for.
     #[error(transparent)]
     Fault(#[from] PlanFault),
-}
-
-/// The live record a block's claims read at `key`, with the crossing
-/// it records.
-///
-/// Among the held readings of the key the block carries, the one at
-/// the newest anchor by weighted time, decoded as a crossing leaf.
-/// `Some` only for a record, and a bare presence of the key licenses
-/// nothing — a reading that carries no value says nothing an arrival
-/// can be composed from.
-///
-/// The arrival a consuming core runs against. The answer does not
-/// depend on how many readings of the key a block carries or in what
-/// order.
-#[must_use]
-pub fn live_record(
-    state_claims: &[StateClaim],
-    key: SubstateKey,
-) -> Option<(Crossing, CrossingCell)> {
-    state_claims
-        .iter()
-        .filter_map(|claim| claim.held(key).map(|bytes| (claim.anchor.ts, bytes)))
-        .max_by_key(|(ts, _)| *ts)
-        .and_then(
-            |(_, bytes)| match CrossingLeaf::read(&ProtocolHasher, key, bytes)? {
-                CrossingLeaf::Record { crossing, cell } => Some((crossing, cell)),
-                CrossingLeaf::Answer { .. } => None,
-            },
-        )
 }
 
 #[cfg(test)]

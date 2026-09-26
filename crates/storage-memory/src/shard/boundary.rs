@@ -13,9 +13,9 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, SubstateStore,
-    Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, key_under_prefix,
-    load_read_frontier, prefix_low_key,
+    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, MemberIndex,
+    SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
+    key_under_prefix, load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, FrontierInputs, ReadFrontier,
@@ -108,6 +108,10 @@ impl BoundaryStore for SimShardStorage {
 
     fn read_frontier(&self, shard: ShardId) -> ReadFrontier {
         load_read_frontier(self, shard)
+    }
+
+    fn member_index(&self, shard: ShardId) -> MemberIndex {
+        MemberIndex::load(self, shard)
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {

@@ -21,8 +21,8 @@ use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::{
     AbandonmentRecord, Address, Block, BlockHeight, CollectionId, Deadline, DiscardCause, EntryKey,
     Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, SettledEntries,
-    Settlement, ShardId, ShardTrie, TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash,
-    TxOutcome, Verifiable, Verified, WeightedTimestamp,
+    Settlement, ShardId, ShardTrie, SubstateKey, TickHalf, TickId, TickLine, TickManifest,
+    Transaction, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{ProtocolHasher, TICK_MEMBER_SLOT, collection_id};
 
@@ -57,6 +57,9 @@ pub struct MemberRow {
     /// The parent-QC clock of the block that committed it: the clock it
     /// is priced at.
     pub committed: WeightedTimestamp,
+    /// The height of the block that committed it, from which a crossing
+    /// read for it counts as arrived.
+    pub height: BlockHeight,
     /// Where it stands.
     pub state: RowState,
     /// What it holds while in flight, as its line named them; empty in
@@ -508,6 +511,7 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
                 tx,
                 deadline,
                 committed: inputs.committed,
+                height: inputs.height,
                 state: RowState::Pending,
                 holds: Capped::empty(),
                 covered: false,
@@ -591,9 +595,11 @@ fn member_taken(
         || read_at::<MemberRow>(state, member_entry(shard, tx)).is_some()
 }
 
-/// The family as `state` holds it for `shard`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The family as `state` holds it for `shard`: what a seat loads, and
+/// what a coordinator then advances by the same fold every commit runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberIndex {
+    shard: ShardId,
     /// Every member row, by transaction.
     pub members: BTreeMap<TxHash, MemberRow>,
     /// Every tick row, by height.
@@ -601,6 +607,16 @@ pub struct MemberIndex {
 }
 
 impl MemberIndex {
+    /// No rows at all, for `shard`.
+    #[must_use]
+    pub const fn empty(shard: ShardId) -> Self {
+        Self {
+            shard,
+            members: BTreeMap::new(),
+            ticks: BTreeMap::new(),
+        }
+    }
+
     /// Both collections, one range read each.
     #[must_use]
     pub fn load(state: &(impl Substates + ?Sized), shard: ShardId) -> Self {
@@ -616,7 +632,54 @@ impl MemberIndex {
                 Some((height, from_slice::<TickRow>(&bytes).ok()?))
             })
             .collect();
-        Self { members, ticks }
+        Self {
+            shard,
+            members,
+            ticks,
+        }
+    }
+
+    /// The shard whose family this is.
+    #[must_use]
+    pub const fn shard(&self) -> ShardId {
+        self.shard
+    }
+
+    /// Fold one block's content in, as [`member_writes`] folds it into
+    /// state.
+    ///
+    /// # Panics
+    ///
+    /// If a written row fails to decode, which a row this fold encoded
+    /// cannot.
+    pub fn advance(&mut self, inputs: &MemberInputs) {
+        let writes = member_writes(&*self, inputs);
+        let (_, members) = collection_of(self.shard, MEMBERS);
+        let (_, ticks) = collection_of(self.shard, TICKS);
+        for (key, change) in writes {
+            if key.collection == members {
+                let Some(bytes) = change else {
+                    self.members.retain(|tx, _| member_order(*tx) != key.order);
+                    continue;
+                };
+                let row: MemberRow = from_slice(&bytes).expect("the fold encodes rows it decodes");
+                self.members.insert(row.tx, row);
+            } else if key.collection == ticks {
+                let height = BlockHeight::new(
+                    u64::try_from(key.order).expect("tick rows are keyed by height"),
+                );
+                match change {
+                    Some(bytes) => {
+                        let row: TickRow =
+                            from_slice(&bytes).expect("the fold encodes rows it decodes");
+                        self.ticks.insert(height, row);
+                    }
+                    None => {
+                        self.ticks.remove(&height);
+                    }
+                }
+            }
+        }
     }
 
     /// The heights whose determined half the chain still owes.
@@ -630,9 +693,52 @@ impl MemberIndex {
     }
 }
 
+/// The index read as the state its own collections sit in; every other
+/// collection, a predecessor's included, reads empty.
+impl Substates for MemberIndex {
+    fn cell(&self, _key: SubstateKey) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn entries_in_range(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        lo: u128,
+        hi: u128,
+        limit: usize,
+    ) -> Vec<(u128, Vec<u8>)> {
+        let (own, members) = collection_of(self.shard, MEMBERS);
+        let (_, ticks) = collection_of(self.shard, TICKS);
+        if owner != own {
+            return Vec::new();
+        }
+        let mut entries: Vec<(u128, Vec<u8>)> = if collection == members {
+            self.members
+                .iter()
+                .map(|(tx, row)| (member_order(*tx), row))
+                .filter(|(order, _)| (lo..=hi).contains(order))
+                .map(|(order, row)| (order, to_vec(row).expect("a member row encodes")))
+                .collect()
+        } else if collection == ticks {
+            self.ticks
+                .iter()
+                .map(|(height, row)| (u128::from(height.inner()), row))
+                .filter(|(order, _)| (lo..=hi).contains(order))
+                .map(|(order, row)| (order, to_vec(row).expect("a tick row encodes")))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        entries.sort_unstable_by_key(|(order, _)| *order);
+        entries.truncate(limit);
+        entries
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Hash, SubstateKey};
+    use hyperscale_types::Hash;
 
     use super::*;
 
@@ -905,5 +1011,43 @@ mod tests {
             Some(twin)
         );
         assert_eq!(colliding_member_row(LOCAL, [tx(2), tx(3)], &store), None);
+    }
+
+    /// A cache loaded from state and advanced by the same fold stays
+    /// equal to state through every kind of step the fold takes.
+    #[test]
+    fn a_cache_advances_as_state_does() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2, 3, 4]));
+        let mut cache = MemberIndex::load(&store, LOCAL);
+        let steps = [
+            naming(
+                2,
+                vec![
+                    member(1, Settlement::Alone),
+                    member(2, Settlement::Shared),
+                    member(3, Settlement::Awaited),
+                ],
+            ),
+            MemberInputs {
+                covered: vec![tx(4)],
+                ..committing(3, &[5])
+            },
+            settling(4, 2, TickHalf::Determined, &[1]),
+            naming(
+                5,
+                vec![TickLine::Discard {
+                    tick: TickId::new(LOCAL, BlockHeight::new(2)),
+                    cause: DiscardCause::Rejected,
+                }],
+            ),
+            settling(6, 2, TickHalf::Legs, &[2]),
+        ];
+        for step in &steps {
+            store.fold(step);
+            cache.advance(step);
+            assert_eq!(cache, MemberIndex::load(&store, LOCAL), "after {step:?}");
+        }
+        assert_eq!(cache.members[&tx(5)].height, BlockHeight::new(3));
     }
 }

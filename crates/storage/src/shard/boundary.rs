@@ -16,7 +16,7 @@ use hyperscale_types::{
     SubstateLeaf,
 };
 
-use crate::Substates;
+use crate::{MemberIndex, Substates};
 
 /// The default number of boundary pins a backend retains before
 /// evicting the oldest.
@@ -440,6 +440,11 @@ pub trait BoundaryStore {
     /// read the same way however the store was reached, since the table
     /// is state and the state is what every seat imports.
     fn read_frontier(&self, shard: ShardId) -> ReadFrontier;
+
+    /// The tick membership `shard`'s slice of the committed state holds:
+    /// [`MemberIndex::load`](crate::MemberIndex::load) over the store,
+    /// read the same way however the store was reached.
+    fn member_index(&self, shard: ShardId) -> MemberIndex;
 }
 
 #[cfg(test)]

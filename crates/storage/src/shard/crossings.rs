@@ -17,11 +17,53 @@ use std::collections::BTreeSet;
 
 use hyperscale_types::{
     Inclusion, Movement, ProtocolHasher, SettledWrites, StateClaim, StateWrites, SubstateKey,
+    TxHash,
 };
-use hyperscale_vm_effects::{Answered, CrossingLeaf, Terms};
+use hyperscale_vm_effects::{Answered, Crossing, CrossingCell, CrossingLeaf, Terms};
 
 use crate::Substates;
 use crate::shard::writes::fold_state_writes;
+
+/// Among the held readings of the key the block carries, the one at
+/// the newest anchor by weighted time, decoded as a crossing leaf.
+///
+/// `Some` only for a record, and a bare presence of the key licenses
+/// nothing — a reading that carries no value says nothing an arrival
+/// can be composed from.
+///
+/// The arrival a consuming core runs against. The answer does not
+/// depend on how many readings of the key a block carries or in what
+/// order.
+#[must_use]
+pub fn live_record(
+    state_claims: &[StateClaim],
+    key: SubstateKey,
+) -> Option<(Crossing, CrossingCell)> {
+    state_claims
+        .iter()
+        .filter_map(|claim| claim.held(key).map(|bytes| (claim.anchor.ts, bytes)))
+        .max_by_key(|(ts, _)| *ts)
+        .and_then(
+            |(_, bytes)| match CrossingLeaf::read(&ProtocolHasher, key, bytes)? {
+                CrossingLeaf::Record { crossing, cell } => Some((crossing, cell)),
+                CrossingLeaf::Answer { .. } => None,
+            },
+        )
+}
+
+/// Every record `state_claims` read live, with the transaction that
+/// issued it.
+///
+/// The crossings a consumer here waiting on them counts as arrived. Off
+/// [`live_record`], so the reading a member runs against is the one that
+/// counts.
+#[must_use]
+pub fn record_arrivals(state_claims: &[StateClaim]) -> BTreeSet<(SubstateKey, TxHash)> {
+    let keys: BTreeSet<SubstateKey> = state_claims.iter().flat_map(StateClaim::keys).collect();
+    keys.into_iter()
+        .filter_map(|key| live_record(state_claims, key).map(|(_, cell)| (key, cell.tx)))
+        .collect()
+}
 
 /// The credits the owed records `state_claims` read license, with the
 /// `Taken` answer each writes: what the consumer's commit fold lands in

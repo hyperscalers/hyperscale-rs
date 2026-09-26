@@ -235,7 +235,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
     assert_eq!(MemberIndex::load(&left_store.snapshot(), parent), rows);
     assert_eq!(
         MemberIndex::load(&right_store.snapshot(), parent),
-        MemberIndex::default()
+        MemberIndex::empty(parent)
     );
     assert!(children.composes_to(parent_root));
 }
