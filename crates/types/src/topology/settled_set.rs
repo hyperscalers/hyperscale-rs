@@ -275,6 +275,7 @@ mod tests {
                         witness_base: BeaconWitnessLeafCount::ZERO,
                         terminal_settled_txs: None,
                         handoff_complete: *handoff_complete,
+                        terminal_epoch: None,
                     },
                 )
             })

@@ -2089,6 +2089,7 @@ mod tests {
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     terminal_settled_txs: None,
                     handoff_complete,
+                    terminal_epoch: None,
                 },
             );
             let snapshot = shard_snapshot(2, &[0, 1, 2, 3], 0).with_boundaries(boundaries);

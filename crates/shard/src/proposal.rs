@@ -29,7 +29,7 @@ use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
 
 use crate::admission::{
-    Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
+    Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, Section, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_each, unwrapped,
 };
@@ -187,7 +187,7 @@ pub struct Prefilter<'a> {
 ///
 /// Logs the refusals when non-zero.
 pub fn select_transactions(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     prefilter: Prefilter<'_>,
     fold: &mut TransactionsFold<'_>,
     ready_txs: &[Arc<Verified<Transaction>>],
@@ -250,7 +250,7 @@ pub fn select_transactions(
 /// drops only what a gap in that order would have made unofferable
 /// anyway, and the cap drops a suffix.
 pub fn select_finalizations(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut FinalizationsFold,
     finalizations: Vec<Arc<Verifiable<Finalization>>>,
 ) -> Vec<Arc<Verifiable<Finalization>>> {
@@ -273,7 +273,7 @@ pub fn select_finalizations(
 /// commits nothing never advances the frontier that would retire the
 /// set, the next proposal carries it again.
 pub fn select_abandonment_records(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut RecordsFold<'_>,
     records: Vec<AbandonmentRecord>,
 ) -> Vec<AbandonmentRecord> {
@@ -329,7 +329,7 @@ pub fn select_abandonment_records(
 /// and what the order rule refuses is dropped.
 #[must_use]
 pub fn select_state_claims(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut StateClaimsFold,
     state_claims: Vec<StateClaim>,
 ) -> Vec<StateClaim> {
@@ -396,7 +396,7 @@ pub fn trim_local_crossings(
 /// the queue drains monotonically; unselected batches remain queued for
 /// the next proposal.
 pub fn select_provisions(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut ProvisionsFold,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
 ) -> Vec<Arc<Verifiable<Provisions>>> {

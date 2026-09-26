@@ -246,6 +246,7 @@ mod tests {
             witness_base: BeaconWitnessLeafCount::ZERO,
             terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         };
         (
             PendingChain::new(Arc::new(storage), ChainOrigin::ROOT),
@@ -343,6 +344,7 @@ mod tests {
             witness_base: BeaconWitnessLeafCount::ZERO,
             terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         };
         let peer = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
 

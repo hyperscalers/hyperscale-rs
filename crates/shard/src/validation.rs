@@ -8,7 +8,7 @@
 //!   items through the [`crate::admission`] predicate the proposer
 //!   selected them by.
 //!
-//! Everything here is stateless — callers supply the [`Admission`]
+//! Everything here is stateless — callers supply the [`Committed`]
 //! context explicitly. The async verification pipeline lives in
 //! [`crate::verification`]; this module is just the pure rules.
 //!
@@ -24,7 +24,7 @@ use hyperscale_types::{
 };
 
 use crate::admission::{
-    Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
+    Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_all, unwrapped,
 };
@@ -323,14 +323,10 @@ fn validate_block_work(
 /// names, state claims, crossing re-offers. Returns a single diagnostic
 /// on the first failure so the caller can log once.
 pub fn validate_block_for_vote(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     block: &Block,
-    coasting: bool,
     parent_load: Option<ShardLoad>,
 ) -> Result<(), String> {
-    if coasting {
-        validate_coast_block_empty(block)?;
-    }
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
     validate_roots_commit_sections(block)?;
@@ -340,12 +336,29 @@ pub fn validate_block_for_vote(
     validate_block_work(block, parent_load, budget)
 }
 
+/// A coast block's pre-vote check: empty, which leaves nothing for any
+/// section to admit, and otherwise held to the checks every block is.
+///
+/// Needs no committed view, because an empty block reads none: a coast
+/// or recovery bridge block anchored in a window this node has evicted
+/// is judged all the same.
+pub fn validate_coast_block_for_vote(
+    block: &Block,
+    parent_load: Option<ShardLoad>,
+) -> Result<(), String> {
+    validate_coast_block_empty(block)?;
+    validate_transactions_verified(block)?;
+    validate_transaction_ordering(block)?;
+    validate_roots_commit_sections(block)?;
+    validate_block_work(block, parent_load, DeclaredWork::ZERO)
+}
+
 /// Every section's items through its [`Section`](crate::admission::Section)
 /// predicate, in the order the folds depend on.
 ///
 /// Returns what the block's transactions reserve on this shard, which
 /// the header's own claim is checked against.
-pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork, String> {
+pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork, String> {
     let mut provisions = ProvisionsFold::default();
     admit_all::<ProvisionsSection>(
         ctx,
@@ -1484,6 +1497,96 @@ pub mod tests {
         }
     }
 
+    /// The departures a block's anchored window attests are the ones the
+    /// schedule's walk over its retained windows finds, while every
+    /// terminal record stands: the same shards, the same cuts, and the
+    /// same evidence verdicts, open handoff or stamped.
+    #[test]
+    fn departures_read_off_the_window_equal_the_schedule_walk() {
+        use hyperscale_types::{Epoch, WindowLookup};
+
+        let (left, right) = ShardId::ROOT.children();
+        let (survivors_left, survivors_right) = (left.children(), right.children());
+        let survivors = [
+            survivors_left.0,
+            survivors_left.1,
+            survivors_right.0,
+            survivors_right.1,
+        ];
+        for handoff in [None, Some(Epoch::new(1))] {
+            let schedule = departures(&[left, right], &survivors, handoff);
+            let windows = schedule.windows();
+            for ms in [DEPARTURE_CUT_MS + 1, DEPARTURE_CUT_MS + 500, 5_500, 15_500] {
+                let at = WeightedTimestamp::from_millis(ms);
+                let WindowLookup::Window(window) = schedule.lookup(at) else {
+                    panic!("the fixture holds every window it anchors in");
+                };
+                let mut read: Vec<_> = window.departures(windows).collect();
+                let mut walked: Vec<_> = schedule.departures_at(at).collect();
+                read.sort_unstable_by_key(|(shard, _)| shard.inner());
+                walked.sort_unstable_by_key(|(shard, _)| shard.inner());
+                assert_eq!(read, walked, "at {ms}");
+                assert_eq!(read.len(), 2);
+                for shard in [left, right, survivors[0]] {
+                    assert_eq!(
+                        window.terminal_cut(shard, windows),
+                        schedule.terminal_cut_for_shard(shard, at),
+                        "{shard:?} at {ms}"
+                    );
+                    assert_eq!(
+                        window.evidence_readable(shard, at, windows),
+                        schedule.terminal_evidence_readable(shard, at),
+                        "{shard:?} at {ms}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Once a departed shard's terminal record has dropped from the
+    /// window a block is anchored in, a record naming that departure is
+    /// refused alike by a replica that still retains the window its chain
+    /// ended in and by one that has evicted it: the anchored window is
+    /// the whole answer.
+    #[test]
+    fn a_record_after_its_boundary_drops_is_refused_alike() {
+        use std::collections::HashMap;
+
+        use hyperscale_types::Epoch;
+
+        let (left, right) = ShardId::ROOT.children();
+        let (survivors_left, survivors_right) = (left.children(), right.children());
+        let mut deep = departures(
+            &[left, right],
+            &[
+                survivors_left.0,
+                survivors_left.1,
+                survivors_right.0,
+                survivors_right.1,
+            ],
+            None,
+        );
+        let dropped = Arc::new((**deep.head()).clone().with_boundaries(HashMap::new()));
+        for epoch in 6..=20u64 {
+            deep.insert(Epoch::new(epoch), Arc::clone(&dropped));
+        }
+        deep.set_head(Arc::clone(&dropped));
+        let mut shallow = deep.clone();
+        shallow.evict_below(Epoch::new(6));
+
+        let records = vec![verdict(left, &[1])];
+        let block = block_with_verdicts(records.clone(), AbandonmentRoot::over(&records));
+        let refusal = |schedule| {
+            let mut against = Against::schedule(topology_snapshot(), schedule);
+            against.anchor = WeightedTimestamp::from_millis(7_500);
+            against.local_shard = survivors_right.0;
+            admit(&against, &block).unwrap_err()
+        };
+        let from_deep = refusal(deep);
+        assert!(from_deep.contains("does not attest"), "{from_deep}");
+        assert_eq!(from_deep, refusal(shallow));
+    }
+
     /// A departure names a crossing off this shard's leaf only where the
     /// departed shard was the one to take it: it held the consumer's
     /// route, and the transaction's deadline had passed by the cut. A
@@ -2095,6 +2198,40 @@ pub mod tests {
         assert!(admit(&owing(3, &[]), &block_settling(&[6], &[])).is_ok());
     }
 
+    /// The node-local owed set only refuses: empty, it admits nothing
+    /// the committed frontier rule refuses on its own, and populated, it
+    /// refuses the skip.
+    #[test]
+    fn owed_determined_only_refuses() {
+        let err = admit(&owing(3, &[]), &block_settling(&[2], &[])).unwrap_err();
+        assert!(err.contains("at or below the frontier"), "{err}");
+        let err = admit(&owing(3, &[4]), &block_settling(&[6], &[])).unwrap_err();
+        assert!(err.contains("still owes"), "{err}");
+    }
+
+    /// A voter whose dedup index is fresh — after a halt recovery past f,
+    /// a whole committee can be — admits a batch the chain carried before
+    /// it began folding: no completeness gate holds the vote back, and
+    /// the shallow tier over-admits per item rather than stalling.
+    #[test]
+    fn a_shallow_committee_still_commits() {
+        let bundle = Provisions::new(
+            ShardId::leaf(1, 1),
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(
+                TxHash::from(Hash::from_bytes(b"carried before")),
+                Capped::empty(),
+            )]),
+        );
+        let fresh = plain();
+        assert!(!fresh.dedup.is_complete(fresh.anchor));
+        let mut fold = ProvisionsFold::default();
+        assert!(ProvisionsSection::admit(&fresh.ctx(), &mut fold, &bundle).is_ok());
+    }
+
     /// A legs half is unconstrained. It waits on a counterpart and may
     /// land arbitrarily late; its declared cells are claimed against
     /// every later tick from the moment it executes, so it has nothing
@@ -2294,13 +2431,9 @@ pub mod tests {
         txs.reverse(); // intentionally mis-sort to prove short-circuit
         txs.push(tx(30)); // Unverified entry
         let block = block_with_transactions(BlockHeight::new(1), txs);
-        let err = validate_block_for_vote(
-            &Against::window(topo).ctx(),
-            &block,
-            false,
-            Some(ShardLoad::ZERO),
-        )
-        .unwrap_err();
+        let err =
+            validate_block_for_vote(&Against::window(topo).ctx(), &block, Some(ShardLoad::ZERO))
+                .unwrap_err();
         assert!(err.contains("not admission-validated"));
     }
 
@@ -2308,15 +2441,8 @@ pub mod tests {
     fn coast_blocks_must_be_empty() {
         // Past the terminal window a block exists only to certify the
         // crossing: any content fails the pre-vote check.
-        let topo = topology_snapshot();
         let with_tx = block_with_transactions(BlockHeight::new(1), sorted_verified_txs(&[10]));
-        let err = validate_block_for_vote(
-            &Against::window(topo.clone()).ctx(),
-            &with_tx,
-            true,
-            Some(ShardLoad::ZERO),
-        )
-        .unwrap_err();
+        let err = validate_coast_block_for_vote(&with_tx, Some(ShardLoad::ZERO)).unwrap_err();
         assert!(err.contains("coast block"), "{err}");
 
         // A boundary record is content too. A chain whose capacity to
@@ -2325,25 +2451,11 @@ pub mod tests {
         // four.
         let records = vec![verdict(ShardId::ROOT, &[1])];
         let with_record = block_with_verdicts(records.clone(), AbandonmentRoot::over(&records));
-        let err = validate_block_for_vote(
-            &Against::window(topo.clone()).ctx(),
-            &with_record,
-            true,
-            Some(ShardLoad::ZERO),
-        )
-        .unwrap_err();
+        let err = validate_coast_block_for_vote(&with_record, Some(ShardLoad::ZERO)).unwrap_err();
         assert!(err.contains("abandonment records"), "{err}");
 
         let empty = block_with_transactions(BlockHeight::new(1), Vec::new());
-        assert!(
-            validate_block_for_vote(
-                &Against::window(topo).ctx(),
-                &empty,
-                true,
-                Some(ShardLoad::ZERO)
-            )
-            .is_ok()
-        );
+        assert!(validate_coast_block_for_vote(&empty, Some(ShardLoad::ZERO)).is_ok());
     }
 
     // ═══════════════════════════════════════════════════════════════════════

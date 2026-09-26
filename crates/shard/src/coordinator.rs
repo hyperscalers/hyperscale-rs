@@ -20,8 +20,8 @@ use hyperscale_types::{
     Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
     PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
     ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
-    SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, derive_reshape_trigger,
-    ready_signal_window,
+    SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, WindowLookup,
+    derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -158,7 +158,7 @@ use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::admission::{
-    Admission, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateClaimsFold,
+    Committed, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateClaimsFold,
     TransactionsFold,
 };
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
@@ -185,7 +185,7 @@ use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
 use crate::validation::{
     qc_has_local_quorum_power, qc_weighted_timestamp_too_far_ahead, validate_block_for_vote,
-    validate_header, validate_proposer,
+    validate_coast_block_for_vote, validate_header, validate_proposer,
 };
 use crate::verification::{
     InFlightCheck, ReadyStateRootVerification, SubstateCountBlocked, SubstateCountSource,
@@ -1925,16 +1925,34 @@ impl ShardCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// What a block extending `parent_qc` is admitted against: the chain
-    /// behind the parent, walked once, and the window the block sits in.
+    /// behind the parent, walked once, the committee `snapshot` its
+    /// parent's anchor resolves, and the window its own anchor sits in.
+    ///
+    /// `None` defers: the window at the block's anchor is one this node's
+    /// beacon has not committed yet, which never reads as anything, or it
+    /// has been evicted, which no votable anchor reaches. The proposer
+    /// stalls behind its latch and the voter leaves the block pending;
+    /// the beacon block that commits the window re-drives both.
     fn admission<'a>(
         &'a self,
         snapshot: &'a TopologySnapshot,
         topology_schedule: &'a TopologySchedule,
         chain: &'a QcChainSets,
         parent_qc: &QuorumCertificate,
-    ) -> Admission<'a> {
+    ) -> Option<Committed<'a>> {
         let parent_block_hash = parent_qc.block_hash();
         let anchor = parent_qc.weighted_timestamp();
+        let window = match topology_schedule.lookup(anchor) {
+            WindowLookup::Window(window) => window,
+            WindowLookup::NotYetCommitted => return None,
+            WindowLookup::Evicted => {
+                warn!(
+                    anchor = anchor.as_millis(),
+                    "A block's anchor lies in an evicted window; not judging it"
+                );
+                return None;
+            }
+        };
         let parent_settled_frontier = if parent_qc.is_genesis() {
             Some(BlockHeight::GENESIS)
         } else {
@@ -1949,8 +1967,10 @@ impl ShardCoordinator {
             state_root: self.chain_view().parent_state_root(parent_block_hash),
             ts: anchor,
         };
-        Admission {
+        Some(Committed {
             snapshot,
+            window,
+            windows: topology_schedule.windows(),
             schedule: topology_schedule,
             local_shard: self.local_shard,
             anchor,
@@ -1960,7 +1980,7 @@ impl ShardCoordinator {
             dedup: &self.dedup_index,
             parent_settled_frontier,
             owed_determined: &self.owed_determined,
-        }
+        })
     }
 
     /// Mirror the execution fold's owed determined halves, which
@@ -2080,7 +2100,9 @@ impl ShardCoordinator {
         else {
             return vec![];
         };
-        let ctx = self.admission(committee, topology_schedule, &chain, &parent_qc);
+        let Some(ctx) = self.admission(committee, topology_schedule, &chain, &parent_qc) else {
+            return vec![];
+        };
         // In the order the folds depend on: provisions first, since a
         // cross-shard transaction rides only beside (or after) its payer
         // bundle; the claims before the transactions they license;
@@ -3493,13 +3515,38 @@ impl ShardCoordinator {
             let anchor_wt = block.header().parent_qc().weighted_timestamp();
             let coasting = self.past_terminal_window(topology_schedule, anchor_wt)
                 || self.recovery_bridging(topology_schedule, anchor_wt);
-            if self.reject_invalid_block_contents(
-                committee,
-                topology_schedule,
-                block_hash,
-                block,
-                coasting,
-            ) {
+            // A coast or bridge block is required empty, so it reads no
+            // window: judged without one, it stays votable however stale
+            // its anchor is. Anything else is judged against the committed
+            // view at its anchors, and waits where that view is not held.
+            let parent = block.header().parent_block_hash();
+            let parent_load = self.chain_view().parent_load_checked(parent);
+            let verdict = if coasting {
+                validate_coast_block_for_vote(block, parent_load)
+            } else {
+                let chain = QcChainSets::behind(&self.chain_view(), parent);
+                let Some(ctx) = self.admission(
+                    committee,
+                    topology_schedule,
+                    &chain,
+                    block.header().parent_qc(),
+                ) else {
+                    trace!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        "The block's anchor window is not held — deferring the vote"
+                    );
+                    return vec![];
+                };
+                validate_block_for_vote(&ctx, block, parent_load)
+            };
+            if let Err(e) = verdict {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    error = %e,
+                    "Block failed pre-vote validation - not voting"
+                );
                 return vec![];
             }
 
@@ -3771,42 +3818,6 @@ impl ShardCoordinator {
         transactions
             .filter(|fee| trie.shard_for_prefix(fee.vault.owner) == self.local_shard)
             .collect()
-    }
-
-    /// Validate transaction ordering, ticks, and cross-ancestor tx uniqueness
-    /// against the QC chain + retention cache. Returns `true` when the caller
-    /// should reject the block (logs the reason).
-    fn reject_invalid_block_contents(
-        &self,
-        topology_snapshot: &TopologySnapshot,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        block: &Block,
-        coasting: bool,
-    ) -> bool {
-        let parent = block.header().parent_block_hash();
-        let chain = QcChainSets::behind(&self.chain_view(), parent);
-        let ctx = self.admission(
-            topology_snapshot,
-            topology_schedule,
-            &chain,
-            block.header().parent_qc(),
-        );
-        if let Err(e) = validate_block_for_vote(
-            &ctx,
-            block,
-            coasting,
-            self.chain_view().parent_load_checked(parent),
-        ) {
-            warn!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                error = %e,
-                "Block failed pre-vote validation - not voting"
-            );
-            return true;
-        }
-        false
     }
 
     /// Create a vote for a block.
@@ -5561,6 +5572,10 @@ impl ShardCoordinator {
         // now seat a block's committee — retry any beacon-witness verification
         // that was parked on that lag before it strands the shard.
         actions.extend(self.retry_beacon_witness_awaiting_committee(topology_schedule));
+        // And a vote deferred because the window at its block's anchor was
+        // not committed here is re-driven by the beacon block that commits
+        // it, rather than waiting on a view change.
+        actions.extend(self.redrive_pending_votes(topology_schedule));
         // The same fold is what carries this chain's predecessors to a seat
         // the flip never reached, so a boot that lands mid-window picks
         // them up at the first beacon block it commits.
@@ -7369,6 +7384,7 @@ mod tests {
             witness_base: BeaconWitnessLeafCount::ZERO,
             terminal_settled_txs: Some(SettledTxsRoot::ZERO),
             handoff_complete: None,
+            terminal_epoch: None,
         };
         let live = |shards: &[ShardId], boundaries: HashMap<ShardId, ShardAnchor>| {
             Arc::new(TopologySnapshot::from_explicit_committees(
@@ -9202,6 +9218,138 @@ mod tests {
             after_roots
                 .iter()
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
+    }
+
+    /// A pending block whose own anchor lies in a window the schedule has
+    /// not committed draws no vote and stays pending; the beacon block
+    /// that commits the window re-drives the vote, with no view change.
+    #[test]
+    #[allow(clippy::too_many_lines)] // synthetic QC/header fixtures, one block field per line
+    fn a_vote_deferred_on_an_uncommitted_window_is_redriven_by_the_beacon() {
+        let (mut state, single) = make_multi_validator_state_at(1);
+        // The committee's window is committed, but not the window the
+        // block's own anchor (99s) lies in.
+        let snapshot = Arc::clone(single.head());
+        let mut topology_schedule =
+            TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
+        topology_schedule.set_head(Arc::clone(&snapshot));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        let parent_block = Block::Live {
+            header: make_header_at_height(BlockHeight::new(1), 99_000),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let parent_block_hash = parent_block.hash();
+        state.committed_height = BlockHeight::new(1);
+        state.committed_hash = parent_block_hash;
+        install_complete_block(&mut state, &parent_block);
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let parent_qc = {
+            let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                signers,
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(99_000),
+            )
+        };
+        let header = {
+            let __h = make_header_at_height(BlockHeight::new(2), 100_000);
+            BlockHeader::new(BlockHeaderParts {
+                shard_id: __h.shard_id(),
+                height: __h.height(),
+                parent_block_hash,
+                parent_qc: parent_qc.into(),
+                proposer: __h.proposer(),
+                timestamp: __h.timestamp(),
+                round: __h.round(),
+                is_fallback: __h.is_fallback(),
+                state_root: __h.state_root(),
+                transaction_root: __h.transaction_root(),
+                certificate_root: __h.certificate_root(),
+                local_receipt_root: __h.local_receipt_root(),
+                provision_root: __h.provision_root(),
+                provision_tx_roots: __h.provision_tx_roots().clone(),
+                txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
+                ..Default::default()
+            })
+        };
+        let block_hash = header.hash();
+
+        let _ = state.on_block_header(
+            &topology_schedule,
+            &header,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+
+        // QC verified — but state root verification is still pending, so no vote yet.
+        // SAFETY: synthetic test fixture, parent_qc built locally.
+        let verified =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
+        let after_qc = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(verified));
+        assert!(
+            !after_qc
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
+
+        // State root completes — beacon witness root still pending.
+        let after_state = state.on_block_check_completed(
+            &topology_schedule,
+            block_hash,
+            VerificationKind::StateRoot,
+            CheckOutcome::Checked { bytes_delta: 0 },
+        );
+        assert!(
+            !after_state
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
+
+        // Every check completes, but the block's anchor window is not
+        // committed here: no vote, and the block stays pending.
+        let after_roots = state.on_block_check_completed(
+            &topology_schedule,
+            block_hash,
+            VerificationKind::BeaconWitnessRoot,
+            CheckOutcome::Checked { bytes_delta: 0 },
+        );
+        assert!(
+            !after_roots
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })),
+            "a block judged in an uncommitted window draws no vote"
+        );
+
+        // The beacon commits the window, and its persistence re-drives the
+        // vote with no view change.
+        for epoch in 1..=100 {
+            topology_schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
+        }
+        let redriven = state.on_beacon_block_persisted(&topology_schedule);
+        assert!(
+            redriven
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })),
+            "the beacon block that commits the window re-drives the vote"
         );
     }
 
@@ -12987,6 +13135,7 @@ mod tests {
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     terminal_settled_txs: None,
                     handoff_complete: None,
+                    terminal_epoch: Some(Epoch::new(0)),
                 },
             )])),
         );
@@ -13108,12 +13257,14 @@ mod tests {
         ) -> Result<(), String> {
             let parent = block.header().parent_block_hash();
             let chain = QcChainSets::behind(&self.chain_view(), parent);
-            let ctx = self.admission(
-                topology_schedule.head(),
-                topology_schedule,
-                &chain,
-                block.header().parent_qc(),
-            );
+            let ctx = self
+                .admission(
+                    topology_schedule.head(),
+                    topology_schedule,
+                    &chain,
+                    block.header().parent_qc(),
+                )
+                .ok_or("the block's anchor window is not held")?;
             let provisions = ProvisionsFold::default();
             admit_all::<TransactionsSection<'_>>(
                 &ctx,
@@ -13131,12 +13282,14 @@ mod tests {
         ) -> Result<(), String> {
             let parent = block.header().parent_block_hash();
             let chain = QcChainSets::behind(&self.chain_view(), parent);
-            let ctx = self.admission(
-                topology_schedule.head(),
-                topology_schedule,
-                &chain,
-                block.header().parent_qc(),
-            );
+            let ctx = self
+                .admission(
+                    topology_schedule.head(),
+                    topology_schedule,
+                    &chain,
+                    block.header().parent_qc(),
+                )
+                .ok_or("the block's anchor window is not held")?;
             let finalizations = FinalizationsFold::from(&ctx);
             admit_all::<RecordsSection<'_>>(
                 &ctx,
@@ -13407,6 +13560,26 @@ mod tests {
                 .vote_fence()
                 .records(&block_with_records(AFTER_CUT_MS, records))
                 .is_err()
+        );
+    }
+
+    /// A block anchored in a window this node's beacon has not committed
+    /// yields no committed view at all, so a record on it is never read as
+    /// readable: the vote defers until the beacon commits the window. The
+    /// same record anchored in a committed window passes.
+    #[test]
+    fn an_abandonment_record_on_an_uncommitted_window_defers() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
+        let err = coord
+            .admit_records(&sched, &block_with_records(2_500, records.clone()))
+            .unwrap_err();
+        assert!(err.contains("not held"), "{err}");
+        assert!(
+            coord
+                .admit_records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .is_ok()
         );
     }
 

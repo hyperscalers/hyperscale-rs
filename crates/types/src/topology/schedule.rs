@@ -116,6 +116,55 @@ impl<'a> WindowView<'a> {
     pub fn boundary(self, shard: ShardId) -> Option<ShardAnchor> {
         self.snapshot.boundary(shard)
     }
+
+    /// Every shard whose terminal record this window carries and whose
+    /// chain it no longer runs, each with the cut its chain ended at.
+    ///
+    /// Read off this window's own records, so two replicas answer alike
+    /// however many older windows each still retains; a departure whose
+    /// record has dropped is one this window no longer attests.
+    pub fn departures(
+        self,
+        windows: EpochWindows,
+    ) -> impl Iterator<Item = (ShardId, WeightedTimestamp)> + 'a {
+        let trie = self.snapshot.shard_trie();
+        self.snapshot
+            .boundaries()
+            .filter(move |(shard, _)| !trie.contains(*shard))
+            .filter_map(move |(shard, anchor)| {
+                Some((shard, windows.window_of(anchor.terminal_epoch?).end))
+            })
+    }
+
+    /// Where departed `shard`'s chain ended, as this window's terminal
+    /// record says: the end of its terminal epoch's window. `None` while
+    /// `shard` runs in this window, or once its record has dropped.
+    #[must_use]
+    pub fn terminal_cut(self, shard: ShardId, windows: EpochWindows) -> Option<WeightedTimestamp> {
+        if self.snapshot.shard_trie().contains(shard) {
+            return None;
+        }
+        let epoch = self.snapshot.boundary(shard)?.terminal_epoch?;
+        Some(windows.window_of(epoch).end)
+    }
+
+    /// Whether departed `shard`'s terminal evidence is still readable at
+    /// `at`: this window carries its record, and the handoff-complete
+    /// stamp, if the beacon has landed it, has not aged past the evidence
+    /// window.
+    #[must_use]
+    pub fn evidence_readable(
+        self,
+        shard: ShardId,
+        at: WeightedTimestamp,
+        windows: EpochWindows,
+    ) -> bool {
+        self.snapshot.boundary(shard).is_some_and(|anchor| {
+            anchor
+                .handoff_complete
+                .is_none_or(|done| at <= windows.handoff_evidence_expiry(done))
+        })
+    }
 }
 
 /// Result of resolving a weighted timestamp to its window.
@@ -1249,6 +1298,7 @@ mod tests {
                         witness_base: BeaconWitnessLeafCount::ZERO,
                         terminal_settled_txs: *settled,
                         handoff_complete: None,
+                        terminal_epoch: None,
                     },
                 )
             })

@@ -70,6 +70,12 @@ pub struct ShardAnchor {
     /// here; `None` while the handoff is pending (an open window), and
     /// always `None` for a live shard's anchor.
     pub handoff_complete: Option<Epoch>,
+    /// The epoch whose cut this shard's chain terminates at, once a
+    /// reshape scheduled it; `None` for a live shard. The end of that
+    /// epoch's window is the shard's terminal cut, so a window carrying
+    /// the record answers where the departed chain ended without walking
+    /// the schedule.
+    pub terminal_epoch: Option<Epoch>,
 }
 
 /// One reshape cohort seat as the topology projects it.
@@ -944,6 +950,14 @@ impl TopologySnapshot {
         self.boundaries.get(&shard).copied()
     }
 
+    /// Every shard's beacon-attested boundary anchor this snapshot
+    /// carries.
+    pub fn boundaries(&self) -> impl Iterator<Item = (ShardId, ShardAnchor)> + '_ {
+        self.boundaries
+            .iter()
+            .map(|(&shard, &anchor)| (shard, anchor))
+    }
+
     /// Whether the beacon fold has observed `shard` cross a boundary past its
     /// seeded genesis — it is producing on its own chain, not merely seeded.
     /// `false` for a freshly seeded reshape successor until its first crossing
@@ -1555,6 +1569,7 @@ mod tests {
             witness_base: BeaconWitnessLeafCount::ZERO,
             terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         };
         let mut boundaries = HashMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);

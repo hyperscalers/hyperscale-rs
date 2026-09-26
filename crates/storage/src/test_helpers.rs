@@ -951,6 +951,7 @@ pub fn pin_snap_sync_replica(
         witness_base: BeaconWitnessLeafCount::ZERO,
         terminal_settled_txs: None,
         handoff_complete: None,
+        terminal_epoch: None,
     }
 }
 

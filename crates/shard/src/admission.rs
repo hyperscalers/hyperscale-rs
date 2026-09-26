@@ -5,7 +5,7 @@
 //! what a block carries, and the two must agree: a proposer offering
 //! what its own voters refuse spends a round and offers it again. So
 //! each section has one predicate, [`Section::admit`], read against one
-//! [`Admission`] context — the chain behind the block's parent and the
+//! [`Committed`] context — the chain behind the block's parent and the
 //! window it is anchored in — with a running [`Section::Fold`] for the
 //! rules that hold across the section. The proposer filters its
 //! candidates on it; the voter runs it over the block and refuses on the
@@ -25,12 +25,13 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, Finalization,
-    FinalizationHash, MAX_ENGAGEMENTS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
-    Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateKey, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp, budget_admits_block,
-    caps_admit_transaction, evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
+    Finalization, FinalizationHash, MAX_ENGAGEMENTS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_HELD_VALUE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES,
+    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, StateClaim,
+    SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable,
+    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
+    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -106,12 +107,28 @@ impl QcChainSets {
     }
 }
 
-/// What a block is admitted against.
+/// What a block is admitted against: the committed view at the block's
+/// two anchors.
+///
+/// Every input is the block, its parent's header, the committee at the
+/// parent's anchor, the window at the block's own anchor, or a tier
+/// folded from committed blocks and read at that anchor — so two
+/// replicas at different tips, clocks or head epochs answer alike.
+/// `owed_determined` is the one node-local input, and it only refuses.
 #[derive(Clone, Copy)]
-pub(crate) struct Admission<'a> {
-    /// The committee the block is classified under.
+pub(crate) struct Committed<'a> {
+    /// The committee the block is classified under: the one its parent's
+    /// anchor resolves. Classification, payer routing and the recovery
+    /// fences read it; every time comparison reads [`Self::anchor`]. The
+    /// two anchors straddle an epoch cut once per window.
     pub(crate) snapshot: &'a TopologySnapshot,
-    /// The schedule, for the departures a record may name.
+    /// The window at the block's own anchor, whose boundary records say
+    /// which shards have departed and where each chain ended.
+    pub(crate) window: WindowView<'a>,
+    /// The epoch grid the windows sit on.
+    pub(crate) windows: EpochWindows,
+    /// The schedule, read only for the window a state claim's own anchor
+    /// lies in, which is at most a retention horizon before the block's.
     pub(crate) schedule: &'a TopologySchedule,
     /// The shard the block is on.
     pub(crate) local_shard: ShardId,
@@ -141,6 +158,9 @@ pub(crate) struct Admission<'a> {
     /// settle past one of these; a validator that never composed the
     /// tick holds it in no set and enforces nothing, so the rule refuses
     /// only what a composing quorum would refuse anyway.
+    ///
+    /// The one node-local input, and so it may only refuse: an empty set
+    /// admits nothing the order rule would refuse on its own.
     pub(crate) owed_determined: &'a BTreeSet<BlockHeight>,
 }
 
@@ -159,7 +179,7 @@ pub(crate) trait Section {
     /// # Errors
     ///
     /// Why the item is refused, for the voter's log.
-    fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, item: &Self::Item) -> Result<(), String>;
+    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, item: &Self::Item) -> Result<(), String>;
 }
 
 /// The block's provisions.
@@ -204,7 +224,7 @@ impl Section for ProvisionsSection {
     /// every replica's verdict a pure function of the block's own
     /// anchor: a block anchored before the recovery folded resolves a
     /// snapshot without the record and stays valid.
-    fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, batch: &Provisions) -> Result<(), String> {
+    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, batch: &Provisions) -> Result<(), String> {
         let provision_hash = batch.hash();
         if ctx.chain.provisions.contains(&provision_hash) {
             return Err(format!(
@@ -295,7 +315,7 @@ impl<'p> Section for TransactionsSection<'p> {
     /// writes for every transaction it carries; a transaction that does
     /// not fit is refused on its own, so a large composition never
     /// starves the small ones behind it.
-    fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, tx: &Transaction) -> Result<(), String> {
+    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, tx: &Transaction) -> Result<(), String> {
         let tx_hash = tx.hash();
         if ctx.chain.txs.contains(&tx_hash) {
             return Err(format!(
@@ -398,7 +418,7 @@ pub(crate) struct FinalizationsFold {
 impl FinalizationsFold {
     /// A fold starting at the parent's settlement frontier.
     #[must_use]
-    pub(crate) fn from(ctx: &Admission<'_>) -> Self {
+    pub(crate) fn from(ctx: &Committed<'_>) -> Self {
         Self {
             resolved_here: HashSet::new(),
             carried_here: HashSet::new(),
@@ -447,7 +467,7 @@ impl Section for FinalizationsSection {
     /// constrained: a leg's declared cells are claimed against every
     /// later tick from the moment it executes, so it has nothing to
     /// invert against.
-    fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, fw: &Finalization) -> Result<(), String> {
+    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, fw: &Finalization) -> Result<(), String> {
         if fw.local_ec().vote_anchor_ts() < ctx.chain_origin {
             return Err(format!(
                 "certificate for tick {:?} predates this chain's origin",
@@ -531,7 +551,7 @@ impl Section for FinalizationsSection {
 /// Refuse `tx_hash` if the chain has already reached a verdict on it —
 /// by an ancestor above committed height, or by a committed block within
 /// the retention window.
-fn already_resolved(ctx: &Admission<'_>, tx_hash: TxHash) -> Result<(), String> {
+fn already_resolved(ctx: &Committed<'_>, tx_hash: TxHash) -> Result<(), String> {
     if ctx.chain.resolved.contains(&tx_hash) {
         return Err(format!(
             "transaction {tx_hash} already resolved by a QC chain ancestor"
@@ -592,7 +612,7 @@ impl RecordsSection<'_> {
     ///
     /// Why the name is refused.
     pub(crate) fn name_stands(
-        ctx: &Admission<'_>,
+        ctx: &Committed<'_>,
         fold: &RecordsFold<'_>,
         tx_hash: TxHash,
     ) -> Result<(), String> {
@@ -614,14 +634,14 @@ impl RecordsSection<'_> {
     /// A stranger to the departed shard is absent from its settled set
     /// trivially, and abandoning it would charge a payer for a
     /// transaction a live counterpart can still settle. Judged from the
-    /// figures the record restates and the departures the schedule
-    /// attests at the block's anchor, so every replica answers alike —
+    /// figures the record restates and the departures the window at the
+    /// block's anchor attests, so every replica answers alike —
     /// including one holding no entry for the name, which rebuilds the
     /// entry from the record precisely because it cannot check the name
     /// against an account of its own.
-    fn parties_stand(ctx: &Admission<'_>, record: &AbandonmentRecord) -> Result<(), String> {
+    fn parties_stand(ctx: &Committed<'_>, record: &AbandonmentRecord) -> Result<(), String> {
         let departures: Vec<(ShardId, WeightedTimestamp)> =
-            ctx.schedule.departures_at(ctx.anchor).collect();
+            ctx.window.departures(ctx.windows).collect();
         for entry in record.unsettled() {
             if !entry.party(
                 ctx.local_shard,
@@ -654,22 +674,22 @@ impl RecordsSection<'_> {
         Ok(())
     }
 
-    /// Whether a record's departure is one the schedule attests at the
-    /// block's anchor: the cut it names is the departed shard's, and its
-    /// boundary record is still readable. A record anchored after the
-    /// beacon closed and swept the departure claims what nobody can
+    /// Whether a record's departure is one the window at the block's
+    /// anchor attests: the cut it names is the departed shard's, and its
+    /// boundary record is still readable there. A record anchored after
+    /// the beacon closed and swept the departure claims what nobody can
     /// check.
-    fn evidence_stands(ctx: &Admission<'_>, verdict: &AbandonmentRecord) -> Result<(), String> {
+    fn evidence_stands(ctx: &Committed<'_>, verdict: &AbandonmentRecord) -> Result<(), String> {
         let terminal_wt = verdict.terminal_wt();
         let shard = verdict.shard();
-        let scheduled = ctx.schedule.terminal_cut_for_shard(shard, ctx.anchor);
+        let scheduled = ctx.window.terminal_cut(shard, ctx.windows);
         if scheduled != Some(terminal_wt) {
             return Err(format!(
                 "abandonment record names a departure of {shard:?} at {terminal_wt:?} the \
                  schedule does not attest ({scheduled:?})"
             ));
         }
-        if !ctx.schedule.terminal_evidence_readable(shard, ctx.anchor) {
+        if !ctx.window.evidence_readable(shard, ctx.anchor, ctx.windows) {
             return Err(format!(
                 "abandonment record names a departure of {shard:?} whose evidence window has \
                  closed"
@@ -684,7 +704,7 @@ impl<'f> Section for RecordsSection<'f> {
     type Fold = RecordsFold<'f>;
 
     /// A well-formed record, in its place in the section's order, under
-    /// a departure the schedule attests, naming only what the departed
+    /// a departure the anchored window attests, naming only what the departed
     /// shard was party to and what stands, within the budget the records
     /// share.
     ///
@@ -704,7 +724,7 @@ impl<'f> Section for RecordsSection<'f> {
     /// how many transactions the drain can have owed at once, which
     /// binds again the moment a name gets cheaper.
     fn admit(
-        ctx: &Admission<'_>,
+        ctx: &Committed<'_>,
         fold: &mut Self::Fold,
         verdict: &AbandonmentRecord,
     ) -> Result<(), String> {
@@ -815,7 +835,7 @@ impl Section for StateClaimsSection {
     /// schedule at the anchor's own clock, never the head, so a split
     /// parent's coast anchor owns nothing; the fold reads the committed
     /// fact and never re-resolves.
-    fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, claim: &StateClaim) -> Result<(), String> {
+    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, claim: &StateClaim) -> Result<(), String> {
         let at = || {
             format!(
                 "state claim on {:?} at height {}",
@@ -921,7 +941,7 @@ impl Section for StateClaimsSection {
 /// An owed record's value is the credit this shard's fold lands, so it
 /// is carried only where its consumer routes. Anywhere else it licenses
 /// nothing and spends the budget.
-fn owed_elsewhere(ctx: &Admission<'_>, claim: &StateClaim) -> bool {
+fn owed_elsewhere(ctx: &Committed<'_>, claim: &StateClaim) -> bool {
     claim.cells.iter().any(|(key, stated)| {
         stated.held().is_some_and(|bytes| {
             matches!(
@@ -942,7 +962,7 @@ fn owed_elsewhere(ctx: &Admission<'_>, claim: &StateClaim) -> bool {
 ///
 /// The first refusal.
 pub(crate) fn admit_all<'i, S: Section>(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut S::Fold,
     items: impl IntoIterator<Item = &'i S::Item>,
 ) -> Result<(), String>
@@ -958,7 +978,7 @@ where
 /// one — the proposer's filter over its candidates. Returns what was
 /// kept and how many were refused.
 pub(crate) fn admit_each<S: Section, T>(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut S::Fold,
     items: Vec<T>,
     item: impl Fn(&T) -> &S::Item,
@@ -990,10 +1010,10 @@ pub(crate) mod fixtures {
     use hyperscale_types::{
         Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, NetworkDefinition,
         ShardAnchor, ShardId, StateRoot, TopologySchedule, TopologySnapshot, ValidatorSet,
-        WeightedTimestamp,
+        WeightedTimestamp, WindowLookup,
     };
 
-    use super::{Admission, QcChainSets};
+    use super::{Committed, QcChainSets};
     use crate::commit_dedup::CommitDedupIndex;
 
     /// What a test block is admitted against: one window, with nothing
@@ -1013,10 +1033,11 @@ pub(crate) mod fixtures {
     }
 
     impl Against {
-        /// Admission under `snapshot`, which is every window of the
-        /// schedule too.
+        /// Admission under `snapshot`, whose one window spans every
+        /// anchor a test sets.
         pub fn window(snapshot: TopologySnapshot) -> Self {
-            let schedule = TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()));
+            let schedule =
+                TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot.clone()));
             Self::schedule(snapshot, schedule)
         }
 
@@ -1041,9 +1062,18 @@ pub(crate) mod fixtures {
             }
         }
 
-        pub(crate) fn ctx(&self) -> Admission<'_> {
-            Admission {
+        /// # Panics
+        ///
+        /// If the fixture's anchor lies outside every window its schedule
+        /// holds, which no test means.
+        pub(crate) fn ctx(&self) -> Committed<'_> {
+            let WindowLookup::Window(window) = self.schedule.lookup(self.anchor) else {
+                panic!("a fixture anchors inside its own schedule");
+            };
+            Committed {
                 snapshot: &self.snapshot,
+                window,
+                windows: self.schedule.windows(),
                 schedule: &self.schedule,
                 local_shard: self.local_shard,
                 anchor: self.anchor,
@@ -1108,6 +1138,7 @@ pub(crate) mod fixtures {
                         witness_base: BeaconWitnessLeafCount::ZERO,
                         terminal_settled_txs: None,
                         handoff_complete,
+                        terminal_epoch: Some(Epoch::new(0)),
                     },
                 )
             })
@@ -1125,6 +1156,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod state_claim_tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use hyperscale_hbor::Bytes;
@@ -1132,7 +1164,7 @@ mod state_claim_tests {
         proven_claim, state_and_proof, state_and_proof_holding, test_key,
     };
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, Inclusion, MerkleInclusionProof,
+        Address, AddressClass, Anchor, BlockHeight, Epoch, Inclusion, MerkleInclusionProof,
         NetworkDefinition, RETENTION_HORIZON, ShardId, StateClaim, Stated, SubstateKey,
         TopologySnapshot, ValidatorSet, WeightedTimestamp,
     };
@@ -1148,7 +1180,14 @@ mod state_claim_tests {
     /// past it: past the cut every owner routes to the root, and the
     /// producer's anchors there own nothing.
     fn against(block_anchor: WeightedTimestamp) -> Against {
-        let schedule = departures(&[PRODUCER, ShardId::leaf(1, 1)], &[ShardId::ROOT], None);
+        let mut schedule = departures(&[PRODUCER, ShardId::leaf(1, 1)], &[ShardId::ROOT], None);
+        // The block is judged in the window its own anchor lies in, which
+        // the schedule has committed however far past the cut it is.
+        let head = Arc::clone(schedule.head());
+        let block_epoch = schedule.epoch_for(block_anchor);
+        if schedule.at(block_anchor).is_none() {
+            schedule.insert(block_epoch, head);
+        }
         let snapshot = (**schedule.head()).clone();
         let mut against = Against::schedule(snapshot, schedule);
         against.anchor = block_anchor;
@@ -1407,12 +1446,17 @@ mod state_claim_tests {
             Ok(()),
             "the successor's reading past the cut is admitted",
         );
-        let unscheduled = WeightedTimestamp::from_millis(1_000_000_000);
-        let mut past_the_schedule = against(unscheduled);
-        past_the_schedule.local_shard = ShardId::leaf(1, 1);
+        // A claim anchored in a window this replica has evicted carries a
+        // value no window here can place.
+        let mut evicted = against(block_anchor);
+        evicted.schedule.evict_below(Epoch::new(1));
+        evicted.local_shard = ShardId::leaf(1, 1);
         assert!(
-            admit(&past_the_schedule, &held(ShardId::ROOT, unscheduled, key))
-                .is_err_and(|err| err.contains("no schedule window covers")),
+            admit(
+                &evicted,
+                &held(ShardId::ROOT, WeightedTimestamp::from_millis(500), key)
+            )
+            .is_err_and(|err| err.contains("no schedule window covers")),
         );
     }
 }

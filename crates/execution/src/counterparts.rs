@@ -343,7 +343,7 @@ struct Probe {
 }
 
 /// What a commit folded, and what it could not answer for.
-pub struct Committed {
+pub struct CommitFolded {
     /// The fetches it releases and the probes it opens.
     pub(crate) actions: Vec<Action>,
     /// The transactions let go of because every counterpart has fallen
@@ -530,7 +530,7 @@ impl Counterparts {
         block: &Block,
         now: WeightedTimestamp,
         wanted: &[WantedRecord],
-    ) -> Committed {
+    ) -> CommitFolded {
         let windows = topology_schedule.windows();
         self.gc_settled_sets(topology_schedule, now);
         self.wanted = wanted.iter().map(|wanted| wanted.key).collect();
@@ -612,7 +612,7 @@ impl Counterparts {
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
         actions.extend(self.probe(trie, now, wanted, windows));
-        Committed {
+        CommitFolded {
             actions,
             unanswerable,
             settled,

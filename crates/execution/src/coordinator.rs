@@ -6451,6 +6451,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 terminal_settled_txs: None,
                 handoff_complete: None,
+                terminal_epoch: None,
             },
         );
         TopologySchedule::single(Arc::new(TopologySnapshot::from_explicit_committees(
@@ -7246,6 +7247,7 @@ mod tests {
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     terminal_settled_txs: None,
                     handoff_complete: None,
+                    terminal_epoch: None,
                 },
             )])),
         );
@@ -11367,6 +11369,7 @@ mod tests {
                         witness_base: BeaconWitnessLeafCount::ZERO,
                         terminal_settled_txs: None,
                         handoff_complete: *handoff_complete,
+                        terminal_epoch: None,
                     },
                 )
             })

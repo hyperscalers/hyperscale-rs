@@ -1020,6 +1020,7 @@ mod tests {
             witness_base: BeaconWitnessLeafCount::ZERO,
             terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         };
         // The terminal's own parent QC sits at the cut exactly — the
         // boundary instant counts as not yet crossed.

@@ -1860,6 +1860,7 @@ impl BeaconState {
                         witness_base: b.witness_base,
                         terminal_settled_txs: b.terminal_settled_txs,
                         handoff_complete: b.handoff_complete,
+                        terminal_epoch: b.terminal_epoch,
                     },
                 )
             })
