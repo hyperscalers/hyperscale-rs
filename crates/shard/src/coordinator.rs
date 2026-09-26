@@ -7506,14 +7506,15 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, DeclaredWork, Epoch, Hash,
-        Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof,
-        NetworkDefinition, NetworkParams, ProvisionEntry, RETENTION_HORIZON, RoutePrefix,
-        SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickLine, TimestampRange,
-        TopologySchedule, TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx,
-        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict, test_utils,
+        BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, DeclaredWork, DiscardCause,
+        Epoch, Hash, Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+        MerkleInclusionProof, NetworkDefinition, NetworkParams, ProvisionEntry, RETENTION_HORIZON,
+        RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor,
+        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickId, TickLine,
+        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim, TxOutcome,
+        UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet,
+        VoteCount, WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict,
+        test_utils,
     };
 
     use super::*;
@@ -8128,6 +8129,130 @@ mod tests {
             (
                 vec![member(&early), member(&late), member(&test_transaction(3))],
                 "a line no row stands for",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&schedule, &committee, &child(refused)),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
+    }
+
+    /// A chain whose block 1 committed three transactions, in hash order,
+    /// and whose block 2 named the first: the coordinator at its tip, the
+    /// schedule, the tip's hash and the three.
+    fn one_of_three_in_flight() -> (
+        ShardCoordinator,
+        TopologySchedule,
+        BlockHash,
+        [Transaction; 3],
+    ) {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"byzantine tip"));
+        let mut txs = [
+            test_transaction(1),
+            test_transaction(2),
+            test_transaction(3),
+        ];
+        txs.sort_by_key(Transaction::hash);
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 1_000),
+            &txs,
+            Vec::new(),
+        );
+        let naming = carrying(
+            block_chained_on(BlockHeight::new(2), committing.hash(), 1_500),
+            &[],
+            vec![member(&txs[0])],
+        );
+        let parent = naming.hash();
+        let (state, schedule) = committed_through(from, [committing, naming]);
+        (state, schedule, parent, txs)
+    }
+
+    /// A voter refuses every manifest but the chain's: over a chain whose
+    /// block 1 committed three transactions and whose block 2 named the
+    /// first, the next block may name only the other two, each to run, in
+    /// canonical order, and nothing else.
+    #[test]
+    fn a_voter_refuses_every_manifest_but_the_chains() {
+        let (mut state, schedule, parent, [held, first, second]) = one_of_three_in_flight();
+        let committee = Arc::clone(schedule.head());
+        let child = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(3), parent, 2_000),
+                &[],
+                lines,
+            )
+        };
+        let joining = |tx: &Transaction, joins| TickLine::Member {
+            tx: tx.hash(),
+            joins,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+        };
+        let holding_tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+
+        assert!(
+            state
+                .check_tick_manifest(
+                    &schedule,
+                    &committee,
+                    &child(vec![member(&first), member(&second)])
+                )
+                .is_ok(),
+            "the chain's own manifest is admitted",
+        );
+        for (refused, why) in [
+            (
+                vec![joining(&first, Joins::Aborted), member(&second)],
+                "an abort before the deadline",
+            ),
+            (
+                vec![
+                    member(&first),
+                    member(&second),
+                    joining(&held, Joins::Aborted),
+                ],
+                "an abort of a member in flight no departure covers",
+            ),
+            (
+                vec![joining(&first, Joins::ExecutesAborted), member(&second)],
+                "a member run aborted before its engagement deadline",
+            ),
+            (
+                vec![member(&held), member(&first), member(&second)],
+                "a member already in flight named again",
+            ),
+            (
+                vec![member(&second), member(&first)],
+                "lines out of canonical order",
+            ),
+            (vec![member(&first)], "an incomplete manifest"),
+            (
+                vec![
+                    member(&first),
+                    member(&second),
+                    TickLine::Discard {
+                        tick: holding_tick,
+                        cause: DiscardCause::Abandoned(held.hash()),
+                    },
+                ],
+                "a discard of a tick whose determined half is owed",
+            ),
+            (
+                vec![
+                    member(&first),
+                    member(&second),
+                    TickLine::Discard {
+                        tick: holding_tick,
+                        cause: DiscardCause::Recovery,
+                    },
+                ],
+                "a recovery discard no recovery licenses",
             ),
         ] {
             assert!(
