@@ -518,7 +518,6 @@ fn a_tick_lines_weight_bounds_its_encoding() {
     for cause in [
         DiscardCause::Abandoned(widest_tx),
         DiscardCause::Unanswerable(widest_tx),
-        DiscardCause::Rejected,
         DiscardCause::Recovery,
     ] {
         let line = TickLine::Discard { tick: deep, cause };

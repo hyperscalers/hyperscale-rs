@@ -81,9 +81,6 @@ pub enum DiscardCause {
     /// Every counterpart the transaction reaches has departed, and no
     /// settled set that could speak for it is still read.
     Unanswerable(TxHash),
-    /// A departed partner's settled set does not hold the tick's legs
-    /// half.
-    Rejected,
     /// The tick sits at or below a halt recovery's attested frontier,
     /// and the block is the first the fresh committee certified.
     Recovery,

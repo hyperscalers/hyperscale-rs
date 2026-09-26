@@ -375,7 +375,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         };
         let abandoned = match cause {
             DiscardCause::Abandoned(tx) | DiscardCause::Unanswerable(tx) => Some(tx),
-            DiscardCause::Rejected | DiscardCause::Recovery => None,
+            DiscardCause::Recovery => None,
         };
         let dropped = match cause {
             DiscardCause::Unanswerable(tx) => Some(tx),
@@ -1087,7 +1087,7 @@ mod tests {
                 5,
                 vec![TickLine::Discard {
                     tick: TickId::new(LOCAL, BlockHeight::new(2)),
-                    cause: DiscardCause::Rejected,
+                    cause: DiscardCause::Unanswerable(tx(3)),
                 }],
             ),
             settling(6, 2, TickHalf::Legs, &[2]),
