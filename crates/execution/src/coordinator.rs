@@ -13256,7 +13256,7 @@ mod tests {
     /// An abandonment composed and then lost is composed again, byte for
     /// byte, and never twice at once: while the tick holding it stands
     /// nothing is composed for the member, and once the tick is
-    /// released — as `release_wedged_ticks` and the settled-set gate's
+    /// released — as a recovery discard and the settled-set gate's
     /// `Reject` release it — the next commit composes the same
     /// abandonment with the same receipt.
     #[test]
