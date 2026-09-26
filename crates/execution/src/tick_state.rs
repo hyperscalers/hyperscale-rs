@@ -951,47 +951,6 @@ impl TickState {
             .any(|tx_hash| self.seats.get(tx_hash).is_some_and(|seat| !seat.settled))
     }
 
-    /// Whether the chain owes this tick a determined half it can no
-    /// longer deliver.
-    ///
-    /// A determined half the chain still owes is one every later half
-    /// must settle behind, so a tick that never reaches its own
-    /// certificate holds the settlement frontier against its whole
-    /// shard — blocks still commit and nothing behind it ever finalizes.
-    /// [`determined_ready`](Self::determined_ready) reasons only about
-    /// coverage, where a leg waiting on a counterpart cannot hold
-    /// determined members; it does not cover
-    /// [`attestable`](Self::attestable), and a certificate that never
-    /// forms holds them just as hard.
-    ///
-    /// One way a half becomes undeliverable: `committee_replaced`, when
-    /// no fresh quorum can ever hold this tick. A halt
-    /// recovery replaced the committee its anchor names and the tick
-    /// sits at or below the recovery's attested frontier, so the
-    /// replaced members no longer serve the shard and the fresh members
-    /// snap-synced past its block without executing it — waiting changes
-    /// nothing, and a fresh member that did execute it while catching up
-    /// would otherwise hold the frontier against its own committee's
-    /// work. A tick above the frontier is not this: the fresh committee
-    /// re-executes it from the harvested tail and attests it like any
-    /// live tick. The caller answers it from the committing block: true
-    /// only on a block the fresh committee certified, which no replica
-    /// commits before folding the record.
-    ///
-    /// Both read as committed content — seats settle on committed
-    /// finalizations, and the committing block's certifier is what its
-    /// commit resolved — so every replica releases the same ticks at the
-    /// same frontier.
-    /// Whether *this* validator happened to hand its own half off
-    /// ([`determined_pending`](Self::determined_pending)) is local state
-    /// and deliberately not asked: releasing lets go of the chain holds
-    /// later ticks read, and replicas letting go at different frontiers
-    /// would read different overlays from the same chain.
-    #[must_use]
-    pub fn owes_undeliverable_determined(&self, committee_replaced: bool) -> bool {
-        self.determined_unsettled() && committee_replaced
-    }
-
     /// The anchor whose committee would have to attest this tick.
     #[must_use]
     pub const fn anchor(&self) -> WeightedTimestamp {

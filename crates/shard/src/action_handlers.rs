@@ -326,6 +326,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
             &|tx| manifest.facts.get(&tx),
             &inputs,
             &|shard| inputs.evidence(shard),
+            manifest.recovery,
         );
         Arc::new(Capped::new(lines).expect("the budget stops at the line cap"))
     };

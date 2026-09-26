@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
-    Address, CollectionId, Deadline, DeclaredKey, DiscardCause, Evidence, Joins,
+    Address, BlockHeight, CollectionId, Deadline, DeclaredKey, DiscardCause, Evidence, Joins,
     MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Reach, Role, Settlement,
     ShardId, ShardTrie, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
     WeightedTimestamp, compatible, tick_manifest_admits_block,
@@ -416,6 +416,9 @@ pub struct ManifestInputs {
     pub facts: BTreeMap<TxHash, MemberFacts>,
     /// What committed content up to the parent says of them.
     pub committed: CommittedSets,
+    /// The frontier of a halt recovery whose ticks the block discards,
+    /// where its parent is the fresh committee's.
+    pub recovery: Option<BlockHeight>,
 }
 
 /// Where a candidate stands, as its row says, with what judging it
@@ -484,11 +487,22 @@ pub fn member_lines<'f>(
     facts: &dyn Fn(TxHash) -> Option<&'f MemberFacts>,
     inputs: &dyn CommittedInputs,
     evidence: &dyn Fn(ShardId) -> Evidence,
+    recovery: Option<BlockHeight>,
 ) -> (Vec<TickLine>, Vec<TxHash>) {
     let mut holds = ProvisionalCells::default();
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
     let mut unanswerable = Vec::new();
+    // Every tick at or below a halt recovery's frontier is discarded
+    // whole by the first block the fresh committee's certificate
+    // follows: no fresh quorum can hold it, and no other line names its
+    // members in that block.
+    let recovered: Vec<BlockHeight> = recovery.map_or_else(Vec::new, |frontier| {
+        rows.ticks
+            .range(..=frontier)
+            .map(|(height, _)| *height)
+            .collect()
+    });
     for row in rows.members.values() {
         let passed = row.deadline.passed(anchor);
         let standing = match row.state {
@@ -498,6 +512,9 @@ pub fn member_lines<'f>(
                 settlement,
             } => {
                 holds.claim(&row.holds);
+                if recovered.contains(&tick) {
+                    continue;
+                }
                 // A tick still owing its determined half is let go of by
                 // nothing but a recovery: a determined contribution that
                 // ran is readable, and a discard dropping it would lose
@@ -564,7 +581,11 @@ pub fn member_lines<'f>(
     }
     let mut budget = ManifestBudget::default();
     let mut lines = select_members(anchor, candidates, inputs, &mut holds, &mut budget);
-    for discard in unanswerable {
+    let recoveries = recovered.into_iter().map(|height| TickLine::Discard {
+        tick: TickId::new(rows.shard(), height),
+        cause: DiscardCause::Recovery,
+    });
+    for discard in unanswerable.into_iter().chain(recoveries) {
         if !budget.take(&discard) {
             break;
         }
@@ -1203,8 +1224,9 @@ mod tests {
             rows.members.insert(held.tx, held);
         }
         let live = |_| Evidence::Live { terminating: false };
-        let lines =
-            |at: WeightedTimestamp| member_lines(&rows, at, &|_| None, &Held::default(), &live);
+        let lines = |at: WeightedTimestamp| {
+            member_lines(&rows, at, &|_| None, &Held::default(), &live, None)
+        };
         let (before, missing) = lines(deadline.at().minus(Duration::from_millis(1)));
         assert!(before.is_empty() && missing.is_empty());
         let (after, missing) = lines(deadline.at());
@@ -1254,9 +1276,14 @@ mod tests {
             },
         );
         let lines = |evidence: Evidence| {
-            member_lines(&rows, deadline.at(), &|_| None, &Held::default(), &|_| {
-                evidence
-            })
+            member_lines(
+                &rows,
+                deadline.at(),
+                &|_| None,
+                &Held::default(),
+                &|_| evidence,
+                None,
+            )
         };
         assert_eq!(
             lines(Evidence::Unreadable),
@@ -1324,13 +1351,39 @@ mod tests {
         );
         for evidence in [Evidence::Readable, Evidence::Unreadable] {
             assert_eq!(
-                member_lines(&rows, deadline.at(), &|_| None, &Held::default(), &|_| {
-                    evidence
-                }),
+                member_lines(
+                    &rows,
+                    deadline.at(),
+                    &|_| None,
+                    &Held::default(),
+                    &|_| evidence,
+                    None,
+                ),
                 (vec![], vec![]),
                 "{evidence:?}",
             );
         }
+        // A halt recovery discards it whole, owed half and all, once its
+        // frontier reaches the tick, and names nothing else of its rows.
+        let recovered = |frontier: u64| {
+            member_lines(
+                &rows,
+                deadline.at(),
+                &|_| None,
+                &Held::default(),
+                &|_| Evidence::Unreadable,
+                Some(BlockHeight::new(frontier)),
+            )
+            .0
+        };
+        assert_eq!(
+            recovered(2),
+            vec![TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                cause: DiscardCause::Recovery,
+            }],
+        );
+        assert!(recovered(1).is_empty(), "a tick above the frontier stands");
     }
 
     /// Past its deadline, a held member is aborted beside its tick's

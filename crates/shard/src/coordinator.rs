@@ -2135,11 +2135,20 @@ impl ShardCoordinator {
             committee,
             topology_schedule,
         );
+        let Some(parent_anchor) = self.block_anchor(block.header().parent_block_hash()) else {
+            return Err(Withheld::deferred("the parent's anchor is not held".into()));
+        };
+        let recovery =
+            topology_schedule.recovery_frontier(committee, self.local_shard, parent_anchor, anchor);
         let facts = &self.member_facts;
-        let (expected, missing) =
-            member_lines(&rows, anchor, &|tx| facts.get(tx), &sets, &|shard| {
-                sets.evidence(shard)
-            });
+        let (expected, missing) = member_lines(
+            &rows,
+            anchor,
+            &|tx| facts.get(tx),
+            &sets,
+            &|shard| sets.evidence(shard),
+            recovery,
+        );
         if let Some(tx) = missing.first() {
             return Err(Withheld::deferred(format!(
                 "no facts held for pending member {tx:?}"
@@ -2204,9 +2213,16 @@ impl ShardCoordinator {
             .filter(|row| row.state == RowState::Pending)
             .filter_map(|row| Some((row.tx, self.member_facts.get(row.tx)?.clone())))
             .collect();
+        let recovery = topology_schedule.recovery_frontier(
+            committee,
+            self.local_shard,
+            self.block_anchor(parent)?,
+            anchor,
+        );
         Some(ManifestInputs {
             facts,
             committed: held,
+            recovery,
         })
     }
 

@@ -655,6 +655,37 @@ impl TopologySchedule {
         })
     }
 
+    /// The attested frontier of the halt recovery `snapshot` records for
+    /// `shard`, where the block anchored at `anchor_wt` and certified under
+    /// a QC stamped `qc_wt` is the fresh committee's.
+    ///
+    /// The band [`committee_replaced_for_certified`](Self::committee_replaced_for_certified)
+    /// reads, off a snapshot the caller names rather than the head, so a
+    /// block-validity input reads one record on every replica: the
+    /// snapshot governing the block's own anchor.
+    #[must_use]
+    pub fn recovery_frontier(
+        &self,
+        snapshot: &TopologySnapshot,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> Option<BlockHeight> {
+        let (rotated_at, frontier) = snapshot
+            .pending_recoveries()
+            .get(&shard)
+            .map(|recovery| (recovery.rotated_at, recovery.attested_frontier))
+            .or_else(|| {
+                snapshot
+                    .completed_recoveries()
+                    .get(&shard)
+                    .map(|completed| (completed.rotated_at, completed.attested_frontier))
+            })?;
+        let bridge = rotated_at.next();
+        let replaced = self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge;
+        (!replaced).then_some(frontier)
+    }
+
     /// Whether a cross-shard artifact from `shard` at `height` is fenced by
     /// an in-flight halt recovery: past the beacon-attested frontier the
     /// recovery froze, the retained (beyond-f) committee could only have

@@ -166,7 +166,10 @@ fn record_unanswerable(covered_by_record: bool) {
 #[derive(Clone, Copy)]
 enum Named<'a> {
     Lines(&'a [TickLine]),
-    Composed(&'a [Unanswerable]),
+    Composed {
+        unanswerable: &'a [Unanswerable],
+        recovered: &'a [TickId],
+    },
 }
 
 /// Where a commit's tick takes its members from.
@@ -1162,6 +1165,7 @@ impl ExecutionCoordinator {
         anchored: &TopologySnapshot,
         tick_id: TickId,
         unanswerable: &[Unanswerable],
+        recovered: &[TickId],
     ) -> Vec<TickLine> {
         let mut lines = self.candidates.named(
             anchored.shard_trie(),
@@ -1214,6 +1218,10 @@ impl ExecutionCoordinator {
                     .filter(settled_first)?,
                 cause: DiscardCause::Unanswerable(entry.tx_hash),
             })
+        }));
+        lines.extend(recovered.iter().map(|&tick| TickLine::Discard {
+            tick,
+            cause: DiscardCause::Recovery,
         }));
         lines
     }
@@ -1552,19 +1560,26 @@ impl ExecutionCoordinator {
         let composed;
         let lines = match named {
             Named::Lines(lines) => lines,
-            Named::Composed(unanswerable) => {
-                composed = self.composed_lines(anchored, tick_id, unanswerable);
+            Named::Composed {
+                unanswerable,
+                recovered,
+            } => {
+                composed = self.composed_lines(anchored, tick_id, unanswerable, recovered);
                 &composed[..]
             }
         };
         seated.extend(lines.iter().cloned());
         for line in lines {
-            if let TickLine::Discard {
-                tick,
-                cause: DiscardCause::Unanswerable(tx_hash),
-            } = line
-            {
-                self.drop_unanswerable(*tick, *tx_hash);
+            match line {
+                TickLine::Discard {
+                    tick,
+                    cause: DiscardCause::Unanswerable(tx_hash),
+                } => self.drop_unanswerable(*tick, *tx_hash),
+                TickLine::Discard {
+                    tick,
+                    cause: DiscardCause::Recovery,
+                } => self.discard_recovered(*tick),
+                _ => {}
             }
         }
         let (admitted, in_hand) =
@@ -3147,6 +3162,11 @@ impl ExecutionCoordinator {
             }));
         }
         let unanswerable = committed.unanswerable;
+        let recovered = if naming == Naming::Composed {
+            self.recovered_ticks(topology_schedule, certified)
+        } else {
+            Vec::new()
+        };
         for entry in &unanswerable {
             record_unanswerable(entry.covered_by_record);
         }
@@ -3155,7 +3175,6 @@ impl ExecutionCoordinator {
         // carry txs.
         actions.extend(self.check_exec_cert_timeouts());
         actions.extend(self.check_vote_retry_timeouts(topology_schedule));
-        self.release_wedged_ticks(topology_schedule, certified);
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         // Re-check gate-held finalizations against the advanced schedule:
@@ -3229,7 +3248,10 @@ impl ExecutionCoordinator {
             block,
             match naming {
                 Naming::Manifest => Named::Lines(block.tick_manifest()),
-                Naming::Composed => Named::Composed(&unanswerable),
+                Naming::Composed => Named::Composed {
+                    unanswerable: &unanswerable,
+                    recovered: &recovered,
+                },
             },
         ));
 
@@ -3510,86 +3532,70 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// Release every tick still owing a determined half it can no longer
-    /// deliver.
+    /// The ticks a halt recovery discards at this commit, as a fixture
+    /// names them in place of a proposer: every tick at or below the
+    /// recovery's attested frontier, on the first commit the fresh
+    /// committee certified.
     ///
-    /// Admission refuses a determined half that settles past a tick whose
-    /// own half the chain still owes, so a tick that never reaches its
-    /// certificate stops the shard settling anything at all: later halves
-    /// are built and offered and refused for good, and the members they
-    /// name stay committed and never finalized until their deadlines
-    /// abandon them. [`admit_abandoned`](Self::admit_abandoned) already
-    /// discards a tick holding an abandoned member, but a tick whose
-    /// members are not yet abandonable is not reached that way, and
-    /// nothing else releases it.
-    ///
-    /// Discarding is what a halt recovery has already established: no
-    /// fresh quorum can hold the tick, so the members go to the deadline
-    /// path, which is where a transaction nothing can settle belongs. On
-    /// an unchanged committee a determined half fails to certify only
-    /// through divergence, which fail-stops, so nothing else releases
-    /// one. The order rule is untouched — a discarded tick produces no
-    /// half to invert against.
-    ///
-    /// Releasing lets go of holds the composition below reads, so it has
-    /// to fire on the same commit everywhere. The replacement reads the
-    /// recovery record, which
-    /// replicas fold at their own pace against their shard commits — a
-    /// fresh member replays the harvested tail with it folded, the
-    /// retained members committed those blocks live without it — so it
-    /// is gated on the committing block being one the fresh committee
-    /// certified: that is committed content, and no replica commits such
-    /// a block before folding the record that resolves its committee.
-    /// Every replica then releases at the first fresh block, and none on
-    /// the tail. Released is only what no fresh quorum can hold — a tick
-    /// at or below the recovery's attested frontier. A tail tick above
-    /// it is the fresh committee's to attest and waits on its
-    /// certificate like any live tick.
-    fn release_wedged_ticks(
-        &mut self,
+    /// No fresh quorum can hold such a tick: the replaced members no
+    /// longer serve the shard, and the fresh members snap-synced past its
+    /// block without executing it. A tail tick above the frontier is the
+    /// fresh committee's to attest and waits on its certificate like any
+    /// live tick.
+    fn recovered_ticks(
+        &self,
         topology_schedule: &TopologySchedule,
         certified: &CertifiedBlock,
-    ) {
+    ) -> Vec<TickId> {
         let local_shard = self.local_shard;
-        let fresh_certified = !topology_schedule.committee_replaced_for_certified(
+        if topology_schedule.committee_replaced_for_certified(
             local_shard,
             self.committed_committee_anchor_wt,
             certified.qc().weighted_timestamp(),
-        );
-        let wedged: Vec<TickId> = self
-            .ticks
+        ) {
+            return Vec::new();
+        }
+        self.ticks
             .ticks_iter()
             .filter(|(tick_id, tick)| {
-                let replaced = fresh_certified
-                    && topology_schedule.committee_replaced_for_anchored(
-                        local_shard,
-                        tick.anchor(),
-                        tick_id.block_height(),
-                    );
-                tick.owes_undeliverable_determined(replaced)
+                topology_schedule.committee_replaced_for_anchored(
+                    local_shard,
+                    tick.anchor(),
+                    tick_id.block_height(),
+                )
             })
             .map(|(tick_id, _)| *tick_id)
-            .collect();
-        for tick_id in wedged {
-            // What the tally saw is the whole diagnosis: split roots are
-            // replicas that executed the tick differently, and power under
-            // quorum on one root is votes that never arrived. Reported
-            // here because this is the only place that knows a tick has
-            // run out of time to certify.
-            let tally = self.ticks.get_tracker(&tick_id);
-            tracing::warn!(
-                tick = %tick_id,
-                tallied_here = tally.is_some(),
-                distinct_receipt_roots =
-                    tally.map_or(0, VoteTracker::distinct_global_receipt_root_count),
-                verified_power = tally
-                    .map_or(0, |tracker| tracker.total_verified_power().inner()),
-                "Releasing a tick that never certified — it was holding the settlement frontier"
-            );
-            // The determined seats a wedged tick owes share no verdict
-            // and go on the rule alone; no member is singled out.
-            self.release_tick(tick_id, None);
-        }
+            .collect()
+    }
+
+    /// Discard a tick a committed `Recovery` line names, whole: every
+    /// member goes to the deadline path, a `Shared` one included, since
+    /// no fresh quorum can hold the certificate a counterpart would
+    /// settle it against.
+    fn discard_recovered(&mut self, tick_id: TickId) {
+        // What the tally saw is the whole diagnosis: split roots are
+        // replicas that executed the tick differently, and power under
+        // quorum on one root is votes that never arrived.
+        let tally = self.ticks.get_tracker(&tick_id);
+        tracing::warn!(
+            tick = %tick_id,
+            tallied_here = tally.is_some(),
+            distinct_receipt_roots =
+                tally.map_or(0, VoteTracker::distinct_global_receipt_root_count),
+            verified_power = tally.map_or(0, |tracker| tracker.total_verified_power().inner()),
+            "Discarding a tick a halt recovery left no quorum to certify"
+        );
+        let released: Vec<TxHash> = self
+            .ticks
+            .get_tick(&tick_id)
+            .map_or_else(Vec::new, |tick| tick.tx_hashes().to_vec());
+        self.ticks.discard_tick(&tick_id);
+        self.release_chain_holds(tick_id, &released, true);
+        self.finalized.remove_tick(&tick_id);
+        self.exec_certs.evict(&tick_id);
+        let height = tick_id.block_height();
+        self.pending_ticks
+            .retain(|queued| !matches!(queued, Queued::Run(pending) if pending.tick == height));
     }
 
     /// Release a tick that can no longer speak for `abandoned`, or for
@@ -7156,16 +7162,16 @@ mod tests {
         );
     }
 
-    /// The replacement release fires on the commit of a block the fresh
-    /// committee certified and on no other: a fresh member replaying the
-    /// harvested tail commits the replaced committee's blocks with the
-    /// record already folded, and must let go of nothing the retained
-    /// members, who committed those blocks live, did not. And it
-    /// releases only what no fresh quorum can hold — a tick at or below
-    /// the attested frontier — while a tail tick above it, the fresh
-    /// committee's to attest, waits on its certificate.
+    /// A recovery discards on the commit of a block the fresh committee
+    /// certified and on no other: a fresh member replaying the harvested
+    /// tail commits the replaced committee's blocks with the record
+    /// already folded, and must let go of nothing the retained members,
+    /// who committed those blocks live, did not. And it discards only
+    /// what no fresh quorum can hold — a tick at or below the attested
+    /// frontier — while a tail tick above it, the fresh committee's to
+    /// attest, waits on its certificate.
     #[test]
-    fn a_replaced_tick_is_released_on_the_first_fresh_certified_commit() {
+    fn a_replaced_tick_is_discarded_on_the_first_fresh_certified_commit() {
         let mut state = make_test_state();
         let schedule = make_test_topology_bridged_at_20(BlockHeight::new(1));
         let hold = |height: u64, anchor_ms: u64| {
@@ -7200,20 +7206,41 @@ mod tests {
         // the span, so nothing is released.
         state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(2_500);
         state.committed_ts = WeightedTimestamp::from_millis(2_900);
-        state.release_wedged_ticks(&schedule, &test_certify(block.clone(), 2_900));
         assert!(
-            state.ticks.get_tick(&frontier_id).is_some(),
-            "a commit the replaced committee certified releases nothing"
+            state
+                .recovered_ticks(&schedule, &test_certify(block.clone(), 2_900))
+                .is_empty(),
+            "a commit the replaced committee certified discards nothing"
         );
 
         // A bridge block: anchored below the bridge, certified one skew
         // window under it, which is the fresh committee's.
         state.committed_ts = WeightedTimestamp::from_millis(20_900);
-        state.release_wedged_ticks(&schedule, &test_certify(block, 20_900));
-        assert!(
-            state.ticks.get_tick(&frontier_id).is_none(),
-            "the first fresh-certified commit releases the frontier tick"
+        assert_eq!(
+            state.recovered_ticks(&schedule, &test_certify(block, 20_900)),
+            vec![frontier_id],
+            "the first fresh-certified commit discards the frontier tick"
         );
+        state.discard_recovered(frontier_id);
+        assert!(state.ticks.get_tick(&frontier_id).is_none());
+
+        // The line's licence reads the same band off the snapshot a
+        // voter classifies the block under.
+        let anchored = schedule.head();
+        let frontier = |qc_ms: u64| {
+            schedule.recovery_frontier(
+                anchored,
+                ShardId::ROOT,
+                WeightedTimestamp::from_millis(2_500),
+                WeightedTimestamp::from_millis(qc_ms),
+            )
+        };
+        assert_eq!(
+            frontier(2_900),
+            None,
+            "the replaced committee's block licenses nothing"
+        );
+        assert_eq!(frontier(20_900), Some(BlockHeight::new(1)));
         assert!(
             state.ticks.get_tick(&tail_id).is_some(),
             "a tail tick above the frontier waits on the fresh committee's certificate"
