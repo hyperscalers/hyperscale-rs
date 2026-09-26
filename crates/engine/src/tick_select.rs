@@ -498,6 +498,17 @@ pub fn member_lines<'f>(
                 settlement,
             } => {
                 holds.claim(&row.holds);
+                // A tick still owing its determined half is let go of by
+                // nothing but a recovery: a determined contribution that
+                // ran is readable, and a discard dropping it would lose
+                // it.
+                if rows
+                    .ticks
+                    .get(&tick)
+                    .is_some_and(|held| held.determined_unsettled)
+                {
+                    continue;
+                }
                 let tick = TickId::new(rows.shard(), tick);
                 if joins != Joins::Aborted && settlement != Settlement::Alone {
                     match answerable(&row.reach, evidence) {
@@ -780,7 +791,7 @@ pub fn select_members<'a>(
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_storage::MemberRow;
+    use hyperscale_storage::{MemberRow, TickRow};
     use hyperscale_types::{
         AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES,
     };
@@ -1277,6 +1288,49 @@ mod tests {
             "a covered member a shard can still answer for is aborted at its deadline: \
              {answered:?}",
         );
+    }
+
+    /// A tick still owing its determined half is let go of by nothing
+    /// but a recovery: a covered held row past its deadline, and one no
+    /// counterpart can answer for, both wait for that half to settle.
+    #[test]
+    fn a_tick_owing_its_determined_half_is_not_discarded() {
+        let deadline = Deadline::of(ms(10_000));
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        rows.members.insert(
+            tx(1),
+            MemberRow {
+                tx: tx(1),
+                deadline,
+                committed: ms(0),
+                height: BlockHeight::new(1),
+                state: RowState::InFlight {
+                    tick: BlockHeight::new(2),
+                    joins: Joins::Executes,
+                    settlement: Settlement::Shared,
+                },
+                holds: Capped::empty(),
+                reach: Capped::from_array([PEER]),
+                covered: true,
+            },
+        );
+        rows.ticks.insert(
+            BlockHeight::new(2),
+            TickRow {
+                members: Capped::from_array([tx(1)]),
+                determined_unsettled: true,
+                legs_unsettled: true,
+            },
+        );
+        for evidence in [Evidence::Readable, Evidence::Unreadable] {
+            assert_eq!(
+                member_lines(&rows, deadline.at(), &|_| None, &Held::default(), &|_| {
+                    evidence
+                }),
+                (vec![], vec![]),
+                "{evidence:?}",
+            );
+        }
     }
 
     /// Past its deadline, a held member is aborted beside its tick's

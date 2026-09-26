@@ -1149,9 +1149,20 @@ impl ExecutionCoordinator {
             &mut self.provisional_cells(),
             self.committed_ts,
         );
+        // A tick still owing its determined half is let go of by nothing
+        // but a recovery.
+        let settled_first = |held_by: &TickId| {
+            self.ticks
+                .get_tick(held_by)
+                .is_none_or(|tick| !tick.determined_unsettled())
+        };
         let mut discards = Vec::new();
         for entry in self.abandonable(tick_id) {
-            let Some(held_by) = self.ticks.tick_assignment(entry.tx_hash) else {
+            let Some(held_by) = self
+                .ticks
+                .tick_assignment(entry.tx_hash)
+                .filter(settled_first)
+            else {
                 continue;
             };
             let reach: Vec<ShardId> = self
@@ -1179,7 +1190,10 @@ impl ExecutionCoordinator {
         lines.extend(discards);
         lines.extend(unanswerable.iter().filter_map(|entry| {
             Some(TickLine::Discard {
-                tick: self.ticks.tick_assignment(entry.tx_hash)?,
+                tick: self
+                    .ticks
+                    .tick_assignment(entry.tx_hash)
+                    .filter(settled_first)?,
                 cause: DiscardCause::Unanswerable(entry.tx_hash),
             })
         }));
@@ -3483,15 +3497,17 @@ impl ExecutionCoordinator {
     /// members are not yet abandonable is not reached that way, and
     /// nothing else releases it.
     ///
-    /// Discarding is what the tick's own state has already established:
-    /// past [`TICK_SETTLEABLE_SPAN`] it can settle nothing, so the
-    /// members go to the deadline path, which is where a transaction
-    /// nothing can settle belongs. The order rule is untouched — a
-    /// discarded tick produces no half to invert against.
+    /// Discarding is what a halt recovery has already established: no
+    /// fresh quorum can hold the tick, so the members go to the deadline
+    /// path, which is where a transaction nothing can settle belongs. On
+    /// an unchanged committee a determined half fails to certify only
+    /// through divergence, which fail-stops, so nothing else releases
+    /// one. The order rule is untouched — a discarded tick produces no
+    /// half to invert against.
     ///
     /// Releasing lets go of holds the composition below reads, so it has
-    /// to fire on the same commit everywhere. The span reads committed
-    /// stamps alone. The replacement reads the recovery record, which
+    /// to fire on the same commit everywhere. The replacement reads the
+    /// recovery record, which
     /// replicas fold at their own pace against their shard commits — a
     /// fresh member replays the harvested tail with it folded, the
     /// retained members committed those blocks live without it — so it
@@ -3502,15 +3518,12 @@ impl ExecutionCoordinator {
     /// the tail. Released is only what no fresh quorum can hold — a tick
     /// at or below the recovery's attested frontier. A tail tick above
     /// it is the fresh committee's to attest and waits on its
-    /// certificate like any live tick, with the span as its backstop.
-    ///
-    /// [`TICK_SETTLEABLE_SPAN`]: crate::tick_state::TICK_SETTLEABLE_SPAN
+    /// certificate like any live tick.
     fn release_wedged_ticks(
         &mut self,
         topology_schedule: &TopologySchedule,
         certified: &CertifiedBlock,
     ) {
-        let committed_ts = self.committed_ts;
         let local_shard = self.local_shard;
         let fresh_certified = !topology_schedule.committee_replaced_for_certified(
             local_shard,
@@ -3527,7 +3540,7 @@ impl ExecutionCoordinator {
                         tick.anchor(),
                         tick_id.block_height(),
                     );
-                tick.owes_undeliverable_determined(committed_ts, replaced)
+                tick.owes_undeliverable_determined(replaced)
             })
             .map(|(tick_id, _)| *tick_id)
             .collect();
@@ -4593,7 +4606,6 @@ mod tests {
 
     use super::*;
     use crate::counterparts::TestRows;
-    use crate::tick_state::TICK_SETTLEABLE_SPAN;
 
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
@@ -12904,27 +12916,6 @@ mod tests {
             &[x],
             "X is abandoned, T is not: a counterpart can still settle it",
         );
-
-        assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
-    }
-
-    /// A tick released for owing a determined half past
-    /// [`TICK_SETTLEABLE_SPAN`] keeps the member whose verdict a
-    /// counterpart shares.
-    ///
-    /// `X`'s determined half is what the span releases; `T` awaits
-    /// [`PEER`], whose settlement against the certificate the release
-    /// must leave standing.
-    #[test]
-    fn a_wedged_ticks_release_keeps_the_member_a_counterpart_can_settle() {
-        let (mut state, tick_id, t, _) = state_holding_a_shared_verdict(3);
-        let sched = two_shard_topology();
-        let past_the_span = 1_000 + TICK_SETTLEABLE_SPAN.as_secs() * 1_000 + 1_000;
-        state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(1_000);
-        state.committed_ts = WeightedTimestamp::from_millis(past_the_span);
-        let block = make_live_block(BlockHeight::new(4), 0, ValidatorId::new(0), vec![]);
-
-        state.release_wedged_ticks(&sched, &test_certify(block, past_the_span));
 
         assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
     }

@@ -41,9 +41,9 @@ use hyperscale_engine::legs::Member;
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, Joins, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY,
-    MAX_VALIDITY_RANGE, Role, Settles, ShardId, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome,
-    Verified, WeightedTimestamp, compute_global_receipt_root, refused_transactions, settles,
+    GlobalReceiptRoot, Joins, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY, Role,
+    Settles, ShardId, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, Verified,
+    WeightedTimestamp, compute_global_receipt_root, refused_transactions, settles,
 };
 
 /// A tick whose local execution disagreed with the quorum's.
@@ -192,18 +192,6 @@ impl Membership {
 /// guarantee has failed, so the dump is invariant-violation diagnostics
 /// rather than routine load noise.
 pub const TICK_OVERDUE_WARN: Duration = Duration::from_secs(MAX_FINALIZATION_DELAY.as_secs() * 2);
-
-/// How long past its own anchor a tick can still hold a member something
-/// could settle.
-///
-/// Two validity ranges wide, with the finalization delay on top: a
-/// member's validity end is at most one [`MAX_VALIDITY_RANGE`] past the
-/// anchor — the transaction had to be admissible in the block that
-/// committed it — and a core member closes at `MAX_FINALIZATION_DELAY`
-/// past that end, well inside a second range. The delay is carried on top
-/// so the span clears the close rather than landing on it.
-pub const TICK_SETTLEABLE_SPAN: Duration =
-    Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2 + MAX_FINALIZATION_DELAY.as_secs());
 
 /// One member's seat in its tick: the terms it joined on, and everything
 /// the tick has learned about it since — from the engine, from the
@@ -976,8 +964,8 @@ impl TickState {
     /// [`attestable`](Self::attestable), and a certificate that never
     /// forms holds them just as hard.
     ///
-    /// Two ways a half becomes undeliverable. `committee_replaced` is the
-    /// immediate one: no fresh quorum can ever hold this tick. A halt
+    /// One way a half becomes undeliverable: `committee_replaced`, when
+    /// no fresh quorum can ever hold this tick. A halt
     /// recovery replaced the committee its anchor names and the tick
     /// sits at or below the recovery's attested frontier, so the
     /// replaced members no longer serve the shard and the fresh members
@@ -990,31 +978,18 @@ impl TickState {
     /// only on a block the fresh committee certified, which no replica
     /// commits before folding the record.
     ///
-    /// [`TICK_SETTLEABLE_SPAN`] past the tick's own anchor is the other:
-    /// no member it holds can still be settleable, so a half emitted
-    /// after it would settle a transaction already past every deadline
-    /// that could decide it. Inside the span a member is merely slow, and
-    /// the abandonment path is what speaks for one whose own close has
-    /// passed.
-    ///
     /// Both read as committed content — seats settle on committed
-    /// finalizations, the stamps are BFT-authenticated, and the
-    /// committing block's certifier is what its commit resolved — so
-    /// every replica releases the same ticks at the same frontier.
+    /// finalizations, and the committing block's certifier is what its
+    /// commit resolved — so every replica releases the same ticks at the
+    /// same frontier.
     /// Whether *this* validator happened to hand its own half off
     /// ([`determined_pending`](Self::determined_pending)) is local state
     /// and deliberately not asked: releasing lets go of the chain holds
     /// later ticks read, and replicas letting go at different frontiers
     /// would read different overlays from the same chain.
     #[must_use]
-    pub fn owes_undeliverable_determined(
-        &self,
-        committed_ts: WeightedTimestamp,
-        committee_replaced: bool,
-    ) -> bool {
-        self.determined_unsettled()
-            && (committee_replaced
-                || committed_ts.elapsed_since(self.tick_ts) >= TICK_SETTLEABLE_SPAN)
+    pub fn owes_undeliverable_determined(&self, committee_replaced: bool) -> bool {
+        self.determined_unsettled() && committee_replaced
     }
 
     /// The anchor whose committee would have to attest this tick.
