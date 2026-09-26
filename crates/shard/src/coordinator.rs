@@ -1957,6 +1957,7 @@ impl ShardCoordinator {
         snapshot: &'a TopologySnapshot,
         topology_schedule: &'a TopologySchedule,
         chain: &'a QcChainSets,
+        owed_determined: &'a BTreeSet<BlockHeight>,
         parent_qc: &QuorumCertificate,
     ) -> Option<Committed<'a>> {
         let parent_block_hash = parent_qc.block_hash();
@@ -1998,8 +1999,25 @@ impl ShardCoordinator {
             chain,
             dedup: &self.dedup_index,
             parent_settled_frontier,
-            owed_determined: &self.owed_determined,
+            owed_determined,
         })
+    }
+
+    /// The ticks whose determined half the chain up to `parent` still
+    /// owes: the rows' flags at the parent, beside execution's report for
+    /// the ticks that run nothing but reclaims, which no row names. `None`
+    /// while a block between the committed tip and the parent is not held.
+    fn owed_determined_at(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        parent: BlockHash,
+    ) -> Option<BTreeSet<BlockHeight>> {
+        let mut owed = self
+            .ancestry(topology_schedule, parent)?
+            .rows
+            .owed_determined();
+        owed.extend(self.owed_determined.iter().copied());
+        Some(owed)
     }
 
     /// Classify the transactions of `block`, about to commit on the
@@ -2322,7 +2340,17 @@ impl ShardCoordinator {
         else {
             return vec![];
         };
-        let Some(ctx) = self.admission(committee, topology_schedule, &chain, &parent_qc) else {
+        let Some(owed_determined) = self.owed_determined_at(topology_schedule, parent_block_hash)
+        else {
+            return vec![];
+        };
+        let Some(ctx) = self.admission(
+            committee,
+            topology_schedule,
+            &chain,
+            &owed_determined,
+            &parent_qc,
+        ) else {
             return vec![];
         };
         // In the order the folds depend on: provisions first, since a
@@ -3778,10 +3806,20 @@ impl ShardCoordinator {
                 validate_coast_block_for_vote(block, parent_load)
             } else {
                 let chain = QcChainSets::behind(&self.chain_view(), parent);
+                let Some(owed_determined) = self.owed_determined_at(topology_schedule, parent)
+                else {
+                    trace!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        "A block between the committed tip and the parent is not held — deferring the vote"
+                    );
+                    return vec![];
+                };
                 let Some(ctx) = self.admission(
                     committee,
                     topology_schedule,
                     &chain,
+                    &owed_determined,
                     block.header().parent_qc(),
                 ) else {
                     trace!(
@@ -7448,7 +7486,7 @@ mod tests {
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
-    use hyperscale_storage::{DedupWindow, committed_tx_cell_key};
+    use hyperscale_storage::{DedupWindow, TickRow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
@@ -8112,6 +8150,42 @@ mod tests {
             );
         }
         (state, schedule)
+    }
+
+    /// A voter reads the ticks the chain owes a determined half off the
+    /// rows at the parent, so one whose execution never held the tick
+    /// still owes it; execution's report stands beside them for the ticks
+    /// that run nothing but reclaims.
+    #[test]
+    fn owed_determined_halves_are_read_off_the_rows() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"owed tip"));
+        let (mut state, schedule) = committed_through(from, []);
+        state.member_rows.ticks.insert(
+            BlockHeight::new(5),
+            TickRow {
+                members: Capped::empty(),
+                determined_unsettled: true,
+                legs_unsettled: false,
+            },
+        );
+        state.member_rows.ticks.insert(
+            BlockHeight::new(6),
+            TickRow {
+                members: Capped::empty(),
+                determined_unsettled: false,
+                legs_unsettled: true,
+            },
+        );
+        assert!(state.owed_determined.is_empty());
+        assert_eq!(
+            state.owed_determined_at(&schedule, from),
+            Some(BTreeSet::from([BlockHeight::new(5)])),
+        );
+        state.owed_determined = BTreeSet::from([BlockHeight::new(7)]);
+        assert_eq!(
+            state.owed_determined_at(&schedule, from),
+            Some(BTreeSet::from([BlockHeight::new(5), BlockHeight::new(7)])),
+        );
     }
 
     /// The anchor the block after `chain`'s tip is admitted at.
@@ -13793,6 +13867,7 @@ mod tests {
                     topology_schedule.head(),
                     topology_schedule,
                     &chain,
+                    &self.owed_determined,
                     block.header().parent_qc(),
                 )
                 .ok_or("the block's anchor window is not held")?;
@@ -13818,6 +13893,7 @@ mod tests {
                     topology_schedule.head(),
                     topology_schedule,
                     &chain,
+                    &self.owed_determined,
                     block.header().parent_qc(),
                 )
                 .ok_or("the block's anchor window is not held")?;

@@ -114,7 +114,8 @@ impl QcChainSets {
 /// parent's anchor, the window at the block's own anchor, or a tier
 /// folded from committed blocks and read at that anchor — so two
 /// replicas at different tips, clocks or head epochs answer alike.
-/// `owed_determined` is the one node-local input, and it only refuses.
+/// Execution's report beside the rows' owed ticks is the one node-local
+/// input, and it only refuses.
 #[derive(Clone, Copy)]
 pub(crate) struct Committed<'a> {
     /// The committee the block is classified under: the one its parent's
@@ -152,15 +153,16 @@ pub(crate) struct Committed<'a> {
     /// leaves the order unjudged here: such a block is verified but not
     /// voted on.
     pub(crate) parent_settled_frontier: Option<BlockHeight>,
-    /// Ticks whose determined half this chain still owes, by height —
-    /// the fold's answer, which a proposer and every voter reach
-    /// independently over the same committed blocks. A half may not
-    /// settle past one of these; a validator that never composed the
-    /// tick holds it in no set and enforces nothing, so the rule refuses
-    /// only what a composing quorum would refuse anyway.
+    /// Ticks whose determined half this chain still owes, by height: the
+    /// member rows' flags at the parent, which a proposer and every voter
+    /// read alike, beside execution's report for the ticks that run
+    /// nothing but reclaims, which no row names. A half may not settle
+    /// past one of these.
     ///
-    /// The one node-local input, and so it may only refuse: an empty set
-    /// admits nothing the order rule would refuse on its own.
+    /// The report is the one node-local input, and so it may only
+    /// refuse: a validator that never composed a reclaim tick holds it in
+    /// no set and enforces nothing, so it refuses only what a composing
+    /// quorum would refuse anyway.
     pub(crate) owed_determined: &'a BTreeSet<BlockHeight>,
 }
 
