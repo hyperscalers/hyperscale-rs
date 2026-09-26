@@ -22,6 +22,7 @@
 pub mod abandonment;
 pub mod beacon_witness;
 pub mod certificate;
+pub mod engagement;
 pub mod leaf;
 pub mod local_receipt;
 pub mod provision_tx;

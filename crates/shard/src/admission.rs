@@ -25,13 +25,12 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Finalization,
-    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, StateClaim,
-    SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable,
-    WeightedTimestamp, budget_admits_block, caps_admit_transaction, evidence_admits_block,
-    state_claims_admit_block, sweep_admits_block,
+    AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, Finalization,
+    FinalizationHash, MAX_ENGAGEMENTS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
+    Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateKey, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp, budget_admits_block,
+    caps_admit_transaction, evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -172,10 +171,25 @@ pub(crate) struct ProvisionsFold {
     /// Transactions the admitted batches provision, against the block's
     /// cap on them.
     pub(crate) tx_count: usize,
-    /// Which transactions each admitted batch provisions, by payer
-    /// shard — what the transactions section reads to engage a
-    /// cross-shard transaction.
-    pub(crate) provisioned: HashSet<(ShardId, TxHash)>,
+    /// What the admitted batches engage — what the transactions section
+    /// reads to engage a cross-shard transaction in the same block.
+    pub(crate) engaged: BTreeSet<Engagement>,
+}
+
+impl ProvisionsFold {
+    /// Whether an admitted batch from `source` names `tx_hash`, at any
+    /// source height.
+    pub(crate) fn engages(&self, source: ShardId, tx_hash: TxHash) -> bool {
+        let at = |source_height| Engagement {
+            source,
+            tx_hash,
+            source_height,
+        };
+        self.engaged
+            .range(at(BlockHeight::GENESIS)..=at(BlockHeight::new(u64::MAX)))
+            .next()
+            .is_some()
+    }
 }
 
 impl Section for ProvisionsSection {
@@ -213,19 +227,14 @@ impl Section for ProvisionsSection {
             ));
         }
         let tx_count = fold.tx_count.saturating_add(batch.transactions().len());
-        if tx_count > MAX_TXS_PER_BLOCK {
+        if tx_count > MAX_ENGAGEMENTS_PER_BLOCK {
             return Err(format!(
-                "provisions batch {provision_hash:?} carries the block past {MAX_TXS_PER_BLOCK} \
-                 provisioned transactions"
+                "provisions batch {provision_hash:?} carries the block past \
+                 {MAX_ENGAGEMENTS_PER_BLOCK} provisioned transactions"
             ));
         }
         fold.tx_count = tx_count;
-        fold.provisioned.extend(
-            batch
-                .transactions()
-                .iter()
-                .map(|entry| (source_shard, entry.tx_hash)),
-        );
+        fold.engaged.extend(Engagement::of_batch(batch));
         Ok(())
     }
 }
@@ -303,11 +312,10 @@ impl<'p> Section for TransactionsSection<'p> {
         let payer_shard = trie.shard_for_prefix(tx.fee_payer());
         if !ctx.snapshot.is_single_shard_transaction(tx)
             && payer_shard != ctx.local_shard
-            && !fold
-                .provisions
-                .provisioned
-                .contains(&(payer_shard, tx_hash))
-            && !ctx.dedup.contains_provision_tx(payer_shard, tx_hash)
+            && !fold.provisions.engages(payer_shard, tx_hash)
+            && !ctx
+                .dedup
+                .engaged(payer_shard, tx_hash, ctx.anchor, ctx.snapshot)
         {
             return Err(format!(
                 "cross-shard VM transaction {tx_hash} lacks its payer bundle from \

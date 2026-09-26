@@ -64,7 +64,7 @@ impl ShardParticipation {
 
         // The engagement gate: a non-payer shard proposes a cross-shard
         // transaction only beside its payer bundle — this proposal's
-        // own provisions — or after an earlier block absorbed it. The
+        // own provisions — or after a committed block engaged it. The
         // bundle is the transaction commit proof (verified against a
         // commit-proven payer header), so locks engage only on committed
         // payer evidence; a mis-paired inclusion is backstopped by the
@@ -100,11 +100,9 @@ impl ShardParticipation {
         }
     }
 
-    /// Whether the engagement evidence for `tx` is in hand: not a
-    /// transaction, single-shard, our shard is the payer's, the payer's
-    /// bundle rides in `queued`, an earlier block already absorbed it,
-    /// or the records a delivery-only transaction consumes are held as
-    /// live readings to ride beside it.
+    /// Whether the engagement evidence for `tx` is in hand: it is
+    /// single-shard, our shard is the payer's, the payer's bundle rides
+    /// in `queued`, or a committed block's engagements name it.
     fn engagement_held(
         &self,
         tx: &Arc<Verified<Transaction>>,
@@ -119,8 +117,8 @@ impl ShardParticipation {
             return true;
         }
         let tx_hash = tx.hash();
-        self.execution_coordinator
-            .has_provisions_from(tx_hash, payer_shard)
+        self.shard_coordinator
+            .engaged_committed(payer_shard, tx_hash, topology)
             || riding.contains(&(payer_shard, tx_hash))
     }
 

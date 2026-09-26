@@ -71,20 +71,24 @@ impl NodeStateMachine {
             .execution_coordinator
             .resolutions_of(certified.block().certificates());
         actions.extend(s.mempool_coordinator.on_resolutions(&resolutions));
-        // Committed bundles are engagement evidence: promote any parked
-        // cross-shard transaction whose payer bundle just committed.
-        // Covers the case where another proposer paired the bundle
-        // before this node's provisions pipeline verified it.
+        // Committed engagements are engagement evidence: promote any
+        // parked cross-shard transaction whose payer bundle just
+        // committed. Covers the case where another proposer paired the
+        // bundle before this node's provisions pipeline verified it, and
+        // reads the list the engagement tier folds, so a block that
+        // arrives sealed promotes what a live one does.
         let trie = self
             .beacon_coordinator
             .current_topology_snapshot()
             .shard_trie()
             .clone();
-        for bundle in certified.block().provisions() {
+        let engagements = certified.block().engagements();
+        // Ascending, so each source's entries are one run.
+        for run in engagements.chunk_by(|a, b| a.source == b.source) {
             s.mempool_coordinator.on_engagement_evidence(
                 &trie,
-                bundle.source_shard(),
-                bundle.transactions().iter().map(|entry| entry.tx_hash),
+                run[0].source,
+                run.iter().map(|engagement| engagement.tx_hash),
             );
         }
 

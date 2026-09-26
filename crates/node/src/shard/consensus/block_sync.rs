@@ -28,9 +28,9 @@ use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash,
-    Inventory, LocalReceiptRoot, ProvisionHash, ProvisionsRoot, RehydrateError, StateClaimsRoot,
-    StoredReceipt, TransactionRoot, Verifiable, Verified,
+    AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock,
+    EngagementRoot, Hash, Inventory, LocalReceiptRoot, ProvisionHash, ProvisionsRoot,
+    RehydrateError, SetRoot, StateClaimsRoot, StoredReceipt, TransactionRoot, Verifiable, Verified,
 };
 
 use crate::event::classify_fetch_error;
@@ -396,10 +396,11 @@ fn cache_sensitive_validation_failure(reason: &str) -> bool {
 /// derives the `Live` list by hashing the same bodies the root is computed
 /// over. One expression therefore binds both variants.
 ///
-/// The abandonment records are the one body list no hash in the
-/// manifest binds — they ride inline rather than by reference — so this is
-/// the only place a serving peer's copy is held to the header the committee
-/// actually signed.
+/// The abandonment records and a sealed block's engagements are the body
+/// lists no hash in the manifest binds — they ride inline rather than by
+/// reference — so this is the only place a serving peer's copy is held to
+/// the header the committee actually signed. A live block's engagements
+/// are derived from its provision bodies, which the provisions root binds.
 ///
 /// On `Err`, the returned `&'static str` is suitable for both the
 /// metrics label and the warn message.
@@ -430,6 +431,10 @@ fn validate_synced_block(
         != header.state_claims_root()
     {
         return Err("state_claims_root_mismatch");
+    }
+
+    if EngagementRoot::over(certified.block().engagements().iter()) != header.engagement_root() {
+        return Err("engagement_root_mismatch");
     }
 
     if Verified::<TransactionRoot>::compute(certified.block().transactions()).into_inner()
@@ -489,10 +494,10 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts,
         BlockHeight, CertificateRoot, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline,
-        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield,
-        TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable,
-        WeightedTimestamp, WitnessSources,
+        Engagement, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash,
+        GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round, ShardId,
+        SignerBitfield, TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, UnsettledTx,
+        Verifiable, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -985,6 +990,7 @@ mod tests {
                 Capped::new(provision_hashes)
                     .expect("a rebuilt block keeps the caps its source met"),
             ),
+            engagements: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
@@ -1003,6 +1009,56 @@ mod tests {
         assert!(
             validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc)).is_ok(),
             "the batches the header commits are the ones it accepts"
+        );
+    }
+
+    /// A `Sealed` block keeps the engagements its dropped bodies named,
+    /// and no manifest hash binds that inline list: the header's root is
+    /// the only thing holding a serving peer's copy to what the committee
+    /// signed. A stripped or altered list fails; the committed one passes.
+    #[test]
+    fn a_synced_block_whose_list_misses_its_root_is_refused() {
+        let entry = |seed: u8| Engagement {
+            source: ShardId::leaf(1, 1),
+            tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
+            source_height: BlockHeight::new(3),
+        };
+        let committed = vec![entry(1), entry(2)];
+        let root = EngagementRoot::over(&committed);
+        let sealed = |engagements: Vec<Engagement>| Block::Sealed {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: HEIGHT,
+                parent_block_hash: BlockHash::ZERO,
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                timestamp: ProposerTimestamp::from_millis(1_000),
+                provision_tx_roots: Capped::default(),
+                engagement_root: root,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provision_hashes: Arc::new(Capped::empty()),
+            engagements: Arc::new(Capped::new(engagements).expect("a list written out in a test")),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+
+        for served in [Vec::new(), vec![entry(1)], vec![entry(1), entry(3)]] {
+            let block = sealed(served);
+            let qc = qc_for(&block);
+            assert_eq!(
+                validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(block, qc))
+                    .unwrap_err(),
+                "engagement_root_mismatch"
+            );
+        }
+
+        let carried = sealed(committed);
+        let qc = qc_for(&carried);
+        assert!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc)).is_ok(),
+            "the list the header commits is the one it accepts"
         );
     }
 

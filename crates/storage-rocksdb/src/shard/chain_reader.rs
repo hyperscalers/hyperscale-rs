@@ -49,7 +49,7 @@ impl ShardChainReader for RocksDbShardStorage {
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         self.get_block_metadata(height)
             .map(|metadata| {
-                let (header, _, qc, _) = metadata.into_parts();
+                let (header, _, _, qc, _) = metadata.into_parts();
                 CertifiedBlockHeader::new(header, qc)
             })
             .or_else(|| {

@@ -22,6 +22,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-crypto-bls.workspace = true
+hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true

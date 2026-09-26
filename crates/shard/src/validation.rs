@@ -17,9 +17,10 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, LeafRoot, LocalTimestamp,
-    MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad,
-    StateClaimsRoot, TopologySnapshot, Transaction, Verifiable, VoteCount,
+    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, EngagementRoot, LeafRoot,
+    LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate,
+    SetRoot, ShardId, ShardLoad, StateClaimsRoot, TopologySnapshot, Transaction, Verifiable,
+    VoteCount,
 };
 
 use crate::admission::{
@@ -370,14 +371,15 @@ pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork
     Ok(transactions.budget)
 }
 
-/// The header's abandonment root and state-claims root
-/// commit the sections they claim.
+/// The header's abandonment, state-claims and engagement roots commit
+/// the sections they claim.
 ///
 /// What this establishes is that every replica reads the same section:
 /// the root binds the items to the header, and the canonical order the
 /// section rule holds each item to means one set of answers has one
 /// encoding, so two proposers naming the same claims cannot produce
-/// blocks that differ.
+/// blocks that differ. The engagement root is over what the block's own
+/// provisions name, which is what a sealed form of it keeps.
 pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
     let computed = AbandonmentRoot::over(block.abandonment_records());
     let claimed = block.header().abandonment_root();
@@ -391,6 +393,14 @@ pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
     if computed != claimed {
         return Err(format!(
             "state claims root {claimed:?} does not commit the block's claims {computed:?}"
+        ));
+    }
+    let computed = EngagementRoot::over(block.engagements().iter());
+    let claimed = block.header().engagement_root();
+    if computed != claimed {
+        return Err(format!(
+            "engagement root {claimed:?} does not commit what the block's provisions name \
+             {computed:?}"
         ));
     }
     Ok(())
@@ -479,15 +489,15 @@ pub mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
-        BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, ExecutionOutcome,
-        Finalization, Hash, Inclusion, LegRole, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
-        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
-        Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer,
-        SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange,
-        Transaction, TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
-        WitnessSources, state_claims_admit_block, test_utils,
+        BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, Engagement,
+        ExecutionOutcome, Finalization, Hash, Inclusion, LegRole, LocalKey, MAX_INTENTS,
+        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
+        ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix,
+        ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot,
+        SubstateKey, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
+        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+        Verified, WeightedTimestamp, WitnessSources, state_claims_admit_block, test_utils,
     };
 
     use super::*;
@@ -2412,10 +2422,19 @@ pub mod tests {
         let paired = block_with_tx(&tx, vec![Arc::clone(&bundle)]);
         assert!(admit(&engaged(&topo, local), &paired).is_ok());
 
-        // A bundle committed within the retention window: engaged.
+        // A bundle an earlier block committed, registered through that
+        // block's own list: engaged.
         let mut dedup = CommitDedupIndex::new();
-        dedup.register_committed_provision_txs(
-            std::slice::from_ref(&bundle),
+        dedup.register_committed_engagements(
+            &paired.engagements(),
+            WeightedTimestamp::from_millis(1_000),
+        );
+        assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
+
+        // The same block committed and sealed feeds the same entry.
+        let mut dedup = CommitDedupIndex::new();
+        dedup.register_committed_engagements(
+            &paired.clone().into_sealed().engagements(),
             WeightedTimestamp::from_millis(1_000),
         );
         assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
@@ -2435,6 +2454,159 @@ pub mod tests {
         let mispaired = block_with_tx(&tx, vec![wrong_source]);
         let err = admit(&engaged(&topo, local), &mispaired).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
+    }
+
+    /// The payer's bundle for `tx`, from `payer` at `height`, with the
+    /// empty entry a payer holding none of its reads sends.
+    fn payer_bundle(
+        payer: ShardId,
+        local: ShardId,
+        height: u64,
+        tx_hash: TxHash,
+    ) -> Arc<Verifiable<Provisions>> {
+        Arc::new(
+            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+                payer,
+                local,
+                BlockHeight::new(height),
+                WeightedTimestamp::ZERO,
+                MerkleInclusionProof::dummy(),
+                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+            ))
+            .into(),
+        )
+    }
+
+    /// A committed payer entry engages only while its committing anchor
+    /// plus the horizon is ahead of the admitting anchor, and only at a
+    /// source height no recovery fences.
+    #[test]
+    fn a_committed_engagement_lapses_and_is_fenced_at_admission() {
+        use hyperscale_types::{Epoch, RecoveryCause, ShardRecovery};
+
+        let topo = TestCommittee::new(4, 42).topology_snapshot(2);
+        let local = ShardId::leaf(1, 0);
+        let payer = ShardId::leaf(1, 1);
+        let local_owner = test_principal(0x01);
+        let payer_owner = test_principal(0x81);
+        let tx = stub_tx(payer_owner, &[local_owner.address(), payer_owner.address()]);
+        let committed = block_with_tx(&tx, vec![payer_bundle(payer, local, 7, tx.hash())]);
+        let bare = block_with_tx(&tx, Vec::new());
+        let anchor = WeightedTimestamp::from_millis(1_000);
+        let with_entry = |topo: &TopologySnapshot, at: WeightedTimestamp| {
+            let mut dedup = CommitDedupIndex::new();
+            dedup.register_committed_engagements(&committed.engagements(), anchor);
+            let mut against = engaged_with(topo, local, dedup);
+            against.anchor = at;
+            against
+        };
+
+        let deadline = anchor.plus(RETENTION_HORIZON);
+        let inside = deadline.minus(std::time::Duration::from_millis(1));
+        assert!(admit(&with_entry(&topo, inside), &bare).is_ok());
+        let err = admit(&with_entry(&topo, deadline), &bare).unwrap_err();
+        assert!(err.contains("payer bundle"), "{err}");
+
+        let recovering = topo.with_pending_recoveries(
+            std::iter::once((
+                payer,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(2),
+                    retained: Vec::new(),
+                    attested_frontier: BlockHeight::new(6),
+                },
+            ))
+            .collect(),
+        );
+        let err = admit(&with_entry(&recovering, inside), &bare).unwrap_err();
+        assert!(err.contains("payer bundle"), "{err}");
+    }
+
+    /// The committed arm is keyed by the payer's shard under the
+    /// admitting anchor's trie. A payer bundle committed under the
+    /// parent before the payer split engages nothing once admission
+    /// resolves the payer to a child, so the transaction is refused and
+    /// no value moves.
+    #[test]
+    fn a_payer_cut_between_commit_and_admission_refuses() {
+        let before = TestCommittee::new(4, 42).topology_snapshot(2);
+        let after = TestCommittee::new(4, 42).topology_snapshot(4);
+        let payer_owner = test_principal(0x81);
+        let local_owner = test_principal(0x01);
+        let tx = stub_tx(payer_owner, &[local_owner.address(), payer_owner.address()]);
+        let parent_payer = before.shard_trie().shard_for_prefix(tx.fee_payer());
+        let child_payer = after.shard_trie().shard_for_prefix(tx.fee_payer());
+        let local = after.shard_trie().shard_for_prefix(local_owner.address());
+        assert_eq!(parent_payer, ShardId::leaf(1, 1));
+        assert!(parent_payer.is_ancestor_of(child_payer), "the payer split");
+        assert_ne!(local, child_payer);
+
+        let committed = block_with_tx(&tx, vec![payer_bundle(parent_payer, local, 7, tx.hash())]);
+        let mut dedup = CommitDedupIndex::new();
+        dedup.register_committed_engagements(
+            &committed.engagements(),
+            WeightedTimestamp::from_millis(1_000),
+        );
+        let err = admit(
+            &engaged_with(&after, local, dedup),
+            &block_with_tx(&tx, Vec::new()),
+        )
+        .unwrap_err();
+        assert!(err.contains("payer bundle"), "{err}");
+    }
+
+    /// The header's engagement root commits what the block's provisions
+    /// name: a root over anything else is refused, and the sealed form of
+    /// an honest block, which keeps the list, passes as the live one does.
+    #[test]
+    fn the_engagement_root_commits_what_the_provisions_engage() {
+        let local = ShardId::leaf(1, 0);
+        let payer = ShardId::leaf(1, 1);
+        let tx_hash = TxHash::from(Hash::from_bytes(b"engaged"));
+        let provisions = vec![
+            payer_bundle(payer, local, 3, tx_hash),
+            payer_bundle(payer, local, 4, tx_hash),
+        ];
+        let with_root = |root: EngagementRoot| {
+            let base = header_at_height(BlockHeight::new(6), 100_000);
+            Block::Live {
+                header: BlockHeader::new(BlockHeaderParts {
+                    height: base.height(),
+                    parent_block_hash: base.parent_block_hash(),
+                    parent_qc: base.parent_qc().clone().into(),
+                    proposer: base.proposer(),
+                    timestamp: base.timestamp(),
+                    round: base.round(),
+                    provision_tx_roots: Capped::default(),
+                    engagement_root: root,
+                    ..Default::default()
+                }),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(
+                    Capped::new(provisions.clone()).expect("a list written out in a test"),
+                ),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            }
+        };
+        let honest = EngagementRoot::over(&Engagement::of_provisions(&provisions));
+
+        let err = validate_roots_commit_sections(&with_root(EngagementRoot::ZERO))
+            .expect_err("a root claiming nothing does not commit two entries");
+        assert!(err.contains("engagement root"), "{err}");
+        let short = EngagementRoot::over(&Engagement::of_provisions(&provisions[..1]));
+        let err = validate_roots_commit_sections(&with_root(short))
+            .expect_err("a root omitting one entry fails");
+        assert!(err.contains("engagement root"), "{err}");
+
+        let live = with_root(honest);
+        assert!(validate_roots_commit_sections(&live).is_ok());
+        let sealed = live.into_sealed();
+        assert_eq!(sealed.engagements().len(), 2);
+        assert!(validate_roots_commit_sections(&sealed).is_ok());
     }
 
     /// The signed ceiling is the payer shard's verdict and no other

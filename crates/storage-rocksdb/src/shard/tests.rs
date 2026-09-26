@@ -413,6 +413,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             transactions: Arc::new(Capped::empty()),
             certificates: Arc::new(Capped::empty()),
             provision_hashes: Arc::new(Capped::empty()),
+            engagements: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
@@ -445,6 +446,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             transactions,
             certificates,
             provision_hashes,
+            engagements,
             abandonment_records,
             state_claims,
             witness_sources,
@@ -456,6 +458,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
+                engagements,
                 abandonment_records,
                 state_claims,
                 witness_sources,
@@ -673,12 +676,14 @@ fn test_commit_block_stores_certificates() {
             header,
             transactions,
             provision_hashes,
+            engagements,
             ..
         } => Block::Sealed {
             header,
             transactions,
             certificates: Arc::clone(&fw_certificates),
             provision_hashes,
+            engagements,
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
@@ -1285,6 +1290,46 @@ fn a_committed_bundle_survives_a_reopen() {
             .collect::<Vec<_>>(),
         vec![hash],
     );
+}
+
+/// A stored block is sealed, and it keeps the engagements its dropped
+/// bodies named, across a reopen, on both read paths: the engagement
+/// tier folds them after the bodies are gone.
+#[test]
+fn a_stored_block_keeps_its_engagements() {
+    let temp_dir = TempDir::new().unwrap();
+    let tx_hash = TxHash::from(Hash::from_bytes(b"engaged"));
+    let expected = {
+        let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+        let block = with_provisions(
+            make_test_block(BlockHeight::new(1)),
+            ShardId::leaf(1, 1),
+            tx_hash,
+        );
+        let expected = block.engagements().into_owned();
+        commit_settled_at(
+            &storage,
+            &make_test_certified(block),
+            &[],
+            &[],
+            &no_witness(),
+        );
+        expected
+    };
+    assert_eq!(expected.len(), 1);
+    assert_eq!(expected[0].tx_hash, tx_hash);
+
+    let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let stored = reopened
+        .get_block(BlockHeight::new(1))
+        .expect("the committed block is stored");
+    assert!(!stored.block().is_live());
+    assert_eq!(*stored.block().engagements(), expected[..]);
+    let (served, _, _) = reopened
+        .get_block_for_sync(BlockHeight::new(1))
+        .expect("the committed block is servable");
+    assert!(!served.is_live());
+    assert_eq!(*served.engagements(), expected[..]);
 }
 
 #[test]

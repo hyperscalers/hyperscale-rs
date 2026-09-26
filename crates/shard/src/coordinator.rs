@@ -5174,11 +5174,8 @@ impl ShardCoordinator {
             .register_committed_certs(block.certificates());
         self.dedup_index
             .register_committed_provisions(manifest.provision_hashes(), commit_ts);
-        // Bundle content feeds the engagement mirror — live bodies only;
-        // a sealed manifest has no content and the mirror votes
-        // conservatively across that gap.
         self.dedup_index
-            .register_committed_provision_txs(block.provisions(), commit_ts);
+            .register_committed_engagements(&block.engagements(), anchor);
     }
 
     /// Commit-time fee-ledger bookkeeping: engage reservations for the
@@ -6500,6 +6497,8 @@ impl ShardCoordinator {
         // have been evicted from mempool already, so stale entries just waste
         // memory.
         self.dedup_index.prune(self.committed_ts);
+        self.dedup_index
+            .prune_engagements(self.committed_block_anchor_wt);
 
         // Remote headers are pruned per-shard-tip at insertion time, not by
         // local committed height (remote shards have independent heights).
@@ -6922,6 +6921,22 @@ impl ShardCoordinator {
             .len()
     }
 
+    /// Whether a committed batch from `source` engages `tx_hash` at the
+    /// committed tip's anchor — the tier a voter's committed arm reads,
+    /// asked at the clock the proposer knows. The proposal's own anchor
+    /// sits at or above it, and the transactions section drops whatever
+    /// lapses between the two.
+    #[must_use]
+    pub fn engaged_committed(
+        &self,
+        source: ShardId,
+        tx_hash: TxHash,
+        snapshot: &TopologySnapshot,
+    ) -> bool {
+        self.dedup_index
+            .engaged(source, tx_hash, self.committed_block_anchor_wt, snapshot)
+    }
+
     /// Get the shard consensus configuration.
     #[must_use]
     pub const fn config(&self) -> &ShardConsensusConfig {
@@ -7062,17 +7077,18 @@ mod tests {
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
-    use hyperscale_storage::committed_tx_cell_key;
+    use hyperscale_storage::{DedupWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, DeclaredWork, Epoch, Hash,
-        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
-        RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx,
-        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict, test_utils,
+        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof, NetworkDefinition,
+        NetworkParams, ProvisionEntry, RETENTION_HORIZON, RoutePrefix, SettledSetVerdict,
+        SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateClaimsRoot, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
+        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
+        ValidatorSet, VoteCount, WeightedTimestamp, WindowLookup, WitnessSources,
+        settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -7533,6 +7549,292 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"anchor_parent")),
             parent_weighted_ms,
         )
+    }
+
+    /// A chain spanning more than a retention horizon, one block every
+    /// half horizon, each carrying a payer bundle from `ENGAGING_PAYER`
+    /// that names one transaction; the last also re-engages the first
+    /// block's transaction at a later source height.
+    fn engaging_chain(from: BlockHash) -> Vec<Block> {
+        let half = u64::try_from(RETENTION_HORIZON.as_millis() / 2).expect("fits");
+        let bundle = |height: u64, seeds: &[u8]| {
+            Arc::new(Verifiable::from(Provisions::new(
+                ENGAGING_PAYER,
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                WeightedTimestamp::ZERO,
+                MerkleInclusionProof::dummy(),
+                Capped::new(
+                    seeds
+                        .iter()
+                        .map(|seed| ProvisionEntry::new(engaged_tx(*seed), Capped::empty()))
+                        .collect(),
+                )
+                .expect("a list written out in a test"),
+            )))
+        };
+        let mut parent = from;
+        (1..=4u8)
+            .map(|seed| {
+                let height = u64::from(seed);
+                let seeds: &[u8] = if seed == 4 { &[4, 1] } else { &[seed] };
+                let Block::Live {
+                    header,
+                    transactions,
+                    certificates,
+                    abandonment_records,
+                    state_claims,
+                    witness_sources,
+                    ..
+                } = block_chained_on(BlockHeight::new(height), parent, 1_000 + height * half)
+                else {
+                    unreachable!("a chained block is live")
+                };
+                let block = Block::Live {
+                    header,
+                    transactions,
+                    certificates,
+                    provisions: Arc::new(Capped::from_array([bundle(10 + height, seeds)])),
+                    abandonment_records,
+                    state_claims,
+                    witness_sources,
+                };
+                parent = block.hash();
+                block
+            })
+            .collect()
+    }
+
+    const ENGAGING_PAYER: ShardId = ShardId::leaf(1, 1);
+
+    fn engaged_tx(seed: u8) -> TxHash {
+        TxHash::from(Hash::from_bytes(&[seed; 32]))
+    }
+
+    /// Commit `blocks` on a fresh coordinator whose tip is `from`, each
+    /// through the commit path a certified block takes.
+    fn committed_through(
+        from: BlockHash,
+        blocks: impl IntoIterator<Item = Block>,
+    ) -> (ShardCoordinator, TopologySchedule) {
+        let (mut state, schedule) = make_test_state();
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = from;
+        for block in blocks {
+            let qc = make_test_qc(block.hash(), block.height());
+            let _ = state.on_block_ready_to_commit(
+                &schedule,
+                Arc::new(Verified::new_unchecked_for_test(
+                    CertifiedBlock::new_unchecked(block, qc),
+                )),
+                CommitSource::Aggregator,
+            );
+        }
+        (state, schedule)
+    }
+
+    /// The anchor the block after `chain`'s tip is admitted at.
+    fn next_anchor(chain: &[Block]) -> WeightedTimestamp {
+        chain
+            .last()
+            .expect("a chain")
+            .header()
+            .parent_qc()
+            .weighted_timestamp()
+            .plus(Duration::from_millis(1))
+    }
+
+    /// A voter that committed the span sealed, as a sync delivers it,
+    /// holds the tier a voter that committed it live holds, and admits
+    /// exactly what the live voter admits at the next block's anchor.
+    #[test]
+    fn a_sealed_synced_voter_admits_what_a_live_one_does() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"engaging tip"));
+        let chain = engaging_chain(from);
+        let (live, schedule) = committed_through(from, chain.clone());
+        let (sealed, _) = committed_through(from, chain.iter().cloned().map(Block::into_sealed));
+        assert_eq!(live.committed_height(), BlockHeight::new(4));
+        assert_eq!(sealed.committed_height(), BlockHeight::new(4));
+
+        assert_eq!(
+            live.dedup_index.engagement_rows(),
+            sealed.dedup_index.engagement_rows()
+        );
+        let at = next_anchor(&chain);
+        let snapshot = schedule.head();
+        for seed in 1..=4 {
+            let tx_hash = engaged_tx(seed);
+            assert_eq!(
+                live.dedup_index
+                    .engaged(ENGAGING_PAYER, tx_hash, at, snapshot),
+                sealed
+                    .dedup_index
+                    .engaged(ENGAGING_PAYER, tx_hash, at, snapshot),
+                "transaction {seed}"
+            );
+        }
+        assert!(
+            !live
+                .dedup_index
+                .engaged(ENGAGING_PAYER, engaged_tx(2), at, snapshot),
+            "the second block's entry lapsed a horizon after it"
+        );
+        assert!(
+            live.dedup_index
+                .engaged(ENGAGING_PAYER, engaged_tx(1), at, snapshot),
+            "the first block's transaction was engaged again inside the horizon"
+        );
+    }
+
+    /// A voter that restarts over its store seeds the tier from the
+    /// sealed blocks it holds, with no provision body read, and holds
+    /// what the voter that stayed up built live.
+    #[test]
+    fn a_restarted_voter_admits_what_a_live_one_does() {
+        use hyperscale_storage::test_helpers::commit_settled_at;
+        use hyperscale_storage_memory::SimShardStorage;
+
+        let from = BlockHash::from_raw(Hash::from_bytes(b"engaging tip"));
+        let chain = engaging_chain(from);
+        let (live, schedule) = committed_through(from, chain.clone());
+
+        let storage = SimShardStorage::default();
+        for block in &chain {
+            let qc = make_test_qc(block.hash(), block.height());
+            commit_settled_at(
+                &storage,
+                &Arc::new(Verified::new_unchecked_for_test(
+                    CertifiedBlock::new_unchecked(block.clone(), qc),
+                )),
+                &[],
+                &[],
+                &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            );
+        }
+        let tip_anchor = chain
+            .last()
+            .expect("a chain")
+            .header()
+            .parent_qc()
+            .weighted_timestamp();
+        let window = DedupWindow::from_reader(
+            &storage,
+            BlockHeight::new(4),
+            tip_anchor,
+            ChainOrigin {
+                genesis_height: BlockHeight::new(1),
+                anchor_wt: WeightedTimestamp::ZERO,
+            },
+        );
+        let restarted = CommitDedupIndex::seeded(&window, tip_anchor);
+
+        assert_eq!(
+            restarted.engagement_rows(),
+            live.dedup_index.engagement_rows()
+        );
+        let at = next_anchor(&chain);
+        for seed in 1..=4 {
+            let tx_hash = engaged_tx(seed);
+            assert_eq!(
+                restarted.engaged(ENGAGING_PAYER, tx_hash, at, schedule.head()),
+                live.dedup_index
+                    .engaged(ENGAGING_PAYER, tx_hash, at, schedule.head()),
+                "transaction {seed}"
+            );
+        }
+    }
+
+    /// The proposer's pre-filter and a voter's committed arm read one
+    /// tier: a transaction whose payer bundle an earlier block committed
+    /// is offered on the proposer's read at the committed tip and
+    /// admitted by a voter at the next anchor, and once the entry lapses
+    /// at a proposal's anchor the transactions section drops it.
+    #[test]
+    fn the_proposer_and_the_voter_read_one_committed_tier() {
+        use crate::admission::fixtures::Against;
+        use crate::validation::admit_sections;
+
+        test_utils::install_stub_protocol_statics();
+        let topo = test_utils::TestCommittee::new(4, 42).topology_snapshot(2);
+        let local = ShardId::leaf(1, 0);
+        let payer_owner = test_utils::test_principal(0x81);
+        let local_owner = test_utils::test_principal(0x01);
+        let tx: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_utils::stub_transaction(
+                payer_owner,
+                &[local_owner.address(), payer_owner.address()],
+                1_000,
+                TimestampRange::new(
+                    WeightedTimestamp::ZERO,
+                    WeightedTimestamp::from_millis(100_000),
+                ),
+            )),
+        ));
+        assert_eq!(
+            topo.shard_trie().shard_for_prefix(tx.fee_payer()),
+            ENGAGING_PAYER
+        );
+
+        let from = BlockHash::from_raw(Hash::from_bytes(b"engaging tip"));
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } = block_chained_on(BlockHeight::new(1), from, 1_000)
+        else {
+            unreachable!("a chained block is live")
+        };
+        let engaging = Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(
+                Provisions::new(
+                    ENGAGING_PAYER,
+                    local,
+                    BlockHeight::new(7),
+                    WeightedTimestamp::ZERO,
+                    MerkleInclusionProof::dummy(),
+                    Capped::from_array([ProvisionEntry::new(tx.hash(), Capped::empty())]),
+                ),
+            ))])),
+            abandonment_records,
+            state_claims,
+            witness_sources,
+        };
+        let (mut state, _) = committed_through(from, [engaging]);
+        assert!(
+            state.engaged_committed(ENGAGING_PAYER, tx.hash(), &topo),
+            "the proposer offers it"
+        );
+
+        let bare = Block::Live {
+            header: block_chained_on(BlockHeight::new(2), state.committed_hash, 2_000)
+                .header()
+                .clone(),
+            transactions: Arc::new(Capped::from_array([Arc::clone(&tx)])),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let mut voter = Against::window(topo);
+        voter.local_shard = local;
+        voter.dedup = std::mem::replace(&mut state.dedup_index, CommitDedupIndex::new());
+        voter.anchor = WeightedTimestamp::from_millis(2_000);
+        assert!(
+            admit_sections(&voter.ctx(), &bare).is_ok(),
+            "a voter admits it"
+        );
+
+        voter.anchor = WeightedTimestamp::from_millis(1_000).plus(RETENTION_HORIZON);
+        let err = admit_sections(&voter.ctx(), &bare).unwrap_err();
+        assert!(err.contains("payer bundle"), "{err}");
     }
 
     /// As [`block_with_parent_qc_ts`], but extending `parent_hash` — so a

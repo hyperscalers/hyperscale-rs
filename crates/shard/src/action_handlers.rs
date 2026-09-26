@@ -29,21 +29,21 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
-    Deadline, DeferOn, Derivation, Epoch, EpochWindows, Finalization, FrontierInputs, Hash,
-    LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions,
-    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim,
-    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey,
-    SweepFrontier, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionRootContext, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
-    VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
-    WitnessSources, absorb_committed_cells, commit_witness_window, derive_leaves,
-    fees_over_certificates, local_settled_tx_hashes, missed_proposals_since_prev_commit,
-    next_reveal_chain, protocol_statics, shard_reveal_sign, signed_bytes,
-    verify_shard_vote_equivocation, vrf_output_from_proof,
+    Deadline, DeferOn, Derivation, Engagement, EngagementRoot, Epoch, EpochWindows, Finalization,
+    FrontierInputs, Hash, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit,
+    PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal,
+    ReshapeTrigger, Resolutions, RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad,
+    SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext, Stopwatch,
+    StoredReceipt, SubstateKey, SweepFrontier, Timeout, TimeoutContext, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight, UnsettledTx,
+    ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
+    derive_leaves, fees_over_certificates, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
+    signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
 use crate::local_crossings::{
@@ -417,9 +417,9 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Proofs of counterparts' cells, committed so every replica folds
     // the same answers at this height.
     let state_claims_root = Verified::<StateClaimsRoot>::compute(&state_claims).into_inner();
-    // The crossings this block refuses, committed so the cells it wrote
-    // for them are a fact about the block rather than about whoever
-    // built it.
+    // What the provisions engage, committed so a sealed form keeps the
+    // entries the engagement tier folds after the bodies are gone.
+    let engagement_root = EngagementRoot::over(&Engagement::of_provisions(&provisions));
 
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
@@ -438,6 +438,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         provision_tx_roots,
         abandonment_root,
         state_claims_root,
+        engagement_root,
         txs_in_flight,
         settled_tick_frontier,
         sweep_frontier,

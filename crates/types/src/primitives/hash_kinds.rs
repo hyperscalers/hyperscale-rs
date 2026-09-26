@@ -191,6 +191,18 @@ hash_newtype!(
     "StateClaimsRoot"
 );
 
+hash_newtype!(
+    /// Set root over the [`Engagement`](crate::Engagement)s a block's
+    /// provisions name.
+    ///
+    /// Carried in
+    /// [`BlockHeader::engagement_root`](crate::BlockHeader), so a sealed
+    /// block's kept list is bound to the bodies it dropped, and the
+    /// engagement tier folds the same entries on every commit path.
+    pub EngagementRoot,
+    "EngagementRoot"
+);
+
 // ── Beacon chain ─────────────────────────────────────────────────────────────
 
 hash_newtype!(

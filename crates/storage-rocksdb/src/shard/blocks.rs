@@ -335,7 +335,7 @@ impl RocksDbShardStorage {
         // 1. Get block metadata
         let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
 
-        let (header, manifest, qc, _) = metadata.into_parts();
+        let (header, manifest, engagements, qc, _) = metadata.into_parts();
 
         // 2. Batch-fetch transactions (preserving order)
         let transactions =
@@ -395,7 +395,7 @@ impl RocksDbShardStorage {
         // provision bodies, but the manifest's provision-hash list rides
         // along so sync-serving glue can re-attach bodies from the
         // in-memory cache when a requester is still within the
-        // execution window.
+        // execution window, and the engagements they named ride with it.
         let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions
             .into_iter()
             .map(|tx| {
@@ -413,6 +413,7 @@ impl RocksDbShardStorage {
                 Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
             ),
             provision_hashes: Arc::new(manifest.provision_hashes().clone()),
+            engagements: Arc::new(engagements),
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
@@ -461,7 +462,7 @@ impl RocksDbShardStorage {
 
         // 1. Get block metadata
         let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
-        let (header, manifest, qc, _) = metadata.into_parts();
+        let (header, manifest, engagements, qc, _) = metadata.into_parts();
         let qc = qc.into_unverified();
 
         // 2. Try to batch-fetch transactions (preserving order)
@@ -548,6 +549,7 @@ impl RocksDbShardStorage {
                 Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
             ),
             provision_hashes: Arc::new(provision_hashes_bounded.clone()),
+            engagements: Arc::new(engagements),
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),

@@ -236,6 +236,11 @@ pub const MAX_PROOFS_PER_QUERY: usize = 256;
 /// for small-to-mid-shard topologies; widening the topology may require
 /// revisiting.
 pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
+
+/// Hard cap on the transactions one block's provisions name between
+/// them, and so on the [`Engagements`](crate::Engagements) a sealed block
+/// keeps of them: one entry per named transaction.
+pub const MAX_ENGAGEMENTS_PER_BLOCK: usize = MAX_TXS_PER_BLOCK;
 /// The most leaves one cells query may be answered over, keys and
 /// range entries together.
 ///

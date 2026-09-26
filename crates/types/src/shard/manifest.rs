@@ -5,7 +5,7 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
-    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    Engagements, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     QuorumCertificate, StateClaim, TxHash, Verifiable, WitnessSources,
 };
@@ -172,6 +172,11 @@ impl BlockManifest {
 pub struct BlockMetadata {
     header: BlockHeader,
     manifest: BlockManifest,
+    /// The engagements the block's provisions named, kept beside the
+    /// manifest rather than in it: a proposal derives them from the
+    /// bodies it carries, and only the stored form, which drops the
+    /// bodies, has to keep them.
+    engagements: Engagements,
     qc: Verifiable<QuorumCertificate>,
     beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
 }
@@ -190,6 +195,13 @@ impl BlockMetadata {
     /// Storage backends call this so the fetch responder can map
     /// `committed_block_hash` to a `(first_leaf, last_leaf)` range without
     /// re-walking history.
+    ///
+    /// # Panics
+    ///
+    /// If the block's provisions name more than
+    /// [`MAX_ENGAGEMENTS_PER_BLOCK`](crate::MAX_ENGAGEMENTS_PER_BLOCK)
+    /// transactions, which the provisions section refuses of any block a
+    /// chain commits.
     #[must_use]
     pub fn from_block_with_witness_count(
         block: &Block,
@@ -199,6 +211,8 @@ impl BlockMetadata {
         Self {
             header: block.header().clone(),
             manifest: BlockManifest::from_block(block),
+            engagements: Capped::new(block.engagements().into_owned())
+                .expect("the provisions section caps what a block's provisions name"),
             qc: qc.into(),
             beacon_witness_leaf_count_at_block_end,
         }
@@ -214,6 +228,12 @@ impl BlockMetadata {
     #[must_use]
     pub const fn manifest(&self) -> &BlockManifest {
         &self.manifest
+    }
+
+    /// The engagements the block's provisions named.
+    #[must_use]
+    pub const fn engagements(&self) -> &Engagements {
+        &self.engagements
     }
 
     /// Quorum certificate that commits this block.
@@ -236,12 +256,14 @@ impl BlockMetadata {
     ) -> (
         BlockHeader,
         BlockManifest,
+        Engagements,
         Verifiable<QuorumCertificate>,
         BeaconWitnessLeafCount,
     ) {
         (
             self.header,
             self.manifest,
+            self.engagements,
             self.qc,
             self.beacon_witness_leaf_count_at_block_end,
         )

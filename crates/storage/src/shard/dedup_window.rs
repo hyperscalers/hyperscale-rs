@@ -23,7 +23,7 @@
 use std::collections::HashSet;
 
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, FEE_HOLD_WINDOW, FinalizationHash,
+    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Engagement, FEE_HOLD_WINDOW, FinalizationHash,
     PrincipalAddr, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp,
 };
 
@@ -52,6 +52,13 @@ pub struct DedupWindow {
     /// *this certificate*, which is the only thing that refuses one whose
     /// members reach no verdict at all.
     pub finalizations: Vec<(FinalizationHash, WeightedTimestamp)>,
+    /// `(engagement, deadline)` for every entry the window's blocks
+    /// committed, each at its own block's anchor plus
+    /// [`RETENTION_HORIZON`] — the clock the live commit stamps with, so
+    /// a restart and a snap-synced joiner seed the tier the live path
+    /// built. Read off the block's own list, which a stored sealed block
+    /// keeps, so no provision body is read.
+    pub engagements: Vec<(Engagement, WeightedTimestamp)>,
     /// The oldest block anchor the walk folded, or `None` when it folded
     /// nothing.
     ///
@@ -204,7 +211,7 @@ impl DedupWindow {
     /// now reaches its anchor.
     ///
     /// `anchor` is the block's own `parent_qc` weighted timestamp, which
-    /// the provision tier keys its deadline on.
+    /// the provision and engagement tiers key their deadlines on.
     fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
         for finalization in block.certificates().iter() {
@@ -219,10 +226,16 @@ impl DedupWindow {
                 self.resolved.push((tx_hash, deadline));
             }
         }
-        let provision_deadline = anchor.plus(RETENTION_HORIZON);
+        let anchored_deadline = anchor.plus(RETENTION_HORIZON);
         for hash in block.provision_hashes() {
-            self.provisions.push((hash, provision_deadline));
+            self.provisions.push((hash, anchored_deadline));
         }
+        self.engagements.extend(
+            block
+                .engagements()
+                .iter()
+                .map(|engagement| (*engagement, anchored_deadline)),
+        );
     }
 
     /// Fold one committed block's fee reservations in: what its

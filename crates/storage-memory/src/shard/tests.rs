@@ -27,9 +27,9 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, DEDUP_WINDOW, FEE_HOLD_WINDOW, FrontierInputs, Hash, LocalKey, RETENTION_HORIZON,
-    SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction,
-    TransactionDecision, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
+    ChainOrigin, DEDUP_WINDOW, Engagement, FEE_HOLD_WINDOW, FrontierInputs, Hash, LocalKey,
+    RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange,
+    Transaction, TransactionDecision, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -225,12 +225,14 @@ fn test_transactions_batch_with_indexed_block() {
             header,
             certificates,
             provision_hashes,
+            engagements,
             ..
         } => Block::Sealed {
             header,
             transactions: Arc::new(Capped::from_array([tx])),
             certificates,
             provision_hashes,
+            engagements,
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
@@ -894,4 +896,62 @@ fn dedup_window_stamps_each_batch_against_its_own_block() {
         ],
         "two blocks at different anchors must not share one deadline",
     );
+}
+
+/// The engagement tier seeds from the lists the stored blocks keep, each
+/// entry at its own block's anchor plus the horizon — the clock the live
+/// commit stamps with — and no provision body is read.
+#[test]
+fn dedup_window_seeds_engagements_from_block_lists() {
+    let storage = SimShardStorage::default();
+    let (older_ms, newer_ms) = (10_000u64, 40_000u64);
+    let (older_tx, newer_tx) = (test_transaction(4).hash(), test_transaction(5).hash());
+    let payer = ShardId::leaf(1, 1);
+
+    for (height, anchor_ms, tx_hash) in [(1u64, older_ms, older_tx), (2, newer_ms, newer_tx)] {
+        let block = test_helpers::with_provisions(
+            block_with_txs(BlockHeight::new(height), anchor_ms, vec![]),
+            payer,
+            tx_hash,
+        );
+        commit_empty(&storage, &block);
+    }
+    assert!(
+        !storage
+            .get_block(BlockHeight::new(1))
+            .expect("stored")
+            .block()
+            .is_live(),
+        "the walk reads sealed blocks"
+    );
+
+    let window = DedupWindow::from_reader(
+        &storage,
+        BlockHeight::new(2),
+        WeightedTimestamp::from_millis(newer_ms),
+        ChainOrigin {
+            genesis_height: BlockHeight::new(1),
+            anchor_wt: WeightedTimestamp::ZERO,
+        },
+    );
+
+    let mut seeded = window.engagements;
+    seeded.sort_unstable();
+    let entry = |tx_hash| Engagement {
+        source: payer,
+        tx_hash,
+        source_height: BlockHeight::new(1),
+    };
+    let mut expected = vec![
+        (
+            entry(older_tx),
+            WeightedTimestamp::from_millis(older_ms).plus(RETENTION_HORIZON),
+        ),
+        (
+            entry(newer_tx),
+            WeightedTimestamp::from_millis(newer_ms).plus(RETENTION_HORIZON),
+        ),
+    ];
+    expected.sort_unstable();
+    assert_eq!(seeded, expected);
 }

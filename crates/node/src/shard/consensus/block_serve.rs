@@ -188,6 +188,7 @@ mod tests {
             transactions,
             certificates,
             provision_hashes: Arc::new(Capped::from_array([hash])),
+            engagements: Arc::new(Capped::empty()),
             abandonment_records,
             state_claims,
             witness_sources,

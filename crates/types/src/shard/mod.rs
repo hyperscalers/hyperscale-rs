@@ -3,6 +3,8 @@
 //! - [`block`]: [`Block`] (the Live/Sealed enum).
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
 //! - [`certified_header`]: [`CertifiedBlockHeader`] cross-shard trust attestation.
+//! - [`engagement`]: [`Engagement`](engagement::Engagement), a transaction
+//!   a block's provisions name, which the committed engagement tier folds.
 //! - [`evidence`]: [`ShardVoteEquivocation`] self-proving double-vote evidence.
 //! - [`demands`]: what a block [`Demands`](demands::Demands) be checked
 //!   before a vote, and how one [`CheckOutcome`](demands::CheckOutcome) ends.
@@ -39,6 +41,7 @@ pub mod chain_origin;
 pub mod commit_proof;
 pub mod counterpart_mirror;
 pub mod demands;
+pub mod engagement;
 pub mod evidence;
 pub mod fork_fence;
 pub mod header;

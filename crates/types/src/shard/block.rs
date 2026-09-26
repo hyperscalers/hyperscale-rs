@@ -6,6 +6,7 @@
 //! verified) and every internal commitment root the block declares has
 //! been checked against the inline data.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor};
@@ -13,11 +14,11 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
-    ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
-    StateRoot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, WitnessSources,
+    Engagement, Engagements, ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, ShardId, SharedWitnessSources,
+    SplitChildRoots, StateClaim, StateRoot, Transaction, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -109,7 +110,9 @@ pub fn fees_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) ->
 ///
 /// The header's `provision_root` commits to the original provision set, so
 /// `Sealed` is self-consistent — a `Live` block matches its `Sealed` form
-/// modulo the provision payload.
+/// modulo the provision payload. A `Sealed` block keeps the engagements
+/// those bodies named, which the header's `engagement_root` binds: the
+/// engagement tier is folded from them wherever the bodies are gone.
 #[derive(Debug, Clone, Hbor)]
 pub enum Block {
     /// Block within its cross-shard execution window — carries provisions.
@@ -153,6 +156,11 @@ pub enum Block {
         /// Content hashes of the provisions the block consumed while
         /// `Live`. Empty iff the block consumed no provisions.
         provision_hashes: Arc<Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>>,
+        /// The transactions the dropped provisions named, by the shard
+        /// and height that sent them, ascending. Committed via the
+        /// header's `engagement_root`, which a `Live` block's bodies
+        /// derive.
+        engagements: Arc<Engagements>,
         /// What departed shards left unresolved of this chain's business.
         ///
         /// Retained through sealing, unlike provisions: a verdict is
@@ -527,6 +535,21 @@ impl Block {
         }
     }
 
+    /// The engagements the block's provisions name, regardless of
+    /// variant: derived from the bodies on `Live`, read from the kept
+    /// list on `Sealed`. The two agree on the same block by
+    /// construction, as [`Self::provision_hashes`] does: `into_sealed`
+    /// derives the list before dropping the bodies.
+    #[must_use]
+    pub fn engagements(&self) -> Cow<'_, [Engagement]> {
+        match self {
+            Self::Live { provisions, .. } => {
+                Cow::Owned(Engagement::of_provisions(provisions).into_iter().collect())
+            }
+            Self::Sealed { engagements, .. } => Cow::Borrowed(engagements),
+        }
+    }
+
     /// Content hashes of the block's provisions, regardless of variant.
     /// Computed inline from `provisions` on `Live`; read from the carried
     /// list on `Sealed`. The two paths agree on the same block by
@@ -565,10 +588,19 @@ impl Block {
         matches!(self, Self::Live { .. })
     }
 
-    /// Convert to `Sealed` by dropping provision bodies and retaining only
-    /// their hashes. Identity on an already-sealed block. This is the
-    /// canonical persisted shape; sync-serving glue re-attaches provision
-    /// bodies (via `into_live`) when the requester needs them.
+    /// Convert to `Sealed` by dropping provision bodies and retaining
+    /// their hashes and the engagements they named. Identity on an
+    /// already-sealed block. This is the canonical persisted shape;
+    /// sync-serving glue re-attaches provision bodies (via `into_live`)
+    /// when the requester needs them.
+    ///
+    /// # Panics
+    ///
+    /// If the bodies name more than [`MAX_ENGAGEMENTS_PER_BLOCK`]
+    /// transactions, which the provisions section refuses of any block
+    /// a chain commits.
+    ///
+    /// [`MAX_ENGAGEMENTS_PER_BLOCK`]: crate::MAX_ENGAGEMENTS_PER_BLOCK
     #[must_use]
     pub fn into_sealed(self) -> Self {
         match self {
@@ -584,11 +616,15 @@ impl Block {
                 // One hash per body, so the list keeps the cap the
                 // provisions field already met.
                 let hashes = provisions.map(|p| p.hash());
+                let engagements =
+                    Capped::new(Engagement::of_provisions(&provisions).into_iter().collect())
+                        .expect("the provisions section caps what a block's provisions name");
                 Self::Sealed {
                     header,
                     transactions,
                     certificates,
                     provision_hashes: Arc::new(hashes),
+                    engagements: Arc::new(engagements),
                     abandonment_records,
                     state_claims,
                     witness_sources,
@@ -600,7 +636,8 @@ impl Block {
 
     /// Attach provisions, promoting `Sealed` → `Live`. Used by sync-serving
     /// to upgrade a persisted block when the requester is still inside the
-    /// cross-shard execution window.
+    /// cross-shard execution window. The kept engagements go: the bodies
+    /// derive them.
     ///
     /// # Panics
     ///

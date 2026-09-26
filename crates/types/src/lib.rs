@@ -116,10 +116,10 @@ pub use network::{
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot,
-    FinalizationHash, GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
-    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, RevealChain, SettledTxsRoot, StateClaimsRoot,
-    StateRoot, TransactionRoot, TxHash, WritesRoot,
+    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
+    EngagementRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
+    GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
+    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex,
@@ -159,6 +159,7 @@ pub use shard::commit_proof::{
 };
 pub use shard::counterpart_mirror::CounterpartMirror;
 pub use shard::demands::{CheckOutcome, DeferOn, Demands, VerificationKind};
+pub use shard::engagement::{Engagement, Engagements};
 pub use shard::evidence::{
     ShardForkProof, ShardForkProofVerifyError, ShardVoteEquivocation, ShardVoteEquivocationContext,
     ShardVoteEquivocationVerifyError, verify_shard_vote_equivocation,
@@ -172,13 +173,14 @@ pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, Rehy
 pub use shard::limits::{
     ABANDONMENT_RECORD_BYTES, BLOCK_CAPS, ESCROWED_RECORD_BYTES, MAX_BLOCK_COMPUTE,
     MAX_BLOCK_FOOTPRINT, MAX_BLOCK_READ_BYTES, MAX_BLOCK_RETENTION_BYTES, MAX_BLOCK_WRITE_BYTES,
-    MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, MAX_FETCH_RESPONSE_BYTES,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
-    MAX_ROUND_GAP, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK,
-    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES,
-    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES,
-    ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
+    MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
+    MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_CLAIMS_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+    MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
+    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
     STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TX_CAPS, UNCLAIMED_CROSSING_BYTES,
     UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction, drain_admits_block,
     evidence_admits_block, state_claims_admit_block, sweep_admits_block,
@@ -194,9 +196,9 @@ pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CommittingShards, LeafRoot,
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    REVEAL_CHAIN_DOMAIN_TAG, RootMismatch, SplitChildRoots, StateRootContext, StateRootVerifyError,
-    TransactionRootContext, TxRootVerifyError, commit_witness_window, derive_leaves,
-    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
+    REVEAL_CHAIN_DOMAIN_TAG, RootMismatch, SetRoot, SplitChildRoots, StateRootContext,
+    StateRootVerifyError, TransactionRootContext, TxRootVerifyError, commit_witness_window,
+    derive_leaves, derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
     settled_txs_root_from_hashes,
 };
