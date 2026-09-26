@@ -11,10 +11,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_hbor::Capped;
+use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
-    Address, CollectionId, Deadline, DeclaredKey, Joins, MAX_HOLDS_PER_MEMBER, Mode, ModeKind,
-    Role, Settlement, ShardId, SubstateKey, TickLine, TopologySnapshot, Transaction, TxHash,
-    WeightedTimestamp, compatible, tick_manifest_admits_block,
+    Address, CollectionId, Deadline, DeclaredKey, Joins, MAX_HOLDS_PER_MEMBER,
+    MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Role, Settlement, ShardId, ShardTrie, SubstateKey,
+    TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, compatible,
+    tick_manifest_admits_block,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -236,8 +238,13 @@ impl MemberFacts {
             .into_iter()
             .collect();
         let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-        let decomposed = classified.decomposed();
-        let member = Member::of(classified, local, participating);
+        Self::of_member(&Member::of(classified, local, participating), tx, trie)
+    }
+
+    /// The facts of `member`, `tx`'s member classified under `trie`.
+    #[must_use]
+    pub fn of_member(member: &Member, tx: &Transaction, trie: &ShardTrie) -> Self {
+        let local = member.local();
         let reaches_beyond = member.reaches_beyond();
         let settlement = if !member.abortable() {
             Settlement::Alone
@@ -248,8 +255,8 @@ impl MemberFacts {
         };
         let (requires, engagement) = if !reaches_beyond {
             (BTreeSet::new(), None)
-        } else if decomposed {
-            (requirements_of(&member, tx.legs()), None)
+        } else if member.classified().decomposed() {
+            (requirements_of(member, tx.legs()), None)
         } else {
             let remote: BTreeSet<ShardId> = member
                 .reach()
@@ -339,20 +346,93 @@ pub fn readiness(
     }
 }
 
-/// What a manifest has spent of its byte budget.
+/// Committed inputs as the sets a coordinator gathers for the members
+/// it asks about: what it hands a builder, and what a voter reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommittedSets {
+    /// `(source, tx)` for every committed bundle naming `tx`.
+    pub engaged: BTreeSet<(ShardId, TxHash)>,
+    /// `(record, tx)` for every record read live naming `tx`, at or after
+    /// the block that committed `tx`.
+    pub arrived: BTreeSet<(SubstateKey, TxHash)>,
+}
+
+impl CommittedInputs for CommittedSets {
+    fn engaged(&self, source: ShardId, tx: TxHash) -> bool {
+        self.engaged.contains(&(source, tx))
+    }
+
+    fn arrived(&self, key: SubstateKey, tx: TxHash) -> bool {
+        self.arrived.contains(&(key, tx))
+    }
+}
+
+/// What a proposer's coordinator hands the block builder.
+///
+/// The facts of every member it may name, and what committed content up
+/// to the parent says of them. The builder adds the block's own bundles
+/// and claims, once it has dropped what the block will not carry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestInputs {
+    /// Each member's facts, by transaction.
+    pub facts: BTreeMap<TxHash, MemberFacts>,
+    /// What committed content up to the parent says of them.
+    pub committed: CommittedSets,
+}
+
+/// The member lines a block names over `rows`: the family after the
+/// block's own finalizations, discards, records and transactions.
+///
+/// Every `Pending` row is a candidate, and every in-flight row's holds
+/// are held. A candidate whose facts `facts` does not have is left
+/// waiting and returned beside the lines, so a voter, which cannot judge
+/// a manifest without them, defers, and a proposer names what it can.
+#[must_use]
+pub fn member_lines<'f>(
+    rows: &MemberIndex,
+    anchor: WeightedTimestamp,
+    facts: &dyn Fn(TxHash) -> Option<&'f MemberFacts>,
+    inputs: &dyn CommittedInputs,
+) -> (Vec<TickLine>, Vec<TxHash>) {
+    let mut holds = ProvisionalCells::default();
+    let mut candidates = Vec::new();
+    let mut missing = Vec::new();
+    for row in rows.members.values() {
+        match row.state {
+            RowState::Pending => match facts(row.tx) {
+                Some(known) => candidates.push((row.tx, known)),
+                None => missing.push(row.tx),
+            },
+            RowState::InFlight { .. } => holds.claim(&row.holds),
+            RowState::Released => {}
+        }
+    }
+    let lines = select_members(
+        anchor,
+        candidates,
+        inputs,
+        &mut holds,
+        &mut ManifestBudget::default(),
+    );
+    (lines, missing)
+}
+
+/// What a manifest has spent of its byte budget and its line cap.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ManifestBudget {
     spent: usize,
+    lines: usize,
 }
 
 impl ManifestBudget {
     /// Take `line` if it fits what is left, and say whether it did.
     pub fn take(&mut self, line: &TickLine) -> bool {
         let spent = self.spent.saturating_add(line.wire_weight());
-        if !tick_manifest_admits_block(spent) {
+        if !tick_manifest_admits_block(spent) || self.lines >= MAX_TICK_LINES_PER_BLOCK {
             return false;
         }
         self.spent = spent;
+        self.lines += 1;
         true
     }
 }

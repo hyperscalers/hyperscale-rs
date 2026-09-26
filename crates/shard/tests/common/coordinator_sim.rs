@@ -1466,6 +1466,7 @@ impl ShardCoordinatorSim {
                 fence: _,
                 parent_anchor,
                 local_crossings,
+                manifest,
             } => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
                 // whose QC round sits below the honest lock, so honest
@@ -1612,6 +1613,7 @@ impl ShardCoordinatorSim {
                     carry_split_child_roots,
                     terminal_settled_txs,
                     &frontier,
+                    &manifest,
                 );
                 let block_hash = result.block_hash;
                 let bytes_delta = result.jmt_snapshot.bytes_delta;

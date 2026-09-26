@@ -192,7 +192,9 @@ mod tests {
     use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{RecoveredState, ReplayWindow};
-    use hyperscale_types::test_utils::{certify, make_live_block, test_transaction};
+    use hyperscale_types::test_utils::{
+        certify, make_live_block, naming_its_own, test_transaction,
+    };
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock,
         CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot,
@@ -325,9 +327,8 @@ mod tests {
                 vec![],
             );
             tip = block.hash();
-            blocks.push(Verified::<CertifiedBlock>::from_persisted(certify(
-                block,
-                height * 1_000,
+            blocks.push(Verified::<CertifiedBlock>::from_persisted(naming_its_own(
+                &certify(block, height * 1_000),
             )));
         }
         let recovered = RecoveredState {

@@ -23,14 +23,14 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use hyperscale_engine::legs::Classified;
+use hyperscale_engine::legs::{Classified, Member};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
     Finalization, FinalizationHash, MAX_ENGAGEMENTS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_HELD_VALUE_BYTES, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_BYTES,
-    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, StateClaim,
-    SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable,
-    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
+    MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_STATE_CLAIMS_BYTES, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, RETENTION_HORIZON,
+    ShardId, StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    Verifiable, WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
     evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
@@ -328,6 +328,22 @@ impl<'p> Section for TransactionsSection<'p> {
             return Err(format!(
                 "transaction {tx_hash} only delivers here, which its commit fold credits"
             ));
+        }
+        // A member a counterpart's verdict can still discard holds what it
+        // declared while in flight, and its line carries those holds: one
+        // declaring more than a line carries could never be named, so it
+        // is never carried either.
+        if tx.routing().declared_modes.len() > MAX_HOLDS_PER_MEMBER {
+            let participating = ctx
+                .snapshot
+                .all_shards_for_transaction(tx)
+                .into_iter()
+                .collect();
+            if Member::of(classified.clone(), ctx.local_shard, participating).abortable() {
+                return Err(format!(
+                    "transaction {tx_hash} declares more accesses than a member line carries"
+                ));
+            }
         }
         let payer_shard = trie.shard_for_prefix(tx.fee_payer());
         if !ctx.snapshot.is_single_shard_transaction(tx)

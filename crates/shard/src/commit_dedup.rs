@@ -301,7 +301,6 @@ impl CommitDedupIndex {
 
     /// Whether a committed claim read `record` live naming `tx` in a
     /// block at or above `since`, for an admission anchored at `at`.
-    #[cfg(test)]
     pub(crate) fn arrived(
         &self,
         record: SubstateKey,

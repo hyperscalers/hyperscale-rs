@@ -381,12 +381,6 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<RecordsSection<'_>>(ctx, &mut records, block.abandonment_records())?;
     let mut state_claims = StateClaimsFold::default();
     admit_all::<StateClaimsSection>(ctx, &mut state_claims, block.state_claims())?;
-    if !block.tick_manifest().is_empty() {
-        return Err(format!(
-            "block names {} tick lines, and no line is admissible yet",
-            block.tick_manifest().len()
-        ));
-    }
     Ok(transactions.budget)
 }
 

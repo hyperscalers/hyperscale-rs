@@ -7,6 +7,7 @@ use std::time::Duration;
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
 use hyperscale_engine::legs::{Member, Runs};
+use hyperscale_engine::tick_select::ManifestInputs;
 use hyperscale_storage::{CommittedHere, MemberInputs, TickResolution};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
@@ -1141,6 +1142,11 @@ pub enum Action {
         /// What the read frontier judges of the offered content. The
         /// handler drops whatever it refuses against the parent state.
         fence: ReadFence,
+        /// What the block's member lines are named over: each member's
+        /// facts and what committed content up to the parent says of
+        /// them. The handler adds the block's own bundles and claims once
+        /// it has dropped what the block will not carry.
+        manifest: ManifestInputs,
     },
 
     /// Execute one tick's whole batch: the committing block's

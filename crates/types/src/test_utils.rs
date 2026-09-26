@@ -19,14 +19,14 @@ use crate::{
     BlockHeaderParts, BlockHeight, BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader,
     ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
     DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt, ExecutionCertificate,
-    ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, MerkleInclusionProof,
+    ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins, MerkleInclusionProof,
     NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Role,
-    Round, Routing, ShardForkProof, ShardId, ShardLoad, SignerBitfield, StateClaim, StateRoot,
-    StateWrites, StoredReceipt, TickHalf, TickId, TimestampRange, TopologySnapshot, Transaction,
-    TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
-    ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-    compute_global_receipt_root, install_protocol_statics, protocol_statics_installed,
-    signed_bytes,
+    Round, Routing, Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, StateClaim,
+    StateRoot, StateWrites, StoredReceipt, TickHalf, TickId, TickLine, TimestampRange,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, install_protocol_statics,
+    protocol_statics_installed, signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -376,6 +376,88 @@ pub fn make_live_block(
         tick_manifest: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
+}
+
+/// `certified` naming each of its own transactions as a determined member,
+/// in hash order: what a proposer names for single-shard transactions,
+/// every one ready in the block that commits it.
+#[must_use]
+pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
+    let mut hashes: Vec<TxHash> = certified
+        .block()
+        .transactions()
+        .iter()
+        .map(|tx| tx.hash())
+        .collect();
+    hashes.sort_unstable();
+    naming(
+        certified,
+        hashes
+            .into_iter()
+            .map(|tx| TickLine::Member {
+                tx,
+                joins: Joins::Executes,
+                settlement: Settlement::Alone,
+                holds: Capped::empty(),
+            })
+            .collect(),
+    )
+}
+
+/// `certified` with its tick manifest replaced by `lines`, header and
+/// certificate untouched: a fixture's block naming what its own commit
+/// seated, for a replay that seats from the manifest.
+///
+/// # Panics
+///
+/// If `lines` overruns the manifest's cap.
+#[must_use]
+pub fn naming(certified: &CertifiedBlock, lines: Vec<TickLine>) -> CertifiedBlock {
+    let manifest = Arc::new(Capped::new(lines).expect("a fixture names under the cap"));
+    let (block, qc) = certified.clone().into_parts();
+    let block = match block {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest: manifest,
+            witness_sources,
+        },
+        Block::Sealed {
+            header,
+            transactions,
+            certificates,
+            provision_hashes,
+            engagements,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } => Block::Sealed {
+            header,
+            transactions,
+            certificates,
+            provision_hashes,
+            engagements,
+            abandonment_records,
+            state_claims,
+            tick_manifest: manifest,
+            witness_sources,
+        },
+    };
+    CertifiedBlock::new_unchecked(block, qc)
 }
 
 /// Pair a block with a minimal valid `QuorumCertificate` so it satisfies

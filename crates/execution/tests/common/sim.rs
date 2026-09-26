@@ -41,7 +41,9 @@ use hyperscale_storage::{
     Anchored, RecoveredState, ReplayWindow, SubstateStore, Substates, TickChain, TickOutput,
     VersionedStore, merge_writes_from_receipts,
 };
-use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, certify, make_live_block};
+use hyperscale_types::test_utils::{
+    StubVmStatics, TestCommittee, certify, make_live_block, naming,
+};
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
     ConsensusReceipt, CounterpartMirror, DeclaredRange, EventRoot, ExecutionCertificate,
@@ -320,16 +322,19 @@ impl ExecutionSim {
                 .collect(),
         );
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
-        self.committed
-            .push(Verified::<CertifiedBlock>::from_persisted(
-                certified.clone(),
-            ));
         // The fixture's blocks all extend the genesis QC, so each one's
         // committee anchor is its own.
         let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
-        let effects = self
-            .coord
-            .commit_block(&self.topology, &certified, committee_anchor);
+        let effects =
+            self.coord
+                .commit_block_composing(&self.topology, &certified, committee_anchor);
+        // Kept naming what its commit seated, as a proposer's block
+        // would, so a replay seats the same members.
+        self.committed
+            .push(Verified::<CertifiedBlock>::from_persisted(naming(
+                &certified,
+                effects.named,
+            )));
         self.absorb(effects.actions);
         // Persistence follows the commit, which is when the chain evicts
         // the folds it believes the base now covers.
@@ -386,16 +391,19 @@ impl ExecutionSim {
             sealed @ Block::Sealed { .. } => sealed,
         };
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
-        self.committed
-            .push(Verified::<CertifiedBlock>::from_persisted(
-                certified.clone(),
-            ));
         // The fixture's blocks all extend the genesis QC, so each one's
         // committee anchor is its own.
         let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
-        let effects = self
-            .coord
-            .commit_block(&self.topology, &certified, committee_anchor);
+        let effects =
+            self.coord
+                .commit_block_composing(&self.topology, &certified, committee_anchor);
+        // Kept naming what its commit seated, as a proposer's block
+        // would, so a replay seats the same members.
+        self.committed
+            .push(Verified::<CertifiedBlock>::from_persisted(naming(
+                &certified,
+                effects.named,
+            )));
         self.absorb(effects.actions);
         self.chain.prune_persisted(self.height);
         self.release_due();

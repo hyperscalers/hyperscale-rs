@@ -9,15 +9,16 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
+use hyperscale_engine::tick_select::{ManifestInputs, member_lines};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    BeaconChainReader, ChainWrites, JmtSnapshot, MemberInputs, ParentAnchor, ShardChainWriter,
-    ShardStorage, SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore,
-    colliding_committed_cell, colliding_member_row, committed_tx_cells, creations_of,
-    load_read_frontier, sweep_for_block, without_colliding_committed_cells,
-    without_colliding_member_rows,
+    BeaconChainReader, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs, ParentAnchor,
+    ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex, TerminalWindow,
+    VersionedStore, colliding_committed_cell, colliding_member_row, committed_tx_cells,
+    creations_of, load_read_frontier, record_arrivals, sweep_for_block,
+    without_colliding_committed_cells, without_colliding_member_rows,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -210,6 +211,10 @@ pub struct ProposalResult {
 /// 2. Compute tx/cert/receipt/provision roots
 /// 3. Build `BlockHeader` + `Block`, hash it
 /// 4. Return block, hash, prepared commit handle
+///
+/// # Panics
+///
+/// Never: the member lines stop at the manifest's line cap.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // one linear block-assembly pipeline
 pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + SweepIndex>(
@@ -247,6 +252,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     carry_split_child_roots: bool,
     terminal_settled_txs: Option<SettledTxsRoot>,
     frontier: &FrontierInputs,
+    manifest: &ManifestInputs,
 ) -> ProposalResult {
     // The proposer builds on an anchored view of its parent — the state
     // this block's settling movements land on, the pending chain its
@@ -288,18 +294,36 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // proposer's voters, a replica committing on the certificate alone,
     // a split child following the block — derives the same set.
     let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
-    // The lines naming what this block's tick holds and lets go, and
-    // what the block does to tick membership.
-    let tick_manifest: Arc<TickManifest> = Arc::new(Capped::empty());
-    let members = MemberInputs::from_parts(
-        local_shard,
-        height,
-        parent_qc.weighted_timestamp(),
-        transactions.iter().map(|tx| &***tx),
-        &certificates,
-        &abandonment_records,
-        Arc::clone(&tick_manifest),
-    );
+    // The member lines, named over the block as it will be carried: the
+    // parent's rows with this block's own content folded in, what the
+    // chain up to the parent says of each member, and the bundles and
+    // claims the block keeps.
+    let anchor = parent_qc.weighted_timestamp();
+    let content = |manifest: Arc<TickManifest>| {
+        MemberInputs::from_parts(
+            local_shard,
+            height,
+            anchor,
+            transactions.iter().map(|tx| &***tx),
+            &certificates,
+            &abandonment_records,
+            manifest,
+        )
+    };
+    let tick_manifest: Arc<TickManifest> = {
+        let mut rows = MemberIndex::load(&anchored, local_shard);
+        rows.advance(&content(Arc::new(Capped::empty())));
+        let mut inputs = manifest.committed.clone();
+        inputs.engaged.extend(
+            Engagement::of_provisions(&provisions)
+                .into_iter()
+                .map(|engagement| (engagement.source, engagement.tx_hash)),
+        );
+        inputs.arrived.extend(record_arrivals(&state_claims));
+        let (lines, _) = member_lines(&rows, anchor, &|tx| manifest.facts.get(&tx), &inputs);
+        Arc::new(Capped::new(lines).expect("the budget stops at the line cap"))
+    };
+    let members = content(Arc::clone(&tick_manifest));
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,
@@ -1366,6 +1390,7 @@ where
             fence,
             parent_anchor,
             local_crossings,
+            manifest,
         } => {
             // Sign the block's randomness reveal here — off the main loop, on
             // the dispatch pool — so the sans-io coordinator holds no key. Its
@@ -1597,6 +1622,7 @@ where
                 carry_split_child_roots,
                 terminal_settled_txs,
                 &frontier,
+                &manifest,
             );
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;

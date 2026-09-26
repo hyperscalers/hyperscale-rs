@@ -10,9 +10,9 @@
 //! [`Requirement`]s, and `arrived` the crossing records committed
 //! claims have read for the candidates that consume them.
 //!
-//! A tx is fully provisioned when every requirement is met; that predicate
-//! is surfaced as [`is_fully_provisioned`](ProvisioningTracker::is_fully_provisioned)
-//! so callers never inspect the underlying maps.
+//! Whether a member is ready is not asked here: the tick's member lines
+//! name it, off committed inputs every replica reads alike, and this
+//! tracker holds what the member then runs with.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -267,6 +267,7 @@ impl ProvisioningTracker {
     /// for txs with no recorded requirements (single-shard txs or txs we
     /// aren't tracking). A recorded empty set is immediately satisfied —
     /// the member that waits on nothing and dispatches without waiting.
+    #[cfg(test)]
     pub(crate) fn is_fully_provisioned(&self, tx_hash: TxHash) -> bool {
         self.required.get(&tx_hash).is_some_and(|(_, required)| {
             required.iter().all(|requirement| match requirement {

@@ -16,12 +16,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn,
-    Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
-    PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
-    ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
-    SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, WindowLookup,
-    derive_reshape_trigger, ready_signal_window,
+    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror,
+    Deadline, DeferOn, Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
+    MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash,
+    ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary,
+    StateClaim, StoredReceipt, SubstateKey, TickLine, TxsInFlight, VerificationKind,
+    WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -142,9 +142,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_engine::tick_select::{ManifestInputs, member_lines};
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
-    CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, record_arrivals,
+    CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, ReplayWindow, RowState,
+    record_arrivals,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
@@ -184,6 +187,7 @@ use crate::proposal::{
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
+use crate::tick_members::{Ancestry, FactsCache, OwnContent, committed_sets};
 use crate::timeout_keeper::TimeoutKeeper;
 use crate::validation::{
     qc_has_local_quorum_power, qc_weighted_timestamp_too_far_ahead, validate_block_for_vote,
@@ -487,6 +491,16 @@ pub struct ShardCoordinator {
     /// state's own rows without a read of the store.
     member_rows: MemberIndex,
 
+    /// Each member's facts, classified where this node first held its
+    /// body: the half of what a member line is judged over that the rows
+    /// do not carry.
+    member_facts: FactsCache,
+
+    /// The replay window's transactions, each with the anchor its
+    /// including block's committee resolves at, awaiting the schedule
+    /// that classifies them.
+    restored_bodies: Vec<(Arc<Verifiable<Transaction>>, WeightedTimestamp)>,
+
     /// Ticks whose determined half the chain still owes, mirrored from
     /// the execution fold so the proposer and the vote path judge
     /// settlement order by one rule. Empty until the node reports one,
@@ -766,6 +780,8 @@ impl ShardCoordinator {
                 .members
                 .clone()
                 .unwrap_or_else(|| MemberIndex::empty(local_shard)),
+            member_facts: FactsCache::default(),
+            restored_bodies: restored_bodies(&recovered.replay),
             owed_determined: BTreeSet::new(),
             ready_signal_pool: ReadySignalPool::new(),
             detected_equivocators: BTreeSet::new(),
@@ -1986,6 +2002,199 @@ impl ShardCoordinator {
         })
     }
 
+    /// Classify the transactions of `block`, about to commit on the
+    /// current tip, under the committee the tip's anchor resolves: a block
+    /// this node commits on its certificate alone, or syncs, was never
+    /// classified by a vote.
+    fn classify_committing(&mut self, topology_schedule: &TopologySchedule, block: &Block) {
+        if let Some(committee) =
+            self.committee_at(topology_schedule, self.committed_block_anchor_wt)
+        {
+            self.member_facts.classify(
+                committee.as_ref(),
+                self.local_shard,
+                block.transactions().iter().map(|tx| tx.as_unverified()),
+            );
+        }
+    }
+
+    /// Classify the replay window's transactions whose committees the
+    /// schedule now resolves, and let go of those past their deadlines.
+    fn classify_restored(&mut self, topology_schedule: &TopologySchedule) {
+        if self.restored_bodies.is_empty() {
+            return;
+        }
+        let local = self.local_shard;
+        let committed = self.committed_block_anchor_wt;
+        let bodies = std::mem::take(&mut self.restored_bodies);
+        for (tx, anchor) in bodies {
+            if let Some(committee) = self.committee_at(topology_schedule, anchor) {
+                self.member_facts
+                    .classify(committee.as_ref(), local, [tx.as_unverified()]);
+            } else if !Deadline::of_transaction(tx.as_unverified()).passed(committed) {
+                self.restored_bodies.push((tx, anchor));
+            }
+        }
+    }
+
+    /// The chain between the committed tip and `parent`, every block of
+    /// it held and its transactions classified; `None` while a block of
+    /// it is not held here.
+    fn ancestry(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        parent: BlockHash,
+    ) -> Option<Ancestry> {
+        self.classify_restored(topology_schedule);
+        let mut blocks = Vec::new();
+        let mut current = parent;
+        while current != self.committed_hash {
+            let block = self.chain_view().get_block(current)?.clone();
+            if block.height() <= self.committed_height {
+                return None;
+            }
+            current = block.header().parent_block_hash();
+            blocks.push(block);
+        }
+        blocks.reverse();
+        let local = self.local_shard;
+        for block in &blocks {
+            if let Some(committee) = self.committee_of_block(topology_schedule, block.hash()) {
+                self.member_facts.classify(
+                    committee,
+                    local,
+                    block.transactions().iter().map(|tx| tx.as_unverified()),
+                );
+            }
+        }
+        Some(Ancestry::over(&self.member_rows, &blocks))
+    }
+
+    /// Whether `block`'s member lines are the ones the chain up to its
+    /// parent names: every `Pending` row ready at its anchor, in
+    /// canonical order under the hold rule, up to the budget.
+    ///
+    /// # Errors
+    ///
+    /// Refused for any other list; deferred while an ancestor is not held
+    /// or a candidate's facts are not, since a voter cannot judge
+    /// completeness without either.
+    fn check_tick_manifest(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
+        block: &Block,
+    ) -> Result<(), Withheld> {
+        if let Some(line) = block
+            .tick_manifest()
+            .iter()
+            .find(|line| !matches!(line, TickLine::Member { .. }))
+        {
+            return Err(Withheld::Refused(format!(
+                "the block names {line:?}, which no line admits yet"
+            )));
+        }
+        let Some(ancestry) = self.ancestry(topology_schedule, block.header().parent_block_hash())
+        else {
+            return Err(Withheld::deferred(
+                "a block between the committed tip and the parent is not held".into(),
+            ));
+        };
+        self.member_facts.classify(
+            committee,
+            self.local_shard,
+            block.transactions().iter().map(|tx| tx.as_unverified()),
+        );
+        let mut rows = ancestry.rows.clone();
+        rows.advance(&MemberInputs {
+            manifest: Arc::new(Capped::empty()),
+            ..MemberInputs::of(block)
+        });
+        let own = OwnContent::of(
+            &block.engagements().iter().copied().collect(),
+            record_arrivals(block.state_claims()),
+        );
+        let anchor = block.header().parent_qc().weighted_timestamp();
+        let sets = committed_sets(
+            &rows,
+            &self.member_facts,
+            &ancestry,
+            &own,
+            &self.dedup_index,
+            anchor,
+            committee,
+        );
+        let facts = &self.member_facts;
+        let (expected, missing) = member_lines(&rows, anchor, &|tx| facts.get(tx), &sets);
+        if let Some(tx) = missing.first() {
+            return Err(Withheld::deferred(format!(
+                "no facts held for pending member {tx:?}"
+            )));
+        }
+        if block.tick_manifest()[..] != expected[..] {
+            return Err(Withheld::Refused(format!(
+                "the block names {} member lines where the chain names {}",
+                block.tick_manifest().len(),
+                expected.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// What the builder of a block extending `parent` names members
+    /// over: the facts of every member it may name and what committed
+    /// content up to the parent says of them. `None` while a block
+    /// between the committed tip and the parent is not held.
+    #[allow(clippy::too_many_arguments)] // the block's parts the rows fold, beside its committee
+    fn manifest_inputs(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
+        parent: BlockHash,
+        height: BlockHeight,
+        anchor: WeightedTimestamp,
+        payload: Option<&ProposalPayload>,
+    ) -> Option<ManifestInputs> {
+        let ancestry = self.ancestry(topology_schedule, parent)?;
+        let local = self.local_shard;
+        let mut rows = ancestry.rows.clone();
+        if let Some(payload) = payload {
+            self.member_facts.classify(
+                committee,
+                local,
+                payload.transactions.iter().map(|tx| &***tx),
+            );
+            rows.advance(&MemberInputs::from_parts(
+                local,
+                height,
+                anchor,
+                payload.transactions.iter().map(|tx| &***tx),
+                &payload.finalizations,
+                &payload.abandonment_records,
+                Arc::new(Capped::empty()),
+            ));
+        }
+        let held = committed_sets(
+            &rows,
+            &self.member_facts,
+            &ancestry,
+            &OwnContent::default(),
+            &self.dedup_index,
+            anchor,
+            committee,
+        );
+        let facts = rows
+            .members
+            .values()
+            .filter(|row| row.state == RowState::Pending)
+            .filter_map(|row| Some((row.tx, self.member_facts.get(row.tx)?.clone())))
+            .collect();
+        Some(ManifestInputs {
+            facts,
+            committed: held,
+        })
+    }
+
     /// Tick membership at the committed tip.
     #[must_use]
     pub const fn member_rows(&self) -> &MemberIndex {
@@ -2614,6 +2823,28 @@ impl ShardCoordinator {
             }
             ProposalKind::Fallback | ProposalKind::Sync => Vec::new(),
         };
+        // What the block's member lines are named over, off the chain up
+        // to the parent; the builder names them once it has dropped what
+        // the block will not carry.
+        let payload = match &kind {
+            ProposalKind::Normal(payload) => Some(payload.as_ref()),
+            ProposalKind::Fallback | ProposalKind::Sync => None,
+        };
+        let Some(manifest) = self.manifest_inputs(
+            topology_schedule,
+            committee,
+            parent_block_hash,
+            height,
+            parent_qc.weighted_timestamp(),
+            payload,
+        ) else {
+            trace!(
+                validator = ?self.me,
+                height = height.inner(),
+                "A block between the committed tip and the parent is not held; deferring the build"
+            );
+            return vec![];
+        };
         let plan = assemble_build_action(
             self.me,
             self.local_shard,
@@ -2638,6 +2869,7 @@ impl ShardCoordinator {
             self.ancestry_committed_height(&parent_qc),
             substate_bytes,
             topology_schedule.windows(),
+            manifest,
         );
 
         info!(
@@ -3572,6 +3804,31 @@ impl ShardCoordinator {
                     "Block failed pre-vote validation - not voting"
                 );
                 return vec![];
+            }
+            // The member lines are judged over the chain up to the parent,
+            // which a coast block, naming none, never reads.
+            if !coasting {
+                match self.check_tick_manifest(topology_schedule, committee, block) {
+                    Ok(()) => {}
+                    Err(Withheld::Refused(why)) => {
+                        warn!(
+                            validator = ?self.me,
+                            block_hash = ?block_hash,
+                            %why,
+                            "The block's member lines are not the chain's — not voting"
+                        );
+                        return vec![];
+                    }
+                    Err(Withheld::Deferred { why, wanted }) => {
+                        trace!(
+                            validator = ?self.me,
+                            block_hash = ?block_hash,
+                            %why,
+                            "The block's member lines cannot yet be judged — deferring"
+                        );
+                        return wanted;
+                    }
+                }
             }
 
             // Blocks the safe-vote rule declines must still run verification to
@@ -5056,6 +5313,7 @@ impl ShardCoordinator {
             self.committed_hash,
         );
 
+        self.classify_committing(topology_schedule, block);
         self.committed_height = height;
         self.committed_hash = block_hash;
         self.committed_rounds.insert(height, block.header().round());
@@ -5252,6 +5510,7 @@ impl ShardCoordinator {
             anchor,
         );
         self.member_rows.advance(&MemberInputs::of(block));
+        self.member_facts.retain(&self.member_rows, anchor);
     }
 
     /// Commit-time fee-ledger bookkeeping: engage the block's
@@ -7162,6 +7421,29 @@ impl ShardCoordinator {
     }
 }
 
+/// The replay window's transactions, each with the anchor its including
+/// block's committee resolves at: the block below's own anchor, which is
+/// the window's resume clock for its first block.
+fn restored_bodies(
+    replay: &ReplayWindow,
+) -> Vec<(Arc<Verifiable<Transaction>>, WeightedTimestamp)> {
+    let mut below = replay.anchor_wt;
+    let mut bodies = Vec::new();
+    for certified in &replay.blocks {
+        let block = certified.block();
+        let own = block.header().parent_qc().weighted_timestamp();
+        let committee_anchor = below.unwrap_or(own);
+        bodies.extend(
+            block
+                .transactions()
+                .iter()
+                .map(|tx| (Arc::clone(tx), committee_anchor)),
+        );
+        below = Some(own);
+    }
+    bodies
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -7170,17 +7452,17 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{DedupWindow, committed_tx_cell_key};
-    use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
+    use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, DeclaredWork, Epoch, Hash,
-        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof, NetworkDefinition,
-        NetworkParams, ProvisionEntry, RETENTION_HORIZON, RoutePrefix, SettledSetVerdict,
-        SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield,
-        StateClaimsRoot, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
-        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
-        ValidatorSet, VoteCount, WeightedTimestamp, WindowLookup, WitnessSources,
-        settled_set_verdict, test_utils,
+        Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof,
+        NetworkDefinition, NetworkParams, ProvisionEntry, RETENTION_HORIZON, RoutePrefix,
+        SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TimestampRange, TopologySchedule,
+        TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
+        WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -7697,6 +7979,113 @@ mod tests {
                 block
             })
             .collect()
+    }
+
+    /// `block` carrying `transactions` and naming `lines`.
+    fn carrying(block: Block, transactions: &[Transaction], lines: Vec<TickLine>) -> Block {
+        let Block::Live {
+            header,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } = block
+        else {
+            unreachable!("a chained block is live")
+        };
+        Block::Live {
+            header,
+            transactions: Arc::new(
+                Capped::new(
+                    transactions
+                        .iter()
+                        .map(|tx| {
+                            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                                tx.clone(),
+                            )))
+                        })
+                        .collect(),
+                )
+                .expect("a list written out in a test"),
+            ),
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest: Arc::new(Capped::new(lines).expect("a list written out in a test")),
+            witness_sources,
+        }
+    }
+
+    fn member(tx: &Transaction) -> TickLine {
+        TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+        }
+    }
+
+    /// A voter admits exactly the member lines the chain up to the parent
+    /// names: a committed transaction ready at once is named in the next
+    /// block, and a block leaving it out, naming a transaction no row
+    /// stands for, or naming out of canonical order is refused.
+    #[test]
+    fn a_voter_admits_the_chains_member_lines_and_no_others() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"member tip"));
+        let mut pair = [test_transaction(1), test_transaction(2)];
+        pair.sort_by_key(Transaction::hash);
+        let [early, late] = pair;
+        assert!(early.is_routed() && late.is_routed());
+        // The committing block names nothing, so both stand pending.
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 1_000),
+            &[early.clone(), late.clone()],
+            Vec::new(),
+        );
+        let parent = committing.hash();
+        let (mut state, schedule) = committed_through(from, [committing]);
+        assert_eq!(state.member_rows().members.len(), 2);
+        let committee = Arc::clone(schedule.head());
+        let child = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(2), parent, 2_000),
+                &[],
+                lines,
+            )
+        };
+
+        assert!(
+            state
+                .check_tick_manifest(
+                    &schedule,
+                    &committee,
+                    &child(vec![member(&early), member(&late)])
+                )
+                .is_ok(),
+            "both are ready, and named in hash order",
+        );
+        for (refused, why) in [
+            (vec![member(&early)], "one ready member left out"),
+            (
+                vec![member(&late), member(&early)],
+                "out of canonical order",
+            ),
+            (
+                vec![member(&early), member(&late), member(&test_transaction(3))],
+                "a line no row stands for",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&schedule, &committee, &child(refused)),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
     }
 
     const ENGAGING_PAYER: ShardId = ShardId::leaf(1, 1);
@@ -11540,7 +11929,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
 
     fn make_test_tx_with_seed(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_utils::test_transaction(seed)))
+        Arc::new(Verifiable::from(test_transaction(seed)))
     }
 
     fn sort_txs_by_hash(txs: &mut [Arc<Verifiable<Transaction>>]) {

@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
+use hyperscale_engine::tick_select::ManifestInputs;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
     Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY,
@@ -462,6 +463,7 @@ pub fn assemble_build_action(
     fee_read_height: BlockHeight,
     substate_bytes: Option<u64>,
     windows: EpochWindows,
+    manifest: ManifestInputs,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
@@ -559,6 +561,7 @@ pub fn assemble_build_action(
         fence,
         parent_anchor,
         local_crossings,
+        manifest,
     };
 
     BuildActionPlan {

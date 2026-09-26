@@ -46,7 +46,7 @@ pub enum Withheld {
 }
 
 impl Withheld {
-    const fn deferred(why: String) -> Self {
+    pub(crate) const fn deferred(why: String) -> Self {
         Self::Deferred {
             why,
             wanted: Vec::new(),

@@ -412,7 +412,7 @@ mod tests {
     use hyperscale_execution::CommitEffects;
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
-        TestCommittee, certify, make_live_block, shard_fork_proof, test_transaction,
+        TestCommittee, certify, make_live_block, naming_its_own, shard_fork_proof, test_transaction,
     };
     use hyperscale_types::{
         Block, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, CertifiedBlock,
@@ -885,9 +885,9 @@ mod tests {
         node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::BlockCommitted {
-                certified: Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(certify(
-                    block, 1_000,
-                ))),
+                certified: Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+                    naming_its_own(&certify(block, 1_000)),
+                )),
                 committee_anchor: WeightedTimestamp::ZERO,
             },
         )
