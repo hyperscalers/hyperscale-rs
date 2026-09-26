@@ -55,11 +55,19 @@ impl TestNode {
 #[derive(Default)]
 pub struct TestNodeBuilder {
     local_idx: usize,
+    recovered: RecoveredState,
 }
 
 impl TestNodeBuilder {
     pub(crate) fn local_idx(mut self, idx: usize) -> Self {
         self.local_idx = idx;
+        self
+    }
+
+    /// Boot from `recovered`, as a restarted node does, instead of a
+    /// fresh start.
+    pub(crate) fn recovered(mut self, recovered: RecoveredState) -> Self {
+        self.recovered = recovered;
         self
     }
 
@@ -77,7 +85,7 @@ impl TestNodeBuilder {
             Arc::new(AllCodeRuns),
             local_shard,
             &ShardConsensusConfig::default(),
-            &RecoveredState::default(),
+            &self.recovered,
             beacon_coordinator,
             MempoolConfig::default(),
             ProvisionConfig::default(),

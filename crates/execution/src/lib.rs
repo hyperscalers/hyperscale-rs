@@ -40,7 +40,7 @@ mod record_reads;
 mod ticks;
 mod vote_tracker;
 
-pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
+pub use coordinator::{CommitEffects, CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
 pub use counterparts::{CrossingIndex, CrossingIndexSlot, Offers};
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;

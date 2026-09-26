@@ -43,15 +43,20 @@ impl ShardParticipation {
             }
             // Both halves resume from the same recovered tip: consensus
             // from the frontier it stored, execution from the
-            // transactions that frontier still owes an outcome for.
+            // transactions that frontier still owes an outcome for. The
+            // replay's folds are handed off as a live commit's are, and
+            // the tip is settled once over the last of them, so the
+            // restarted voter refuses by the fold's owed ticks before its
+            // first live commit.
             ProtocolEvent::CommittedStateRestored { height, hash, qc } => {
                 let mut actions = self
                     .shard_coordinator
                     .on_committed_state_restored(height, hash, qc);
-                actions.extend(
-                    self.execution_coordinator
-                        .on_committed_state_restored(topology_schedule, self.derivation.as_ref()),
-                );
+                let effects = self
+                    .execution_coordinator
+                    .on_committed_state_restored(topology_schedule, self.derivation.as_ref());
+                actions.extend(self.apply_commit_effects(effects));
+                actions.extend(self.settle_tip(topology_schedule));
                 actions
             }
             // Remote-header catch-up finished. The coordinator keeps no
@@ -115,14 +120,17 @@ impl ShardParticipation {
         let mut actions = self
             .remote_headers_coordinator
             .on_beacon_block_persisted(sched);
-        actions.extend(self.execution_coordinator.on_beacon_block_persisted(sched));
+        let effects = self.execution_coordinator.on_beacon_block_persisted(sched);
+        actions.extend(self.apply_commit_effects(effects));
         actions.extend(self.shard_coordinator.on_beacon_block_persisted(sched));
-        // A proposer whose committee lookup stalled on the missing epoch has no
-        // other retry signal: without this kick the view-change timer fires
+        // Settled after the shard's own redrive, since a commit parked on
+        // this window may have folded. Its proposal latch is also the
+        // only retry a proposer whose committee lookup stalled on the
+        // missing epoch has: without it the view-change timer fires
         // first, the height is re-proposed in a later round, and the
-        // round-contiguous commit rule never sees the consecutive rounds it
-        // needs. The post-dispatch hook turns the latch into one `try_propose`.
-        self.shard_coordinator.queue_ready_proposal();
+        // round-contiguous commit rule never sees the consecutive rounds
+        // it needs.
+        actions.extend(self.settle_tip(sched));
         actions
     }
 
@@ -178,18 +186,21 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::make_live_block;
+    use hyperscale_storage::{RecoveredState, ReplayWindow};
+    use hyperscale_types::test_utils::{certify, make_live_block, test_transaction};
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
-        ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot, QuorumCertificate, ShardId,
-        ValidatorId, Verified,
+        Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock,
+        CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot,
+        QuorumCertificate, ShardId, ValidatorId, Verified, WeightedTimestamp,
     };
 
     use crate::assert_emits;
+    use crate::state::NodeStateMachine;
     use crate::state::test_support::TestNode;
 
     /// `BlockSyncComplete` fans out to shard consensus, remote-headers, and
@@ -298,6 +309,124 @@ mod tests {
             node.shard_coordinator().committed_height(),
             restored_height,
             "committed height must reflect the restored value",
+        );
+    }
+
+    fn replay_window(count: u64) -> (RecoveredState, BlockHash) {
+        let mut blocks = Vec::new();
+        let mut tip = BlockHash::ZERO;
+        for height in 1..=count {
+            let block = make_live_block(
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                height * 1_000,
+                ValidatorId::new(0),
+                vec![Arc::new(test_transaction(u8::try_from(height).unwrap()))],
+                vec![],
+            );
+            tip = block.hash();
+            blocks.push(Verified::<CertifiedBlock>::from_persisted(certify(
+                block,
+                height * 1_000,
+            )));
+        }
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(count),
+            replay: ReplayWindow {
+                blocks,
+                compose_from: BlockHeight::GENESIS,
+                anchor_wt: Some(WeightedTimestamp::ZERO),
+            },
+            ..RecoveredState::default()
+        };
+        (recovered, tip)
+    }
+
+    fn restore(node: &mut NodeStateMachine, height: u64, tip: BlockHash) -> Vec<Action> {
+        node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::CommittedStateRestored {
+                height: BlockHeight::new(height),
+                hash: Some(tip),
+                qc: None,
+            },
+        )
+    }
+
+    /// The replay settles the tip once, so a restarted voter mirrors the
+    /// fold's owed determined ticks into consensus before its first live
+    /// commit, and refuses a skipped tick from boot.
+    #[test]
+    fn a_restored_replica_mirrors_the_owed_determined_ticks_before_any_live_commit() {
+        let (recovered, tip) = replay_window(3);
+        let TestNode { mut node, .. } = TestNode::builder().recovered(recovered).build();
+        assert!(node.shard_coordinator().owed_determined().is_empty());
+
+        let _ = restore(&mut node, 3, tip);
+
+        assert_eq!(
+            node.shard_coordinator().owed_determined(),
+            &BTreeSet::from([
+                BlockHeight::new(1),
+                BlockHeight::new(2),
+                BlockHeight::new(3)
+            ]),
+            "each replayed tick's determined half is owed until a block settles it",
+        );
+    }
+
+    /// A replay feeds only the execution fold and the tip: none of the
+    /// hooks the live commit stream feeds. The mempool marks a block's
+    /// transactions committed off that stream, so a live commit of the
+    /// same blocks reports each one and the replay reports none.
+    #[test]
+    fn a_replay_runs_no_liveness_hook() {
+        let (recovered, tip) = replay_window(20);
+
+        let TestNode { node: mut live, .. } = TestNode::new();
+        let mut reported = 0;
+        for certified in &recovered.replay.blocks {
+            reported += live
+                .handle(
+                    LocalTimestamp::ZERO,
+                    ProtocolEvent::BlockCommitted {
+                        certified: Arc::new(certified.clone()),
+                        committee_anchor: certified
+                            .block()
+                            .header()
+                            .parent_qc()
+                            .weighted_timestamp(),
+                    },
+                )
+                .iter()
+                .filter(|action| matches!(action, Action::EmitTransactionStatus { .. }))
+                .count();
+        }
+        assert_eq!(
+            reported, 20,
+            "the live stream reports every committed transaction"
+        );
+
+        let TestNode { mut node, .. } = TestNode::builder().recovered(recovered).build();
+        let actions = restore(&mut node, 20, tip);
+        for action in &actions {
+            assert!(
+                !matches!(
+                    action,
+                    Action::EmitTransactionStatus { .. }
+                        | Action::StartRemoteHeaderSync { .. }
+                        | Action::Fetch(FetchRequest::Ask {
+                            ids: FetchIds::ShardWitnesses(_),
+                            ..
+                        })
+                ),
+                "a replay ran a live hook: {action:?}",
+            );
+        }
+        assert_eq!(
+            node.shard_coordinator().owed_determined().len(),
+            20,
+            "and it settled the tip over the last replayed block",
         );
     }
 }

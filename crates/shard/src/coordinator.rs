@@ -1259,33 +1259,19 @@ impl ShardCoordinator {
         pending.into_iter().map(|(_, _, hash)| hash).collect()
     }
 
-    /// Whether `wt` lands past this shard's terminal window — the coast
-    /// region after a split's cut. A block whose parent QC carries such a
-    /// timestamp must be empty (it exists only to certify the crossing),
-    /// and a committed one terminates the chain.
-    fn past_terminal_window(
-        &self,
-        topology_schedule: &TopologySchedule,
-        wt: WeightedTimestamp,
-    ) -> bool {
-        topology_schedule
-            .at_for_shard(self.local_shard, wt)
-            .is_some_and(|(_, past_terminal)| past_terminal)
-    }
-
     /// Whether this chain has gone **quiescent**: the committed tip's parent QC
     /// sits past the shard's terminal window, i.e. the first coast block has
     /// committed and the crossing's canonical QC is readable from the committed
     /// chain. Content stops here — the terminal block is the last that can
-    /// decide a transaction — so the one-shot terminal sweep (aborting in-flight
-    /// transactions no later block can ever decide) keys on this flip.
+    /// decide a transaction — and execution's terminal latch reads the same
+    /// flip off the same committed tip.
     ///
     /// Quiescence is *not* the end of the chain's life: the committee keeps
     /// coasting, voting, and serving past this point until its reshape
     /// successors are live, which [`Self::dissolved`] is the test for.
     #[must_use]
     pub fn quiescent(&self, topology_schedule: &TopologySchedule) -> bool {
-        self.past_terminal_window(topology_schedule, self.committed_block_anchor_wt)
+        topology_schedule.past_terminal(self.local_shard, self.committed_block_anchor_wt)
     }
 
     /// Whether this chain may **dissolve** — stop proposing, ingesting headers,
@@ -1989,6 +1975,13 @@ impl ShardCoordinator {
         })
     }
 
+    /// The heights whose determined half the execution fold says the
+    /// chain still owes, as last mirrored here.
+    #[must_use]
+    pub const fn owed_determined(&self) -> &BTreeSet<BlockHeight> {
+        &self.owed_determined
+    }
+
     /// Mirror the execution fold's owed determined halves, which
     /// settlement order at admission is judged against.
     pub fn set_owed_determined(&mut self, owed: BTreeSet<BlockHeight>) {
@@ -2076,7 +2069,7 @@ impl ShardCoordinator {
         // exists solely to carry the chain's clock across the halt gap, so
         // the anchored-committee resolution downstream never sees a
         // stale-anchored block carry content.
-        if self.past_terminal_window(topology_schedule, parent_qc.weighted_timestamp())
+        if topology_schedule.past_terminal(self.local_shard, parent_qc.weighted_timestamp())
             || self.recovery_bridging(topology_schedule, parent_qc.weighted_timestamp())
         {
             return self.build_and_dispatch_proposal(
@@ -3527,7 +3520,7 @@ impl ShardCoordinator {
             // Coast blocks past a terminal cut and recovery bridge blocks
             // across a halt gap are both required empty.
             let anchor_wt = block.header().parent_qc().weighted_timestamp();
-            let coasting = self.past_terminal_window(topology_schedule, anchor_wt)
+            let coasting = topology_schedule.past_terminal(self.local_shard, anchor_wt)
                 || self.recovery_bridging(topology_schedule, anchor_wt);
             // A coast or bridge block is required empty, so it reads no
             // window: judged without one, it stays votable however stale

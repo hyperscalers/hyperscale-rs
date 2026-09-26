@@ -412,6 +412,17 @@ impl TopologySchedule {
         Self::resolved(self.lookup_for_shard(shard, wt))
     }
 
+    /// Whether `wt` lands past `shard`'s terminal window: the
+    /// past-terminal half of [`at_for_shard`](Self::at_for_shard). A
+    /// window this schedule has not committed or has evicted answers
+    /// `false`, so a replica whose schedule lags reads the flip once it
+    /// catches up.
+    #[must_use]
+    pub fn past_terminal(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+        self.at_for_shard(shard, wt)
+            .is_some_and(|(_, past_terminal)| past_terminal)
+    }
+
     /// Collapse a lookup tuple to its resolved committee — `None` for
     /// [`NotYetCommitted`](ScheduleLookup::NotYetCommitted) and
     /// [`Evicted`](ScheduleLookup::Evicted) alike. The one adapter behind

@@ -78,18 +78,12 @@ pub(in crate::state) struct ShardParticipation {
     /// a consistent stamp without threading it through every signature.
     pub(in crate::state) now: LocalTimestamp,
 
-    /// Latches the one-shot terminal sweep: when the local chain terminates at a
-    /// reshape boundary (the first coast commit), every in-flight transaction
-    /// and pending tick is aborted exactly once — no later block can ever decide
-    /// them.
-    pub(in crate::state) terminal_chain_swept: bool,
-
     /// Latches the pending-pool handback, and counts the offers made
     /// before it latched. Whatever the local chain admitted and never
     /// included is offered back to the network as it coasts to its
-    /// dissolution; the sweep above cannot reach those entries, because
-    /// an aborted transaction is a decided one and these were never
-    /// decided by anything.
+    /// dissolution; the terminal abort of in-flight transactions cannot
+    /// reach those entries, because an aborted transaction is a decided
+    /// one and these were never decided by anything.
     pub(in crate::state) pending_pool_handed_back: bool,
     pub(in crate::state) handback_attempts: u32,
 
@@ -205,7 +199,6 @@ impl ShardParticipation {
                 fork_fence.clone(),
             ),
             now: LocalTimestamp::ZERO,
-            terminal_chain_swept: false,
             pending_pool_handed_back: false,
             handback_attempts: 0,
             last_cleanup_height: None,

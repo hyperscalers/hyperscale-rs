@@ -8,62 +8,19 @@
 //!
 //! - `on_block_header_received` validates in-flight before shard ingest;
 //! - `on_qc_formed` gathers proposal inputs to feed `shard.on_qc_formed`;
-//! - `on_block_committed` fans out to mempool, remote-headers, provisions,
-//!   outbound-provisions, and execution in commit order;
+//! - `apply_commit_effects` and `settle_tip` take what an execution fold
+//!   returns, for a live commit, the restart's replay and a parked commit
+//!   folded on a beacon block alike;
 //! - `RemoteHeaderAdmitted` fans verified headers to execution + provisions.
-//!
-//! # Orchestration ordering — `on_block_committed`
-//!
-//! The fanout sequence has load-bearing dependencies. Reordering will
-//! silently break invariants the downstream coordinators rely on; the edges
-//! are not enforced by the type system.
-//!
-//! Dedup-index registration is owned by
-//! [`crate::coordinator::ShardCoordinator::record_block_committed`] (in the
-//! `shard` crate) and runs synchronously when the shard coordinator
-//! internally commits the block — earlier than this fanout.
-//!
-//! The order is, with the dependency edge that motivates each step:
-//!
-//! 1. `shard.on_block_committed_verification` — marks the block's JMT
-//!    snapshot as a usable parent in `PendingChain`. Child state-root
-//!    verifications in subsequent dispatches need this; if any are pending
-//!    against this block as their parent, they unblock here. Must precede
-//!    any path that may emit child verifications.
-//! 2. `mempool.on_block_committed` — Pending → Committed → Completed
-//!    transitions for `block.transactions` and `block.certificates`.
-//! 3. `remote_headers.on_block_committed` — liveness updates and
-//!    cross-shard timeout scheduling. Independent of the local coordinators
-//!    above; ordered here so all "cross-shard" work runs before execution.
-//! 4. `provisions.on_block_committed` — pruning + fallback timeouts. Reads
-//!    provision hashes directly off the block (`Block::Live` carries them
-//!    inline; `Block::Sealed` has none). Independent of mempool and
-//!    remote-headers; sequenced before execution because execution may
-//!    consume provisions queued here on the next proposal attempt.
-//! 5. `outbound_provisions.on_block_committed(qc.weighted_timestamp())` —
-//!    deterministic eviction sweep. Uses the shard consensus-authenticated weighted
-//!    timestamp from the QC so every validator evicts identically. Must
-//!    follow earlier steps because eviction reads the now-up-to-date
-//!    provisions state.
-//! 6. `apply_block_to_execution` — per-tick cleanup, tick dispatch (Live)
-//!    or tick-assignment recording (Sealed), and vote emission. Last
-//!    because (a) execution's tick-cleanup reads `block.certificates` after
-//!    mempool has finished its terminal-state transitions, and (b) vote
-//!    emission may produce actions whose ordering with respect to mempool
-//!    state matters.
-//!
-//! Finally, the function latches a proposal-retry via
-//! `shard.queue_ready_proposal()` — in-flight counts changed, so the next
-//! proposer needs to re-evaluate. The post-dispatch drain in `mod.rs::handle`
-//! invokes `try_event_driven_proposal` once.
 
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
+use hyperscale_execution::CommitEffects;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, ShardForkProof,
-    TopologySchedule, Verifiable, Verified, WeightedTimestamp, drain_admits_block,
+    BlockHash, BlockHeader, BlockManifest, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, QuorumCertificate, ShardForkProof, TopologySchedule, Verifiable, Verified,
+    drain_admits_block,
 };
 
 use super::ShardParticipation;
@@ -408,47 +365,51 @@ impl ShardParticipation {
         )
     }
 
-    /// Apply a committed block to execution: cert cleanup, tick setup +
-    /// dispatch (Live) or tick-assignment recording only (Sealed), and
-    /// vote emission. Provisions live inline on `Block::Live` — no separate
-    /// argument needed.
-    pub(in crate::state) fn apply_block_to_execution(
-        &mut self,
-        sched: &TopologySchedule,
-        certified: &CertifiedBlock,
-        committee_anchor: WeightedTimestamp,
-    ) -> Vec<Action> {
-        let mut actions = Vec::new();
+    /// Hand the node what an execution fold returned: the resolutions to
+    /// the mempool, then the fold's own actions, then, at the quiescence
+    /// commit, the abort of every transaction still in flight, which no
+    /// later block can decide. The abort follows the resolutions so a
+    /// transaction the terminal block settled completes on its outcome.
+    ///
+    /// Live commits, the restart's replay and a parked commit folded on a
+    /// beacon block all come through here.
+    pub(in crate::state) fn apply_commit_effects(&mut self, effects: CommitEffects) -> Vec<Action> {
+        let mut actions = self
+            .mempool_coordinator
+            .on_resolutions(&effects.resolutions);
+        actions.extend(effects.actions);
+        if effects.terminal {
+            actions.extend(self.mempool_coordinator.abort_in_flight());
+        }
+        actions
+    }
 
-        // Release execution's per-tick bookkeeping for finalizations included
-        // in this block. Per-tx terminal state for the mempool is already
-        // handled separately by `on_block_committed` reading
-        // `block.certificates`.
-        self.execution_coordinator
-            .cleanup_committed_finalizations(certified.block().certificates());
-
-        actions.extend(self.execution_coordinator.on_block_committed(
-            sched,
-            certified,
-            committee_anchor,
-        ));
-
-        // Round voting: scan all incomplete ticks and emit votes for
-        // complete ones. Single path to execution voting — abort intents
-        // have already been processed above (with override semantics), so
-        // the accumulator state is deterministic at this height. All
-        // validators at this height produce the same votes.
-        actions.extend(self.execution_coordinator.emit_vote_actions(sched));
-
+    /// What reads the tip after its folds, run once per event however
+    /// many blocks the event folded: the vote scan, the fold's owed
+    /// determined ticks mirrored into consensus (where the proposer's
+    /// selection and the vote path both refuse by them), and the
+    /// proposal latch.
+    ///
+    /// Each reads current state, so after a replay that a live commit
+    /// beat, it applies the live state and never the replay's.
+    pub(in crate::state) fn settle_tip(&mut self, sched: &TopologySchedule) -> Vec<Action> {
+        // The single path to execution voting from a commit: every
+        // replica at this tip produces the same votes.
+        let actions = self.execution_coordinator.emit_vote_actions(sched);
+        self.shard_coordinator
+            .set_owed_determined(self.execution_coordinator.owed_determined_ticks());
+        self.shard_coordinator.queue_ready_proposal();
         actions
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
+    use hyperscale_execution::CommitEffects;
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         TestCommittee, certify, make_live_block, shard_fork_proof, test_transaction,
@@ -457,10 +418,11 @@ mod tests {
         Block, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, CertifiedBlock,
         CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, MerkleInclusionProof,
         ProvisionEntry, ProvisionTxRoot, Provisions, QuorumCertificate, RETENTION_HORIZON, Round,
-        ShardForkProof, ShardId, TransactionStatus, TxHash, ValidatorId, Verified,
-        WeightedTimestamp, WitnessSources,
+        ShardForkProof, ShardId, Transaction, TransactionDecision, TransactionStatus, TxHash,
+        ValidatorId, Verified, WeightedTimestamp, WitnessSources,
     };
 
+    use crate::state::NodeStateMachine;
     use crate::state::test_support::TestNode;
 
     /// `RemoteHeaderAdmitted` registers the provisions the header's
@@ -900,5 +862,109 @@ mod tests {
             Some(TransactionStatus::Committed(BlockHeight::new(1))),
             "on_block_committed must flip the included tx from Pending to Committed(1)",
         );
+    }
+
+    /// Admit `raw_tx` and commit it live at height 1, leaving it in flight.
+    fn commit_in_flight(node: &mut NodeStateMachine, raw_tx: &Arc<Transaction>) -> Vec<Action> {
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::TransactionValidated {
+                tx: Arc::new(Verified::new_unchecked_for_test((**raw_tx).clone())),
+                submitted_locally: true,
+            },
+        );
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(0),
+            vec![Arc::clone(raw_tx)],
+            vec![],
+        );
+        node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BlockCommitted {
+                certified: Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(certify(
+                    block, 1_000,
+                ))),
+                committee_anchor: WeightedTimestamp::ZERO,
+            },
+        )
+    }
+
+    /// A live commit hands the mempool the block before the fold's
+    /// effects, and settles the tip last: the transaction is reported
+    /// committed ahead of its tick's dispatch, and the fold's owed tick
+    /// is mirrored into consensus by the time the commit returns.
+    #[test]
+    fn a_live_commit_emits_its_hooks_in_commit_order() {
+        let TestNode { mut node, .. } = TestNode::new();
+        let raw_tx = Arc::new(test_transaction(1));
+        let tx_hash = raw_tx.hash();
+
+        let actions = commit_in_flight(&mut node, &raw_tx);
+
+        let position = |wanted: fn(&Action) -> bool| {
+            actions
+                .iter()
+                .position(wanted)
+                .unwrap_or_else(|| panic!("missing from {actions:?}"))
+        };
+        let reported = position(|action| {
+            matches!(
+                action,
+                Action::EmitTransactionStatus {
+                    status: TransactionStatus::Committed(_),
+                    ..
+                }
+            )
+        });
+        let dispatched = position(|action| matches!(action, Action::ExecuteTransactions { .. }));
+        assert!(
+            reported < dispatched,
+            "the mempool hears the block before the fold's actions"
+        );
+        assert_eq!(
+            node.shard_coordinator().owed_determined(),
+            &BTreeSet::from([BlockHeight::new(1)]),
+        );
+        assert_eq!(
+            node.mempool_coordinator().status(&tx_hash),
+            Some(TransactionStatus::Committed(BlockHeight::new(1))),
+        );
+    }
+
+    /// The quiescence commit's effects abort what is still in flight,
+    /// once: a later commit's effects, which never carry the latch
+    /// again, abort nothing.
+    #[test]
+    fn the_quiescence_commit_aborts_in_flight_once() {
+        let TestNode { mut node, .. } = TestNode::new();
+        let raw_tx = Arc::new(test_transaction(1));
+        let tx_hash = raw_tx.hash();
+        let _ = commit_in_flight(&mut node, &raw_tx);
+        let participation = node.shard.as_mut().expect("a shard node");
+
+        let aborted = participation.apply_commit_effects(CommitEffects {
+            terminal: true,
+            ..CommitEffects::default()
+        });
+        assert!(aborted.iter().any(|action| matches!(
+            action,
+            Action::EmitTransactionStatus {
+                tx_hash: aborted_hash,
+                status: TransactionStatus::Completed(TransactionDecision::Aborted),
+                ..
+            } if *aborted_hash == tx_hash
+        )));
+
+        let later = participation.apply_commit_effects(CommitEffects::default());
+        assert!(
+            !later
+                .iter()
+                .any(|action| matches!(action, Action::EmitTransactionStatus { .. })),
+            "nothing is aborted twice, got {later:?}",
+        );
+        assert_eq!(node.mempool_coordinator().status(&tx_hash), None);
     }
 }

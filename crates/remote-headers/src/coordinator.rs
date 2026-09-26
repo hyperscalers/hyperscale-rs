@@ -251,9 +251,6 @@ pub struct RemoteHeaderCoordinator {
     /// shard hasn't sent headers within `HEADER_LIVENESS_TIMEOUT`.
     expected: BTreeMap<ShardId, ExpectedHeader>,
 
-    /// Current local committed height (updated on each block commit).
-    local_committed_height: BlockHeight,
-
     /// The node's committed clock: the "now" reference for liveness
     /// timeouts, independent of local block production rate.
     clock: CommittedClock,
@@ -304,7 +301,6 @@ impl RemoteHeaderCoordinator {
             fork_fence,
             tips: HashMap::new(),
             expected: BTreeMap::new(),
-            local_committed_height: BlockHeight::new(0),
             clock,
             committed_once: false,
             local_shard,
@@ -703,7 +699,6 @@ impl RemoteHeaderCoordinator {
         let new_ts = self.clock.now();
         let first_commit = !self.committed_once;
         self.committed_once = true;
-        self.local_committed_height = certified.block().height();
 
         // Retro-stamp entries recorded before the first local commit: on a
         // fresh chain remote headers can arrive (and verify) while the

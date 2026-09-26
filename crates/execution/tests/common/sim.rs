@@ -327,10 +327,10 @@ impl ExecutionSim {
         // The fixture's blocks all extend the genesis QC, so each one's
         // committee anchor is its own.
         let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
-        let actions = self
+        let effects = self
             .coord
-            .on_block_committed(&self.topology, &certified, committee_anchor);
-        self.absorb(actions);
+            .commit_block(&self.topology, &certified, committee_anchor);
+        self.absorb(effects.actions);
         // Persistence follows the commit, which is when the chain evicts
         // the folds it believes the base now covers.
         self.chain.prune_persisted(self.height);
@@ -392,10 +392,10 @@ impl ExecutionSim {
         // The fixture's blocks all extend the genesis QC, so each one's
         // committee anchor is its own.
         let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
-        let actions = self
+        let effects = self
             .coord
-            .on_block_committed(&self.topology, &certified, committee_anchor);
-        self.absorb(actions);
+            .commit_block(&self.topology, &certified, committee_anchor);
+        self.absorb(effects.actions);
         self.chain.prune_persisted(self.height);
         self.release_due();
     }
@@ -561,10 +561,10 @@ impl ExecutionSim {
         );
         self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
         self.pending.clear();
-        let actions = self
+        let effects = self
             .coord
             .on_committed_state_restored(&self.topology, &StubVmStatics);
-        self.absorb(actions);
+        self.absorb(effects.actions);
         self.drain();
     }
 
