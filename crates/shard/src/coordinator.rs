@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
-    FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
+    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn,
+    Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
     PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
     ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
     SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, derive_reshape_trigger,
@@ -319,9 +319,10 @@ pub struct ShardCoordinator {
     /// Hash of the latest committed block.
     committed_hash: BlockHash,
 
-    /// BFT-authenticated weighted timestamp of the latest committed block.
-    /// "Now" reference for time-based retention in proposal dedup.
-    committed_ts: WeightedTimestamp,
+    /// The node's committed clock, which this coordinator's commit
+    /// advances and the mempool, provisions and remote-header coordinators
+    /// read. Pacing only; no admission rule reads it.
+    clock: CommittedClock,
 
     /// [`Self::block_anchor`] of the latest committed block: its parent QC's
     /// weighted timestamp. Held as a scalar because the committed tip is
@@ -702,7 +703,7 @@ impl ShardCoordinator {
             recent_headers: recovered.recent_headers,
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
-            committed_ts: committed_block_anchor_wt,
+            clock: CommittedClock::seeded(committed_block_anchor_wt),
             committed_block_anchor_wt,
             committed_committee_anchor_wt,
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
@@ -1121,6 +1122,13 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn mirror(&self) -> &Arc<CounterpartMirror> {
         &self.mirror
+    }
+
+    /// The node's committed clock, which this coordinator's commit
+    /// advances, for the coordinators that pace off it.
+    #[must_use]
+    pub const fn committed_clock(&self) -> &CommittedClock {
+        &self.clock
     }
 
     /// The mirror, for the execution coordinator to read the same bytes
@@ -1609,7 +1617,7 @@ impl ShardCoordinator {
         {
             return None;
         }
-        let wt_window_start = self.committed_ts;
+        let wt_window_start = self.clock.now();
         let wt_window_end =
             wt_window_start.plus(ready_signal_window(topology_schedule.epoch_duration_ms()));
         let recipients: Vec<ValidatorId> = committee
@@ -1785,9 +1793,10 @@ impl ShardCoordinator {
         // anchors at its final canonical weighted timestamp (ZERO and
         // height 0 for chains born at network genesis).
         self.committed_height = genesis.height();
-        self.committed_ts = genesis.header().parent_qc().weighted_timestamp();
-        self.committed_block_anchor_wt = self.committed_ts;
-        self.committed_committee_anchor_wt = self.committed_ts;
+        let genesis_anchor = genesis.header().parent_qc().weighted_timestamp();
+        self.clock.advance(genesis_anchor);
+        self.committed_block_anchor_wt = genesis_anchor;
+        self.committed_committee_anchor_wt = genesis_anchor;
         self.substate_bytes_frontier.0 = genesis.height();
 
         // Record genesis time as initial leader activity so that the view
@@ -4024,7 +4033,7 @@ impl ShardCoordinator {
         {
             return;
         }
-        if signal.wt_window_end() < self.committed_ts {
+        if signal.wt_window_end() < self.clock.now() {
             return;
         }
         self.ready_signal_pool.admit(signal, self.now);
@@ -4982,7 +4991,6 @@ impl ShardCoordinator {
 
         self.committed_height = height;
         self.committed_hash = block_hash;
-        self.committed_ts = commit_ts;
         self.committed_rounds.insert(height, block.header().round());
         while self.committed_rounds.len() > COMMITTED_ROUNDS_HORIZON {
             self.committed_rounds.pop_first();
@@ -5312,14 +5320,12 @@ impl ShardCoordinator {
         // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
         // this block's header, so every validator reads the identical value —
         // unlike the block's own QC, whose timestamp rides outside the signed
-        // message and can be rewritten by a relay. It is a deadline clock,
-        // so it advances by the rule
-        // [`WeightedTimestamp::advanced_by_commit`] states, which is also
-        // what the mempool's, the provisions pipeline's and the
-        // remote-header store's own clocks advance by.
-        let weighted_ts = self
-            .committed_ts
-            .advanced_by_commit(certified.block().header().parent_qc().weighted_timestamp());
+        // message and can be rewritten by a relay. It advances the node's
+        // one committed clock, by the rule
+        // [`WeightedTimestamp::advanced_by_commit`] states.
+        self.clock
+            .advance(certified.block().header().parent_qc().weighted_timestamp());
+        let weighted_ts = self.clock.now();
 
         let (abandon, witness) = self.record_block_committed(
             topology_schedule,
@@ -6496,7 +6502,7 @@ impl ShardCoordinator {
         // for proposal dedup — transactions committed far in the past will
         // have been evicted from mempool already, so stale entries just waste
         // memory.
-        self.dedup_index.prune(self.committed_ts);
+        self.dedup_index.prune(self.clock.now());
         self.dedup_index
             .prune_engagements(self.committed_block_anchor_wt);
 
@@ -6854,7 +6860,7 @@ impl ShardCoordinator {
             pending_commits: self.commits.out_of_order_len(),
             pending_commits_awaiting_data: 0,
             received_votes_by_height: self.votes.received_votes_len(),
-            dedup_window_complete: self.dedup_index.is_complete(self.committed_ts),
+            dedup_window_complete: self.dedup_index.is_complete(self.clock.now()),
             committed_resolution_lookup: self.dedup_index.resolved_tx_retention_len(),
             committed_provision_lookup: self.dedup_index.provision_retention_len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),
@@ -11632,7 +11638,7 @@ mod tests {
         let [(start, end, recipients)] = signals.as_slice() else {
             panic!("expected exactly one ready signal, got {actions:?}");
         };
-        assert_eq!(**start, state.committed_ts);
+        assert_eq!(**start, state.clock.now());
         assert_eq!(
             **end,
             start.plus(ready_signal_window(topology_schedule.epoch_duration_ms()))

@@ -23,6 +23,8 @@
 //! is local-only and deliberately not wired.
 
 use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hyperscale_hbor::Hbor;
@@ -118,6 +120,39 @@ impl WeightedTimestamp {
     pub fn minus(self, duration: Duration) -> Self {
         let sub = duration.as_millis().try_into().unwrap_or(u64::MAX);
         Self(self.0.saturating_sub(sub))
+    }
+}
+
+/// This node's committed clock: the running maximum of the anchors of
+/// the blocks it has committed, as [`WeightedTimestamp::advanced_by_commit`]
+/// states it, held once and shared by handle.
+///
+/// Every coordinator that paces work off the commit reads the same
+/// value, so two of them cannot disagree about how old an entry is.
+/// It is this node's reading and nothing more: a node with less history
+/// holds a lower one, so no admission rule reads it — a block is judged
+/// at its own anchor.
+#[derive(Debug, Clone, Default)]
+pub struct CommittedClock(Arc<AtomicU64>);
+
+impl CommittedClock {
+    /// A clock resuming at `at`, the recovered tip's anchor.
+    #[must_use]
+    pub fn seeded(at: WeightedTimestamp) -> Self {
+        Self(Arc::new(AtomicU64::new(at.as_millis())))
+    }
+
+    /// The running maximum so far.
+    #[must_use]
+    pub fn now(&self) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Advance to the block that just committed, whose `parent_qc`
+    /// weighted timestamp is `block_anchor`; never moves backwards.
+    pub fn advance(&self, block_anchor: WeightedTimestamp) {
+        self.0
+            .fetch_max(block_anchor.as_millis(), Ordering::Relaxed);
     }
 }
 
@@ -266,6 +301,22 @@ impl Display for LocalTimestamp {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every handle reads one value, which only rises.
+    #[test]
+    fn the_committed_clock_is_one_value_across_handles() {
+        use super::CommittedClock;
+        let shard = CommittedClock::seeded(WeightedTimestamp::from_millis(5_000));
+        let readers = [shard.clone(), shard.clone()];
+        shard.advance(WeightedTimestamp::from_millis(9_000));
+        shard.advance(WeightedTimestamp::from_millis(4_000));
+        for reader in &readers {
+            assert_eq!(reader.now(), WeightedTimestamp::from_millis(9_000));
+        }
+        readers[0].advance(WeightedTimestamp::from_millis(11_000));
+        assert_eq!(shard.now(), WeightedTimestamp::from_millis(11_000));
+    }
+
     use super::*;
 
     /// A deadline clock advanced by a block whose anchor sits below it

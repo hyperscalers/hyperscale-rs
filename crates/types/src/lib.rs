@@ -237,7 +237,7 @@ pub use time::timeouts::{
     SKIP_TIMEOUT, VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT,
     VIEW_CHANGE_TIMEOUT_MAX, VIEW_CHANGE_TIMEOUT_MIN,
 };
-pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
+pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{

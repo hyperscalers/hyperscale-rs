@@ -58,6 +58,16 @@ impl NodeStateMachine {
         s.shard_coordinator
             .on_block_committed_verification(block_hash);
 
+        // The node's one fork fence clears here, before any coordinator
+        // reads it for this commit, once the attested recovery for a
+        // fenced shard completes; a later re-fork can then re-engage.
+        let cleared = s.fork_fence.clear_completed(
+            self.beacon_coordinator
+                .topology_schedule()
+                .head()
+                .completed_recoveries(),
+        );
+
         actions.extend(s.mempool_coordinator.on_block_committed(
             self.beacon_coordinator.current_topology_snapshot(),
             certified,
@@ -92,10 +102,11 @@ impl NodeStateMachine {
             );
         }
 
-        actions.extend(
-            s.remote_headers_coordinator
-                .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
-        );
+        actions.extend(s.remote_headers_coordinator.on_block_committed(
+            self.beacon_coordinator.topology_schedule(),
+            certified,
+            &cleared,
+        ));
 
         actions.extend(
             s.provisions_coordinator
@@ -152,14 +163,6 @@ impl NodeStateMachine {
             .set_owed_determined(s.execution_coordinator.owed_determined_ticks());
 
         s.shard_coordinator.queue_ready_proposal();
-
-        // The fork-proof dedup fence clears once the attested recovery for
-        // its shard completes — the coordinators self-clear their own
-        // fences on the same edge, so a later re-fork can re-engage.
-        if !s.fork_fence.is_empty() {
-            let head = self.beacon_coordinator.topology_schedule().head();
-            s.fork_fence.clear_completed(head.completed_recoveries());
-        }
 
         actions
     }

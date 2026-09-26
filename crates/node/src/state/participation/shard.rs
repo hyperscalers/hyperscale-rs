@@ -253,13 +253,9 @@ impl ShardParticipation {
         let fork_height = proof.height();
         let completed = topology_schedule.head().completed_recoveries();
 
-        if self
-            .fork_fence
-            .engage(shard, fork_height, completed)
-            .is_none()
-        {
+        let Some(frontier) = self.fork_fence.engage(shard, fork_height, completed) else {
             return Vec::new();
-        }
+        };
 
         tracing::error!(
             shard = shard.inner(),
@@ -267,13 +263,9 @@ impl ShardParticipation {
             "shard fork proven — engaging local fence and re-gossiping"
         );
 
-        let mut actions =
-            self.provisions_coordinator
-                .engage_fork_fence(shard, fork_height, completed);
-        self.remote_headers_coordinator
-            .engage_fork_fence(shard, fork_height, completed);
-        self.mempool_coordinator
-            .engage_fork_fence(shard, fork_height, completed);
+        // One engage, above; the mempool and remote headers read the
+        // shared fence, and provisions purges what already got through.
+        let mut actions = self.provisions_coordinator.on_fork_fenced(shard, frontier);
         // A fenced provision might already sit in a proposal the shard is
         // waiting to complete; nudge the proposer to re-evaluate without it.
         self.shard_coordinator.queue_ready_proposal();

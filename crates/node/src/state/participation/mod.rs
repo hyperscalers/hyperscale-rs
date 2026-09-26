@@ -102,11 +102,12 @@ pub(in crate::state) struct ShardParticipation {
     pub(in crate::state) last_cleanup_height: Option<BlockHeight>,
     pub(in crate::state) cleanup_stall_ticks: u32,
 
-    /// Dedup fence for verified fork proofs: one engage-and-regossip per
-    /// forked shard, so a later proof for an already-fenced shard is
-    /// ignored. Engaged and cleared on the same edges as the consuming
-    /// coordinators' fences (see [`ForkFence`]), so a re-fork after a
-    /// completed recovery can re-engage. Empty under honest operation.
+    /// The node's one fork fence (see [`ForkFence`]): engaged here on a
+    /// verified proof, cleared once per commit as recoveries complete,
+    /// and read by the mempool, provisions and remote-header coordinators
+    /// through the handles they hold. It also dedups proofs: a later
+    /// proof for an already-fenced shard is ignored, and a re-fork after
+    /// a completed recovery can re-engage. Empty under honest operation.
     pub(in crate::state) fork_fence: ForkFence,
 }
 
@@ -132,12 +133,6 @@ impl ShardParticipation {
         finalization_store: Arc<FinalizationStore>,
         crossing_index: Arc<CrossingIndexSlot>,
     ) -> Self {
-        let mut mempool_coordinator =
-            MempoolCoordinator::with_tx_store(local_shard, mempool_config, tx_store);
-        // The admission gate reads this clock, and only a commit moves it:
-        // unseeded it sits at zero and admits everything, expired
-        // transactions included, until the first post-restart commit.
-        mempool_coordinator.seed_committed(recovered.committed_height, recovered.block_anchor_wt());
         // Execution's commit frontier and its account of what is still in
         // flight both seed from the same recovered tip the shard
         // coordinator restores, so the first post-restart commit
@@ -149,6 +144,23 @@ impl ShardParticipation {
             shard_config.clone(),
             recovered.clone(),
         );
+        // One committed clock, seeded at the recovered tip and advanced by
+        // the shard's commit, and one fork fence, which only this machine
+        // engages and clears: the coordinators below read both, so none
+        // can disagree with another about how old an entry is or which
+        // shards are fenced. Seeded rather than zero, because every
+        // deadline gate reading the clock is vacuous at zero until the
+        // resumed chain commits its next block.
+        let clock = shard_coordinator.committed_clock().clone();
+        let fork_fence = ForkFence::new();
+        let mut mempool_coordinator = MempoolCoordinator::with_tx_store(
+            local_shard,
+            mempool_config,
+            tx_store,
+            clock.clone(),
+            fork_fence.clone(),
+        );
+        mempool_coordinator.seed_committed(recovered.committed_height);
         // One mirror of the commit-proven remote anchors and one of what
         // counterparts have said, both owned by the shard coordinator:
         // the vote fence and the execution coordinator ask the same
@@ -171,18 +183,14 @@ impl ShardParticipation {
         // was process-lifetime, so a restart re-verified every
         // already-committed batch that re-arrived for a whole retention
         // horizon.
-        let mut provisions_coordinator = ProvisionCoordinator::with_config_and_store(
+        let provisions_coordinator = ProvisionCoordinator::with_config_and_store(
             local_shard,
             provision_config,
             Arc::clone(&provision_store),
             committed_provisions,
+            clock.clone(),
+            fork_fence.clone(),
         );
-        // Every deadline gate in that crate compares against this clock,
-        // and only a commit moves it: unseeded it sits at zero, which
-        // leaves each of them vacuous until the resumed chain commits its
-        // next block and stamps what arrives meanwhile with a deadline
-        // that same commit reads as long past.
-        provisions_coordinator.seed_committed(recovered.block_anchor_wt());
         Self {
             local_shard,
             derivation,
@@ -191,14 +199,18 @@ impl ShardParticipation {
             mempool_coordinator,
             provisions_coordinator,
             outbound_provisions: OutboundProvisionTracker::new(provision_store),
-            remote_headers_coordinator: RemoteHeaderCoordinator::new(local_shard),
+            remote_headers_coordinator: RemoteHeaderCoordinator::sharing(
+                local_shard,
+                clock,
+                fork_fence.clone(),
+            ),
             now: LocalTimestamp::ZERO,
             terminal_chain_swept: false,
             pending_pool_handed_back: false,
             handback_attempts: 0,
             last_cleanup_height: None,
             cleanup_stall_ticks: 0,
-            fork_fence: ForkFence::new(),
+            fork_fence,
         }
     }
 
