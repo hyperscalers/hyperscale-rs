@@ -15,7 +15,7 @@ use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{AllCodeRuns, ExecutionMode, Executor};
-use hyperscale_execution::{ExecCertStore, FinalizationStore};
+use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_hbor::Capped;
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network::HandlerRegistry;
@@ -28,7 +28,7 @@ use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
-use hyperscale_types::network::request::GetBlockRequest;
+use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_transaction};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
@@ -144,6 +144,7 @@ impl Fixture {
             Arc::new(TxStore::new()),
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
+            Arc::new(CrossingIndexSlot::default()),
         );
         VnodeInit {
             state,
@@ -173,7 +174,7 @@ impl Fixture {
 }
 
 fn block_request() -> GetBlockRequest {
-    GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1))
+    GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute)
 }
 
 #[test]

@@ -19,8 +19,8 @@ use thiserror::Error;
 use crate::{
     AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionOutcome, ExecutionVote,
     ExecutionVoteMessage, GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition,
-    RETENTION_HORIZON, ShardId, SignerBitfield, TickId, TransactionDecision, TxHash, TxOutcome,
-    ValidatorId, Verified, Verify, WeightedTimestamp, compute_global_receipt_root,
+    RETENTION_HORIZON, Role, ShardId, SignerBitfield, TickId, TransactionDecision, TxHash,
+    TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp, compute_global_receipt_root,
     compute_sparse_proof, signed_bytes, tx_outcome_leaf, verify_sparse_inclusion,
 };
 
@@ -32,22 +32,15 @@ const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.atteste
 /// it.
 ///
 /// Neither is evidence the chain keeps. A refusal is the counterpart's
-/// verdict, which the mempool reports; what licenses taking the
-/// crossing back is the claim cell the refusing core never wrote,
-/// proved absent past the deadline. A claiming success is a cue: it
-/// says the counterpart's execution went through, not that it wrote the
-/// claim the success promises — its own finalization can still be
-/// refused afterwards — so what the retirement stands on is the claim
-/// cell proved present, and the certificate only opens the question.
+/// verdict, and an acceptance is a core's; both are what the mempool
+/// reports. What settles a crossing is the answer cell, pushed or read
+/// present, never the certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spoken {
     /// The counterpart refused it: a rejection or an abort.
     Refused(TransactionDecision),
-    /// The counterpart's execution claimed, in a role that claims.
-    Claimed {
-        /// The vote anchor the certificate speaks at.
-        at: WeightedTimestamp,
-    },
+    /// A core member's execution succeeded.
+    Accepted,
 }
 
 /// Aggregated certificate for an execution tick.
@@ -428,20 +421,17 @@ impl ExecutionCertificate {
     /// What this certificate says of each transaction, as a counterpart
     /// hears it.
     ///
-    /// A success speaks only in a role that claims. A leg's success is
-    /// its own side going through, which says nothing about the crossings
-    /// it consumed — and an issuer that heard it as an acceptance would
-    /// take it for the claim its record is held for. A refusal speaks
+    /// A success speaks only from a core member: a leg's success is its
+    /// own side going through, and a whole or a delivery success decides
+    /// nothing a counterpart's mempool waits on. A refusal speaks
     /// whatever the role, since a member that could not do its part ends
     /// the transaction on its shard.
     pub fn verdicts(&self) -> impl Iterator<Item = (TxHash, Spoken)> + '_ {
-        let at = self.vote_anchor_ts;
         self.tx_outcomes.iter().filter_map(move |outcome| {
             let spoken = match outcome.outcome() {
-                ExecutionOutcome::Succeeded { .. } => outcome
-                    .role()
-                    .success_claims()
-                    .then_some(Spoken::Claimed { at })?,
+                ExecutionOutcome::Succeeded { .. } => {
+                    matches!(outcome.role(), Role::Core).then_some(Spoken::Accepted)?
+                }
                 ExecutionOutcome::Failed => Spoken::Refused(TransactionDecision::Reject),
                 ExecutionOutcome::Aborted => Spoken::Refused(TransactionDecision::Aborted),
             };
@@ -1149,17 +1139,16 @@ mod tests {
         assert_eq!(cert.project_to(&keep).expect("all kept"), cert);
     }
 
-    /// A success speaks an acceptance only in a role that claims what
-    /// crossed to it. A leg's success is its own side going through, and
-    /// an issuer that heard it as an acceptance would take it for the
-    /// claim its record is held for — which on a shard that is both a
-    /// caller and a recipient of one swap is every swap.
+    /// A success speaks an acceptance only from a core member. A leg's
+    /// success is its own side going through, and a whole shape's
+    /// decides nothing a counterpart's mempool waits on.
     #[test]
     fn only_a_claiming_success_speaks_an_acceptance() {
         let outcomes = vec![
-            outcome(1).as_role(Role::Delivery),
+            outcome(1).as_role(Role::Leg),
             outcome(2).as_role(Role::Leg),
             outcome(3).as_role(Role::Core),
+            outcome(5).as_role(Role::Whole),
             TxOutcome::new(
                 TxHash::from(Hash::from_bytes(&[4u8; 4])),
                 ExecutionOutcome::Failed,
@@ -1182,19 +1171,11 @@ mod tests {
                 .iter()
                 .map(|(tx_hash, _)| *tx_hash)
                 .collect::<Vec<_>>(),
-            vec![
-                outcomes[0].tx_hash(),
-                outcomes[2].tx_hash(),
-                outcomes[3].tx_hash()
-            ],
-            "the leg's success says nothing; its refusal still ends the transaction here",
+            vec![outcomes[2].tx_hash(), outcomes[4].tx_hash()],
+            "only the core's success speaks; a leg's refusal still ends the transaction here",
         );
-        assert!(matches!(spoken[0].1, Spoken::Claimed { .. }));
-        assert!(matches!(spoken[1].1, Spoken::Claimed { .. }));
-        assert!(matches!(
-            spoken[2].1,
-            Spoken::Refused(TransactionDecision::Reject)
-        ));
+        assert_eq!(spoken[0].1, Spoken::Accepted);
+        assert_eq!(spoken[1].1, Spoken::Refused(TransactionDecision::Reject));
     }
 
     /// A recipient party to nothing in the tick gets no certificate: an

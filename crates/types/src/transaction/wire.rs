@@ -975,7 +975,6 @@ mod tests {
             declares: Vec::new(),
             intent: IntentHash(Hash32([0x5A; 32])),
             local: 0,
-            expiry_ms: 0,
         };
         let edge = ValueEdge {
             source: 0,

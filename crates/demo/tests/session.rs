@@ -292,12 +292,27 @@ fn run_past_split(seed: u64, count: usize) -> Vec<TraceEvent> {
     events
 }
 
+/// The transactions an owed crossing of reached another shard's fold,
+/// each with the shard it left and the shard that credited it.
+fn credited(events: &[TraceEvent]) -> BTreeMap<String, (String, String)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::CrossingCredited { from, to, txs, .. } if from != to => Some(
+                txs.iter()
+                    .map(|tx| (tx.0.clone(), (from.0.clone(), to.0.clone())))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 #[test]
-fn a_cross_shard_transfer_is_provisioned_one_way_and_certified_on_each_side() {
+fn a_cross_shard_transfer_is_certified_on_the_payers_side_and_credited_on_the_other() {
     let events = run_past_split(42, 6);
 
-    // Which shards provisioned state to which, per transaction.
-    let mut provisioned: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
     // Which shards signed a certificate covering each transaction.
     let mut certified: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // Which shards committed a finalization covering it, and who they
@@ -306,14 +321,6 @@ fn a_cross_shard_transfer_is_provisioned_one_way_and_certified_on_each_side() {
 
     for event in &events {
         match &event.kind {
-            TraceKind::ProvisionsVerified { from, to, txs, .. } => {
-                for tx in txs {
-                    provisioned
-                        .entry(tx.0.clone())
-                        .or_default()
-                        .insert((from.0.clone(), to.0.clone()));
-                }
-            }
             TraceKind::ExecutionCertified {
                 shard, outcomes, ..
             } => {
@@ -342,51 +349,26 @@ fn a_cross_shard_transfer_is_provisioned_one_way_and_certified_on_each_side() {
         }
     }
 
+    // A transfer's record reaches the recipient's shard as a state claim,
+    // whose fold credits it: the payer's shard certifies and finalizes
+    // it alone, naming itself, and the recipient's certifies nothing.
+    let crossed = credited(&events);
     assert!(
-        !provisioned.is_empty(),
+        !crossed.is_empty(),
         "a session past the split must produce cross-shard transfers",
     );
-
-    for (tx, pairs) in &provisioned {
-        let shards: BTreeSet<&String> = pairs.iter().flat_map(|(a, b)| [a, b]).collect();
+    for (tx, (payer, _)) in &crossed {
         assert_eq!(
-            shards.len(),
-            2,
-            "tx {tx} spans exactly two shards, saw {pairs:?}",
+            certified.get(tx),
+            Some(&BTreeSet::from([payer.clone()])),
+            "tx {tx} must be certified by its payer's shard alone",
         );
-        // One direction: the payer's shard settles the transfer alone and
-        // the recipient's takes delivery of what it committed. Nothing
-        // travels back.
-        assert_eq!(
-            pairs.len(),
-            1,
-            "a transfer is provisioned payer to recipient and no other way, saw {pairs:?}",
-        );
-
-        // Each side signed a certificate for its own half.
-        let signers = certified.get(tx).expect("a provisioned tx is certified");
-        assert_eq!(
-            signers.iter().collect::<BTreeSet<_>>(),
-            shards,
-            "tx {tx} needs a certificate from each side",
-        );
-
-        // And each side committed a tick of its own, naming itself alone:
-        // the payer's verdict waits on no one, and the delivery is the
-        // recipient's own block's business.
         let commits = finalized.get(tx).expect("a certified tx is finalized");
         assert_eq!(
-            commits.iter().map(|(s, _)| s).collect::<BTreeSet<_>>(),
-            shards,
-            "tx {tx} must finalize on both shards, saw {commits:?}",
+            commits,
+            &BTreeSet::from([(payer.clone(), vec![payer.clone()])]),
+            "tx {tx} must finalize on its payer's shard alone, naming itself",
         );
-        for (shard, participants) in commits {
-            assert_eq!(
-                participants,
-                &vec![shard.clone()],
-                "the tick {shard} committed must name itself alone",
-            );
-        }
     }
 }
 
@@ -474,15 +456,9 @@ fn the_load_generator_picks_pairs_the_trie_routes_across_shards() {
             _ => None,
         })
         .collect();
-    let crossed: BTreeSet<String> = events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            TraceKind::ProvisionsVerified { txs, .. } => Some(txs),
-            _ => None,
-        })
-        .flatten()
-        .map(|tx| tx.0.clone())
-        .collect();
+    // A transfer crosses shards when the recipient's shard credits its
+    // record.
+    let crossed: BTreeSet<String> = credited(&events).into_keys().collect();
 
     assert_eq!(submitted.len(), 8, "every submission is reported");
     let local: Vec<_> = submitted.difference(&crossed).collect();

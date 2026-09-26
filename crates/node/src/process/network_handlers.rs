@@ -7,7 +7,7 @@ use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_hbor::{Bytes, Capped};
-use hyperscale_metrics::record_fetch_response_sent;
+use hyperscale_metrics::{record_crossing_push_dropped, record_fetch_response_sent};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::{
@@ -19,9 +19,9 @@ use hyperscale_types::network::notification::beacon::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::network::notification::{
-    BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
-    ExecutionVoteNotification, ProvisionsNotification, ReadySignalNotification,
-    TimeoutNotification,
+    BlockHeaderNotification, BlockVoteNotification, CrossingReadingsNotification,
+    ExecutionCertificatesNotification, ExecutionVoteNotification, ProvisionsNotification,
+    ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::network::request::beacon::{
     GetBeaconBlockRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
@@ -30,13 +30,14 @@ use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
 };
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, signed_bytes};
+use hyperscale_types::{ExecutionCertificate, ShardId, Signed, Verifiable, signed_bytes};
 use tracing::warn;
 
 use crate::beacon::gossip::register_beacon_gossip_handlers;
 use crate::event::{HostEvent, ShardScopedInput};
 use crate::host::NodeHost;
 use crate::process::{ProcessIo, SharedShardSenders};
+use crate::shard::cross_shard::crossing_push;
 use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
@@ -393,6 +394,78 @@ where
                         }
                     };
                     push_protocol_event(tx, target_shard, event);
+                },
+            );
+
+        // ── crossing.readings → ProtocolEvent::CrossingReadingsReceived ─
+        //
+        // A producer's pushed record readings. Nothing is held before
+        // every check passes: routed and cheap first, then the sender
+        // against the committee that proposed the anchor's block —
+        // resolved at the anchor's own clock, since the head names an
+        // empty committee for a split parent's coast blocks and drops a
+        // member rotated out since — then each claim's own proof, on
+        // this thread as the signature was.
+
+        let senders = self.process.shard_event_senders.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
+        let process = Arc::clone(&self.process);
+        let verifier = Arc::clone(&self.process.verifier);
+        self.process
+            .network
+            .register_notification_handler::<CrossingReadingsNotification>(
+                move |notification: CrossingReadingsNotification| {
+                    let target_shard = notification.target_shard;
+                    let senders = senders.load();
+                    let Some(tx) = senders.get(&target_shard) else {
+                        record_crossing_push_dropped("unhosted");
+                        return;
+                    };
+                    let anchor = match crossing_push::shaped(&notification) {
+                        Ok(anchor) => anchor,
+                        Err(reason) => {
+                            record_crossing_push_dropped(reason);
+                            return;
+                        }
+                    };
+                    let schedule = process.topology_schedule();
+                    let Some((signing, _)) = schedule.at_for_shard(anchor.shard, anchor.ts) else {
+                        record_crossing_push_dropped("unscheduled_anchor");
+                        return;
+                    };
+                    let topo = topology_snapshot.load();
+                    let Some(public_key) = resolve_sender_key(
+                        signing,
+                        &topo,
+                        notification.signer(),
+                        anchor.shard,
+                        "crossing readings",
+                    ) else {
+                        record_crossing_push_dropped("sender");
+                        return;
+                    };
+                    let msg = notification.signing_message(topo.network());
+                    if !verify_sig_with_metrics(
+                        verifier.as_ref(),
+                        &msg,
+                        &public_key,
+                        notification.signature(),
+                        "crossing_readings",
+                    ) {
+                        record_crossing_push_dropped("signature");
+                        return;
+                    }
+                    if let Err(reason) = crossing_push::proven(&notification.claims) {
+                        record_crossing_push_dropped(reason);
+                        return;
+                    }
+                    push_protocol_event(
+                        tx,
+                        target_shard,
+                        ProtocolEvent::CrossingReadingsReceived {
+                            claims: notification.claims.into_inner(),
+                        },
+                    );
                 },
             );
 
@@ -788,10 +861,9 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     use hyperscale_engine::Executor;
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetCellsRequest, GetCommittedTxsRequest, GetInstanceRecordsRequest,
-        GetPackageArtifactsRequest, GetProvisionsRequest, GetRelayedStateProofRequest,
-        GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest, GetStateRangeRequest,
-        GetTransactionsRequest, GetWitnessHistoryRequest,
+        GetBlockRequest, GetCellsRequest, GetInstanceRecordsRequest, GetPackageArtifactsRequest,
+        GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest,
+        GetStateRangeRequest, GetTransactionsRequest, GetWitnessHistoryRequest,
     };
     use hyperscale_types::network::response::{
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
@@ -803,10 +875,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        CommittedTxsCache, SettledTxsCache, serve_cells_request, serve_committed_txs_request,
-        serve_execution_certs_request, serve_finalizations_request, serve_local_provisions_request,
-        serve_provision_request, serve_relayed_state_proof_request, serve_remote_headers_request,
-        serve_settled_txs_request, serve_state_proof_request,
+        SettledTxsCache, serve_cells_request, serve_execution_certs_request,
+        serve_finalizations_request, serve_local_provisions_request, serve_provision_request,
+        serve_remote_headers_request, serve_settled_txs_request, serve_state_proof_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -990,15 +1061,14 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetProvisionsRequest>(
             shard,
             move |req: GetProvisionsRequest| {
-                let cache_key = (req.block_height.inner(), req.target_shard.inner());
+                let height = req.height;
+                let cache_key = (height.inner(), req.target_shard.inner());
 
                 // Outbound fast path: if we still hold the exact batch we
                 // generated for this (source_block_height, target_shard),
                 // rebuild the response from memory — no RocksDB regeneration,
                 // no merkle-proof recomputation.
-                if let Some(provisions) =
-                    outbound_cache.get_outbound(req.block_height, req.target_shard)
-                {
+                if let Some(provisions) = outbound_cache.get_outbound(height, req.target_shard) {
                     record_fetch_response_sent("provision", provisions.transactions().len().max(1));
                     return GetProvisionResponse {
                         provisions: Some(provisions),
@@ -1178,30 +1248,11 @@ pub fn register_shard_request_handlers<S, N, D>(
             serve_settled_txs_request(&pending_chain, &settled_txs_cache, window_floor, &req)
         });
 
-    // ── committed_txs.request → terminated-shard membership answers ──
-    //
-    // A reshape successor resolving a transaction whose validity window
-    // opened before its own origin names our terminal block and the
-    // hashes it wants decided. Absence is proven against the terminal's
-    // `committed_txs_root`, which the successor already commit-proved, so
-    // nothing here is trusted. No window floor: the committed window is
-    // anchor-relative only.
-    let pending_chain = Arc::clone(&io.pending_chain);
-    // The walk behind an answer is the committed window in full, and the
-    // set it produces cannot change once the terminal is committed. One
-    // reconstruction serves every query about that terminal, from every
-    // peer, for as long as anyone is still asking.
-    let committed_txs_cache = Arc::new(CommittedTxsCache::default());
-    process
-        .network
-        .register_request_handler::<GetCommittedTxsRequest>(shard, move |req| {
-            serve_committed_txs_request(&pending_chain, &committed_txs_cache, &req)
-        });
-
     // ── state_proof.request → proof of keys at a committed height ──
     //
     // A shard holding an escrow a core here never claimed asks whether
-    // this shard committed the transaction, against one of our headers
+    // this shard committed the transaction, and a split's right child asks
+    // a terminated parent whether it did, each against one of our headers
     // it has commit-proved. The proof is checked against that header's
     // root on the requester's side, so nothing here is trusted; a
     // height outside the JMT's history answers `not_found` and the
@@ -1225,21 +1276,6 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetCellsRequest>(shard, move |req| {
             serve_cells_request(&pending_chain, &req)
-        });
-
-    // ── relayed_state_proof.request → a peer's copy of a proof ────
-    //
-    // A committee member fencing a vote on a block's state claim needs a
-    // proof of the counterpart's cell and could not obtain one from the
-    // counterpart itself. Anything this node fetched for its own probes
-    // is passed on; nothing is constructed, since this node holds no
-    // copy of that shard's tree. The requester checks the bytes against
-    // the root it commit-proved, so relaying grants no trust.
-    let proven_cells = Arc::clone(&io.caches.proven_cells);
-    process
-        .network
-        .register_request_handler::<GetRelayedStateProofRequest>(shard, move |req| {
-            serve_relayed_state_proof_request(&proven_cells, &req)
         });
 
     // ── beacon.proposal.request → process-level serve cache ──────

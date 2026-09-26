@@ -23,6 +23,7 @@ use hyperscale_types::{
 use tracing::warn;
 
 use crate::build::build_provisions;
+use crate::crossing_push::push_crossing_readings;
 
 /// One outbound provision batch destined for a single target shard.
 pub(crate) type ProvisionBatch = (Arc<Provisions>, Vec<ValidatorId>);
@@ -80,22 +81,17 @@ where
     N: Network,
 {
     match action {
-        Action::VerifyProvisions {
-            provisions,
-            certified_header,
-        } => {
+        Action::VerifyProvisions { provisions, anchor } => {
             let merkle_start = Stopwatch::start();
-            let ctx_verify = ProvisionsContext {
-                certified_header: &certified_header,
-            };
+            let ctx_verify = ProvisionsContext { anchor };
             let result = match provisions.verify(&ctx_verify) {
                 Ok(verified) => Ok(Arc::new(verified)),
                 Err(err) => {
                     warn!(
                         source_shard = provisions.source_shard().inner(),
                         block_height = provisions.block_height().inner(),
-                        header_height = certified_header.height().inner(),
-                        header_state_root = ?certified_header.state_root(),
+                        anchor_height = anchor.height.inner(),
+                        anchor_state_root = ?anchor.state_root,
                         proof_len = provisions.proof().as_bytes().len(),
                         error = ?err,
                         "Provision merkle proof verification failed"
@@ -112,10 +108,7 @@ where
                 "inclusion_proof",
                 merkle_start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::StateProvisionsVerified {
-                result,
-                certified_header,
-            });
+            ctx.notify_protocol(ProtocolEvent::StateProvisionsVerified { result, anchor });
         }
         Action::FetchAndBroadcastProvisions {
             block_hash,
@@ -181,6 +174,12 @@ where
                 ctx.network.notify(&recipients, &notification);
             }
         }
+        Action::PushCrossingReadings {
+            block_hash,
+            anchor,
+            targets,
+            shard_recipients,
+        } => push_crossing_readings(ctx, block_hash, anchor, &targets, &shard_recipients),
         _ => unreachable!("hyperscale_provisions::handle_action called with non-provisions action"),
     }
 }

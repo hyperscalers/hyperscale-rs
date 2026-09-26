@@ -10,16 +10,19 @@
 
 use std::time::Duration;
 
+use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    Address, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
-    TransactionStatus, TxHash, WeightedTimestamp, Window,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
+use hyperscale_vm_effects::{CrossingId, Kind};
+use hyperscale_vm_types::{LegRole, LegShape};
 
 use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{assert_reclaimed_leg, declared_price, held, held_at, vault_balance};
-use crate::support::tx::{build_route_tx, validity_around};
+use crate::support::tx::{build_route_tx, build_swap_tx, validity_around};
 use crate::support::wait::await_blocks;
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
@@ -224,10 +227,6 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         cut.iter().any(|handle| handle.fired() > 0),
         "the certificate channel must actually have been exercised and cut",
     );
-    assert!(
-        clock(c) < Window::Delivery.of(Deadline::of(validity_end)).end,
-        "the cut has to lift inside the delivery window, or the core's output has nowhere to land",
-    );
     for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
         assert!(
             c.chain_fate(shard, hash).1.is_none(),
@@ -326,6 +325,271 @@ fn assert_venues_gave_back<C: Cluster>(
     );
 }
 
+/// A core whose siblings never combine holds its input, and settles
+/// whole once they do.
+///
+/// [`a_route_cut_off_across_its_deadline_is_not_reclaimed`] holds the
+/// same cut and lifts it before the producer's leaf can read anything.
+/// This one holds it past the close of [`Window::Core`], and pins that
+/// nothing speaks there: the trader's input is neither refunded nor
+/// banked, neither venue writes a `Never`, and the one escrowed record
+/// stands locked at [`ROUTE_INPUT`], named by the world's report. A
+/// member awaiting a sibling is never released for being wedged and
+/// never abandoned while uncovered, so once the cut lifts the core
+/// combines, the route settles whole, the resource is conserved and the
+/// report is empty.
+///
+/// **The verdict is a presence, and only the consumer speaks it.** A
+/// claim's absence answers nothing at any anchor, and a core member held
+/// by a silent sibling has no answer to give: its certificate may be
+/// out, and the sibling may yet combine an accept with it. What the
+/// producer waits on is the member's own verdict, whenever it comes.
+///
+/// Requires disjoint committees, as its neighbour does.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the trader's
+/// leg never pays, if the cut never fires, if anything moves the input
+/// while the cut stands, if a venue writes a `Never` for a crossing its
+/// member may still take, if the route does not settle whole once the
+/// cut lifts, or if the resource is not conserved.
+pub fn a_route_whose_core_never_combines_holds_its_input<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, trader) = &traders[0];
+    let cut = [
+        isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+    ];
+    let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
+
+    let mut charges = Charges::default();
+    let validity = validity_around(c.now());
+    let funded = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity,
+    );
+    let hash = charges.submit(c, route);
+
+    assert!(
+        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
+            < funded - ROUTE_INPUT),
+        "the trader's leg must pay the input and the price before the core is asked anything",
+    );
+    let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
+
+    let deadline = Deadline::of(validity.end_timestamp_exclusive);
+    hold_past_the_core_window(c, deadline);
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut",
+    );
+    assert_nothing_spoke(c, hash, *trader, paid);
+    let locked = protocol_resource.locked(c, &charges);
+    assert_eq!(
+        locked.len(),
+        1,
+        "the one escrowed record stands locked: {locked:?}"
+    );
+    assert_eq!(
+        (locked[0].kind, locked[0].amount),
+        (Kind::Escrowed, ROUTE_INPUT),
+        "and it is the trader's input: {locked:?}",
+    );
+
+    // The siblings combine, and the route settles whole.
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(12), |c| held(
+            c,
+            trader.address(),
+            *PROTOCOL_RESOURCE
+        ) > paid),
+        "once the cut lifts the core must combine and the route bank its output: \
+         trader holds {} against {paid}",
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+    );
+    let status = c.tx_status(hash);
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "a route whose core was held must still settle whole; status = {status:?}",
+    );
+    let locked = protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(10),
+        "a route whose core never combined",
+    );
+    assert!(
+        locked.is_empty(),
+        "nothing stays locked once the route settled: {locked:?}"
+    );
+    units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(10),
+        "a route whose core never combined",
+    );
+}
+
+/// Run past the close of the core window and hold there for the tail a
+/// refund would land in: no clock of any shard's speaks for a member
+/// awaiting its sibling, so what a wrong clock would do is given room
+/// to show.
+///
+/// # Panics
+///
+/// Panics if the clock never reaches the close, or a venue stops
+/// committing past it.
+fn hold_past_the_core_window<C: Cluster>(c: &mut C, deadline: Deadline) {
+    let close = Window::Core.of(deadline).end;
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(70), |c| clock(c) >= close),
+        "the cut must stand past the close of the core window; clock {:?} against {close:?}",
+        clock(c),
+    );
+    for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            await_blocks(c, venue, RECLAIM_TAIL_BLOCKS, epochs(2)),
+            "venue {venue} must keep committing past the close",
+        );
+    }
+}
+
+/// Assert that nothing has spoken for the route `hash` while its core is
+/// held by a silent sibling: the trader still holds exactly `paid`, and
+/// neither venue has certified or written a `Never`.
+///
+/// # Panics
+///
+/// Panics if the input moved, or a venue certified or answered.
+fn assert_nothing_spoke<C: Cluster>(c: &C, hash: TxHash, trader: PrincipalAddr, paid: u128) {
+    assert_eq!(
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+        paid,
+        "while the core is held by its silent sibling the input is neither refunded nor banked",
+    );
+    for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.chain_fate(shard, hash).1.is_none(),
+            "neither venue may certify while its sibling is silent",
+        );
+        assert!(
+            c.declined(shard, hash).is_empty(),
+            "and neither may write a Never for a crossing its member may still take",
+        );
+    }
+}
+
+/// A crossing whose consumer has refused it is declined by the
+/// consumer's own finalization.
+///
+/// The ordinary refusal. A venue asked for a price no pool this size can
+/// pay refuses its member, and a refused member's writes are discarded —
+/// so the claim is never written and the record stands. What the venue's
+/// refusal receipt writes instead is `Never` at the crossing's decline
+/// key, and it lands with the rejecting finalization itself: on no
+/// clock, past no deadline, waiting on no member. With the venue's
+/// verdict cut off from the shard that staged the value, the producer
+/// cannot reclaim off it until the cut lifts, and the `Never` is what
+/// it then reclaims off.
+///
+/// Its pair is [`a_route_whose_core_never_combines_holds_its_input`],
+/// where a venue holds a member it cannot run and says nothing at all.
+///
+/// Requires disjoint committees, as its neighbours do.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the caller's
+/// leg never pays, if the venue does not refuse, if the `Never` does not
+/// land with the refusing finalization, if the cut never fires, if the
+/// input never comes home, or if either side of the pair is not
+/// conserved.
+pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, trader) = &traders[0];
+    // The venue's own committee certifies its refusal; what is cut is
+    // the road that verdict takes to the shard holding the record, so
+    // the producer has nothing to reclaim off while the cut stands.
+    let cut = isolate_ec_intake(c, TRADER_SHARD, FIRST_VENUE_SHARD);
+    let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
+
+    let mut charges = Charges::default();
+    let validity = validity_around(c.now());
+    let swap = build_swap_tx(
+        key,
+        *trader,
+        &first.meta,
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        REFUSED_FLOOR,
+        validity,
+    );
+    let hash = charges.submit(c, swap);
+
+    assert!(
+        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
+            < SWAPPER_FUNDING - ROUTE_INPUT),
+        "the caller's leg must stage the input, or no crossing was ever handed across",
+    );
+    let staged = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    assert!(
+        c.run_until(epochs(8), |c| matches!(
+            c.chain_fate(FIRST_VENUE_SHARD, hash).1,
+            Some((_, TransactionDecision::Reject))
+        )),
+        "the venue must refuse the swap: a refused member is what leaves the claim unwritten",
+    );
+    let (refused_at, _) = c
+        .chain_fate(FIRST_VENUE_SHARD, hash)
+        .1
+        .expect("the venue refused");
+    let declined: Vec<BlockHeight> = c
+        .declined(FIRST_VENUE_SHARD, hash)
+        .into_iter()
+        .map(|(height, _)| height)
+        .collect();
+    assert_eq!(
+        declined,
+        vec![refused_at],
+        "the Never lands with the venue's rejecting finalization and rides nothing else",
+    );
+    assert!(
+        c.run_until(epochs(4), |_| cut.fired() > 0),
+        "the certificate channel must actually have been exercised and cut",
+    );
+
+    // The verdict reaches the producer, and the input comes home off the
+    // `Never` once, with the pair conserved across it.
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(10), |c| held(
+            c,
+            trader.address(),
+            *PROTOCOL_RESOURCE
+        ) > staged),
+        "the input must come home once the verdict reaches the producer: caller holds {}",
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+    );
+    protocol_resource.assert_settles_within(c, &charges, epochs(10), "a refused crossing");
+    units.assert_settles_within(c, &Charges::default(), epochs(10), "a refused crossing");
+}
+
 /// Everything that can hold each side of the pair in a route scenario:
 /// the traders and the two venues themselves. The providers stocked and
 /// hold nothing a route can reach.
@@ -362,6 +626,34 @@ fn route_worlds<C: Cluster>(
 
 /// Drive every trader's route through both venues and hold the run to
 /// every route accepting, with both sides of the pair conserved.
+/// Which way a route's record crosses: into the core from the trader's
+/// inbound leg, or out of it to the trader's outbound leg. An edge
+/// between two core legs writes no record, since every core shard runs
+/// the whole core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordRoad {
+    IntoTheCore,
+    OutOfTheCore,
+}
+
+/// The records a route's legs write, each with the road it crosses.
+fn records_by_road(legs: &[LegShape]) -> Vec<(SubstateKey, RecordRoad)> {
+    legs.iter()
+        .flat_map(|consumer| consumer.edges.iter().map(move |edge| (consumer, edge)))
+        .filter_map(|(consumer, edge)| {
+            let producer = legs.get(edge.source as usize)?;
+            let road = match (producer.role, consumer.role) {
+                (LegRole::Inbound, LegRole::Core) => RecordRoad::IntoTheCore,
+                (LegRole::Core, LegRole::Outbound) => RecordRoad::OutOfTheCore,
+                _ => return None,
+            };
+            let key = CrossingId::of_edge(producer, consumer.target, edge.output)
+                .record_key(&ProtocolHasher);
+            Some((key, road))
+        })
+        .collect()
+}
+
 fn drive_routes<C: Cluster>(
     c: &mut C,
     first: &StockedVenue,
@@ -374,6 +666,7 @@ fn drive_routes<C: Cluster>(
     let start = c.now();
     let mut charges = Charges::default();
     let mut submissions: Vec<TxHash> = Vec::with_capacity(traders.len());
+    let mut records: Vec<(SubstateKey, RecordRoad)> = Vec::new();
     for (key, account) in traders {
         let tx = build_route_tx(
             key,
@@ -384,6 +677,11 @@ fn drive_routes<C: Cluster>(
             0,
             validity_around(c.now()),
         );
+        records.extend(records_by_road(
+            &tx.try_derived(c.derivation().as_ref())
+                .expect("a scenario route derives")
+                .legs,
+        ));
         submissions.push(charges.submit(c, tx));
     }
 
@@ -405,11 +703,46 @@ fn drive_routes<C: Cluster>(
         );
     }
 
+    // Each trader's records reached their consumers as held readings in
+    // the consumers' chains: pushed by the producer's next proposer, or
+    // read by the consumer when no push landed. The inbound record is
+    // consumed by the core, which every venue shard runs, so both venue
+    // chains read it, one through the push and the other through its
+    // own read; the outbound record is consumed on the trader's shard,
+    // where the deposit that banks the trader's output lands a hop
+    // after the second venue's verdict. Waited for, since the verdict
+    // is what the status reports and the deposit is what conserves.
+    assert!(
+        !records.is_empty(),
+        "a route through two venues writes records"
+    );
+    let readers = |road: &RecordRoad| -> &'static [ShardId] {
+        match road {
+            RecordRoad::IntoTheCore => &[FIRST_VENUE_SHARD, SECOND_VENUE_SHARD],
+            RecordRoad::OutOfTheCore => &[TRADER_SHARD],
+        }
+    };
+    let unread = |c: &C| -> Vec<(SubstateKey, RecordRoad)> {
+        records
+            .iter()
+            .filter(|(key, road)| {
+                readers(road)
+                    .iter()
+                    .any(|shard| !c.reads_record(*shard, *key))
+            })
+            .copied()
+            .collect()
+    };
+    let delivered = c.run_until(budget, |c| unread(c).is_empty());
+    assert!(
+        delivered,
+        "every trader's record must be read by its consumers' chains within budget; unread: {:?}",
+        unread(c),
+    );
+
     // Nothing here mints: the protocol resource the traders paid in is what the venues
     // now hold less the prices burned, and the units the first venue
-    // paid out are what the second took back. Driven rather than read,
-    // since the deposit that banks each trader's output lands a hop
-    // after the second venue's verdict.
+    // paid out are what the second took back.
     protocol_resource.assert_settles_within(c, &charges, budget, "routes through two venues");
     units.assert_settles_within(c, &Charges::default(), budget, "routes through two venues");
 

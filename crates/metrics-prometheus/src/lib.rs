@@ -161,6 +161,19 @@ pub struct Metrics {
     /// composed each: an entry, or the record leaf alone.
     pub reclaims_admitted: CounterVec,
     pub reclaim_probes_pending: Counter,
+    /// The bytes a committed block's state claims weigh, proofs
+    /// included.
+    pub state_claims_weight: Histogram,
+    /// Consumers' asks for crossing records: the fallback reads.
+    pub record_asks: Counter,
+    /// Fenced claims committed blocks carried, by what they read.
+    pub fenced_claims_carried: CounterVec,
+    /// Fenced claims the read frontier refused from what a validator
+    /// held to offer, by what they read.
+    pub fenced_claims_refused: CounterVec,
+    pub crossing_fallback_asks: CounterVec,
+    /// Pushed crossing readings the consumer dropped, by reason.
+    pub crossing_pushes_dropped: CounterVec,
     /// Fetch responses a requester's own check refused, by fetch kind and
     /// the check that refused them.
     pub fetch_responses_refused: CounterVec,
@@ -775,6 +788,50 @@ impl Metrics {
             )
             .unwrap(),
 
+            record_asks: register_counter!(
+                "hyperscale_record_asks_total",
+                "Asks a consumer put to a producer's chain for a crossing record it waits on"
+            )
+            .unwrap(),
+
+            fenced_claims_carried: register_counter_vec!(
+                "hyperscale_fenced_claims_carried_total",
+                "Fenced claims committed blocks carried, by what they read",
+                &["reading"]
+            )
+            .unwrap(),
+
+            fenced_claims_refused: register_counter_vec!(
+                "hyperscale_fenced_claims_refused_total",
+                "Fenced claims the read frontier refused from what a validator held to offer",
+                &["reading"]
+            )
+            .unwrap(),
+
+            crossing_fallback_asks: register_counter_vec!(
+                "hyperscale_crossing_fallback_asks_total",
+                "Crossing questions asked past their deadline, where no push answered them",
+                &["asker"]
+            )
+            .unwrap(),
+
+            crossing_pushes_dropped: register_counter_vec!(
+                "hyperscale_crossing_pushes_dropped_total",
+                "Pushed crossing readings the consumer dropped, by reason",
+                &["reason"]
+            )
+            .unwrap(),
+
+            state_claims_weight: register_histogram!(
+                "hyperscale_state_claims_weight_bytes",
+                "Bytes a committed block's state claims weigh, proofs included",
+                vec![
+                    0.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 131_072.0, 262_144.0,
+                    1_048_576.0,
+                ]
+            )
+            .unwrap(),
+
             fetch_responses_refused: register_counter_vec!(
                 "hyperscale_fetch_responses_refused_total",
                 "Fetch responses refused by the requester's own check",
@@ -1102,6 +1159,37 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_reclaim_probe_pending(&self) {
         self.metrics.reclaim_probes_pending.inc();
+    }
+
+    fn record_state_claims_weight(&self, bytes: usize) {
+        self.metrics.state_claims_weight.observe(bytes as f64);
+    }
+
+    fn record_record_ask(&self) {
+        self.metrics.record_asks.inc();
+    }
+
+    fn record_crossing_fallback_ask(&self, asker: &str) {
+        self.metrics
+            .crossing_fallback_asks
+            .with_label_values(&[asker])
+            .inc();
+    }
+
+    fn record_fenced_claim(&self, reading: &str, carried: bool) {
+        let counter = if carried {
+            &self.metrics.fenced_claims_carried
+        } else {
+            &self.metrics.fenced_claims_refused
+        };
+        counter.with_label_values(&[reading]).inc();
+    }
+
+    fn record_crossing_push_dropped(&self, reason: &str) {
+        self.metrics
+            .crossing_pushes_dropped
+            .with_label_values(&[reason])
+            .inc();
     }
 
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {

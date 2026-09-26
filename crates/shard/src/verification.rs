@@ -12,14 +12,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_storage::committed_tx_cells;
+use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
-    ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
-    ReshapeThresholds, RevealChain, ShardId, SplitChildRoots, StateRoot, SubstateKey,
-    SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TxHash, TxsInFlight,
-    UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
-    WeightedTimestamp,
+    ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
+    QuorumCertificate, ReadFence, ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId,
+    SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier, TopologySchedule,
+    TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
+    VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -27,15 +27,16 @@ use tracing::{debug, trace, warn};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
-use crate::proposal::late_deliveries;
+use crate::read_fence::read_fence;
 
-/// The committed cells `block` writes.
+/// The cells `block` writes of the chain's own accord.
 ///
-/// One per transaction it carries, under the block's own shard. Every
-/// reader of the block's root — the proposer's voters, a replica
-/// committing it on its certificate alone, a split child following it —
-/// derives the same set from the same two facts, and no window enters
-/// it.
+/// A committed-transaction cell per transaction it carries, under the
+/// block's own shard, under
+/// the consuming node's target. Every reader of the block's root — the
+/// proposer's voters, a replica committing it on its certificate alone,
+/// a split child following it — derives the same set from the same
+/// sections, and no window enters it.
 #[must_use]
 pub fn committed_cells_for(block: &Block) -> Vec<(SubstateKey, Vec<u8>)> {
     committed_tx_cells(
@@ -98,12 +99,9 @@ pub struct ReadyStateRootVerification {
     /// Finalizations from the `PendingBlock` — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    /// Hashes of the block's own transactions — its contribution to the
-    /// committed-transaction window a terminating boundary header roots.
-    pub block_tx_hashes: Vec<TxHash>,
-    /// The committed cells the block writes, derived under its window,
-    /// folded under the root being verified.
-    pub creations: Vec<(SubstateKey, Vec<u8>)>,
+    /// The committed markers the block writes, each with the inherited
+    /// key its transaction is also judged by.
+    pub creations: Vec<CommittedHere>,
     /// Height of the block being verified.
     pub block_height: BlockHeight,
     /// The header's `split_child_roots` claim, verified beside the
@@ -112,13 +110,13 @@ pub struct ReadyStateRootVerification {
     /// Whether the block's window requires the claim (the shard's final
     /// epoch before a split).
     pub split_child_roots_required: bool,
-    /// Whether the block's window requires terminal roots — set on any
+    /// Whether the block's window requires the terminal settled root — set on any
     /// terminating boundary header (a split parent's or a merge child's
     /// final epoch), broader than [`Self::split_child_roots_required`].
-    pub terminal_roots_required: bool,
-    /// The header's `terminal_roots` claim, verified beside the state root
+    pub terminal_settled_txs_required: bool,
+    /// The header's `terminal_settled_txs` claim, verified beside the state root
     /// over the committed retention window.
-    pub claimed_terminal_roots: Option<TerminalRoots>,
+    pub claimed_terminal_settled_txs: Option<SettledTxsRoot>,
     /// The block's parent-QC weighted timestamp — the settled-transaction window
     /// anchor.
     pub parent_weighted_timestamp: WeightedTimestamp,
@@ -131,6 +129,21 @@ pub struct ReadyStateRootVerification {
     /// The header's own `sweep_frontier` claim, recomputed beside the
     /// state root.
     pub claimed_sweep_frontier: SweepFrontier,
+    /// What the block's claims do to the read frontier, folded under
+    /// the root being verified.
+    pub frontier: FrontierInputs,
+    /// What the block writes to tick membership, folded under the root
+    /// being verified.
+    pub members: MemberInputs,
+    /// What the read frontier judges of the block against the parent
+    /// state.
+    pub fence: ReadFence,
+    /// The block's claims: what the fold settles on, and among which
+    /// the parent-anchored ones are re-read from the parent view.
+    pub state_claims: Vec<StateClaim>,
+    /// The block's abandonment records, whose crossings named off this
+    /// shard's leaves are read from the parent view.
+    pub abandonment_records: Vec<AbandonmentRecord>,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -158,10 +171,14 @@ pub struct PendingStateRootVerification {
     pub(crate) block_height: BlockHeight,
     pub(crate) claimed_split_child_roots: Option<SplitChildRoots>,
     pub(crate) split_child_roots_required: bool,
-    pub(crate) terminal_roots_required: bool,
-    pub(crate) claimed_terminal_roots: Option<TerminalRoots>,
+    pub(crate) terminal_settled_txs_required: bool,
+    pub(crate) claimed_terminal_settled_txs: Option<SettledTxsRoot>,
     pub(crate) parent_weighted_timestamp: WeightedTimestamp,
     pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
+    pub(crate) frontier: FrontierInputs,
+    pub(crate) fence: ReadFence,
+    pub(crate) state_claims: Vec<StateClaim>,
+    pub(crate) abandonment_records: Vec<AbandonmentRecord>,
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
@@ -797,8 +814,10 @@ impl VerificationPipeline {
         block: &Block,
         parent_block_height: BlockHeight,
         split_child_roots_required: bool,
-        terminal_roots_required: bool,
+        terminal_settled_txs_required: bool,
         settled_txs_window_floor: Option<WeightedTimestamp>,
+        frontier: FrontierInputs,
+        fence: ReadFence,
     ) {
         let parent_block_hash = block.header().parent_block_hash();
         let ready = PendingStateRootVerification {
@@ -810,10 +829,14 @@ impl VerificationPipeline {
             block_height: block.height(),
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
-            terminal_roots_required,
-            claimed_terminal_roots: block.header().terminal_roots(),
+            terminal_settled_txs_required,
+            claimed_terminal_settled_txs: block.header().settled_txs_root(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor,
+            frontier,
+            fence,
+            state_claims: block.state_claims().to_vec(),
+            abandonment_records: block.abandonment_records().to_vec(),
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -869,7 +892,6 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         block: &Block,
-        late_deliveries: HashSet<TxHash>,
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
@@ -883,7 +905,6 @@ impl VerificationPipeline {
             expected_root: block.header().transaction_root(),
             transactions: block.transactions().clone(),
             validity_anchor: block.header().parent_qc().weighted_timestamp(),
-            late_deliveries,
         }]
     }
 
@@ -945,7 +966,6 @@ impl VerificationPipeline {
             block_hash,
             expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
-            certificates: block.certificates().clone(),
             topology_snapshot: topology_snapshot.clone(),
         }]
     }
@@ -983,7 +1003,7 @@ impl VerificationPipeline {
     /// check. The handler reads each named transaction off the store and
     /// answers with a [`Resolutions`](hyperscale_types::Resolutions), which
     /// the coordinator folds into the pipeline: exact verifies, wrong or
-    /// lapsed refuses, and unknown leaves the root in flight — the vote
+    /// overdue refuses, and unknown leaves the root in flight — the vote
     /// deferred, the block pending.
     pub(crate) fn initiate_resolutions_verification(
         &mut self,
@@ -992,48 +1012,35 @@ impl VerificationPipeline {
         schedule: &TopologySchedule,
     ) -> Vec<Action> {
         let anchor = block.header().parent_qc().weighted_timestamp();
-        // No window, no check: the mark is not taken and no action goes
-        // out, so the block stays pending and the next re-drive asks
-        // again — the same shape an unknown name takes. A stand-in would
-        // not be a neutral answer: under one shard every prefix resolves
-        // to it, so no body classifies as delivering here, no delivery
-        // is ever read as lapsed, and the block passes the arm the
-        // abandonment fence rests on — a permissive answer to the
-        // question that keeps a crossing from being claimed after its
-        // issuer may have taken it back. A window this cannot read is
-        // one to wait for.
-        let Some(window) = schedule.at(anchor) else {
+        // No window, no check: a block whose own anchor no retained
+        // window carries is one this node cannot place in the schedule
+        // at all. The mark is not taken and no action goes out, so the
+        // block stays pending and the next re-drive asks again — the
+        // same shape an unknown name takes, and the conservative answer
+        // where a stand-in would be a guess.
+        if schedule.at(anchor).is_none() {
             warn!(
                 ?block_hash,
                 ?anchor,
                 "Deferring resolutions verification — no retained window carries the anchor"
             );
             return Vec::new();
-        };
-        let trie = window.shard_trie().clone();
+        }
         let entries: Vec<UnsettledTx> = block
             .abandonment_records()
             .iter()
             .flat_map(AbandonmentRecord::unsettled)
             .cloned()
             .collect();
-        let deliveries = block.undecided_names();
-        let successes = block.successes_decided_alone();
         debug!(
             ?block_hash,
             names = entries.len(),
-            deliveries = deliveries.len(),
-            successes = successes.len(),
             "Initiating resolutions verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::Resolutions);
         vec![Action::VerifyResolutions {
             block_hash,
             entries,
-            deliveries,
-            successes,
-            anchor,
-            trie,
             windows: schedule.windows(),
         }]
     }
@@ -1583,7 +1590,7 @@ impl VerificationPipeline {
         block: &Block,
         count_source: SubstateCountSource<'_>,
         split_child_roots_required: bool,
-        terminal_roots_required: bool,
+        terminal_settled_txs_required: bool,
         fee_demands: Vec<FeeDemand>,
         fee_read_height: BlockHeight,
         fee_read_ready: bool,
@@ -1596,28 +1603,28 @@ impl VerificationPipeline {
             .into_iter()
             .filter(|&kind| !self.is_root_in_flight(block_hash, kind))
             .collect();
-
         for kind in wanted {
             match kind {
                 // The state root's own deferred queue is the second
                 // place it may already be waiting.
                 VerificationKind::StateRoot => {
                     if self.needs_state_root_verification(block) {
+                        let windows = schedule.windows();
+                        let fence = read_fence(block.state_claims(), windows);
                         self.initiate_state_root_verification(
                             block_hash,
                             block,
                             h.parent_qc().height(),
                             split_child_roots_required,
-                            terminal_roots_required,
+                            terminal_settled_txs_required,
                             schedule.settled_window_floor(local_shard, anchor),
+                            FrontierInputs::of_block(block, windows),
+                            fence,
                         );
                     }
                 }
                 VerificationKind::TransactionRoot => {
-                    let late = late_deliveries(block.transactions(), schedule, anchor, local_shard);
-                    actions.extend(
-                        self.initiate_transaction_root_verification(block_hash, block, late),
-                    );
+                    actions.extend(self.initiate_transaction_root_verification(block_hash, block));
                 }
                 VerificationKind::ProvisionRoot => {
                     if let Some(pending) = pending_blocks.get(block_hash) {
@@ -1847,9 +1854,11 @@ impl VerificationPipeline {
         let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
         let finalizations: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
-        let block_tx_hashes: Vec<TxHash> =
-            block.transactions().iter().map(|tx| tx.hash()).collect();
-        let creations = committed_cells_for(block);
+        let creations = committed_here(
+            block.header().shard_id(),
+            chain.chain_origin().anchor_wt,
+            block.transactions().iter().map(|tx| tx.as_unverified()),
+        );
         Some(ReadyStateRootVerification {
             block_hash: pending.block_hash,
             parent_block_hash: pending.parent_block_hash,
@@ -1858,17 +1867,21 @@ impl VerificationPipeline {
             expected_root: pending.expected_root,
             expected_local_receipt_root: pending.expected_local_receipt_root,
             finalizations,
-            block_tx_hashes,
             creations,
             block_height: pending.block_height,
             claimed_split_child_roots: pending.claimed_split_child_roots,
             split_child_roots_required: pending.split_child_roots_required,
-            terminal_roots_required: pending.terminal_roots_required,
-            claimed_terminal_roots: pending.claimed_terminal_roots,
+            terminal_settled_txs_required: pending.terminal_settled_txs_required,
+            claimed_terminal_settled_txs: pending.claimed_terminal_settled_txs,
             parent_weighted_timestamp: pending.parent_weighted_timestamp,
             settled_txs_window_floor: pending.settled_txs_window_floor,
             parent_sweep_frontier: chain.parent_sweep_frontier(pending.parent_block_hash),
             claimed_sweep_frontier: block.header().sweep_frontier(),
+            frontier: pending.frontier.clone(),
+            members: MemberInputs::of(block),
+            fence: pending.fence.clone(),
+            state_claims: pending.state_claims.clone(),
+            abandonment_records: pending.abandonment_records.clone(),
         })
     }
 
@@ -2209,14 +2222,11 @@ mod tests {
     use super::*;
     use crate::pending::PendingBlock;
 
-    /// The deadline holds only an execution's success decided alone. A
-    /// member with a sibling to stay atomic with settles on the sibling's
-    /// clock, a refusal writes no claim to reclaim against, a member
-    /// settling what an execution left is past the deadline by
-    /// construction, and a leg's own success decides nothing — that one
-    /// is a delivery's question.
+    /// A leg's own success decides nothing, so it is the one name the
+    /// block's finalizations resolve without deciding: a decision, a
+    /// refusal, a member with a sibling and a settlement all decide.
     #[test]
-    fn only_an_executions_success_decided_alone_is_held_to_the_deadline() {
+    fn only_a_legs_finalization_names_what_it_does_not_decide() {
         let alone = test_transaction(1).hash();
         let with_sibling = test_transaction(2).hash();
         let refused = test_transaction(3).hash();
@@ -2244,10 +2254,10 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
-        assert_eq!(block.successes_decided_alone(), vec![alone]);
         assert_eq!(block.undecided_names(), vec![leg]);
     }
 
@@ -2304,6 +2314,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -2351,6 +2362,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -2578,6 +2590,8 @@ mod tests {
             false,
             false,
             None,
+            FrontierInputs::still(ShardId::ROOT),
+            ReadFence::default(),
         );
 
         let mut pb =
@@ -2640,6 +2654,8 @@ mod tests {
             false,
             false,
             None,
+            FrontierInputs::still(ShardId::ROOT),
+            ReadFence::default(),
         );
 
         let pending = PendingBlocks::new();
@@ -2688,6 +2704,8 @@ mod tests {
             false,
             false,
             None,
+            FrontierInputs::still(ShardId::ROOT),
+            ReadFence::default(),
         );
 
         let empty_pending = PendingBlocks::new();
@@ -3064,6 +3082,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         };
         let demands = block.demands();
         assert!(demands.contains(VerificationKind::TransactionRoot));

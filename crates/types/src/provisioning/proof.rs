@@ -1,7 +1,7 @@
 //! Merkle proofs over the JMT state tree, on the wire.
 
 use hyperscale_hbor::{Bytes, Hbor};
-use hyperscale_jmt::{Blake3Hasher, ClaimTermination, MultiProof, Tree, ValueHash};
+use hyperscale_jmt::{Blake3Hasher, ClaimTermination, MultiProof, ProofError, Tree, ValueHash};
 use thiserror::Error;
 
 use crate::{MAX_MERKLE_PROOF_LEN, ShardId, StateRoot, SubstateKey, shard_prefix_path};
@@ -66,6 +66,12 @@ pub enum StateProofError {
     /// The proof does not reconstruct the root it was checked against.
     #[error("state proof does not reconstruct the state root")]
     RootMismatch,
+    /// The proof claims a key beyond the ones asked about.
+    #[error("state proof claims a key it was not asked about")]
+    ExtraClaim,
+    /// A reading stated beside the proof is not what the proof says.
+    #[error("state proof disagrees with the reading stated for a key")]
+    ReadingMismatch,
 }
 
 impl MerkleInclusionProof {
@@ -135,6 +141,51 @@ impl MerkleInclusionProof {
         <Tree<Blake3Hasher, 1>>::verify(&proof, root_bytes, &shard_prefix_path(shard), &expected)
             .map_err(|_| StateProofError::RootMismatch)?;
         Ok(inclusions)
+    }
+
+    /// [`Self::inclusions`], over a proof that claims exactly `keys`.
+    ///
+    /// A proof answering more than it was asked is bytes a proposer can
+    /// pad a block with, so the form a block carries admits one proof
+    /// per key set: a claim the proof carries that `keys` does not name
+    /// refuses it as [`StateProofError::ExtraClaim`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::inclusions`], and `ExtraClaim`.
+    pub fn exact_inclusions(
+        &self,
+        root: StateRoot,
+        shard: ShardId,
+        keys: &[SubstateKey],
+    ) -> Result<Vec<(SubstateKey, Inclusion)>, StateProofError> {
+        let proof = MultiProof::decode(self.as_bytes()).map_err(|_| StateProofError::Malformed)?;
+        let mut asked: Vec<_> = keys.iter().map(SubstateKey::to_bytes).collect();
+        asked.sort_unstable();
+        asked.dedup();
+        if proof.claims.len() > asked.len() {
+            return Err(StateProofError::ExtraClaim);
+        }
+        self.inclusions(root, shard, keys)
+    }
+
+    /// This proof cut down to `keys`: what a fresh proof over them alone
+    /// would carry, byte for byte, so one fetch answers several claims
+    /// and one claim can be cut by key.
+    ///
+    /// # Errors
+    ///
+    /// [`StateProofError::Malformed`] when the bytes do not decode or do
+    /// not describe one tree, and [`StateProofError::MissingClaim`] when
+    /// `keys` names a key the proof does not claim.
+    pub fn restrict(&self, keys: &[SubstateKey]) -> Result<Self, StateProofError> {
+        let proof = MultiProof::decode(self.as_bytes()).map_err(|_| StateProofError::Malformed)?;
+        let keep: Vec<_> = keys.iter().map(SubstateKey::to_bytes).collect();
+        let cut = <Tree<Blake3Hasher, 1>>::restrict(&proof, &keep).map_err(|err| match err {
+            ProofError::MissingClaim => StateProofError::MissingClaim,
+            _ => StateProofError::Malformed,
+        })?;
+        Ok(Self::new(cut.encode()))
     }
 
     /// Get the raw proof bytes.
@@ -298,6 +349,60 @@ mod tests {
         );
         assert_eq!(
             MerkleInclusionProof::new(vec![0xff; 8]).inclusions(root, ShardId::ROOT, &[missing]),
+            Err(StateProofError::Malformed)
+        );
+    }
+
+    /// A proof claiming a key beyond the ones asked is refused by the
+    /// exact reader and accepted by the plain one, and one missing an
+    /// asked key is refused by both.
+    #[test]
+    fn exact_inclusions_refuse_an_extra_and_a_missing_key() {
+        let (held, other, missing) = (test_key(1), test_key(2), test_key(3));
+        let (root, proof) = tree_and_proof(&[held, other], &[missing, held]);
+        assert_eq!(
+            proof.exact_inclusions(root, ShardId::ROOT, &[held]),
+            Err(StateProofError::ExtraClaim),
+        );
+        assert_eq!(
+            proof
+                .inclusions(root, ShardId::ROOT, &[held])
+                .map(|r| r.len()),
+            Ok(1),
+            "the plain reader still accepts the superset",
+        );
+        assert_eq!(
+            proof.exact_inclusions(root, ShardId::ROOT, &[held, missing, other]),
+            Err(StateProofError::MissingClaim),
+        );
+        assert_eq!(
+            proof
+                .exact_inclusions(root, ShardId::ROOT, &[held, missing])
+                .map(|r| r.len()),
+            Ok(2),
+        );
+    }
+
+    /// Restricting a proof to some of its keys is the proof over those
+    /// keys alone, and it still answers for them under the root.
+    #[test]
+    fn restrict_is_the_proof_over_the_kept_keys() {
+        let (held, other, missing) = (test_key(1), test_key(2), test_key(3));
+        let (root, whole) = tree_and_proof(&[held, other], &[missing, held, other]);
+        let (_, fresh) = tree_and_proof(&[held, other], &[held, missing]);
+        let cut = whole.restrict(&[held, missing]).unwrap();
+        assert_eq!(cut, fresh);
+        assert_eq!(
+            cut.exact_inclusions(root, ShardId::ROOT, &[held, missing])
+                .map(|r| r.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            whole.restrict(&[test_key(9)]),
+            Err(StateProofError::MissingClaim)
+        );
+        assert_eq!(
+            MerkleInclusionProof::new(vec![0xff; 8]).restrict(&[held]),
             Err(StateProofError::Malformed)
         );
     }

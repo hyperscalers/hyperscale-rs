@@ -192,19 +192,26 @@ hash_newtype!(
 );
 
 hash_newtype!(
-    /// Merkle root over the transactions a shard committed within its
-    /// retention window up to a terminal block.
+    /// Set root over the [`Engagement`](crate::Engagement)s a block's
+    /// provisions name.
     ///
-    /// Carried in [`BlockHeader::committed_txs_root`](crate::BlockHeader)
-    /// on a terminating shard's boundary header, beside
-    /// [`SettledTxsRoot`]. A successor reads it off the terminal it
-    /// commit-proved to tell a replay of something the predecessor
-    /// committed from a first inclusion the predecessor never made.
+    /// Carried in
+    /// [`BlockHeader::engagement_root`](crate::BlockHeader), so a sealed
+    /// block's kept list is bound to the bodies it dropped, and the
+    /// engagement tier folds the same entries on every commit path.
+    pub EngagementRoot,
+    "EngagementRoot"
+);
+
+hash_newtype!(
+    /// Root over a block's [`TickLine`](crate::TickLine)s, in manifest
+    /// order.
     ///
-    /// Leaves are sorted by transaction hash, which is what makes absence
-    /// provable from a bracketing pair rather than the whole set.
-    pub CommittedTxsRoot,
-    "CommittedTxsRoot"
+    /// Carried in
+    /// [`BlockHeader::tick_manifest_root`](crate::BlockHeader), so both
+    /// block forms keep one manifest and every commit path folds it.
+    pub TickManifestRoot,
+    "TickManifestRoot"
 );
 
 // ── Beacon chain ─────────────────────────────────────────────────────────────

@@ -9,7 +9,7 @@
 
 use hyperscale_hbor::Capped;
 use hyperscale_storage::committed_tx_cells;
-use hyperscale_types::{AddressClass, ShardId};
+use hyperscale_types::{AddressClass, FrontierInputs, ShardId};
 use hyperscale_vm_effects::Hash32;
 use hyperscale_vm_types::{Address, IntentHash, LegRole, LegShape, ValueEdge};
 
@@ -36,7 +36,6 @@ fn leg(target: Address, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
         declares: vec![target],
         intent: IntentHash(Hash32([7; 32])),
         local: 0,
-        expiry_ms: 1_000,
     }
 }
 
@@ -135,19 +134,109 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
         provisions,
         abandonment_records,
         state_claims,
+        tick_manifest: Arc::new(Capped::empty()),
         witness_sources,
     };
 
     let parent_root = SimShardStorage::new(shard_prefix_path(parent))
-        .follow_block_writes(&block, &committed)
+        .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
         .expect("the parent commits its block");
     let children = SplitChildRoots {
         left: SimShardStorage::new(shard_prefix_path(left))
-            .follow_block_writes(&block, &committed)
+            .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
             .expect("a child follows"),
         right: SimShardStorage::new(shard_prefix_path(right))
-            .follow_block_writes(&block, &committed)
+            .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
             .expect("a child follows"),
     };
+    assert!(children.composes_to(parent_root));
+}
+
+/// A split child following its parent's block folds the parent's tick
+/// membership over its own half: the rows sit under the parent's owner,
+/// which is the left child's, so the left child holds them and the
+/// right child holds none, and the halves recompose the parent's root.
+#[test]
+fn a_followed_block_recomposes_the_parents_member_rows() {
+    use std::sync::Arc;
+
+    use hyperscale_storage::test_helpers::{block_settling, make_state_writes};
+    use hyperscale_storage::{BoundaryStore, MemberIndex, SubstateStore};
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::{
+        Block, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusReceipt, GlobalReceiptHash,
+        Joins, Settlement, SplitChildRoots, StoredReceipt, TickLine, TxHash, Verifiable,
+        shard_prefix_path,
+    };
+
+    let parent = ShardId::leaf(2, 2);
+    let (left, right) = parent.children();
+    let tx = test_transaction(1);
+    let committed = committed_tx_cells(parent, [&tx]);
+    let right_half = StoredReceipt::synced(
+        TxHash::ZERO,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes: make_state_writes(0xA0, 1, vec![1; 4]),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let Block::Live {
+        header,
+        certificates,
+        provisions,
+        abandonment_records,
+        state_claims,
+        witness_sources,
+        ..
+    } = block_settling(BlockHeight::new(1), vec![right_half])
+    else {
+        unreachable!("the fixture builds a live block");
+    };
+    let block = Block::Live {
+        header: BlockHeader::new(BlockHeaderParts {
+            shard_id: parent,
+            ..header.into_parts()
+        }),
+        transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx.clone()))])),
+        certificates,
+        provisions,
+        abandonment_records,
+        state_claims,
+        tick_manifest: Arc::new(Capped::from_array([TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+        }])),
+        witness_sources,
+    };
+
+    let whole = SimShardStorage::new(shard_prefix_path(parent));
+    let parent_root = whole
+        .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
+        .expect("the parent commits its block");
+    let rows = MemberIndex::load(&whole.snapshot(), parent);
+    assert_eq!(rows.members.len(), 1, "the block puts its member in flight");
+    assert_eq!(rows.ticks.len(), 1);
+
+    let left_store = SimShardStorage::new(shard_prefix_path(left));
+    let right_store = SimShardStorage::new(shard_prefix_path(right));
+    let children = SplitChildRoots {
+        left: left_store
+            .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
+            .expect("a child follows"),
+        right: right_store
+            .follow_block_writes(&block, &committed, &FrontierInputs::still(ShardId::ROOT))
+            .expect("a child follows"),
+    };
+    assert_eq!(MemberIndex::load(&left_store.snapshot(), parent), rows);
+    assert_eq!(
+        MemberIndex::load(&right_store.snapshot(), parent),
+        MemberIndex::empty(parent)
+    );
     assert!(children.composes_to(parent_root));
 }

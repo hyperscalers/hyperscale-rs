@@ -6,13 +6,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
-use hyperscale_storage::{JmtSnapshot, SweepRows, entry_leaf_rows, index_leaf, retire_dated};
+use hyperscale_storage::{
+    Indexed, JmtSnapshot, RowChange, SweepRows, entry_leaf_rows, index_leaf, retire_dated,
+};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-    ConsensusReceipt, EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization,
-    FinalizationHash, Hash, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters,
-    SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction,
-    TxHash, ValidatorId, WeightedTimestamp,
+    ConsensusReceipt, EntryKey, ExecutionMetadata, Finalization, FinalizationHash, Hash,
+    ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites,
+    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash, ValidatorId,
+    WeightedTimestamp,
 };
 use im::OrdMap;
 
@@ -69,6 +71,9 @@ pub struct SharedState {
     pub(crate) version_time: BTreeMap<u64, u64>,
     /// The oldest version historical reads are answered at.
     pub(crate) retention_floor: u64,
+    /// The oldest version this node's own readers still name;
+    /// `u64::MAX` until one holds. The floor never passes it.
+    pub(crate) retention_hold: u64,
     /// Committed substate byte total per version, written in
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
@@ -83,6 +88,9 @@ pub struct SharedState {
     /// from the same judgement so both backends enumerate the same
     /// candidates.
     pub(crate) sweep_index: SweepRows,
+    /// The crossing index — the mirror of the `RocksDB` backend's: one
+    /// key per committed crossing record or answer.
+    pub(crate) crossing_index: BTreeSet<SubstateKey>,
 }
 
 impl SharedState {
@@ -97,6 +105,7 @@ impl SharedState {
         let retired = retire_dated(
             self.retention_floor,
             version,
+            self.retention_hold,
             tip_ts,
             self.version_time
                 .range(self.retention_floor..)
@@ -124,9 +133,11 @@ impl SharedState {
             entries_history: OrdMap::new(),
             version_time: BTreeMap::new(),
             retention_floor: 0,
+            retention_hold: u64::MAX,
             substate_bytes: BTreeMap::new(),
             package_artifacts: BTreeMap::new(),
             sweep_index: SweepRows::default(),
+            crossing_index: BTreeSet::new(),
         }
     }
 
@@ -235,11 +246,10 @@ pub struct ConsensusState {
     pub(crate) execution_metadata: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub(crate) receipt_heights: HashMap<TxHash, BlockHeight>,
-    /// Execution certificates keyed by [`TickId`].
-    pub(crate) execution_certs: HashMap<TickId, ExecutionCertificate>,
-    /// Index: attested transaction → every certificate of this shard's
-    /// carrying an outcome for it. Mirrors the production
-    /// `tx_cert_index` CF so simulation integration tests serve the
+    /// Index: every finalization of this shard's carrying an outcome for
+    /// a transaction, keyed by the transaction then the finalization's
+    /// hash, its key in `certificates`. Mirrors the production
+    /// `tx_finalizations` CF so simulation integration tests serve the
     /// by-transaction certificate fetch the same way a real node does.
     ///
     /// A set rather than a slot: a shard certifies one transaction its
@@ -247,9 +257,7 @@ pub struct ConsensusState {
     /// a retirement, a reclaim, an abandonment — and a counterpart that
     /// asks by naming the transaction cannot say which of them it
     /// wants.
-    pub(crate) tx_cert_index: HashMap<TxHash, BTreeSet<TickId>>,
-    /// Index: `block_height` → `TickId`s at that height.
-    pub(crate) finalizations_by_height: HashMap<BlockHeight, Vec<TickId>>,
+    pub(crate) tx_finalizations: BTreeSet<(TxHash, FinalizationHash)>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
     /// `RocksDB` `beacon_witnesses` CF so simulation integration tests
     /// can serve fetches and replay the accumulator on restart. Shard
@@ -295,9 +303,7 @@ impl ConsensusState {
             consensus_receipts: HashMap::new(),
             execution_metadata: HashMap::new(),
             receipt_heights: HashMap::new(),
-            execution_certs: HashMap::new(),
-            tx_cert_index: HashMap::new(),
-            finalizations_by_height: HashMap::new(),
+            tx_finalizations: BTreeSet::new(),
             beacon_witnesses: BTreeMap::new(),
             provisions: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,
@@ -382,9 +388,19 @@ pub fn apply_writes(
     let mut sweep_rows = SweepRows::default();
     for (key, change) in writes.cells().iter().chain(&leaf_rows) {
         let prior = state.current_state.get(key).cloned();
-        let package = index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
+        let Indexed { package, crossing } =
+            index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
         if let (Some(package), Some(value)) = (package, change) {
             state.package_artifacts.insert(package, value.clone());
+        }
+        match crossing {
+            RowChange::Put => {
+                state.crossing_index.insert(*key);
+            }
+            RowChange::Delete => {
+                state.crossing_index.remove(key);
+            }
+            RowChange::Keep => {}
         }
         if write_history {
             state.state_history.insert((*key, version), prior);

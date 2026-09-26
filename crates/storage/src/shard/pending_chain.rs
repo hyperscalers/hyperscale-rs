@@ -13,9 +13,9 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey,
     ExecutionCertificate, Finalization, FinalizationHash, QuorumCertificate, RETENTION_HORIZON,
-    ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SweepBucket, SweepFrontier,
-    TerminalRoots, TickId, Transaction, TxHash, Verifiable, Verified, WeightedTimestamp,
-    committed_txs_root_from_hashes, local_settled_tx_hashes, settled_txs_root_from_hashes,
+    SettledTxsRoot, ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SweepBucket,
+    SweepFrontier, Transaction, TxHash, Verifiable, Verified, WeightedTimestamp,
+    local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -103,12 +103,6 @@ pub struct ChainEntry {
     /// settled-transaction window walk reaches a pending ancestor's contribution
     /// during the proposer's build, not just after commit.
     pub settled_txs: Vec<TxHash>,
-    /// Hashes of the transactions this block carries. Carried from insert
-    /// for the same reason as `settled_txs`: a pending ancestor has no
-    /// attached block until the commit pipeline reaches it, so a
-    /// committed-transaction window walk would miss its contribution
-    /// during the proposer's build.
-    pub committed_txs: Vec<TxHash>,
     /// JMT snapshot from this block's speculative state-root computation.
     pub jmt_snapshot: Arc<JmtSnapshot>,
     /// shard-committed block paired with its QC. `None` until the entry's
@@ -258,15 +252,13 @@ where
     /// If no blocks have been committed yet, returns a view with no
     /// pending entries (reads fall through to base storage).
     pub fn view_at_committed_tip(self: &Arc<Self>) -> Arc<SubstateView<S>> {
-        self.base.committed_hash().map_or_else(
-            || {
-                Arc::new(SubstateView::base_only(
-                    Arc::clone(&self.base),
-                    self.base.jmt_height(),
-                ))
-            },
-            |h| self.view_at(h, self.base.committed_height()),
-        )
+        match self.base.committed_head() {
+            (height, Some(hash)) => self.view_at(hash, height),
+            (_, None) => Arc::new(SubstateView::base_only(
+                Arc::clone(&self.base),
+                self.base.jmt_height(),
+            )),
+        }
     }
 
     /// Attach the [`CertifiedBlock`] to the entry inserted earlier at
@@ -446,35 +438,28 @@ where
             .then(|| stored.into_iter().map(|fw| Arc::new(fw.into())).collect())
     }
 
-    /// The commitments a terminating boundary header carries, both walked
-    /// over the block being built or verified and the committed window
-    /// behind it.
+    /// The settled-transaction root a terminating boundary header
+    /// carries, walked over the block being built or verified and the
+    /// committed window behind it: `[min(anchor_wt, settled_window_floor)
+    /// − RETENTION_HORIZON, parent]`, because a counterpart's fence can
+    /// hold a straddler admitted as far back as the reshape.
     ///
-    /// One call because one predicate governs both: a header carries the
-    /// pair or neither, so computing one without the other has no caller.
-    /// The two walks differ in reach and in what they fold. The settled
-    /// side runs over `[min(anchor_wt, settled_window_floor) −
-    /// RETENTION_HORIZON, parent]`, because a counterpart's fence can hold
-    /// a straddler admitted as far back as the reshape; the committed side
-    /// floors at `anchor_wt − RETENTION_HORIZON`, because a successor only
-    /// asks about transactions whose validity window is still open.
-    ///
-    /// `window` is where both walks start and stop; `own_certificates` and
-    /// `own_txs` are what the block under construction contributes.
+    /// `window` is where the walk starts and stops; `own_certificates` is
+    /// what the block under construction contributes.
     ///
     /// # Errors
     ///
-    /// [`WindowCoverage::Short`] when either walk stops on a height this
-    /// node does not hold. The pair is then uncomputable here — not wrong,
+    /// [`WindowCoverage::Short`] when the walk stops on a height this node
+    /// does not hold. The root is then uncomputable here — not wrong,
     /// absent — and a caller must decline to attest rather than carry a
-    /// root taken over a prefix.
-    pub fn terminal_roots_in_window(
+    /// root taken over a prefix, which every full-history replica would
+    /// compute larger.
+    pub fn terminal_settled_txs_root(
         &self,
         window: &TerminalWindow,
         own_certificates: &[Arc<Verifiable<Finalization>>],
-        own_txs: Vec<TxHash>,
-    ) -> Result<TerminalRoots, WindowCoverage> {
-        let (settled, settled_coverage) = self.settled_txs_in_window(
+    ) -> Result<SettledTxsRoot, WindowCoverage> {
+        let (settled, coverage) = self.settled_txs_in_window(
             window.local_shard,
             window.parent_block_hash,
             window.parent_block_height,
@@ -482,97 +467,10 @@ where
             window.settled_window_floor,
             local_settled_tx_hashes(own_certificates, window.local_shard),
         );
-        let (committed, committed_coverage) = self.committed_txs_in_window(
-            window.parent_block_hash,
-            window.parent_block_height,
-            window.anchor_wt,
-            own_txs,
-        );
-        // Either walk falling short makes the pair unattestable: a root
-        // over a prefix is a smaller root, and every full-history replica
-        // computes the whole one.
-        if settled_coverage.short_at().is_some() {
-            return Err(settled_coverage);
+        if coverage.short_at().is_some() {
+            return Err(coverage);
         }
-        if committed_coverage.short_at().is_some() {
-            return Err(committed_coverage);
-        }
-        Ok(TerminalRoots {
-            settled_txs: settled_txs_root_from_hashes(settled.iter()),
-            committed_txs: committed_txs_root_from_hashes(committed.iter()),
-        })
-    }
-
-    /// Every transaction committed across the window, unioned with `own`
-    /// (the block being built or verified).
-    ///
-    /// Structurally the settled walk's twin — pending prefix by hash, then
-    /// the committed tail by height until a block falls below the floor —
-    /// but it folds each block's whole transaction list rather than
-    /// filtering certificates, and it takes no schedule-supplied floor.
-    /// The settled root reaches back to the reshape's admission because a
-    /// counterpart's fence can hold a straddler that old; a successor only
-    /// asks about transactions whose validity window is still open, and
-    /// nothing committed below `anchor_wt − RETENTION_HORIZON` can be.
-    ///
-    /// Pure over the parent chain, so the proposer (parent still pending)
-    /// and every verifier (parent committed) walk the same ancestors and
-    /// derive the same root.
-    pub fn committed_txs_in_window(
-        &self,
-        parent_block_hash: BlockHash,
-        parent_block_height: BlockHeight,
-        anchor_wt: WeightedTimestamp,
-        own: Vec<TxHash>,
-    ) -> (std::collections::BTreeSet<TxHash>, WindowCoverage) {
-        let mut set: std::collections::BTreeSet<TxHash> = own.into_iter().collect();
-        // Pending prefix: walk by hash so a certified-but-unattached
-        // ancestor still resolves. These sit within the window by
-        // construction and carry no QC to test a floor against.
-        let mut hash = parent_block_hash;
-        let mut height = parent_block_height;
-        {
-            let entries = read_or_recover(&self.entries);
-            while let Some(entry) = entries.get(&hash) {
-                set.extend(entry.committed_txs.iter().copied());
-                hash = entry.parent_block_hash;
-                let Some(prev) = height.prev() else { break };
-                height = prev;
-            }
-        }
-        // Committed tail, floored on each block's own `parent_qc` weighted
-        // timestamp — the canonical, hash-pinned value, identical on every
-        // node. The served certifying QC must not gate it: a coast past
-        // the crossing can re-issue that QC at a higher round with a
-        // divergent timestamp, and a per-node-variable cutoff would
-        // diverge the attested root.
-        let floor = anchor_wt
-            .as_millis()
-            .saturating_sub(RETENTION_HORIZON.as_secs() * 1000);
-        let mut h = height;
-        let coverage = loop {
-            // The metadata row alone: the anchor the floor tests and the
-            // transaction hashes the set folds are both in it, and the
-            // bodies this fold would otherwise rehydrate are discarded.
-            let Some(metadata) = self.block_metadata(h) else {
-                break self.coverage_at(h);
-            };
-            if metadata
-                .header()
-                .parent_qc()
-                .weighted_timestamp()
-                .as_millis()
-                < floor
-            {
-                break WindowCoverage::Whole;
-            }
-            set.extend(metadata.manifest().tx_hashes().iter().copied());
-            let Some(prev) = h.prev() else {
-                break WindowCoverage::Whole;
-            };
-            h = prev;
-        };
-        (set, coverage)
+        Ok(settled_txs_root_from_hashes(settled.iter()))
     }
 
     /// The tick-ids `local_shard` settled across the window, unioned with
@@ -774,15 +672,6 @@ where
     /// Consensus receipt by tx hash. Pass-through to base storage.
     pub fn consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
         self.base.get_consensus_receipt(tx_hash)
-    }
-
-    /// Batched execution-certificate read by `TickId`. Pass-through to
-    /// base storage.
-    pub fn execution_certificates_batch(
-        &self,
-        ids: &[TickId],
-    ) -> Vec<Verified<ExecutionCertificate>> {
-        self.base.get_execution_certificates_batch(ids)
     }
 
     /// The execution certificates carrying outcomes for `tx_hashes`,
@@ -1349,6 +1238,10 @@ mod tests {
         /// whole-block rehydration. The attested window folds read the
         /// metadata row instead, and a test pins that they make none.
         sync_block_reads: AtomicUsize,
+        /// What [`ShardChainReader::committed_head`] answers. The bare
+        /// [`ShardChainReader::committed_height`] stays at genesis, so a
+        /// reader that pairs the two separately sees a store that moved.
+        head: (BlockHeight, Option<BlockHash>),
     }
 
     impl StubStore {
@@ -1459,6 +1352,8 @@ mod tests {
         fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
             None
         }
+
+        fn hold_retention_at(&self, _height: BlockHeight) {}
     }
 
     impl TreeReader for StubStore {
@@ -1498,8 +1393,8 @@ mod tests {
         fn committed_height(&self) -> BlockHeight {
             BlockHeight::new(0)
         }
-        fn committed_hash(&self) -> Option<BlockHash> {
-            None
+        fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {
+            self.head
         }
         fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
             None
@@ -1532,18 +1427,6 @@ mod tests {
         }
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
             None
-        }
-        fn get_execution_certificate(
-            &self,
-            _tick_id: &TickId,
-        ) -> Option<Verified<ExecutionCertificate>> {
-            None
-        }
-        fn get_execution_certificates_batch(
-            &self,
-            _tick_ids: &[TickId],
-        ) -> Vec<Verified<ExecutionCertificate>> {
-            Vec::new()
         }
         fn get_execution_certificates_for_txs(
             &self,
@@ -1609,7 +1492,6 @@ mod tests {
             parent_block_hash: parent,
             height,
             settled_txs: Vec::new(),
-            committed_txs: Vec::new(),
             jmt_snapshot: snapshot_of(writes.resolve(&mut |_| None).expect("nothing moved")),
             certified_block: None,
             certified_uncommitted: None,
@@ -1646,6 +1528,28 @@ mod tests {
             stub = stub.with_block(b);
         }
         Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT))
+    }
+
+    /// The committed tip's hash and height are one read. A persist that
+    /// lands between two separate reads pairs the old tip's hash with the
+    /// new height while the old tip is still pending, and the walk's
+    /// height check takes the shard loop down with it.
+    #[test]
+    fn the_committed_tip_view_anchors_at_its_own_heads_height() {
+        let tip = bh(b"tip");
+        let stub = StubStore {
+            head: (BlockHeight::new(5), Some(tip)),
+            ..StubStore::default()
+        };
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        chain.insert(
+            tip,
+            entry_at(bh(b"parent"), BlockHeight::new(5), &StateWrites::default()),
+        );
+        assert_eq!(
+            chain.view_at_committed_tip().anchor_height,
+            BlockHeight::new(5)
+        );
     }
 
     #[test]
@@ -1836,7 +1740,6 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 height,
                 settled_txs: Vec::new(),
-                committed_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -1928,7 +1831,6 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(5),
                 settled_txs: Vec::new(),
-                committed_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -2105,6 +2007,7 @@ mod tests {
             provisions,
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // The certifying QC carries a deliberately divergent timestamp (a
@@ -2144,7 +2047,6 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(4),
                 settled_txs: vec![settled_tx(&wa)],
-                committed_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -2156,7 +2058,6 @@ mod tests {
                 parent_block_hash: ancestor,
                 height: BlockHeight::new(5),
                 settled_txs: vec![settled_tx(&wb)],
-                committed_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -2204,7 +2105,6 @@ mod tests {
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
                 height: BlockHeight::new(4),
                 settled_txs: vec![settled_tx(&parent_tick)],
-                committed_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -2249,6 +2149,7 @@ mod tests {
             provisions,
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // A deliberately divergent certifying timestamp, as in
@@ -2275,99 +2176,15 @@ mod tests {
         test_transaction(seed).hash()
     }
 
-    /// The pending prefix contributes ancestors whose `certified_block`
-    /// has not attached yet — invisible to `block_for_sync`, and the
-    /// reason the entry carries its own transaction hashes. Without this
-    /// a proposer's committed root would diverge from its verifiers'.
-    #[test]
-    fn committed_txs_window_collects_unattached_pending_ancestors() {
-        let chain = empty_chain();
-        let ancestor = BlockHash::from_raw(Hash::from_bytes(b"ancestor"));
-        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
-        chain.insert(
-            ancestor,
-            ChainEntry {
-                parent_block_hash: BlockHash::ZERO,
-                height: BlockHeight::new(4),
-                settled_txs: Vec::new(),
-                committed_txs: vec![tx_hash(1)],
-                jmt_snapshot: empty_snapshot(),
-                certified_block: None,
-                certified_uncommitted: None,
-            },
-        );
-        chain.insert(
-            parent,
-            ChainEntry {
-                parent_block_hash: ancestor,
-                height: BlockHeight::new(5),
-                settled_txs: Vec::new(),
-                committed_txs: vec![tx_hash(2)],
-                jmt_snapshot: empty_snapshot(),
-                certified_block: None,
-                certified_uncommitted: None,
-            },
-        );
-        let (set, _) = chain.committed_txs_in_window(
-            parent,
-            BlockHeight::new(5),
-            WeightedTimestamp::from_millis(10_000),
-            vec![tx_hash(3)],
-        );
-        assert_eq!(set, BTreeSet::from([tx_hash(1), tx_hash(2), tx_hash(3)]));
-    }
-
-    /// The committed tail walks by height and stops at `anchor −
-    /// RETENTION_HORIZON`, reading each block's own `parent_qc` timestamp
-    /// rather than its served certifying QC — which `committed_sync_block`
-    /// sets far above the floor, so a walk reading the wrong one would
-    /// include the below-floor block.
-    #[test]
-    fn committed_txs_window_floors_the_committed_tail() {
-        let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
-        let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000); // floor = 10_000
-        let stub = StubStore::default()
-            .with_sync_block(
-                BlockHeight::new(3),
-                committed_sync_block(BlockHeight::new(3), anchor.as_millis(), &[10, 11]),
-            )
-            .with_sync_block(
-                BlockHeight::new(2),
-                committed_sync_block(BlockHeight::new(2), 9_999, &[12]),
-            );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
-        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
-        chain.insert(
-            parent,
-            ChainEntry {
-                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
-                height: BlockHeight::new(4),
-                settled_txs: Vec::new(),
-                committed_txs: vec![tx_hash(13)],
-                jmt_snapshot: empty_snapshot(),
-                certified_block: None,
-                certified_uncommitted: None,
-            },
-        );
-        let (set, _) =
-            chain.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
-        assert_eq!(
-            set,
-            BTreeSet::from([tx_hash(13), tx_hash(10), tx_hash(11)]),
-            "the below-floor block's transaction must not enter the window"
-        );
-    }
-
-    /// Neither attested walk rehydrates a block.
+    /// The attested walk rehydrates no block.
     ///
-    /// What each fold reads of a block is in its stored metadata row —
-    /// the parent-QC anchor their floors test, and the manifest's
-    /// transaction hashes the committed set folds — plus, on the settled
-    /// side, the stored attestations. Going through the whole-block read
-    /// multi-gets every body, every certificate, and a receipt per
-    /// settling outcome, per walked height, for data both folds discard.
+    /// What the fold reads of a block is its stored metadata row — the
+    /// parent-QC anchor its floor tests — and the stored attestations.
+    /// Going through the whole-block read multi-gets every body, every
+    /// certificate, and a receipt per settling outcome, per walked height,
+    /// for data the fold discards.
     #[test]
-    fn the_attested_walks_read_no_block_bodies() {
+    fn the_attested_walk_reads_no_block_bodies() {
         let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
         let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000);
         let stub = StubStore::default()
@@ -2392,20 +2209,10 @@ mod tests {
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
                 height: BlockHeight::new(4),
                 settled_txs: Vec::new(),
-                committed_txs: vec![tx_hash(13)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
             },
-        );
-
-        let (set, coverage) =
-            chain.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
-        assert_eq!(coverage, WindowCoverage::Whole);
-        assert_eq!(
-            set,
-            BTreeSet::from([tx_hash(13), tx_hash(10), tx_hash(11), tx_hash(12)]),
-            "the manifest's hashes are the set, and they are in the metadata row",
         );
 
         let (_, coverage) = chain.settled_txs_in_window(
@@ -2450,32 +2257,36 @@ mod tests {
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
                 height: BlockHeight::new(4),
                 settled_txs: Vec::new(),
-                committed_txs: vec![tx_hash(13)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
             },
         );
 
-        let (set, coverage) =
-            chain.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
+        let settled = |chain: &PendingChain<StubStore>| {
+            chain
+                .settled_txs_in_window(
+                    ShardId::ROOT,
+                    parent,
+                    BlockHeight::new(4),
+                    anchor,
+                    None,
+                    Vec::new(),
+                )
+                .1
+        };
         assert_eq!(
-            coverage,
+            settled(&chain),
             WindowCoverage::Short {
                 at: BlockHeight::new(2)
             },
         );
-        assert_eq!(
-            set,
-            BTreeSet::from([tx_hash(13), tx_hash(10)]),
-            "the prefix is still what it walked — it is the verdict that changes",
-        );
 
-        // And the pair refuses to be computed at all rather than handing
-        // back a root over that prefix.
+        // And the root refuses to be computed at all rather than handing
+        // back one over that prefix.
         assert!(
             chain
-                .terminal_roots_in_window(
+                .terminal_settled_txs_root(
                     &TerminalWindow {
                         local_shard: ShardId::ROOT,
                         parent_block_hash: parent,
@@ -2484,7 +2295,6 @@ mod tests {
                         settled_window_floor: None,
                     },
                     &[],
-                    Vec::new(),
                 )
                 .is_err(),
         );
@@ -2514,26 +2324,33 @@ mod tests {
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
             height: BlockHeight::new(height),
             settled_txs: Vec::new(),
-            committed_txs: vec![tx_hash(13)],
             jmt_snapshot: empty_snapshot(),
             certified_block: None,
             certified_uncommitted: None,
         };
         child.insert(parent, entry(4));
 
-        let (_, coverage) =
-            child.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
-        assert_eq!(coverage, WindowCoverage::Whole);
+        let settled = |chain: &PendingChain<StubStore>| {
+            chain
+                .settled_txs_in_window(
+                    ShardId::ROOT,
+                    parent,
+                    BlockHeight::new(4),
+                    anchor,
+                    None,
+                    Vec::new(),
+                )
+                .1
+        };
+        assert_eq!(settled(&child), WindowCoverage::Whole);
 
         // And the origin height itself, which is the case that actually
         // occurs: a chain whose window never reaches the floor walks to
         // its own genesis, and the genesis block is not always servable.
         let at_origin = chain_from(3, StubStore::default());
         at_origin.insert(parent, entry(4));
-        let (_, coverage) =
-            at_origin.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
         assert_eq!(
-            coverage,
+            settled(&at_origin),
             WindowCoverage::Whole,
             "a miss at the chain's own genesis height is its bottom, not a hole",
         );
@@ -2548,10 +2365,8 @@ mod tests {
             ),
         );
         genesis_born.insert(parent, entry(4));
-        let (_, coverage) =
-            genesis_born.committed_txs_in_window(parent, BlockHeight::new(4), anchor, Vec::new());
         assert_eq!(
-            coverage,
+            settled(&genesis_born),
             WindowCoverage::Short {
                 at: BlockHeight::new(2)
             },
@@ -2563,7 +2378,7 @@ mod tests {
     /// chain derive the same value — and a transaction the walk misses
     /// changes it.
     #[test]
-    fn committed_txs_root_tracks_the_window_set() {
+    fn the_terminal_settled_root_tracks_the_window_set() {
         // The chain begins at the block under construction's parent: there
         // are no committed blocks beneath it, so the window is whole.
         let chain = chain_from(2, StubStore::default());
@@ -2573,35 +2388,31 @@ mod tests {
             ChainEntry {
                 parent_block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(2),
-                settled_txs: Vec::new(),
-                committed_txs: vec![tx_hash(20)],
+                settled_txs: vec![tx_hash(20), tx_hash(21)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
             },
         );
-        let anchor = WeightedTimestamp::from_millis(10_000);
         let root = chain
-            .terminal_roots_in_window(
+            .terminal_settled_txs_root(
                 &TerminalWindow {
                     local_shard: ShardId::ROOT,
                     parent_block_hash: parent,
                     parent_block_height: BlockHeight::new(2),
-                    anchor_wt: anchor,
+                    anchor_wt: WeightedTimestamp::from_millis(10_000),
                     settled_window_floor: None,
                 },
                 &[],
-                vec![tx_hash(21)],
             )
-            .expect("the stub holds every height in the window")
-            .committed_txs;
+            .expect("the stub holds every height in the window");
         assert_eq!(
             root,
-            committed_txs_root_from_hashes([tx_hash(20), tx_hash(21)].iter())
+            settled_txs_root_from_hashes([tx_hash(20), tx_hash(21)].iter())
         );
         assert_ne!(
             root,
-            committed_txs_root_from_hashes([tx_hash(20)].iter()),
+            settled_txs_root_from_hashes([tx_hash(20)].iter()),
             "dropping a transaction must change the root"
         );
     }

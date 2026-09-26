@@ -75,7 +75,9 @@
 //! decoded proof against a root or key set. Use [`Tree::verify`] for that.
 
 use crate::hasher::{EMPTY_HASH, Hash, Hasher};
-use crate::node::{KEY_BYTES, Key, MAX_DEPTH_BITS, NibblePath, Node, NodeKey, ValueHash, bits_at};
+use crate::node::{
+    KEY_BITS, KEY_BYTES, Key, MAX_DEPTH_BITS, NibblePath, Node, NodeKey, ValueHash, bits_at,
+};
 use crate::storage::TreeReader;
 use crate::tree::Tree;
 
@@ -314,6 +316,62 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         }
 
         Ok(())
+    }
+
+    /// The proof [`Self::prove`] would build over `keep` alone, cut out
+    /// of `proof`, byte for byte.
+    ///
+    /// The walk follows the proof's own topology as verification does.
+    /// A bucket some kept key descends is descended; one only dropped
+    /// keys descend is reconstructed and emitted as the sibling the
+    /// prover would have emitted for an unclaimed bucket; one nobody
+    /// descends keeps its sibling. The tree's shape does not depend on
+    /// which keys are asked, so every kept claim terminates where it
+    /// did, and the result is what a fresh proof over `keep` says.
+    ///
+    /// # Errors
+    ///
+    /// [`ProofError::MissingClaim`] when `keep` names a key the proof
+    /// does not claim, and [`ProofError::Malformed`] when the proof's
+    /// claims or siblings do not describe one tree.
+    pub fn restrict(proof: &MultiProof, keep: &[Key]) -> Result<MultiProof, ProofError> {
+        let mut kept: Vec<Key> = keep.to_vec();
+        kept.sort_unstable();
+        kept.dedup();
+        if kept
+            .iter()
+            .any(|key| proof.claims.binary_search_by_key(key, |c| c.key).is_err())
+        {
+            return Err(ProofError::MissingClaim);
+        }
+        if kept.is_empty() {
+            return Ok(MultiProof {
+                root_depth_bits: proof.root_depth_bits,
+                claims: Vec::new(),
+                siblings: Vec::new(),
+            });
+        }
+        let root_path = NibblePath::from_key_prefix(&kept[0], proof.root_depth_bits);
+        check_claim_grid::<ARITY_BITS>(&proof.claims, &root_path)?;
+
+        let mut claims = Vec::with_capacity(kept.len());
+        let mut siblings = Vec::new();
+        let (_, consumed) = restrict_rec::<H, ARITY_BITS>(
+            &proof.claims,
+            proof.root_depth_bits,
+            &proof.siblings,
+            &kept,
+            &mut claims,
+            &mut siblings,
+        )?;
+        if consumed != proof.siblings.len() {
+            return Err(ProofError::Malformed("trailing siblings"));
+        }
+        Ok(MultiProof {
+            root_depth_bits: proof.root_depth_bits,
+            claims,
+            siblings,
+        })
     }
 }
 
@@ -634,6 +692,74 @@ where
     Ok((H::hash_internal(&children), consumed))
 }
 
+/// Reconstruct the subtree hash for `claims` as [`verify_rec`] does,
+/// writing the claims among `kept` and the siblings a proof over them
+/// alone would carry, and report how many of `siblings` were consumed.
+///
+/// Called only on a subtree some kept key descends; a subtree none
+/// does is reconstructed whole and becomes one sibling of the parent.
+fn restrict_rec<H, const ARITY_BITS: u8>(
+    claims: &[ProofClaim],
+    depth: u16,
+    siblings: &[Hash],
+    kept: &[Key],
+    claims_out: &mut Vec<ProofClaim>,
+    siblings_out: &mut Vec<Hash>,
+) -> Result<(Hash, usize), ProofError>
+where
+    H: Hasher,
+{
+    debug_assert!(!claims.is_empty());
+    let is_kept = |claim: &ProofClaim| kept.binary_search(&claim.key).is_ok();
+
+    if let Some(hash) = terminal_group::<H>(claims, depth)? {
+        claims_out.extend(claims.iter().filter(|c| is_kept(c)).cloned());
+        return Ok((hash, 0));
+    }
+
+    let arity = 1usize << ARITY_BITS as usize;
+    let child_depth = depth + u16::from(ARITY_BITS);
+    let mut consumed = 0usize;
+    let mut children: Vec<Hash> = vec![EMPTY_HASH; arity];
+    let mut pos = 0usize;
+    for (bucket, child) in children.iter_mut().enumerate() {
+        let start = pos;
+        while pos < claims.len() && bits_at(&claims[pos].key, depth, ARITY_BITS) as usize == bucket
+        {
+            pos += 1;
+        }
+        let range = &claims[start..pos];
+        if range.is_empty() {
+            let sibling = *siblings.get(consumed).ok_or(ProofError::Malformed(
+                "not enough siblings to reconstruct internal node",
+            ))?;
+            siblings_out.push(sibling);
+            *child = sibling;
+            consumed += 1;
+        } else if range.iter().any(is_kept) {
+            let (h, used) = restrict_rec::<H, ARITY_BITS>(
+                range,
+                child_depth,
+                &siblings[consumed..],
+                kept,
+                claims_out,
+                siblings_out,
+            )?;
+            *child = h;
+            consumed += used;
+        } else {
+            let (h, used) = verify_rec::<H, ARITY_BITS>(range, child_depth, &siblings[consumed..])?;
+            siblings_out.push(h);
+            *child = h;
+            consumed += used;
+        }
+    }
+    if pos != claims.len() {
+        return Err(ProofError::Malformed("claims not covered by bucket split"));
+    }
+    Ok((H::hash_internal(&children), consumed))
+}
+
 /// Count the siblings a non-empty subtree consumes when verified.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 fn siblings_needed<const ARITY_BITS: u8>(claims: &[ProofClaim], depth: u16) -> usize {
@@ -664,6 +790,22 @@ const WIRE_VERSION: u8 = 0x01;
 const TERM_LEAF: u8 = 0x01;
 const TERM_EMPTY: u8 = 0x02;
 const TERM_LEAF_MISMATCH: u8 = 0x03;
+
+/// The widest a one-claim proof over a binary tree can encode: the
+/// header, one claim at its widest termination, the sibling count, a
+/// bitmap bit per level and every level's sibling written out.
+///
+/// Read off the format above. A binary tree has one sibling per level
+/// and at most [`KEY_BITS`] levels, and the bound counts every one of
+/// them as a hash the bitmap does not elide, which no real tree
+/// reaches. The state tree is binary, so this is what bounds a single
+/// cell's proof inside a block.
+pub const MAX_SINGLE_CLAIM_PROOF_BYTES: usize = {
+    let header = 1 + 2 + 4;
+    let claim = KEY_BYTES + 2 + 1 + KEY_BYTES + 32;
+    let siblings = 4 + (KEY_BITS as usize).div_ceil(8) + KEY_BITS as usize * 32;
+    header + claim + siblings
+};
 
 /// Cap on claims accepted from a single peer-supplied multiproof.
 ///
@@ -1102,6 +1244,85 @@ mod tests {
         let wrong_root =
             Jmt::verify(&proof, res.root_hash, &NibblePath::empty(), &expected).unwrap_err();
         assert!(matches!(wrong_root, ProofError::Malformed(_)));
+    }
+
+    /// Cutting a proof down to some of its keys gives the proof a fresh
+    /// walk over those keys alone would build, byte for byte: for keys
+    /// that share paths and keys that do not, for presences, for
+    /// absences ending at an empty slot, and for absences ending at
+    /// another key's leaf.
+    #[test]
+    fn restrict_is_the_proof_over_the_kept_keys_alone() {
+        let entries: Vec<(Key, ValueHash)> = (0u8..32).map(|i| (k(i * 8), v(i))).collect();
+        let (store, root, root_hash) = build_store(&entries);
+        // Two absences: one at an empty slot, one diverging at a leaf.
+        let mut beside = k(0);
+        beside[47] = 1;
+        let far = k(255);
+        let all = [k(0), k(8), k(16), k(200), beside, far];
+        let whole = Jmt::prove(&store, &root, &all).unwrap();
+
+        let cases: Vec<Vec<Key>> = vec![
+            vec![k(0)],
+            vec![k(8), k(16)],
+            vec![k(0), k(200)],
+            vec![beside],
+            vec![far, k(16)],
+            vec![k(0), beside],
+            all.to_vec(),
+        ];
+        for keep in cases {
+            let cut = Jmt::restrict(&whole, &keep).unwrap();
+            let fresh = Jmt::prove(&store, &root, &keep).unwrap();
+            assert_eq!(cut, fresh, "restricting to {keep:?}");
+            assert_eq!(cut.encode(), fresh.encode());
+            let expected: Vec<(Key, Option<ValueHash>)> = keep
+                .iter()
+                .map(|key| {
+                    let held = entries.iter().find(|(k, _)| k == key).map(|(_, val)| *val);
+                    (*key, held)
+                })
+                .collect();
+            Jmt::verify(&cut, root_hash, &NibblePath::empty(), &expected).unwrap();
+        }
+        assert_eq!(
+            Jmt::restrict(&whole, &[]).unwrap(),
+            Jmt::prove(&store, &root, &[]).unwrap(),
+            "nothing kept is the empty proof"
+        );
+        assert!(matches!(
+            Jmt::restrict(&whole, &[k(1)]),
+            Err(ProofError::MissingClaim)
+        ));
+    }
+
+    /// A one-claim proof over the deepest shape a binary tree takes —
+    /// two keys diverging at the last bit — encodes under the bound
+    /// the format is read to give.
+    #[test]
+    fn the_deepest_one_claim_proof_encodes_under_its_bound() {
+        let mut twin = k(1);
+        twin[47] = 1;
+        let (store, root, _) = build_store(&[(k(1), v(1)), (twin, v(2))]);
+        let proof = Jmt::prove(&store, &root, &[k(1)]).unwrap();
+        assert_eq!(proof.siblings.len(), usize::from(KEY_BITS));
+        assert!(proof.encode().len() <= MAX_SINGLE_CLAIM_PROOF_BYTES);
+        // The bound counts every sibling written out, which is what a
+        // proof carries when the bitmap elides none of them.
+        let dense = MultiProof {
+            root_depth_bits: 0,
+            claims: vec![ProofClaim {
+                key: k(1),
+                value_hash: None,
+                depth_bits: KEY_BITS,
+                termination: ClaimTermination::LeafMismatch {
+                    stored_key: twin,
+                    stored_value_hash: v(2),
+                },
+            }],
+            siblings: vec![[0xAB; 32]; usize::from(KEY_BITS)],
+        };
+        assert_eq!(dense.encode().len(), MAX_SINGLE_CLAIM_PROOF_BYTES);
     }
 
     #[test]

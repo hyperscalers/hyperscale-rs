@@ -18,8 +18,8 @@ use hyperscale_storage::test_helpers::{
     test_witness_window_retention_and_recovery,
 };
 use hyperscale_storage::{
-    DedupWindow, ParentAnchor, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
-    VersionedStore, test_helpers,
+    ChainWrites, DedupWindow, MemberInputs, ParentAnchor, ShardChainReader, ShardChainWriter,
+    SubstateStore, Substates, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
     install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_transaction,
@@ -27,9 +27,9 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, DEDUP_WINDOW, Deadline, FEE_HOLD_WINDOW, Hash, LocalKey, RETENTION_HORIZON,
-    SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction,
-    TransactionDecision, TxHash, Verifiable, WeightedTimestamp, Window, WitnessSources,
+    ChainOrigin, DEDUP_WINDOW, Engagement, FEE_HOLD_WINDOW, FrontierInputs, Hash, LocalKey,
+    RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange,
+    Transaction, TransactionDecision, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -219,20 +219,24 @@ fn test_transactions_batch_with_indexed_block() {
             provisions,
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
             header,
             certificates,
             provision_hashes,
+            engagements,
             ..
         } => Block::Sealed {
             header,
             transactions: Arc::new(Capped::from_array([tx])),
             certificates,
             provision_hashes,
+            engagements,
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -280,6 +284,11 @@ fn a_prepared_commit_writes_its_committed_cells() {
 }
 
 #[test]
+fn a_settling_claim_folds_its_removals() {
+    test_helpers::test_a_settling_claim_folds_its_removals(&SimShardStorage::default());
+}
+
+#[test]
 fn test_prepare_commit_state_root_matches() {
     let storage = Arc::new(SimShardStorage::default());
     let block = make_test_block(BlockHeight::new(1));
@@ -295,8 +304,13 @@ fn test_prepare_commit_state_root_matches() {
             base_reads: None,
         },
         &[],
-        &[],
-        &[],
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
         BlockHeight::new(1),
     );
     let certified = make_test_certified(block);
@@ -401,9 +415,9 @@ fn a_retained_bundle_drops_below_the_history_floor() {
 }
 
 #[test]
-fn the_widest_copy_of_a_tick_holds_the_slot() {
+fn every_copy_of_a_tick_answers_for_what_it_carries() {
     let storage = SimShardStorage::default();
-    test_helpers::test_widest_tick_copy_holds_the_slot(&storage);
+    test_helpers::test_every_copy_of_a_tick_answers_for_what_it_carries(&storage);
 }
 
 #[test]
@@ -416,6 +430,12 @@ fn the_tx_index_answers_with_the_local_shards_certificate() {
 fn the_tx_index_answers_with_every_certificate_of_this_shards() {
     let storage = SimShardStorage::default();
     test_helpers::test_the_tx_index_answers_with_every_certificate_of_this_shards(&storage);
+}
+
+#[test]
+fn a_foreign_ticks_finalization_is_stored_and_not_indexed() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_foreign_ticks_finalization_is_stored_and_not_indexed(&storage);
 }
 
 #[test]
@@ -585,6 +605,7 @@ fn block_with_txs(
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -605,38 +626,6 @@ fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
         1_000,
         validity,
     )))
-}
-
-/// The fold recovers each committed transaction against the close of the
-/// delivery window its own signed end opens, not against when the block
-/// carrying it committed.
-#[test]
-fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
-    let storage = SimShardStorage::default();
-    let tx = dedup_tx(1, 90_000);
-    let tx_hash = tx.hash();
-    let block = block_with_txs(BlockHeight::new(1), 1_000, vec![tx]);
-    commit_empty(&storage, &block);
-
-    let window = DedupWindow::from_reader(
-        &storage,
-        BlockHeight::new(1),
-        WeightedTimestamp::from_millis(1_000),
-        ChainOrigin {
-            genesis_height: BlockHeight::new(1),
-            anchor_wt: WeightedTimestamp::ZERO,
-        },
-    );
-
-    assert_eq!(
-        window.committed,
-        vec![(
-            tx_hash,
-            Window::Delivery
-                .of(Deadline::of(WeightedTimestamp::from_millis(90_000)))
-                .end
-        )],
-    );
 }
 
 /// The fold records the names a finalization *decided*, as the live
@@ -725,15 +714,8 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
     let storage = SimShardStorage::default();
     // Three blocks, all inside the window, none of them the chain's
     // claimed origin — so the walk runs out beneath them.
-    let tx = dedup_tx(3, 900_000);
-    let tx_hash = tx.hash();
     for height in 1..=3u64 {
-        let txs = if height == 3 {
-            vec![tx.clone()]
-        } else {
-            vec![]
-        };
-        let block = block_with_txs(BlockHeight::new(height), 400_000 + height, txs);
+        let block = block_with_txs(BlockHeight::new(height), 400_000 + height, vec![]);
         commit_empty(&storage, &block);
     }
 
@@ -744,15 +726,6 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
         ChainOrigin::ROOT,
     );
 
-    assert_eq!(
-        window.committed,
-        vec![(
-            tx_hash,
-            Window::Delivery
-                .of(Deadline::of(WeightedTimestamp::from_millis(900_000)))
-                .end
-        )],
-    );
     assert!(
         !window.reached_origin,
         "a walk that ran out of blocks above its origin has not reached it",
@@ -764,24 +737,25 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
     );
 }
 
-/// The fee tier reaches deeper than the dedup tiers, because a hold
-/// outlives the delivery window the dedup tiers close on.
+/// The fee tier reaches deeper than the dedup tier, and the descent is
+/// floored at the deeper of the two.
 ///
-/// A hold lives to its validity end plus `RETENTION_HORIZON`, and the
+/// A hold ends at its validity end plus `RETENTION_HORIZON`, and the
 /// block committing it sits no earlier than one `MAX_VALIDITY_RANGE`
-/// before that end — `FEE_HOLD_WINDOW` past the tip, which is
-/// `MAX_FINALIZATION_DELAY` deeper than `DEDUP_WINDOW`. A walk floored at
-/// the dedup tiers' depth would seed a ledger short of what the payer has
-/// actually engaged.
+/// before that end — `FEE_HOLD_WINDOW` past the tip. The dedup tiers
+/// reach `DEDUP_WINDOW`, which is `RETENTION_HORIZON` and shallower. A
+/// walk floored at the dedup tiers' depth would seed a ledger that
+/// under-counts what the payer shard still holds engaged.
 #[test]
 fn the_fee_tier_is_folded_below_the_dedup_floor() {
     let storage = SimShardStorage::default();
     let dedup_ms = u64::try_from(DEDUP_WINDOW.as_millis()).unwrap();
     let fee_ms = u64::try_from(FEE_HOLD_WINDOW.as_millis()).unwrap();
+    assert!(fee_ms > dedup_ms, "the fee tier is the deeper of the two");
     let tip_ms = fee_ms + 100_000;
 
-    // Height 1 sits between the two floors: below the dedup tiers' reach,
-    // inside the fee tier's.
+    // Height 1 sits between the two floors: below the dedup tier's
+    // reach, inside the fee tier's.
     let below_dedup = tip_ms - dedup_ms - 1_000;
     let deep = dedup_tx(1, tip_ms + 1_000);
     let deep_hash = deep.hash();
@@ -806,17 +780,16 @@ fn the_fee_tier_is_folded_below_the_dedup_floor() {
         },
     );
 
-    let committed: Vec<TxHash> = window.committed.iter().map(|(h, _)| *h).collect();
     assert_eq!(
-        committed,
-        vec![near_hash],
+        window.covered_from,
+        Some(WeightedTimestamp::from_millis(below_dedup)),
         "the dedup tiers stop at their own floor",
     );
     let held: Vec<TxHash> = window.fee_holds.iter().map(|hold| hold.tx_hash).collect();
     assert_eq!(
         held,
         vec![near_hash, deep_hash],
-        "the fee tier reaches the block below it",
+        "and the fee tier reaches the block below it",
     );
     assert!(window.fee_holds_whole, "and the descent reached the origin");
 }
@@ -927,4 +900,62 @@ fn dedup_window_stamps_each_batch_against_its_own_block() {
         ],
         "two blocks at different anchors must not share one deadline",
     );
+}
+
+/// The engagement tier seeds from the lists the stored blocks keep, each
+/// entry at its own block's anchor plus the horizon — the clock the live
+/// commit stamps with — and no provision body is read.
+#[test]
+fn dedup_window_seeds_engagements_from_block_lists() {
+    let storage = SimShardStorage::default();
+    let (older_ms, newer_ms) = (10_000u64, 40_000u64);
+    let (older_tx, newer_tx) = (test_transaction(4).hash(), test_transaction(5).hash());
+    let payer = ShardId::leaf(1, 1);
+
+    for (height, anchor_ms, tx_hash) in [(1u64, older_ms, older_tx), (2, newer_ms, newer_tx)] {
+        let block = test_helpers::with_provisions(
+            block_with_txs(BlockHeight::new(height), anchor_ms, vec![]),
+            payer,
+            tx_hash,
+        );
+        commit_empty(&storage, &block);
+    }
+    assert!(
+        !storage
+            .get_block(BlockHeight::new(1))
+            .expect("stored")
+            .block()
+            .is_live(),
+        "the walk reads sealed blocks"
+    );
+
+    let window = DedupWindow::from_reader(
+        &storage,
+        BlockHeight::new(2),
+        WeightedTimestamp::from_millis(newer_ms),
+        ChainOrigin {
+            genesis_height: BlockHeight::new(1),
+            anchor_wt: WeightedTimestamp::ZERO,
+        },
+    );
+
+    let mut seeded = window.engagements;
+    seeded.sort_unstable();
+    let entry = |tx_hash| Engagement {
+        source: payer,
+        tx_hash,
+        source_height: BlockHeight::new(1),
+    };
+    let mut expected = vec![
+        (
+            entry(older_tx),
+            WeightedTimestamp::from_millis(older_ms).plus(RETENTION_HORIZON),
+        ),
+        (
+            entry(newer_tx),
+            WeightedTimestamp::from_millis(newer_ms).plus(RETENTION_HORIZON),
+        ),
+    ];
+    expected.sort_unstable();
+    assert_eq!(seeded, expected);
 }

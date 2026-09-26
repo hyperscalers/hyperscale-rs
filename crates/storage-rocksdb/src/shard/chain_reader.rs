@@ -1,6 +1,6 @@
 //! `ShardChainReader` implementation for `RocksDbShardStorage`.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,16 +9,14 @@ use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction,
-    TxHash, Verifiable, Verified,
+    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, Transaction, TxHash,
+    Verifiable, Verified,
 };
 
-use super::column_families::{
-    BeaconWitnessesCf, BlocksCf, ExecutionCertsCf, ProvisionsCf, TxCertIndexCf,
-};
+use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, TxFinalizationsCf};
 use super::core::RocksDbShardStorage;
 use super::metadata::read_boundary_header;
-use crate::typed_cf::{TypedCf, get, iter_all, iter_from};
+use crate::typed_cf::{TypedCf, iter_all, iter_from};
 
 impl ShardChainReader for RocksDbShardStorage {
     fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
@@ -51,7 +49,7 @@ impl ShardChainReader for RocksDbShardStorage {
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         self.get_block_metadata(height)
             .map(|metadata| {
-                let (header, _, qc, _) = metadata.into_parts();
+                let (header, _, _, qc, _) = metadata.into_parts();
                 CertifiedBlockHeader::new(header, qc)
             })
             .or_else(|| {
@@ -65,8 +63,9 @@ impl ShardChainReader for RocksDbShardStorage {
         self.read_committed_height()
     }
 
-    fn committed_hash(&self) -> Option<BlockHash> {
-        self.read_committed_hash().map(BlockHash::from_raw)
+    fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {
+        let (height, hash) = self.read_committed_head();
+        (height, hash.map(BlockHash::from_raw))
     }
 
     fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
@@ -96,43 +95,32 @@ impl ShardChainReader for RocksDbShardStorage {
         Self::get_consensus_receipt(self, tx_hash)
     }
 
-    fn get_execution_certificate(
-        &self,
-        tick_id: &TickId,
-    ) -> Option<Verified<ExecutionCertificate>> {
-        let cfs = self.cf();
-        let certs_cf = ExecutionCertsCf::handle(&cfs);
-        get::<ExecutionCertsCf>(&*self.db, certs_cf, tick_id)
-            .map(Verified::<ExecutionCertificate>::from_persisted)
-    }
-
-    fn get_execution_certificates_batch(
-        &self,
-        tick_ids: &[TickId],
-    ) -> Vec<Verified<ExecutionCertificate>> {
-        let cfs = self.cf();
-        let certs_cf = ExecutionCertsCf::handle(&cfs);
-        tick_ids
-            .iter()
-            .filter_map(|wid| get::<ExecutionCertsCf>(&*self.db, certs_cf, wid))
-            .map(Verified::<ExecutionCertificate>::from_persisted)
-            .collect()
-    }
-
     fn get_execution_certificates_for_txs(
         &self,
         tx_hashes: &[TxHash],
     ) -> Vec<Verified<ExecutionCertificate>> {
         let cfs = self.cf();
-        let index_cf = TxCertIndexCf::handle(&cfs);
-        let certs_cf = ExecutionCertsCf::handle(&cfs);
-        let mut seen: HashSet<TickId> = HashSet::new();
-        tx_hashes
+        let index_cf = TxFinalizationsCf::handle(&cfs);
+        // Every finalization any asked transaction names, read once each:
+        // one finalization commonly answers for several of them.
+        let asked: BTreeSet<TxHash> = tx_hashes.iter().copied().collect();
+        let finalizations: BTreeSet<FinalizationHash> = asked
             .iter()
-            .filter_map(|tx| get::<TxCertIndexCf>(&*self.db, index_cf, &Hash::from(*tx)))
-            .flatten()
-            .filter(|tick_id| seen.insert(*tick_id))
-            .filter_map(|tick_id| get::<ExecutionCertsCf>(&*self.db, certs_cf, &tick_id))
+            .flat_map(|tx| {
+                iter_from::<TxFinalizationsCf>(
+                    &self.db,
+                    index_cf,
+                    &(*tx, FinalizationHash::from_raw(Hash::ZERO)),
+                )
+                .take_while(move |((at, _), ())| at == tx)
+                .map(|((_, finalization), ())| finalization)
+            })
+            .collect();
+        let ids: Vec<FinalizationHash> = finalizations.into_iter().collect();
+        self.get_certificates_batch(&ids)
+            .iter()
+            .map(|fw| fw.local_ec().clone())
+            .filter(|cert| asked.iter().any(|tx| cert.covers(tx)))
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }

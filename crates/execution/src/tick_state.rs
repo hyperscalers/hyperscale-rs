@@ -41,10 +41,9 @@ use hyperscale_engine::legs::Member;
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY,
-    MAX_VALIDITY_RANGE, Role, Settles, ShardId, StoredReceipt, SubstateKey, TickHalf, TickId,
-    TxHash, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
-    refused_transactions, settles,
+    GlobalReceiptRoot, Joins, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY, Role,
+    Settles, ShardId, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, Verified,
+    WeightedTimestamp, compute_global_receipt_root, refused_transactions, settles,
 };
 
 /// A tick whose local execution disagreed with the quorum's.
@@ -75,11 +74,10 @@ pub struct Divergence {
 /// every participant, since every one of them runs it. Two cases and no
 /// third; a shape needing one is a shape the classifier should refuse.
 ///
-/// **Reach** is every shard the transaction touches — who this tick's
-/// certificate is owed to, because any of them may need what a member
-/// escrowed. Waiting on reach would hold a leg behind the core it feeds;
-/// routing on awaited would withhold a crossing from the shard that
-/// claims it.
+/// **Reach** is every shard the transaction touches. Who this tick's
+/// certificate is owed to is [`Membership::owes_certificate_to`]'s
+/// question, asked of reach: waiting on reach would hold a leg behind the
+/// core it feeds.
 ///
 /// Both include this shard, and awaited is a subset of reach.
 ///
@@ -87,11 +85,7 @@ pub struct Divergence {
 /// transaction: it does unless the member is a leg, whose transaction
 /// its core decides. Not a third awaited case — a leg and a single-shard
 /// core await the same set — but the one fact the wire cannot derive
-/// from that set. And whether the member only **delivers**: a leg that
-/// failed is the transaction's end on its shard, since it could not
-/// issue, but a delivery that failed decides nothing either way — the
-/// value it claims stays in its cell for a later claim. And whether the
-/// member **executes** the transaction or settles what an execution left:
+/// from that set. And whether the member **executes** the transaction or settles what an execution left:
 /// a reclaim, an abandonment, a held record's disposal or a retirement
 /// runs no execution of the transaction's own, and the deadline holds
 /// only what does.
@@ -105,17 +99,6 @@ pub struct Membership {
 impl Membership {
     /// The two sets and the role `member` answers — a cache of its
     /// derivation, in the shape a tick carries.
-    ///
-    /// Classifies **one member**, and so reads the side it runs on. Not
-    /// the same question as [`Part::of`](crate::ledger::Part), which
-    /// classifies a shard's one ledger entry and reads
-    /// [`Classified::only_delivers_at`]: the branches look alike and
-    /// answer differently for a shard with legs on both sides of the
-    /// core, whose delivering member is a `Delivery` here and whose
-    /// single entry is a leg there. Folding either into the other reads
-    /// a delivery's verdict off an entry that bears one.
-    ///
-    /// [`Classified::only_delivers_at`]: hyperscale_engine::legs::Classified::only_delivers_at
     #[must_use]
     pub fn of(member: &Member) -> Self {
         let awaited = member.awaited();
@@ -138,20 +121,6 @@ impl Membership {
             awaited: participating.clone(),
             reach: participating,
             role: Role::Whole,
-        }
-    }
-
-    /// A member that settles nothing about the transaction: a retirement,
-    /// deleting records whose claims committed elsewhere. Awaits nobody,
-    /// decides nothing — the verdict was reached where the claims were,
-    /// and a name that decided here would be a second verdict on a chain
-    /// that may already hold the first — and executes nothing.
-    #[must_use]
-    pub fn housekeeping(local: ShardId) -> Self {
-        Self {
-            awaited: BTreeSet::from([local]),
-            reach: BTreeSet::from([local]),
-            role: Role::Retiring,
         }
     }
 
@@ -192,45 +161,25 @@ impl Membership {
         self.awaited.iter().any(|&shard| shard != local)
     }
 
+    /// Whether `shard` is owed this member's outcome: it awaits this
+    /// shard's certificate for the transaction, or reads a verdict off it
+    /// — a core success it folds, or a refusal it relays.
+    ///
+    /// A leg's outcome meets neither at any shard: a core awaits the core
+    /// alone, and a leg speaks no verdict a producer or sibling reads. A
+    /// consumer reads a leg's crossing off the record it pushed, never
+    /// off its certificate, so a leg's certificate stays home.
+    #[must_use]
+    pub fn owes_certificate_to(&self, shard: ShardId, local: ShardId) -> bool {
+        shard != local && self.reach.contains(&shard) && self.role != Role::Leg
+    }
+
     /// Whether the transaction touches a shard besides this one — off
     /// what it reaches, never off what this member awaits. A leg of a
     /// divided transaction reaches beyond and awaits only itself.
     #[must_use]
     pub fn reaches_beyond(&self, local: ShardId) -> bool {
         self.reach.iter().any(|&shard| shard != local)
-    }
-}
-
-/// How a member joins its tick.
-///
-/// The three cases are the whole of it: what the tick answers for is its
-/// membership, and what the VM runs is its batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Admission {
-    /// In the batch, attested with whatever execution returns.
-    Executes,
-    /// In the batch and attested `Aborted` whatever it returns — the
-    /// payer's leg whose counterparts never engaged. It still executes,
-    /// because the charge that abort settles is what the execution
-    /// builds.
-    ExecutesAborted,
-    /// Not in the batch. Past the deadline that bounds it, so no
-    /// execution here can reach an outcome, and the tick attests
-    /// `Aborted` on nothing but the hash and the reservation its
-    /// committing block took.
-    Aborted,
-}
-
-impl Admission {
-    /// Whether the member goes to the engine, and so whether the tick
-    /// waits for a result before it can vote.
-    const fn dispatched(self) -> bool {
-        matches!(self, Self::Executes | Self::ExecutesAborted)
-    }
-
-    /// Whether the tick attests `Aborted` whatever execution says.
-    const fn aborts(self) -> bool {
-        matches!(self, Self::ExecutesAborted | Self::Aborted)
     }
 }
 
@@ -244,21 +193,6 @@ impl Admission {
 /// rather than routine load noise.
 pub const TICK_OVERDUE_WARN: Duration = Duration::from_secs(MAX_FINALIZATION_DELAY.as_secs() * 2);
 
-/// How long past its own anchor a tick can still hold a member something
-/// could settle.
-///
-/// The widest close a tick holds is a delivery's, and it is two windows
-/// wide rather than one: a delivery is admissible from its transaction's
-/// validity end for a further [`MAX_VALIDITY_RANGE`], and that validity
-/// end is itself at most one `MAX_VALIDITY_RANGE` past the anchor — the
-/// transaction had to be admissible in the block that committed it. A
-/// core member closes far earlier, at `MAX_FINALIZATION_DELAY` past its
-/// validity end, so the delivery bound covers both, and the finalization
-/// delay is carried on top so the span clears the close rather than
-/// landing on it.
-pub const TICK_SETTLEABLE_SPAN: Duration =
-    Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2 + MAX_FINALIZATION_DELAY.as_secs());
-
 /// One member's seat in its tick: the terms it joined on, and everything
 /// the tick has learned about it since — from the engine, from the
 /// certificates that cover it, and from the chain that settles it.
@@ -269,11 +203,10 @@ struct Seat {
     /// owed to.
     membership: Membership,
     /// What the member was charged, where its committing block took a
-    /// place in the drain for it — `None` for the second member a mixed
-    /// shard runs, whose issuing member took the place and settled the
-    /// price. Carried apart from the transaction because an abandoned
-    /// member has no body here and still has to attest exactly what was
-    /// priced.
+    /// place in the drain for it — `None` for a member settling what an
+    /// execution left, which no block took a place for. Carried apart
+    /// from the transaction because an abandoned member has no body here
+    /// and still has to attest exactly what was priced.
     charged: Option<u128>,
     /// Dispatched to the engine and still owing a result. A tick is
     /// votable once no seat is.
@@ -295,25 +228,12 @@ struct Seat {
     /// so a receipt from a locally-executed transaction cannot leak into
     /// a `Finalization` whose certificate attests it `Aborted`.
     receipt: Option<StoredReceipt>,
-    /// The fee receipt the engine built alongside the execution receipt,
-    /// for a cross-shard transaction this shard pays for. An abort
+    /// The refusal receipt the engine built alongside the execution
+    /// receipt: the payer's floor where this shard holds the vault, and
+    /// the `Never` answers of a consumer that can be refused. A refusal
     /// settles it: the transaction's own effects are discarded, the
-    /// payer's floor is not.
-    fee_receipt: Option<StoredReceipt>,
-    /// What this shard attests it did for the member, carried from
-    /// execution onto the outcome it votes.
-    /// What the member's execution escrowed out, carried from execution
-    /// onto the outcome it votes.
-    escrowed: Vec<SubstateKey>,
-    /// The shards the member's crossings land on, read off the frozen
-    /// classification at admission. Attested on the outcome only where
-    /// the execution escrowed something.
-    crossing_targets: BTreeSet<ShardId>,
-    /// The committed cell this shard wrote at the member's inclusion,
-    /// for a member of the core. Attested on the outcome only where the
-    /// member refuses: the settling block deletes it, and a leg probing
-    /// the core reads the refusal as the absence it is.
-    committed_cell: Option<SubstateKey>,
+    /// floor and the answers are not.
+    refusal_receipt: Option<StoredReceipt>,
     /// Which shards have reported on the member via a certificate.
     covered_by: BTreeSet<ShardId>,
     /// A certificate reported abort. Terminal — an aborted transaction
@@ -327,20 +247,17 @@ struct Seat {
 }
 
 impl Seat {
-    /// A seat on the terms `admission` names.
-    const fn new(membership: Membership, charged: Option<u128>, admission: Admission) -> Self {
+    /// A seat on the terms `joins` names.
+    const fn new(membership: Membership, charged: Option<u128>, joins: Joins) -> Self {
         Self {
             membership,
             charged,
-            awaiting_result: admission.dispatched(),
-            aborted: admission.aborts(),
-            abandons: matches!(admission, Admission::Aborted),
+            awaiting_result: joins.dispatched(),
+            aborted: joins.aborts(),
+            abandons: matches!(joins, Joins::Aborted),
             result: None,
             receipt: None,
-            fee_receipt: None,
-            escrowed: Vec::new(),
-            crossing_targets: BTreeSet::new(),
-            committed_cell: None,
+            refusal_receipt: None,
             covered_by: BTreeSet::new(),
             aborted_anywhere: false,
             settled: false,
@@ -352,6 +269,18 @@ impl Seat {
     /// awaited shard to have certified it.
     fn is_covered(&self) -> bool {
         self.aborted_anywhere || self.membership.awaited().is_subset(&self.covered_by)
+    }
+
+    /// Whether a counterpart shares the verdict on this member: a whole
+    /// shape or a core member awaiting a shard other than `local`, which
+    /// settles the member against this shard's certificate.
+    ///
+    /// Read off committed membership alone, never off whether this
+    /// replica has handed its own certificate off, so every replica
+    /// answers alike on the same commit.
+    fn shares_verdict(&self, local: ShardId) -> bool {
+        matches!(self.membership.role(), Role::Whole | Role::Core)
+            && self.membership.abortable(local)
     }
 }
 
@@ -434,11 +363,11 @@ impl TickState {
         }
     }
 
-    /// Admit a member, on the terms `admission` names.
+    /// Admit a member, on the terms `joins` names.
     ///
     /// One entry point for all three, because they differ only in what
     /// the tick waits for and what it will say. An
-    /// [`Aborted`](Admission::Aborted) member joins with no body at all:
+    /// [`Aborted`](Joins::Aborted) member joins with no body at all:
     /// the ledger names it by hash, by the shards party to it, and by the
     /// work its committing block reserved, which is everything an abort
     /// has to state. A member the tick already holds keeps the terms it
@@ -448,14 +377,14 @@ impl TickState {
         tx_hash: TxHash,
         membership: Membership,
         charged: Option<u128>,
-        admission: Admission,
+        joins: Joins,
     ) {
         if self.seats.contains_key(&tx_hash) {
             return;
         }
         self.order.push(tx_hash);
         self.seats
-            .insert(tx_hash, Seat::new(membership, charged, admission));
+            .insert(tx_hash, Seat::new(membership, charged, joins));
     }
 
     // ── Identity getters ────────────────────────────────────────────────
@@ -539,18 +468,20 @@ impl TickState {
             .is_some_and(|seat| seat.membership.awaited().contains(&shard))
     }
 
-    /// The shards other than this one that the tick's members reach —
-    /// who its certificate is owed to. Reach rather than awaited: a
-    /// shard this tick waits on nothing from may still need what a
-    /// member escrowed.
+    /// The shards other than this one that some member owes its
+    /// outcome to — who this tick's certificate is projected to.
     #[must_use]
     pub fn counterpart_shards(&self) -> Vec<ShardId> {
         let local = self.tick_id.shard_id();
         self.seats
             .values()
-            .flat_map(|seat| seat.membership.reach())
-            .copied()
-            .filter(|&s| s != local)
+            .flat_map(|seat| {
+                seat.membership
+                    .reach()
+                    .iter()
+                    .copied()
+                    .filter(|&shard| seat.membership.owes_certificate_to(shard, local))
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -589,24 +520,6 @@ impl TickState {
         self.seats.get(&tx_hash).is_some_and(|seat| seat.abandons)
     }
 
-    /// Whether a success this tick attests for `tx_hash` is one no block
-    /// will carry past the transaction's deadline.
-    ///
-    /// The three terms the deadline fence reads, off the membership the
-    /// outcome's own are derived from: the success bears the verdict, it
-    /// is this shard's execution of the transaction rather than a member
-    /// settling what one left, and it waits on nobody — so no
-    /// counterpart's certificate is coming to close its coverage either.
-    #[must_use]
-    pub fn decided_alone(&self, tx_hash: TxHash) -> bool {
-        self.seats.get(&tx_hash).is_some_and(|seat| {
-            let role = seat.membership.role();
-            role.success_decides()
-                && role.executes()
-                && !seat.membership.abortable(self.tick_id.shard_id())
-        })
-    }
-
     /// The tick's members whose settlement waits on `shard` — what this
     /// tick is waiting on that shard for.
     pub fn txs_awaiting(&self, shard: ShardId) -> impl Iterator<Item = TxHash> + '_ {
@@ -616,13 +529,14 @@ impl TickState {
             .filter(move |&tx_hash| self.awaits(tx_hash, shard))
     }
 
-    /// The tick's members `shard` is party to — what its copy of this
-    /// tick's certificate carries.
+    /// The tick's members that owe `shard` their outcome — what its copy
+    /// of this tick's certificate carries.
     pub fn txs_reaching(&self, shard: ShardId) -> impl Iterator<Item = TxHash> + '_ {
+        let local = self.tick_id.shard_id();
         self.order.iter().copied().filter(move |tx_hash| {
             self.seats
                 .get(tx_hash)
-                .is_some_and(|seat| seat.membership.reach().contains(&shard))
+                .is_some_and(|seat| seat.membership.owes_certificate_to(shard, local))
         })
     }
 
@@ -647,33 +561,12 @@ impl TickState {
         }
     }
 
-    /// Record what a member's execution escrowed out.
-    pub fn record_escrowed(&mut self, tx_hash: TxHash, escrowed: Vec<SubstateKey>) {
-        if let Some(seat) = self.seats.get_mut(&tx_hash) {
-            seat.escrowed = escrowed;
-        }
-    }
-
-    /// Record the shards a member's crossings land on.
-    pub fn record_crossing_targets(&mut self, tx_hash: TxHash, targets: BTreeSet<ShardId>) {
-        if let Some(seat) = self.seats.get_mut(&tx_hash) {
-            seat.crossing_targets = targets;
-        }
-    }
-
-    /// Record the committed cell this shard wrote at a core member's
-    /// inclusion, which its refusal retracts.
-    pub fn record_committed_cell(&mut self, tx_hash: TxHash, cell: SubstateKey) {
-        if let Some(seat) = self.seats.get_mut(&tx_hash) {
-            seat.committed_cell = Some(cell);
-        }
-    }
-
-    /// Record the fee receipt the engine built beside a member's
-    /// execution receipt: what the payer owes if the transaction aborts.
-    pub fn record_fee_receipt(&mut self, receipt: StoredReceipt) {
+    /// Record the refusal receipt the engine built beside a member's
+    /// execution receipt: what the payer owes and what the consumer
+    /// answers if the transaction is refused.
+    pub fn record_refusal_receipt(&mut self, receipt: StoredReceipt) {
         if let Some(seat) = self.seats.get_mut(&receipt.tx_hash) {
-            seat.fee_receipt.get_or_insert(receipt);
+            seat.refusal_receipt.get_or_insert(receipt);
         }
     }
 
@@ -832,28 +725,12 @@ impl TickState {
                 // whether it is owed: a leg that completed here still
                 // owes the floor if a counterpart refuses it, and a
                 // charge nobody named is a charge nothing can settle.
-                let charge = seat
-                    .fee_receipt
+                let refusal = seat
+                    .refusal_receipt
                     .as_ref()
                     .map(|fee| fee.consensus.receipt_hash());
-                // What left, and where it lands. The targets are attested
-                // only beside something escrowed: a member that issued
-                // nothing promises no bundle to anyone.
-                let targets = if seat.escrowed.is_empty() {
-                    BTreeSet::new()
-                } else {
-                    seat.crossing_targets.clone()
-                };
-                // A core member's refusal retracts the committed cell
-                // its inclusion wrote: the settling block deletes it,
-                // so a leg probing the core reads the refusal as an
-                // absence, the same one a core that never included the
-                // transaction leaves.
-                let retracts = seat
-                    .committed_cell
-                    .filter(|_| !matches!(outcome, ExecutionOutcome::Succeeded { .. }));
-                let attested = match charge {
-                    Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee),
+                let attested = match refusal {
+                    Some(receipt) => TxOutcome::with_refusal(*tx_hash, outcome, receipt),
                     None => TxOutcome::new(*tx_hash, outcome),
                 };
                 // What the transaction was charged when its block
@@ -865,9 +742,6 @@ impl TickState {
                     None => attested,
                 }
                 .awaiting(counterparts)
-                .escrowing(seat.escrowed.clone())
-                .crossing_to(targets)
-                .retracting(retracts)
                 .as_role(seat.membership.role())
             })
             .collect();
@@ -1075,60 +949,6 @@ impl TickState {
         self.determined_members()
             .iter()
             .any(|tx_hash| self.seats.get(tx_hash).is_some_and(|seat| !seat.settled))
-    }
-
-    /// Whether the chain owes this tick a determined half it can no
-    /// longer deliver.
-    ///
-    /// A determined half the chain still owes is one every later half
-    /// must settle behind, so a tick that never reaches its own
-    /// certificate holds the settlement frontier against its whole
-    /// shard — blocks still commit and nothing behind it ever finalizes.
-    /// [`determined_ready`](Self::determined_ready) reasons only about
-    /// coverage, where a leg waiting on a counterpart cannot hold
-    /// determined members; it does not cover
-    /// [`attestable`](Self::attestable), and a certificate that never
-    /// forms holds them just as hard.
-    ///
-    /// Two ways a half becomes undeliverable. `committee_replaced` is the
-    /// immediate one: no fresh quorum can ever hold this tick. A halt
-    /// recovery replaced the committee its anchor names and the tick
-    /// sits at or below the recovery's attested frontier, so the
-    /// replaced members no longer serve the shard and the fresh members
-    /// snap-synced past its block without executing it — waiting changes
-    /// nothing, and a fresh member that did execute it while catching up
-    /// would otherwise hold the frontier against its own committee's
-    /// work. A tick above the frontier is not this: the fresh committee
-    /// re-executes it from the harvested tail and attests it like any
-    /// live tick. The caller answers it from the committing block: true
-    /// only on a block the fresh committee certified, which no replica
-    /// commits before folding the record.
-    ///
-    /// [`TICK_SETTLEABLE_SPAN`] past the tick's own anchor is the other:
-    /// no member it holds can still be settleable, so a half emitted
-    /// after it would settle a transaction already past every deadline
-    /// that could decide it. Inside the span a member is merely slow, and
-    /// the abandonment path is what speaks for one whose own close has
-    /// passed.
-    ///
-    /// Both read as committed content — seats settle on committed
-    /// finalizations, the stamps are BFT-authenticated, and the
-    /// committing block's certifier is what its commit resolved — so
-    /// every replica releases the same ticks at the same frontier.
-    /// Whether *this* validator happened to hand its own half off
-    /// ([`determined_pending`](Self::determined_pending)) is local state
-    /// and deliberately not asked: releasing lets go of the chain holds
-    /// later ticks read, and replicas letting go at different frontiers
-    /// would read different overlays from the same chain.
-    #[must_use]
-    pub fn owes_undeliverable_determined(
-        &self,
-        committed_ts: WeightedTimestamp,
-        committee_replaced: bool,
-    ) -> bool {
-        self.determined_unsettled()
-            && (committee_replaced
-                || committed_ts.elapsed_since(self.tick_ts) >= TICK_SETTLEABLE_SPAN)
     }
 
     /// The anchor whose committee would have to attest this tick.
@@ -1348,11 +1168,11 @@ impl TickState {
                 // a `Failed` receipt carries nothing, and a completed
                 // leg's effects are discarded by the refusal. Either way
                 // the pairing stays one receipt per outcome.
-                Settles::Charge(_) => {
+                Settles::Refusal(_) => {
                     self.take_receipt(outcome.tx_hash());
                     self.seats
                         .get_mut(&outcome.tx_hash())
-                        .and_then(|seat| seat.fee_receipt.take())
+                        .and_then(|seat| seat.refusal_receipt.take())
                 }
                 Settles::Effects(_) | Settles::Failure => self.take_receipt(outcome.tx_hash()),
                 Settles::Nothing => continue,
@@ -1398,16 +1218,103 @@ impl TickState {
         self.legs_emitted = true;
         Some(self.with_drained_receipts(attestation))
     }
+
+    /// Release every member sharing no verdict with a counterpart, and
+    /// `abandoned` whatever it shares. Returns the released members and
+    /// the kept ones, each in composition order.
+    ///
+    /// What stays is a member a counterpart can settle against this
+    /// shard's certificate, which outlives the tick: dropped here,
+    /// nothing would settle it, and its entry being certified, nothing
+    /// would abandon it. Every determined seat goes, so the tick owes no
+    /// determined half afterwards; the legs half is owed again for the
+    /// kept legs, since a finalization taken before named a released
+    /// member.
+    pub fn release(&mut self, abandoned: Option<TxHash>) -> (Vec<TxHash>, Vec<TxHash>) {
+        let local = self.tick_id.shard_id();
+        let (kept, released): (Vec<TxHash>, Vec<TxHash>) =
+            self.order.iter().copied().partition(|&tx_hash| {
+                Some(tx_hash) != abandoned
+                    && self
+                        .seats
+                        .get(&tx_hash)
+                        .is_some_and(|seat| seat.shares_verdict(local))
+            });
+        for tx_hash in &released {
+            self.seats.remove(tx_hash);
+        }
+        self.order.clone_from(&kept);
+        self.legs_emitted = false;
+        (released, kept)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_engine::legs::{Classified, Side};
+    use hyperscale_engine::legs::Classified;
     use hyperscale_types::{
         AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
     };
 
     use super::*;
+
+    /// Two replicas, one with its own certificate in hand and one
+    /// without, release the same members on the same commit: what stays
+    /// is read off committed membership alone.
+    #[test]
+    fn a_release_reads_committed_membership_alone() {
+        let local = ShardId::leaf(1, 0);
+        let peer = ShardId::leaf(1, 1);
+        let tick_id = TickId::new(local, BlockHeight::new(1));
+        let shared = TxHash::from(Hash::from_bytes(&[1; 32]));
+        let alone = TxHash::from(Hash::from_bytes(&[2; 32]));
+        let holding = || {
+            let mut tick = TickState::new(tick_id, BlockHash::ZERO, WeightedTimestamp::ZERO);
+            tick.admit(
+                shared,
+                Membership::whole(BTreeSet::from([local, peer])),
+                None,
+                Joins::Executes,
+            );
+            tick.admit(
+                alone,
+                Membership::whole(BTreeSet::from([local])),
+                None,
+                Joins::Executes,
+            );
+            tick
+        };
+        let mut emitted = holding();
+        emitted.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::ZERO,
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([
+                    TxOutcome::new(shared, ExecutionOutcome::Aborted),
+                    TxOutcome::new(alone, ExecutionOutcome::Aborted),
+                ]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        assert!(emitted.local_ec_emitted());
+        let mut pending = holding();
+        assert!(!pending.local_ec_emitted());
+
+        assert_eq!(emitted.release(None), (vec![alone], vec![shared]));
+        assert_eq!(pending.release(None), (vec![alone], vec![shared]));
+        assert_eq!(emitted.tx_hashes(), &[shared]);
+        assert!(
+            !emitted.determined_unsettled(),
+            "a kept tick owes no determined half",
+        );
+        assert_eq!(
+            holding().release(Some(shared)),
+            (vec![shared, alone], vec![]),
+            "the abandoned member goes whatever it shares",
+        );
+    }
 
     fn tx(seed: u8) -> TxHash {
         TxHash::from(Hash::from_bytes(&[seed; 32]))
@@ -1431,57 +1338,6 @@ mod tests {
         ShardId::leaf(1, index)
     }
 
-    /// A core member's refusal retracts the committed cell its inclusion
-    /// wrote, and its success does not: the settling block deletes the
-    /// cell of a refused transaction, so a leg probing the core reads
-    /// the refusal as the absence a core that never included it leaves.
-    #[test]
-    fn a_core_members_refusal_retracts_its_committed_cell() {
-        use hyperscale_types::test_utils::test_key;
-
-        let local = shard(0);
-        let (refused, accepted) = (tx(1), tx(2));
-        let mut tick = TickState::new(
-            TickId::new(local, BlockHeight::new(1)),
-            BlockHash::ZERO,
-            WeightedTimestamp::from_millis(1_000),
-        );
-        for (tx_hash, cell) in [(refused, test_key(1)), (accepted, test_key(2))] {
-            tick.admit(
-                tx_hash,
-                Membership::whole(BTreeSet::from([local, shard(1)])),
-                Some(10),
-                Admission::Executes,
-            );
-            tick.record_committed_cell(tx_hash, cell);
-        }
-        tick.record_execution_result(refused, ExecutionOutcome::Failed);
-        tick.record_execution_result(
-            accepted,
-            ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-            },
-        );
-        let (_, _, outcomes) = tick.build_vote_data().expect("every member came back");
-        let retracts = |tx_hash: TxHash| {
-            outcomes
-                .iter()
-                .find(|outcome| outcome.tx_hash() == tx_hash)
-                .expect("the tick votes every member")
-                .retracts()
-        };
-        assert_eq!(
-            retracts(refused),
-            Some(test_key(1)),
-            "the refusal names the cell the settling block deletes"
-        );
-        assert_eq!(
-            retracts(accepted),
-            None,
-            "a success leaves its cell standing"
-        );
-    }
-
     /// A tick at `shard(0)` running one single-shard member and one leg
     /// bound to `shard(1)`, both executed and both holding a receipt.
     fn mixed_tick() -> (TickState, TxHash, TxHash) {
@@ -1496,13 +1352,13 @@ mod tests {
             determined,
             Membership::whole(BTreeSet::from([local])),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.admit(
             leg,
             Membership::whole(BTreeSet::from([local, shard(1)])),
             Some(20),
-            Admission::Executes,
+            Joins::Executes,
         );
         for tx_hash in [determined, leg] {
             tick.record_execution_result(
@@ -1544,7 +1400,7 @@ mod tests {
             member,
             Membership::whole(BTreeSet::from([local, peer])),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         let from_peer = |counterparts: Vec<ShardId>| {
             Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
@@ -1596,13 +1452,13 @@ mod tests {
             determined,
             Membership::whole(BTreeSet::from([local])),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.admit(
             leg,
             Membership::whole(BTreeSet::from([local, shard(1)])),
             Some(20),
-            Admission::Executes,
+            Joins::Executes,
         );
         for tx_hash in [determined, leg] {
             tick.record_execution_result(
@@ -1732,7 +1588,7 @@ mod tests {
             tx(1),
             Membership::whole(BTreeSet::from([local])),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.record_execution_result(
             tx(1),
@@ -1773,12 +1629,7 @@ mod tests {
         assert!(swap.decomposed());
         let participating = BTreeSet::from([low, high]);
         let member_of = |classified: &Classified, local, participating: &BTreeSet<ShardId>| {
-            Member::of(
-                classified.clone(),
-                local,
-                Side::Issuing,
-                participating.clone(),
-            )
+            Member::of(classified.clone(), local, participating.clone())
         };
         let caller = Membership::of(&member_of(&swap, low, &participating));
         assert_eq!(
@@ -1817,90 +1668,74 @@ mod tests {
         assert_eq!(whole, Membership::whole(participating));
     }
 
-    /// A shard outside the core whose every leg is a delivery is frozen
-    /// as delivering; one that also issues is not, and neither is the
-    /// core. A delivering member decides nothing whichever way it went —
-    /// its failure leaves the value in the cell — where a leg that
-    /// failed to issue is the transaction's end on its shard.
+    /// A membership stated outright, for the routing pins.
+    fn membership(
+        awaited: impl IntoIterator<Item = ShardId>,
+        reach: impl IntoIterator<Item = ShardId>,
+        role: Role,
+    ) -> Membership {
+        Membership {
+            awaited: awaited.into_iter().collect(),
+            reach: reach.into_iter().collect(),
+            role,
+        }
+    }
+
+    /// A tick holding a leg and a core member routes per member: the
+    /// venue's copy carries the core outcome it awaits and leaves out the
+    /// leg beside it.
     #[test]
-    fn a_delivering_member_never_decides() {
+    fn a_mixed_tick_routes_its_core_outcome_and_withholds_its_leg() {
         use hyperscale_types::BlockHeight;
-        use hyperscale_vm_types::LegRole;
 
-        use crate::fixtures::{leaf, leg, payer, swap, trie};
+        use crate::fixtures::leaf;
 
-        let trie = trie();
-        let placement = &trie;
-        let (sender, recipient) = (leaf(0), leaf(1));
-
-        let transfer = Classified::freeze(
-            &[
-                leg(0, LegRole::Core, &[]),
-                leg(1, LegRole::Outbound, &[(0, 0)]),
-            ],
-            payer(),
-            &[],
-            placement,
-        );
-        assert!(transfer.decomposed());
-        assert!(transfer.only_delivers_at(recipient));
-        assert!(
-            !transfer.only_delivers_at(sender),
-            "the core bears the verdict"
-        );
-        let swap = Classified::freeze(&swap(), payer(), &[], placement);
-        assert!(
-            !swap.only_delivers_at(leaf(0)),
-            "a shard that also issues runs on the transaction's window"
-        );
-
+        let (local, venue) = (leaf(0), leaf(1));
+        let (leg, core) = (tx(1), tx(2));
         let mut tick = TickState::new(
-            TickId::new(recipient, BlockHeight::new(1)),
+            TickId::new(local, BlockHeight::new(1)),
             BlockHash::ZERO,
             WeightedTimestamp::from_millis(1_000),
         );
-        let participating = BTreeSet::from([sender, recipient]);
-        let delivery = tx(1);
-        let membership = Membership::of(&Member::of(
-            transfer,
-            recipient,
-            Side::Delivering,
-            participating.clone(),
-        ));
-        assert!(membership.role().delivers());
-        assert_eq!(membership.role(), Role::Delivery);
-        tick.admit(delivery, membership, Some(10), Admission::Executes);
-        let issuer = tx(2);
         tick.admit(
-            issuer,
-            Membership::of(&Member::of(swap, leaf(0), Side::Issuing, participating)),
+            leg,
+            membership([local], [local, venue], Role::Leg),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
-        tick.record_execution_result(delivery, ExecutionOutcome::Failed);
-        tick.record_execution_result(issuer, ExecutionOutcome::Failed);
-        let (_, _, outcomes) = tick.build_vote_data().expect("both settle alone");
-        let decides = |hash: TxHash| {
-            outcomes
-                .iter()
-                .find(|outcome| outcome.tx_hash() == hash)
-                .expect("attested")
-                .decides()
-        };
-        assert!(!decides(delivery), "a failed delivery decides nothing");
-        assert!(
-            decides(issuer),
-            "a failed issue is the transaction's end here"
+        tick.admit(
+            core,
+            membership([local, venue], [local, venue], Role::Core),
+            Some(10),
+            Joins::Executes,
         );
+
+        assert_eq!(tick.counterpart_shards(), vec![venue]);
+        assert_eq!(tick.txs_reaching(venue).collect::<Vec<_>>(), vec![core]);
+    }
+
+    /// A core member reaching a leg's producer owes it its outcome: the
+    /// producer reads the core's verdict off it, relaying a refusal and
+    /// folding a success.
+    #[test]
+    fn a_core_outcome_is_owed_to_its_leg_producer() {
+        use crate::fixtures::leaf;
+
+        let (local, producer) = (leaf(1), leaf(0));
+        let core = membership([local], [local, producer], Role::Core);
+        assert!(core.owes_certificate_to(producer, local));
+        assert!(!core.owes_certificate_to(local, local));
+        let leg = membership([producer], [local, producer], Role::Leg);
+        assert!(!leg.owes_certificate_to(local, producer));
     }
 
     /// A leg awaiting nobody but itself settles in the determined half on
-    /// the tick's own certificate, while that certificate is still owed
-    /// to every shard the transaction reaches. A certificate from one of
-    /// those shards is neither coverage for the leg nor part of its
-    /// finalization: its verdict is not the leg's to apply.
+    /// the tick's own certificate, and owes that certificate to nobody:
+    /// the venue reads the leg's crossing off the record it was pushed.
+    /// A certificate from the venue is neither coverage for the leg nor
+    /// part of its finalization: its verdict is not the leg's to apply.
     #[test]
-    fn a_leg_certifies_alone_and_is_still_routed_to_its_reach() {
+    fn a_leg_certifies_alone_and_owes_its_certificate_to_nobody() {
         use hyperscale_types::BlockHeight;
 
         use crate::fixtures::{leaf, payer, swap, trie};
@@ -1919,11 +1754,10 @@ mod tests {
             Membership::of(&Member::of(
                 classified,
                 local,
-                Side::Issuing,
                 BTreeSet::from([local, venue]),
             )),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
 
         assert_eq!(tick.determined_members(), vec![leg], "it settles alone");
@@ -1933,12 +1767,11 @@ mod tests {
             0,
             "and expects no certificate"
         );
-        assert_eq!(
-            tick.counterpart_shards(),
-            vec![venue],
-            "yet its own is owed to the venue"
+        assert!(
+            tick.counterpart_shards().is_empty(),
+            "and owes its own to nobody"
         );
-        assert_eq!(tick.txs_reaching(venue).collect::<Vec<_>>(), vec![leg]);
+        assert_eq!(tick.txs_reaching(venue).count(), 0);
         assert_eq!(tick.txs_awaiting(venue).count(), 0);
 
         tick.record_execution_result(
@@ -2029,7 +1862,7 @@ mod tests {
             member,
             Membership::whole(participating),
             Some(10),
-            Admission::Executes,
+            Joins::Executes,
         );
         tick.record_execution_result(
             member,

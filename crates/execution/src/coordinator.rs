@@ -14,10 +14,10 @@
 //!   on every participant's certificate.
 //! - **Divided.** The star is a core with legs around it. A leg runs
 //!   where its own state lives and certifies alone; the core bears the
-//!   verdict; value between them crosses as an escrow record the
-//!   consumer claims. A shard with legs on both sides of the core runs
-//!   two members — one issuing at the commit, one delivering once the
-//!   core's output has crossed back.
+//!   verdict; value between them crosses as a record the consumer
+//!   claims. An owed crossing's consumer runs no member: its shard's
+//!   commit fold credits the record's reading, so a shard that only
+//!   takes delivery never includes the transaction.
 //! - **Settling.** No node at all: a reclaim taking back a crossing
 //!   nobody claimed, a retirement deleting records whose claims
 //!   committed, or a record this shard holds and decides from the leaf
@@ -49,50 +49,52 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
-use hyperscale_engine::{CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_fee_receipt};
+use hyperscale_engine::legs::{Classified, Member, Runs, Unclaimable, never_answer};
+use hyperscale_engine::tick_select::{ProvisionalCells, Requirement, requirements_of};
+use hyperscale_engine::{
+    CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
+};
+use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
-    record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
+    record_batch_unavailable, record_crossing_push_dropped, record_reclaim_admitted,
+    record_unresolvable_tx,
 };
-use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
+use hyperscale_storage::{RecoveredState, TickResolution};
+use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
-    CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation,
+    AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CertifiedBlock,
+    CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, ProvenCells, Provisions,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey,
-    TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
-    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    Window, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
-    tick_leader_at,
+    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, Joins,
+    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions, ScheduleLookup,
+    SettledSetVerdict, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim, StateWrites,
+    StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, WindowView, derive_block_transactions,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
+use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
-use crate::counterparts::{Counterparts, Offers};
+use crate::counterparts::{Counterparts, CrossingIndexSlot, Offers};
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalizations::FinalizationStore;
 use crate::gate::{Attested, Gate, gate_certificate};
-use crate::ledger::{Ledger, Settleable, Unanswerable};
+use crate::ledger::{Certified, Ledger, Settleable, Unanswerable};
 use crate::lookups::{
     assign_participants, attesting_committee, build_provision_requests, ec_has_shard_quorum_power,
-    fetch_keys_covered, peers_excluding_self,
+    fetch_keys_covered, peers_excluding_self, record_pushes,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
-use crate::provisional::ProvisionalCells;
-use crate::provisioning::{ProvisioningTracker, Requirement, requirements_of};
-use crate::tick_state::{Admission, Divergence, Membership, TickState};
+use crate::parked_claims::ParkedClaims;
+use crate::provisioning::{ProvisioningTracker, WantedRecord};
+use crate::tick_state::{Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::vote_tracker::VoteTracker;
-
-/// One payer-side engagement wait: the transaction, the counterpart
-/// shards whose echo its vote waits on, and the signed window end that
-/// bounds the wait.
-type EngagementWait = (TxHash, BTreeSet<ShardId>, WeightedTimestamp);
 
 /// One transaction a committed block put in flight, as this shard sees
 /// it: the body, and the member this shard runs of it.
@@ -131,23 +133,66 @@ fn committed_members(
         .into_iter()
         .map(|(tx, participating)| {
             let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-            let side = classified.first_side_at(local_shard);
             CommittedMember {
-                member: Member::of(classified, local_shard, side, participating),
+                member: Member::of(classified, local_shard, participating),
                 tx,
             }
         })
         .collect()
 }
 
+/// What each member a finalization's receipts name left, as the receipts
+/// state it.
+fn receipt_writes(fw: &Finalization) -> Vec<(TxHash, StateWrites)> {
+    fw.receipts()
+        .iter()
+        .filter_map(|receipt| Some((receipt.tx_hash, receipt.consensus.writes()?.clone())))
+        .collect()
+}
+
+/// Count a transaction let go of with no outcome, by whether a
+/// committed record had covered it.
+fn record_unanswerable(covered_by_record: bool) {
+    record_unresolvable_tx(if covered_by_record {
+        "record_covered"
+    } else {
+        "no_record"
+    });
+}
+
+/// The members a commit's tick seats: the manifest's lines, or what
+/// this node's own inputs name, with the strands its ledger let go of at
+/// this commit.
+#[derive(Clone, Copy)]
+enum Named<'a> {
+    Lines(&'a [TickLine]),
+    Composed {
+        unanswerable: &'a [Unanswerable],
+        recovered: &'a [TickId],
+    },
+}
+
+/// Where a commit's tick takes its members from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    /// The member lines the block's committed manifest names.
+    Manifest,
+    /// The members this node's own committed inputs name: for a block
+    /// whose builder named none, a fixture standing in for a proposer
+    /// whose inputs are this node's.
+    Composed,
+}
+
 /// The committed block a tick is created against: its identity, and the
 /// environment anchors the transactions it commits execute under.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct CommittingBlock {
     hash: BlockHash,
     height: BlockHeight,
     /// The block's parent-QC weighted timestamp.
     ts: WeightedTimestamp,
+    /// The records its content licenses a reclaim of here.
+    licensed: Vec<(SubstateKey, Unclaimable)>,
 }
 
 /// A tick with entries on the tick chain and no committed fate yet.
@@ -164,17 +209,34 @@ struct TickedBatch {
     provisional_claims: Vec<(DeclaredKey, Mode)>,
     /// The legs those claims belong to. A tick's fate arrives in halves,
     /// and only the half carrying the legs releases their cells — so the
-    /// entry has to know which members that is.
+    /// entry has to know which members that is. Narrows as legs are
+    /// released: a release lets go of what the released legs held and
+    /// leaves the kept legs' claims to their own settlement.
     legs: BTreeSet<TxHash>,
 }
 
-/// One composed-but-undispatched tick: the block's identity anchors plus
+/// One seated but undispatched tick: the block's identity anchors plus
 /// the members that joined at its commit.
 struct PendingTick {
     tick: BlockHeight,
     tick_ts: WeightedTimestamp,
     env: TickEnvironment,
     requests: Vec<CrossShardExecutionRequest>,
+    /// Whether this node holds everything the tick's lines name: a body
+    /// for each member and the bundles each one named to run needs.
+    in_hand: bool,
+}
+
+/// One seated tick in dispatch order.
+enum Queued {
+    /// A tick this node runs.
+    Run(PendingTick),
+    /// A tick this node seated and cannot run: sealed, below the store's
+    /// reach, or short a body or a bundle. Every later tick reads a
+    /// baseline its readable writes belong in, so none dispatches until
+    /// its determined half has settled and the receipts that settled it
+    /// are seated on the chain in its place.
+    Held(TickId),
 }
 
 impl PendingTick {
@@ -208,6 +270,36 @@ pub struct CompletionData {
     pub(crate) global_receipt_root: GlobalReceiptRoot,
     /// Per-tx outcomes in tick order.
     pub(crate) tx_outcomes: Vec<TxOutcome>,
+}
+
+/// What folding committed blocks into execution hands the node: one
+/// commit's, or a run's in commit order where a drain or a replay folded
+/// several.
+#[derive(Debug, Default)]
+pub struct CommitEffects {
+    /// What each folded block's finalizations settle about the
+    /// transactions they name, read off the ledger before the same fold
+    /// released the entries.
+    pub resolutions: Vec<(TxHash, TxResolution)>,
+    /// The folds' actions, in commit order.
+    pub actions: Vec<Action>,
+    /// Whether a fold here derived the terminal latch: the quiescence
+    /// commit, after which no block seats a tick and nothing in flight can
+    /// be decided.
+    pub terminal: bool,
+    /// The member lines each folded block's tick seated, in commit order:
+    /// its manifest's, or what this node's own inputs named where the
+    /// commit composed.
+    pub named: Vec<TickLine>,
+}
+
+impl CommitEffects {
+    fn absorb(&mut self, later: Self) {
+        self.resolutions.extend(later.resolutions);
+        self.actions.extend(later.actions);
+        self.terminal |= later.terminal;
+        self.named.extend(later.named);
+    }
 }
 
 /// Execution memory statistics for monitoring collection sizes.
@@ -303,20 +395,85 @@ impl ExecutionMemoryStats {
     }
 }
 
-/// The name a housekeeping member over held records takes on the chain
-/// disposing of them.
+/// The name a reclaim of records a block licenses takes on the chain
+/// taking them back.
 ///
-/// Derived from the transaction that issued the crossings and the record
-/// cells being settled, so every replica at one frontier reaches the same
-/// name and no two members ever share one. It is not the issuing
-/// transaction's own hash: that transaction belongs to a chain that has
-/// ended, this one never committed it, and a receipt naming it would be a
-/// verdict this chain has no standing to reach.
-fn disposal_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
+/// Derived from the record cells being settled, so every replica at one
+/// frontier reaches the same name. A record is disposed once, so its
+/// record set names the member. It is no transaction's own hash: a
+/// reading names no transaction, and a receipt naming the issuer would
+/// be a verdict on a transaction this chain may never have committed.
+fn disposal_member_name(records: &[SubstateKey]) -> TxHash {
     let keys: Vec<Vec<u8>> = records.iter().map(|key| key.to_bytes().to_vec()).collect();
-    let mut parts: Vec<&[u8]> = vec![b"hyperscale.record.disposal", &issued_by.0.0];
+    let mut parts: Vec<&[u8]> = vec![b"hyperscale.record.disposal"];
     parts.extend(keys.iter().map(Vec::as_slice));
     TxHash::from(Hash::from_parts(&parts))
+}
+
+/// The records under `local`'s prefix that `block` licenses a reclaim
+/// of, each with its evidence, ascending by key and once each.
+///
+/// Read off the block alone, so a replica replaying it composes what
+/// its peers did: every reading of a decline key present, whose named
+/// crossing's record routes here (the consumer's `Never`); every
+/// escrowed record a departure's unsettled name states; and every
+/// crossing a departure names off the leaves.
+fn reclaim_licences(
+    state_claims: &[StateClaim],
+    abandonment_records: &[AbandonmentRecord],
+    local: ShardId,
+) -> Vec<(SubstateKey, Unclaimable)> {
+    let here = |key: &SubstateKey| ShardTrie::shard_owns_prefix(local, key.owner);
+    let mut licensed: BTreeMap<SubstateKey, Unclaimable> = BTreeMap::new();
+    for claim in state_claims {
+        for (key, stated) in claim.cells.iter() {
+            if !matches!(stated.inclusion(), Inclusion::Present(_)) {
+                continue;
+            }
+            let Some(id) = claim.crossing_of(*key) else {
+                continue;
+            };
+            let record = id.record_key(&ProtocolHasher);
+            if id.answer_key(&ProtocolHasher, Answered::Never) == *key && here(&record) {
+                licensed
+                    .entry(record)
+                    .or_insert(Unclaimable::Never { read: *key });
+            }
+        }
+    }
+    for departure in abandonment_records {
+        for name in departure.unsettled() {
+            for record in name.escrowed.iter().filter(|record| here(record)) {
+                licensed
+                    .entry(*record)
+                    .or_insert(Unclaimable::IssuedBy { tx: name.tx_hash });
+            }
+        }
+        for crossing in departure.unclaimed() {
+            if here(&crossing.record) {
+                licensed
+                    .entry(crossing.record)
+                    .or_insert(Unclaimable::IssuedBy { tx: crossing.tx });
+            }
+        }
+    }
+    licensed.into_iter().collect()
+}
+
+/// The record cells a producer on `local` writes for consumers
+/// elsewhere, in edge order: every one, or those of one `kind`.
+///
+/// What a reclaim of the transaction credits back. An owed crossing is
+/// taken back by nobody — its only disposal is the commit fold's
+/// removal on its consumer's claim — and the reclaim skips one it names.
+fn issued_records(classified: &Classified, local: ShardId, kind: Option<Kind>) -> Vec<SubstateKey> {
+    classified
+        .crossings()
+        .filter(|(edge, _)| {
+            edge.from == local && kind.is_none_or(|kind| edge.crossing.kind == kind)
+        })
+        .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+        .collect()
 }
 
 /// Execution state machine.
@@ -350,33 +507,46 @@ pub struct ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════
     // Tick dispatch
     // ═══════════════════════════════════════════════════════════════════════
-    /// Ticks composed at commit but not yet dispatched, in height order.
+    /// Ticks seated at commit but not yet dispatched, in height order.
     /// Ticks execute serially — each output is the next tick's baseline —
     /// so the head dispatches only when no tick is in flight.
-    pending_ticks: VecDeque<PendingTick>,
+    pending_ticks: VecDeque<Queued>,
+
+    /// The seated ticks this node never runs, whose settlements it seats
+    /// from their receipts as they commit. Kept until the tick leaves
+    /// the registry.
+    held: BTreeSet<TickId>,
 
     /// Whether a dispatched tick's `ExecutionBatchCompleted` is still
     /// outstanding.
     tick_in_flight: bool,
 
-    /// Whether this chain's terminal block has committed.
+    /// Whether the committed tip is past this chain's terminal window.
     ///
-    /// Set by [`abort_pending_ticks`](Self::abort_pending_ticks), which
-    /// fires once on the first coast commit. Composition runs on every
-    /// commit after it, so without the latch a candidate unblocked past
-    /// the terminal would compose into a tick nothing can certify.
+    /// Derived in every fold from the tip header's parent QC, before
+    /// that fold seats, and never cleared. It flips at the quiescence
+    /// commit, the first coast block, whose parent QC certifies the
+    /// terminal block; the terminal block itself seats as any other.
+    /// Seating is the latch's only reader and runs only inside a fold, so
+    /// nothing seeds it at construction: a restart, a snap-sync seat and
+    /// a reshape adoption each derive it in their first fold. Without it
+    /// a tick past the terminal would be seated where nothing can
+    /// certify it.
     terminated: bool,
 
     /// What this node can run, asked where a tick dispatches.
     ///
     /// A queued tick whose members run code this node cannot resolve
     /// waits at the dispatch head. It cannot be consulted where the tick
-    /// is composed: membership is what the committee's votes are cast
-    /// over, so it has to be a function of committed chain state alone,
-    /// and a node's holdings are not that. Dispatch is where the
-    /// difference is local — the tick still answers for exactly the
-    /// members it was composed with, whenever it runs.
+    /// is seated: membership is what the committee's votes are cast over,
+    /// so it is the block's manifest, and a node's holdings are not
+    /// committed content. Dispatch is where the difference is local — the
+    /// tick still answers for exactly the members it was seated with,
+    /// whenever it runs.
     code: Arc<dyn CodeAvailability>,
+
+    /// The group's crossing index slot, held so the host can bind it.
+    crossing_index: Arc<CrossingIndexSlot>,
 
     /// The highest tick whose output is on the tick chain. A resolution
     /// is emitted only once its tick's tick has appended, so a commit
@@ -391,23 +561,27 @@ pub struct ExecutionCoordinator {
 
     /// The blocks a restart has to replay before this coordinator's
     /// account of what is in flight matches its peers'. Construction has
-    /// no schedule to compose against, so they wait for
+    /// no schedule to seat against, so they wait for
     /// [`on_committed_state_restored`](Self::on_committed_state_restored)
     /// and are empty from then on.
     replay_blocks: Vec<Verified<CertifiedBlock>>,
+    /// Commits whose anchored committee sits in a window this node's
+    /// beacon has not committed yet, each with its committee anchor, in
+    /// commit order. Folded as the windows land, and every later commit
+    /// queues behind the first, so the fold never runs out of order.
+    awaiting_window: VecDeque<(CertifiedBlock, WeightedTimestamp, Naming)>,
 
     /// The lowest height a tick may be *dispatched* at.
     ///
     /// A tick reads its baseline as of the height below it, and a store
     /// answers a historical read only inside its retention horizon — so a
-    /// replay reaching further back than that composes its ticks and runs
-    /// none of them. Composition is what fixes which tick holds a member,
-    /// and every replica of the shard has to agree on that whatever it
-    /// can still execute; the baseline is what the store cannot answer
-    /// for. What such a tick left is seated from the receipts that
+    /// replay reaching further back than that seats its ticks and runs
+    /// none of them. The manifest fixes which tick holds a member, and
+    /// every replica of the shard seats it whatever it can still execute;
+    /// the baseline is what the store cannot answer for. What such a tick left is seated from the receipts that
     /// committed it instead. `GENESIS` on every path but a replay, where
     /// every height qualifies.
-    compose_from: BlockHeight,
+    dispatch_from: BlockHeight,
 
     /// Tick fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
@@ -480,6 +654,12 @@ pub struct ExecutionCoordinator {
     /// a source block's commit proof, a departed partner's settled set —
     /// re-driven through the handler it arrived by ([`Self::release`]).
     parked: ParkedArtifacts,
+    /// Pushed claims waiting on their anchor's proof.
+    parked_claims: ParkedClaims,
+    /// The records the last live block wrote, by the shard owning each
+    /// consumer, kept one commit for the next block's proposer to push
+    /// beside the header that proves them.
+    pending_push: Option<(BlockHash, Anchor, BTreeMap<ShardId, Vec<SubstateKey>>)>,
 
     /// What counterparts have said about the transactions in flight
     /// here, and what this shard still asks them: the ledger of what is
@@ -527,11 +707,11 @@ impl ExecutionCoordinator {
             me,
             local_shard,
             code,
+            Arc::new(CrossingIndexSlot::default()),
             &RecoveredState::default(),
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         )
     }
@@ -563,11 +743,11 @@ impl ExecutionCoordinator {
         me: ValidatorId,
         local_shard: ShardId,
         code: Arc<dyn CodeAvailability>,
+        crossing_index: Arc<CrossingIndexSlot>,
         recovered: &RecoveredState,
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizationStore>,
         proven_anchors: Arc<ProvenAnchors>,
-        proven_cells: Arc<ProvenCells>,
         mirror: Arc<CounterpartMirror>,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
@@ -594,25 +774,28 @@ impl ExecutionCoordinator {
             None => recovered.committee_anchor_wt(),
         };
         Self {
-            counterparts: Counterparts::holding(
+            counterparts: Counterparts::new(
                 local_shard,
                 proven_anchors,
-                proven_cells,
                 mirror,
-                &recovered.escrow_records,
+                Arc::clone(&crossing_index) as _,
+                recovered.read_frontier.clone(),
             ),
+            crossing_index,
             finalized,
             committed_height,
             committed_ts: committed_block_anchor_wt,
             committed_committee_anchor_wt,
             pending_ticks: VecDeque::new(),
+            held: BTreeSet::new(),
             code,
             tick_in_flight: false,
             terminated: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
             replay_blocks: recovered.replay.blocks.clone(),
-            compose_from: recovered.replay.compose_from,
+            awaiting_window: VecDeque::new(),
+            dispatch_from: recovered.replay.dispatch_from,
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
             ticks: TickRegistry::new(),
@@ -623,6 +806,8 @@ impl ExecutionCoordinator {
             exec_certs,
             pending_verifications: HashSet::new(),
             parked: ParkedArtifacts::default(),
+            parked_claims: ParkedClaims::new(),
+            pending_push: None,
             me,
             local_shard,
         }
@@ -638,6 +823,14 @@ impl ExecutionCoordinator {
         &self.finalized
     }
 
+    /// The slot this coordinator's crossing questions read from, shared
+    /// by the vnode group: the host binds it to the shard's chain once
+    /// the chain is open.
+    #[must_use]
+    pub const fn crossing_index(&self) -> &Arc<CrossingIndexSlot> {
+        &self.crossing_index
+    }
+
     /// Reference to the shared execution-certificate store. The `io_loop`
     /// clones this `Arc` into its `SharedCaches` so the inbound EC fetch
     /// handler can read aggregated local-shard certificates without
@@ -651,97 +844,83 @@ impl ExecutionCoordinator {
     // Tick Assignment
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// The committed block's **anchored** committee — `at_for_shard(local_shard,
-    /// anchor_wt)`, the same snapshot the proposer classified `ticks` against
-    /// and the verifier validated against. Both of those resolve a block's
-    /// committee from its parent, so `anchor_wt` is
-    /// [`Self::committed_committee_anchor_wt`], not the block's own: the two
-    /// straddle an epoch cut once per window, and a reshape cut there changes
-    /// the shard set `compute_ticks` routes over.
+    /// The committee a committed block's content is classified under: the
+    /// one at its `committee_anchor`, its parent's anchor, which is the
+    /// snapshot the proposer classified the block against and the verifier
+    /// validated it against. The block's own anchor and its committee
+    /// anchor straddle an epoch cut once per window, and a reshape cut
+    /// there changes the shard set `compute_ticks` routes over.
     ///
-    /// Tick and provision classification at commit keys on it, not the
-    /// `ArcSwap` head, so every replica groups a block's transactions
-    /// identically across a reshape boundary (a head-flipped replica would
-    /// otherwise split execution votes). Falls back to the head only if the
-    /// window was evicted — unreachable for a just-committed block, whose
-    /// committee resolved at verification.
-    /// The committee this shard was under at `anchor_wt`, or the head
-    /// where the schedule names none.
+    /// `None` while that window is newer than this node's beacon has
+    /// committed: the commit waits for it rather than read the head, so
+    /// every replica groups a block's transactions identically across a
+    /// reshape boundary.
     ///
-    /// The fallback is reached in one shape that matters: a split child
-    /// replaying the window it inherited asks about an anchor before its
-    /// own cut, where no snapshot names it at all — `Evicted`, not a
-    /// transient lag — and there is no committee of its own to find. The
-    /// head is then the only one it has, and it classifies the inherited
-    /// content the way the child's own keyspace is cut rather than the
-    /// way its parent's was.
-    ///
-    /// That is a reading of the present, which is what the callers here
-    /// want: they ask who is party to a transaction *now*, to put a
-    /// question to a counterpart that can answer it. A caller wanting
-    /// the classification the content was committed under must not use
-    /// this — that is the block's own anchor trie, and phase 5 removed
-    /// the last consumer that confused the two.
-    fn classification_committee<'t>(
+    /// An evicted committee anchor is reached by the first block of a
+    /// chain whose predecessor's anchor lies before its cut, and that
+    /// block classifies under its own anchor's window. Where that is
+    /// evicted too, no window names this shard at all — a split child
+    /// replaying the window it inherited, whose content predates its own
+    /// cut — and the head, its only committee, classifies the content the
+    /// way the child's own keyspace is cut.
+    fn anchored_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
-        anchor_wt: WeightedTimestamp,
-    ) -> &'t TopologySnapshot {
-        topology_schedule
-            .at_for_shard(self.local_shard, anchor_wt)
-            .map_or_else(
-                || topology_schedule.head().as_ref(),
-                |(snapshot, _)| snapshot.as_ref(),
-            )
+        committee_anchor: WeightedTimestamp,
+        own_anchor: WeightedTimestamp,
+    ) -> Option<&'t TopologySnapshot> {
+        let resolve = |wt| match topology_schedule.lookup_for_shard(self.local_shard, wt).0 {
+            ScheduleLookup::Committee(snapshot) => Ok(snapshot.as_ref()),
+            ScheduleLookup::NotYetCommitted => Err(true),
+            ScheduleLookup::Evicted => Err(false),
+        };
+        match resolve(committee_anchor) {
+            Ok(snapshot) => Some(snapshot),
+            Err(true) => None,
+            Err(false) => match resolve(own_anchor) {
+                Ok(snapshot) => Some(snapshot),
+                Err(true) => None,
+                Err(false) => Some(topology_schedule.head().as_ref()),
+            },
+        }
     }
 
-    /// The trie that says who was party to a transaction.
+    /// The trie that says who was party to a transaction, off the latest
+    /// committed block's anchored committee; `None` while that window is
+    /// not committed here.
     ///
     /// One accessor rather than an anchor chosen per call site, because
-    /// the two sites that ask it have to agree: composition derives an
+    /// the sites that ask it have to agree: composition derives an
     /// abandonment's participants from it, and the finalize gate
     /// re-derives the same set to put the fence's question to. A window
     /// later resolves a departed counterpart's *successor*, so a gate
     /// reading a different anchor than composition would ask about a
     /// shard that was never party — and pass, because a live successor is
     /// what [`settled_set_verdict`] steps over.
-    ///
-    /// The anchor is the block's committee anchor, not its own timestamp:
-    /// the two straddle an epoch cut once per window, and it is the
-    /// former that classified the block's content.
-    fn counterpart_trie<'t>(&self, topology_schedule: &'t TopologySchedule) -> &'t ShardTrie {
-        self.classification_committee(topology_schedule, self.committed_committee_anchor_wt)
-            .shard_trie()
+    fn counterpart_trie<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+    ) -> Option<&'t ShardTrie> {
+        self.anchored_committee(
+            topology_schedule,
+            self.committed_committee_anchor_wt,
+            self.committed_ts,
+        )
+        .map(TopologySnapshot::shard_trie)
     }
 
-    /// Set up per-tick execution state for a newly committed block.
-    ///
-    /// For each distinct tick, creates a [`TickState`], records tx → tick
-    /// assignments, and pre-populates provisions that arrived before the
-    /// block.
-    ///
-    /// Emits `ExecuteTransactions` actions
-    /// for ticks that are fully provisioned at creation time: single-shard
-    /// ticks always qualify; cross-shard ticks do when all required provisions
-    /// arrived before block commit.
-    ///
-    /// Returns the emitted dispatch actions plus any early execution votes
-    /// that need to be replayed through `on_execution_vote()`.
     /// Register a new cross-shard tick's transactions: the dependency set
-    /// execution waits on and the engagement echoes the payer's vote
-    /// waits on.
+    /// the member runs with once a manifest names it.
     fn register_cross_shard_txs(
         &mut self,
         classification: &TopologySnapshot,
         txs: &[CommittedMember],
-    ) -> Vec<EngagementWait> {
+    ) {
         let local_shard = self.local_shard;
-        let mut engagement_waits: Vec<EngagementWait> = Vec::new();
 
         for CommittedMember { tx, member } in txs {
             let tx_hash = tx.hash();
             let classified = member.classified();
-            let participating = member.reach();
             // A divided member waits on its execution scope minus itself
             // and on the crossings its legs consume, and on nothing else.
             // Its inbound escrow is its engagement — reclaimable if
@@ -754,27 +933,6 @@ impl ExecutionCoordinator {
                     .record_required(tx_hash, requirements_of(member, tx.legs()));
                 continue;
             }
-            let remote_participants = || -> BTreeSet<ShardId> {
-                participating
-                    .iter()
-                    .filter(|&&s| s != local_shard)
-                    .copied()
-                    .collect()
-            };
-
-            // The payer shard votes only once every counterpart has echoed
-            // its engagement — its own commitment of the transaction — or
-            // the window closed without one. Keyed on the same participant
-            // set the tick was grouped by, so every replica waits on the
-            // same shards.
-            if classification.shard_trie().shard_for_prefix(tx.fee_payer()) == local_shard {
-                engagement_waits.push((
-                    tx_hash,
-                    remote_participants(),
-                    tx.validity_range().end_timestamp_exclusive,
-                ));
-            }
-
             // The dependency set is what execution waits for: the shards
             // owning the transaction's read set, plus — on a non-payer
             // shard — the payer shard, whose bundle is the engagement
@@ -804,8 +962,6 @@ impl ExecutionCoordinator {
                     .collect(),
             );
         }
-
-        engagement_waits
     }
 
     /// Record what a committed block puts in flight: the ledger entry it
@@ -850,11 +1006,9 @@ impl ExecutionCoordinator {
             .filter(|committed| committed.member.reaches_beyond())
             .cloned()
             .collect();
-        let engagement_waits = if reaches_beyond.is_empty() {
-            Vec::new()
-        } else {
-            self.register_cross_shard_txs(classification, &reaches_beyond)
-        };
+        if !reaches_beyond.is_empty() {
+            self.register_cross_shard_txs(classification, &reaches_beyond);
+        }
 
         for CommittedMember { tx, member } in members {
             // Block-container entries decoded from the wire land as
@@ -874,14 +1028,6 @@ impl ExecutionCoordinator {
                 member.classified().clone(),
             );
         }
-
-        for (tx_hash, counterparts, validity_end) in engagement_waits {
-            self.candidates.record_engagement_wait(
-                tx_hash,
-                counterparts,
-                Deadline::of(validity_end).at(),
-            );
-        }
     }
 
     /// Replay the committed chain from where this coordinator's account
@@ -891,36 +1037,36 @@ impl ExecutionCoordinator {
     /// halves of what was lost — which tick holds which transaction, and
     /// what each tick's baseline was — are functions of committed content
     /// alone, so re-driving the ordinary commit path over the stored
-    /// blocks reproduces them exactly. A replica that skipped this would
-    /// compose those transactions into a tick of its own, and its peers'
-    /// certificate for that height would come back under a root it never
-    /// computed.
+    /// blocks, each seated from its manifest, reproduces them exactly.
     ///
-    /// Two reaches, because a replay has two jobs. Composition runs over
+    /// Two reaches, because a replay has two jobs. Seating runs over
     /// every block the window holds, which runs back as far as an
     /// undischarged record; execution runs only over what the store can
     /// still anchor a baseline at. Below
-    /// [`compose_from`](Self::compose_from) the ticks compose and none is
-    /// dispatched — nothing is lost there, because such a tick was
+    /// [`dispatch_from`](Self::dispatch_from) the ticks are seated and
+    /// none is dispatched — nothing is lost there, because such a tick was
     /// settled by a fate the replay reads off the chain, and what it left
     /// is seated from the receipts that committed it.
     ///
     /// The blocks arrive with the provision bundles they carried already
-    /// reattached, so a leg composes here on the evidence it composed on
-    /// the first time rather than waiting for a fetch nobody will answer.
+    /// reattached, so a leg runs here on the evidence it ran on the first
+    /// time rather than waiting for a fetch nobody will answer.
     ///
-    /// Deferred to here rather than done at construction because
-    /// composition needs a topology, and there is none until the schedule
+    /// Deferred to here rather than done at construction because seating
+    /// needs a topology, and there is none until the schedule
     /// is up. Idempotent: the payload is taken, and a live commit that
     /// beat this call has already advanced the frontier past it.
+    ///
+    /// The effects carry the seated ticks' resolutions first, then each
+    /// replayed block's fold in commit order.
     pub fn on_committed_state_restored(
         &mut self,
         topology_schedule: &TopologySchedule,
         derivation: &dyn Derivation,
-    ) -> Vec<Action> {
+    ) -> CommitEffects {
         let blocks = std::mem::take(&mut self.replay_blocks);
         if blocks.is_empty() {
-            return Vec::new();
+            return CommitEffects::default();
         }
         // Provision deadlines stamp against this clock, which a commit
         // would have advanced before any of this ran.
@@ -936,27 +1082,33 @@ impl ExecutionCoordinator {
         // Every settled tick the replay is below the store's reach to
         // re-run, seated on the chain before the first one it does run
         // reads a baseline that has to carry it.
-        let mut actions = self.restored_ticks(&blocks);
+        let mut effects = CommitEffects {
+            actions: self.restored_ticks(&blocks),
+            ..CommitEffects::default()
+        };
         for certified in &blocks {
             // The replay window came off the store, so nothing derived
             // these on the way in.
             derive_block_transactions(certified.block(), derivation);
-            // The whole of what a commit does to execution, in the order
-            // a commit does it. A finalization the replay recomposes but
-            // never releases leaves its members assigned to a tick that
-            // has already settled — and a leg's reclaim, which is admitted
-            // only where no tick speaks for the transaction, is then held
-            // out for as long as the entry lives.
-            self.cleanup_committed_finalizations(certified.block().certificates());
-            actions.extend(self.on_block_committed(topology_schedule, certified));
+            // The fold a live commit runs, releases and terminal latch
+            // included: a finalization the replay reseats but never
+            // releases leaves its members assigned to a tick that has
+            // already settled, and a leg's reclaim, admitted only where no
+            // tick speaks for the transaction, is then held out for as
+            // long as the entry lives.
+            effects.absorb(self.commit_block_carrying(
+                topology_schedule,
+                certified,
+                Naming::Manifest,
+            ));
         }
-        actions
+        effects
     }
 
     /// Seat the ticks the replay runs none of on the chain, from what the
     /// receipts that settled them say they left.
     ///
-    /// A tick composed below [`compose_from`](Self::compose_from) is one
+    /// A tick seated below [`dispatch_from`](Self::dispatch_from) is one
     /// no replay of this replica's re-runs, and its writes reach the base
     /// only at the block that committed its finalization. Every tick the
     /// replay *does* run below that block reads a baseline the base has
@@ -974,22 +1126,16 @@ impl ExecutionCoordinator {
         let mut resolutions: Vec<(TickId, TickResolution)> = Vec::new();
         for certified in blocks {
             let block = certified.block();
-            if block.height() < self.compose_from {
+            if block.height() < self.dispatch_from {
                 continue;
             }
             for fw in block.certificates().iter() {
                 let fw = fw.as_unverified();
                 let tick_id = *fw.tick_id();
-                if tick_id.block_height() >= self.compose_from {
+                if tick_id.block_height() >= self.dispatch_from {
                     continue;
                 }
-                let writes: Vec<(TxHash, StateWrites)> = fw
-                    .receipts()
-                    .iter()
-                    .filter_map(|receipt| {
-                        Some((receipt.tx_hash, receipt.consensus.writes()?.clone()))
-                    })
-                    .collect();
+                let writes = receipt_writes(fw);
                 if writes.is_empty() {
                     continue;
                 }
@@ -1008,21 +1154,82 @@ impl ExecutionCoordinator {
         vec![Action::ResolveTicks { resolutions }]
     }
 
-    /// Compose this commit's tick and set it up to be attested.
+    /// The lines this node's own committed inputs name for the tick at
+    /// `tick_id`: its candidates, then an abort of each entry past its
+    /// deadline no shard is left to settle, with the discard of the tick
+    /// that holds it where one does, then the discard of each member of
+    /// `unanswerable` a tick holds. What a fixture building a block
+    /// stands in for.
+    fn composed_lines(
+        &self,
+        anchored: &TopologySnapshot,
+        tick_id: TickId,
+        unanswerable: &[Unanswerable],
+        recovered: &[TickId],
+    ) -> Vec<TickLine> {
+        let mut lines = self.candidates.named(
+            anchored.shard_trie(),
+            &self.provisioning,
+            &mut self.provisional_cells(),
+            self.committed_ts,
+        );
+        // A tick still owing its determined half is let go of by nothing
+        // but a recovery.
+        let settled_first = |held_by: &TickId| {
+            self.ticks
+                .get_tick(held_by)
+                .is_none_or(|tick| !tick.determined_unsettled())
+        };
+        let mut discards = Vec::new();
+        for entry in self.abandonable(tick_id) {
+            let held_by = match self.ticks.tick_assignment(entry.tx_hash) {
+                Some(held_by) if settled_first(&held_by) => Some(held_by),
+                Some(_) => continue,
+                None => None,
+            };
+            let reach: Vec<ShardId> = self
+                .counterparts
+                .ledger
+                .counterparts(entry.tx_hash, anchored.shard_trie())
+                .into_iter()
+                .collect();
+            lines.push(TickLine::Member {
+                tx: entry.tx_hash,
+                joins: Joins::Aborted,
+                settlement: if reach.is_empty() {
+                    Settlement::Alone
+                } else {
+                    Settlement::Awaited
+                },
+                holds: Capped::empty(),
+                reach: Capped::new(reach).expect("no more counterparts than prefixes"),
+            });
+            discards.extend(held_by.map(|tick| TickLine::Discard {
+                tick,
+                cause: DiscardCause::Abandoned(entry.tx_hash),
+            }));
+        }
+        lines.extend(discards);
+        lines.extend(unanswerable.iter().filter_map(|entry| {
+            Some(TickLine::Discard {
+                tick: self
+                    .ticks
+                    .tick_assignment(entry.tx_hash)
+                    .filter(settled_first)?,
+                cause: DiscardCause::Unanswerable(entry.tx_hash),
+            })
+        }));
+        lines.extend(recovered.iter().map(|&tick| TickLine::Discard {
+            tick,
+            cause: DiscardCause::Recovery,
+        }));
+        lines
+    }
+
+    /// Admit into the tick being seated everything its manifest names
+    /// `Aborted`.
     ///
-    /// The tick takes the candidates that can reach their outcome in it
-    /// and the transactions past their deadline that nothing else will,
-    /// and nothing else. That is what makes it votable the moment its
-    /// batch returns: every member of a tick has an outcome there, so no
-    /// member of one waits on another.
-    ///
-    /// Returns the tick, if the commit composed one, and any early votes
-    /// its leader can now replay.
-    /// Admit into the tick being composed everything this commit
-    /// abandons: past its deadline, with no shard left that could settle
-    /// it.
-    ///
-    /// Read after composition's own assignments, so a member that just
+    /// Read after the tick's own member assignments, so a member that just
     /// joined this tick is not taken from it — the tick that holds a
     /// transaction is the one that speaks for it.
     ///
@@ -1032,27 +1239,56 @@ impl ExecutionCoordinator {
     /// dominant, so their coverage closes on it — and what the fence
     /// asks its question about. Nothing is awaited: an abort needs no
     /// counterpart's verdict, so the whole shape's one set serves.
+    ///
+    /// An abandonment reaches no engine, so what its verdict settles is
+    /// built here rather than read off a result: the charge, where the
+    /// vault is this shard's, and a `Never` at each refusable crossing
+    /// the member consumed, where the ledger says the abandonment
+    /// answers for it and the decline key is this shard's. The receipt
+    /// rides the abandonment's finalization under the transaction's own
+    /// name, so a later accept of it on this chain is refused as already
+    /// resolved. It reads no answer first: an entry the ledger lets
+    /// answer never reached an executing tick, so nothing wrote its
+    /// claim or decline key, and a second abandonment writes the same
+    /// bytes to a key that still holds nothing.
     fn admit_abandoned(
         &mut self,
-        topology_schedule: &TopologySchedule,
+        trie: &ShardTrie,
         tick_id: TickId,
         state: &mut TickState,
+        lines: &[TickLine],
     ) {
         let local_shard = self.local_shard;
-        let trie = self.counterpart_trie(topology_schedule);
-        for entry in self.abandonable(tick_id) {
+        // The members the manifest names `Aborted`, and nothing else: an
+        // abort the manifest does not name has no row in flight in this
+        // tick, so no finalization of it could commit.
+        let entries: Vec<UnsettledTx> = lines
+            .iter()
+            .filter_map(|line| match line {
+                TickLine::Member {
+                    tx,
+                    joins: Joins::Aborted,
+                    ..
+                } => self.counterparts.ledger.abandonment_figures(*tx),
+                _ => None,
+            })
+            .collect();
+        for entry in entries {
             let UnsettledTx {
                 tx_hash,
+                deadline,
                 charged,
                 charge,
                 ..
             } = entry;
             // A tick that held the member can never speak for it — its
-            // coverage will not close — and its other legs would wait on
-            // that coverage forever. It goes with the member; the rest of
-            // its members reach their own deadlines instead.
+            // coverage will not close. The member goes, and with it every
+            // sibling sharing no verdict with a counterpart, to their own
+            // deadlines; a sibling a counterpart can settle stays, since
+            // that counterpart settles it against the certificate already
+            // out.
             if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
-                self.discard_tick(held_by);
+                self.release_tick(held_by, Some(tx_hash));
             }
             let mut participating = self.counterparts.ledger.counterparts(tx_hash, trie);
             participating.insert(local_shard);
@@ -1060,45 +1296,49 @@ impl ExecutionCoordinator {
                 tx_hash,
                 Membership::whole(participating).settling(),
                 Some(charged),
-                Admission::Aborted,
+                Joins::Aborted,
             );
-            // An abandonment reaches no engine, so the charge its verdict
-            // settles is built here rather than read off a result. The
-            // floor is owed whether or not the transaction ever ran: the
-            // reservation engaged when its block committed it, and an
+            // The floor is owed whether or not the transaction ever ran:
+            // the reservation engaged when its block committed it, and an
             // abort that released it without burning would price an
             // attempt nobody could execute below the success it was
-            // competing with.
-            //
-            // Fees never move cross-shard, so only the shard holding the
-            // vault settles it — the same question the engine asks of the
-            // payers it prices.
-            if trie.shard_for_prefix(charge.vault.owner) == local_shard {
-                let fee = build_fee_receipt(
-                    local_shard,
-                    trie,
-                    tx_hash,
+            // competing with. Fees never move cross-shard, so only the
+            // shard holding the vault settles it — the same question the
+            // engine asks of the payers it prices.
+            let vault = (trie.shard_for_prefix(charge.vault.owner) == local_shard).then(|| {
+                (
                     charge.vault,
                     Movement::unjudged(*PROTOCOL_RESOURCE, charge.amount),
-                );
-                state.record_fee_receipt(StoredReceipt::synced(tx_hash, Arc::new(fee)));
+                )
+            });
+            let nevers: Vec<(SubstateKey, Vec<u8>)> = self
+                .counterparts
+                .ledger
+                .abandonment_answers(tx_hash)
+                .map_or_default(|classified| {
+                    classified
+                        .refusable_consumed(local_shard)
+                        .map(|edge| {
+                            never_answer(tx_hash, deadline.validity_end().as_millis(), edge)
+                        })
+                        .filter(|(key, _)| trie.shard_for_prefix(key.owner) == local_shard)
+                        .collect()
+                });
+            if let Some(receipt) = build_refusal_receipt(local_shard, trie, tx_hash, vault, &nevers)
+            {
+                state.record_refusal_receipt(StoredReceipt::synced(tx_hash, Arc::new(receipt)));
             }
             self.candidates.remove(tx_hash);
             self.ticks.assign_tx(tx_hash, tick_id);
-            self.counterparts.ledger.certify(tx_hash);
+            self.counterparts
+                .ledger
+                .certify(tx_hash, Certified::ByAbandonment);
         }
     }
 
-    /// Drop every delivering candidate the delivery window has closed
-    /// on, and what no candidate waits for any more.
-    ///
-    /// Past the close no tick can take the member, and a mixed shard's
-    /// delivering candidate is removed by nothing else — its ledger entry
-    /// is the leg's, and a leg is never abandoned. What was provisioned
-    /// belongs to the candidates waiting on it, and a mixed shard's
-    /// delivering member is one until its own tick takes it.
+    /// Drop what no candidate waits for any more: what was provisioned
+    /// belongs to the candidates waiting on it.
     fn sweep_candidates(&mut self) {
-        self.candidates.drop_closed_deliveries(self.committed_ts);
         let candidates = &self.candidates;
         self.provisioning
             .sweep(self.committed_ts, |tx_hash| candidates.contains(tx_hash));
@@ -1135,12 +1375,14 @@ impl ExecutionCoordinator {
             }
             self.counterparts.ledger.admit_reclaim(tx_hash);
             record_reclaim_admitted(false);
-            // A mixed shard's delivering member waits on what the core
-            // returns, and the evidence this reclaim is composed from is
-            // that the core never claimed. Nothing is coming, so the
-            // candidate goes with the leg it was registered beside.
+            // A leg still waiting to run is not run past the evidence
+            // this reclaim is composed from, that its core never claimed:
+            // its candidate goes.
             self.candidates.remove(tx_hash);
-            let records = classified.records_issued(local_shard);
+            let records = issued_records(&classified, local_shard, None)
+                .into_iter()
+                .map(|key| (key, Unclaimable::IssuedBy { tx: tx_hash }))
+                .collect();
             // The plan reads no body — every cell is the record's — but
             // the price still follows the vault, and this is the shard
             // that holds it.
@@ -1153,175 +1395,56 @@ impl ExecutionCoordinator {
                 tx_hash,
                 Some(transaction),
                 records,
-                Licence::Unclaimed,
                 charged,
             );
         }
     }
 
-    /// Admit into the tick being composed the records this shard holds
-    /// whose claim it can now read.
+    /// Admit into the tick being composed the reclaim of the records
+    /// the committing block licenses: one member over every record its
+    /// readings and departures name here.
     ///
-    /// One member per issuing transaction, under a name of this chain's
-    /// own ([`disposal_member_name`]) rather than the transaction's. A
-    /// record older than what this chain replays is one no entry here
-    /// names, and its transaction may have been decided on a chain that
-    /// has ended: naming it here would put a second verdict
-    /// on a transaction nothing local can speak for, and would offer the
-    /// chain a resolution its own pre-cut rule exists to refuse. What
-    /// this shard does decide is the housekeeping itself, which is
-    /// nobody else's.
-    ///
-    /// The member carries the records and no body; whether each is
-    /// credited back or deleted is the engine's to decide against the
-    /// claim cell, which is the only reader holding a snapshot.
-    ///
-    /// What bounds the admission is the answer, and every form of it is
-    /// committed content, so every replica at one frontier admits the
-    /// same set. Where the claim routes here the engine reads the cell
-    /// against its own snapshot, inside the window an absent claim means
-    /// something in. Where it routes elsewhere the answer is the proof a
-    /// block carried, folded before this composes.
-    ///
-    /// The window is the lapse for every record, not the claim. A leaf
-    /// does not name its consumer's role, so a delivery-consumed record
-    /// read under the claim window would be judged absent one validity
-    /// range before its consumer could honestly have written the cell.
-    /// The lapse is the later of the two and is honest for both — and
-    /// past it no core shard of any arity can still commit, so the
-    /// silence is final however wide the core was.
+    /// Composed from the block alone — no index, no tip state, no
+    /// node-local crossing map — so every replica at one frontier admits
+    /// the same member, and a replica replaying the block composes what
+    /// its peers did. A record an entry here settles is left to it: the
+    /// entry composes the reclaim under its transaction's name. Whether
+    /// the record is still here is the engine's question at execution,
+    /// which skips one already disposed; the member carries no body, and
+    /// the price was settled where the crossing was issued.
     fn admit_record_disposals(
         &mut self,
-        topology_schedule: &TopologySchedule,
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
         prices: PriceTable,
+        licensed: &[(SubstateKey, Unclaimable)],
         state: &mut TickState,
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
-        if self.counterparts.held.is_empty() {
+        let records: Vec<(SubstateKey, Unclaimable)> = licensed
+            .iter()
+            .filter(|(key, _)| !self.counterparts.ledger.settles_record(*key))
+            .copied()
+            .collect();
+        if records.is_empty() {
             return;
         }
-        let Some(window) = topology_schedule.at(tick_ts) else {
+        let keys: Vec<SubstateKey> = records.iter().map(|(key, _)| *key).collect();
+        let tx_hash = disposal_member_name(&keys);
+        if self.ticks.tick_assignment(tx_hash).is_some() {
             return;
-        };
-        let trie = window.shard_trie();
-        let local_shard = self.local_shard;
-        // One licence per issuing transaction, so records answered the
-        // same way settle together and a record still waiting holds
-        // nothing back.
-        let mut due: BTreeMap<(TxHash, Licence), Vec<SubstateKey>> = BTreeMap::new();
-        for (key, record) in &self.counterparts.held {
-            // An entry that settles its own records is the one to do
-            // it: its reclaim and its retirement compose from the same
-            // leaves under the transaction's own name, and two members
-            // over one record would leave the second reading a cell the
-            // first deleted. The leaf answers where no such entry does —
-            // every record older than what this chain replays, every one
-            // whose entry has been pruned, and every one an abandonment
-            // record reconstructed an entry for that keeps no
-            // classification to settle from.
-            if self.counterparts.ledger.settles_records(record.cell.tx) {
-                continue;
-            }
-            let claim = record.cell.consumer_claim;
-            let licence = if matches!(record.answer, Some(Inclusion::Present(_))) {
-                // A claim proved present is the consumer holding the
-                // crossing, and a presence is bounded by no window. It
-                // answers over every other reading here: taking back
-                // value a consumer demonstrably has is the one mistake
-                // this cannot make.
-                Some(Licence::Claimed)
-            } else if trie.shard_for_prefix(claim.owner) == local_shard
-                && Window::Lapse.of(record.deadline()).contains(&tick_ts)
-            {
-                // This shard holds the cell, so the engine reads it
-                // against its own snapshot — the same licence, answered
-                // without a fetch, and the cell itself is the closest
-                // evidence there is while the window it answers in
-                // stands.
-                Some(Licence::OwnLeaf)
-            } else if record.unclaimable() {
-                // A departure says the chain that was to consume this
-                // crossing can never settle what issued it, and a claim
-                // read absent inside its window says nobody took it.
-                // Either way the value goes back.
-                Some(Licence::Unclaimed)
-            } else {
-                None
-            };
-            let Some(licence) = licence else {
-                continue;
-            };
-            due.entry((record.cell.tx, licence)).or_default().push(*key);
         }
-        for ((issued_by, licence), records) in due {
-            let tx_hash = disposal_member_name(issued_by, &records);
-            // Taken once: the credit deletes the cell, so a second
-            // member over the same record would read nothing and the
-            // records would be stranded behind a refusal.
-            for key in &records {
-                self.counterparts.held.remove(key);
-            }
-            record_reclaim_admitted(true);
-            // No body reached this shard: the chain that issued the
-            // crossing ended at the cut, and the price it owed was
-            // settled there.
-            self.seat_settling(
-                tick_id, tick_ts, prices, state, requests, tx_hash, None, records, licence, true,
-            );
-        }
+        record_reclaim_admitted(true);
+        self.seat_settling(
+            tick_id, tick_ts, prices, state, requests, tx_hash, None, records, true,
+        );
     }
 
-    /// Admit into the tick being composed every retirement a committed
-    /// record has licensed: a member running no node, awaiting nobody,
-    /// reserving nothing, charged nothing, that deletes the records of
-    /// crossings every consumer has claimed.
-    fn admit_retirements(
-        &mut self,
-        tick_id: TickId,
-        tick_ts: WeightedTimestamp,
-        prices: PriceTable,
-        state: &mut TickState,
-        requests: &mut Vec<CrossShardExecutionRequest>,
-    ) {
-        let local_shard = self.local_shard;
-        for Settleable {
-            tx_hash,
-            body: transaction,
-            classified,
-            charged,
-        } in self.counterparts.ledger.retirable()
-        {
-            // Only once nothing this shard runs of the transaction is
-            // left: a mixed shard's delivering member is still a
-            // candidate while the core's output is on its way, and the
-            // retirement is the last word here, not a word beside it.
-            if self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash) {
-                continue;
-            }
-            self.counterparts.ledger.admit_retire(tx_hash);
-            let records = classified.records_issued(local_shard);
-            self.seat_settling(
-                tick_id,
-                tick_ts,
-                prices,
-                state,
-                requests,
-                tx_hash,
-                Some(transaction),
-                records,
-                Licence::Claimed,
-                charged,
-            );
-        }
-    }
-
-    /// Seat a settling member in the tick: dispatched, awaiting nobody
-    /// but this shard since its own certificate is the whole of its
-    /// settlement, reserving nothing since no block took a reservation
-    /// for it, and running no node since the engine settles the records
-    /// on the licence alone.
+    /// Seat a reclaim in the tick: dispatched, awaiting nobody but this
+    /// shard since its own certificate is the whole of its settlement,
+    /// reserving nothing since no block took a reservation for it, and
+    /// running no node since the engine takes the records back on the
+    /// cells alone. It is this shard's verdict on the transaction.
     #[allow(clippy::too_many_arguments)] // one seat, every term of it
     fn seat_settling(
         &mut self,
@@ -1332,34 +1455,28 @@ impl ExecutionCoordinator {
         requests: &mut Vec<CrossShardExecutionRequest>,
         tx_hash: TxHash,
         transaction: Option<Arc<Verified<Transaction>>>,
-        records: Vec<SubstateKey>,
-        on: Licence,
+        records: Vec<(SubstateKey, Unclaimable)>,
         charged: bool,
     ) {
         let local_shard = self.local_shard;
-        // A retirement decides nothing: the verdict was reached where
-        // the claims were. Every other settlement is this shard's verdict
-        // on the transaction.
-        let membership = match on {
-            Licence::Claimed => Membership::housekeeping(local_shard),
-            Licence::Unclaimed | Licence::OwnLeaf => {
-                Membership::whole(BTreeSet::from([local_shard])).settling()
-            }
-        };
-        state.admit(tx_hash, membership, None, Admission::Executes);
+        state.admit(
+            tx_hash,
+            Membership::whole(BTreeSet::from([local_shard])).settling(),
+            None,
+            Joins::Executes,
+        );
         self.ticks.assign_tx(tx_hash, tick_id);
         requests.push(CrossShardExecutionRequest {
             tx_hash,
             transaction,
             provisions: Vec::new(),
             clock: tick_ts,
-            // The tick's own anchor is this settlement's: nothing
-            // committed it but the block being composed.
+            // The tick's own anchor is this reclaim's: nothing committed
+            // it but the block being composed.
             prices,
-            runs: Runs::Settle {
+            runs: Runs::Reclaim {
                 member: Member::whole(local_shard),
                 records,
-                on,
                 charged,
             },
             arrivals: Vec::new(),
@@ -1367,8 +1484,7 @@ impl ExecutionCoordinator {
     }
 
     /// Seat one composed member in the tick: its reservation, its
-    /// crossing targets, its tick assignment, and — for a mixed shard's
-    /// issuing member — the delivering member it makes composable.
+    /// crossing targets and its tick assignment.
     fn admit_member(
         &mut self,
         tick_id: TickId,
@@ -1385,11 +1501,6 @@ impl ExecutionCoordinator {
             .request
             .shape()
             .map(|(shape, body)| (shape.clone(), Arc::clone(body)));
-        // A mixed shard's delivering member is the second this shard
-        // runs of the transaction: the issuing one returned the
-        // reservation its block took and settled the price, so this
-        // one reserves nothing and issues nothing.
-        let second_member = shape.as_ref().is_some_and(|(shape, _)| shape.is_second());
         // One table per member: the one the block that committed it
         // named. Both figures a member is priced by are this chain's
         // own — the share its outcome attests, which its abandonment
@@ -1400,78 +1511,21 @@ impl ExecutionCoordinator {
         // burn at the member's clock would price it at a window its
         // admission never judged the signed ceiling against.
         let prices = member.committed_prices;
-        let reach = member.membership_reach();
         state.admit(
             member.request.tx_hash,
             member.membership,
             match &shape {
-                Some((shape, body)) if !second_member => {
+                Some((shape, body)) => {
                     Some(shape.classified().local_price(body, local_shard, &prices))
                 }
                 _ => None,
             },
-            member.admission,
+            member.joins,
         );
-        // Where this member's crossings land, off the frozen
-        // classification: the shards its outcome promises a bundle
-        // to, if it issues anything. Only an issuing member issues;
-        // a delivery and a reclaim promise nobody a bundle.
-        let targets: BTreeSet<ShardId> = match &shape {
-            Some((shape, _)) if shape.side() == Side::Issuing => shape
-                .classified()
-                .edges()
-                .iter()
-                .filter(|edge| edge.from == local_shard)
-                .flat_map(|edge| edge.to.iter().copied())
-                .collect(),
-            _ => BTreeSet::new(),
-        };
-        state.record_crossing_targets(member.request.tx_hash, targets);
-        // A core member's inclusion wrote this shard's committed cell
-        // for the transaction, and its refusal retracts it: what a leg
-        // probing the core reads as the same absence a core that never
-        // included the transaction leaves.
-        if let Some((shape, body)) = &shape
-            && shape.side() == Side::Issuing
-            && shape.in_core()
-        {
-            state.record_committed_cell(
-                member.request.tx_hash,
-                committed_tx_cell_key(
-                    local_shard,
-                    member.request.tx_hash,
-                    body.validity_range().end_timestamp_exclusive,
-                ),
-            );
-        }
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
-        self.counterparts.ledger.certify(member.request.tx_hash);
-        // A shard with legs on both sides of the core runs them as two
-        // members: the issuing one just admitted, and a delivering one
-        // that waits on what the core returns. Registered here, at the
-        // issuing admission, so every replica composes it from the
-        // same commit; it joins a later tick once its arrival lands.
-        if let Some((shape, body)) = &shape
-            && shape.side() == Side::Issuing
-            && shape.runs_both_sides()
-        {
-            let delivering = Member::of(
-                shape.classified().clone(),
-                local_shard,
-                Side::Delivering,
-                reach,
-            );
-            self.provisioning.record_required(
-                member.request.tx_hash,
-                requirements_of(&delivering, body.legs()),
-            );
-            self.candidates.register_member(
-                Arc::clone(body),
-                delivering,
-                member.request.clock,
-                member.committed_prices,
-            );
-        }
+        self.counterparts
+            .ledger
+            .certify(member.request.tx_hash, Certified::ByExecution);
         if let Some((_, body)) = &shape
             && member.request.runs.abortable()
         {
@@ -1485,11 +1539,17 @@ impl ExecutionCoordinator {
         requests.push(request);
     }
 
-    fn compose_tick(
+    /// Seat the tick the committing block names: its members, its aborts
+    /// and its discards, as the lines say, and the reclaims this shard's
+    /// committed content licenses. Seating reads no baseline, so it runs
+    /// whether or not the tick can be dispatched.
+    fn seat_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
-        block: CommittingBlock,
-        held: &mut ProvisionalCells,
+        anchored: &TopologySnapshot,
+        block: &CommittingBlock,
+        named: Named<'_>,
+        seated: &mut Vec<TickLine>,
     ) -> (
         Option<PendingTick>,
         Vec<Verifiable<ExecutionVote>>,
@@ -1497,9 +1557,34 @@ impl ExecutionCoordinator {
     ) {
         let local_shard = self.local_shard;
         let tick_id = TickId::new(local_shard, block.height);
-        let admitted = self
-            .candidates
-            .compose(&self.provisioning, held, self.committed_ts);
+        let composed;
+        let lines = match named {
+            Named::Lines(lines) => lines,
+            Named::Composed {
+                unanswerable,
+                recovered,
+            } => {
+                composed = self.composed_lines(anchored, tick_id, unanswerable, recovered);
+                &composed[..]
+            }
+        };
+        seated.extend(lines.iter().cloned());
+        for line in lines {
+            match line {
+                TickLine::Discard {
+                    tick,
+                    cause: DiscardCause::Unanswerable(tx_hash),
+                } => self.drop_unanswerable(*tick, *tx_hash),
+                TickLine::Discard {
+                    tick,
+                    cause: DiscardCause::Recovery,
+                } => self.discard_recovered(*tick),
+                _ => {}
+            }
+        }
+        let (admitted, in_hand) =
+            self.candidates
+                .take_named(lines, &self.provisioning, anchored.shard_trie(), block.ts);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
@@ -1511,18 +1596,17 @@ impl ExecutionCoordinator {
             self.admit_member(tick_id, member, &mut state, &mut ticked, &mut requests);
         }
 
-        self.admit_abandoned(topology_schedule, tick_id, &mut state);
-        // The tick's own anchor prices what the tick itself composes:
+        self.admit_abandoned(anchored.shard_trie(), tick_id, &mut state, lines);
+        // The tick's own anchor prices what the tick itself settles:
         // a settlement is committed by the block being built, not by an
         // earlier one, so there is one table for all of them.
         let tick_prices = prices_at(topology_schedule, block.ts);
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
-        self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_record_disposals(
-            topology_schedule,
             tick_id,
             block.ts,
             tick_prices,
+            &block.licensed,
             &mut state,
             &mut requests,
         );
@@ -1555,7 +1639,7 @@ impl ExecutionCoordinator {
         // Resolved under the committee that attests the tick, which is
         // the one that will verify the certificate. A window this shard
         // has already left seats nobody, and there is no leader to be:
-        // the tick composes, but no vote it could carry would reach a
+        // the tick is seated, but no vote it could carry would reach a
         // quorum.
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
         if let Some(committee) =
@@ -1587,14 +1671,9 @@ impl ExecutionCoordinator {
             // execution output, and a window taken from this node's head
             // would make the answer depend on how far this node has
             // folded the beacon rather than on what the block committed.
-            env: TickEnvironment::governing(
-                self.classification_committee(
-                    topology_schedule,
-                    self.committed_committee_anchor_wt,
-                ),
-                topology_schedule.windows(),
-            ),
+            env: TickEnvironment::governing(anchored, topology_schedule.windows()),
             requests,
+            in_hand,
         });
         (pending, votes_to_replay, members)
     }
@@ -1685,7 +1764,7 @@ impl ExecutionCoordinator {
     /// goes back whole and waits exactly as a tick composed for code
     /// this node has not fetched waits. What releases it is the same
     /// thing — the engine answering for the package — and what retries
-    /// it is the next commit, which composes and dispatches as every
+    /// it is the next commit, which seats and dispatches as every
     /// commit does.
     pub fn on_execution_batch_unavailable(
         &mut self,
@@ -1703,12 +1782,13 @@ impl ExecutionCoordinator {
         );
         record_batch_unavailable();
         self.tick_in_flight = false;
-        self.pending_ticks.push_front(PendingTick {
+        self.pending_ticks.push_front(Queued::Run(PendingTick {
             tick,
             tick_ts,
             env,
             requests,
-        });
+            in_hand: true,
+        }));
         Vec::new()
     }
 
@@ -1734,17 +1814,16 @@ impl ExecutionCoordinator {
             tick_id,
             results,
             tx_outcomes,
-            fee_receipts,
+            refusal_receipts,
         } = outcome;
         if let Some(state) = self.ticks.get_tick_mut(&tick_id) {
             for result in results {
                 state.record_receipt(result);
             }
-            for fee in fee_receipts {
-                state.record_fee_receipt(fee);
+            for fee in refusal_receipts {
+                state.record_refusal_receipt(fee);
             }
             for wr in tx_outcomes {
-                state.record_escrowed(wr.tx_hash(), wr.escrowed().to_vec());
                 let (tx_hash, outcome) = wr.into_parts();
                 state.record_execution_result(tx_hash, outcome);
             }
@@ -1834,23 +1913,6 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Clean up execution-local per-tick state for finalizations included in the
-    /// committed block.
-    ///
-    /// Per-tx terminal state for the mempool is driven by
-    /// `mempool::on_block_committed` reading `block.certificates` directly.
-    /// This function only handles execution's own bookkeeping.
-    pub fn cleanup_committed_finalizations(
-        &mut self,
-        certificates: &[Arc<Verifiable<Finalization>>],
-    ) {
-        for fw in certificates {
-            // No-op for synced ticks we never aggregated locally; for ticks we
-            // tracked, releases accumulator/cache state for the tick's txs.
-            self.remove_finalization(fw.as_unverified());
-        }
-    }
-
     /// Apply provisions committed in a block.
     ///
     /// Absorbs every batch before reading any of it back: interleaving
@@ -1878,9 +1940,6 @@ impl ExecutionCoordinator {
                 self.provisioning.absorb_provisions(&verified);
             }
         }
-
-        self.candidates
-            .absorb_engagement_evidence(&self.provisioning);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2234,18 +2293,17 @@ impl ExecutionCoordinator {
         let head = topology_schedule.head();
 
         // Who should receive this certificate is a question about the
-        // batch's transactions, not about its identity: the shards they
-        // reach, less our own — reach rather than awaited, since a shard
-        // this tick waits on nothing from may still claim what a member
-        // escrowed. Read off the batch's own record rather than the
-        // provision accumulator, which may have been pruned by the time
-        // the certificate is aggregated.
+        // batch's transactions, not about its identity: a copy goes where
+        // some member owes its outcome, which the frozen membership
+        // decides per member. A leg owes nobody, so a tick of legs alone
+        // projects nowhere and tracks nothing. Read off the batch's own
+        // record rather than the provision accumulator, which may have
+        // been pruned by the time the certificate is aggregated.
         //
-        // The same record answers what each of them receives. A shard is
-        // party to the transactions naming it and to no others, so that
-        // is what its copy carries — the certificate a remote shard gets
-        // is sized by its own stake in the batch rather than by the
-        // batch.
+        // The same record answers what each of them receives: the members
+        // that owe that shard their outcome, and no others — the
+        // certificate a remote shard gets is sized by its own stake in the
+        // batch rather than by the batch.
         let per_target: Vec<(ShardId, HashSet<TxHash>)> =
             self.ticks.get_tick(tick_id).map_or_default(|tick| {
                 tick.counterpart_shards()
@@ -2583,29 +2641,37 @@ impl ExecutionCoordinator {
         &self.counterparts.proven_anchors
     }
 
-    /// The shared mirror of what this validator has proven of
-    /// counterparts' cells, which the shard coordinator owns and this
-    /// coordinator's fetches fill.
-    #[must_use]
-    pub const fn proven_cells(&self) -> &Arc<ProvenCells> {
-        &self.counterparts.proven_cells
-    }
-
     /// Ask each silent counterpart what it holds, against the trie that
     /// says who was party to each transaction.
     fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        let trie = self.counterpart_trie(topology_schedule);
-        self.counterparts.probe(trie, self.committed_ts)
+        let Some(trie) = self.counterpart_trie(topology_schedule) else {
+            return Vec::new();
+        };
+        let wanted = self.wanted_records();
+        self.counterparts.probe(
+            trie,
+            self.committed_ts,
+            &wanted,
+            topology_schedule.windows(),
+        )
+    }
+
+    /// The crossing records consumers here wait on with no arrival for:
+    /// the candidates' filed requirements.
+    fn wanted_records(&self) -> Vec<WantedRecord> {
+        self.provisioning.wanted_records()
     }
 
     /// Keep a fetched proof for a block this validator proposes.
     pub fn on_proof_fetched(
         &mut self,
         anchor: Anchor,
-        keys: Vec<SubstateKey>,
-        proof: MerkleInclusionProof,
+        keys: &[SubstateKey],
+        proof: &MerkleInclusionProof,
+        values: &[ServedValue],
     ) {
-        self.counterparts.on_proof_fetched(anchor, keys, proof);
+        self.counterparts
+            .on_proof_fetched(anchor, keys, proof, values);
     }
 
     /// What this validator holds to offer in a block it proposes.
@@ -2624,16 +2690,117 @@ impl ExecutionCoordinator {
     pub fn on_committed_remote_header(
         &mut self,
         topology_schedule: &TopologySchedule,
-        source_shard: ShardId,
+        anchor: Anchor,
     ) -> Vec<Action> {
+        let source_shard = anchor.shard;
         if source_shard == self.local_shard {
             return vec![];
         }
         let mut actions = self.release(topology_schedule, Wake::Proof(source_shard));
+        // The pushed claims that waited on exactly this anchor re-enter
+        // where a fresh push would, against the anchor now proven.
+        let now = self.committed_ts;
+        for claim in self.parked_claims.release(source_shard, anchor.height) {
+            actions.extend(self.place_pushed_claim(topology_schedule, claim, now));
+        }
         // A counterpart's header past a leg's deadline is what a probe
         // of its committed set, or of its claim cell, waits on.
         actions.extend(self.probe_silent_counterparts(topology_schedule));
         actions
+    }
+
+    /// Re-place the early pushes whose keys `wanted` now names: a push
+    /// that ran ahead of its consumer's commit is offered once the
+    /// commit files the want.
+    fn release_early_pushes(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        wanted: &[WantedRecord],
+    ) -> Vec<Action> {
+        let keys: BTreeSet<SubstateKey> = wanted.iter().map(|record| record.key).collect();
+        let now = self.committed_ts;
+        self.parked_claims
+            .release_early(&keys)
+            .into_iter()
+            .flat_map(|claim| self.place_pushed_claim(topology_schedule, claim, now))
+            .collect()
+    }
+
+    /// Place a producer's pushed readings, each past ingress: offered
+    /// where its anchor is one this replica commit-proved, dropped where
+    /// the proven anchor differs, parked until the proof lands where
+    /// there is none yet.
+    pub fn on_crossing_readings(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        claims: Vec<StateClaim>,
+    ) -> Vec<Action> {
+        let now = self.committed_ts;
+        claims
+            .into_iter()
+            .flat_map(|claim| self.place_pushed_claim(topology_schedule, claim, now))
+            .collect()
+    }
+
+    fn place_pushed_claim(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        claim: StateClaim,
+        now: WeightedTimestamp,
+    ) -> Vec<Action> {
+        let anchor = claim.anchor;
+        if topology_schedule.recovery_fences(anchor.shard, anchor.height) {
+            record_crossing_push_dropped("fenced");
+            return vec![];
+        }
+        // Below the read frontier's floor every voter refuses it, and
+        // the fallback read covers a push lost or delayed past one
+        // producer block.
+        if self
+            .counterparts
+            .refuse_pushed(&claim, topology_schedule.windows())
+        {
+            record_crossing_push_dropped("below_floor");
+            return vec![];
+        }
+        match self
+            .counterparts
+            .proven_anchors
+            .at(anchor.shard, anchor.height)
+        {
+            Some(proven) if proven == anchor => {
+                let wanted = self.wanted_records();
+                if !self.counterparts.offer_pushed(&claim, &wanted, now)
+                    && let Err(reason) = self.parked_claims.hold_early(claim)
+                {
+                    record_crossing_push_dropped(reason);
+                }
+                vec![]
+            }
+            Some(_) => {
+                record_crossing_push_dropped("anchor_disagrees");
+                vec![]
+            }
+            None => {
+                if let Err(reason) = self.parked_claims.park(claim) {
+                    record_crossing_push_dropped(reason);
+                    return vec![];
+                }
+                // At or below the shard's attested boundary the header
+                // exists and is fetched; above it, it arrives on its own.
+                if topology_schedule
+                    .head()
+                    .boundary(anchor.shard)
+                    .is_some_and(|boundary| anchor.height <= boundary.height)
+                {
+                    return vec![Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                        source_shard: anchor.shard,
+                        block_height: anchor.height,
+                    })];
+                }
+                vec![]
+            }
+        }
     }
 
     /// Re-drive everything `wake` lets through, each by the handler it
@@ -2803,92 +2970,211 @@ impl ExecutionCoordinator {
     // Block Commit Handling
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle block committed.
+    /// Fold a committed block into execution: the one entry live commits,
+    /// block sync and the restart's replay all take.
     ///
-    /// Runs the variant-agnostic bookkeeping (height bump, timeout checks,
-    /// pruning), then dispatches to either `on_live_block_committed` —
-    /// which drives fresh execution — or `on_sealed_block_committed` —
-    /// which only records tx → tick mappings so late-arriving certs can
-    /// route back to the mempool.
+    /// The fold waits behind any commit whose anchored committee sits in
+    /// a window this node's beacon has not committed, and folds with it
+    /// once it lands, so the effects returned may carry earlier blocks'
+    /// ahead of this one's, or nothing. Each block's fold, in order:
     ///
-    /// Orchestration order matters. The phases below run in sequence and
-    /// depend on earlier phases completing first:
-    ///
-    /// 1. **Anchor time** — bump `committed_height` and `committed_ts`
-    ///    from the QC. Every downstream phase reads these.
-    /// 2. **First-commit retro-stamp** — entries buffered pre-first-commit
-    ///    carry `WeightedTimestamp::ZERO`; stamp them with the new
-    ///    `committed_ts` before timeout checks, otherwise
-    ///    `elapsed_since(ZERO)` dwarfs every deadline and triggers a
-    ///    fallback-fetch storm.
-    /// 3. **Timeout checks** — expected-cert fallbacks and vote retries.
-    ///    Read the freshly-bumped `committed_ts`.
-    /// 4. **Pruning** — resolved ticks, stale buffered ECs, aged
-    ///    conflict-detector provisions. Must follow timeouts so a retry
-    ///    fires before the tick it references is pruned away.
-    /// 5. **Dispatch** — route to the live or sealed path for block-specific
-    ///    work (tick setup + dispatch, or late-cert routing).
+    /// 1. **Resolutions** — what its finalizations settle, read off the
+    ///    ledger before anything releases the entries.
+    /// 2. **Release** — execution's own bookkeeping for those
+    ///    finalizations.
+    /// 3. **Anchor time** — bump `committed_height` and `committed_ts`
+    ///    from the header's parent QC; everything below reads them.
+    /// 4. **Terminal latch** — derived from the new tip before anything
+    ///    is seated.
+    /// 5. **Timeouts, then pruning**, so a retry fires before the tick it
+    ///    references is pruned away.
+    /// 6. **Seat, then dispatch** — both forms seat the tick the block
+    ///    names; only a live one within the store's reach dispatches it.
     #[instrument(skip(self, certified, topology_schedule), fields(
         height = certified.block().height().inner(),
         block_hash = ?certified.block().hash(),
         tx_count = certified.block().transactions().len(),
         is_live = certified.block().is_live(),
     ))]
-    pub fn on_block_committed(
+    pub fn commit_block(
         &mut self,
         topology_schedule: &TopologySchedule,
         certified: &CertifiedBlock,
-    ) -> Vec<Action> {
+        committee_anchor: WeightedTimestamp,
+    ) -> CommitEffects {
+        self.commit_named(
+            topology_schedule,
+            certified,
+            committee_anchor,
+            Naming::Manifest,
+        )
+    }
+
+    /// [`Self::commit_block`] seating the members this node's own
+    /// committed inputs name, in place of the block's manifest: what a
+    /// fixture whose blocks name nothing commits through, standing in
+    /// for a proposer whose inputs are this node's.
+    pub fn commit_block_composing(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        certified: &CertifiedBlock,
+        committee_anchor: WeightedTimestamp,
+    ) -> CommitEffects {
+        self.commit_named(
+            topology_schedule,
+            certified,
+            committee_anchor,
+            Naming::Composed,
+        )
+    }
+
+    fn commit_named(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        certified: &CertifiedBlock,
+        committee_anchor: WeightedTimestamp,
+        naming: Naming,
+    ) -> CommitEffects {
+        self.awaiting_window
+            .push_back((certified.clone(), committee_anchor, naming));
+        self.drain_awaiting_window(topology_schedule)
+    }
+
+    /// Fold the commits waiting on their windows, oldest first, for as
+    /// long as each one's anchored committee resolves. A commit whose
+    /// window this node's beacon has not committed stays at the front,
+    /// and every later one queues behind it, so the fold still runs in
+    /// commit order.
+    fn drain_awaiting_window(&mut self, topology_schedule: &TopologySchedule) -> CommitEffects {
+        let mut effects = CommitEffects::default();
+        while let Some((certified, committee_anchor, _)) = self.awaiting_window.front() {
+            let own_anchor = certified.block().header().parent_qc().weighted_timestamp();
+            let Some(anchored) =
+                self.anchored_committee(topology_schedule, *committee_anchor, own_anchor)
+            else {
+                break;
+            };
+            let (certified, committee_anchor, naming) = self
+                .awaiting_window
+                .pop_front()
+                .expect("the front was just read");
+            effects.absorb(self.commit_anchored(
+                topology_schedule,
+                anchored,
+                &certified,
+                committee_anchor,
+                naming,
+            ));
+        }
+        effects
+    }
+
+    /// [`Self::commit_block`] with the committee anchor carried from
+    /// the commit before: the previous block's own anchor where the chain
+    /// is contiguous, the block's own anchor across a gap. The restart's
+    /// replay commits this way, since no event carries its anchors.
+    ///
+    /// "First commit" means the chain has never committed, not that the
+    /// clock reads zero: a root chain's first blocks genuinely anchor at
+    /// zero, and their zero is a carriable parent anchor, not a gap.
+    fn commit_block_carrying(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        certified: &CertifiedBlock,
+        naming: Naming,
+    ) -> CommitEffects {
+        let height = certified.block().height();
+        let first_commit = self.committed_height == BlockHeight::GENESIS
+            && self.committed_ts == WeightedTimestamp::ZERO;
+        let committee_anchor = if !first_commit && height == self.committed_height.next() {
+            self.committed_ts
+        } else {
+            certified.block().header().parent_qc().weighted_timestamp()
+        };
+        self.commit_named(topology_schedule, certified, committee_anchor, naming)
+    }
+
+    /// One commit's fold, under the committee its anchor resolved.
+    #[allow(clippy::too_many_lines)] // sequential orchestration of one commit's fold
+    fn commit_anchored(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        anchored: &TopologySnapshot,
+        certified: &CertifiedBlock,
+        committee_anchor: WeightedTimestamp,
+        naming: Naming,
+    ) -> CommitEffects {
         let block = certified.block();
         let height = block.height();
+
+        // What the block's finalizations settle about the transactions
+        // they name is the ledger's reading — a name that decides nothing
+        // is a leg finalizing here, a deciding success on a leg entry is
+        // the reclaim — taken before the same block releases the entries.
+        let resolutions = self
+            .counterparts
+            .ledger
+            .resolutions_of(block.certificates());
+        for fw in block.certificates().iter() {
+            // No-op for synced ticks never aggregated here.
+            self.remove_finalization(fw.as_unverified());
+        }
 
         // Update committed height + timestamp before anything else — needed
         // for timeout calculations and pruning even when there are no new
         // transactions.
-        //
-        // "First commit" means the chain has never committed, not that the
-        // clock reads zero: a root chain's first blocks genuinely anchor at
-        // zero, and their zero is a carriable parent anchor, not a gap.
-        let first_commit = self.committed_height == BlockHeight::GENESIS
-            && self.committed_ts == WeightedTimestamp::ZERO;
         if height > self.committed_height {
-            let own_anchor = certified.block().header().parent_qc().weighted_timestamp();
-            // This block's committee anchors on its parent, whose anchor is
-            // the one the previous commit carried — or the recovered frontier
-            // seeded at construction, which is the same value across a
-            // restart. Contiguity is what makes the carry exact — across a
-            // gap (a fresh chain's first commit, or a commit landing above a
-            // hole) there is no parent anchor to inherit, so the block's own
-            // stands in: the same window except when the gap ends on an
-            // epoch's first block, and exact again at the next commit. A
-            // fresh chain is exact too: its genesis QC carries the chain
-            // origin's anchor, which *is* the parent anchor of block one.
-            self.committed_committee_anchor_wt =
-                if !first_commit && height == self.committed_height.next() {
-                    self.committed_ts
-                } else {
-                    own_anchor
-                };
+            self.committed_committee_anchor_wt = committee_anchor;
             self.committed_height = height;
-            self.committed_ts = own_anchor;
+            self.committed_ts = block.header().parent_qc().weighted_timestamp();
         }
+        // Read off the tip header's parent QC, which the header's hash
+        // pins, and never off the block's own certifying QC, whose
+        // timestamp a relay can rewrite. So it flips at the quiescence
+        // commit, whose parent QC certifies the terminal block, and
+        // before that commit seats.
+        let terminal = !self.terminated
+            && topology_schedule.past_terminal(self.local_shard, self.committed_ts);
+        let mut actions = if terminal {
+            self.terminate()
+        } else {
+            Vec::new()
+        };
         self.provisioning.advance_clock(self.committed_ts);
+        self.parked_claims.retire_below(self.committed_ts);
         self.sweep_candidates();
         // What the block says about counterparts, and what it opens to
         // ask them; the strands no counterpart can answer for any more
         // are let go of below.
-        let trie = self.counterpart_trie(topology_schedule);
+        let trie = anchored.shard_trie();
+        let wanted = self.wanted_records();
+        actions.extend(self.release_early_pushes(topology_schedule, &wanted));
         let committed =
             self.counterparts
-                .on_commit(trie, topology_schedule, block, self.committed_ts);
-        let mut actions = committed.actions;
-        self.release_unanswerable(&committed.unanswerable);
+                .on_commit(trie, topology_schedule, block, self.committed_ts, &wanted);
+        actions.extend(committed.actions);
+        // The leg entries the fold closed, for the mempool: no
+        // finalization names them, so this is where their acceptance is
+        // reported.
+        if !committed.settled.is_empty() {
+            actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
+                resolutions: committed.settled,
+            }));
+        }
+        let unanswerable = committed.unanswerable;
+        let recovered = if naming == Naming::Composed {
+            self.recovered_ticks(topology_schedule, certified)
+        } else {
+            Vec::new()
+        };
+        for entry in &unanswerable {
+            record_unanswerable(entry.covered_by_record);
+        }
 
         // Timeout checks + pruning run every block, not just commits that
         // carry txs.
         actions.extend(self.check_exec_cert_timeouts());
         actions.extend(self.check_vote_retry_timeouts(topology_schedule));
-        self.release_wedged_ticks(topology_schedule, certified);
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         // Re-check gate-held finalizations against the advanced schedule:
@@ -2915,9 +3201,18 @@ impl ExecutionCoordinator {
 
         // Tick fates the block's committed certificates decide. Emitted
         // ahead of the block-specific work, so a tick dispatched below
-        // reads the resolved chain.
+        // reads the resolved chain. A held tick never ran here, so what
+        // its half left is seated from the receipts that settled it, at
+        // or above where the store reaches; below it the base carries it.
+        let mut restored: Vec<(TickId, TickResolution)> = Vec::new();
         for fw in block.certificates().iter() {
             let fw = fw.as_unverified();
+            if self.held.contains(fw.tick_id()) && height >= self.dispatch_from {
+                let writes = receipt_writes(fw);
+                if !writes.is_empty() {
+                    restored.push((*fw.tick_id(), TickResolution::Restored { height, writes }));
+                }
+            }
             let aborted: BTreeSet<TxHash> = fw
                 .tx_decisions()
                 .into_iter()
@@ -2936,70 +3231,65 @@ impl ExecutionCoordinator {
                 },
             );
         }
+        if !restored.is_empty() {
+            actions.push(Action::ResolveTicks {
+                resolutions: restored,
+            });
+        }
+        let ticks = &self.ticks;
+        self.held.retain(|tick_id| ticks.contains_tick(tick_id));
         actions.extend(self.drain_ready_tick_resolutions());
 
-        match block {
-            Block::Live {
-                header,
-                transactions,
-                certificates,
-                provisions,
-                ..
-            } => actions.extend(self.on_live_block_committed(
-                topology_schedule,
-                block.hash(),
-                header,
-                transactions,
-                certificates,
-                provisions,
-            )),
-            Block::Sealed {
-                header,
-                transactions,
-                ..
-            } => actions.extend(self.on_sealed_block_committed(
-                topology_schedule,
-                header,
-                transactions,
-            )),
-        }
+        let mut named = Vec::new();
+        actions.extend(self.on_block_committed(
+            &mut named,
+            topology_schedule,
+            anchored,
+            block,
+            match naming {
+                Naming::Manifest => Named::Lines(block.tick_manifest()),
+                Naming::Composed => Named::Composed {
+                    unanswerable: &unanswerable,
+                    recovered: &recovered,
+                },
+            },
+        ));
 
-        actions
+        CommitEffects {
+            resolutions,
+            actions,
+            terminal,
+            named,
+        }
     }
 
-    /// Live path: still within the cross-shard execution window. Proposer
-    /// broadcasts provisions, setup+dispatch runs for the block's txs, and
-    /// inline provisions are applied so newly-created ticks can transition
-    /// to `Provisioned` immediately.
-    fn on_live_block_committed(
+    /// What this commit sends out: the provisions its proposer
+    /// broadcasts, the crossing readings the parent's commit made go with
+    /// it, and the pushes queued for the next. Nothing on a block this
+    /// replica cannot run.
+    fn pushes(
         &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        header: &BlockHeader,
-        transactions: &[Arc<Verifiable<Transaction>>],
-        certificates: &[Arc<Verifiable<Finalization>>],
-        provisions: &[Arc<Verifiable<Provisions>>],
+        anchored: &TopologySnapshot,
+        committed: &Block,
+        runnable: bool,
     ) -> Vec<Action> {
+        let block_hash = committed.hash();
+        let header = committed.header();
+        let transactions = committed.transactions();
+        let finalizations = committed.certificates();
         let height = header.height();
-        let mut actions = Vec::new();
-
-        // Classification anchors on the block's committee, not the head, so
-        // every replica groups its ticks and provisions identically across a
-        // reshape boundary.
-        let anchored =
-            self.classification_committee(topology_schedule, self.committed_committee_anchor_wt);
-
-        // Below where a baseline is readable a tick composes and never
-        // runs: which tick holds a member is what every replica has to
-        // agree on, and the baseline is the only part of it the store
-        // cannot answer for.
-        let runnable = height >= self.compose_from;
-
         // ── Provision broadcasting (proposer only) ─────────────────────
+        // The crossing changes the parent block made go with it: this
+        // block's certified header is what proves the parent to a
+        // reader, and its proposer sends both. Taken whether or not this
+        // replica proposes, so nothing older than one commit is ever
+        // pushed.
+        let mut actions = Vec::new();
+        let pending_push = self.pending_push.take();
         if runnable && self.me == header.proposer() {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(anchored, transactions, certificates, self.me, local_shard)
+                build_provision_requests(anchored, transactions, self.me, local_shard)
             {
                 actions.push(Action::FetchAndBroadcastProvisions {
                     block_hash,
@@ -3010,12 +3300,87 @@ impl ExecutionCoordinator {
                     shard_recipients,
                 });
             }
+            if let Some((parent_hash, anchor, mut targets)) = pending_push {
+                // The owed records still standing whose consumers have
+                // not credited them, pushed again at the parent's view,
+                // where each record still stands.
+                for (target, records) in self.counterparts.owed_repushes(
+                    anchored.shard_trie(),
+                    self.committed_ts,
+                    anchor.height,
+                ) {
+                    let keys = targets.entry(target).or_default();
+                    keys.extend(records);
+                    keys.sort_unstable();
+                    keys.dedup();
+                }
+                let shard_recipients = targets
+                    .keys()
+                    .map(|&target| (target, anchored.committee_for_shard(target).to_vec()))
+                    .collect();
+                actions.push(Action::PushCrossingReadings {
+                    block_hash: parent_hash,
+                    anchor,
+                    targets,
+                    shard_recipients,
+                });
+            }
         }
+        // Every live block is pushed for, whether or not it wrote a
+        // record: the answers it wrote and the records it removed are
+        // the handler's to find, off the block and its parent.
+        if runnable {
+            let targets = record_pushes(finalizations, anchored.shard_trie(), self.local_shard);
+            let anchor = Anchor {
+                shard: self.local_shard,
+                height,
+                state_root: header.state_root(),
+                ts: header.parent_qc().weighted_timestamp(),
+            };
+            self.pending_push = Some((block_hash, anchor, targets));
+        }
+        actions
+    }
+
+    /// One commit path for both block forms: register what the block
+    /// commits, apply the bundles it carries, and seat the tick it names.
+    ///
+    /// A `Sealed` block is seated exactly as a `Live` one is, since both
+    /// keep the transactions, the claims, the records and the manifest
+    /// seating reads, but its tick is never dispatched: it carries no
+    /// bundles to run a cross-shard member over, and its proposer's pushes
+    /// went out when it was live.
+    fn on_block_committed(
+        &mut self,
+        seated: &mut Vec<TickLine>,
+        topology_schedule: &TopologySchedule,
+        anchored: &TopologySnapshot,
+        committed: &Block,
+        named: Named<'_>,
+    ) -> Vec<Action> {
+        let block_hash = committed.hash();
+        let header = committed.header();
+        let transactions = committed.transactions();
+        let provisions = committed.provisions();
+        let state_claims = committed.state_claims();
+        let abandonment_records = committed.abandonment_records();
+        let height = header.height();
+        let mut actions = Vec::new();
+
+        // Below where a baseline is readable, or on a sealed block with
+        // no bundles to run over, a tick is seated and never runs: which
+        // tick holds a member is what every replica has to agree on, and
+        // the baseline and the bundles are what this replica may not
+        // hold.
+        let runnable = committed.is_live() && height >= self.dispatch_from;
+
+        actions.extend(self.pushes(anchored, committed, runnable));
 
         let block = CommittingBlock {
             hash: block_hash,
             height,
             ts: self.committed_ts,
+            licensed: reclaim_licences(state_claims, abandonment_records, self.local_shard),
         };
 
         // Everything this commit puts in flight or unblocks, before
@@ -3024,25 +3389,19 @@ impl ExecutionCoordinator {
         if !transactions.is_empty() {
             self.register_committed_txs(anchored, &block, transactions);
         }
+        // After the block's transactions are registered, so a record
+        // read in a transaction's own block is its arrival.
+        self.provisioning.fold_record_readings(state_claims);
         if !provisions.is_empty() {
             self.apply_committed_provisions(provisions);
         }
-        // Every commit, not only one carrying provisions: a bundle that
-        // committed before its transaction did is evidence already in
-        // hand, and a payer whose wait only ever cleared on a later
-        // bundle would never execute.
-        self.candidates
-            .absorb_engagement_evidence(&self.provisioning);
-
-        // What earlier ticks hold provisionally, and the set this commit's
-        // own composition adds to. A terminated chain composes nothing:
-        // no later block of it can carry a finalization, so a tick it
-        // composed could never reach a verdict.
-        let mut held = self.provisional_cells();
+        // A terminated chain seats nothing: no later block of it can
+        // carry a finalization, so a tick it seated could never reach a
+        // verdict.
         let (pending, early_votes, members) = if self.terminated {
             (None, Vec::new(), Vec::new())
         } else {
-            self.compose_tick(topology_schedule, block, &mut held)
+            self.seat_tick(topology_schedule, anchored, &block, named, seated)
         };
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology_schedule, vote));
@@ -3054,23 +3413,27 @@ impl ExecutionCoordinator {
             actions.extend(self.replay_early_attestations(topology_schedule, &members));
         }
         if let Some(pending) = pending {
-            if runnable {
+            if runnable && pending.in_hand {
                 tracing::debug!(
                     height = height.inner(),
                     members = pending.requests.len(),
                     "Dispatching this commit's tick"
                 );
-                self.pending_ticks.push_back(pending);
+                self.pending_ticks.push_back(Queued::Run(pending));
             } else {
+                let tick_id = TickId::new(self.local_shard, height);
                 tracing::debug!(
                     height = height.inner(),
                     members = pending.requests.len(),
-                    "Composed a tick the store can no longer anchor a baseline for"
+                    in_hand = pending.in_hand,
+                    "Seated a tick this node cannot run; holding dispatch behind it"
                 );
+                self.held.insert(tick_id);
+                self.pending_ticks.push_back(Queued::Held(tick_id));
             }
         }
-        // What composition abandoned, before the tick it composed reads
-        // the chain: a discarded tick's legs hold cells this one may
+        // What seating abandoned, before the tick it seated reads the
+        // chain: a discarded tick's legs hold cells this one may
         // need, and nothing else is coming to release them.
         actions.extend(self.drain_ready_tick_resolutions());
         actions.extend(self.dispatch_next_tick());
@@ -3162,133 +3525,160 @@ impl ExecutionCoordinator {
             .ledger
             .past_deadline(self.committed_ts)
             .into_iter()
+            // A candidate still waiting for a tick is the manifest's to
+            // abort.
+            .filter(|entry| !self.candidates.contains(entry.tx_hash))
             .filter(|entry| self.beyond_every_shard(composing, entry.tx_hash))
             .collect()
     }
 
-    /// Release every tick still owing a determined half it can no longer
-    /// deliver.
+    /// The ticks a halt recovery discards at this commit, as a fixture
+    /// names them in place of a proposer: every tick at or below the
+    /// recovery's attested frontier, on the first commit the fresh
+    /// committee certified.
     ///
-    /// Admission refuses a determined half that settles past a tick whose
-    /// own half the chain still owes, so a tick that never reaches its
-    /// certificate stops the shard settling anything at all: later halves
-    /// are built and offered and refused for good, and the members they
-    /// name stay committed and never finalized until their deadlines
-    /// abandon them. [`admit_abandoned`](Self::admit_abandoned) already
-    /// discards a tick holding an abandoned member, but a tick whose
-    /// members are not yet abandonable is not reached that way, and
-    /// nothing else releases it.
-    ///
-    /// Discarding is what the tick's own state has already established:
-    /// past [`TICK_SETTLEABLE_SPAN`] it can settle nothing, so the
-    /// members go to the deadline path, which is where a transaction
-    /// nothing can settle belongs. The order rule is untouched — a
-    /// discarded tick produces no half to invert against.
-    ///
-    /// Releasing lets go of holds the composition below reads, so it has
-    /// to fire on the same commit everywhere. The span reads committed
-    /// stamps alone. The replacement reads the recovery record, which
-    /// replicas fold at their own pace against their shard commits — a
-    /// fresh member replays the harvested tail with it folded, the
-    /// retained members committed those blocks live without it — so it
-    /// is gated on the committing block being one the fresh committee
-    /// certified: that is committed content, and no replica commits such
-    /// a block before folding the record that resolves its committee.
-    /// Every replica then releases at the first fresh block, and none on
-    /// the tail. Released is only what no fresh quorum can hold — a tick
-    /// at or below the recovery's attested frontier. A tail tick above
-    /// it is the fresh committee's to attest and waits on its
-    /// certificate like any live tick, with the span as its backstop.
-    ///
-    /// [`TICK_SETTLEABLE_SPAN`]: crate::tick_state::TICK_SETTLEABLE_SPAN
-    fn release_wedged_ticks(
-        &mut self,
+    /// No fresh quorum can hold such a tick: the replaced members no
+    /// longer serve the shard, and the fresh members snap-synced past its
+    /// block without executing it. A tail tick above the frontier is the
+    /// fresh committee's to attest and waits on its certificate like any
+    /// live tick.
+    fn recovered_ticks(
+        &self,
         topology_schedule: &TopologySchedule,
         certified: &CertifiedBlock,
-    ) {
-        let committed_ts = self.committed_ts;
+    ) -> Vec<TickId> {
         let local_shard = self.local_shard;
-        let fresh_certified = !topology_schedule.committee_replaced_for_certified(
+        if topology_schedule.committee_replaced_for_certified(
             local_shard,
             self.committed_committee_anchor_wt,
             certified.qc().weighted_timestamp(),
-        );
-        let wedged: Vec<TickId> = self
-            .ticks
+        ) {
+            return Vec::new();
+        }
+        self.ticks
             .ticks_iter()
             .filter(|(tick_id, tick)| {
-                let replaced = fresh_certified
-                    && topology_schedule.committee_replaced_for_anchored(
-                        local_shard,
-                        tick.anchor(),
-                        tick_id.block_height(),
-                    );
-                tick.owes_undeliverable_determined(committed_ts, replaced)
+                topology_schedule.committee_replaced_for_anchored(
+                    local_shard,
+                    tick.anchor(),
+                    tick_id.block_height(),
+                )
             })
             .map(|(tick_id, _)| *tick_id)
-            .collect();
-        for tick_id in wedged {
-            // What the tally saw is the whole diagnosis: split roots are
-            // replicas that executed the tick differently, and power under
-            // quorum on one root is votes that never arrived. Reported
-            // here because this is the only place that knows a tick has
-            // run out of time to certify.
-            let tally = self.ticks.get_tracker(&tick_id);
-            tracing::warn!(
+            .collect()
+    }
+
+    /// Discard a tick a committed `Recovery` line names, whole: every
+    /// member goes to the deadline path, a `Shared` one included, since
+    /// no fresh quorum can hold the certificate a counterpart would
+    /// settle it against.
+    fn discard_recovered(&mut self, tick_id: TickId) {
+        // What the tally saw is the whole diagnosis: split roots are
+        // replicas that executed the tick differently, and power under
+        // quorum on one root is votes that never arrived.
+        let tally = self.ticks.get_tracker(&tick_id);
+        tracing::warn!(
+            tick = %tick_id,
+            tallied_here = tally.is_some(),
+            distinct_receipt_roots =
+                tally.map_or(0, VoteTracker::distinct_global_receipt_root_count),
+            verified_power = tally.map_or(0, |tracker| tracker.total_verified_power().inner()),
+            "Discarding a tick a halt recovery left no quorum to certify"
+        );
+        let released: Vec<TxHash> = self
+            .ticks
+            .get_tick(&tick_id)
+            .map_or_else(Vec::new, |tick| tick.tx_hashes().to_vec());
+        self.ticks.discard_tick(&tick_id);
+        self.release_chain_holds(tick_id, &released, true);
+        self.finalized.remove_tick(&tick_id);
+        self.exec_certs.evict(&tick_id);
+        let height = tick_id.block_height();
+        self.pending_ticks
+            .retain(|queued| !matches!(queued, Queued::Run(pending) if pending.tick == height));
+    }
+
+    /// Release a tick that can no longer speak for `abandoned`, or for
+    /// the determined half it owes: every member sharing no verdict with
+    /// a counterpart goes to its own deadline, and `abandoned` goes
+    /// whatever it shares. A member whose verdict a counterpart shares
+    /// stays, with the tick, its certificate and its assignment: the
+    /// counterpart settles it against that certificate, which outlives
+    /// the tick, and dropped here nothing would settle it and — its
+    /// entry certified — nothing could abandon it.
+    ///
+    /// Nothing kept: the tick, both its finalizations and its
+    /// certificate all go. A proposer offering a finalization for a
+    /// member abandoned here would be refused by every voter, and would
+    /// keep offering it; a certificate left in the cache is answered to
+    /// a counterpart asking by transaction, for a verdict this shard has
+    /// retracted and beside the abort that replaced it.
+    ///
+    /// Something kept: the tick stays and so does its certificate, since
+    /// a sibling settles against it. Its legs half is composed again on
+    /// the kept legs — one taken before names a released member, which
+    /// every voter would refuse, so it is evicted — and its determined
+    /// half is untouched, emitted or pending: it releases no claim, and
+    /// its writes are readable from the append.
+    ///
+    /// Which members stay is read off committed membership alone, never
+    /// off whether this replica has handed its own certificate off, so
+    /// every replica releases the same set on the same commit.
+    fn release_tick(&mut self, tick_id: TickId, abandoned: Option<TxHash>) {
+        let (released, kept) = self
+            .ticks
+            .get_tick_mut(&tick_id)
+            .map_or_else(|| (Vec::new(), Vec::new()), |tick| tick.release(abandoned));
+        let counts = self.ticks.release_tick(&tick_id, &kept);
+        self.release_chain_holds(tick_id, &released, kept.is_empty());
+        if kept.is_empty() {
+            self.finalized.remove_tick(&tick_id);
+            self.exec_certs.evict(&tick_id);
+            tracing::info!(
                 tick = %tick_id,
-                tallied_here = tally.is_some(),
-                distinct_receipt_roots =
-                    tally.map_or(0, VoteTracker::distinct_global_receipt_root_count),
-                verified_power = tally
-                    .map_or(0, |tracker| tracker.total_verified_power().inner()),
-                "Releasing a tick that never certified — it was holding the settlement frontier"
+                released = counts.assignments,
+                "Released a tick holding nothing a counterpart can settle"
             );
-            self.discard_tick(tick_id);
+        } else {
+            self.finalized.remove_half(&tick_id, TickHalf::Legs);
+            tracing::info!(
+                tick = %tick_id,
+                released = counts.assignments,
+                kept = kept.len(),
+                "Released a tick's members, keeping those a counterpart can settle"
+            );
         }
     }
 
-    /// Drop a tick that can no longer speak for a member being abandoned,
-    /// releasing the transactions it holds to their own deadlines and the
-    /// cells its legs held against.
-    fn discard_tick(&mut self, tick_id: TickId) {
-        let counts = self.ticks.discard_tick(&tick_id);
-        self.release_chain_holds(tick_id);
-        // Its finalization goes with it: a proposer offering one for a
-        // member abandoned here would be refused by every voter, and
-        // would keep offering it.
-        self.finalized.remove_tick(&tick_id);
-        // And its certificate, which no finalization of this shard's will
-        // ever commit. Left in the cache it is answered to a counterpart
-        // asking by transaction, for a verdict this shard has retracted
-        // and beside the abort that replaced it.
-        self.exec_certs.evict(&tick_id);
-        tracing::info!(
-            tick = %tick_id,
-            released = counts.assignments,
-            "Discarded a tick holding an abandoned member"
-        );
-    }
-
-    /// Tell the chain a tick's legs reach no verdict, so what they hold
-    /// against the cells they declared is let go of.
+    /// Tell the chain a tick's `released` legs reach no verdict, so what
+    /// they hold against the cells they declared is let go of; `whole`
+    /// releases every leg the tick holds, and drops the entry if it
+    /// holds none.
     ///
     /// A leg's reservation stands on the chain until its tick's fate
     /// resolves it, and every later tick's reader takes it as value
-    /// already spoken for. A tick that has stopped speaking for its
-    /// members reaches no fate, so nothing else would ever release it:
+    /// already spoken for. A tick that has stopped speaking for a member
+    /// reaches no fate for it, so nothing else would ever release it:
     /// the payer's cells stay locked on every replica that ran the tick,
     /// the entry never evicts, and a replica that rebuilt the chain
     /// without the hold reads a different overlay from the same chain.
-    fn release_chain_holds(&mut self, tick_id: TickId) {
-        let Some(members) = self
-            .ticked
-            .get(&tick_id)
-            .map(|ticked| ticked.legs.clone())
-            .filter(|legs| !legs.is_empty())
-        else {
-            self.ticked.remove(&tick_id);
+    /// A kept leg's claims stay for its own settlement to clear.
+    fn release_chain_holds(&mut self, tick_id: TickId, released: &[TxHash], whole: bool) {
+        let Some(ticked) = self.ticked.get(&tick_id) else {
             return;
         };
+        let members: BTreeSet<TxHash> = ticked
+            .legs
+            .iter()
+            .copied()
+            .filter(|leg| whole || released.contains(leg))
+            .collect();
+        if members.is_empty() {
+            if whole {
+                self.ticked.remove(&tick_id);
+            }
+            return;
+        }
         self.record_tick_resolution(&tick_id, TickResolution::Abandoned { members });
     }
 
@@ -3340,21 +3730,20 @@ impl ExecutionCoordinator {
                 if held_by.is_some_and(|tick| tick.abandons(tx_hash)) {
                     return false;
                 }
-                // Two fences refuse the finalization a tick is waiting to
-                // commit, and past either the tick has nothing left to
-                // say: a delivery's is refused at the lapse, and a
-                // success that decides alone at the deadline. Left to,
-                // such a tick holds a member nothing can resolve while
-                // every proposer offers a finalization every voter
-                // refuses. Which clock each runs on is already applied —
-                // an entry reaches here only past its own abandon
-                // window's opening.
-                self.counterparts.ledger.is_covered(tx_hash)
-                    || self.counterparts.ledger.is_delivery(tx_hash)
-                    || held_by.is_some_and(|tick| tick.decided_alone(tx_hash))
+                // Which clock it runs on is already applied: an entry
+                // reaches here only past its own abandon window's
+                // opening. A departure is the only covering a held member
+                // can have: a leg's readings license its reclaim, and a
+                // core member runs only once every sibling's committed
+                // bundle names it, so a sibling's absence reaches only one
+                // no tick took.
+                self.counterparts.ledger.departed(tx_hash)
             }
+            // An entry no execution of ours took is re-offered once its
+            // tick is gone: it spends nothing to abort at any age, and
+            // its only exit is an abandonment's committed finalization.
             None => {
-                !self.counterparts.ledger.is_certified(tx_hash)
+                !self.counterparts.ledger.executed(tx_hash)
                     || self.no_counterpart_can_settle(tx_hash)
             }
         }
@@ -3369,8 +3758,10 @@ impl ExecutionCoordinator {
             || self.counterparts.ledger.is_covered(tx_hash)
     }
 
-    /// Let go of what this shard holds against transactions no shard can
-    /// settle any more.
+    /// Let go of what this shard holds against a transaction no shard
+    /// can settle any more, on the committed line that names it: its
+    /// ledger entry goes with no outcome, and the tick holding it is
+    /// released.
     ///
     /// Every counterpart has left and every settled set that could have
     /// spoken for them has stopped reading, so the tick holding one will
@@ -3389,24 +3780,19 @@ impl ExecutionCoordinator {
     /// Each of these is also a reservation the drain never gets back —
     /// only a committed certificate returns one, and by here none is
     /// coming. Counted by cause, because the drain's baseline rises with
-    /// them and a shard that accumulates enough admits nothing at all.
-    fn release_unanswerable(&mut self, unanswerable: &[Unanswerable]) {
-        for entry in unanswerable {
-            record_unresolvable_tx(if entry.covered_by_record {
-                "record_covered"
-            } else {
-                "no_record"
-            });
-            if let Some(tick_id) = self.ticks.tick_assignment(entry.tx_hash) {
-                tracing::info!(
-                    tx = %entry.tx_hash,
-                    tick = %tick_id,
-                    covered_by_record = entry.covered_by_record,
-                    "Releasing a strand whose counterparts have all fallen silent"
-                );
-                self.discard_tick(tick_id);
-            }
+    /// them and a shard that accumulates enough admits nothing at all;
+    /// the ledger may drop the entry first, and counts it there.
+    fn drop_unanswerable(&mut self, tick_id: TickId, tx_hash: TxHash) {
+        if self.counterparts.ledger.contains(tx_hash) {
+            record_unanswerable(self.counterparts.ledger.departed(tx_hash));
+            self.counterparts.ledger.forget(tx_hash);
         }
+        tracing::info!(
+            tx = %tx_hash,
+            tick = %tick_id,
+            "Releasing a strand whose counterparts have all fallen silent"
+        );
+        self.release_tick(tick_id, Some(tx_hash));
     }
 
     /// Record a tick's fate for the tick chain.
@@ -3428,12 +3814,14 @@ impl ExecutionCoordinator {
         //
         // Only the half carrying the legs clears them. A determined
         // member holds no cell — its writes are readable from the append
-        // — so its own half settling releases nothing.
+        // — so its own half settling releases nothing. A resolution
+        // naming some of the legs clears theirs and leaves the rest to
+        // their own: a release lets go of the released legs' holds while
+        // the kept legs' later settlement still finds the entry.
         let releases_claims = match &resolution {
-            TickResolution::Settled { members, .. } => {
+            TickResolution::Settled { members, .. } | TickResolution::Abandoned { members } => {
                 ticked.legs.iter().all(|leg| members.contains(leg))
             }
-            TickResolution::Abandoned { .. } => true,
             // Never reaches here: a restore is emitted for a tick this
             // coordinator holds no claims for, and only the replay emits
             // one at all.
@@ -3441,6 +3829,10 @@ impl ExecutionCoordinator {
         };
         if releases_claims {
             self.ticked.remove(tick_id);
+        } else if let (TickResolution::Abandoned { members }, Some(ticked)) =
+            (&resolution, self.ticked.get_mut(tick_id))
+        {
+            ticked.legs.retain(|leg| !members.contains(leg));
         }
         self.pending_tick_resolutions
             .push((*tick_id, tick_id.block_height(), resolution));
@@ -3474,14 +3866,26 @@ impl ExecutionCoordinator {
         if self.tick_in_flight {
             return Vec::new();
         }
-        let Some(head) = self.pending_ticks.front() else {
+        // A held tick blocks until its determined half has settled: its
+        // readable writes are in the chain then, seated from the receipts.
+        while let Some(Queued::Held(tick_id)) = self.pending_ticks.front() {
+            if self
+                .ticks
+                .get_tick(tick_id)
+                .is_some_and(TickState::determined_unsettled)
+            {
+                return Vec::new();
+            }
+            self.pending_ticks.pop_front();
+        }
+        let Some(Queued::Run(head)) = self.pending_ticks.front() else {
             return Vec::new();
         };
         // Running a member whose code this node lacks would reach the
         // engine's no-code refusal while every replica holding the bytes
         // settles it — one tick, two receipt roots. Waiting is the whole
         // of the fix: the fetch heals, and the tick that runs then is the
-        // tick that was composed now. Ticks are serial, so this shard's
+        // tick that was seated now. Ticks are serial, so this shard's
         // execution stops here until the bytes land — the trade a
         // withheld artifact is meant to draw, liveness rather than a
         // fork.
@@ -3489,7 +3893,7 @@ impl ExecutionCoordinator {
         // Asked of the engine rather than read off a set kept in step
         // with it. A set has to be seeded, and a shard seated mid-epoch
         // is handed ticks before anything has seeded it; asking leaves
-        // nothing to seed. The next commit composes and dispatches
+        // nothing to seed. The next commit seats and dispatches
         // again, which is what retries a tick held here.
         if !head.runnable(self.code.as_ref()) {
             tracing::debug!(
@@ -3499,7 +3903,7 @@ impl ExecutionCoordinator {
             );
             return Vec::new();
         }
-        let Some(tick) = self.pending_ticks.pop_front() else {
+        let Some(Queued::Run(tick)) = self.pending_ticks.pop_front() else {
             return Vec::new();
         };
         self.tick_in_flight = true;
@@ -3511,36 +3915,14 @@ impl ExecutionCoordinator {
         }]
     }
 
-    /// Sealed path: past the cross-shard execution window. Ticks will
-    /// finalize from the already-aggregated cert + receipts included
-    /// downstream, so we skip `TickState` creation, dispatch, and vote
-    /// tracking. Only the tx → tick mapping is recorded (plus any early
-    /// ECs replayed) so a late-arriving cert still routes back to each
-    /// tx for mempool terminal-state bookkeeping.
-    fn on_sealed_block_committed(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        header: &BlockHeader,
-        transactions: &[Arc<Verifiable<Transaction>>],
-    ) -> Vec<Action> {
-        if transactions.is_empty() {
-            return Vec::new();
-        }
-        let anchored =
-            self.classification_committee(topology_schedule, self.committed_committee_anchor_wt);
-        self.register_sealed_assignments(anchored, header.height(), transactions);
-        let tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
-        self.replay_early_attestations(topology_schedule, &tx_hashes)
-    }
-
     /// Replay buffered certificates for transactions that have just
     /// gained a tick assignment.
     ///
     /// Driven by assignment rather than by commit, because those are no
     /// longer the same moment: a member waits in the candidate pool until
     /// a tick can take it, and a counterpart's certificate arriving in
-    /// that window has nowhere to route. Composition is what gives it
-    /// one, so composition is what replays.
+    /// that window has nowhere to route. Seating is what gives it one,
+    /// so seating is what replays.
     fn replay_early_attestations(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -3559,36 +3941,6 @@ impl ExecutionCoordinator {
             actions.extend(self.handle_attestation(topology_schedule, ec));
         }
         actions
-    }
-
-    /// What a committed block's finalizations settle about the
-    /// transactions they name, for the mempool's status of each: the
-    /// ledger's reading, taken before the block releases the entries.
-    #[must_use]
-    pub fn resolutions_of(
-        &self,
-        finalizations: &[Arc<Verifiable<Finalization>>],
-    ) -> Vec<(TxHash, TxResolution)> {
-        self.counterparts.ledger.resolutions_of(finalizations)
-    }
-
-    /// Register tx → tick assignments for a `Sealed` block without any of
-    /// the execution-side state setup (`TickState`, vote tracker, conflict
-    /// detector, required-provision tracking). The block's ticks are
-    /// already settled; we only need the mapping so a future cert can
-    /// route back to the tx for mempool terminal-state bookkeeping.
-    fn register_sealed_assignments(
-        &mut self,
-        topology_snapshot: &TopologySnapshot,
-        block_height: BlockHeight,
-        transactions: &[Arc<Verifiable<Transaction>>],
-    ) {
-        let _ = topology_snapshot;
-        let tick_id = TickId::new(self.local_shard, block_height);
-        for tx in transactions {
-            self.ticks.assign_tx(tx.hash(), tick_id);
-            self.counterparts.ledger.certify(tx.hash());
-        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3615,7 +3967,7 @@ impl ExecutionCoordinator {
         // read before routing: the leg's tick settled long ago, so the
         // certificate routes nowhere, and the refusal is the one thing
         // in it this shard still has a use for.
-        let mut actions = self.counterparts.on_certificate(ec);
+        let mut actions = self.counterparts.on_certificate(ec, self.committed_ts);
 
         let routing = self.ticks.classify_attestation(ec);
 
@@ -3752,7 +4104,7 @@ impl ExecutionCoordinator {
                 for tx_hash in finalized_arc.tx_hashes() {
                     self.ticks.remove_assignment(tx_hash);
                 }
-                self.release_chain_holds(tick_id);
+                self.release_chain_holds(tick_id, &[], true);
                 self.drain_ready_tick_resolutions()
             }
         }
@@ -3788,6 +4140,7 @@ impl ExecutionCoordinator {
         }
 
         self.counterparts.on_settled(shard, settled);
+        self.parked_claims.drop_shard(shard);
         self.release(topology_schedule, Wake::SettledSet(shard))
     }
 
@@ -3840,19 +4193,30 @@ impl ExecutionCoordinator {
 
     /// Re-drive every certificate and finalization held on a committee
     /// epoch the beacon has now reached. Called on `BeaconBlockPersisted`.
+    ///
+    /// Returns commit effects because a commit parked on a window the
+    /// beacon had not committed folds here, and its resolutions and
+    /// terminal latch reach the node as any fold's do.
     pub fn on_beacon_block_persisted(
         &mut self,
         topology_schedule: &TopologySchedule,
-    ) -> Vec<Action> {
-        let mut actions = self.release(topology_schedule, Wake::Beacon);
-        actions.push(Action::Fetch(FetchRequest::SettledTxs {
-            wanted: self
-                .counterparts
-                .wanted_settled_sets(topology_schedule, self.committed_ts),
-            preferred: None,
-            class: None,
-        }));
-        actions
+    ) -> CommitEffects {
+        // The parked commits fold first, so everything below reads the
+        // frontier they advance.
+        let mut effects = self.drain_awaiting_window(topology_schedule);
+        effects
+            .actions
+            .extend(self.release(topology_schedule, Wake::Beacon));
+        effects
+            .actions
+            .push(Action::Fetch(FetchRequest::SettledTxs {
+                wanted: self
+                    .counterparts
+                    .wanted_settled_sets(topology_schedule, self.committed_ts),
+                preferred: None,
+                class: None,
+            }));
+        effects
     }
 
     /// Handle the result of [`Action::VerifyFinalization`]. Emits the
@@ -3895,6 +4259,12 @@ impl ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
     // Query Methods
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// The height of the last block this coordinator folded.
+    #[must_use]
+    pub const fn committed_height(&self) -> BlockHeight {
+        self.committed_height
+    }
 
     /// Get the local tick assignment for a transaction.
     #[must_use]
@@ -3942,15 +4312,6 @@ impl ExecutionCoordinator {
             .filter(|(_, tick)| tick.determined_unsettled())
             .map(|(tick_id, _)| tick_id.block_height())
             .collect()
-    }
-
-    /// Whether provisions from `shard` have been absorbed for `tx_hash` —
-    /// committed chain content, since absorption runs at block commit.
-    /// The proposal seam's engagement check reads this for the payer
-    /// shard of a cross-shard transaction.
-    #[must_use]
-    pub fn has_provisions_from(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        self.provisioning.has_received_from(tx_hash, shard)
     }
 
     /// Get a finalization by its identity (returns `Arc` for sharing).
@@ -4023,13 +4384,13 @@ impl ExecutionCoordinator {
             .on_txs_terminated(tx_hashes.iter().copied());
     }
 
-    /// Drop every pending tick and EC expectation. Called once when the
-    /// local chain terminates at a reshape boundary: finalization is a
-    /// finalization in a later block, and a terminated chain commits
-    /// no later block, so every pending tick here is permanently
-    /// undecidable. Serving state (aggregated ECs, finalizations)
-    /// stays — peers still fetch what this chain produced.
-    pub fn abort_pending_ticks(&mut self) -> Vec<Action> {
+    /// Drop every pending tick and EC expectation, in the fold that
+    /// derives the terminal latch: finalization is a finalization in a
+    /// later block, and no later content block exists, so every pending
+    /// tick here is permanently undecidable. Serving state (aggregated
+    /// ECs, finalizations) stays — peers still fetch what this chain
+    /// produced.
+    fn terminate(&mut self) -> Vec<Action> {
         let counts = self.ticks.drain_all();
         let mut expected = self.expected_certs.drain_expected();
         expected.sort();
@@ -4044,7 +4405,7 @@ impl ExecutionCoordinator {
         // What the chain owes an outcome for goes with the rest. The
         // ledger's entries are abandonable at their deadlines, and a
         // deadline falling after the terminal would have this chain
-        // compose a tick to abandon them in — on a coast block, under a
+        // seat a tick to abandon them in — on a coast block, under a
         // committee it no longer has. Nothing here can reach a verdict
         // either way, which is the same reason the ticks above go.
         self.counterparts.ledger = Ledger::new(self.local_shard);
@@ -4054,16 +4415,16 @@ impl ExecutionCoordinator {
         // chain, so its completion must be able to release the queue.
         self.pending_tick_resolutions.clear();
         self.pending_ticks.clear();
+        self.held.clear();
         self.ticked.clear();
         self.tick_in_flight = false;
         // And the candidates behind them, with the latch that keeps
-        // composition from admitting more. The sweep fires once, on the
-        // first coast commit, while composition runs on every one after
-        // it: a candidate whose cross-shard provisions land past the
-        // terminal would otherwise compose into a tick at a
-        // past-terminal anchor, which gets no vote tracker and is never
-        // votable — an execution batch dispatched and written into the
-        // chain just cleared, for an outcome that can never certify.
+        // seating from admitting more: a candidate whose cross-shard
+        // provisions land past the terminal would otherwise be seated in
+        // a tick at a past-terminal anchor, which gets no vote tracker
+        // and is never votable — an execution batch dispatched and
+        // written into the chain just cleared, for an outcome that can
+        // never certify.
         self.candidates.clear();
         self.terminated = true;
         let mut actions = vec![Action::ClearTickChain];
@@ -4231,31 +4592,29 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_hbor::Capped;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
         make_finalization_leaving, make_leg_finalization,
-        make_live_block as helpers_make_live_block, state_and_proof, test_prefix, test_transaction,
-        test_transaction_running, test_transaction_with_prefixes,
+        make_live_block as helpers_make_live_block, naming, proven_claim, state_and_proof,
+        test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, CLAIM_VISIBILITY_LAG, ConsensusPublicKey, ConsensusReceipt,
-        ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome,
-        GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
-        MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate, RETENTION_HORIZON,
-        Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer,
-        SignerBitfield, StateClaim, StateRoot, StoredReceipt, SubstateKey, TickHalf,
-        TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet,
-        Window,
+        BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Deadline,
+        EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash,
+        Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
+        NetworkDefinition, Probed, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryCause,
+        Role, SeedRing, SeedSource, Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
+        StateClaim, StateRoot, Stated, StoredReceipt, SubstateKey, TickHalf, TransactionDecision,
+        TxClaim, TxResolution, UnclaimedCrossing, UnsettledTx, ValidatorInfo, ValidatorSet, Window,
     };
-    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash};
+    use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
 
     use super::*;
-    use crate::counterparts::HeldRecord;
-    use crate::ledger::Part;
+    use crate::counterparts::TestRows;
 
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
@@ -4365,7 +4724,7 @@ mod tests {
                 tx.hash(),
                 Membership::whole(participating),
                 Some(tx.price(&PriceTable::GENESIS)),
-                Admission::Executes,
+                Joins::Executes,
             );
         }
         state
@@ -4464,7 +4823,9 @@ mod tests {
         );
 
         // Block committed with transaction
-        let actions = state.on_block_committed(&topology_schedule, &certify(block));
+        let actions = state
+            .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
+            .actions;
 
         // Should request execution (single-shard path) and set up tick tracking
         assert!(!actions.is_empty());
@@ -4481,7 +4842,7 @@ mod tests {
         assert!(state.ticks.contains_tick(&tick_id.unwrap()));
     }
 
-    /// A tick composes whatever the block committed, and waits at the
+    /// A tick seats whatever the block named, and waits at the
     /// dispatch head for code this node has not fetched.
     ///
     /// Membership is what the committee votes over, so it cannot turn on
@@ -4509,7 +4870,9 @@ mod tests {
             ValidatorId::new(0),
             vec![Arc::new(tx)],
         );
-        let actions = state.on_block_committed(&topology_schedule, &certify(block));
+        let actions = state
+            .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
+            .actions;
 
         assert!(
             !actions
@@ -4522,18 +4885,21 @@ mod tests {
             "the tick is composed regardless — only its dispatch waits"
         );
 
-        // The fetch lands. Nothing reports it: the next commit composes
+        // The fetch lands. Nothing reports it: the next commit seats
         // and dispatches as every commit does, and finds the head ready.
         code.release(package);
-        let released = state.on_block_committed(
-            &topology_schedule,
-            &certify(make_live_block(
-                BlockHeight::new(2),
-                2000,
-                ValidatorId::new(0),
-                vec![],
-            )),
-        );
+        let released = state
+            .commit_block_carrying(
+                &topology_schedule,
+                &certify(make_live_block(
+                    BlockHeight::new(2),
+                    2000,
+                    ValidatorId::new(0),
+                    vec![],
+                )),
+                Naming::Composed,
+            )
+            .actions;
         let dispatched: Vec<&TxHash> = released
             .iter()
             .filter_map(|action| match action {
@@ -4563,15 +4929,18 @@ mod tests {
         let package = Hash::from_bytes(b"code this node holds");
         let tx = test_transaction_running(1, &[package]);
         let tx_hash = tx.hash();
-        let actions = state.on_block_committed(
-            &topology_schedule,
-            &certify(make_live_block(
-                BlockHeight::new(1),
-                1000,
-                ValidatorId::new(0),
-                vec![Arc::new(tx)],
-            )),
-        );
+        let actions = state
+            .commit_block_carrying(
+                &topology_schedule,
+                &certify(make_live_block(
+                    BlockHeight::new(1),
+                    1000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                )),
+                Naming::Composed,
+            )
+            .actions;
         let Some(Action::ExecuteTransactions {
             tick,
             tick_ts,
@@ -4592,15 +4961,18 @@ mod tests {
             "a tick handed back waits; it does not re-run on the spot"
         );
 
-        let again = state.on_block_committed(
-            &topology_schedule,
-            &certify(make_live_block(
-                BlockHeight::new(2),
-                2000,
-                ValidatorId::new(0),
-                vec![],
-            )),
-        );
+        let again = state
+            .commit_block_carrying(
+                &topology_schedule,
+                &certify(make_live_block(
+                    BlockHeight::new(2),
+                    2000,
+                    ValidatorId::new(0),
+                    vec![],
+                )),
+                Naming::Composed,
+            )
+            .actions;
         let dispatched: Vec<TxHash> = again
             .iter()
             .filter_map(|action| match action {
@@ -4638,7 +5010,9 @@ mod tests {
             ValidatorId::new(0),
             vec![Arc::new(tx)],
         );
-        let actions = state.on_block_committed(&topology_schedule, &certify(block));
+        let actions = state
+            .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
+            .actions;
 
         assert!(
             actions
@@ -4694,7 +5068,7 @@ mod tests {
             ValidatorId::new(0),
             vec![Arc::new(tx)],
         );
-        state.on_block_committed(&schedule, &test_certify(block, 1_000));
+        state.commit_block_carrying(&schedule, &test_certify(block, 1_000), Naming::Composed);
 
         let tick_id = state
             .ticks
@@ -4715,7 +5089,7 @@ mod tests {
                 tick_id,
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
-                fee_receipts: vec![],
+                refusal_receipts: vec![],
             },
         );
 
@@ -4763,7 +5137,9 @@ mod tests {
             ValidatorId::new(0),
             vec![Arc::new(tx)],
         );
-        state.on_block_committed(&unresolvable, &test_certify(block, 5_000));
+        // The commit folds under the window it is classified in; only the
+        // vote's routing reads the schedule afterwards.
+        state.commit_block_carrying(&resolved, &test_certify(block, 5_000), Naming::Composed);
 
         // Execution lands, so the tick is complete and ready to vote.
         let tick_id = state
@@ -4777,7 +5153,7 @@ mod tests {
                 tick_id,
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
-                fee_receipts: vec![],
+                refusal_receipts: vec![],
             },
         );
 
@@ -4814,7 +5190,7 @@ mod tests {
 
         // Commit the block as validator 0 to discover the tick_id.
         let mut state0 = make_test_state();
-        state0.on_block_committed(&topo0, &certify(block));
+        state0.commit_block_carrying(&topo0, &certify(block), Naming::Composed);
         let tick_id = state0
             .ticks
             .ticks_iter()
@@ -4833,7 +5209,7 @@ mod tests {
             vec![Arc::new(tx.clone())],
         );
         let mut state_leader = make_test_state_for(leader);
-        state_leader.on_block_committed(&topo_leader, &certify(block_leader));
+        state_leader.commit_block_carrying(&topo_leader, &certify(block_leader), Naming::Composed);
         assert!(
             state_leader.ticks.contains_tracker(&tick_id),
             "Leader should have VoteTracker"
@@ -4849,7 +5225,7 @@ mod tests {
             vec![Arc::new(tx)],
         );
         let mut state_non = make_test_state_for(non_leader_id);
-        state_non.on_block_committed(&topo_non, &certify(block_non));
+        state_non.commit_block_carrying(&topo_non, &certify(block_non), Naming::Composed);
         assert!(
             !state_non.ticks.contains_tracker(&tick_id),
             "Non-leader should NOT have VoteTracker"
@@ -4868,7 +5244,7 @@ mod tests {
             vec![Arc::new(tx.clone())],
         );
         let mut state = make_test_state();
-        state.on_block_committed(&topo, &certify(block));
+        state.commit_block_carrying(&topo, &certify(block), Naming::Composed);
 
         let tick_id = state
             .ticks
@@ -4888,7 +5264,7 @@ mod tests {
             vec![Arc::new(tx)],
         );
         let mut state_non = make_test_state_for(*non_leader_id);
-        state_non.on_block_committed(&topo_non, &certify(block_non));
+        state_non.commit_block_carrying(&topo_non, &certify(block_non), Naming::Composed);
 
         assert!(!state_non.ticks.contains_tracker(&tick_id));
         assert!(state_non.ticks.contains_tick(&tick_id));
@@ -5239,6 +5615,65 @@ mod tests {
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
+    }
+
+    /// A tick of pure legs owes its certificate to nobody: the venue reads
+    /// each leg's crossing off the record pushed to it. The certificate
+    /// goes to this shard's own peers alone, and nothing is tracked for
+    /// re-broadcast.
+    #[test]
+    fn a_leg_only_tick_projects_nothing_and_tracks_nothing() {
+        use hyperscale_types::compute_global_receipt_root;
+
+        use crate::fixtures::{leaf, payer, swap, trie};
+
+        let (local, venue) = (leaf(0), leaf(1));
+        let tick_id = TickId::new(local, BlockHeight::new(1));
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+        let leg = TxHash::from(Hash::from_bytes(b"leg"));
+        let mut tick = TickState::new(tick_id, BlockHash::ZERO, WeightedTimestamp::ZERO);
+        tick.admit(
+            leg,
+            Membership::of(&Member::of(
+                Classified::freeze(&swap(), payer(), &[], &trie()),
+                local,
+                BTreeSet::from([local, venue]),
+            )),
+            Some(10),
+            Joins::Executes,
+        );
+        state.ticks.insert_tick(tick_id, tick);
+
+        let outcomes = vec![TxOutcome::new(
+            leg,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        )];
+        let cert = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            compute_global_receipt_root(&outcomes),
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let actions = state.on_certificate_aggregated(
+            &topo,
+            &tick_id,
+            &Arc::new(Verified::new_unchecked_for_test(cert)),
+        );
+
+        let broadcasts: Vec<ShardId> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::BroadcastExecutionCertificate { shard, .. } => Some(*shard),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(broadcasts, vec![state.local_shard], "local peers only");
+        assert_eq!(state.outbound_certs.memory_stats().tracked_certificates, 0);
     }
 
     /// A shard receives the outcomes for the transactions it is party to
@@ -5666,13 +6101,14 @@ mod tests {
         );
 
         // The commit proof lands: the deferred EC replays into dispatch.
-        state.proven_anchors().record(Anchor {
+        let proven = Anchor {
             shard: remote_shard,
             height: BlockHeight::new(5),
             state_root: StateRoot::ZERO,
             ts: WeightedTimestamp::ZERO,
-        });
-        let actions = state.on_committed_remote_header(&topo, remote_shard);
+        };
+        state.proven_anchors().record(proven);
+        let actions = state.on_committed_remote_header(&topo, proven);
         assert!(
             actions
                 .iter()
@@ -6174,13 +6610,14 @@ mod tests {
 
         // The source block is commit-proven; the gate under test is verify
         // dispatch without a local tracker, not the commit-proof gate.
-        state.proven_anchors().record(Anchor {
+        let proven = Anchor {
             shard: remote_shard,
             height: BlockHeight::new(5),
             state_root: StateRoot::ZERO,
             ts: WeightedTimestamp::ZERO,
-        });
-        state.on_committed_remote_header(&topo, remote_shard);
+        };
+        state.proven_anchors().record(proven);
+        state.on_committed_remote_header(&topo, proven);
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
             actions
@@ -6252,8 +6689,9 @@ mod tests {
                 height,
                 weighted_timestamp: WeightedTimestamp::from_millis(1),
                 witness_base: BeaconWitnessLeafCount::ZERO,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 handoff_complete: None,
+                terminal_epoch: None,
             },
         );
         TopologySchedule::single(Arc::new(TopologySnapshot::from_explicit_committees(
@@ -6359,7 +6797,7 @@ mod tests {
             ValidatorId::new(4),
             vec![Arc::new(test_transaction(1))],
         );
-        coord.on_block_committed(&schedule, &test_certify(block, ED));
+        coord.commit_block_carrying(&schedule, &test_certify(block, ED), Naming::Composed);
         let tick_id = coord
             .ticks
             .ticks_iter()
@@ -6430,7 +6868,7 @@ mod tests {
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
-        let drained = coord.on_beacon_block_persisted(&caught_up);
+        let drained = coord.on_beacon_block_persisted(&caught_up).actions;
         assert!(
             drained
                 .iter()
@@ -6484,7 +6922,7 @@ mod tests {
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
-        let drained = coord.on_beacon_block_persisted(&caught_up);
+        let drained = coord.on_beacon_block_persisted(&caught_up).actions;
         assert!(
             drained
                 .iter()
@@ -6724,16 +7162,16 @@ mod tests {
         );
     }
 
-    /// The replacement release fires on the commit of a block the fresh
-    /// committee certified and on no other: a fresh member replaying the
-    /// harvested tail commits the replaced committee's blocks with the
-    /// record already folded, and must let go of nothing the retained
-    /// members, who committed those blocks live, did not. And it
-    /// releases only what no fresh quorum can hold — a tick at or below
-    /// the attested frontier — while a tail tick above it, the fresh
-    /// committee's to attest, waits on its certificate.
+    /// A recovery discards on the commit of a block the fresh committee
+    /// certified and on no other: a fresh member replaying the harvested
+    /// tail commits the replaced committee's blocks with the record
+    /// already folded, and must let go of nothing the retained members,
+    /// who committed those blocks live, did not. And it discards only
+    /// what no fresh quorum can hold — a tick at or below the attested
+    /// frontier — while a tail tick above it, the fresh committee's to
+    /// attest, waits on its certificate.
     #[test]
-    fn a_replaced_tick_is_released_on_the_first_fresh_certified_commit() {
+    fn a_replaced_tick_is_discarded_on_the_first_fresh_certified_commit() {
         let mut state = make_test_state();
         let schedule = make_test_topology_bridged_at_20(BlockHeight::new(1));
         let hold = |height: u64, anchor_ms: u64| {
@@ -6768,20 +7206,41 @@ mod tests {
         // the span, so nothing is released.
         state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(2_500);
         state.committed_ts = WeightedTimestamp::from_millis(2_900);
-        state.release_wedged_ticks(&schedule, &test_certify(block.clone(), 2_900));
         assert!(
-            state.ticks.get_tick(&frontier_id).is_some(),
-            "a commit the replaced committee certified releases nothing"
+            state
+                .recovered_ticks(&schedule, &test_certify(block.clone(), 2_900))
+                .is_empty(),
+            "a commit the replaced committee certified discards nothing"
         );
 
         // A bridge block: anchored below the bridge, certified one skew
         // window under it, which is the fresh committee's.
         state.committed_ts = WeightedTimestamp::from_millis(20_900);
-        state.release_wedged_ticks(&schedule, &test_certify(block, 20_900));
-        assert!(
-            state.ticks.get_tick(&frontier_id).is_none(),
-            "the first fresh-certified commit releases the frontier tick"
+        assert_eq!(
+            state.recovered_ticks(&schedule, &test_certify(block, 20_900)),
+            vec![frontier_id],
+            "the first fresh-certified commit discards the frontier tick"
         );
+        state.discard_recovered(frontier_id);
+        assert!(state.ticks.get_tick(&frontier_id).is_none());
+
+        // The line's licence reads the same band off the snapshot a
+        // voter classifies the block under.
+        let anchored = schedule.head();
+        let frontier = |qc_ms: u64| {
+            schedule.recovery_frontier(
+                anchored,
+                ShardId::ROOT,
+                WeightedTimestamp::from_millis(2_500),
+                WeightedTimestamp::from_millis(qc_ms),
+            )
+        };
+        assert_eq!(
+            frontier(2_900),
+            None,
+            "the replaced committee's block licenses nothing"
+        );
+        assert_eq!(frontier(20_900), Some(BlockHeight::new(1)));
         assert!(
             state.ticks.get_tick(&tail_id).is_some(),
             "a tail tick above the frontier waits on the fresh committee's certificate"
@@ -6850,7 +7309,7 @@ mod tests {
         let tx = test_transaction(u8::try_from(height.inner()).unwrap());
         let tx_hash = tx.hash();
         let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![Arc::new(tx)]);
-        state.on_block_committed(schedule, &test_certify(block, anchor_ms));
+        state.commit_block_carrying(schedule, &test_certify(block, anchor_ms), Naming::Composed);
         let tick_id = state
             .ticks
             .tick_assignment(tx_hash)
@@ -6862,7 +7321,7 @@ mod tests {
                 tick_id,
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
-                fee_receipts: vec![],
+                refusal_receipts: vec![],
             },
         );
         tick_id
@@ -7047,8 +7506,9 @@ mod tests {
                     height: BlockHeight::new(9),
                     weighted_timestamp: WeightedTimestamp::from_millis(1_000),
                     witness_base: BeaconWitnessLeafCount::ZERO,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     handoff_complete: None,
+                    terminal_epoch: None,
                 },
             )])),
         );
@@ -7080,7 +7540,11 @@ mod tests {
                 ValidatorId::new(0),
                 vec![],
             );
-            let _ = state.on_block_committed(&topo, &test_certify(block, anchor_ms));
+            let _ = state.commit_block_carrying(
+                &topo,
+                &test_certify(block, anchor_ms),
+                Naming::Composed,
+            );
         };
 
         commit(&mut state, 1, 500);
@@ -7116,7 +7580,11 @@ mod tests {
                 ValidatorId::new(0),
                 vec![],
             );
-            let _ = state.on_block_committed(&topo, &test_certify(block, anchor_ms));
+            let _ = state.commit_block_carrying(
+                &topo,
+                &test_certify(block, anchor_ms),
+                Naming::Composed,
+            );
         };
 
         // Block 1 anchors at genesis zero; block 2 dates itself far past it.
@@ -7144,6 +7612,7 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             Arc::new(TestCode::default()),
+            Arc::new(CrossingIndexSlot::default()),
             &RecoveredState {
                 committed_height: BlockHeight::new(5),
                 committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
@@ -7153,7 +7622,6 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -7166,7 +7634,7 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        let _ = state.on_block_committed(&topo, &test_certify(block, 1_100));
+        let _ = state.commit_block_carrying(&topo, &test_certify(block, 1_100), Naming::Composed);
 
         assert_eq!(
             state.committed_committee_anchor_wt,
@@ -7180,6 +7648,66 @@ mod tests {
     /// committee — not the `ArcSwap` head, so every replica groups a block's
     /// transactions identically across a reshape boundary (matching the
     /// proposer and the verifier).
+    /// A commit whose committee anchor lies in a window this node's
+    /// beacon has not committed is parked, not classified under the head:
+    /// the frontier holds, and a later commit queues behind it. Once the
+    /// beacon commits the window, both fold in order under it, as on a
+    /// replica that held the window all along.
+    #[test]
+    fn a_block_whose_window_is_unresolved_is_parked_not_classified_at_the_head() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let validators: Vec<ValidatorInfo> = (0..4u64)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let one_shard = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators.clone()),
+        ));
+        let two_shards = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(validators),
+        ));
+        let mut sched = TopologySchedule::new(1000, Epoch::new(0), Arc::clone(&one_shard));
+        sched.set_head(two_shards);
+
+        let block_at = |height: u64, anchor_ms: u64| {
+            test_certify(
+                make_live_block_on_shard(
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    anchor_ms,
+                    ValidatorId::new(0),
+                    vec![],
+                ),
+                anchor_ms,
+            )
+        };
+        let first = block_at(1, 1_500);
+        let second = block_at(2, 1_700);
+        let _ = state.commit_block_composing(&sched, &first, WeightedTimestamp::from_millis(1_500));
+        let _ =
+            state.commit_block_composing(&sched, &second, WeightedTimestamp::from_millis(1_500));
+        assert_eq!(state.committed_height, BlockHeight::GENESIS, "both wait");
+
+        sched.insert(Epoch::new(1), one_shard);
+        let _ = state.on_beacon_block_persisted(&sched);
+        assert_eq!(state.committed_height, BlockHeight::new(2));
+        assert_eq!(
+            state
+                .counterpart_trie(&sched)
+                .expect("the window is committed now")
+                .leaves()
+                .len(),
+            1,
+            "classified under the window, not the two-shard head",
+        );
+    }
+
     #[test]
     fn classification_committee_anchors_at_the_block_window_not_the_head() {
         let state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
@@ -7208,7 +7736,10 @@ mod tests {
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
-        let anchored = state.classification_committee(&sched, WeightedTimestamp::from_millis(500));
+        let at = WeightedTimestamp::from_millis(500);
+        let anchored = state
+            .anchored_committee(&sched, at, at)
+            .expect("the fixture holds the window");
         assert_eq!(
             anchored.num_shards(),
             1,
@@ -7267,7 +7798,9 @@ mod tests {
             ValidatorId::new(0),
             vec![Arc::new(test_transaction(1))],
         );
-        let actions = state.on_block_committed(&sched, &certify(block));
+        let actions = state
+            .commit_block_carrying(&sched, &certify(block), Naming::Composed)
+            .actions;
         let env = actions
             .iter()
             .find_map(|action| match action {
@@ -7578,7 +8111,7 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        state.on_block_committed(schedule, &test_certify(block, now_ms));
+        state.commit_block_carrying(schedule, &test_certify(block, now_ms), Naming::Composed);
         state
             .scan_votable_ticks(schedule)
             .into_iter()
@@ -7599,7 +8132,7 @@ mod tests {
         let reserved = tx.price(&PriceTable::GENESIS);
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.on_block_committed(
+        state.commit_block_carrying(
             &schedule,
             &test_certify(
                 make_live_block(
@@ -7610,6 +8143,7 @@ mod tests {
                 ),
                 1_000,
             ),
+            Naming::Composed,
         );
         assert_eq!(
             state.counterparts.ledger.len(),
@@ -7651,16 +8185,22 @@ mod tests {
         let schedule = make_test_topology();
         let mut state = make_test_state();
         let tx = test_transaction(1);
-        let expected = build_fee_receipt(
+        let expected = build_refusal_receipt(
             ShardId::ROOT,
-            state.counterpart_trie(&schedule),
+            state
+                .counterpart_trie(&schedule)
+                .expect("the fixture holds the window"),
             tx.hash(),
-            tx.fee_vault(),
-            Movement::unjudged(*PROTOCOL_RESOURCE, tx.price(&PriceTable::GENESIS)),
-        );
+            Some((
+                tx.fee_vault(),
+                Movement::unjudged(*PROTOCOL_RESOURCE, tx.price(&PriceTable::GENESIS)),
+            )),
+            &[],
+        )
+        .expect("a charge names a receipt");
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.on_block_committed(
+        state.commit_block_carrying(
             &schedule,
             &test_certify(
                 make_live_block(
@@ -7671,6 +8211,7 @@ mod tests {
                 ),
                 1_000,
             ),
+            Naming::Composed,
         );
         state
             .ticks
@@ -7680,7 +8221,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].is_aborted());
         assert_eq!(
-            outcomes[0].fee_receipt(),
+            outcomes[0].refusal_receipt(),
             Some(expected.receipt_hash()),
             "the abandonment settles the same floor an attested abort would",
         );
@@ -7698,13 +8239,14 @@ mod tests {
         assert_eq!(
             state
                 .counterpart_trie(&schedule)
+                .expect("the fixture holds the window")
                 .shard_for_prefix(tx.fee_vault().owner),
             PEER,
             "the fixture is only a test of this if the vault is elsewhere",
         );
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.on_block_committed(
+        state.commit_block_carrying(
             &schedule,
             &test_certify(
                 make_live_block_on_shard(
@@ -7716,6 +8258,7 @@ mod tests {
                 ),
                 1_000,
             ),
+            Naming::Composed,
         );
         state
             .ticks
@@ -7728,7 +8271,11 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        state.on_block_committed(&schedule, &test_certify(block, deadline_ms));
+        state.commit_block_carrying(
+            &schedule,
+            &test_certify(block, deadline_ms),
+            Naming::Composed,
+        );
         let outcomes: Vec<TxOutcome> = state
             .scan_votable_ticks(&schedule)
             .into_iter()
@@ -7738,7 +8285,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].is_aborted());
         assert_eq!(
-            outcomes[0].fee_receipt(),
+            outcomes[0].refusal_receipt(),
             None,
             "the vault is not here, so neither is the burn",
         );
@@ -7760,7 +8307,7 @@ mod tests {
     /// A replay releases the ticks the blocks it re-drives finalized,
     /// exactly as a commit does.
     ///
-    /// A replay recomposes the tick that held a transaction *and* commits
+    /// A replay reseats the tick that held a transaction *and* commits
     /// the block whose finalization settled it, and the second is what
     /// hands the transaction back. Skipping it leaves the transaction
     /// assigned to a tick that has already settled, which nothing later
@@ -7795,7 +8342,7 @@ mod tests {
             committed_height: BlockHeight::new(3),
             replay: ReplayWindow {
                 blocks: vec![replayable(committing, 2_000), replayable(settling, 3_000)],
-                compose_from: BlockHeight::GENESIS,
+                dispatch_from: BlockHeight::GENESIS,
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -7804,11 +8351,11 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             Arc::new(TestCode::default()),
+            Arc::new(CrossingIndexSlot::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -7821,7 +8368,275 @@ mod tests {
         );
     }
 
-    /// A replay reaching below what the store can anchor composes its
+    /// A sealed block seats exactly what its live form does: the tick its
+    /// manifest names, and nothing its manifest does not name. It is
+    /// never dispatched, since it carries no bundles to run over.
+    #[test]
+    fn a_sealed_block_seats_what_its_live_form_does() {
+        let schedule = make_test_topology();
+        let named_tx = test_transaction(1);
+        let unnamed_tx = test_transaction(2);
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        let committing = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(named_tx.clone()), Arc::new(unnamed_tx.clone())],
+        );
+        let lines = vec![TickLine::Member {
+            tx: named_tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+        }];
+        let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
+        let sealed = naming(&test_certify(committing.into_sealed(), 2_000), lines);
+        let seat = |certified: &CertifiedBlock| {
+            let mut state = make_test_state();
+            state.commit_block_carrying(
+                &schedule,
+                &test_certify(seed.clone(), 1_000),
+                Naming::Manifest,
+            );
+            state.commit_block_carrying(&schedule, certified, Naming::Manifest);
+            state
+        };
+        let (live, sealed) = (seat(&live), seat(&sealed));
+        let tick = Some(TickId::new(ShardId::ROOT, BlockHeight::new(2)));
+        for state in [&live, &sealed] {
+            assert_eq!(state.ticks.tick_assignment(named_tx.hash()), tick);
+            assert_eq!(state.ticks.tick_assignment(unnamed_tx.hash()), None);
+        }
+        assert!(live.tick_in_flight || !live.pending_ticks.is_empty());
+        assert!(
+            !sealed.tick_in_flight
+                && matches!(
+                    sealed.pending_ticks.front(),
+                    Some(Queued::Held(held)) if *held == TickId::new(ShardId::ROOT, BlockHeight::new(2))
+                ),
+            "a sealed tick is seated, never dispatched, and holds dispatch behind it",
+        );
+    }
+
+    /// A tick this node cannot run holds every later tick until its
+    /// determined half settles; the settling commit seats what its
+    /// receipts say it left on the chain, then the later tick runs.
+    #[test]
+    fn a_held_tick_holds_dispatch_until_it_settles() {
+        let schedule = make_test_topology();
+        let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
+        let member = |tx: &Transaction| TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+        };
+        let mut state = make_test_state();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        state.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Manifest);
+        let sealed = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(held_tx.clone())],
+        )
+        .into_sealed();
+        state.commit_block_carrying(
+            &schedule,
+            &naming(&test_certify(sealed, 2_000), vec![member(&held_tx)]),
+            Naming::Manifest,
+        );
+        let later = make_live_block(
+            BlockHeight::new(3),
+            3_000,
+            ValidatorId::new(0),
+            vec![Arc::new(later_tx.clone())],
+        );
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &naming(&test_certify(later, 3_000), vec![member(&later_tx)]),
+            Naming::Manifest,
+        );
+        let executes = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        };
+        assert!(
+            !executes(&effects.actions),
+            "the held tick holds tick 3 back"
+        );
+
+        let mut writes = StateWrites::default();
+        writes.cells.insert(
+            SubstateKey {
+                owner: Address::new([7; 31], AddressClass::Component),
+                local: LocalKey([1; 16]),
+            },
+            Some(vec![1]),
+        );
+        let finalization: Arc<Verifiable<Finalization>> =
+            Arc::new(make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), writes).into());
+        let settling = helpers_make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(4),
+            4_000,
+            ValidatorId::new(0),
+            vec![],
+            vec![finalization],
+        );
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &test_certify(settling, 4_000),
+            Naming::Manifest,
+        );
+        let restored = effects.actions.iter().position(|action| {
+            matches!(action, Action::ResolveTicks { resolutions }
+            if resolutions.iter().any(|(tick, resolution)| {
+                tick.block_height() == BlockHeight::new(2)
+                    && matches!(resolution, TickResolution::Restored { .. })
+            }))
+        });
+        let dispatched = effects
+            .actions
+            .iter()
+            .position(|action| matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3)));
+        assert!(restored.is_some(), "the settled half's writes are seated");
+        assert!(dispatched.is_some(), "and tick 3 then runs");
+        assert!(
+            restored < dispatched,
+            "seated before the tick that reads them"
+        );
+    }
+
+    /// The receipt of `tx`'s floor burned on `ROOT`, as an abort
+    /// settles it.
+    fn floor_receipt(
+        state: &ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        tx: &Transaction,
+    ) -> GlobalReceiptHash {
+        build_refusal_receipt(
+            ShardId::ROOT,
+            state
+                .counterpart_trie(schedule)
+                .expect("the fixture holds the window"),
+            tx.hash(),
+            Some((
+                tx.fee_vault(),
+                Movement::unjudged(*PROTOCOL_RESOURCE, tx.price(&PriceTable::GENESIS)),
+            )),
+            &[],
+        )
+        .expect("a charge names a receipt")
+        .receipt_hash()
+    }
+
+    /// Each outcome's transaction and the charge its receipt settles.
+    fn charged(outcomes: &[TxOutcome]) -> Vec<(TxHash, Option<GlobalReceiptHash>)> {
+        outcomes
+            .iter()
+            .map(|outcome| (outcome.tx_hash(), outcome.refusal_receipt()))
+            .collect()
+    }
+
+    /// A discard charges nothing: of two members of one tick, the one an
+    /// abort names is charged its floor by that abort, the tick-mate the
+    /// discard lets go of is charged by its own abort later, and the
+    /// discard itself settles no outcome for either.
+    #[test]
+    fn a_discard_charges_nothing() {
+        let schedule = make_test_topology();
+        let mut pair = [test_transaction(1), test_transaction(2)];
+        pair.sort_by_key(Transaction::hash);
+        let [abandoned, mate] = pair;
+        let line = |tx: &Transaction, joins| TickLine::Member {
+            tx: tx.hash(),
+            joins,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+        };
+        let mut state = make_test_state();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        state.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Manifest);
+        let holding = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(abandoned.clone()), Arc::new(mate.clone())],
+        );
+        state.commit_block_carrying(
+            &schedule,
+            &naming(
+                &test_certify(holding, 2_000),
+                vec![
+                    line(&abandoned, Joins::Executes),
+                    line(&mate, Joins::Executes),
+                ],
+            ),
+            Naming::Manifest,
+        );
+        let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        assert_eq!(state.ticks.tick_assignment(mate.hash()), Some(held_by));
+
+        let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+        let settle = |state: &mut ExecutionCoordinator, height, now_ms, lines| {
+            let block = make_live_block(
+                BlockHeight::new(height),
+                now_ms,
+                ValidatorId::new(0),
+                vec![],
+            );
+            state.commit_block_carrying(
+                &schedule,
+                &naming(&test_certify(block, now_ms), lines),
+                Naming::Manifest,
+            );
+            state
+                .scan_votable_ticks(&schedule)
+                .into_iter()
+                .flat_map(|completion| completion.tx_outcomes)
+                .collect::<Vec<TxOutcome>>()
+        };
+        let expected = floor_receipt(&state, &schedule, &abandoned);
+        let outcomes = settle(
+            &mut state,
+            3,
+            deadline_ms,
+            vec![
+                line(&abandoned, Joins::Aborted),
+                TickLine::Discard {
+                    tick: held_by,
+                    cause: DiscardCause::Abandoned(abandoned.hash()),
+                },
+            ],
+        );
+        assert_eq!(
+            charged(&outcomes),
+            vec![(abandoned.hash(), Some(expected))],
+            "the abort charges its member once, and the discard charges nobody",
+        );
+        assert!(!state.ticks.contains_tick(&held_by));
+        assert_eq!(state.ticks.tick_assignment(mate.hash()), None);
+
+        let expected = floor_receipt(&state, &schedule, &mate);
+        let outcomes = settle(
+            &mut state,
+            4,
+            deadline_ms + 1_000,
+            vec![line(&mate, Joins::Aborted)],
+        );
+        assert_eq!(
+            charged(&outcomes),
+            vec![(mate.hash(), Some(expected))],
+            "the let-go tick-mate is charged by its own abort alone",
+        );
+    }
+
+    /// A replay reaching below what the store can anchor seats its
     /// ticks there and dispatches none of them.
     ///
     /// Composition's reach is what the chain is still owed an outcome
@@ -7832,7 +8647,7 @@ mod tests {
     /// which tick holds a member, which every replica of the shard reads
     /// the same however far back its own store reaches.
     #[test]
-    fn a_replay_below_the_stores_reach_composes_without_dispatching() {
+    fn a_replay_below_the_stores_reach_seats_without_dispatching() {
         let schedule = make_test_topology();
         let held = test_transaction(1);
         let held_hash = held.hash();
@@ -7843,14 +8658,25 @@ mod tests {
             vec![Arc::new(held)],
         );
         let above = make_live_block(BlockHeight::new(3), 3_000, ValidatorId::new(0), vec![]);
+        // The committing block names its own transaction, ready at once.
+        let committing = Verified::<CertifiedBlock>::from_persisted(naming(
+            &test_certify(committing, 2_000),
+            vec![TickLine::Member {
+                tx: held_hash,
+                joins: Joins::Executes,
+                settlement: Settlement::Alone,
+                holds: Capped::empty(),
+                reach: Capped::empty(),
+            }],
+        ));
 
         let recovered = RecoveredState {
             committed_height: BlockHeight::new(3),
             replay: ReplayWindow {
-                blocks: vec![replayable(committing, 2_000), replayable(above, 3_000)],
+                blocks: vec![committing, replayable(above, 3_000)],
                 // The store has retired everything below height 2, so a
                 // tick at 2 would read a baseline at 1 that is gone.
-                compose_from: BlockHeight::new(3),
+                dispatch_from: BlockHeight::new(3),
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -7859,15 +8685,17 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             Arc::new(TestCode::default()),
+            Arc::new(CrossingIndexSlot::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
-        let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+        let actions = restarted
+            .on_committed_state_restored(&schedule, &StubVmStatics)
+            .actions;
         assert!(
             !actions
                 .iter()
@@ -7925,7 +8753,7 @@ mod tests {
             committed_height: BlockHeight::new(4),
             replay: ReplayWindow {
                 blocks: vec![replayable(committing, 2_000), replayable(settling, 4_000)],
-                compose_from: BlockHeight::new(3),
+                dispatch_from: BlockHeight::new(3),
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -7934,15 +8762,17 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             Arc::new(TestCode::default()),
+            Arc::new(CrossingIndexSlot::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
-        let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+        let actions = restarted
+            .on_committed_state_restored(&schedule, &StubVmStatics)
+            .actions;
         let restored = actions.iter().position(|action| {
             matches!(action, Action::ResolveTicks { resolutions }
             if resolutions.iter().any(|(tick_id, resolution)| {
@@ -7970,12 +8800,13 @@ mod tests {
     /// members, however far back each one's own store reaches.
     ///
     /// The abandonment rides the tick being composed — a member and its
-    /// fee receipt — so it reaches a `TxOutcome` and the receipt root. What
+    /// refusal receipt — so it reaches a `TxOutcome` and the receipt root. What
     /// decides it is which tick holds the member and whether a
     /// certificate of this shard's covers it, and both are composition's
     /// output: a replay that composed nothing there would have to assert
     /// them, and either answer diverges from the replica that never went
-    /// down.
+    /// down. The fixture's member is held and decides alone, so both keep
+    /// it past the deadline; a replay that lost its tick would abandon it.
     #[test]
     fn a_replay_abandons_what_a_seated_replica_at_the_same_frontier_does() {
         let schedule = make_test_topology();
@@ -7991,16 +8822,22 @@ mod tests {
 
         // The replica that was seated when the block committed.
         let mut seated = make_test_state();
-        seated.on_block_committed(&schedule, &test_certify(seed, 1_000));
-        seated.on_block_committed(&schedule, &test_certify(committing.clone(), 2_000));
+        seated.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Composed);
+        let committing = test_certify(committing, 2_000);
+        let named = seated
+            .commit_block_carrying(&schedule, &committing, Naming::Composed)
+            .named;
 
         // The replica restarted with the store no longer able to anchor a
         // baseline at the committing height.
         let recovered = RecoveredState {
             committed_height: BlockHeight::new(2),
             replay: ReplayWindow {
-                blocks: vec![replayable(committing, 2_000)],
-                compose_from: BlockHeight::new(3),
+                blocks: vec![Verified::<CertifiedBlock>::from_persisted(naming(
+                    &committing,
+                    named,
+                ))],
+                dispatch_from: BlockHeight::new(3),
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -8009,11 +8846,11 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             Arc::new(TestCode::default()),
+            Arc::new(CrossingIndexSlot::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -8025,17 +8862,20 @@ mod tests {
                 .map(|outcome| outcome.tx_hash())
                 .collect::<Vec<_>>()
         };
+        let holder = Some(TickId::new(ShardId::ROOT, BlockHeight::new(2)));
         assert_eq!(
             aborted(abandonment_vote(&mut seated, &schedule, 3, deadline_ms)),
-            vec![held_hash],
-            "fixture precondition: past the deadline the seated replica abandons it",
+            Vec::<TxHash>::new(),
+            "fixture precondition: past the deadline the seated replica keeps it",
         );
+        assert_eq!(seated.ticks.tick_assignment(held_hash), holder);
         assert_eq!(
             aborted(abandonment_vote(&mut restarted, &schedule, 3, deadline_ms)),
-            vec![held_hash],
-            "and the restarted one abandons it too, or the ticks the two \
+            Vec::<TxHash>::new(),
+            "and the restarted one keeps it too, or the ticks the two \
              compose carry different receipt roots",
         );
+        assert_eq!(restarted.ticks.tick_assignment(held_hash), holder);
     }
 
     /// A restart replays the chain it lost execution state for, so it
@@ -8061,8 +8901,11 @@ mod tests {
         // A replica that never went down: its tick at height 2 takes the
         // transaction and holds it until a finalization resolves it.
         let mut live = make_test_state();
-        live.on_block_committed(&schedule, &test_certify(seed, 1_000));
-        live.on_block_committed(&schedule, &test_certify(committing.clone(), 2_000));
+        live.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Composed);
+        let committing = test_certify(committing, 2_000);
+        let named = live
+            .commit_block_carrying(&schedule, &committing, Naming::Composed)
+            .named;
         assert_eq!(
             live.ticks.tick_assignment(held_hash),
             Some(TickId::new(ShardId::ROOT, BlockHeight::new(2))),
@@ -8070,13 +8913,17 @@ mod tests {
         );
 
         // A restarted one recovers the same chain: the block that
-        // committed the transaction, under the clock of the block below
-        // it so the replay stays on the carry path.
+        // committed the transaction, naming what the live commit seated,
+        // under the clock of the block below it so the replay stays on
+        // the carry path.
         let recovered = RecoveredState {
             committed_height: BlockHeight::new(2),
             replay: ReplayWindow {
-                blocks: vec![replayable(committing, 2_000)],
-                compose_from: BlockHeight::GENESIS,
+                blocks: vec![Verified::<CertifiedBlock>::from_persisted(naming(
+                    &committing,
+                    named,
+                ))],
+                dispatch_from: BlockHeight::GENESIS,
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -8085,11 +8932,11 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             Arc::new(TestCode::default()),
+            Arc::new(CrossingIndexSlot::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
         assert!(
@@ -8097,7 +8944,9 @@ mod tests {
             "construction has no topology to compose against, so it holds",
         );
 
-        let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+        let actions = restarted
+            .on_committed_state_restored(&schedule, &StubVmStatics)
+            .actions;
         assert_eq!(
             restarted.ticks.tick_assignment(held_hash),
             live.ticks.tick_assignment(held_hash),
@@ -8126,8 +8975,12 @@ mod tests {
             ValidatorId::new(0),
             vec![Arc::new(test_transaction(2))],
         );
-        live.on_block_committed(&schedule, &test_certify(next.clone(), 3_000));
-        restarted.on_block_committed(&schedule, &test_certify(next, 3_000));
+        live.commit_block_carrying(
+            &schedule,
+            &test_certify(next.clone(), 3_000),
+            Naming::Composed,
+        );
+        restarted.commit_block_carrying(&schedule, &test_certify(next, 3_000), Naming::Composed);
         assert_eq!(
             tick_members(&restarted, 3),
             tick_members(&live, 3),
@@ -8149,7 +9002,7 @@ mod tests {
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
         let mut state = make_test_state();
-        state.on_block_committed(
+        state.commit_block_carrying(
             &schedule,
             &test_certify(
                 make_live_block(
@@ -8160,6 +9013,7 @@ mod tests {
                 ),
                 1_000,
             ),
+            Naming::Composed,
         );
 
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
@@ -8175,7 +9029,7 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )],
-                fee_receipts: Vec::new(),
+                refusal_receipts: Vec::new(),
             },
         );
         state.emit_vote_actions(&schedule);
@@ -8204,34 +9058,122 @@ mod tests {
         state.scan_votable_ticks(&schedule);
     }
 
+    /// `block` certified with its header's parent QC at `parent_ms` and
+    /// its own certifying QC at `qc_ms`: the certifying stamp rides
+    /// outside the signed header, so the two can disagree.
+    fn certify_split(block: Block, parent_ms: u64, qc_ms: u64) -> CertifiedBlock {
+        let stamped = test_certify(block, parent_ms);
+        let qc = stamped.qc();
+        let rewritten = QuorumCertificate::new(
+            qc.block_hash(),
+            qc.shard_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            qc.signers().clone(),
+            qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(qc_ms),
+        );
+        CertifiedBlock::new_unchecked(
+            stamped.block().clone(),
+            Verified::new_unchecked_for_test(rewritten),
+        )
+    }
+
+    fn clears_the_tick_chain(actions: &[Action]) -> bool {
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::ClearTickChain))
+    }
+
+    /// The latch reads the committed tip header's parent QC, never the
+    /// block's own certifying QC: the terminal block composes as any
+    /// other, however its certifying stamp reads, and the quiescence
+    /// commit after it derives the latch before it composes.
+    #[test]
+    fn the_latch_reads_the_quiescence_commits_parent_qc() {
+        let schedule = terminating_schedule();
+        let mut state = make_test_state();
+
+        let terminal = make_live_block(
+            BlockHeight::new(1),
+            500,
+            ValidatorId::new(0),
+            vec![Arc::new(test_transaction(1))],
+        );
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &certify_split(terminal, 500, 1_500),
+            Naming::Composed,
+        );
+        assert!(
+            !effects.terminal,
+            "the terminal block's own fold is not the quiescence commit"
+        );
+        assert!(!state.terminated);
+        assert_eq!(
+            tick_members(&state, 1).len(),
+            1,
+            "the terminal block composes"
+        );
+
+        let quiescence = make_live_block(
+            BlockHeight::new(2),
+            1_500,
+            ValidatorId::new(0),
+            vec![Arc::new(test_transaction(2))],
+        );
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &test_certify(quiescence, 1_500),
+            Naming::Composed,
+        );
+        assert!(
+            effects.terminal,
+            "a parent QC past the cut is the quiescence commit"
+        );
+        assert!(clears_the_tick_chain(&effects.actions));
+        assert!(
+            tick_members(&state, 2).is_empty(),
+            "the latch is derived before the quiescence commit composes",
+        );
+        assert!(
+            tick_members(&state, 1).is_empty(),
+            "and the terminal block's tick, which nothing can certify, is drained",
+        );
+    }
+
+    /// A schedule in which [`HOME`] splits at the end of epoch 0 while
+    /// [`PEER`] runs on, with windows retained well past a straddler's
+    /// deadline.
+    fn home_terminating_schedule(epoch_duration_ms: u64) -> TopologySchedule {
+        let (left, right) = HOME.children();
+        let mut sched = TopologySchedule::new(
+            epoch_duration_ms,
+            Epoch::new(0),
+            leaves_snap(&[HOME, PEER], &[(HOME, 0)]),
+        );
+        let post = leaves_snap_departed(&[left, right, PEER], &[], &[(HOME, None)]);
+        for epoch in 1..=12u64 {
+            sched.insert(Epoch::new(epoch), Arc::clone(&post));
+        }
+        sched.set_head(post);
+        sched
+    }
+
     /// A terminated chain composes nothing, however its candidates
     /// unblock afterwards.
     ///
-    /// The sweep fires once, on the first coast commit, while
-    /// composition runs on every one after it. A tick composed past the
-    /// terminal anchors where no vote tracker exists, so it is never
-    /// votable — an execution batch dispatched and a write into the tick
-    /// chain just cleared, for an outcome that can never certify.
-    ///
-    /// Two things stand between the coast commit and that tick, and the
-    /// test separates them: the sweep clears what is held, and the latch
-    /// refuses what arrives after. The re-registration below is the
+    /// The drain at the quiescence commit clears what is held, and the
+    /// latch refuses what arrives after. The registration below is the
     /// second case — the shape a cross-shard provision landing past the
-    /// terminal leaves — and it is what the clear alone does not cover.
+    /// terminal leaves — and it is what the drain alone does not cover.
     #[test]
     fn a_terminated_chain_composes_no_further_tick() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
-
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &PriceTable::GENESIS,
-            [(&transaction, &Classified::whole())],
-        );
 
         // BASELINE: the same commit on a live chain composes a tick.
         {
@@ -8248,7 +9190,11 @@ mod tests {
                 ValidatorId::new(0),
                 vec![],
             );
-            live.on_block_committed(&schedule, &test_certify(block, deadline_ms));
+            live.commit_block_carrying(
+                &two_shard_topology(),
+                &test_certify(block, deadline_ms),
+                Naming::Composed,
+            );
             assert!(
                 live.ticks
                     .get_tick(&TickId::new(HOME, BlockHeight::new(1)))
@@ -8257,46 +9203,259 @@ mod tests {
             );
         }
 
-        // The chain's terminal block committed and the sweep ran.
-        let swept = state.abort_pending_ticks();
-        assert!(
-            swept
-                .iter()
-                .any(|action| matches!(action, Action::ClearTickChain)),
-            "the sweep clears the tick chain, got {swept:?}",
+        let schedule = home_terminating_schedule(10_000);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let quiescence = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(1),
+            20_000,
+            ValidatorId::new(0),
+            vec![],
         );
-
-        assert!(
-            state.candidates.is_empty(),
-            "the sweep took the candidates with the ticks",
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &test_certify(quiescence, 20_000),
+            Naming::Composed,
         );
+        assert!(effects.terminal);
 
-        // A candidate that lands after the sweep: composition admitted
-        // exactly this one on the live chain above, so nothing but the
-        // latch stands between it and a tick.
+        // A candidate that lands after the quiescence commit:
+        // composition admitted exactly this one on the live chain above,
+        // so nothing but the latch stands between it and a tick.
         state.counterparts.ledger.register_committed(
             test_committed(),
             &PriceTable::GENESIS,
             [(&transaction, &Classified::whole())],
         );
-
-        // A coast commit past it.
         let coast = make_live_block_on_shard(
             HOME,
-            BlockHeight::new(1),
+            BlockHeight::new(2),
             deadline_ms,
             ValidatorId::new(0),
             vec![],
         );
-        state.on_block_committed(&schedule, &test_certify(coast, deadline_ms));
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &test_certify(coast, deadline_ms),
+            Naming::Composed,
+        );
 
+        assert!(!effects.terminal, "the drain runs once");
         assert!(
             state
                 .ticks
-                .get_tick(&TickId::new(HOME, BlockHeight::new(1)))
+                .get_tick(&TickId::new(HOME, BlockHeight::new(2)))
                 .is_none(),
             "a terminated chain composes no tick, not even for a candidate \
-             registered after the sweep",
+             registered after the quiescence commit",
+        );
+    }
+
+    /// Nothing clears the latch: a later tip whose anchor resolves no
+    /// window reads not-past, and the chain stays terminated without
+    /// draining again.
+    #[test]
+    fn the_latch_never_clears() {
+        let schedule = terminating_schedule();
+        let mut state = make_test_state();
+        let quiescence = make_live_block(BlockHeight::new(1), 1_500, ValidatorId::new(0), vec![]);
+        assert!(
+            state
+                .commit_block_carrying(
+                    &schedule,
+                    &test_certify(quiescence, 1_500),
+                    Naming::Composed
+                )
+                .terminal
+        );
+
+        // Epoch 50 is a window this schedule never committed.
+        let unresolved = make_live_block(
+            BlockHeight::new(2),
+            50_500,
+            ValidatorId::new(0),
+            vec![Arc::new(test_transaction(1))],
+        );
+        assert!(!schedule.past_terminal(ShardId::ROOT, WeightedTimestamp::from_millis(50_500)));
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &test_certify(unresolved, 50_500),
+            Naming::Composed,
+        );
+        assert!(!effects.terminal);
+        assert!(
+            !clears_the_tick_chain(&effects.actions),
+            "the drain does not run again"
+        );
+        assert!(state.terminated);
+        assert!(tick_members(&state, 2).is_empty());
+    }
+
+    /// A coordinator restarted over `blocks`, anchored where the first of
+    /// them begins.
+    fn restarted_over(
+        blocks: Vec<Verified<CertifiedBlock>>,
+        committed_height: u64,
+        anchor_ms: u64,
+    ) -> ExecutionCoordinator {
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(committed_height),
+            replay: ReplayWindow {
+                blocks,
+                dispatch_from: BlockHeight::GENESIS,
+                anchor_wt: Some(WeightedTimestamp::from_millis(anchor_ms)),
+            },
+            ..RecoveredState::default()
+        };
+        ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            Arc::new(TestCode::default()),
+            Arc::new(CrossingIndexSlot::default()),
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
+        )
+    }
+
+    /// A replay that crosses the quiescence commit derives the latch in
+    /// that block's fold, as the live chain did, and composes nothing
+    /// past it.
+    #[test]
+    fn a_replay_across_the_quiescence_commit_composes_nothing_past_it() {
+        let schedule = terminating_schedule();
+        let block = |height: u64, ms: u64, seed: u8| {
+            replayable(
+                make_live_block(
+                    BlockHeight::new(height),
+                    ms,
+                    ValidatorId::new(0),
+                    vec![Arc::new(test_transaction(seed))],
+                ),
+                ms,
+            )
+        };
+        let mut restarted = restarted_over(
+            vec![block(1, 500, 1), block(2, 1_500, 2), block(3, 1_800, 3)],
+            3,
+            0,
+        );
+
+        let effects = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+        assert!(effects.terminal);
+        assert!(clears_the_tick_chain(&effects.actions));
+        assert!(restarted.terminated);
+        for height in 1..=3 {
+            assert!(
+                tick_members(&restarted, height).is_empty(),
+                "no tick stands at height {height}",
+            );
+        }
+    }
+
+    /// A replay whose window starts past the quiescence commit derives
+    /// the latch in its first block's fold, before that block composes.
+    #[test]
+    fn a_replay_starting_past_the_quiescence_commit_terminates_at_its_first_block() {
+        let schedule = terminating_schedule();
+        let past = make_live_block(
+            BlockHeight::new(4),
+            1_800,
+            ValidatorId::new(0),
+            vec![Arc::new(test_transaction(1))],
+        );
+        let mut restarted = restarted_over(vec![replayable(past, 1_800)], 4, 1_500);
+
+        let effects = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+        assert!(effects.terminal);
+        assert!(tick_members(&restarted, 4).is_empty());
+    }
+
+    /// A seat with no replay past the cut derives the latch in its first
+    /// fold and composes nothing there.
+    #[test]
+    fn a_seat_past_the_cut_terminates_before_its_first_composition() {
+        let schedule = terminating_schedule();
+        let mut seated = restarted_over(Vec::new(), 4, 1_500);
+        assert!(
+            !seated.terminated,
+            "nothing seeds the latch at construction"
+        );
+        assert!(
+            !seated
+                .on_committed_state_restored(&schedule, &StubVmStatics)
+                .terminal
+        );
+
+        let first = make_live_block(
+            BlockHeight::new(5),
+            1_800,
+            ValidatorId::new(0),
+            vec![Arc::new(test_transaction(1))],
+        );
+        let effects =
+            seated.commit_block_carrying(&schedule, &test_certify(first, 1_800), Naming::Composed);
+        assert!(effects.terminal);
+        assert!(tick_members(&seated, 5).is_empty());
+    }
+
+    /// The fold reads what a block's finalizations settle before it
+    /// releases the entries they name. A leg's reclaim whose core left
+    /// reports an abort only while its entry is held; read after the
+    /// release, the same finalization would report the acceptance.
+    #[test]
+    fn commit_block_takes_resolutions_before_it_releases_them() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&transaction, &leg_classified())],
+        );
+        state
+            .counterparts
+            .ledger
+            .record_abandonment_records(&[AbandonmentRecord::new(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                [UnsettledTx::for_transaction(
+                    &transaction,
+                    test_committed(),
+                    transaction.price(&PriceTable::GENESIS),
+                    Capped::empty(),
+                    &PriceTable::GENESIS,
+                )],
+            )]);
+
+        let reclaim: Arc<Verifiable<Finalization>> = Arc::new(
+            helpers_make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept)
+                .into(),
+        );
+        let block = helpers_make_live_block(
+            HOME,
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![],
+            vec![reclaim],
+        );
+        let effects =
+            state.commit_block_carrying(&schedule, &test_certify(block, 2_000), Naming::Composed);
+
+        assert_eq!(
+            effects.resolutions,
+            vec![(tx_hash, TxResolution::Decided(TransactionDecision::Aborted))],
+        );
+        assert_eq!(
+            state.counterparts.ledger.len(),
+            0,
+            "and the same fold released the entry"
         );
     }
 
@@ -8330,7 +9489,11 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        state.on_block_committed(&schedule, &test_certify(block, deadline_ms));
+        state.commit_block_carrying(
+            &schedule,
+            &test_certify(block, deadline_ms),
+            Naming::Composed,
+        );
         let outcomes: Vec<TxOutcome> = state
             .scan_votable_ticks(&schedule)
             .into_iter()
@@ -8374,7 +9537,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &leg_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         state
             .counterparts
             .ledger
@@ -8392,6 +9558,7 @@ mod tests {
                     &transaction,
                     test_committed(),
                     transaction.price(&PriceTable::GENESIS),
+                    Capped::empty(),
                     &PriceTable::GENESIS,
                 )],
             )]);
@@ -8403,7 +9570,13 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        let actions = state.on_block_committed(&schedule, &test_certify(block, past_deadline_ms));
+        let actions = state
+            .commit_block_carrying(
+                &schedule,
+                &test_certify(block, past_deadline_ms),
+                Naming::Composed,
+            )
+            .actions;
 
         let tick = state
             .ticks
@@ -8425,14 +9598,7 @@ mod tests {
             })
             .expect("the reclaim is dispatched to the engine");
         assert!(
-            matches!(
-                request.runs,
-                Runs::Settle {
-                    on: Licence::Unclaimed,
-                    charged: true,
-                    ..
-                }
-            ),
+            matches!(request.runs, Runs::Reclaim { charged: true, .. }),
             "the leg's finalization committed here, so its certificate settled the price"
         );
         assert!(!request.runs.abortable(), "nothing retracts a reclaim");
@@ -8459,7 +9625,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &leg_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
 
         let certificate = |outcome: ExecutionOutcome| {
             Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
@@ -8502,7 +9671,7 @@ mod tests {
                 TickId::new(PEER, BlockHeight::new(3)),
                 WeightedTimestamp::from_millis(7_000),
                 GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(tx_hash, outcome)]),
+                Capped::from_array([TxOutcome::new(tx_hash, outcome).as_role(Role::Core)]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )))
@@ -8567,7 +9736,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(transaction, classified)],
         );
-        state.counterparts.ledger.certify(transaction.hash());
+        state
+            .counterparts
+            .ledger
+            .certify(transaction.hash(), Certified::ByExecution);
         state
     }
 
@@ -8618,8 +9790,8 @@ mod tests {
         // both chains run on one wall clock: a node holding a
         // counterpart's header at `ts` has committed to there itself.
         state.committed_ts = state.committed_ts.max(ts);
-        let opened = state.on_committed_remote_header(schedule, shard);
-        (StateClaim::new(anchor, cells), opened)
+        let opened = state.on_committed_remote_header(schedule, anchor);
+        (StateClaim::new(anchor, cells, proof), opened)
     }
 
     /// Feed `state` the proof its own fetch brings back for `claim`,
@@ -8632,7 +9804,7 @@ mod tests {
     ) {
         let keys = claim.keys();
         let (_, proof) = state_and_proof(claim.anchor.shard, present, &keys);
-        state.on_proof_fetched(claim.anchor, keys, proof);
+        state.on_proof_fetched(claim.anchor, &keys, &proof, &[]);
     }
 
     /// Commit a block on [`HOME`] carrying `bundles` — the seam every
@@ -8669,90 +9841,12 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         };
-        state.on_block_committed(schedule, &test_certify(block, ts_ms))
-    }
-
-    /// Commit a block on `HOME` carrying `finalization`, the way this
-    /// shard's own writes reach its chain.
-    fn commit_finalizing(
-        state: &mut ExecutionCoordinator,
-        schedule: &TopologySchedule,
-        height: u64,
-        ts_ms: u64,
-        finalization: Finalization,
-    ) -> Vec<Action> {
-        let Block::Live {
-            header,
-            transactions,
-            provisions,
-            abandonment_records,
-            state_claims,
-            witness_sources,
-            ..
-        } = make_live_block_on_shard(
-            HOME,
-            BlockHeight::new(height),
-            ts_ms,
-            ValidatorId::new(0),
-            vec![],
-        )
-        else {
-            unreachable!("a live block")
-        };
-        let block = Block::Live {
-            header,
-            transactions,
-            certificates: Arc::new(Capped::from_array([Arc::new(Verifiable::from(
-                finalization,
-            ))])),
-            provisions,
-            abandonment_records,
-            state_claims,
-            witness_sources,
-        };
-        state.on_block_committed(schedule, &test_certify(block, ts_ms))
-    }
-
-    /// A record the ledger disposed of is let go at the commit that
-    /// took its leaf away.
-    ///
-    /// The scan at startup is only the set's first term. A record the
-    /// entry path settled would otherwise be held with no leaf behind
-    /// it, and a disposal composed over a cell nothing can read is
-    /// refused — which strands every other record in the member with
-    /// it. The other term, a record entering at the commit that writes
-    /// it, turns on the bytes a record is judged by and is covered where
-    /// the real answers are installed.
-    #[test]
-    fn a_record_is_let_go_at_the_commit_that_deletes_its_leaf() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state();
-        let (record_key, _, cell) = held_record(0x6A, 400_000);
         state
-            .counterparts
-            .held
-            .insert(record_key, HeldRecord::of(cell));
-
-        commit_finalizing(
-            &mut state,
-            &schedule,
-            1,
-            1_000,
-            make_finalization_leaving(
-                BlockHeight::new(1),
-                cell.tx,
-                StateWrites {
-                    cells: BTreeMap::from([(record_key, None)]),
-                    ..StateWrites::default()
-                },
-            ),
-        );
-        assert!(
-            state.counterparts.held.is_empty(),
-            "the leaf is gone, so nothing here still owes for it",
-        );
+            .commit_block_carrying(schedule, &test_certify(block, ts_ms), Naming::Composed)
+            .actions
     }
 
     /// Commit a block on `HOME` carrying `records`, the way a departure
@@ -8791,9 +9885,12 @@ mod tests {
                 Capped::new(records).expect("a list written out in a test"),
             ),
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         };
-        state.on_block_committed(schedule, &test_certify(block, ts_ms))
+        state
+            .commit_block_carrying(schedule, &test_certify(block, ts_ms), Naming::Composed)
+            .actions
     }
 
     /// The part a leg plays, with the cells a fixture names for it.
@@ -8816,13 +9913,14 @@ mod tests {
             && state.ticks.tick_assignment(tx_hash).is_some()
     }
 
-    /// A delivery that never claimed is probed at its lapse, the
-    /// deadline plus a validity range, and never at a header short of
-    /// it — the deadline itself included, where a core would already be
-    /// asked. The claim the chain carries is read with the lapse as its
-    /// floor, and licenses the reclaim.
+    /// A delivery that has not claimed is probed from its deadline, on
+    /// the same terms a core consumer's claim is. Its claim read absent
+    /// answers nothing and licenses nothing: the crossing is the
+    /// consumer's from the moment the core committed it, and it is the
+    /// consumer's still. The core's own committed cell is asked beside
+    /// it and answers as it always did.
     #[test]
-    fn a_silent_delivery_is_probed_past_the_lapse_and_its_lapse_offered() {
+    fn a_silent_deliverys_absent_claim_licenses_no_reclaim() {
         let schedule = delivery_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -8832,10 +9930,11 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
-        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
+        let past_deadline = deadline.plus(MAX_VALIDITY_RANGE);
         let claim = delivered_claim(&delivery_classified());
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.counterparts.ledger.register_committed(
@@ -8843,28 +9942,32 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &delivery_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
 
         let held: [(ShardId, u64, WeightedTimestamp, &[u8]); 3] = [
             (BEARER, 3, deadline, b"bearer"),
             (DELIVERER, 3, deadline, b"deadline"),
-            (DELIVERER, 4, lapse, b"at"),
+            (DELIVERER, 4, past_deadline, b"at"),
         ];
         for (shard, height, ts, tag) in held {
-            state.proven_anchors().record(Anchor {
+            let proven = Anchor {
                 shard,
                 height: BlockHeight::new(height),
                 state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
                 ts,
-            });
-            state.on_committed_remote_header(&schedule, shard);
+            };
+            state.proven_anchors().record(proven);
+            state.on_committed_remote_header(&schedule, proven);
         }
-        let later = lapse.plus(Duration::from_secs(1));
+        let later = past_deadline.plus(Duration::from_secs(1));
         let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, later, &[], &[claim]);
         let fetches = state_proof_fetches(&opened);
         assert!(
             fetches.contains(&(bundle.anchor, vec![claim])),
-            "the newest header inside the lapse window is the anchor, and the claim cell the key"
+            "the newest header past the deadline is the anchor, and the claim cell the key"
         );
         let core_cell = committed_tx_cell_key(
             BEARER,
@@ -8881,12 +9984,12 @@ mod tests {
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
             reading(&state, DELIVERER, tx_hash, claim),
-            Some(Inclusion::Absent),
-            "the lapse is read off the committed claim"
+            None,
+            "the committed claim absent says only that the delivery has not run"
         );
         assert!(
-            reclaim_admitted(&state, figures.tx_hash),
-            "and licenses the reclaim, with no record in between"
+            !reclaim_admitted(&state, figures.tx_hash),
+            "and licenses no reclaim: the crossing stays the consumer's"
         );
     }
 
@@ -8904,6 +10007,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -8918,13 +10022,24 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &delivery_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
-        let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, later, &[], &[claim]);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
+        let (bundle, opened) = proven_at(
+            &mut state,
+            &schedule,
+            DELIVERER,
+            5,
+            later,
+            &[claim],
+            &[claim],
+        );
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
         );
-        fetch_answers(&mut state, &bundle, &[]);
+        fetch_answers(&mut state, &bundle, &[claim]);
         assert_eq!(
             state.offers().state_claims,
             vec![bundle.clone()],
@@ -8967,20 +10082,37 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &delivery_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
 
-        let lapse = Window::Lapse
-            .of(Deadline::of_transaction(&transaction))
-            .start;
-        let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, lapse, &[], &[claim]);
+        let asked_from = Deadline::of_transaction(&transaction).at();
+        let (bundle, opened) = proven_at(
+            &mut state,
+            &schedule,
+            DELIVERER,
+            5,
+            asked_from,
+            &[claim],
+            &[claim],
+        );
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
             "the cell is asked about once",
         );
-        fetch_answers(&mut state, &bundle, &[]);
+        fetch_answers(&mut state, &bundle, &[claim]);
 
-        let (_, opened) = proven_at(&mut state, &schedule, DELIVERER, 6, lapse, &[], &[claim]);
+        let (_, opened) = proven_at(
+            &mut state,
+            &schedule,
+            DELIVERER,
+            6,
+            asked_from,
+            &[claim],
+            &[claim],
+        );
         assert!(
             state_proof_fetches(&opened).is_empty(),
             "and not again at a newer header, the answer being in hand",
@@ -9011,10 +10143,11 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
-        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
+        let past_deadline = deadline.plus(MAX_VALIDITY_RANGE);
         // The delivery's target falls under the deliverer's left child,
         // as the trie cuts it.
         let claim = delivered_claim(&delivery_classified());
@@ -9029,50 +10162,61 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &delivery_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         // The local chain has crossed the deliverer's cut: its committee
         // is anchored in a window whose trie names the children.
-        state.committed_committee_anchor_wt = lapse;
+        state.committed_committee_anchor_wt = past_deadline;
 
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
-            [(3, deadline, b"short"), (4, lapse, b"at")];
+            [(3, deadline, b"short"), (4, past_deadline, b"at")];
         for (height, ts, tag) in held {
-            state.proven_anchors().record(Anchor {
+            let proven = Anchor {
                 shard: successor,
                 height: BlockHeight::new(height),
                 state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
                 ts,
-            });
-            state.on_committed_remote_header(&schedule, successor);
+            };
+            state.proven_anchors().record(proven);
+            state.on_committed_remote_header(&schedule, proven);
         }
-        let later = lapse.plus(Duration::from_secs(1));
+        let later = past_deadline.plus(Duration::from_secs(1));
         let (bundle, opened) = proven_at(&mut state, &schedule, successor, 5, later, &[], &[claim]);
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
-            "the successor's newest header inside the lapse window is the anchor, and the \
-             claim cell the key; the departed deliverer, with no header, is not asked"
+            "the successor's newest header past the deadline is the anchor, and the claim \
+             cell the key; the departed deliverer, with no header, is not asked"
         );
 
-        // A header of the departed deliverer past the lapse is asked as
-        // well.
-        let (peer_bundle, peer_opened) =
-            proven_at(&mut state, &schedule, DELIVERER, 6, lapse, &[], &[claim]);
+        // A header of the departed deliverer past the deadline is asked
+        // as well.
+        let (peer_bundle, peer_opened) = proven_at(
+            &mut state,
+            &schedule,
+            DELIVERER,
+            6,
+            past_deadline,
+            &[],
+            &[claim],
+        );
         assert_eq!(
             state_proof_fetches(&peer_opened),
             vec![(peer_bundle.anchor, vec![claim])],
-            "the shard that was to deliver is asked wherever it has a header past the lapse"
+            "the shard that was to deliver is asked wherever it has a header past the deadline"
         );
 
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
             reading(&state, successor, tx_hash, claim),
-            Some(Inclusion::Absent),
-            "the lapse is read off the successor's claim"
+            None,
+            "the successor's cell absent says only that the delivery has not run"
         );
         assert!(
-            reclaim_admitted(&state, figures.tx_hash),
-            "and licenses the reclaim"
+            !reclaim_admitted(&state, figures.tx_hash),
+            "and licenses nothing: the crossing is the consumer's whenever it runs"
         );
     }
 
@@ -9099,6 +10243,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9115,13 +10260,14 @@ mod tests {
             (4, deadline, b"at"),
         ];
         for (height, ts, tag) in held {
-            state.proven_anchors().record(Anchor {
+            let proven = Anchor {
                 shard: CORE,
                 height: BlockHeight::new(height),
                 state_root: root(tag),
                 ts,
-            });
-            let actions = state.on_committed_remote_header(&schedule, CORE);
+            };
+            state.proven_anchors().record(proven);
+            let actions = state.on_committed_remote_header(&schedule, proven);
             assert!(
                 state_proof_fetches(&actions).is_empty(),
                 "before the deadline nothing is asked"
@@ -9140,6 +10286,9 @@ mod tests {
 
     /// The core's committed cell proved absent past the deadline
     /// reaches the vote fence and is offered as an `Unclaimed` record.
+    /// An absence says only that the core never included the
+    /// transaction: a core that included and refused it keeps its cell
+    /// and answers with a `Never` instead.
     /// The window is what licenses the answer, not the anchor the
     /// proposer happened to probe at: a proof taken short of the
     /// deadline says nothing, and a second copy adds nothing.
@@ -9159,7 +10308,11 @@ mod tests {
             state_proof_fetches(&opened),
             vec![(
                 bundle.anchor,
-                vec![key, core_claim(&two_shard_core_classified())]
+                vec![
+                    key,
+                    core_claim(&two_shard_core_classified()),
+                    core_decline(&two_shard_core_classified()),
+                ]
             )],
             "the newest header inside the window is the anchor, and the consumer's claim is \
              asked beside the committed cell"
@@ -9209,14 +10362,15 @@ mod tests {
         );
     }
 
-    /// A committed cell read present is not the core's last word. A
-    /// member that included the transaction can still refuse or abort
-    /// inside the core window, and its retraction is what the leg has
-    /// to read to take the crossing back — so a present cell is a
-    /// member still pending, asked again at each newer header, and its
-    /// certificate is not fetched on it.
+    /// A committed cell read present is the core's inclusion, not its
+    /// verdict. A member that included the transaction answers its
+    /// producers itself, with a claim or a `Never` beside the cell, so
+    /// the cell is asked again at each newer header with both answers
+    /// beside it: no certificate is fetched on it, a cell that stays
+    /// present licenses nothing on its own, and the `Never` beside it is
+    /// what licenses taking the crossing back.
     #[test]
-    fn a_core_cell_read_present_is_asked_again_until_its_retraction_answers() {
+    fn a_core_cell_read_present_is_answered_by_the_never_beside_it() {
         let schedule = two_shard_core_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -9226,16 +10380,20 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline
         .at();
         let validity_end = transaction.validity_range().end_timestamp_exclusive;
         let cell = |shard| committed_tx_cell_key(shard, tx_hash, validity_end);
+        let claim = core_claim(&two_shard_core_classified());
+        let decline = core_decline(&two_shard_core_classified());
         let mut state = leg_state(&transaction, &two_shard_core_classified());
         state.committed_ts = deadline;
 
-        // Both core shards had committed the transaction at the deadline.
+        // Both core shards had committed the transaction at the deadline,
+        // and the core had answered nothing yet.
         let (included, opened) = proven_at(
             &mut state,
             &schedule,
@@ -9243,16 +10401,14 @@ mod tests {
             4,
             deadline,
             &[cell(CORE)],
-            &[cell(CORE)],
+            &[cell(CORE), claim, decline],
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(
-                included.anchor,
-                vec![cell(CORE), core_claim(&two_shard_core_classified())]
-            )],
-            "the committed cell is asked about, and the consumer's claim beside it"
+            vec![(included.anchor, vec![cell(CORE), claim, decline])],
+            "the committed cell is asked about, and the consumer's answers beside it"
         );
+        fetch_answers(&mut state, &included, &[cell(CORE)]);
         let (sibling_included, _) = proven_at(
             &mut state,
             &schedule,
@@ -9272,7 +10428,7 @@ mod tests {
         );
         assert!(
             reading(&state, CORE_SIBLING, tx_hash, cell(CORE_SIBLING)).is_none(),
-            "a cell present is a member still pending, not an answer"
+            "a cell present is a member that included the transaction, not an answer"
         );
         assert!(
             !folded.iter().any(|action| matches!(
@@ -9286,30 +10442,38 @@ mod tests {
         );
         assert!(state.offers().abandonment_records.is_empty());
 
-        // A block later the sibling aborted it and retracted its cell.
+        // A block later the core still holds its cell, and beside it
+        // the `Never` its refusal wrote.
         let later = deadline.plus(Duration::from_secs(1));
-        let (retracted, opened) = proven_at(
+        let (refused, opened) = proven_at(
             &mut state,
             &schedule,
-            CORE_SIBLING,
+            CORE,
             5,
             later,
-            &[],
-            &[cell(CORE_SIBLING)],
+            &[cell(CORE), decline],
+            &[cell(CORE), claim, decline],
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(retracted.anchor, vec![cell(CORE_SIBLING)])],
-            "the sibling is asked again at the newer header",
+            vec![(refused.anchor, vec![cell(CORE), claim, decline])],
+            "the core is asked again at the newer header",
         );
-        commit_carrying(&mut state, &schedule, 2, later.as_millis(), vec![retracted]);
-        assert_eq!(
-            reading(&state, CORE_SIBLING, tx_hash, cell(CORE_SIBLING)),
-            Some(Inclusion::Absent)
+        commit_carrying(&mut state, &schedule, 2, later.as_millis(), vec![refused]);
+        assert!(
+            reading(&state, CORE, tx_hash, cell(CORE)).is_none(),
+            "a cell still present is still no answer",
+        );
+        assert!(
+            matches!(
+                reading(&state, CORE, tx_hash, decline),
+                Some(Inclusion::Present(_))
+            ),
+            "the Never beside it is",
         );
         assert!(
             reclaim_admitted(&state, tx_hash),
-            "which is what licenses taking the crossing back"
+            "and it is what licenses taking the crossing back",
         );
     }
 
@@ -9332,6 +10496,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9349,7 +10514,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &two_shard_core_classified())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         state.committed_ts = deadline;
 
         let (never, opened) = proven_at(
@@ -9414,6 +10582,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9437,7 +10606,11 @@ mod tests {
             state_proof_fetches(&opened),
             vec![(
                 included.anchor,
-                vec![cell(CORE), core_claim(&two_shard_core_classified())]
+                vec![
+                    cell(CORE),
+                    core_claim(&two_shard_core_classified()),
+                    core_decline(&two_shard_core_classified()),
+                ]
             )],
             "the shard holding the consumer's target is asked about its claim too",
         );
@@ -9513,11 +10686,15 @@ mod tests {
             BTreeSet::from([claim]),
             "the claim the fixture asks about is the one the shape derives",
         );
-        state.counterparts.ledger.certify(transaction.hash());
+        state
+            .counterparts
+            .ledger
+            .certify(transaction.hash(), Certified::ByExecution);
         state.committed_ts = UnsettledTx::for_transaction(
             transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -9539,6 +10716,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -9560,8 +10738,11 @@ mod tests {
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![cell, claim])],
-            "the committed cell is asked about, and the consumer's claim beside it"
+            vec![(
+                bundle.anchor,
+                vec![cell, claim, core_decline(&leg_classified())]
+            )],
+            "the committed cell is asked about, and the consumer's answers beside it"
         );
 
         fetch_answers(&mut state, &bundle, &[]);
@@ -9610,6 +10791,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -9632,8 +10814,11 @@ mod tests {
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![core_key, claim])],
-            "the committed cell and the claim are asked together"
+            vec![(
+                bundle.anchor,
+                vec![core_key, claim, core_decline(&two_shard_core_classified())]
+            )],
+            "the committed cell and the consumer's answers are asked together"
         );
 
         fetch_answers(&mut state, &bundle, &[core_key]);
@@ -9664,53 +10849,138 @@ mod tests {
     }
 
     /// An escrow record this shard holds: a leaf naming a claim cell
-    /// that sits on `PEER`.
-    fn held_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+    /// that sits on `PEER`, and a cell of its own to credit where
+    /// nobody claims it.
+    fn held_record(local: u8, validity_end_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+        crossing_fixture(local, validity_end_ms, HOME, PEER)
+    }
+
+    /// The record the entry [`leg_classified`] registers issues here, as
+    /// its leaf holds it: a record an entry of this shard's owns, and one
+    /// its consumer on `PEER` is asked about.
+    fn owned_record(validity_end_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+        let id = leg_classified().edges()[0].crossing.id;
+        let record_key = id.record_key(&ProtocolHasher);
+        let cell = id.cell(
+            straddling_transaction(1).hash(),
+            ResourceAddr::new([0xE1; 31]),
+            1_000,
+            validity_end_ms,
+            Terms::Escrowed {
+                credit: SubstateKey {
+                    owner: record_key.owner,
+                    local: LocalKey([0x0F; 16]),
+                },
+            },
+        );
+        (
+            record_key,
+            id.answer_key(&ProtocolHasher, Answered::Taken),
+            cell,
+        )
+    }
+
+    /// A crossing handed *to* this shard: the record sits on `PEER`
+    /// where its producer committed it, and the claim under a target of
+    /// `HOME`'s, which is what makes the answer this shard's to give.
+    ///
+    /// [`held_record`] read from the other end, and the ends are what
+    /// the two fixtures differ in: a producer holds the record and asks
+    /// about the answer, a consumer holds the answer and is asked for
+    /// it.
+    fn arrived_record(local: u8, validity_end_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+        crossing_fixture(local, validity_end_ms, PEER, HOME)
+    }
+
+    /// A record and its claim for one crossing, produced under a target
+    /// of `producer`'s and consumed under one of `consumer`'s, with the
+    /// keys the system derives.
+    fn crossing_fixture(
+        local: u8,
+        validity_end_ms: u64,
+        producer: ShardId,
+        consumer: ShardId,
+    ) -> (SubstateKey, SubstateKey, CrossingCell) {
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
-        let claim = SubstateKey {
-            owner: committed_tx_cell_key(
-                PEER,
-                transaction.hash(),
-                transaction.validity_range().end_timestamp_exclusive,
-            )
-            .owner,
-            local: LocalKey([local; 16]),
-        };
-        let record_key = SubstateKey {
-            owner: committed_tx_cell_key(
-                HOME,
-                transaction.hash(),
-                transaction.validity_range().end_timestamp_exclusive,
-            )
-            .owner,
-            local: LocalKey([local ^ 0xFF; 16]),
-        };
-        let cell = CrossingCell {
-            resource: ResourceAddr::new([0xE1; 31]),
-            amount: 1_000,
+        let validity_end = transaction.validity_range().end_timestamp_exclusive;
+        let id = CrossingId {
+            producer: committed_tx_cell_key(producer, transaction.hash(), validity_end).owner,
+            consumer: committed_tx_cell_key(consumer, transaction.hash(), validity_end).owner,
             intent: IntentHash(Hash32([local; 32])),
             local: 0,
             output: 0,
-            expiry_ms,
-            tx: transaction.hash(),
-            consumer_claim: claim,
-            origin: None,
         };
+        let record_key = id.record_key(&ProtocolHasher);
+        let claim = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let cell = id.cell(
+            transaction.hash(),
+            ResourceAddr::new([0xE1; 31]),
+            1_000,
+            validity_end_ms,
+            Terms::Escrowed {
+                credit: SubstateKey {
+                    owner: record_key.owner,
+                    local: LocalKey([local ^ 0x0F; 16]),
+                },
+            },
+        );
         (record_key, claim, cell)
     }
 
+    /// Hold `cells` in this shard's committed state, as its crossing
+    /// index answers, and derive the questions they put under
+    /// `schedule`'s head.
+    fn hold(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        cells: impl IntoIterator<Item = (SubstateKey, Vec<u8>)>,
+    ) -> Arc<TestRows> {
+        let rows = Arc::new(TestRows::default());
+        for (key, value) in cells {
+            rows.put(key, value);
+        }
+        state.crossing_index().bind(Arc::clone(&rows) as _);
+        state.counterparts.derive_asks(schedule.head().shard_trie());
+        rows
+    }
+
+    /// The reclaim a commit dispatched, if any.
+    fn reclaim_in(actions: &[Action]) -> Option<Runs> {
+        actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => requests
+                .iter()
+                .find(|request| matches!(request.runs, Runs::Reclaim { .. }))
+                .map(|request| request.runs.clone()),
+            _ => None,
+        })
+    }
+
+    /// Which of the two answer cells a proof carries, of the pair one
+    /// probe asks for.
+    #[derive(Clone, Copy)]
+    enum Proved {
+        /// The consumer holds the crossing.
+        Claim,
+        /// The consumer will never take it.
+        Decline,
+        /// Neither cell is there, which answers nothing.
+        Neither,
+    }
+
     /// What a shard holding one record dispatches, once a block carries
-    /// a proof of its claim. `owed_here` registers the issuing
-    /// transaction in the ledger, which is the shard's other way of
-    /// reaching the same leaves.
-    fn held_settlement(present: bool, owed_here: bool) -> Option<Runs> {
+    /// a proof of its consumer's two answer cells. `owed_here` registers
+    /// the issuing transaction in the ledger, which is the shard's other
+    /// way of reaching the same leaves.
+    fn held_settlement(proved: Proved, owed_here: bool) -> Option<Runs> {
         let schedule = two_shard_topology();
-        let mut state = make_test_state();
-        // Past the lapse, which is where an absence answers.
-        let expiry_ms = 400_000;
-        let (record_key, claim, cell) = held_record(0x6A, expiry_ms);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        // Past the deadline, where a question is first asked, and short
+        // of the abandon window's close, where an escrowed record's is
+        // asked no more.
+        let validity_end_ms = 400_000;
+        let (record_key, claim, cell) = owned_record(validity_end_ms);
         if owed_here {
             let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
                 Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -9721,19 +10991,19 @@ mod tests {
                 [(&transaction, &leg_classified())],
             );
         }
-        let deadline = Deadline::from_expiry(expiry_ms);
-        let read_at = Window::Lapse
-            .of(deadline)
-            .start
-            .plus(Duration::from_secs(1));
-        state
-            .counterparts
-            .held
-            .insert(record_key, HeldRecord::of(cell));
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(validity_end_ms));
+        let read_at = deadline.at().plus(Duration::from_secs(1));
+        let decline = CrossingId::of_record(record_key.owner, &cell)
+            .answer_key(&ProtocolHasher, Answered::Never);
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
 
         // The claim sits on PEER, so the seat asks rather than reads.
         state.committed_ts = read_at;
-        let present_keys: Vec<SubstateKey> = if present { vec![claim] } else { Vec::new() };
+        let present_keys: Vec<SubstateKey> = match proved {
+            Proved::Claim => vec![claim],
+            Proved::Decline => vec![decline],
+            Proved::Neither => Vec::new(),
+        };
         let (bundle, opened) = proven_at(
             &mut state,
             &schedule,
@@ -9741,17 +11011,25 @@ mod tests {
             5,
             read_at,
             &present_keys,
-            &[claim],
+            &[claim, decline],
         );
         assert_eq!(
             state_proof_fetches(&opened)
                 .iter()
-                .any(|(_, keys)| keys.contains(&claim)),
-            !owed_here,
-            "the shard asks whoever holds the claim's prefix, and asks only \
-             where no entry of its own is already asking",
+                .filter(|(_, keys)| keys.contains(&claim))
+                .count(),
+            1,
+            "the shard asks whoever holds the claim's prefix, once: the leaf asks \
+             only where no entry of its own is already asking",
         );
-        let actions = commit_carrying(&mut state, &schedule, 1, read_at.as_millis(), vec![bundle]);
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let actions = commit_carrying(
+            &mut state,
+            &schedule,
+            1,
+            read_at.as_millis(),
+            vec![bundle.naming([(claim, id), (decline, id)])],
+        );
         actions.iter().find_map(|action| match action {
             Action::ExecuteTransactions { requests, .. } => {
                 requests.first().map(|request| request.runs.clone())
@@ -9760,34 +11038,32 @@ mod tests {
         })
     }
 
-    /// A held record whose claim routes elsewhere is decided against
-    /// that claim, proved.
+    /// A held record whose consumer routes elsewhere is decided against
+    /// that consumer's answer, proved — and by nothing else.
     ///
-    /// Present, the consumer holds the crossing and the record is
-    /// deleted; absent past the lapse, nobody took it and the value goes
-    /// back. Without this a shard skips such a record on every tick
-    /// forever: the value stands on its prefix with nothing naming it.
+    /// Two presences and no absence. The claim present is the consumer
+    /// holding the crossing, so the record is retired; the decline
+    /// present is the consumer's word that it never will, so the value
+    /// goes back. Neither cell there says only that the consumer has
+    /// not spoken, at any clock: a leaf does not name its consumer's
+    /// role, so no window makes an absence honest for every record this
+    /// reads.
     #[test]
-    fn a_held_record_is_decided_against_a_proof_of_its_claim() {
+    fn a_held_record_is_decided_against_a_proof_of_its_consumers_answer() {
         assert!(
-            matches!(
-                held_settlement(true, false),
-                Some(Runs::Settle {
-                    on: Licence::Claimed,
-                    ..
-                })
-            ),
-            "a claim proved present retires the record"
+            held_settlement(Proved::Claim, false).is_none(),
+            "a claim proved present composes no member: the fold removes the record",
         );
         assert!(
             matches!(
-                held_settlement(false, false),
-                Some(Runs::Settle {
-                    on: Licence::Unclaimed,
-                    ..
-                })
+                held_settlement(Proved::Decline, false),
+                Some(Runs::Reclaim { .. })
             ),
-            "and proved absent past the lapse takes the crossing back"
+            "a decline proved present takes the crossing back"
+        );
+        assert!(
+            held_settlement(Proved::Neither, false).is_none(),
+            "and neither cell proved present decides nothing, however late the reading",
         );
     }
 
@@ -9803,17 +11079,16 @@ mod tests {
     fn a_departure_reclaims_a_record_no_entry_names() {
         let schedule = two_shard_topology();
         let mut state = make_test_state();
-        let expiry_ms = 400_000;
-        let (record_key, _, cell) = held_record(0x6A, expiry_ms);
-        state
-            .counterparts
-            .held
-            .insert(record_key, HeldRecord::of(cell));
+        let validity_end_ms = 400_000;
+        let (record_key, _, cell) = held_record(0x6A, validity_end_ms);
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
 
         // Past the end of the window the entry stood in, which is where
         // the claim cell sweeps too.
         let past = Window::LegEntry
-            .of(Deadline::from_expiry(expiry_ms))
+            .of(Deadline::of(WeightedTimestamp::from_millis(
+                validity_end_ms,
+            )))
             .end
             .plus(Duration::from_secs(1));
         state.committed_ts = past;
@@ -9832,6 +11107,134 @@ mod tests {
                     &transaction,
                     test_committed(),
                     transaction.price(&PriceTable::GENESIS),
+                    Capped::from_array([record_key]),
+                    &PriceTable::GENESIS,
+                )],
+            )],
+        );
+        let runs = reclaim_in(&actions);
+        assert!(
+            matches!(
+                &runs,
+                Some(Runs::Reclaim { records, .. })
+                    if records == &vec![(record_key, Unclaimable::IssuedBy { tx: cell.tx })]
+            ),
+            "the departure takes the crossing back; dispatched {runs:?}",
+        );
+    }
+
+    /// A departure names off the leaf a crossing no entry names, once the
+    /// departed shard's settled set is held and says it never settled
+    /// the transaction, and the block carrying the name composes the
+    /// reclaim; a replica that never held an entry composes the same.
+    /// A set naming the transaction offers nothing.
+    #[test]
+    fn a_departure_names_a_crossing_off_its_leaf_and_reclaims_it() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let validity_end_ms = 400_000;
+        let (record_key, _, cell) = held_record(0x6A, validity_end_ms);
+        let rows = hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+        let past = Window::LegEntry
+            .of(Deadline::of(WeightedTimestamp::from_millis(
+                validity_end_ms,
+            )))
+            .end
+            .plus(Duration::from_secs(1));
+        state.committed_ts = past;
+        let named = UnclaimedCrossing::of(record_key, &cell);
+
+        assert!(
+            state.offers().abandonment_records.is_empty(),
+            "no settled set held, nothing to answer for the departure",
+        );
+        state.counterparts.on_settled(
+            PEER,
+            SettledTxSet {
+                txs: BTreeSet::from([cell.tx]),
+                terminal_wt: past,
+            },
+        );
+        assert!(
+            state.offers().abandonment_records.is_empty(),
+            "a set naming the transaction says the departed shard may have taken it",
+        );
+        state.counterparts.on_settled(
+            PEER,
+            SettledTxSet {
+                txs: BTreeSet::new(),
+                terminal_wt: past,
+            },
+        );
+        let offered = state.offers().abandonment_records;
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].shard(), PEER);
+        assert!(offered[0].unsettled().is_empty());
+        assert_eq!(offered[0].unclaimed(), &[named]);
+
+        let actions = commit_recording(&mut state, &schedule, 1, past.as_millis(), offered);
+        let runs = actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => {
+                requests.first().map(|request| request.runs.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            matches!(
+                &runs,
+                Some(Runs::Reclaim { records, .. })
+                    if records == &vec![(record_key, Unclaimable::IssuedBy { tx: cell.tx })]
+            ),
+            "the departure takes the crossing back; dispatched {runs:?}",
+        );
+        rows.remove(record_key);
+        assert!(
+            state.offers().abandonment_records.is_empty(),
+            "once the reclaim has taken the record, nothing is left to name",
+        );
+    }
+
+    /// A record nobody may take back is left to its entry, however
+    /// plainly the chain says no consumer claimed it.
+    ///
+    /// The same departure, over a record naming no cell to credit. What
+    /// the leaf path composes is a reclaim, and there is nothing to
+    /// reclaim to: the balance stands under the claim the record names,
+    /// and the only account left to close is an entry's, which this
+    /// record has none of. Composing anyway would say the same thing
+    /// every tick, since a departure never stops being true.
+    #[test]
+    fn a_record_nobody_may_take_back_is_left_to_its_entry() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let validity_end_ms = 400_000;
+        let (record_key, _, mut cell) = held_record(0x6A, validity_end_ms);
+        cell.terms = Terms::Owed;
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+
+        let past = Window::LegEntry
+            .of(Deadline::of(WeightedTimestamp::from_millis(
+                validity_end_ms,
+            )))
+            .end
+            .plus(Duration::from_secs(1));
+        state.committed_ts = past;
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let actions = commit_recording(
+            &mut state,
+            &schedule,
+            1,
+            past.as_millis(),
+            vec![AbandonmentRecord::new(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                [UnsettledTx::for_transaction(
+                    &transaction,
+                    test_committed(),
+                    transaction.price(&PriceTable::GENESIS),
+                    Capped::empty(),
                     &PriceTable::GENESIS,
                 )],
             )],
@@ -9843,18 +11246,8 @@ mod tests {
             _ => None,
         });
         assert!(
-            matches!(
-                runs,
-                Some(Runs::Settle {
-                    on: Licence::Unclaimed,
-                    ..
-                })
-            ),
-            "the departure takes the crossing back; dispatched {runs:?}",
-        );
-        assert!(
-            state.counterparts.held.is_empty(),
-            "and the record is taken once",
+            !matches!(runs, Some(Runs::Reclaim { .. })),
+            "nothing settles it here; dispatched {runs:?}",
         );
     }
 
@@ -9872,22 +11265,19 @@ mod tests {
     #[test]
     fn a_record_outlives_the_entry_that_owned_it_and_is_reclaimed_after() {
         let schedule = two_shard_topology();
-        let mut state = make_test_state();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
-        let (record_key, _, cell) = held_record(0x6A, 400_000);
-        state
-            .counterparts
-            .held
-            .insert(record_key, HeldRecord::of(cell));
+        let (record_key, _, cell) = owned_record(400_000);
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
         state.counterparts.ledger.register_committed(
             test_committed(),
             &PriceTable::GENESIS,
             [(&transaction, &leg_classified())],
         );
         assert!(
-            state.counterparts.ledger.settles_records(cell.tx),
+            state.counterparts.ledger.settles_record(record_key),
             "the entry owns the record while it stands",
         );
 
@@ -9900,12 +11290,8 @@ mod tests {
             .plus(Duration::from_secs(1));
         commit_carrying(&mut state, &schedule, 1, horizon.as_millis(), vec![]);
         assert!(
-            !state.counterparts.ledger.settles_records(cell.tx),
-            "and is gone at its horizon",
-        );
-        assert!(
-            state.counterparts.held.contains_key(&record_key),
-            "while the record it owned is still here",
+            !state.counterparts.ledger.settles_record(record_key),
+            "and is gone at its horizon, while the record it owned is still here",
         );
 
         let actions = commit_recording(
@@ -9920,6 +11306,7 @@ mod tests {
                     &transaction,
                     test_committed(),
                     transaction.price(&PriceTable::GENESIS),
+                    Capped::from_array([record_key]),
                     &PriceTable::GENESIS,
                 )],
             )],
@@ -9931,34 +11318,726 @@ mod tests {
             _ => None,
         });
         assert!(
-            matches!(
-                runs,
-                Some(Runs::Settle {
-                    on: Licence::Unclaimed,
-                    ..
-                })
-            ),
+            matches!(runs, Some(Runs::Reclaim { .. })),
             "the cut lands past the entry and the crossing still comes back; \
              dispatched {runs:?}",
         );
     }
 
-    /// A record whose issuing transaction the ledger still holds is the
-    /// ledger's to settle, not the leaf's.
+    /// What a shard holding one record dispatches once a block proves
+    /// its consumer's *decline* present, read at `read_at`.
     ///
-    /// Both paths compose from the same leaves, so two members over one
-    /// record would leave the second reading a cell the first deleted.
-    /// The leaf answers once no entry does, which is every record older
-    /// than what this chain replays.
+    /// `owed_here` registers the issuing transaction in the ledger,
+    /// which is the shard's other way of reaching the same leaves.
+    fn declined_settlement(
+        read_at: WeightedTimestamp,
+        present: bool,
+        owed_here: bool,
+    ) -> Option<(TxHash, Runs)> {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let validity_end_ms = 400_000;
+        let (record_key, claim, cell) = owned_record(validity_end_ms);
+        let decline = CrossingId::of_record(record_key.owner, &cell)
+            .answer_key(&ProtocolHasher, Answered::Never);
+        if owed_here {
+            let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+                Verified::new_unchecked_for_test(straddling_transaction(1)),
+            ));
+            state.counterparts.ledger.register_committed(
+                test_committed(),
+                &PriceTable::GENESIS,
+                [(&transaction, &leg_classified())],
+            );
+        }
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+
+        state.committed_ts = read_at;
+        let present_keys: Vec<SubstateKey> = if present { vec![decline] } else { Vec::new() };
+        let (bundle, _) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            5,
+            read_at,
+            &present_keys,
+            &[claim, decline],
+        );
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let actions = commit_carrying(
+            &mut state,
+            &schedule,
+            1,
+            read_at.as_millis(),
+            vec![bundle.naming([(claim, id), (decline, id)])],
+        );
+        actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => requests
+                .first()
+                .map(|request| (request.tx_hash, request.runs.clone())),
+            _ => None,
+        })
+    }
+
+    /// A decline read present credits the value back from the deadline,
+    /// which is earlier than any silence ever answered.
+    ///
+    /// The instant is the whole assertion. A refusal is composable from
+    /// the deadline, while a shard holding a member of the crossing's
+    /// own transaction waits out the close of [`Window::Core`] — two
+    /// validity ranges and a finalization delay later. So a reclaim at
+    /// the deadline is one nothing but the consumer's own word could
+    /// have licensed.
     #[test]
-    fn a_record_the_ledger_still_owes_for_is_left_to_the_ledger() {
+    fn a_decline_read_present_credits_back_before_any_silence_answers() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(400_000));
+        let at_deadline = deadline.at().plus(Duration::from_secs(1));
         assert!(
-            held_settlement(false, true).is_none(),
-            "an entry here settles its own records",
+            at_deadline < Window::Core.of(deadline).end,
+            "the instant has to sit short of where an absence starts answering",
+        );
+
+        assert!(
+            matches!(
+                declined_settlement(at_deadline, true, false),
+                Some((_, Runs::Reclaim { .. }))
+            ),
+            "the consumer's own refusal is the licence, and it needs no clock",
         );
         assert!(
-            held_settlement(false, false).is_some(),
+            declined_settlement(at_deadline, false, false).is_none(),
+            "and its absence licenses nothing: a consumer that has not refused \
+             may still take the crossing",
+        );
+    }
+
+    /// A decline of a record an entry here still owns is settled by the
+    /// entry, under its transaction's own name, and never also by the
+    /// leaf; where no entry owns the record, the leaf settles it.
+    ///
+    /// Both roads compose from the same reading, so the leaf stands down
+    /// while an entry stands: one settler per record.
+    #[test]
+    fn a_decline_of_a_record_an_entry_owns_is_the_entrys_to_settle() {
+        let at_deadline = Deadline::of(WeightedTimestamp::from_millis(400_000))
+            .at()
+            .plus(Duration::from_secs(1));
+        let issuer = straddling_transaction(1).hash();
+        assert!(
+            matches!(
+                declined_settlement(at_deadline, true, true),
+                Some((named, Runs::Reclaim { .. })) if named == issuer
+            ),
+            "an entry here settles its own records, under its own name",
+        );
+        assert!(
+            matches!(
+                declined_settlement(at_deadline, true, false),
+                Some((named, Runs::Reclaim { .. })) if named != issuer
+            ),
             "and the leaf answers where no entry does",
+        );
+    }
+
+    /// A block carrying the consumer's `Never` for a record here, named
+    /// for the crossing, read at `PEER`.
+    fn never_read(record_key: SubstateKey, cell: &CrossingCell, height: u64) -> StateClaim {
+        let id = CrossingId::of_record(record_key.owner, cell);
+        let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+        StateClaim::new(
+            proven_anchor_of(PEER, height, WeightedTimestamp::from_millis(height * 1_000)),
+            [(decline, Inclusion::Present([7; 32]))],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(decline, id)])
+    }
+
+    /// Composition reads the committing block and nothing else: a
+    /// replica whose index holds the record and one whose index holds
+    /// nothing compose the same member from the same reading.
+    #[test]
+    fn composition_ignores_the_index() {
+        let schedule = two_shard_topology();
+        let (record_key, _, cell) = owned_record(400_000);
+        let composed = |indexed: bool| {
+            let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+            if indexed {
+                hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+            }
+            let actions = commit_carrying(
+                &mut state,
+                &schedule,
+                1,
+                1_000,
+                vec![never_read(record_key, &cell, 5)],
+            );
+            actions.iter().find_map(|action| match action {
+                Action::ExecuteTransactions { requests, .. } => requests
+                    .first()
+                    .map(|request| (request.tx_hash, request.runs.clone())),
+                _ => None,
+            })
+        };
+        let indexed = composed(true);
+        assert!(matches!(indexed, Some((_, Runs::Reclaim { .. }))));
+        assert_eq!(indexed, composed(false));
+    }
+
+    /// A reclaim a reading licensed whose tick is discarded is licensed
+    /// again by the next block carrying the reading, and one still seated
+    /// is not composed twice.
+    #[test]
+    fn a_discarded_reclaim_is_composed_again_from_the_next_reading() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = owned_record(400_000);
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+        let member = disposal_member_name(&[record_key]);
+        commit_carrying(
+            &mut state,
+            &schedule,
+            1,
+            1_000,
+            vec![never_read(record_key, &cell, 5)],
+        );
+        let first = state
+            .ticks
+            .tick_assignment(member)
+            .expect("the reading licenses the reclaim");
+        commit_carrying(
+            &mut state,
+            &schedule,
+            2,
+            2_000,
+            vec![never_read(record_key, &cell, 6)],
+        );
+        assert_eq!(
+            state.ticks.tick_assignment(member),
+            Some(first),
+            "a member already seated is not composed twice",
+        );
+        state.release_tick(first, Some(member));
+        assert_eq!(state.ticks.tick_assignment(member), None);
+        commit_carrying(
+            &mut state,
+            &schedule,
+            3,
+            3_000,
+            vec![never_read(record_key, &cell, 7)],
+        );
+        assert!(
+            state
+                .ticks
+                .tick_assignment(member)
+                .is_some_and(|tick| tick != first),
+            "a discarded one is composed again from the next reading",
+        );
+    }
+
+    /// A departure reclaim whose tick is discarded leaves the record
+    /// standing and nothing composes it again: no later block names the
+    /// departure, and composition reads nothing else.
+    #[test]
+    fn a_discarded_departure_reclaim_strands_its_record() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = held_record(0x6A, 400_000);
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+        let member = disposal_member_name(&[record_key]);
+        commit_recording(
+            &mut state,
+            &schedule,
+            1,
+            1_000,
+            vec![
+                AbandonmentRecord::new(PEER, WeightedTimestamp::from_millis(1_000), [])
+                    .with_unclaimed([UnclaimedCrossing::of(record_key, &cell)]),
+            ],
+        );
+        let tick = state
+            .ticks
+            .tick_assignment(member)
+            .expect("the departure licenses the reclaim");
+        state.release_tick(tick, Some(member));
+        for height in 2..5 {
+            commit_recording(&mut state, &schedule, height, height * 1_000, Vec::new());
+            assert_eq!(
+                state.ticks.tick_assignment(member),
+                None,
+                "no later block composes it: the record stands, locked",
+            );
+        }
+    }
+
+    /// A validity end well clear of zero, so the deadline it derives is
+    /// an instant the tests can sit either side of.
+    const REFUSED_VALIDITY_END_MS: u64 = 4_000_000;
+
+    /// A shard seated at [`HOME`] with a delivery waiting on a crossing
+    /// [`PEER`] writes, and no reading of it. Returns the record, its
+    /// cell and the clock the requirement was filed at, which is what the
+    /// read's arming is measured from.
+    fn a_delivery_waiting_on_a_crossing() -> (
+        ExecutionCoordinator,
+        ShardTrie,
+        SubstateKey,
+        CrossingCell,
+        WeightedTimestamp,
+    ) {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = arrived_record(0x71, REFUSED_VALIDITY_END_MS);
+        let filed_at = Deadline::of(WeightedTimestamp::from_millis(REFUSED_VALIDITY_END_MS)).at();
+        state.provisioning.advance_clock(filed_at);
+        state.provisioning.record_required(
+            cell.tx,
+            BTreeSet::from([Requirement::Crossing { key: record_key }]),
+        );
+        let trie = schedule
+            .at(filed_at)
+            .expect("the window is seated")
+            .shard_trie()
+            .clone();
+        (state, trie, record_key, cell, filed_at)
+    }
+
+    /// The anchors a probe's asks of [`PEER`] name `record` at.
+    fn record_asks(actions: &[Action], record: SubstateKey) -> Vec<Anchor> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::StateProofs(ids),
+                    shard,
+                    ..
+                }) if *shard == PEER => Some(
+                    ids.iter()
+                        .filter(|(_, key)| *key == record)
+                        .map(|(anchor, _)| *anchor)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// A record a delivery here waits on is read from the record's
+    /// holder one finalization delay past the commit that filed the
+    /// want, at the holder's newest proven anchor, and not again until
+    /// the holder has moved on; a committed arrival ends the read.
+    #[test]
+    fn a_record_read_arms_a_finalization_delay_past_the_commit_and_ends_with_the_arrival() {
+        let (mut state, trie, record_key, cell, filed_at) = a_delivery_waiting_on_a_crossing();
+        let armed = filed_at.plus(MAX_FINALIZATION_DELAY);
+        let before = armed.minus(Duration::from_millis(1));
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 9, before));
+        let wanted = state.wanted_records();
+        assert_eq!(wanted.len(), 1);
+        assert!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, before, &wanted, EpochWindows::new(0)),
+                record_key
+            )
+            .is_empty(),
+            "nothing is asked inside one finalization delay of the commit that filed the want",
+        );
+
+        let first = proven_anchor_of(PEER, 10, armed);
+        state.counterparts.proven_anchors.record(first);
+        assert_eq!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            ),
+            vec![first],
+            "one ask at the holder's newest proven anchor",
+        );
+        assert!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            )
+            .is_empty(),
+            "and not again at the same anchor",
+        );
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 11, armed));
+        assert!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            )
+            .is_empty(),
+            "the second ask waits two heights",
+        );
+        let third = proven_anchor_of(PEER, 12, armed);
+        state.counterparts.proven_anchors.record(third);
+        assert_eq!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            ),
+            vec![third],
+        );
+
+        state.provisioning.handed(record_key, cell);
+        let wanted = state.wanted_records();
+        assert!(wanted.is_empty(), "a committed arrival ends the want");
+        state
+            .counterparts
+            .proven_anchors
+            .record(proven_anchor_of(PEER, 20, armed));
+        assert!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                record_key
+            )
+            .is_empty(),
+        );
+    }
+
+    /// Whether `state` holds, to offer, a live reading of the record at
+    /// `key` naming `tx` as its issuer.
+    fn holds_record(state: &ExecutionCoordinator, key: SubstateKey, tx: TxHash) -> bool {
+        use hyperscale_vm_effects::CrossingLeaf;
+
+        state.offers().state_claims.iter().any(|claim| {
+            claim.held(key).is_some_and(|bytes| {
+                matches!(
+                    CrossingLeaf::read(&ProtocolHasher, key, bytes),
+                    Some(CrossingLeaf::Record { cell, .. }) if cell.tx == tx
+                )
+            })
+        })
+    }
+
+    /// A consumer waiting on one record, its want filed one finalization
+    /// delay back so the read is armed, and a pushed claim of the record
+    /// at the holder's height 9: the state the push tests start from.
+    fn a_body_awaiting_a_push() -> (
+        ExecutionCoordinator,
+        TopologySchedule,
+        ShardTrie,
+        SubstateKey,
+        CrossingCell,
+        Anchor,
+        StateClaim,
+    ) {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, _, cell) = arrived_record(0x75, REFUSED_VALIDITY_END_MS);
+        let now = Deadline::of(WeightedTimestamp::from_millis(REFUSED_VALIDITY_END_MS)).at();
+        state
+            .provisioning
+            .advance_clock(now.minus(MAX_FINALIZATION_DELAY));
+        state.provisioning.record_required(
+            cell.tx,
+            BTreeSet::from([Requirement::Crossing { key: record_key }]),
+        );
+        // The candidate the want is filed for, which is what keeps the
+        // want standing across the commits the tests make.
+        state.candidates.register_member(
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            Member::whole(HOME),
+            now,
+            PriceTable::GENESIS,
+        );
+        state.provisioning.advance_clock(now);
+        state.committed_ts = now;
+        let trie = schedule
+            .at(now)
+            .expect("the window is seated")
+            .shard_trie()
+            .clone();
+        let (state_root, proof) = state_and_proof(PEER, &[record_key], &[record_key]);
+        let anchor = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(9),
+            state_root,
+            ts: now,
+        };
+        let claim = StateClaim::new(
+            anchor,
+            [(
+                record_key,
+                Stated::Held(Bytes::new(cell.to_bytes()).unwrap()),
+            )],
+            proof,
+        );
+        (state, schedule, trie, record_key, cell, anchor, claim)
+    }
+
+    #[test]
+    fn a_push_at_a_proven_anchor_is_held_and_stands_in_for_an_ask() {
+        let (mut state, schedule, trie, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.counterparts.proven_anchors.record(anchor);
+        let now = anchor.ts;
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert!(
+            holds_record(&state, record_key, cell.tx),
+            "the pushed reading is held",
+        );
+        assert!(state.parked_claims.is_empty());
+
+        // While the pushed reading is held to offer nothing is asked,
+        // and the want stands until a block carries it.
+        let wanted = state.wanted_records();
+        assert_eq!(wanted.len(), 1);
+        for height in [9, 10, 11] {
+            state
+                .counterparts
+                .proven_anchors
+                .record(proven_anchor_of(PEER, height, now));
+            assert!(
+                record_asks(
+                    &state
+                        .counterparts
+                        .probe(&trie, now, &wanted, EpochWindows::new(0)),
+                    record_key
+                )
+                .is_empty(),
+                "no ask at height {height} while the pushed reading is held",
+            );
+        }
+
+        assert_eq!(
+            state.offers().state_claims.len(),
+            1,
+            "the pushed reading is what the next block carries",
+        );
+    }
+
+    #[test]
+    fn a_push_before_its_proof_is_parked_and_carried_by_the_header() {
+        let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert_eq!(
+            state.parked_claims.len(),
+            1,
+            "held until the anchor is proven"
+        );
+        assert!(!holds_record(&state, record_key, cell.tx));
+
+        state.counterparts.proven_anchors.record(anchor);
+        state.on_committed_remote_header(&schedule, anchor);
+        assert!(state.parked_claims.is_empty());
+        assert!(holds_record(&state, record_key, cell.tx));
+    }
+
+    #[test]
+    fn a_push_whose_anchor_disagrees_with_the_proven_one_is_dropped() {
+        let (mut state, schedule, _, _, _, anchor, claim) = a_body_awaiting_a_push();
+        state.counterparts.proven_anchors.record(Anchor {
+            state_root: StateRoot::ZERO,
+            ..anchor
+        });
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert!(
+            state.parked_claims.is_empty(),
+            "not parked: the anchor is proven, differently"
+        );
+        assert!(state.offers().state_claims.is_empty());
+    }
+
+    #[test]
+    fn a_push_ahead_of_its_want_is_held_until_the_want_is_filed() {
+        let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.provisioning.record_required(cell.tx, BTreeSet::new());
+        state.counterparts.proven_anchors.record(anchor);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert!(
+            state.offers().state_claims.is_empty(),
+            "nothing wants the reading yet, so nothing is offered",
+        );
+        assert_eq!(state.parked_claims.len(), 1, "and it is held for the want");
+
+        state.provisioning.record_required(
+            cell.tx,
+            BTreeSet::from([Requirement::Crossing { key: record_key }]),
+        );
+        let wanted = state.wanted_records();
+        assert!(state.release_early_pushes(&schedule, &wanted).is_empty());
+        assert!(state.parked_claims.is_empty());
+        assert!(holds_record(&state, record_key, cell.tx));
+    }
+
+    /// A pushed presence held when another proposer's block raises its
+    /// producer's entry above it is dropped at that commit, its read
+    /// starts over, the next proven anchor at or above the floor is
+    /// asked at once, and a push at the old anchor arriving afterwards
+    /// is dropped where it lands.
+    #[test]
+    fn a_held_presence_below_a_raised_floor_is_dropped_and_read_again() {
+        let (mut state, schedule, trie, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.counterparts.proven_anchors.record(anchor);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim.clone()])
+                .is_empty()
+        );
+        assert!(holds_record(&state, record_key, cell.tx));
+
+        let now = anchor.ts;
+        let mut above = proven_claim(PEER, 10, &[], &[record_key]);
+        above.anchor.ts = now.plus(Duration::from_secs(1));
+        commit_carrying(&mut state, &schedule, 1, now.as_millis(), vec![above]);
+        assert!(
+            !holds_record(&state, record_key, cell.tx),
+            "the held presence sits below the raised floor and is dropped",
+        );
+
+        let next = proven_anchor_of(PEER, 11, now.plus(Duration::from_secs(2)));
+        state.counterparts.proven_anchors.record(next);
+        let wanted = state.wanted_records();
+        assert_eq!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, next.ts, &wanted, schedule.windows()),
+                record_key
+            ),
+            vec![next],
+            "the read starts over and asks at the next anchor above the floor",
+        );
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        assert!(
+            !holds_record(&state, record_key, cell.tx),
+            "a push at the old anchor is dropped below the floor",
+        );
+    }
+
+    #[test]
+    fn held_claims_are_offered_oldest_anchor_first() {
+        let (mut state, schedule, _, record_key, cell, anchor, later) = a_body_awaiting_a_push();
+        let earlier_ts = anchor.ts.minus(Duration::from_secs(1));
+        let (state_root, proof) = state_and_proof(PEER, &[record_key], &[record_key]);
+        let earlier_anchor = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(8),
+            state_root,
+            ts: earlier_ts,
+        };
+        let earlier = StateClaim::new(
+            earlier_anchor,
+            [(
+                record_key,
+                Stated::Held(Bytes::new(cell.to_bytes()).unwrap()),
+            )],
+            proof,
+        );
+        state.counterparts.proven_anchors.record(anchor);
+        state.counterparts.proven_anchors.record(earlier_anchor);
+        state.on_crossing_readings(&schedule, vec![later, earlier]);
+        let offered: Vec<Anchor> = state
+            .offers()
+            .state_claims
+            .iter()
+            .map(|claim| claim.anchor)
+            .collect();
+        assert_eq!(offered, vec![earlier_anchor, anchor]);
+    }
+
+    /// An anchor of `shard` at `height`, as a validator that has proven
+    /// it holds one.
+    fn proven_anchor_of(shard: ShardId, height: u64, ts: WeightedTimestamp) -> Anchor {
+        Anchor {
+            shard,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::ZERO,
+            ts,
+        }
+    }
+
+    /// Seat an answered crossing, returning the record key, the answer
+    /// cell's key and the crossing.
+    fn answered_crossing(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        seed: u8,
+    ) -> (SubstateKey, SubstateKey, CrossingId) {
+        let (record_key, _, cell) = arrived_record(seed, REFUSED_VALIDITY_END_MS);
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let answer_key = id.answer_key(&ProtocolHasher, Answered::Taken);
+        hold(
+            state,
+            schedule,
+            [(
+                answer_key,
+                id.answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+                    .to_bytes(),
+            )],
+        );
+        (record_key, answer_key, id)
+    }
+
+    /// An answer goes in the commit fold on one reading of its record
+    /// absent, named for the crossing, at or above the read frontier's
+    /// floor: no member is composed.
+    #[test]
+    fn an_answer_goes_in_the_fold_on_one_reading_of_its_record_absent() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, answer_key, id) = answered_crossing(&mut state, &schedule, 0x7A);
+        let at = WeightedTimestamp::from_millis(10_000);
+        state.committed_ts = at;
+        let (claim, _) = proven_at(&mut state, &schedule, PEER, 9, at, &[], &[record_key]);
+        let actions = commit_carrying(
+            &mut state,
+            &schedule,
+            1,
+            at.as_millis(),
+            vec![claim.clone().naming([(record_key, id)])],
+        );
+        assert!(
+            claim
+                .naming([(record_key, id)])
+                .settles()
+                .contains(&answer_key),
+            "the record read gone at or above the floor is the answer's removal",
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            "and no member is composed for it",
         );
     }
 
@@ -9977,6 +12056,7 @@ mod tests {
             &transaction,
             test_committed(),
             transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         );
         let claim = core_claim(&leg_classified());
@@ -9984,35 +12064,25 @@ mod tests {
         (transaction, figures, claim, state)
     }
 
-    /// A cued claim is not asked about before the counterpart could
-    /// have written it.
-    ///
-    /// The cue names where the writing execution ran, and the cell
-    /// lands a lag past it, so a probe inside the lag is a fetch spent
-    /// on an answer that cannot be there — and, since a claim is held
-    /// to each voter's own reading, one taken at whichever height each
-    /// member's own poll happened to reach.
+    /// Nothing asks a consumer's claim before the transaction's
+    /// deadline: before it the answer arrives by push, and a question
+    /// put there reads a cell that may not be written yet.
     #[test]
-    fn a_cued_claim_waits_for_the_cell_to_be_readable() {
+    fn a_claim_is_not_asked_before_the_deadline() {
         let schedule = two_shard_topology();
-        let (transaction, figures, claim, mut state) = consumer_claim_fixture();
-        let claimed_at = figures.deadline.at().minus(Duration::from_secs(5));
-        state
-            .counterparts
-            .fold_claimed(PEER, transaction.hash(), claimed_at);
-
+        let (_, figures, claim, mut state) = consumer_claim_fixture();
         let (_, early) = proven_at(
             &mut state,
             &schedule,
             PEER,
             5,
-            claimed_at.plus(CLAIM_VISIBILITY_LAG / 2),
+            figures.deadline.at().minus(Duration::from_secs(5)),
             &[],
             &[claim],
         );
         assert!(
             state_proof_fetches(&early).is_empty(),
-            "a header inside the lag is not asked of",
+            "a header short of the deadline is not asked of",
         );
 
         let (bundle, opened) = proven_at(
@@ -10020,28 +12090,48 @@ mod tests {
             &schedule,
             PEER,
             6,
-            claimed_at.plus(CLAIM_VISIBILITY_LAG),
+            figures.deadline.at(),
             &[claim],
             &[claim],
         );
-        assert_eq!(
-            state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![claim])],
-            "and the first one past it is",
+        let asked = state_proof_fetches(&opened);
+        assert!(
+            asked.iter().any(|(at, keys)| *at == bundle.anchor
+                && keys.contains(&claim)
+                && keys.contains(&core_decline(&leg_classified()))),
+            "and the first one at it is: {asked:?}",
         );
     }
 
-    /// A consumer's claim proved present is what licenses the
-    /// retirement: the cell is written by the consuming execution and by
-    /// nothing else, so its presence is the consumer holding the
-    /// crossing. The committed claim is the whole of the evidence — it
-    /// reaches no mirror and no record — and the certificate is still
-    /// fetched, since a core's acceptance decides the transaction.
+    /// A consumer's claim proved present, named for its crossing, is
+    /// what settles the record: the commit fold removes it, the entry
+    /// that issued it closes as the transaction accepted, and no member
+    /// is composed. The committed claim is the whole of the evidence: no
+    /// certificate is fetched after it.
     #[test]
-    fn a_claim_proved_present_licenses_the_retirement_off_the_claim_alone() {
+    fn a_claim_proved_present_settles_the_record_in_the_fold() {
         let schedule = two_shard_topology();
         let (transaction, figures, claim, mut state) = consumer_claim_fixture();
         let tx_hash = transaction.hash();
+        let crossing = leg_classified()
+            .crossings()
+            .find(|(edge, _)| edge.from == HOME)
+            .map(|(edge, _)| edge.crossing.id)
+            .expect("the leg issues one crossing");
+        let record_key = crossing.record_key(&ProtocolHasher);
+        let cell = crossing.cell(
+            tx_hash,
+            *PROTOCOL_RESOURCE,
+            10,
+            figures.deadline.at().as_millis() + 1_000,
+            Terms::Escrowed {
+                credit: SubstateKey {
+                    owner: crossing.producer,
+                    local: LocalKey([0x33; 16]),
+                },
+            },
+        );
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
         let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
         let (bundle, opened) = proven_at(
             &mut state,
@@ -10064,166 +12154,38 @@ mod tests {
             &schedule,
             1,
             probed_wt.as_millis(),
-            vec![bundle],
+            vec![bundle.naming([(claim, crossing)])],
+        );
+        assert!(
+            !folded.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(_),
+                    ..
+                })
+            )),
+            "a present claim fetches no certificate"
+        );
+        assert!(
+            !folded.iter().any(|action| matches!(
+                action,
+                Action::ExecuteTransactions { requests, .. }
+                    if requests.iter().any(|request| request.tx_hash == tx_hash)
+            )),
+            "no member is composed for it",
         );
         assert!(
             folded.iter().any(|action| matches!(
                 action,
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::ExecutionCerts(fetched),
-                    ..
-                })
-                    if fetched.as_slice() == [(PEER, tx_hash)]
+                Action::Continuation(ProtocolEvent::TransactionsResolved { resolutions })
+                    if resolutions.contains(&(tx_hash, TxResolution::Decided(TransactionDecision::Accept)))
             )),
-            "a present claim fetches the consumer's certificate"
+            "and the entry closes as the transaction accepted: {folded:?}",
         );
         assert!(
-            matches!(
-                reading(&state, PEER, tx_hash, claim),
-                Some(Inclusion::Present(_))
-            ),
-            "the presence is read off the committed claim"
-        );
-        assert!(
-            state.offers().abandonment_records.is_empty(),
-            "and no record restates it"
-        );
-        let request = folded
-            .iter()
-            .find_map(|action| match action {
-                Action::ExecuteTransactions { requests, .. } => {
-                    requests.iter().find(|request| request.tx_hash == tx_hash)
-                }
-                _ => None,
-            })
-            .expect("the same commit composes the retirement into its tick");
-        assert!(matches!(
-            request.runs,
-            Runs::Settle {
-                on: Licence::Claimed,
-                ..
-            }
-        ));
-        assert!(
-            state.counterparts.ledger.retirable().is_empty(),
-            "and the ledger has handed it to the tick"
-        );
-    }
-
-    /// A consumer's acceptance opens the probe and nothing else. It
-    /// reaches no mirror and no record: what licenses the retirement is
-    /// the presence its probe reads, and once the claim carrying it
-    /// commits the next commit composes the retirement into its tick —
-    /// a dispatched member running no node, awaiting nobody, charged
-    /// nothing.
-    #[test]
-    fn a_consumers_acceptance_cues_the_probe_and_the_presence_retires() {
-        let schedule = two_shard_topology();
-        let (transaction, figures, claim, mut state) = consumer_claim_fixture();
-        let tx_hash = transaction.hash();
-        let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
-        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-            TickId::new(PEER, BlockHeight::new(5)),
-            probed_wt,
-            GlobalReceiptRoot::ZERO,
-            Capped::from_array([TxOutcome::new(
-                tx_hash,
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
-            )]),
-            AggregateSignature::ZERO,
-            SignerBitfield::new(4),
-        )));
-        state.handle_attestation(&schedule, &certificate);
-        assert!(
-            state.offers().abandonment_records.is_empty(),
-            "an acceptance is a cue: the retirement waits on the presence its probe reads"
-        );
-
-        // The probe answers present, which the committed claim writes
-        // to the ledger.
-        state.counterparts.ledger.record_reading(
-            tx_hash,
-            PEER,
-            claim,
-            Probed::Claim,
-            Inclusion::Present([7; 32]),
-        );
-        let actions = commit_carrying(&mut state, &schedule, 2, probed_wt.as_millis(), Vec::new());
-        let request = actions
-            .iter()
-            .find_map(|action| match action {
-                Action::ExecuteTransactions { requests, .. } => {
-                    requests.iter().find(|request| request.tx_hash == tx_hash)
-                }
-                _ => None,
-            })
-            .expect("the retirement is dispatched to the engine");
-        assert!(matches!(
-            request.runs,
-            Runs::Settle {
-                on: Licence::Claimed,
-                ..
-            }
-        ));
-        assert!(!request.runs.abortable(), "nothing retracts a retirement");
-        assert!(
-            state.counterparts.ledger.retirable().is_empty(),
-            "and the ledger has handed it to the tick"
-        );
-    }
-
-    /// A delivery is abandoned at its window's close out of any tick
-    /// still holding it: past the close its issuer may prove the claim
-    /// absent and take the crossing back, so the tick that would write
-    /// the claim is discarded, its finalization with it.
-    #[test]
-    fn a_delivery_held_by_a_tick_is_abandoned_at_the_close() {
-        let schedule = make_test_topology();
-        let mut state = make_test_state();
-        let tx = test_transaction(1);
-        let tx_hash = tx.hash();
-        let validity_end = tx.validity_range().end_timestamp_exclusive;
-        let close_ms = Window::Delivery
-            .of(Deadline::of(validity_end))
-            .end
-            .as_millis();
-
-        state.on_block_committed(
-            &schedule,
-            &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
-                1_000,
-            ),
-        );
-        state.counterparts.ledger.seed(tx_hash, Part::delivery());
-        state.counterparts.ledger.certify(tx_hash);
-        let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
-
-        let outcomes = abandonment_vote(&mut state, &schedule, 2, close_ms - 1);
-        assert!(
-            outcomes.is_empty(),
-            "inside the window the tick is left to it"
-        );
-        assert!(state.ticks.contains_tick(&held_by));
-
-        let outcomes = abandonment_vote(&mut state, &schedule, 3, close_ms);
-        assert!(
-            outcomes
-                .iter()
-                .any(|outcome| outcome.tx_hash() == tx_hash && outcome.decides()),
-            "at the close the delivery is abandoned: {outcomes:?}"
-        );
-        assert!(
-            !state.ticks.contains_tick(&held_by),
-            "and the tick that held it is discarded"
+            state.counterparts.ledger.reclaimable().is_empty()
+                && !state.counterparts.ledger.contains(tx_hash),
+            "the ledger has let the entry go"
         );
     }
 
@@ -10236,7 +12198,7 @@ mod tests {
         let tx = test_transaction(1);
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.on_block_committed(
+        state.commit_block_carrying(
             &schedule,
             &test_certify(
                 make_live_block(
@@ -10247,6 +12209,7 @@ mod tests {
                 ),
                 1_000,
             ),
+            Naming::Composed,
         );
         state
             .ticks
@@ -10278,7 +12241,7 @@ mod tests {
         let tx_hash = tx.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.on_block_committed(
+        state.commit_block_carrying(
             &schedule,
             &test_certify(
                 make_live_block(
@@ -10289,6 +12252,7 @@ mod tests {
                 ),
                 1_000,
             ),
+            Naming::Composed,
         );
         state.committed_ts = WeightedTimestamp::from_millis(deadline_ms);
 
@@ -10301,22 +12265,22 @@ mod tests {
         let _ = tx_hash;
     }
 
-    /// A tick holding a member whose success decides alone is not left to
-    /// past the transaction's deadline.
+    /// A tick holding a member whose success decides alone keeps it past
+    /// the transaction's deadline.
     ///
-    /// Past it no block carries such a finalization — the deadline fence
-    /// refuses it, which is what licenses a leg's reclaim — so a tick
-    /// left to would hold a member nothing can resolve while every
-    /// proposer offers a finalization every voter refuses.
+    /// The member was named to run while the deadline had not passed, so
+    /// its success is admissible whenever its finalization commits: a
+    /// producer reclaims only on the consumer's own `Never`, which no
+    /// block carries beside the success.
     #[test]
-    fn a_tick_holding_a_success_that_decides_alone_is_abandoned_at_the_deadline() {
+    fn a_tick_holding_a_success_that_decides_alone_keeps_it_past_the_deadline() {
         let schedule = make_test_topology();
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.on_block_committed(
+        state.commit_block_carrying(
             &schedule,
             &test_certify(
                 make_live_block(
@@ -10327,6 +12291,7 @@ mod tests {
                 ),
                 1_000,
             ),
+            Naming::Composed,
         );
         let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
@@ -10340,14 +12305,13 @@ mod tests {
 
         let outcomes = abandonment_vote(&mut state, &schedule, 3, deadline_ms);
         assert!(
-            outcomes
-                .iter()
-                .any(|outcome| outcome.tx_hash() == tx_hash && outcome.is_aborted()),
-            "at the deadline the member is abandoned: {outcomes:?}"
+            outcomes.iter().all(|outcome| outcome.tx_hash() != tx_hash),
+            "at the deadline nothing abandons the member: {outcomes:?}"
         );
-        assert!(
-            !state.ticks.contains_tick(&held_by),
-            "and the tick that could no longer speak for it is discarded"
+        assert_eq!(
+            state.ticks.tick_assignment(tx_hash),
+            Some(held_by),
+            "and the tick that holds it still speaks for it"
         );
     }
 
@@ -10377,8 +12341,9 @@ mod tests {
                         height: BlockHeight::new(9),
                         weighted_timestamp: WeightedTimestamp::from_millis(1_000),
                         witness_base: BeaconWitnessLeafCount::ZERO,
-                        terminal_roots: None,
+                        terminal_settled_txs: None,
                         handoff_complete: *handoff_complete,
+                        terminal_epoch: None,
                     },
                 )
             })
@@ -10479,25 +12444,36 @@ mod tests {
     /// The claim cell the core writes for what `classified` says
     /// [`HOME`] issued, under the shard holding the consumer's target.
     fn core_claim(classified: &Classified) -> SubstateKey {
-        let claims = classified.core_claims(HOME);
-        assert_eq!(
-            claims.len(),
-            1,
-            "the fixture issues one crossing to the core"
-        );
-        claims[0].1
+        one_answer(classified, Kind::Escrowed, Answered::Taken, "to the core")
+    }
+
+    /// The one answer cell in `answered`'s role that the consumer of
+    /// the `kind` crossing [`HOME`] issued writes.
+    fn one_answer(
+        classified: &Classified,
+        kind: Kind,
+        answered: Answered,
+        to: &str,
+    ) -> SubstateKey {
+        let answers: Vec<SubstateKey> = classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == HOME && edge.crossing.kind == kind)
+            .map(|(edge, _)| edge.crossing.id.answer_key(&ProtocolHasher, answered))
+            .collect();
+        assert_eq!(answers.len(), 1, "the fixture issues one crossing {to}");
+        answers[0]
+    }
+
+    /// The decline cell the core writes beside [`core_claim`] where it
+    /// refuses what `classified` says [`HOME`] issued.
+    fn core_decline(classified: &Classified) -> SubstateKey {
+        one_answer(classified, Kind::Escrowed, Answered::Never, "to the core")
     }
 
     /// The claim cell a delivery writes for what `classified` says
     /// [`HOME`] issued.
     fn delivered_claim(classified: &Classified) -> SubstateKey {
-        let claims = classified.delivered_claims(HOME);
-        assert_eq!(
-            claims.len(),
-            1,
-            "the fixture issues one crossing to a delivery"
-        );
-        claims[0].1
+        one_answer(classified, Kind::Owed, Answered::Taken, "to a delivery")
     }
 
     /// [`HOME`] beside [`CORE`] and [`CORE_SIBLING`], all live: the
@@ -10626,6 +12602,7 @@ mod tests {
                     },
                     committed: test_committed(),
                     reach: Capped::empty(),
+                    escrowed: Capped::empty(),
                 }],
             )]);
     }
@@ -10668,7 +12645,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &Classified::whole())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
         state
             .counterparts
@@ -10761,7 +12741,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&transaction, &Classified::whole())],
         );
-        state.counterparts.ledger.certify(tx_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
         state.committed_ts = WeightedTimestamp::from_millis(200_000);
         state
             .counterparts
@@ -10866,7 +12849,11 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        state.on_block_committed(&sched, &test_certify(block, STRANDED_DEADLINE_MS));
+        state.commit_block_carrying(
+            &sched,
+            &test_certify(block, STRANDED_DEADLINE_MS),
+            Naming::Composed,
+        );
         assert_eq!(
             state.ticks.tick_assignment(tx_hash),
             Some(composed),
@@ -10882,7 +12869,7 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        state.on_block_committed(&sched, &test_certify(block, later));
+        state.commit_block_carrying(&sched, &test_certify(block, later), Naming::Composed);
         assert!(
             state.ticks.contains_tick(&composed),
             "the tick carrying the abort survives to be certified",
@@ -10990,7 +12977,8 @@ mod tests {
         );
     }
 
-    /// A discarded tick's certificate leaves the serving cache with it.
+    /// A tick released with nothing kept takes its certificate out of
+    /// the serving cache with it.
     ///
     /// No finalization of this shard's will ever commit it, so it never
     /// reaches storage and nothing else drops it — and a counterpart
@@ -11013,7 +13001,7 @@ mod tests {
                 ),
             )));
 
-        state.discard_tick(tick_id);
+        state.release_tick(tick_id, Some(tx_hash));
 
         assert!(
             state.exec_certs.get(&tick_id).is_none(),
@@ -11022,6 +13010,768 @@ mod tests {
         assert!(
             state.exec_certs.certificates_for_tx(tx_hash).is_empty(),
             "and so does the index a counterpart asks by",
+        );
+    }
+
+    /// A success with a receipt in hand, as the engine reports one.
+    fn succeeded() -> ExecutionOutcome {
+        ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+        }
+    }
+
+    /// The receipt a succeeded member's finalization drains.
+    fn succeeded_receipt(tx_hash: TxHash) -> StoredReceipt {
+        StoredReceipt {
+            tx_hash,
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+            metadata: None,
+        }
+    }
+
+    /// [`PEER`]'s certificate settling `tx_hash` against this shard's:
+    /// a success that awaited [`HOME`] for it.
+    fn peer_settles(tx_hash: TxHash) -> Arc<Verified<ExecutionCertificate>> {
+        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            TickId::new(PEER, BlockHeight::new(1)),
+            WeightedTimestamp::from_millis(1_000),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"peer")),
+            Capped::from_array([TxOutcome::new(tx_hash, succeeded()).awaiting([HOME])]),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )))
+    }
+
+    /// A state whose tick at height 1 holds `T`, a transaction whose
+    /// verdict [`PEER`] shares, beside `X`, a member of this shard alone,
+    /// with this shard's own certificate out attesting both succeeded and
+    /// both receipts in hand. Past `X`'s deadline, at a frontier where
+    /// [`PEER`] can still settle `T` against the certificate.
+    fn state_holding_a_shared_verdict(seed: u8) -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        let shared: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(seed)),
+        ));
+        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(seed + 1)),
+        ));
+        let (t, x) = (shared.hash(), alone.hash());
+        let mut tick = tick_holding(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            vec![
+                (
+                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
+                        seed,
+                    ))),
+                    BTreeSet::from([HOME, PEER]),
+                ),
+                (
+                    Arc::new(Verified::new_unchecked_for_test(test_transaction(seed + 1))),
+                    BTreeSet::from([HOME]),
+                ),
+            ],
+        );
+        for tx_hash in [t, x] {
+            tick.record_execution_result(tx_hash, succeeded());
+            tick.record_receipt(succeeded_receipt(tx_hash));
+        }
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
+                Capped::from_array([
+                    TxOutcome::new(t, succeeded()).awaiting([PEER]),
+                    TxOutcome::new(x, succeeded()),
+                ]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        state.ticks.insert_tick(tick_id, tick);
+        state.ticks.assign_tx(t, tick_id);
+        state.ticks.assign_tx(x, tick_id);
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [
+                (&shared, &Classified::whole()),
+                (&alone, &Classified::whole()),
+            ],
+        );
+        state.counterparts.ledger.certify(t, Certified::ByExecution);
+        state.counterparts.ledger.certify(x, Certified::ByExecution);
+        state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
+        (state, tick_id, t, x)
+    }
+
+    /// After a release, `T` is still this shard's to settle on [`PEER`]'s
+    /// certificate — the kept tick's legs half names `T` and no released
+    /// member — and never this shard's to abandon.
+    fn assert_the_shared_verdict_still_settles(
+        state: &mut ExecutionCoordinator,
+        tick_id: TickId,
+        t: TxHash,
+    ) {
+        let tick = state
+            .ticks
+            .get_tick_mut(&tick_id)
+            .expect("the tick keeps the member whose verdict a counterpart shares");
+        tick.add_execution_certificate(peer_settles(t));
+        let legs = tick
+            .take_legs_finalization()
+            .expect("PEER's certificate settles T against this shard's own");
+        assert_eq!(
+            legs.local_ec()
+                .tx_outcomes()
+                .iter()
+                .map(TxOutcome::tx_hash)
+                .collect::<Vec<_>>(),
+            vec![t],
+            "the legs half names T and nothing released",
+        );
+        assert!(
+            state
+                .abandonable(TickId::new(HOME, BlockHeight::new(10)))
+                .iter()
+                .all(|entry| entry.tx_hash != t),
+            "T is a counterpart's to settle, never this shard's to abandon",
+        );
+    }
+
+    /// A tick released because a sibling member was abandoned keeps the
+    /// member whose verdict a counterpart shares.
+    ///
+    /// `X` is past its deadline and a departure covers it, so the block
+    /// names its abort beside the discard of the tick that held it, and
+    /// the composing tick seats the abort. `T` sat in the
+    /// same tick awaiting [`PEER`], whose certificate settles it against
+    /// this shard's — out already, and outliving the tick. Dropped with
+    /// the tick, `T` is settled by nobody: its entry is certified, so the
+    /// deadline path never abandons it either.
+    #[test]
+    fn a_release_through_an_abandoned_sibling_keeps_the_member_a_counterpart_can_settle() {
+        let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(1);
+        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(2)),
+        ));
+        assert_eq!(alone.hash(), x);
+        state
+            .counterparts
+            .ledger
+            .record_abandonment_records(&[AbandonmentRecord::new(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                [UnsettledTx::for_transaction(
+                    &alone,
+                    test_committed(),
+                    alone.price(&PriceTable::GENESIS),
+                    Capped::empty(),
+                    &PriceTable::GENESIS,
+                )],
+            )]);
+        assert!(state.counterparts.ledger.is_covered(x));
+        let sched = two_shard_topology();
+        let composing = TickId::new(HOME, BlockHeight::new(9));
+        let mut composing_tick = TickState::new(
+            composing,
+            BlockHash::from_raw(Hash::from_bytes(b"composing")),
+            WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS),
+        );
+
+        let trie = state
+            .counterpart_trie(&sched)
+            .expect("the fixture holds the window")
+            .clone();
+        let named = [
+            TickLine::Member {
+                tx: x,
+                joins: Joins::Aborted,
+                settlement: Settlement::Alone,
+                holds: Capped::empty(),
+                reach: Capped::empty(),
+            },
+            TickLine::Discard {
+                tick: tick_id,
+                cause: DiscardCause::Abandoned(x),
+            },
+        ];
+        state.admit_abandoned(&trie, composing, &mut composing_tick, &[]);
+        assert!(
+            composing_tick.tx_hashes().is_empty(),
+            "a held member is the manifest's to abort",
+        );
+        state.admit_abandoned(&trie, composing, &mut composing_tick, &named);
+        assert_eq!(
+            composing_tick.tx_hashes(),
+            &[x],
+            "X is abandoned, T is not: a counterpart can still settle it",
+        );
+
+        assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+    }
+
+    /// Commit an empty block on `shard` at `ts`, as the chain hands it
+    /// over, and return what the fold emitted.
+    fn commit_empty_on(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        shard: ShardId,
+        height: u64,
+        ts: WeightedTimestamp,
+    ) -> Vec<Action> {
+        let block = make_live_block_on_shard(
+            shard,
+            BlockHeight::new(height),
+            ts.as_millis(),
+            ValidatorId::new(0),
+            vec![],
+        );
+        state
+            .commit_block_carrying(
+                schedule,
+                &test_certify(block, ts.as_millis()),
+                Naming::Composed,
+            )
+            .actions
+    }
+
+    /// The outcomes every tick that can vote now attests.
+    fn votable_outcomes(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+    ) -> Vec<TxOutcome> {
+        state
+            .scan_votable_ticks(schedule)
+            .into_iter()
+            .flat_map(|completion| completion.tx_outcomes)
+            .collect()
+    }
+
+    /// A shape frozen divided under [`two_shard_topology`] with an
+    /// inbound leg on [`PEER`] feeding a core of [`HOME`] alone, so
+    /// `HOME` holds the crossing's claim and decline keys.
+    fn peer_fed_core_classified() -> Classified {
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(2, LegRole::Inbound, &[]),
+            leg(0, LegRole::Core, &[(0, 0)]),
+        ];
+        let classified = Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::uniform(1));
+        assert_eq!(classified.core(), &BTreeSet::from([HOME]));
+        assert!(classified.decomposed());
+        classified
+    }
+
+    /// [`straddling_transaction`] the other way round: paying from the
+    /// `0b1…` side and writing to the `0b0…` side, so its vault sits on
+    /// [`PEER`] and what it feeds on [`HOME`].
+    fn straddling_transaction_paying_away(seed: u8) -> Transaction {
+        test_transaction_with_prefixes(
+            &[seed | 0x80],
+            &[test_prefix(seed | 0x80)],
+            &[test_prefix(seed & 0x7F)],
+        )
+    }
+
+    /// A state on `shard` holding `transaction` as a core entry no tick
+    /// has taken, frozen as `classified`.
+    fn core_state(
+        shard: ShardId,
+        transaction: &Arc<Verifiable<Transaction>>,
+        classified: &Classified,
+    ) -> ExecutionCoordinator {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), shard);
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(transaction, classified)],
+        );
+        state
+    }
+
+    /// The one `Never` [`HOME`] writes for `transaction` under
+    /// [`peer_fed_core_classified`]: the crossing the leg on [`PEER`]
+    /// hands the core.
+    fn never_of(transaction: &Arc<Verifiable<Transaction>>) -> (SubstateKey, Vec<u8>) {
+        let classified = peer_fed_core_classified();
+        let edges: Vec<_> = classified.refusable_consumed(HOME).collect();
+        assert_eq!(edges.len(), 1, "the fixture hands the core one crossing");
+        never_answer(
+            transaction.hash(),
+            transaction
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis(),
+            edges[0],
+        )
+    }
+
+    /// The deadline of `transaction` as committed at [`test_committed`].
+    fn deadline_of(transaction: &Arc<Verifiable<Transaction>>) -> WeightedTimestamp {
+        UnsettledTx::for_transaction(
+            transaction,
+            test_committed(),
+            transaction.price(&PriceTable::GENESIS),
+            Capped::empty(),
+            &PriceTable::GENESIS,
+        )
+        .deadline
+        .at()
+    }
+
+    /// A committed core member no tick of this shard's ever took is
+    /// abandoned with a receipt carrying `Never` at each refusable
+    /// crossing it consumed, on the shard holding the decline key, which
+    /// is not the vault's. The receipt rides the abandonment under the
+    /// transaction's own name, and its keys held nothing before it: the
+    /// entry never reached an executing tick, so no member of it ran.
+    #[test]
+    fn an_uncertified_abandonment_answers_on_the_shard_holding_the_decline() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = deadline_of(&transaction);
+        let never = never_of(&transaction);
+        let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
+        let trie = state
+            .counterpart_trie(&schedule)
+            .expect("the fixture holds the window");
+        assert_eq!(
+            trie.shard_for_prefix(never.0.owner),
+            HOME,
+            "the fixture's decline key is this shard's",
+        );
+        assert_eq!(
+            trie.shard_for_prefix(transaction.fee_vault().owner),
+            PEER,
+            "and the vault is not",
+        );
+        let expected =
+            build_refusal_receipt(HOME, trie, tx_hash, None, std::slice::from_ref(&never))
+                .expect("a Never names a receipt");
+
+        commit_empty_on(&mut state, &schedule, HOME, 1, deadline);
+        let outcomes = votable_outcomes(&mut state, &schedule);
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the abandonment is composed at the deadline"
+        );
+        assert_eq!(outcomes[0].tx_hash(), tx_hash);
+        assert!(outcomes[0].is_aborted());
+        assert_eq!(
+            outcomes[0].refusal_receipt(),
+            Some(expected.receipt_hash()),
+            "the receipt carries the Never and no charge",
+        );
+    }
+
+    /// An abandonment composed and then lost is composed again, byte for
+    /// byte, and never twice at once: while the tick holding it stands
+    /// nothing is composed for the member, and once the tick is
+    /// released — as a recovery discard and the settled-set gate's
+    /// `Reject` release it — the next commit composes the same
+    /// abandonment with the same receipt.
+    #[test]
+    fn a_discarded_abandonment_is_composed_again() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = deadline_of(&transaction);
+        let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
+
+        commit_empty_on(&mut state, &schedule, HOME, 1, deadline);
+        let first = votable_outcomes(&mut state, &schedule);
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0].refusal_receipt().is_some(),
+            "the receipt carries the Never"
+        );
+        let tick_id = state
+            .ticks
+            .tick_assignment(tx_hash)
+            .expect("the abandonment holds the member");
+
+        commit_empty_on(
+            &mut state,
+            &schedule,
+            HOME,
+            2,
+            deadline.plus(Duration::from_secs(1)),
+        );
+        assert_eq!(
+            state.ticks.tick_assignment(tx_hash),
+            Some(tick_id),
+            "while the abandonment stands, no second is composed",
+        );
+
+        state.release_tick(tick_id, Some(tx_hash));
+        assert!(state.ticks.tick_assignment(tx_hash).is_none());
+        commit_empty_on(
+            &mut state,
+            &schedule,
+            HOME,
+            3,
+            deadline.plus(Duration::from_secs(2)),
+        );
+        let again = votable_outcomes(&mut state, &schedule);
+        assert_eq!(
+            again.len(),
+            1,
+            "the entry is re-offered once its tick is gone"
+        );
+        assert_eq!(again[0].tx_hash(), tx_hash);
+        assert_eq!(
+            again[0].refusal_receipt(),
+            first[0].refusal_receipt(),
+            "and composes the same answer to a key that still holds nothing",
+        );
+        assert_ne!(state.ticks.tick_assignment(tx_hash), Some(tick_id));
+    }
+
+    /// An entry an executing tick took, then released, writes no
+    /// `Never` on any exit: its certificate may be out and a sibling may
+    /// have combined an accept with it. Released uncovered it is neither
+    /// abandoned nor answered, and a release for unanswerability leaves
+    /// the producer's record held — value locked, listed and counted.
+    /// Covered by a record, it is abandoned with the charge alone.
+    #[test]
+    fn a_certified_exit_writes_no_never() {
+        let schedule = two_shard_topology();
+        // Paying from this shard, so the charge is settled here and a
+        // receipt carrying the charge alone is told from one carrying a
+        // `Never` beside it.
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = deadline_of(&transaction);
+        let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
+        let trie = schedule.head().shard_trie().clone();
+        assert_eq!(
+            trie.shard_for_prefix(transaction.fee_vault().owner),
+            HOME,
+            "the fixture's vault is this shard's",
+        );
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        state.ticks.insert_tick(
+            tick_id,
+            tick_holding(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                vec![(
+                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                    BTreeSet::from([HOME, PEER]),
+                )],
+            ),
+        );
+        state.ticks.assign_tx(tx_hash, tick_id);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
+        let (record_key, _, cell) = held_record(0x6A, 400_000);
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+
+        state.release_tick(tick_id, Some(tx_hash));
+        assert!(state.ticks.tick_assignment(tx_hash).is_none());
+        commit_empty_on(
+            &mut state,
+            &schedule,
+            HOME,
+            2,
+            deadline.plus(Duration::from_secs(1)),
+        );
+        assert!(
+            state.ticks.tick_assignment(tx_hash).is_none(),
+            "an executed member released uncovered is not abandoned",
+        );
+        assert!(votable_outcomes(&mut state, &schedule).is_empty());
+        assert!(
+            state
+                .counterparts
+                .ledger
+                .abandonment_answers(tx_hash)
+                .is_none(),
+            "and nothing answers for it",
+        );
+
+        // Covered by the departed sibling's record, the entry is
+        // abandoned inside its window and settles the charge alone.
+        state.counterparts.ledger.record_terminal(
+            PEER,
+            deadline.plus(Duration::from_secs(2)),
+            None,
+        );
+        record_peer_left_unsettled(&mut state, tx_hash);
+        commit_empty_on(
+            &mut state,
+            &schedule,
+            HOME,
+            3,
+            deadline.plus(Duration::from_secs(3)),
+        );
+        let outcomes = votable_outcomes(&mut state, &schedule);
+        assert_eq!(outcomes.len(), 1, "covered, the entry is abandoned");
+        assert!(outcomes[0].is_aborted());
+        let charge = build_refusal_receipt(
+            HOME,
+            &trie,
+            tx_hash,
+            Some((
+                transaction.fee_vault(),
+                Movement::unjudged(*PROTOCOL_RESOURCE, transaction.price(&PriceTable::GENESIS)),
+            )),
+            &[],
+        )
+        .expect("a charge names a receipt");
+        assert_eq!(
+            outcomes[0].refusal_receipt(),
+            Some(charge.receipt_hash()),
+            "the charge alone: an executed entry answers nothing",
+        );
+    }
+
+    /// A core member waiting on a sibling that refused is covered by the
+    /// sibling's certificate, asked for by transaction once the push
+    /// fails, and never by an absence: the sibling keeps its committed
+    /// cell, so the cell reads present and answers nothing.
+    #[test]
+    fn a_refused_siblings_certificate_covers_the_waiting_core() {
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = core_state(CORE, &transaction, &two_shard_core_classified());
+        let tick_id = TickId::new(CORE, BlockHeight::new(1));
+        let mut tick = tick_holding(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            vec![(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                BTreeSet::from([CORE, CORE_SIBLING]),
+            )],
+        );
+        tick.record_execution_result(tx_hash, succeeded());
+        tick.record_receipt(succeeded_receipt(tx_hash));
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
+                Capped::from_array([TxOutcome::new(tx_hash, succeeded()).awaiting([CORE_SIBLING])]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        state.ticks.insert_tick(tick_id, tick);
+        state.ticks.assign_tx(tx_hash, tick_id);
+        state
+            .counterparts
+            .ledger
+            .certify(tx_hash, Certified::ByExecution);
+        state
+            .expected_certs
+            .register(CORE_SIBLING, tx_hash, state.committed_ts);
+
+        state.committed_height = BlockHeight::new(500);
+        state.committed_ts = WeightedTimestamp::from_millis(60_000);
+        let actions = state.check_exec_cert_timeouts();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ExecutionCerts(ids),
+                    ..
+                }) if ids == &vec![(CORE_SIBLING, tx_hash)]
+            )),
+            "the sibling's certificate is asked for by transaction, got: {actions:?}",
+        );
+
+        let tick = state
+            .ticks
+            .get_tick_mut(&tick_id)
+            .expect("the waiting core keeps its tick");
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                TickId::new(CORE_SIBLING, BlockHeight::new(1)),
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"sibling")),
+                Capped::from_array([
+                    TxOutcome::new(tx_hash, ExecutionOutcome::Failed).awaiting([CORE])
+                ]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        let legs = tick
+            .take_legs_finalization()
+            .expect("the sibling's refusal settles T against this shard's own certificate");
+        assert_eq!(
+            legs.tx_decisions(),
+            vec![(tx_hash, TransactionDecision::Reject)],
+            "the waiting core is refused by the certificate, not by an absence",
+        );
+    }
+
+    /// A committed `Unanswerable` discard drops that member, entry and
+    /// all, and keeps its siblings a counterpart can settle.
+    #[test]
+    fn a_release_through_an_unanswerable_member_keeps_its_siblings() {
+        let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(5);
+
+        state.drop_unanswerable(tick_id, x);
+
+        assert!(
+            state.ticks.tick_assignment(x).is_none(),
+            "the unanswerable member is let go of",
+        );
+        assert!(
+            !state.counterparts.ledger.contains(x),
+            "with no outcome: nothing will ever abort it",
+        );
+        assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+    }
+
+    /// A release of a tick in which no member shares a verdict leaves
+    /// nothing behind: the tick, both its finalizations and its
+    /// certificate all go, and its members fall to their own deadlines.
+    #[test]
+    fn a_release_keeping_nothing_leaves_nothing_behind() {
+        let sched = peer_terminating_schedule(600_000);
+        let (mut state, tick_id, tx_hash) = state_stranded_on(&sched, 1);
+        let certificate = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
+            AggregateSignature::ZERO,
+            quorum_signers(),
+        );
+        state
+            .exec_certs
+            .insert(Arc::new(Verified::new_unchecked_for_test(
+                certificate.clone(),
+            )));
+        for half in [TickHalf::Determined, TickHalf::Legs] {
+            state.finalized.insert(
+                tick_id,
+                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                    Finalization::new(
+                        tick_id,
+                        half,
+                        &Capped::from_array([Arc::new(certificate.clone())]),
+                        Capped::from_array([]),
+                    ),
+                ))),
+            );
+        }
+
+        state.release_tick(tick_id, Some(tx_hash));
+
+        assert!(state.ticks.get_tick(&tick_id).is_none(), "the tick goes");
+        assert!(
+            state.ticks.tick_assignment(tx_hash).is_none(),
+            "and its member falls to its own deadline",
+        );
+        assert!(
+            !state.finalized.contains(&tick_id),
+            "both its finalizations go",
+        );
+        assert!(
+            state.exec_certs.get(&tick_id).is_none(),
+            "and its certificate",
+        );
+    }
+
+    /// After a kept release the `ticked` entry names the kept legs only,
+    /// a legs finalization taken before the release is gone, the next
+    /// take names the kept legs, and the kept legs' later settlement
+    /// clears the entry.
+    #[test]
+    fn a_kept_release_narrows_the_ticked_entry_and_recomposes_the_legs_half() {
+        let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(7);
+        state.ticked.insert(
+            tick_id,
+            TickedBatch {
+                provisional_claims: Vec::new(),
+                legs: BTreeSet::from([t, x]),
+            },
+        );
+        let taken_before = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            Capped::from_array([
+                TxOutcome::new(t, ExecutionOutcome::Aborted),
+                TxOutcome::new(x, ExecutionOutcome::Aborted),
+            ]),
+            AggregateSignature::ZERO,
+            quorum_signers(),
+        );
+        state.finalized.insert(
+            tick_id,
+            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                Finalization::new(
+                    tick_id,
+                    TickHalf::Legs,
+                    &Capped::from_array([Arc::new(taken_before)]),
+                    Capped::from_array([]),
+                ),
+            ))),
+        );
+
+        state.release_tick(tick_id, Some(x));
+
+        assert_eq!(
+            state.ticked[&tick_id].legs,
+            BTreeSet::from([t]),
+            "the entry names the kept legs only",
+        );
+        assert!(
+            state
+                .pending_tick_resolutions
+                .iter()
+                .any(|(tick, _, resolution)| {
+                    *tick == tick_id
+                        && matches!(
+                            resolution,
+                            TickResolution::Abandoned { members } if *members == BTreeSet::from([x])
+                        )
+                }),
+            "the released leg's holds are let go of",
+        );
+        assert!(
+            !state.finalized.contains(&tick_id),
+            "the legs finalization taken before the release is gone",
+        );
+        assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+
+        state.record_tick_resolution(
+            &tick_id,
+            TickResolution::Settled {
+                height: BlockHeight::new(2),
+                members: BTreeSet::from([t]),
+                aborted: BTreeSet::new(),
+            },
+        );
+        assert!(
+            !state.ticked.contains_key(&tick_id),
+            "the kept legs' settlement clears the entry",
         );
     }
 
@@ -11085,7 +13835,10 @@ mod tests {
             &PriceTable::GENESIS,
             [(&sibling, &Classified::whole())],
         );
-        state.counterparts.ledger.certify(sibling_hash);
+        state
+            .counterparts
+            .ledger
+            .certify(sibling_hash, Certified::ByExecution);
 
         // The commit that composes the abandonment, on the shard that
         // stranded the member.
@@ -11096,7 +13849,11 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        state.on_block_committed(&sched, &test_certify(block, STRANDED_DEADLINE_MS));
+        state.commit_block_carrying(
+            &sched,
+            &test_certify(block, STRANDED_DEADLINE_MS),
+            Naming::Composed,
+        );
 
         let composed = TickId::new(local, BlockHeight::new(9));
         assert_eq!(
@@ -11148,7 +13905,13 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        let actions = state.on_block_committed(&sched, &test_certify(block, STRANDED_DEADLINE_MS));
+        let actions = state
+            .commit_block_carrying(
+                &sched,
+                &test_certify(block, STRANDED_DEADLINE_MS),
+                Naming::Composed,
+            )
+            .actions;
 
         assert!(
             actions.iter().any(|action| matches!(
@@ -11600,7 +14363,7 @@ mod tests {
         let tx = test_transaction(1);
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.on_block_committed(
+        state.commit_block_carrying(
             &schedule,
             &test_certify(
                 make_live_block(
@@ -11611,6 +14374,7 @@ mod tests {
                 ),
                 1_000,
             ),
+            Naming::Composed,
         );
         state
             .ticks
@@ -11728,7 +14492,9 @@ mod tests {
         );
         let certified = CertifiedBlock::new_unchecked(block, qc);
 
-        let actions = state.on_block_committed(&topo, &certified);
+        let actions = state
+            .commit_block_carrying(&topo, &certified, Naming::Composed)
+            .actions;
 
         let fallback_fired = actions.iter().any(|a| {
             matches!(

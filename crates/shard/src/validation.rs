@@ -8,7 +8,7 @@
 //!   items through the [`crate::admission`] predicate the proposer
 //!   selected them by.
 //!
-//! Everything here is stateless — callers supply the [`Admission`]
+//! Everything here is stateless — callers supply the [`Committed`]
 //! context explicitly. The async verification pipeline lives in
 //! [`crate::verification`]; this module is just the pure rules.
 //!
@@ -17,13 +17,14 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, LeafRoot, LocalTimestamp,
-    MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad,
-    StateClaimsRoot, TopologySnapshot, Transaction, Verifiable, VoteCount,
+    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, EngagementRoot, LeafRoot,
+    LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate,
+    SetRoot, ShardId, ShardLoad, StateClaimsRoot, TickLine, TickManifestRoot, TopologySnapshot,
+    Transaction, Verifiable, VoteCount, tick_manifest_admits_block,
 };
 
 use crate::admission::{
-    Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
+    Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_all, unwrapped,
 };
@@ -319,17 +320,13 @@ fn validate_block_work(
 /// section's items through the one [`Section`] predicate the proposer
 /// selected them by, in the order the folds depend on: provisions, the
 /// transactions they engage, finalizations, the records held to their
-/// names, state claims. Returns a single diagnostic on the first failure
-/// so the caller can log once.
+/// names, state claims, crossing re-offers. Returns a single diagnostic
+/// on the first failure so the caller can log once.
 pub fn validate_block_for_vote(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     block: &Block,
-    coasting: bool,
     parent_load: Option<ShardLoad>,
 ) -> Result<(), String> {
-    if coasting {
-        validate_coast_block_empty(block)?;
-    }
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
     validate_roots_commit_sections(block)?;
@@ -339,12 +336,29 @@ pub fn validate_block_for_vote(
     validate_block_work(block, parent_load, budget)
 }
 
+/// A coast block's pre-vote check: empty, which leaves nothing for any
+/// section to admit, and otherwise held to the checks every block is.
+///
+/// Needs no committed view, because an empty block reads none: a coast
+/// or recovery bridge block anchored in a window this node has evicted
+/// is judged all the same.
+pub fn validate_coast_block_for_vote(
+    block: &Block,
+    parent_load: Option<ShardLoad>,
+) -> Result<(), String> {
+    validate_coast_block_empty(block)?;
+    validate_transactions_verified(block)?;
+    validate_transaction_ordering(block)?;
+    validate_roots_commit_sections(block)?;
+    validate_block_work(block, parent_load, DeclaredWork::ZERO)
+}
+
 /// Every section's items through its [`Section`](crate::admission::Section)
 /// predicate, in the order the folds depend on.
 ///
 /// Returns what the block's transactions reserve on this shard, which
 /// the header's own claim is checked against.
-pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork, String> {
+pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork, String> {
     let mut provisions = ProvisionsFold::default();
     admit_all::<ProvisionsSection>(
         ctx,
@@ -370,14 +384,16 @@ pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork
     Ok(transactions.budget)
 }
 
-/// The header's abandonment root and state-claims root commit the
-/// sections they claim.
+/// The header's abandonment, state-claims, engagement and tick manifest
+/// roots commit the sections they claim, and the tick manifest fits its
+/// byte budget.
 ///
 /// What this establishes is that every replica reads the same section:
 /// the root binds the items to the header, and the canonical order the
 /// section rule holds each item to means one set of answers has one
 /// encoding, so two proposers naming the same claims cannot produce
-/// blocks that differ.
+/// blocks that differ. The engagement root is over what the block's own
+/// provisions name, which is what a sealed form of it keeps.
 pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
     let computed = AbandonmentRoot::over(block.abandonment_records());
     let claimed = block.header().abandonment_root();
@@ -393,6 +409,31 @@ pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
             "state claims root {claimed:?} does not commit the block's claims {computed:?}"
         ));
     }
+    let computed = EngagementRoot::over(block.engagements().iter());
+    let claimed = block.header().engagement_root();
+    if computed != claimed {
+        return Err(format!(
+            "engagement root {claimed:?} does not commit what the block's provisions name \
+             {computed:?}"
+        ));
+    }
+    let computed = TickManifestRoot::over(block.tick_manifest());
+    let claimed = block.header().tick_manifest_root();
+    if computed != claimed {
+        return Err(format!(
+            "tick manifest root {claimed:?} does not commit the block's lines {computed:?}"
+        ));
+    }
+    let weight: usize = block
+        .tick_manifest()
+        .iter()
+        .map(TickLine::wire_weight)
+        .sum();
+    if !tick_manifest_admits_block(weight) {
+        return Err(format!(
+            "tick manifest weighs {weight} bytes, over its budget"
+        ));
+    }
     Ok(())
 }
 
@@ -400,8 +441,8 @@ pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
 /// the shard's terminal window — exists only to certify the crossing. It
 /// must carry no content of any kind, so state stays frozen at the
 /// crossing's root: no transactions, no certificates, no provisions, and
-/// no boundary records, which a chain whose own capacity to resolve
-/// anything ended at its cut has nothing left to write down.
+/// no boundary records or tick lines, which a chain whose own capacity to
+/// resolve anything ended at its cut has nothing left to write down.
 fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
     if !block.transactions().is_empty() {
         return Err(format!(
@@ -431,6 +472,12 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
         return Err(format!(
             "coast block past the terminal window carries {} state claims",
             block.state_claims().len()
+        ));
+    }
+    if !block.tick_manifest().is_empty() {
+        return Err(format!(
+            "coast block past the terminal window carries {} tick lines",
+            block.tick_manifest().len()
         ));
     }
     Ok(())
@@ -471,33 +518,102 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::Capped;
+    use hyperscale_storage::{MemberRow, RowState};
     use hyperscale_types::test_utils::{
-        TestCommittee, make_finalization, make_undecided_finalization, stub_abort_charge,
-        test_principal,
+        TestCommittee, make_finalization, make_leg_finalization, stub_abort_charge, test_principal,
     };
     use hyperscale_types::{
-        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
-        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline,
-        ExecutionOutcome, Finalization, Hash, Inclusion, LocalKey, MAX_INTENTS,
-        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
-        ProvisionEntry, Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad,
-        Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
-        TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
-        WitnessSources, test_utils,
+        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
+        BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, DiscardCause,
+        Engagement, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
+        LegRole, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
+        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
+        Provisions, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, Settlement, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
+        TickId, TickManifest, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
+        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+        Verified, WeightedTimestamp, WitnessSources, state_claims_admit_block, test_utils,
     };
 
     use super::*;
-    use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
+    use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures, departures_cut_at};
+    use crate::admission::{
+        FinalizationsFold, FinalizationsSection, Section, StateClaimsFold, StateClaimsSection,
+    };
     use crate::commit_dedup::CommitDedupIndex;
 
     /// Admit `block`'s sections against `against`.
     fn admit(against: &Against, block: &Block) -> Result<(), String> {
         admit_sections(&against.ctx(), block).map(|_| ())
+    }
+
+    /// A half settles only members its own tick holds in flight in that
+    /// half: one the rows never named, one a discard let go of, and one
+    /// held in the other half are refused. A member no committing block
+    /// reserved a place for — a reclaim — holds no row and needs none.
+    #[test]
+    fn a_half_settles_only_members_its_tick_holds_in_that_half() {
+        let tx = TxHash::from(Hash::from_bytes(b"held member"));
+        let reserved = test_utils::finalization_of(
+            BlockHeight::new(2),
+            vec![
+                TxOutcome::new(
+                    tx,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .reserving(0),
+            ],
+        );
+        let settles = |against: &Against, fw: &Finalization| {
+            let ctx = against.ctx();
+            FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), fw)
+        };
+        let row = |state| MemberRow {
+            tx,
+            deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
+            committed: WeightedTimestamp::ZERO,
+            height: BlockHeight::new(1),
+            state,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            covered: false,
+        };
+        let in_flight = |tick: u64, settlement| RowState::InFlight {
+            tick: BlockHeight::new(tick),
+            joins: Joins::Executes,
+            settlement,
+        };
+
+        let mut against = plain();
+        assert!(settles(&against, &reserved).is_err(), "no row names it");
+        for refused in [
+            in_flight(3, Settlement::Alone),
+            in_flight(2, Settlement::Shared),
+            RowState::Released {
+                settlement: Settlement::Alone,
+            },
+        ] {
+            against.members.members.insert(tx, row(refused));
+            assert!(settles(&against, &reserved).is_err(), "{refused:?}");
+        }
+        against
+            .members
+            .members
+            .insert(tx, row(in_flight(2, Settlement::Alone)));
+        assert_eq!(settles(&against, &reserved), Ok(()));
+
+        let reclaim = test_utils::make_settling_finalization(BlockHeight::new(2), tx);
+        assert_eq!(
+            settles(&plain(), &reclaim),
+            Ok(()),
+            "a reclaim holds no row"
+        );
     }
 
     /// Admission under the test committee, with nothing behind the parent.
@@ -1002,6 +1118,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -1019,6 +1136,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -1086,6 +1204,55 @@ mod tests {
         assert!(admit(&plain(), &binding_nothing).is_ok());
     }
 
+    /// A transaction whose only leg on a shard is an outbound deposit is
+    /// the recipient's fold's to credit, never a transaction that shard
+    /// commits; the payer's shard admits it.
+    #[test]
+    fn a_transaction_this_shard_only_delivers_for_is_refused() {
+        use crate::admission::ProvisionsFold;
+
+        test_utils::install_stub_protocol_statics();
+        let (payer_shard, recipient_shard) = ShardId::ROOT.children();
+        let payer = PrincipalAddr::new([0x10; 31]);
+        let recipient = Address::new([0x90; 31], AddressClass::Component);
+        let transfer = Arc::new(Verifiable::from(
+            test_utils::stub_transaction(
+                payer,
+                &[payer.address(), recipient],
+                1_000,
+                test_utils::test_validity_range(),
+            )
+            .with_legs(
+                &test_utils::StubVmStatics,
+                vec![
+                    test_utils::leg_shape(payer.address(), LegRole::Core, &[]),
+                    test_utils::leg_shape(recipient, LegRole::Outbound, &[(0, 0)]),
+                ],
+            ),
+        ));
+        let on = |local: ShardId| {
+            let mut against = Against::window(TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                2,
+                ValidatorSet::new(Vec::new()),
+            ));
+            against.local_shard = local;
+            let provisions = ProvisionsFold::default();
+            admit_all::<TransactionsSection<'_>>(
+                &against.ctx(),
+                &mut TransactionsFold::beside(&provisions),
+                std::iter::once(&transfer).map(unwrapped),
+            )
+        };
+
+        assert!(
+            on(recipient_shard)
+                .expect_err("the recipient's shard only delivers")
+                .contains("only delivers here"),
+        );
+        assert_eq!(on(payer_shard), Ok(()), "the payer's shard commits it");
+    }
+
     /// A block carrying records, rooted the way the header claims.
     fn block_with_verdicts(verdicts: Vec<AbandonmentRecord>, root: AbandonmentRoot) -> Block {
         let base = header_at_height(BlockHeight::new(6), 100_000);
@@ -1108,6 +1275,7 @@ mod tests {
                 Capped::new(verdicts).expect("a list written out in a test"),
             ),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1132,33 +1300,56 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
-    /// A claim against `ROOT` at `height`, answering for `keys`.
+    /// Claims at one anchor of `shard` wide enough that together they
+    /// outrun the section's budget: each reads two hundred cells of a
+    /// tree holding two thousand, over disjoint ascending ranges, so
+    /// the one that does not fit leaves room for a piece of itself.
+    /// Returns the tree's leaves beside them.
+    pub fn wide_claims(shard: ShardId) -> (Vec<SubstateKey>, Vec<StateClaim>) {
+        wide_claims_at(shard, 3)
+    }
+
+    /// [`wide_claims`] at `shard`'s `height`.
+    pub fn wide_claims_at(shard: ShardId, height: u64) -> (Vec<SubstateKey>, Vec<StateClaim>) {
+        let leaves: Vec<SubstateKey> = (0u16..2_048)
+            .map(|at| SubstateKey {
+                owner: test_utils::test_prefix(u8::try_from(at / 256).expect("under 8")),
+                local: LocalKey([u8::try_from(at % 256).expect("masked"); 16]),
+            })
+            .collect();
+        let mut sorted = leaves.clone();
+        sorted.sort_unstable();
+        let claims: Vec<StateClaim> = sorted
+            .chunks(200)
+            .map(|asked| test_utils::proven_claim(shard, height, &leaves, asked))
+            .collect();
+        let total: usize = claims.iter().map(StateClaim::wire_weight).sum();
+        assert!(
+            !state_claims_admit_block(total),
+            "the fixture's {total} bytes must outrun the budget",
+        );
+        (leaves, claims)
+    }
+
+    /// A claim against `ROOT` at `height`, answering absent for `keys`,
+    /// with a real proof of it.
     fn bundle_at(height: u64, keys: &[u8]) -> StateClaim {
-        StateClaim::new(
-            Anchor {
-                shard: ShardId::ROOT,
-                height: BlockHeight::new(height),
-                state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
-                ts: WeightedTimestamp::from_millis(height * 1_000),
-            },
-            keys.iter().map(|seed| {
-                let key = SubstateKey {
-                    owner: Address::new([*seed; 31], AddressClass::Component),
-                    local: LocalKey([*seed; 16]),
-                };
-                (key, Inclusion::Absent)
-            }),
-        )
+        let asked: Vec<SubstateKey> = keys
+            .iter()
+            .map(|seed| test_utils::test_key(*seed))
+            .collect();
+        test_utils::proven_claim(ShardId::leaf(1, 0), height, &[], &asked)
     }
 
     /// The section is bound to the header's root and held to one form:
     /// ascending without repeats, every bundle naming something. A
     /// second form of the same answers, or a root that does not commit
-    /// them, is refused before any proof is walked.
+    /// them, is refused.
     #[test]
     fn a_state_proof_section_is_held_to_its_root_and_form() {
         let held = |bundles: Vec<StateClaim>, root: StateClaimsRoot| {
@@ -1192,6 +1383,131 @@ mod tests {
         assert!(err.contains("empty"), "{err}");
     }
 
+    /// A claim is checked from the block alone: one whose proof bears
+    /// out every reading under its anchor's root is admitted, and one
+    /// whose proof reconstructs another root, speaks for another
+    /// shard's tree, carries a key the claim does not read, or
+    /// disagrees with a reading is refused. A proof bit flipped fails
+    /// the header's root before the claim is walked, and the sealed
+    /// form keeps the claims and their root.
+    #[test]
+    fn a_state_claim_is_checked_from_the_block() {
+        let held = |bundles: Vec<StateClaim>| {
+            let root = StateClaimsRoot::over(&bundles);
+            let block = block_with_state_claims(bundles, root);
+            validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
+        };
+        let (present, absent) = (test_utils::test_key(1), test_utils::test_key(2));
+        let claim =
+            test_utils::proven_claim(ShardId::leaf(1, 0), 3, &[present], &[present, absent]);
+        assert!(held(vec![claim.clone()]).is_ok());
+
+        let mut other_root = claim.clone();
+        other_root.anchor.state_root = StateRoot::from_raw(Hash::from_bytes(b"another"));
+        let err = held(vec![other_root]).expect_err("a proof of another root is refused");
+        assert!(err.contains("does not prove"), "{err}");
+
+        let mut other_shard = claim.clone();
+        other_shard.anchor.shard = ShardId::leaf(1, 1);
+        let err = held(vec![other_shard]).expect_err("a proof of another shard's tree is refused");
+        assert!(err.contains("does not prove"), "{err}");
+
+        let extra = StateClaim::new(
+            claim.anchor,
+            [(present, claim.reading(present).unwrap())],
+            claim.proof.clone(),
+        );
+        let err = held(vec![extra]).expect_err("a proof claiming a key the claim does not read");
+        assert!(err.contains("does not prove"), "{err}");
+
+        let mut disagreeing = claim.clone();
+        disagreeing.cells = Capped::new(vec![
+            (present, Inclusion::Absent.into()),
+            (absent, Inclusion::Absent.into()),
+        ])
+        .expect("two cells");
+        let err = held(vec![disagreeing]).expect_err("a reading the proof does not bear out");
+        assert!(err.contains("does not prove"), "{err}");
+
+        let mut flipped = claim.clone();
+        let mut bytes = flipped.proof.as_bytes().to_vec();
+        bytes[0] ^= 0x80;
+        flipped.proof = MerkleInclusionProof::new(bytes);
+        let block = block_with_state_claims(
+            vec![flipped],
+            StateClaimsRoot::over(std::slice::from_ref(&claim)),
+        );
+        let err = validate_roots_commit_sections(&block)
+            .expect_err("a proof bit flipped under the honest root fails the root");
+        assert!(err.contains("does not commit"), "{err}");
+
+        let live = block_with_state_claims(vec![claim.clone()], StateClaimsRoot::over(&[claim]));
+        let sealed = live.clone().into_sealed();
+        assert_eq!(sealed.state_claims(), live.state_claims());
+        assert!(validate_roots_commit_sections(&sealed).is_ok());
+        assert!(admit(&plain(), &sealed).is_ok());
+    }
+
+    /// The section's order rule: claims ascend by anchor, and claims at
+    /// one anchor carry disjoint keys in ascending order.
+    #[test]
+    fn the_claim_order_rule_has_three_cases() {
+        let held = |bundles: Vec<StateClaim>| {
+            let root = StateClaimsRoot::over(&bundles);
+            let block = block_with_state_claims(bundles, root);
+            validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
+        };
+        let key = test_utils::test_key;
+        let at = |height: u64, asked: &[SubstateKey]| {
+            test_utils::proven_claim(ShardId::leaf(1, 0), height, &[key(1), key(3)], asked)
+        };
+        assert!(
+            held(vec![at(3, &[key(1), key(2)]), at(3, &[key(3), key(4)])]).is_ok(),
+            "disjoint ascending claims at one anchor are admitted",
+        );
+        let err = held(vec![at(3, &[key(1), key(2)]), at(3, &[key(2), key(3)])])
+            .expect_err("two claims at one anchor reading one key are refused");
+        assert!(err.contains("repeats or precedes"), "{err}");
+        let err = held(vec![at(3, &[key(1), key(2)]), at(3, &[key(1)])])
+            .expect_err("a claim at one anchor below the last key is refused");
+        assert!(err.contains("repeats or precedes"), "{err}");
+        let err = held(vec![at(4, &[key(1)]), at(3, &[key(2)])])
+            .expect_err("claims at two anchors out of order are refused");
+        assert!(err.contains("repeats or precedes"), "{err}");
+    }
+
+    /// The section is spent by the byte, proof included: the claim that
+    /// takes the weight past the budget is refused, however few claims
+    /// stand before it.
+    #[test]
+    fn a_claims_section_past_its_budget_is_refused() {
+        let (leaves, wide) = wide_claims(ShardId::leaf(1, 0));
+        let mut fold = StateClaimsFold::default();
+        let mut carried = 0usize;
+        let mut refused = None;
+        for claim in &wide {
+            match StateClaimsSection::admit(&plain().ctx(), &mut fold, claim) {
+                Ok(()) => carried += 1,
+                Err(err) => {
+                    refused = Some(err);
+                    break;
+                }
+            }
+        }
+        let err = refused.expect("the wide claims outrun the budget");
+        assert!(err.contains("over the section's budget"), "{err}");
+        assert!(
+            carried > 0 && carried < wide.len(),
+            "{carried} of {} carried",
+            wide.len()
+        );
+        assert!(state_claims_admit_block(fold.weight));
+        assert!(!state_claims_admit_block(
+            fold.weight + wide[carried].wire_weight()
+        ));
+        drop(leaves);
+    }
+
     /// The figures of a name reaching one route under each departed
     /// half, so a record against either half may name it.
     fn named(tx_hash: TxHash) -> UnsettledTx {
@@ -1207,6 +1523,7 @@ mod tests {
                 committee_anchor: WeightedTimestamp::ZERO,
             },
             reach: Capped::from_array([route(0x00), route(0xC0)]),
+            escrowed: Capped::empty(),
         }
     }
 
@@ -1275,6 +1592,148 @@ mod tests {
             let err = held_records(&block_with_verdicts(records, root)).unwrap_err();
             assert!(err.contains("repeats or precedes"), "{err}");
         }
+    }
+
+    /// The departures a block's anchored window attests are the ones the
+    /// schedule's walk over its retained windows finds, while every
+    /// terminal record stands: the same shards, the same cuts, and the
+    /// same evidence verdicts, open handoff or stamped.
+    #[test]
+    fn departures_read_off_the_window_equal_the_schedule_walk() {
+        use hyperscale_types::{Epoch, WindowLookup};
+
+        let (left, right) = ShardId::ROOT.children();
+        let (survivors_left, survivors_right) = (left.children(), right.children());
+        let survivors = [
+            survivors_left.0,
+            survivors_left.1,
+            survivors_right.0,
+            survivors_right.1,
+        ];
+        for handoff in [None, Some(Epoch::new(1))] {
+            let schedule = departures(&[left, right], &survivors, handoff);
+            let windows = schedule.windows();
+            for ms in [DEPARTURE_CUT_MS + 1, DEPARTURE_CUT_MS + 500, 5_500, 15_500] {
+                let at = WeightedTimestamp::from_millis(ms);
+                let WindowLookup::Window(window) = schedule.lookup(at) else {
+                    panic!("the fixture holds every window it anchors in");
+                };
+                let mut read: Vec<_> = window.departures(windows).collect();
+                let mut walked: Vec<_> = schedule.departures_at(at).collect();
+                read.sort_unstable_by_key(|(shard, _)| shard.inner());
+                walked.sort_unstable_by_key(|(shard, _)| shard.inner());
+                assert_eq!(read, walked, "at {ms}");
+                assert_eq!(read.len(), 2);
+                for shard in [left, right, survivors[0]] {
+                    assert_eq!(
+                        window.terminal_cut(shard, windows),
+                        schedule.terminal_cut_for_shard(shard, at),
+                        "{shard:?} at {ms}"
+                    );
+                    assert_eq!(
+                        window.evidence_readable(shard, at, windows),
+                        schedule.terminal_evidence_readable(shard, at),
+                        "{shard:?} at {ms}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Once a departed shard's terminal record has dropped from the
+    /// window a block is anchored in, a record naming that departure is
+    /// refused alike by a replica that still retains the window its chain
+    /// ended in and by one that has evicted it: the anchored window is
+    /// the whole answer.
+    #[test]
+    fn a_record_after_its_boundary_drops_is_refused_alike() {
+        use std::collections::HashMap;
+
+        use hyperscale_types::Epoch;
+
+        let (left, right) = ShardId::ROOT.children();
+        let (survivors_left, survivors_right) = (left.children(), right.children());
+        let mut deep = departures(
+            &[left, right],
+            &[
+                survivors_left.0,
+                survivors_left.1,
+                survivors_right.0,
+                survivors_right.1,
+            ],
+            None,
+        );
+        let dropped = Arc::new((**deep.head()).clone().with_boundaries(HashMap::new()));
+        for epoch in 6..=20u64 {
+            deep.insert(Epoch::new(epoch), Arc::clone(&dropped));
+        }
+        deep.set_head(Arc::clone(&dropped));
+        let mut shallow = deep.clone();
+        shallow.evict_below(Epoch::new(6));
+
+        let records = vec![verdict(left, &[1])];
+        let block = block_with_verdicts(records.clone(), AbandonmentRoot::over(&records));
+        let refusal = |schedule| {
+            let mut against = Against::schedule(topology_snapshot(), schedule);
+            against.anchor = WeightedTimestamp::from_millis(7_500);
+            against.local_shard = survivors_right.0;
+            admit(&against, &block).unwrap_err()
+        };
+        let from_deep = refusal(deep);
+        assert!(from_deep.contains("does not attest"), "{from_deep}");
+        assert_eq!(from_deep, refusal(shallow));
+    }
+
+    /// A departure names a crossing off this shard's leaf only where the
+    /// departed shard was the one to take it: it held the consumer's
+    /// route, and the transaction's deadline had passed by the cut. A
+    /// record may name such crossings and nothing else.
+    #[test]
+    fn a_crossing_named_off_its_leaf_is_held_to_its_party_rule() {
+        const CUT_MS: u64 = 60_000;
+        let (left, right) = ShardId::ROOT.children();
+        let (survivors_left, survivors_right) = (left.children(), right.children());
+        let schedule = departures_cut_at(
+            CUT_MS,
+            &[left, right],
+            &[
+                survivors_left.0,
+                survivors_left.1,
+                survivors_right.0,
+                survivors_right.1,
+            ],
+            None,
+        );
+        let mut against = Against::schedule(topology_snapshot(), schedule);
+        against.anchor = WeightedTimestamp::from_millis(CUT_MS + 500);
+        against.local_shard = survivors_right.0;
+
+        let crossing = |consumer: u8, validity_end: u64| UnclaimedCrossing {
+            record: SubstateKey {
+                owner: Address::new([0x80; 31], AddressClass::Component),
+                local: LocalKey([1; 16]),
+            },
+            tx: TxHash::from(Hash::from_bytes(&[7; 32])),
+            consumer: RoutePrefix::of(Address::new([consumer; 31], AddressClass::Component)),
+            validity_end: WeightedTimestamp::from_millis(validity_end),
+        };
+        let held = |crossing: UnclaimedCrossing| {
+            let records = vec![
+                AbandonmentRecord::new(left, WeightedTimestamp::from_millis(CUT_MS), [])
+                    .with_unclaimed([crossing]),
+            ];
+            let root = AbandonmentRoot::over(&records);
+            admit(&against, &block_with_verdicts(records, root))
+        };
+
+        assert!(
+            held(crossing(0x00, 10_000)).is_ok(),
+            "the departed half held the consumer's route past the deadline",
+        );
+        let err = held(crossing(0x00, 50_000)).unwrap_err();
+        assert!(err.contains("was not the one to take"), "{err}");
+        let err = held(crossing(0xC0, 10_000)).unwrap_err();
+        assert!(err.contains("was not the one to take"), "{err}");
     }
 
     /// The budget is one across every record a block carries, and it is
@@ -1504,17 +1963,6 @@ mod tests {
         assert!(err.contains("already in QC chain ancestor"));
     }
 
-    #[test]
-    fn validate_no_duplicate_transactions_rejects_retention_dup() {
-        let txs = sorted_txs(&[10, 20]);
-        let dup_tx = Arc::clone(&txs[0]);
-        let block = block_with_transactions(BlockHeight::new(6), txs);
-        let mut against = plain();
-        against.dedup.register_committed_txs(&[dup_tx]);
-        let err = admit(&against, &block).unwrap_err();
-        assert!(err.contains("already committed"));
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     // validate_no_duplicate_certificates
     // ═══════════════════════════════════════════════════════════════════════
@@ -1532,6 +1980,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -1595,10 +2044,9 @@ mod tests {
     /// — it resolves none — so identity is the only thing that can.
     #[test]
     fn a_committed_certificate_deciding_nothing_cannot_ride_a_second_block() {
-        let fw = Arc::new(make_undecided_finalization(
+        let fw = Arc::new(make_leg_finalization(
             BlockHeight::new(1),
             TxHash::from(Hash::from_bytes(b"retired")),
-            TransactionDecision::Accept,
         ));
         assert_eq!(fw.deciding_tx_hashes().count(), 0);
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
@@ -1681,6 +2129,7 @@ mod tests {
             certificates: Arc::new(Capped::from_array([Arc::new((*settled).clone().into())])),
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::from_array([AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
@@ -1771,6 +2220,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -1848,6 +2298,40 @@ mod tests {
         assert!(admit(&owing(3, &[]), &block_settling(&[6], &[])).is_ok());
     }
 
+    /// The node-local owed set only refuses: empty, it admits nothing
+    /// the committed frontier rule refuses on its own, and populated, it
+    /// refuses the skip.
+    #[test]
+    fn owed_determined_only_refuses() {
+        let err = admit(&owing(3, &[]), &block_settling(&[2], &[])).unwrap_err();
+        assert!(err.contains("at or below the frontier"), "{err}");
+        let err = admit(&owing(3, &[4]), &block_settling(&[6], &[])).unwrap_err();
+        assert!(err.contains("still owes"), "{err}");
+    }
+
+    /// A voter whose dedup index is fresh — after a halt recovery past f,
+    /// a whole committee can be — admits a batch the chain carried before
+    /// it began folding: no completeness gate holds the vote back, and
+    /// the shallow tier over-admits per item rather than stalling.
+    #[test]
+    fn a_shallow_committee_still_commits() {
+        let bundle = Provisions::new(
+            ShardId::leaf(1, 1),
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(
+                TxHash::from(Hash::from_bytes(b"carried before")),
+                Capped::empty(),
+            )]),
+        );
+        let fresh = plain();
+        assert!(!fresh.dedup.is_complete(fresh.anchor));
+        let mut fold = ProvisionsFold::default();
+        assert!(ProvisionsSection::admit(&fresh.ctx(), &mut fold, &bundle).is_ok());
+    }
+
     /// A legs half is unconstrained. It waits on a counterpart and may
     /// land arbitrarily late; its declared cells are claimed against
     /// every later tick from the moment it executes, so it has nothing
@@ -1887,6 +2371,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -2047,13 +2532,9 @@ mod tests {
         txs.reverse(); // intentionally mis-sort to prove short-circuit
         txs.push(tx(30)); // Unverified entry
         let block = block_with_transactions(BlockHeight::new(1), txs);
-        let err = validate_block_for_vote(
-            &Against::window(topo).ctx(),
-            &block,
-            false,
-            Some(ShardLoad::ZERO),
-        )
-        .unwrap_err();
+        let err =
+            validate_block_for_vote(&Against::window(topo).ctx(), &block, Some(ShardLoad::ZERO))
+                .unwrap_err();
         assert!(err.contains("not admission-validated"));
     }
 
@@ -2061,15 +2542,8 @@ mod tests {
     fn coast_blocks_must_be_empty() {
         // Past the terminal window a block exists only to certify the
         // crossing: any content fails the pre-vote check.
-        let topo = topology_snapshot();
         let with_tx = block_with_transactions(BlockHeight::new(1), sorted_verified_txs(&[10]));
-        let err = validate_block_for_vote(
-            &Against::window(topo.clone()).ctx(),
-            &with_tx,
-            true,
-            Some(ShardLoad::ZERO),
-        )
-        .unwrap_err();
+        let err = validate_coast_block_for_vote(&with_tx, Some(ShardLoad::ZERO)).unwrap_err();
         assert!(err.contains("coast block"), "{err}");
 
         // A boundary record is content too. A chain whose capacity to
@@ -2078,25 +2552,11 @@ mod tests {
         // four.
         let records = vec![verdict(ShardId::ROOT, &[1])];
         let with_record = block_with_verdicts(records.clone(), AbandonmentRoot::over(&records));
-        let err = validate_block_for_vote(
-            &Against::window(topo.clone()).ctx(),
-            &with_record,
-            true,
-            Some(ShardLoad::ZERO),
-        )
-        .unwrap_err();
+        let err = validate_coast_block_for_vote(&with_record, Some(ShardLoad::ZERO)).unwrap_err();
         assert!(err.contains("abandonment records"), "{err}");
 
         let empty = block_with_transactions(BlockHeight::new(1), Vec::new());
-        assert!(
-            validate_block_for_vote(
-                &Against::window(topo).ctx(),
-                &empty,
-                true,
-                Some(ShardLoad::ZERO)
-            )
-            .is_ok()
-        );
+        assert!(validate_coast_block_for_vote(&empty, Some(ShardLoad::ZERO)).is_ok());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -2141,6 +2601,7 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
         }
     }
 
@@ -2175,10 +2636,19 @@ mod tests {
         let paired = block_with_tx(&tx, vec![Arc::clone(&bundle)]);
         assert!(admit(&engaged(&topo, local), &paired).is_ok());
 
-        // A bundle committed within the retention window: engaged.
+        // A bundle an earlier block committed, registered through that
+        // block's own list: engaged.
         let mut dedup = CommitDedupIndex::new();
-        dedup.register_committed_provision_txs(
-            std::slice::from_ref(&bundle),
+        dedup.register_committed_engagements(
+            &paired.engagements(),
+            WeightedTimestamp::from_millis(1_000),
+        );
+        assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
+
+        // The same block committed and sealed feeds the same entry.
+        let mut dedup = CommitDedupIndex::new();
+        dedup.register_committed_engagements(
+            &paired.clone().into_sealed().engagements(),
             WeightedTimestamp::from_millis(1_000),
         );
         assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
@@ -2198,6 +2668,210 @@ mod tests {
         let mispaired = block_with_tx(&tx, vec![wrong_source]);
         let err = admit(&engaged(&topo, local), &mispaired).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
+    }
+
+    /// The payer's bundle for `tx`, from `payer` at `height`, with the
+    /// empty entry a payer holding none of its reads sends.
+    fn payer_bundle(
+        payer: ShardId,
+        local: ShardId,
+        height: u64,
+        tx_hash: TxHash,
+    ) -> Arc<Verifiable<Provisions>> {
+        Arc::new(
+            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+                payer,
+                local,
+                BlockHeight::new(height),
+                WeightedTimestamp::ZERO,
+                MerkleInclusionProof::dummy(),
+                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+            ))
+            .into(),
+        )
+    }
+
+    /// A committed payer entry engages only while its committing anchor
+    /// plus the horizon is ahead of the admitting anchor, and only at a
+    /// source height no recovery fences.
+    #[test]
+    fn a_committed_engagement_lapses_and_is_fenced_at_admission() {
+        use hyperscale_types::{Epoch, RecoveryCause, ShardRecovery};
+
+        let topo = TestCommittee::new(4, 42).topology_snapshot(2);
+        let local = ShardId::leaf(1, 0);
+        let payer = ShardId::leaf(1, 1);
+        let local_owner = test_principal(0x01);
+        let payer_owner = test_principal(0x81);
+        let tx = stub_tx(payer_owner, &[local_owner.address(), payer_owner.address()]);
+        let committed = block_with_tx(&tx, vec![payer_bundle(payer, local, 7, tx.hash())]);
+        let bare = block_with_tx(&tx, Vec::new());
+        let anchor = WeightedTimestamp::from_millis(1_000);
+        let with_entry = |topo: &TopologySnapshot, at: WeightedTimestamp| {
+            let mut dedup = CommitDedupIndex::new();
+            dedup.register_committed_engagements(&committed.engagements(), anchor);
+            let mut against = engaged_with(topo, local, dedup);
+            against.anchor = at;
+            against
+        };
+
+        let deadline = anchor.plus(RETENTION_HORIZON);
+        let inside = deadline.minus(std::time::Duration::from_millis(1));
+        assert!(admit(&with_entry(&topo, inside), &bare).is_ok());
+        let err = admit(&with_entry(&topo, deadline), &bare).unwrap_err();
+        assert!(err.contains("payer bundle"), "{err}");
+
+        let recovering = topo.with_pending_recoveries(
+            std::iter::once((
+                payer,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(2),
+                    retained: Vec::new(),
+                    attested_frontier: BlockHeight::new(6),
+                },
+            ))
+            .collect(),
+        );
+        let err = admit(&with_entry(&recovering, inside), &bare).unwrap_err();
+        assert!(err.contains("payer bundle"), "{err}");
+    }
+
+    /// The committed arm is keyed by the payer's shard under the
+    /// admitting anchor's trie. A payer bundle committed under the
+    /// parent before the payer split engages nothing once admission
+    /// resolves the payer to a child, so the transaction is refused and
+    /// no value moves.
+    #[test]
+    fn a_payer_cut_between_commit_and_admission_refuses() {
+        let before = TestCommittee::new(4, 42).topology_snapshot(2);
+        let after = TestCommittee::new(4, 42).topology_snapshot(4);
+        let payer_owner = test_principal(0x81);
+        let local_owner = test_principal(0x01);
+        let tx = stub_tx(payer_owner, &[local_owner.address(), payer_owner.address()]);
+        let parent_payer = before.shard_trie().shard_for_prefix(tx.fee_payer());
+        let child_payer = after.shard_trie().shard_for_prefix(tx.fee_payer());
+        let local = after.shard_trie().shard_for_prefix(local_owner.address());
+        assert_eq!(parent_payer, ShardId::leaf(1, 1));
+        assert!(parent_payer.is_ancestor_of(child_payer), "the payer split");
+        assert_ne!(local, child_payer);
+
+        let committed = block_with_tx(&tx, vec![payer_bundle(parent_payer, local, 7, tx.hash())]);
+        let mut dedup = CommitDedupIndex::new();
+        dedup.register_committed_engagements(
+            &committed.engagements(),
+            WeightedTimestamp::from_millis(1_000),
+        );
+        let err = admit(
+            &engaged_with(&after, local, dedup),
+            &block_with_tx(&tx, Vec::new()),
+        )
+        .unwrap_err();
+        assert!(err.contains("payer bundle"), "{err}");
+    }
+
+    /// The header's engagement root commits what the block's provisions
+    /// name: a root over anything else is refused, and the sealed form of
+    /// an honest block, which keeps the list, passes as the live one does.
+    #[test]
+    fn the_engagement_root_commits_what_the_provisions_engage() {
+        let local = ShardId::leaf(1, 0);
+        let payer = ShardId::leaf(1, 1);
+        let tx_hash = TxHash::from(Hash::from_bytes(b"engaged"));
+        let provisions = vec![
+            payer_bundle(payer, local, 3, tx_hash),
+            payer_bundle(payer, local, 4, tx_hash),
+        ];
+        let with_root = |root: EngagementRoot| {
+            let base = header_at_height(BlockHeight::new(6), 100_000);
+            Block::Live {
+                header: BlockHeader::new(BlockHeaderParts {
+                    height: base.height(),
+                    parent_block_hash: base.parent_block_hash(),
+                    parent_qc: base.parent_qc().clone().into(),
+                    proposer: base.proposer(),
+                    timestamp: base.timestamp(),
+                    round: base.round(),
+                    provision_tx_roots: Capped::default(),
+                    engagement_root: root,
+                    ..Default::default()
+                }),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(
+                    Capped::new(provisions.clone()).expect("a list written out in a test"),
+                ),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            }
+        };
+        let honest = EngagementRoot::over(&Engagement::of_provisions(&provisions));
+
+        let err = validate_roots_commit_sections(&with_root(EngagementRoot::ZERO))
+            .expect_err("a root claiming nothing does not commit two entries");
+        assert!(err.contains("engagement root"), "{err}");
+        let short = EngagementRoot::over(&Engagement::of_provisions(&provisions[..1]));
+        let err = validate_roots_commit_sections(&with_root(short))
+            .expect_err("a root omitting one entry fails");
+        assert!(err.contains("engagement root"), "{err}");
+
+        let live = with_root(honest);
+        assert!(validate_roots_commit_sections(&live).is_ok());
+        let sealed = live.into_sealed();
+        assert_eq!(sealed.engagements().len(), 2);
+        assert!(validate_roots_commit_sections(&sealed).is_ok());
+    }
+
+    /// The header's tick manifest root commits the block's lines, in
+    /// both forms, and a coast block names none.
+    #[test]
+    fn the_tick_manifest_root_commits_its_lines_and_a_coast_block_names_none() {
+        let lines: TickManifest = Capped::from_array([TickLine::Discard {
+            tick: TickId::new(ShardId::ROOT, BlockHeight::new(3)),
+            cause: DiscardCause::Recovery,
+        }]);
+        let with_root = |root: TickManifestRoot| {
+            let base = header_at_height(BlockHeight::new(6), 100_000);
+            Block::Live {
+                header: BlockHeader::new(BlockHeaderParts {
+                    height: base.height(),
+                    parent_block_hash: base.parent_block_hash(),
+                    parent_qc: base.parent_qc().clone().into(),
+                    proposer: base.proposer(),
+                    timestamp: base.timestamp(),
+                    round: base.round(),
+                    provision_tx_roots: Capped::default(),
+                    tick_manifest_root: root,
+                    ..Default::default()
+                }),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(lines.clone()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            }
+        };
+
+        let err = validate_roots_commit_sections(&with_root(TickManifestRoot::ZERO))
+            .expect_err("a root claiming nothing does not commit a line");
+        assert!(err.contains("tick manifest root"), "{err}");
+
+        let honest = with_root(TickManifestRoot::over(&lines));
+        assert!(validate_roots_commit_sections(&honest).is_ok());
+        let sealed = honest.clone().into_sealed();
+        assert_eq!(
+            sealed.tick_manifest().len(),
+            1,
+            "sealing keeps the manifest"
+        );
+        assert!(validate_roots_commit_sections(&sealed).is_ok());
+
+        let err = validate_coast_block_for_vote(&honest, Some(ShardLoad::ZERO)).unwrap_err();
+        assert!(err.contains("tick lines"), "{err}");
     }
 
     /// The signed ceiling is the payer shard's verdict and no other

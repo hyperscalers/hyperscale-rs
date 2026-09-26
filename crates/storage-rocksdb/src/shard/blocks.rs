@@ -28,7 +28,7 @@ use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{
     BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, ProvisionKeyCodec,
-    ProvisionsCf, TransactionsCf, VotedBlockKeyCodec, VotedBlocksCf,
+    ProvisionsCf, TransactionsCf, TxFinalizationsCf, VotedBlockKeyCodec, VotedBlocksCf,
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
@@ -161,13 +161,30 @@ impl RocksDbShardStorage {
                 Some(tx.cached_wire_bytes()),
             );
         }
+        let tx_finalizations_cf = TxFinalizationsCf::handle(&cf);
+        let local_shard = block.header().shard_id();
         for fw in block.certificates().iter() {
-            batch_put::<CertificatesCf>(
-                batch,
-                certificates_cf,
-                &fw.receipt_hash(),
-                &fw.attestation(),
-            );
+            let hash = fw.receipt_hash();
+            batch_put::<CertificatesCf>(batch, certificates_cf, &hash, &fw.attestation());
+            // The by-transaction index rides the same batch, so a crash
+            // cannot leave a key naming a finalization the certificates
+            // family lacks. Only a finalization of this shard's own tick
+            // is indexed, and only for its local certificate: a
+            // counterpart's certificate riding inside it answers a
+            // question nobody asks this shard, and an asker served its
+            // own certificate back refuses it as unsolicited and asks
+            // again.
+            if fw.tick_id().shard_id() != local_shard {
+                continue;
+            }
+            for outcome in fw.local_ec().tx_outcomes() {
+                batch_put::<TxFinalizationsCf>(
+                    batch,
+                    tx_finalizations_cf,
+                    &(outcome.tx_hash(), hash),
+                    &(),
+                );
+            }
         }
         self.append_provisions_to_batch(batch, block, retention_floor);
     }
@@ -318,7 +335,7 @@ impl RocksDbShardStorage {
         // 1. Get block metadata
         let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
 
-        let (header, manifest, qc, _) = metadata.into_parts();
+        let (header, manifest, engagements, qc, _) = metadata.into_parts();
 
         // 2. Batch-fetch transactions (preserving order)
         let transactions =
@@ -378,7 +395,7 @@ impl RocksDbShardStorage {
         // provision bodies, but the manifest's provision-hash list rides
         // along so sync-serving glue can re-attach bodies from the
         // in-memory cache when a requester is still within the
-        // execution window.
+        // execution window, and the engagements they named ride with it.
         let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions
             .into_iter()
             .map(|tx| {
@@ -396,8 +413,10 @@ impl RocksDbShardStorage {
                 Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
             ),
             provision_hashes: Arc::new(manifest.provision_hashes().clone()),
+            engagements: Arc::new(engagements),
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
+            tick_manifest: Arc::new(manifest.tick_manifest().clone()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
         };
 
@@ -444,7 +463,7 @@ impl RocksDbShardStorage {
 
         // 1. Get block metadata
         let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
-        let (header, manifest, qc, _) = metadata.into_parts();
+        let (header, manifest, engagements, qc, _) = metadata.into_parts();
         let qc = qc.into_unverified();
 
         // 2. Try to batch-fetch transactions (preserving order)
@@ -531,8 +550,10 @@ impl RocksDbShardStorage {
                 Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
             ),
             provision_hashes: Arc::new(provision_hashes_bounded.clone()),
+            engagements: Arc::new(engagements),
             abandonment_records: Arc::new(manifest.abandonment_records().clone()),
             state_claims: Arc::new(manifest.state_claims().clone()),
+            tick_manifest: Arc::new(manifest.tick_manifest().clone()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
         };
         let provision_hashes = provision_hashes_bounded;
@@ -606,11 +627,8 @@ impl RocksDbShardStorage {
     // Chain metadata
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Get the chain metadata (committed height, hash, and QC).
-    ///
-    /// Reads all three chain metadata keys in one call. Use the individual
-    /// `read_committed_height`, `read_committed_hash`, `read_latest_qc`
-    /// methods when only one value is needed.
+    /// Get the chain metadata (committed height, hash, and QC), all three
+    /// read from one snapshot.
     #[must_use]
     pub(crate) fn get_chain_metadata(
         &self,
@@ -621,9 +639,10 @@ impl RocksDbShardStorage {
     ) {
         let start = Instant::now();
 
-        let height = self.read_committed_height();
-        let hash = self.read_committed_hash();
-        let qc = self.read_latest_qc();
+        let snapshot = self.db.snapshot();
+        let height = read_committed_height(&snapshot);
+        let hash = read_committed_hash(&snapshot);
+        let qc = read_committed_qc(&snapshot).map(Verified::<QuorumCertificate>::from_persisted);
 
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);
@@ -637,9 +656,13 @@ impl RocksDbShardStorage {
         read_committed_height(&*self.db)
     }
 
-    /// Read only the committed hash from `RocksDB`.
-    pub(crate) fn read_committed_hash(&self) -> Option<Hash> {
-        read_committed_hash(&*self.db)
+    /// Read the committed height and hash from one snapshot.
+    pub(crate) fn read_committed_head(&self) -> (BlockHeight, Option<Hash>) {
+        let snapshot = self.db.snapshot();
+        (
+            read_committed_height(&snapshot),
+            read_committed_hash(&snapshot),
+        )
     }
 
     /// Read only the latest QC from `RocksDB`.

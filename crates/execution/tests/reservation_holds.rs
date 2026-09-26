@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::ExecutedTx;
-use hyperscale_engine::legs::{Classified, Member, Runs, Side};
+use hyperscale_engine::legs::{Classified, Member, Runs};
 use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_storage::TickOutput;
@@ -157,7 +157,6 @@ fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
         runs: Runs::Shape(Member::of(
             Classified::whole(),
             local,
-            Side::Issuing,
             BTreeSet::from([local, counterpart]),
         )),
         arrivals: Vec::new(),

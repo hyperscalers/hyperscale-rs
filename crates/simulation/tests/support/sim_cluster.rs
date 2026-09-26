@@ -20,7 +20,7 @@ use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
-    RanAs, chain_fate, chain_membership, records_naming, status_rank,
+    RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming, status_rank,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
@@ -268,6 +268,18 @@ impl SimCluster {
         Self::grown(config, seed, accounts, packages, false)
     }
 
+    /// [`Self::with_grown_accounts`] with every validator on a host of
+    /// its own, so the two shards' committees share no host and a fault
+    /// keyed by host pair cuts exactly one committee's traffic.
+    #[must_use]
+    pub fn with_grown_accounts_on_dedicated_pool_hosts(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+    ) -> Self {
+        Self::grown(config, seed, accounts, GenesisPackages::protocol(), true)
+    }
+
     /// [`Self::with_grown_packages`] with every pool extra on its own
     /// host, so the committees the grow seats share no host — what a
     /// fault rule keyed on committee hosts needs to cut one shard's
@@ -352,10 +364,16 @@ impl SimCluster {
         Duration::from_millis(EPOCH_MS) * budget.0
     }
 
-    /// Hosts whose `shard` vnode sits in the shard's current committee — the
-    /// live copy. After a grow-then-merge the reformed shard's terminated
-    /// pre-merge chain lingers under the same id on its old hosts; those carry
-    /// no current committee seat, so this filters them out.
+    /// Hosts carrying a `shard` vnode that sits in the shard's current
+    /// committee — the live copy. After a grow-then-merge the reformed
+    /// shard's terminated pre-merge chain lingers under the same id on its
+    /// old hosts; those carry no current committee seat, so this filters
+    /// them out.
+    ///
+    /// Any of the host's vnodes on the shard, not its first: a host that
+    /// kept a lapsed member's vnode on the shard and took a pool
+    /// validator's seat beside it holds one store for both, and that
+    /// store is the committee's.
     fn live_committee_hosts(&self, shard: ShardId) -> Vec<NodeIndex> {
         let Some(topology_snapshot) = self.runner.host_topology(0) else {
             return Vec::new();
@@ -368,8 +386,9 @@ impl SimCluster {
         (0..self.runner.num_hosts())
             .filter(|&host| {
                 self.runner
-                    .vnode_state_in(host, shard)
-                    .is_some_and(|vnode| committee.contains(&vnode.validator_id()))
+                    .shard_vnodes_in(host, shard)
+                    .iter()
+                    .any(|vnode| committee.contains(&vnode.validator_id()))
             })
             .collect()
     }
@@ -521,6 +540,14 @@ impl SimCluster {
     /// after the teardown on a host that serves nothing — dropped, not
     /// delayed. A client routes to the committee the beacon names, and
     /// so does this.
+    fn submit_at(&mut self, host: NodeIndex, tx: Arc<Transaction>) {
+        self.runner.schedule_initial_event(
+            host,
+            Duration::ZERO,
+            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
+        );
+    }
+
     fn host_for_tx(&self, tx: &Transaction) -> Option<NodeIndex> {
         let topology_snapshot = self.runner.host_topology(0)?;
         // Built by the harness rather than by a node, so nothing has
@@ -551,11 +578,16 @@ impl Cluster for SimCluster {
 
     fn submit(&mut self, tx: Arc<Transaction>) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
-        self.runner.schedule_initial_event(
-            host,
-            Duration::ZERO,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
-        );
+        self.submit_at(host, tx);
+    }
+
+    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
+        let host = self
+            .live_committee_hosts(shard)
+            .first()
+            .copied()
+            .unwrap_or(0);
+        self.submit_at(host, tx);
     }
 
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool {
@@ -682,14 +714,17 @@ impl Cluster for SimCluster {
     }
 
     fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
-        // By tallest chain, not by first host: a terminated predecessor's
-        // store can still answer for a shard id its successor has since
-        // reclaimed, and that store's origin is the one the successor
-        // replaced.
+        // The latest origin any store of the shard reports, not the
+        // tallest store's: a terminated predecessor's store can still
+        // answer for a shard id its successor has since reclaimed, and
+        // its origin is the one the successor replaced; and a member
+        // seated past genesis recovers no origin at all, reading network
+        // genesis whatever cut its chain began at. The store seeded at
+        // the cut carries the latest anchor, whichever height it is at.
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .max_by_key(|store| ShardChainReader::committed_height(*store))
             .map(|store| store.load_recovered_state(shard).chain_origin.anchor_wt)
+            .max()
     }
 
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {
@@ -717,6 +752,20 @@ impl Cluster for SimCluster {
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
             .map(|store| records_naming(store, tx))
+            .find(|named| !named.is_empty())
+            .unwrap_or_default()
+    }
+
+    fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .any(|store| reads_record(store, key))
+    }
+
+    fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .map(|store| declines_naming(store, tx))
             .find(|named| !named.is_empty())
             .unwrap_or_default()
     }

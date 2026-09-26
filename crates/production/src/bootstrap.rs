@@ -164,7 +164,8 @@ where
             height = bootstrap.anchor().height.inner(),
             "Snap-sync bootstrap complete; state verified against the anchor"
         );
-        return Ok(bootstrap.into_recovered_state());
+        return Ok(bootstrap
+            .into_recovered_state(storage.read_frontier(shard), storage.member_index(shard)));
     }
 }
 

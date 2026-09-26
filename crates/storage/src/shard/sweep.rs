@@ -10,18 +10,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use hyperscale_hbor::Capped;
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    Address, Block, Finalization, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites,
-    ShardId, ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction,
-    TxHash, Verifiable, WeightedTimestamp, protocol_statics, protocol_statics_installed,
+    Address, Block, FrontierInputs, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES,
+    SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier,
+    Transaction, TxHash, Verified, WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
+use crate::shard::crossings::{crossing_settlements, owed_credits};
+use crate::shard::members::{MemberInputs, member_writes};
+use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
 use crate::tree::JmtSnapshot;
 use crate::{
-    Anchored, filter_state_writes_to_prefix, filter_writes_to_prefix, key_under_prefix,
-    merge_receipts, settle_writes,
+    Anchored, Substates, filter_state_writes_to_prefix, filter_writes_to_prefix, fold_state_writes,
+    key_under_prefix, merge_receipts, settle_writes,
 };
 
 /// When a committed cell stops being needed, or `None` for every cell a
@@ -43,21 +47,6 @@ pub fn sweepable_expiry(key: SubstateKey, value: &[u8]) -> Option<u64> {
         return None;
     }
     protocol_statics().sweepable_cell(key.owner.to_bytes(), key.local.0, value)
-}
-
-/// Whether a committed cell is an escrow record — value the shard holds
-/// for a crossing it issued.
-///
-/// The same seam as [`sweepable_expiry`] and its complement: a record is
-/// outside every sweep's reach by construction, so a store that inherits
-/// a prefix whole has nothing else to tell it that the leaf it just
-/// imported is an obligation. Lives here because both questions are the
-/// same question about a leaf — which family wrote it — asked of the one
-/// authority that can answer from the bytes.
-#[must_use]
-pub fn is_record_cell(key: SubstateKey, value: &[u8]) -> bool {
-    protocol_statics_installed()
-        && protocol_statics().record_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
 /// One row of the sweep index: an owner holding sweepable cells in a
@@ -406,8 +395,8 @@ pub fn merge_sweep_overlay(
 }
 
 /// Fold what the block itself writes — the committed-transaction cells
-/// it creates, and the sweep's removals with the refusals' retractions
-/// — into the settled set its receipts produced.
+/// it creates, and the sweep's removals — into the settled set its
+/// receipts produced.
 ///
 /// All are ordinary writes, a value at the key or `None` at it, so
 /// none needs a commit path of its own: they fold with everything else
@@ -449,19 +438,11 @@ pub fn with_sweep(
     SettledWrites::from_parts(cells, entries)
 }
 
-/// Everything a block removes, each once: what its sweep retires, and
-/// the committed cells its finalizations' refusals retract.
-///
-/// One set, because a refused transaction's cell can fall to the sweep
-/// in the block that retracts it, and a removal named twice would be
-/// two `None`s at one key. Ascending, so the fold walks one order.
+/// Everything a block removes, each once: what its sweep retires and
+/// what its claims settle. Ascending, so the fold walks one order.
 #[must_use]
-pub(crate) fn removals_of(
-    swept: &[SubstateKey],
-    finalizations: &[Arc<Verifiable<Finalization>>],
-) -> Vec<SubstateKey> {
-    let mut removals: BTreeSet<SubstateKey> = swept.iter().copied().collect();
-    removals.extend(finalizations.iter().flat_map(|fw| fw.retractions()));
+pub(crate) fn removals_of(swept: &[SubstateKey], settled: &[SubstateKey]) -> Vec<SubstateKey> {
+    let removals: BTreeSet<SubstateKey> = swept.iter().chain(settled).copied().collect();
     removals.into_iter().collect()
 }
 
@@ -494,21 +475,27 @@ pub fn sweep_through(
 /// composed it.
 ///
 /// The receipts its ticks settled, the committed cells its committer
-/// derived, the sweep its header names, and the cells its refusals
-/// retract.
+/// derived, the sweep its header names, the crossing settlements its
+/// claims license, the read frontier its claims raise, and the tick
+/// membership its content moves.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
 /// every live cell at or below the header's frontier is one the block
 /// removed, and one the block created sits far above it. The creations
 /// are the caller's, derived under the block's own window as the
-/// committer derived them.
+/// committer derived them. The settlements read this half of the state:
+/// a key under the other half reads absent here and falls out, and is
+/// the other follower's. The frontier's writes read the copy of the
+/// table this half holds, which is the whole table, and are written for
+/// both halves before the prefix keeps this one's.
 #[must_use]
 pub fn followed_block_writes(
     store: &(impl SweepIndex + ?Sized),
     prior: &dyn Anchored,
     block: &Block,
     creations: &[(SubstateKey, Vec<u8>)],
+    frontier: &FrontierInputs,
     prefix: &NibblePath,
 ) -> SettledWrites {
     let settling: Vec<StoredReceipt> = block
@@ -519,13 +506,18 @@ pub fn followed_block_writes(
     // Restricted before resolving: a follower holds its prefix of the
     // tree and nothing else, so a movement on any other cell reads an
     // empty prior here and is the owning store's to judge, not this one's.
-    let merged = settle_writes(
-        &filter_state_writes_to_prefix(&merge_receipts(&settling), prefix),
-        prior,
-    );
+    let mut writes = merge_receipts(&settling);
+    fold_state_writes(&mut writes, &owed_credits(block.state_claims(), prior));
+    let merged = settle_writes(&filter_state_writes_to_prefix(&writes, prefix), prior);
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
-    let removals = removals_of(&swept, block.certificates());
-    filter_writes_to_prefix(&with_sweep(merged, creations, &removals), prefix)
+    let settled = crossing_settlements(block.state_claims(), &merged, prior);
+    let removals = removals_of(&swept, &settled);
+    let mut raised = read_frontier_writes(prior, frontier);
+    raised.extend(member_writes(prior, &MemberInputs::of(block)));
+    filter_writes_to_prefix(
+        &with_frontier(with_sweep(merged, creations, &removals), raised),
+        prefix,
+    )
 }
 
 /// The committed-transaction cells `local_shard` writes for
@@ -551,15 +543,148 @@ pub fn committed_tx_cells<'a>(
 ) -> Vec<(SubstateKey, Vec<u8>)> {
     transactions
         .into_iter()
+        .map(|tx| committed_tx_cell(local_shard, tx))
+        .collect()
+}
+
+fn committed_tx_cell(local_shard: ShardId, tx: &Transaction) -> (SubstateKey, Vec<u8>) {
+    let validity_end = tx.validity_range().end_timestamp_exclusive;
+    let cell = Marker::of(tx.hash(), validity_end.as_millis(), Marked::Committed);
+    (
+        committed_tx_cell_key(local_shard, cell.tx, validity_end),
+        cell.to_bytes(),
+    )
+}
+
+/// One transaction's committed marker as a block that carries it writes
+/// it, and every key whose presence says the transaction was already
+/// committed on this chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedHere {
+    /// The marker this shard writes, under its own owner.
+    pub key: SubstateKey,
+    /// The marker's bytes.
+    pub value: Vec<u8>,
+    /// For a transaction whose range opened before the chain's origin,
+    /// the marker key under the owner of the shard's right half.
+    ///
+    /// A shard's owner is its path padded with zeros, so a left
+    /// predecessor wrote under this chain's own owner and `key` already
+    /// answers for it. A merged parent's right predecessor wrote here, in
+    /// the parent's own state. On a chain not born by a merge nothing
+    /// sits at it, so reading it needs no knowledge of how the chain was
+    /// born.
+    pub inherited: Option<SubstateKey>,
+}
+
+impl CommittedHere {
+    /// The write the block folds.
+    #[must_use]
+    pub fn creation(&self) -> (SubstateKey, Vec<u8>) {
+        (self.key, self.value.clone())
+    }
+}
+
+/// [`committed_tx_cells`], with each row carrying the inherited key a
+/// transaction older than `origin` is also judged by.
+#[must_use]
+pub fn committed_here<'a>(
+    local_shard: ShardId,
+    origin: WeightedTimestamp,
+    transactions: impl IntoIterator<Item = &'a Transaction>,
+) -> Vec<CommittedHere> {
+    transactions
+        .into_iter()
         .map(|tx| {
-            let validity_end = tx.validity_range().end_timestamp_exclusive;
-            let cell = Marker::of(tx.hash(), validity_end.as_millis(), Marked::Committed);
-            (
-                committed_tx_cell_key(local_shard, cell.tx, validity_end),
-                cell.to_bytes(),
-            )
+            let (key, value) = committed_tx_cell(local_shard, tx);
+            let range = tx.validity_range();
+            let inherited = (range.start_timestamp_inclusive < origin).then(|| {
+                committed_tx_cell_key(
+                    local_shard.children().1,
+                    tx.hash(),
+                    range.end_timestamp_exclusive,
+                )
+            });
+            CommittedHere {
+                key,
+                value,
+                inherited,
+            }
         })
         .collect()
+}
+
+/// The creations a block's rows fold.
+#[must_use]
+pub fn creations_of(rows: &[CommittedHere]) -> Vec<(SubstateKey, Vec<u8>)> {
+    rows.iter().map(CommittedHere::creation).collect()
+}
+
+/// Whether `row` may not be carried over `state`: its own marker or its
+/// inherited one is present, or its own key is in `named` already.
+/// Presence is the answer, whatever value sits at the key.
+fn committed_already(
+    row: &CommittedHere,
+    named: &mut BTreeSet<SubstateKey>,
+    state: &(impl Substates + ?Sized),
+) -> bool {
+    !named.insert(row.key)
+        || state.cell(row.key).is_some()
+        || row.inherited.is_some_and(|key| state.cell(key).is_some())
+}
+
+/// The first row a block may not carry.
+///
+/// A transaction this chain already committed, by its own marker or an
+/// inherited one present in the parent state, or one whose marker
+/// another transaction in the block names.
+///
+/// One rule, both halves: a block carries no transaction whose committed
+/// key is present in its parent state or named by another transaction in
+/// the same block. Presence is read through `state`, the anchored view,
+/// so a marker an unpersisted ancestor created counts, and a restarted or
+/// snap-synced voter answers as a live one does. A sweep removes only
+/// what is live in the parent, so a creation that is also a removal
+/// breaks the first half on its own and needs no clause.
+///
+/// What the rule buys is that a transaction is committed once per chain
+/// lineage, and that a live committed cell always names the transaction
+/// that created it, so a probe reading the cell reads about the
+/// transaction it asked about. A verifier refuses a block that breaks it
+/// at vote time, before the in-block pair reaches [`with_sweep`]'s assert
+/// and halts every replica, and a proposer keeps the first of each
+/// colliding set.
+#[must_use]
+pub fn colliding_committed_cell(
+    rows: &[CommittedHere],
+    state: &(impl Substates + ?Sized),
+) -> Option<SubstateKey> {
+    let mut named: BTreeSet<SubstateKey> = BTreeSet::new();
+    rows.iter()
+        .find(|row| committed_already(row, &mut named, state))
+        .map(|row| row.key)
+}
+
+/// Drop from `transactions` every one [`colliding_committed_cell`] would
+/// refuse: the first of each set sharing a key is kept, and one this
+/// chain already committed goes.
+///
+/// What a proposer builds from. A colliding transaction is deferred to a
+/// block whose parent no longer holds the cell rather than built into a
+/// block every verifier refuses, one round after another; it stays
+/// pooled meanwhile. A grinder who finds a collision defers only his own
+/// later transaction.
+pub fn without_colliding_committed_cells<const N: usize>(
+    local_shard: ShardId,
+    origin: WeightedTimestamp,
+    transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, N>,
+    state: &(impl Substates + ?Sized),
+) {
+    let mut named: BTreeSet<SubstateKey> = BTreeSet::new();
+    transactions.retain(|tx| {
+        let row = committed_here(local_shard, origin, [&***tx]);
+        !committed_already(&row[0], &mut named, state)
+    });
 }
 
 /// The key `shard` writes its committed cell for `tx` under.
@@ -585,7 +710,10 @@ pub fn committed_tx_cell_key(
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
-    use hyperscale_types::{AddressClass, BlockHeight, SWEEP_BUCKET_MS, StateRoot};
+    use hyperscale_types::{
+        AddressClass, BlockHeight, CollectionId, Hash, SWEEP_BUCKET_MS, StateRoot,
+    };
+    use proptest::prelude::*;
 
     use super::*;
     use crate::CollectedWrites;
@@ -812,32 +940,19 @@ mod tests {
         assert_eq!(settled.cells().get(&removed), Some(&None));
     }
 
-    /// A refusal's retraction removes the cell beside the sweep, and a
-    /// cell both name is removed once.
+    /// A cell the sweep names twice is removed once.
     #[test]
-    fn a_refusals_retraction_removes_beside_the_sweep_once() {
-        use hyperscale_types::test_utils::finalization_of;
-        use hyperscale_types::{BlockHeight, ExecutionOutcome, Hash, TxOutcome};
-
-        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+    fn a_swept_cell_is_removed_once() {
         let (swept, _, _) = cell(1, 1, 0xD1);
-        let (retracted, _, _) = cell(2, 3, 0xC2);
-        let finalizations = vec![Arc::new(Verifiable::from(finalization_of(
-            BlockHeight::new(1),
-            vec![
-                TxOutcome::new(tx(1), ExecutionOutcome::Failed).retracting(Some(retracted)),
-                TxOutcome::new(tx(2), ExecutionOutcome::Aborted).retracting(Some(swept)),
-            ],
-        )))];
-        let mut expected = vec![swept, retracted];
+        let (other, _, _) = cell(2, 3, 0xC2);
+        let mut expected = vec![swept, other];
         expected.sort_unstable();
-        assert_eq!(removals_of(&[swept], &finalizations), expected);
+        assert_eq!(removals_of(&[other, swept], &[swept]), expected);
         let settled = with_sweep(
             SettledWrites::default(),
             &[],
-            &removals_of(&[swept], &finalizations),
+            &removals_of(&[swept], &[swept]),
         );
-        assert_eq!(settled.cells().get(&retracted), Some(&None));
         assert_eq!(settled.cells().get(&swept), Some(&None));
     }
 
@@ -871,5 +986,333 @@ mod tests {
             committed_tx_cells(shard, txs.iter()),
             "derived the same way on every replica"
         );
+    }
+
+    /// A hand-built committed key: no test can grind the collision the
+    /// rule refuses, so the pair is written out.
+    fn committed(tag: u8) -> SubstateKey {
+        SubstateKey {
+            owner: owner(9),
+            local: LocalKey([tag; 16]),
+        }
+    }
+
+    /// A row that inherits nothing.
+    fn own(key: SubstateKey, value: Vec<u8>) -> CommittedHere {
+        CommittedHere {
+            key,
+            value,
+            inherited: None,
+        }
+    }
+
+    /// A parent state holding exactly `present`, each at a value that
+    /// names no transaction.
+    struct Holding(BTreeSet<SubstateKey>);
+
+    impl Substates for Holding {
+        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            self.0.contains(&key).then(|| vec![1])
+        }
+        fn entries_in_range(
+            &self,
+            _owner: Address,
+            _collection: CollectionId,
+            _lo: u128,
+            _hi: u128,
+            _limit: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            Vec::new()
+        }
+    }
+
+    /// The backstop: two creations at one key are one entry in the
+    /// settled map, and which survives is insertion order, which no
+    /// validator can check. Refused at validation before it gets here.
+    #[test]
+    #[should_panic(expected = "which this block's receipts also write")]
+    fn with_sweep_refuses_two_creations_at_one_key() {
+        let key = committed(1);
+        let _ = with_sweep(
+            SettledWrites::default(),
+            &[(key, vec![1]), (key, vec![2])],
+            &[],
+        );
+    }
+
+    /// The other backstop: a transaction created in the block that
+    /// removes a colliding cell a parent wrote.
+    #[test]
+    #[should_panic(expected = "a sweep removed")]
+    fn with_sweep_refuses_a_creation_that_is_also_a_removal() {
+        let key = committed(2);
+        let _ = with_sweep(SettledWrites::default(), &[(key, vec![1])], &[key]);
+    }
+
+    /// The rule the backstops stand behind: a key named twice in one
+    /// block, or once over a cell the parent holds — a cell an
+    /// unpersisted ancestor created reads present through the anchored
+    /// view the caller hands in — and nothing for distinct absent keys.
+    #[test]
+    fn a_colliding_committed_cell_is_found_in_the_block_and_in_the_parent() {
+        let (a, b, c) = (committed(1), committed(2), committed(3));
+        let absent = Holding(BTreeSet::new());
+        assert_eq!(
+            colliding_committed_cell(
+                &[own(a, vec![1]), own(b, vec![1]), own(a, vec![2])],
+                &absent
+            ),
+            Some(a),
+            "named twice in the block",
+        );
+        let holding = Holding(BTreeSet::from([b]));
+        assert_eq!(
+            colliding_committed_cell(&[own(a, vec![1]), own(b, vec![1])], &holding),
+            Some(b),
+            "present in the parent",
+        );
+        assert_eq!(
+            colliding_committed_cell(&[own(a, vec![1]), own(c, vec![1])], &holding),
+            None,
+            "distinct absent keys",
+        );
+    }
+
+    /// A proposer keeps the first transaction of a colliding set and
+    /// drops one whose cell the parent already holds; both stay pooled.
+    #[test]
+    fn a_proposer_keeps_the_first_of_a_colliding_set() {
+        use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+
+        install_stub_protocol_statics();
+        let shard = ShardId::leaf(1, 1);
+        let verified = |n: u8| Arc::new(Verified::new_unchecked_for_test(test_transaction(n)));
+        let (first, second) = (verified(1), verified(2));
+        let key_of = |tx: &Transaction| {
+            committed_tx_cell_key(
+                shard,
+                tx.hash(),
+                tx.validity_range().end_timestamp_exclusive,
+            )
+        };
+
+        // The same transaction listed twice is the in-block pair; the
+        // second listing goes.
+        let mut listed: Capped<Vec<_>, 4> =
+            Capped::new(vec![first.clone(), first.clone(), second.clone()]).expect("three");
+        without_colliding_committed_cells(
+            shard,
+            WeightedTimestamp::ZERO,
+            &mut listed,
+            &Holding(BTreeSet::new()),
+        );
+        assert_eq!(
+            listed.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
+            vec![first.hash(), second.hash()],
+        );
+
+        // A cell the parent holds defers the transaction that would
+        // write it, and leaves the other.
+        let mut listed: Capped<Vec<_>, 4> =
+            Capped::new(vec![first.clone(), second.clone()]).expect("two");
+        without_colliding_committed_cells(
+            shard,
+            WeightedTimestamp::ZERO,
+            &mut listed,
+            &Holding(BTreeSet::from([key_of(&first)])),
+        );
+        assert_eq!(
+            listed.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
+            vec![second.hash()],
+        );
+    }
+
+    /// A transaction older than the chain's origin is also judged by the
+    /// marker a merged parent's right predecessor wrote, under the owner
+    /// of the right half; one the chain has seen open is judged by its
+    /// own marker alone. The proposer drops what the voter refuses.
+    #[test]
+    fn an_inherited_marker_refuses_a_transaction_older_than_the_chain() {
+        use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+
+        install_stub_protocol_statics();
+        let shard = ShardId::leaf(1, 0);
+        let tx = test_transaction(1);
+        let validity_end = tx.validity_range().end_timestamp_exclusive;
+        let right = committed_tx_cell_key(shard.children().1, tx.hash(), validity_end);
+        let holding = Holding(BTreeSet::from([right]));
+        let origin = tx
+            .validity_range()
+            .start_timestamp_inclusive
+            .plus(std::time::Duration::from_millis(1));
+
+        let older = committed_here(shard, origin, [&tx]);
+        assert_eq!(older[0].inherited, Some(right));
+        assert_eq!(
+            colliding_committed_cell(&older, &holding),
+            Some(older[0].key),
+            "the right predecessor committed it",
+        );
+        let newer = committed_here(shard, WeightedTimestamp::ZERO, [&tx]);
+        assert_eq!(newer[0].inherited, None);
+        assert_eq!(colliding_committed_cell(&newer, &holding), None);
+
+        let verified = Arc::new(Verified::new_unchecked_for_test(tx));
+        let mut listed: Capped<Vec<_>, 1> = Capped::new(vec![verified]).expect("one");
+        without_colliding_committed_cells(shard, origin, &mut listed, &holding);
+        assert!(listed.is_empty(), "the proposer drops it too");
+    }
+
+    /// Presence refuses, whatever the value at the key: a marker naming
+    /// another transaction at T's key is still T's refusal, so no
+    /// collision can make a committed transaction read absent.
+    #[test]
+    fn presence_refuses_whatever_the_marker_names() {
+        struct Naming(SubstateKey, Vec<u8>);
+        impl Substates for Naming {
+            fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+                (key == self.0).then(|| self.1.clone())
+            }
+            fn entries_in_range(
+                &self,
+                _owner: Address,
+                _collection: CollectionId,
+                _lo: u128,
+                _hi: u128,
+                _limit: usize,
+            ) -> Vec<(u128, Vec<u8>)> {
+                Vec::new()
+            }
+        }
+
+        let key = committed(5);
+        let other = TxHash::from(Hash::from_bytes(&[0xC; 32]));
+        let state = Naming(key, Marker::of(other, 1_000, Marked::Committed).to_bytes());
+        assert_eq!(
+            colliding_committed_cell(&[own(key, vec![1])], &state),
+            Some(key)
+        );
+    }
+
+    /// A state holding exactly the keys given, for the properties below.
+    fn holding_keys(keys: impl IntoIterator<Item = SubstateKey>) -> Holding {
+        Holding(keys.into_iter().collect())
+    }
+
+    proptest! {
+        /// The builder and the voter read one rule: whatever the builder
+        /// keeps, the voter admits, and whatever it drops, the voter
+        /// refuses — alone, or beside a kept twin.
+        #[test]
+        fn the_builder_keeps_exactly_what_the_voter_admits(
+            picks in prop::collection::vec(0u8..6, 0..10),
+            marked in prop::collection::vec((0u8..6, any::<bool>()), 0..6),
+            older_than_the_chain in any::<bool>(),
+        ) {
+            use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+
+            install_stub_protocol_statics();
+            let shard = ShardId::leaf(1, 0);
+            let origin = if older_than_the_chain {
+                WeightedTimestamp::from_millis(1)
+            } else {
+                WeightedTimestamp::ZERO
+            };
+            let state = holding_keys(marked.iter().filter_map(|(seed, inherited)| {
+                let row = committed_here(shard, WeightedTimestamp::from_millis(1), [&test_transaction(*seed)]).remove(0);
+                if *inherited { row.inherited } else { Some(row.key) }
+            }));
+            let listed: Vec<_> = picks
+                .iter()
+                .map(|seed| Arc::new(Verified::new_unchecked_for_test(test_transaction(*seed))))
+                .collect();
+            let mut kept: Capped<Vec<_>, 16> = Capped::new(listed.clone()).expect("under the cap");
+            without_colliding_committed_cells(shard, origin, &mut kept, &state);
+
+            let kept_rows: Vec<CommittedHere> =
+                kept.iter().map(|tx| rows_of_tx(shard, origin, tx)).collect();
+            prop_assert_eq!(colliding_committed_cell(&kept_rows, &state), None);
+            for tx in &listed {
+                let twin_kept = kept.iter().any(|k| k.hash() == tx.hash());
+                let alone = colliding_committed_cell(&[rows_of_tx(shard, origin, tx)], &state);
+                prop_assert!(twin_kept || alone.is_some(), "a dropped transaction the voter admits alone");
+            }
+        }
+
+        /// A transaction admitted inside its own range creates its marker
+        /// above anything the block's sweep can reach: the sweep stops at
+        /// the anchor's bucket, and the marker expires a grace past the
+        /// range's end.
+        #[test]
+        fn a_creation_sits_above_the_sweep(
+            end_ms in 1u64..10_000_000_000,
+            back_ms in 1u64..10_000_000_000,
+            seed in any::<u8>(),
+        ) {
+            use hyperscale_types::test_utils::install_stub_protocol_statics;
+
+            install_stub_protocol_statics();
+            let anchor = WeightedTimestamp::from_millis(end_ms.saturating_sub(back_ms));
+            let tx = TxHash::from(Hash::from_bytes(&[seed; 32]));
+            let key = committed_tx_cell_key(
+                ShardId::leaf(1, 0),
+                tx,
+                WeightedTimestamp::from_millis(end_ms),
+            );
+            prop_assert!(SweepFrontier::of_leaf(key) > SweepFrontier::ceiling_at(anchor));
+        }
+    }
+
+    /// One transaction's row.
+    fn rows_of_tx(
+        shard: ShardId,
+        origin: WeightedTimestamp,
+        tx: &Verified<Transaction>,
+    ) -> CommittedHere {
+        committed_here(shard, origin, [&**tx]).remove(0)
+    }
+
+    /// A live committed cell names the transaction whose key it sits
+    /// at, across a creation, a removal and a fresh creation in
+    /// consecutive blocks: once the first is removed the key is
+    /// absent, so a second transaction may create it, and the marker
+    /// then names the second.
+    #[test]
+    fn a_live_committed_cell_names_its_creator() {
+        use hyperscale_hbor::from_slice;
+
+        let key = committed(4);
+        let (a, b) = (
+            TxHash::from(Hash::from_bytes(&[0xA; 32])),
+            TxHash::from(Hash::from_bytes(&[0xB; 32])),
+        );
+        let marker = |tx: TxHash| Marker::of(tx, 1_000, Marked::Committed).to_bytes();
+        let cell_after = |writes: SettledWrites| writes.into_parts().0.remove(&key).flatten();
+
+        let created = cell_after(with_sweep(
+            SettledWrites::default(),
+            &[(key, marker(a))],
+            &[],
+        ));
+        let named: Marker = from_slice(&created.expect("created")).expect("a marker");
+        assert_eq!(named.tx, a);
+
+        let holding = Holding(BTreeSet::from([key]));
+        assert_eq!(
+            colliding_committed_cell(&[own(key, marker(b))], &holding),
+            Some(key),
+            "while the first stands, the second is refused",
+        );
+        assert!(
+            cell_after(with_sweep(SettledWrites::default(), &[], &[key])).is_none(),
+            "the sweep removes it",
+        );
+        let recreated = cell_after(with_sweep(
+            SettledWrites::default(),
+            &[(key, marker(b))],
+            &[],
+        ));
+        let named: Marker = from_slice(&recreated.expect("created again")).expect("a marker");
+        assert_eq!(named.tx, b, "and the cell names its creator");
     }
 }

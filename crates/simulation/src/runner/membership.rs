@@ -514,7 +514,10 @@ impl SimulationRunner {
             bootstrap.is_complete(),
             "snap-sync bootstrap for shard {shard:?} did not complete against a pinned anchor",
         );
-        Some(bootstrap.into_recovered_state())
+        Some(
+            bootstrap
+                .into_recovered_state(storage.read_frontier(shard), storage.member_index(shard)),
+        )
     }
 
     /// Build a runtime joiner's `VnodeInit` via [`seat_vnode_group`] —

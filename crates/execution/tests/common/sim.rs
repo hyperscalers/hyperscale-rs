@@ -33,22 +33,26 @@ use hyperscale_engine::{AllCodeRuns, ExecutedTx};
 use hyperscale_execution::action_handlers::{
     ExecutionOutputs, accumulate_tick_output, split_execution_outputs,
 };
-use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
+use hyperscale_execution::{
+    CrossingIndexSlot, ExecCertStore, ExecutionCoordinator, FinalizationStore,
+};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{
     Anchored, RecoveredState, ReplayWindow, SubstateStore, Substates, TickChain, TickOutput,
     VersionedStore, merge_writes_from_receipts,
 };
-use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, certify, make_live_block};
+use hyperscale_types::test_utils::{
+    StubVmStatics, TestCommittee, certify, make_live_block, naming,
+};
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
     ConsensusReceipt, CounterpartMirror, DeclaredRange, EventRoot, ExecutionCertificate,
     ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt, LocalKey,
-    MerkleInclusionProof, Movement, ProvenAnchors, ProvenCells, ProvisionEntry, Provisions,
-    ResourceAddr, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot, StateWrites,
-    StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    compute_global_receipt_root, read_amount,
+    MerkleInclusionProof, Movement, ProvenAnchors, ProvisionEntry, Provisions, ResourceAddr,
+    SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot, StateWrites, StoredReceipt,
+    SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
+    read_amount,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -212,6 +216,8 @@ impl VersionedStore for StubBase {
     fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
         None
     }
+
+    fn hold_retention_at(&self, _height: BlockHeight) {}
 }
 
 /// A tick dispatched but not yet completed.
@@ -316,12 +322,20 @@ impl ExecutionSim {
                 .collect(),
         );
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
+        // The fixture's blocks all extend the genesis QC, so each one's
+        // committee anchor is its own.
+        let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
+        let effects =
+            self.coord
+                .commit_block_composing(&self.topology, &certified, committee_anchor);
+        // Kept naming what its commit seated, as a proposer's block
+        // would, so a replay seats the same members.
         self.committed
-            .push(Verified::<CertifiedBlock>::from_persisted(
-                certified.clone(),
-            ));
-        let actions = self.coord.on_block_committed(&self.topology, &certified);
-        self.absorb(actions);
+            .push(Verified::<CertifiedBlock>::from_persisted(naming(
+                &certified,
+                effects.named,
+            )));
+        self.absorb(effects.actions);
         // Persistence follows the commit, which is when the chain evicts
         // the folds it believes the base now covers.
         self.chain.prune_persisted(self.height);
@@ -371,17 +385,26 @@ impl ExecutionSim {
                 provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
                 abandonment_records,
                 state_claims,
+                tick_manifest: Arc::new(Capped::empty()),
                 witness_sources,
             },
             sealed @ Block::Sealed { .. } => sealed,
         };
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
+        // The fixture's blocks all extend the genesis QC, so each one's
+        // committee anchor is its own.
+        let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
+        let effects =
+            self.coord
+                .commit_block_composing(&self.topology, &certified, committee_anchor);
+        // Kept naming what its commit seated, as a proposer's block
+        // would, so a replay seats the same members.
         self.committed
-            .push(Verified::<CertifiedBlock>::from_persisted(
-                certified.clone(),
-            ));
-        let actions = self.coord.on_block_committed(&self.topology, &certified);
-        self.absorb(actions);
+            .push(Verified::<CertifiedBlock>::from_persisted(naming(
+                &certified,
+                effects.named,
+            )));
+        self.absorb(effects.actions);
         self.chain.prune_persisted(self.height);
         self.release_due();
     }
@@ -473,7 +496,7 @@ impl ExecutionSim {
         let ExecutionOutputs {
             outcomes,
             results,
-            fee_receipts,
+            refusal_receipts,
         } = split_execution_outputs(executed);
         self.receipts
             .entry(tick_id)
@@ -482,12 +505,12 @@ impl ExecutionSim {
         self.charges
             .entry(tick_id)
             .or_default()
-            .extend(fee_receipts.iter().cloned());
+            .extend(refusal_receipts.iter().cloned());
         let outcome = TickBatchOutcome {
             tick_id,
             results,
             tx_outcomes: outcomes,
-            fee_receipts,
+            refusal_receipts,
         };
 
         self.outputs.push((tick, output.clone()));
@@ -529,7 +552,7 @@ impl ExecutionSim {
             committed_height: self.height,
             replay: ReplayWindow {
                 blocks: self.committed.clone(),
-                compose_from: BlockHeight::GENESIS,
+                dispatch_from: BlockHeight::GENESIS,
                 anchor_wt: None,
             },
             ..RecoveredState::default()
@@ -538,19 +561,19 @@ impl ExecutionSim {
             ValidatorId::new(0),
             self.local_shard,
             Arc::new(AllCodeRuns),
+            Arc::new(CrossingIndexSlot::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
-            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
         self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
         self.pending.clear();
-        let actions = self
+        let effects = self
             .coord
             .on_committed_state_restored(&self.topology, &StubVmStatics);
-        self.absorb(actions);
+        self.absorb(effects.actions);
         self.drain();
     }
 
@@ -733,7 +756,7 @@ fn stub_execute(
     // member. Which of the two settles is the tick's decision, not this
     // shard's.
     if abortable {
-        executed.fee_receipt = charged.map(stub_charge);
+        executed.refusal_receipt = charged.map(stub_charge);
     }
     executed
 }
@@ -820,7 +843,7 @@ pub fn settle_refused_by_counterpart(
         .iter()
         .zip(charges)
         .map(|(receipt, charge)| {
-            TxOutcome::with_fee(
+            TxOutcome::with_refusal(
                 receipt.tx_hash,
                 ExecutionOutcome::Succeeded {
                     receipt_hash: receipt.consensus.receipt_hash(),

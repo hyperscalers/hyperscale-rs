@@ -25,6 +25,7 @@
 //!    transaction reached the same verdict everywhere, plus the local
 //!    receipts: everything a block needs to commit the outcome
 
+pub mod arrival;
 pub mod computation;
 pub mod execution_certificate;
 pub mod finalization;
@@ -116,7 +117,7 @@ mod tests {
             ShardId::leaf(1, 0),
             &topology_snapshot,
             &[],
-            &[],
+            &|tx| topology_snapshot.all_shards_for_transaction(tx),
         );
         assert!(map.is_empty());
     }
@@ -134,7 +135,7 @@ mod tests {
             ShardId::leaf(1, 0),
             &topology_snapshot,
             &[tx],
-            &[],
+            &|tx| topology_snapshot.all_shards_for_transaction(tx),
         );
         assert!(map.is_empty(), "single-shard tx must not produce an entry");
     }
@@ -161,7 +162,7 @@ mod tests {
             ShardId::leaf(1, 0),
             &topology_snapshot,
             &[tx_a.clone(), tx_b.clone()],
-            &[],
+            &|tx| topology_snapshot.all_shards_for_transaction(tx),
         );
 
         // Local shard excluded; only shard 1 receives provisions.

@@ -14,23 +14,24 @@
 //! emit — full content, empty fallback, empty sync — so a single
 //! build-and-dispatch helper can drive them uniformly.
 
-use std::collections::HashSet;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_engine::legs::Classified;
+use hyperscale_engine::tick_select::ManifestInputs;
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch,
-    Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal, ReshapeTrigger,
-    RevealChain, Round, ShardId, StateClaim, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
+    AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
+    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
+    ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, TopologySnapshot, Transaction, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
 };
+use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
 
 use crate::admission::{
-    Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
-    RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
+    Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
+    RecordsFold, RecordsSection, Section, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_each, unwrapped,
 };
 use crate::chain_view::ChainView;
@@ -45,7 +46,7 @@ use crate::verification::VerificationPipeline;
 #[derive(Debug)]
 pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
-    Normal(ProposalPayload),
+    Normal(Box<ProposalPayload>),
     /// View-change fallback: empty payload, parent's weighted timestamp
     /// (prevents Byzantine proposers from manipulating consensus time on
     /// timeout), `is_fallback = true`.
@@ -64,6 +65,12 @@ pub struct ProposalPayload {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
+    /// The crossings whose ends share this shard, for the builder to
+    /// read at the parent beside the claims.
+    pub(crate) local_crossings: Vec<CrossingId>,
+    /// What the read frontier judges of the claims selected, for the
+    /// builder to drop against the parent state.
+    pub(crate) fence: ReadFence,
 }
 
 #[derive(Debug, Clone)]
@@ -160,27 +167,20 @@ impl ProposalTracker {
 // Payload selection
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// What a proposer answers for itself that its voters answer by
-/// delegation or at the fence: the validity window each transaction is
-/// held to, with the late deliveries the anchor admits past their
-/// validity end, and the predecessors' answers for transactions opening
-/// before the chain's origin.
+/// What a proposer answers for itself that its voters answer at the
+/// fence: the precut rule for transactions opening before the chain's
+/// origin.
 #[derive(Clone, Copy)]
 pub struct Prefilter<'a> {
-    /// The predecessors' answers for transactions opening before the
-    /// origin.
+    /// The precut rule for transactions opening before the origin.
     pub(crate) precut: &'a Precut,
-    /// Transactions this shard only delivers for, admissible past their
-    /// validity end to the delivery window's close.
-    pub(crate) late_deliveries: &'a HashSet<TxHash>,
 }
 
 /// Filter ready transactions for proposal inclusion. Drops what the
 /// voters' delegated root check refuses — a `validity_range` malformed
-/// against the anchor or not containing it, unless the anchor admits
-/// the transaction as a late delivery — and what their fence defers on
-/// — a transaction opening before the chain's origin that no
-/// predecessor has proven absent; then keeps what
+/// against the anchor or not containing it — and what their fence defers on
+/// — a transaction opening before the chain's origin that the precut rule
+/// does not yet pass; then keeps what
 /// [`TransactionsSection`] admits, folding into `fold`. A transaction
 /// that does not fit the sweep cap is skipped rather than ending the
 /// selection, so a large composition never starves the small ones
@@ -188,8 +188,8 @@ pub struct Prefilter<'a> {
 ///
 /// Logs the refusals when non-zero.
 pub fn select_transactions(
-    ctx: &Admission<'_>,
-    prefilter: &Prefilter<'_>,
+    ctx: &Committed<'_>,
+    prefilter: Prefilter<'_>,
     fold: &mut TransactionsFold<'_>,
     ready_txs: &[Arc<Verified<Transaction>>],
 ) -> Vec<Arc<Verified<Transaction>>> {
@@ -200,25 +200,20 @@ pub fn select_transactions(
         .iter()
         .filter(|tx| {
             let h = tx.hash();
-            // A delivery is admissible to its record's window, not the
-            // transaction's — the same rule the voters' root check reads.
             let range = tx.validity_range();
-            let admitted = range.contains(ctx.anchor)
-                || (prefilter.late_deliveries.contains(&h)
-                    && Window::Delivery
-                        .of(Deadline::of(range.end_timestamp_exclusive))
-                        .contains(&ctx.anchor));
-            if !range.is_well_formed(ctx.anchor) || !admitted {
+            if !range.is_well_formed(ctx.anchor) || !range.contains(ctx.anchor) {
                 expired += 1;
                 return false;
             }
-            // Opened before this chain did, so it belongs to the
-            // predecessor that ran before the cut. Offerable only where
-            // every predecessor proved it absent from its committed set;
-            // anything else a voter defers on or refuses. Zero for a
-            // chain born at network genesis.
+            // Opened before this chain did, so a predecessor may have
+            // committed it. Offerable once the precut rule passes it —
+            // for a right child, once the parent's terminal state proved
+            // its marker absent; anything else a voter defers on or
+            // refuses. Zero for a chain born at network genesis.
             if range.start_timestamp_inclusive < ctx.chain_origin
-                && !prefilter.precut.admissible(&h)
+                && !prefilter
+                    .precut
+                    .admissible(h, range.end_timestamp_exclusive)
             {
                 predates += 1;
                 return false;
@@ -242,36 +237,6 @@ pub fn select_transactions(
     selected
 }
 
-/// The transactions among `txs`, past their validity end at `anchor`,
-/// that `local_shard` only delivers for: frozen divided against the trie
-/// of `anchor`'s window with this shard outside the core and every leg
-/// here a delivery.
-///
-/// Computed against the block's own anchor by the proposer selecting
-/// and by every voter checking, so the set is one set. Empty when the
-/// anchor's window is not retained — a block there is refused on other
-/// grounds.
-#[must_use]
-pub fn late_deliveries<T: Deref<Target = Transaction>>(
-    txs: &[Arc<T>],
-    topology_schedule: &TopologySchedule,
-    anchor: WeightedTimestamp,
-    local_shard: ShardId,
-) -> HashSet<TxHash> {
-    let Some(window) = topology_schedule.at(anchor) else {
-        return HashSet::new();
-    };
-    let trie = window.shard_trie();
-    txs.iter()
-        .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
-        .filter(|tx| {
-            Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie)
-                .only_delivers_at(local_shard)
-        })
-        .map(|tx| tx.hash())
-        .collect()
-}
-
 /// Select finalizations for inclusion: what [`FinalizationsSection`]
 /// admits, in the caller's order, folding into `fold`.
 ///
@@ -286,7 +251,7 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
 /// drops only what a gap in that order would have made unofferable
 /// anyway, and the cap drops a suffix.
 pub fn select_finalizations(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut FinalizationsFold,
     finalizations: Vec<Arc<Verifiable<Finalization>>>,
 ) -> Vec<Arc<Verifiable<Finalization>>> {
@@ -296,8 +261,9 @@ pub fn select_finalizations(
 /// Select the boundary records for inclusion: each trimmed to the names
 /// [`RecordsSection::name_stands`] admits — a name a finalization in
 /// the block resolves, or one the chain already resolved, is refused by
-/// every voter — with an emptied record dropped rather than offered,
-/// then what [`RecordsSection`] admits in canonical order.
+/// every voter — and to the crossings the departed shard was the one to
+/// take, with an emptied record dropped rather than offered, then what
+/// [`RecordsSection`] admits in canonical order.
 ///
 /// A departure's evidence stops answering at the departed shard's
 /// terminal-evidence expiry, read at the block's anchor. The composing
@@ -308,7 +274,7 @@ pub fn select_finalizations(
 /// commits nothing never advances the frontier that would retire the
 /// set, the next proposal carries it again.
 pub fn select_abandonment_records(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut RecordsFold<'_>,
     records: Vec<AbandonmentRecord>,
 ) -> Vec<AbandonmentRecord> {
@@ -330,28 +296,100 @@ pub fn select_abandonment_records(
                 })
                 .cloned()
                 .collect();
-            (!kept.is_empty())
-                .then(|| AbandonmentRecord::new(record.shard(), record.terminal_wt(), kept))
+            let unclaimed = record.unclaimed().iter().copied().filter(|crossing| {
+                crossing.party(
+                    ctx.local_shard,
+                    record.shard(),
+                    record.terminal_wt(),
+                    &departures,
+                )
+            });
+            let kept = AbandonmentRecord::new(record.shard(), record.terminal_wt(), kept)
+                .with_unclaimed(unclaimed);
+            (kept.names() > 0).then_some(kept)
         })
         .collect();
     trimmed.sort_by_key(AbandonmentRecord::shard);
     admit_each::<RecordsSection<'_>, _>(ctx, fold, trimmed, |record| record).0
 }
 
-/// The proofs a block may carry of counterparts' cells: what
-/// [`StateClaimsSection`] admits, in the one order it carries them —
-/// ascending, without repeats, and no more than the block's cap, with
-/// the rest waiting a block.
+/// The claims a block may carry of counterparts' cells: what
+/// [`StateClaimsSection`] admits, in the one order it carries them,
+/// spent against the section's byte budget in the order the composer
+/// offers them.
+///
+/// The budget is spent in the offered order, one producer's claims
+/// together in anchor order and the producers by their oldest anchor,
+/// so no claim of a producer rides while an older one of it is held
+/// back and one busy producer cannot starve another. The first claim
+/// that does not fit is cut to the longest key prefix whose piece fits,
+/// that piece is kept and the spending ends there: a claim is split by
+/// key, never dropped whole, and the composer offers the remainder at
+/// the next proposal once the commit retires what this block carried.
+/// What was kept is then sorted into the section's order and admitted,
+/// and what the order rule refuses is dropped.
 #[must_use]
 pub fn select_state_claims(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut StateClaimsFold,
     state_claims: Vec<StateClaim>,
 ) -> Vec<StateClaim> {
-    let mut sorted = state_claims;
-    sorted.sort_unstable();
-    sorted.dedup();
-    admit_each::<StateClaimsSection, _>(ctx, fold, sorted, |bundle| bundle).0
+    let mut kept = Vec::new();
+    let mut weight = 0usize;
+    for claim in state_claims {
+        if kept.len() >= MAX_STATE_CLAIMS_PER_BLOCK {
+            break;
+        }
+        if state_claims_admit_block(weight.saturating_add(claim.wire_weight())) {
+            weight = weight.saturating_add(claim.wire_weight());
+            kept.push(claim);
+            continue;
+        }
+        let keys = claim.keys();
+        let piece = (1..keys.len()).rev().find_map(|kept| {
+            let piece = claim.restrict(|key| keys[..kept].contains(&key))?;
+            state_claims_admit_block(weight.saturating_add(piece.wire_weight())).then_some(piece)
+        });
+        if let Some(piece) = piece {
+            kept.push(piece);
+        }
+        break;
+    }
+    kept.sort_unstable();
+    kept.dedup();
+    kept.into_iter()
+        .filter(|claim| fold.in_order(claim) && StateClaimsSection::admit(ctx, fold, claim).is_ok())
+        .collect()
+}
+
+/// The crossings of `offered` the section's budget still carries once
+/// `selected` is in it, read at the parent: three keyed and named
+/// readings each, with the empty proof, cut into claims of
+/// [`MAX_PROOFS_PER_QUERY`] readings. What does not fit waits a block.
+#[must_use]
+pub fn trim_local_crossings(
+    selected: &[StateClaim],
+    mut offered: Vec<CrossingId>,
+) -> Vec<CrossingId> {
+    let spent: usize = selected.iter().map(StateClaim::wire_weight).sum();
+    let room = MAX_STATE_CLAIMS_BYTES.saturating_sub(spent);
+    let claims_left = MAX_STATE_CLAIMS_PER_BLOCK.saturating_sub(selected.len());
+    // An owed record rides with its value, which a crossing of either
+    // kind is weighed at: the bound is the widest record and its length.
+    let per_crossing =
+        3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES) + MAX_HELD_VALUE_BYTES + 4;
+    let per_claim = MAX_PROOFS_PER_QUERY / 3;
+    let mut kept = 0;
+    while kept < offered.len() {
+        let claims = kept / per_claim + 1;
+        let weight = claims * STATE_CLAIM_BYTES + (kept + 1) * per_crossing;
+        if weight > room || claims > claims_left {
+            break;
+        }
+        kept += 1;
+    }
+    offered.truncate(kept);
+    offered
 }
 
 /// Select provisions for inclusion: what [`ProvisionsSection`] admits
@@ -359,7 +397,7 @@ pub fn select_state_claims(
 /// the queue drains monotonically; unselected batches remain queued for
 /// the next proposal.
 pub fn select_provisions(
-    ctx: &Admission<'_>,
+    ctx: &Committed<'_>,
     fold: &mut ProvisionsFold,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
 ) -> Vec<Arc<Verifiable<Provisions>>> {
@@ -418,12 +456,14 @@ pub fn assemble_build_action(
     parent_committee_anchor_epoch: Epoch,
     committee_anchor_epoch: Epoch,
     carry_split_child_roots: bool,
-    carry_terminal_roots: bool,
+    carry_terminal_settled_txs: bool,
     settled_txs_window_floor: Option<WeightedTimestamp>,
     classification_topology_snapshot: Arc<TopologySnapshot>,
     fee_checks: Vec<FeeDemand>,
     fee_read_height: BlockHeight,
     substate_bytes: Option<u64>,
+    windows: EpochWindows,
+    manifest: ManifestInputs,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
@@ -437,7 +477,7 @@ pub fn assemble_build_action(
         ProposalKind::Normal(payload) => (
             ProposerTimestamp::from_local(now),
             false,
-            payload,
+            *payload,
             "Requesting block build for proposal",
             false,
         ),
@@ -462,7 +502,21 @@ pub fn assemble_build_action(
         provisions,
         abandonment_records,
         state_claims,
+        local_crossings,
+        fence,
     } = payload;
+    let parent_anchor = Anchor {
+        shard: local_shard,
+        height: parent_block_height,
+        state_root: parent_state_root,
+        ts: parent_qc.weighted_timestamp(),
+    };
+    let frontier = FrontierInputs::for_block(
+        &state_claims,
+        windows,
+        parent_qc.weighted_timestamp(),
+        local_shard,
+    );
 
     // The proposer's new BlockHeader will carry parent_qc in its wire
     // form; HBOR encoding is byte-identical between the raw and
@@ -470,6 +524,7 @@ pub fn assemble_build_action(
     let parent_qc_raw = parent_qc.into_inner();
     let action = Action::BuildProposal {
         shard_id: local_shard,
+        chain_origin: chain.chain_origin().anchor_wt,
         proposer: me,
         height,
         round,
@@ -499,9 +554,14 @@ pub fn assemble_build_action(
         parent_committee_anchor_epoch,
         committee_anchor_epoch,
         carry_split_child_roots,
-        carry_terminal_roots,
+        carry_terminal_settled_txs,
         settled_txs_window_floor,
         classification_topology_snapshot,
+        frontier,
+        fence,
+        parent_anchor,
+        local_crossings,
+        manifest,
     };
 
     BuildActionPlan {
@@ -544,23 +604,27 @@ pub fn dispatch_or_defer(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use hyperscale_hbor::Capped;
+    use hyperscale_storage::committed_tx_cell_key;
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, make_finalization, make_undecided_finalization,
-        stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
+        install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_abort_charge,
+        stub_transaction, stub_transaction_binding, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, MAX_INTENTS,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PredecessorTerminal, RoutePrefix, TimestampRange, TransactionDecision, UnsettledTx,
-        ValidatorSet,
+        Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, Hash, MAX_INTENTS,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, RoutePrefix,
+        StateRoot, TimestampRange, TopologySchedule, TransactionDecision, TxHash, UnsettledTx,
+        ValidatorSet, state_claims_admit_block,
     };
 
     use super::*;
+    use crate::admission::admit_all;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
     use crate::commit_dedup::CommitDedupIndex;
+    use crate::validation::tests::{wide_claims, wide_claims_at};
 
     /// Admission under `snapshot` at `anchor` for a chain that began at
     /// `origin`, with `txs` behind the parent and `dedup` committed.
@@ -617,6 +681,7 @@ mod tests {
                 [0x00; 31],
                 AddressClass::Principal,
             ))]),
+            escrowed: Capped::empty(),
         }
     }
 
@@ -741,19 +806,17 @@ mod tests {
     ///
     /// The offer's dedup asks whether the chain already resolved the
     /// names a finalization carries a verdict on. A member that reaches
-    /// no verdict — a retirement, whose `Membership::housekeeping`
-    /// decides nothing — contributes no such name, so a certificate
-    /// carrying only those asks the question of an empty set. `all()` over
+    /// no verdict — a leg whose success bears none, since its core
+    /// decides — contributes no such name, so a certificate carrying
+    /// only those asks the question of an empty set. `all()` over
     /// an empty iterator is true, and the proposer re-offers the same
     /// certificate on every block while the settlement frontier stands
     /// still.
     #[test]
     fn select_finalizations_drops_a_committed_offer_that_decided_nothing() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"retired"));
-        let committed: Arc<Verifiable<Finalization>> = Arc::new(
-            make_undecided_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept)
-                .into(),
-        );
+        let committed: Arc<Verifiable<Finalization>> =
+            Arc::new(make_leg_finalization(BlockHeight::new(1), tx_hash).into());
         assert_eq!(
             committed.deciding_tx_hashes().count(),
             0,
@@ -916,31 +979,43 @@ mod tests {
         )
     }
 
-    /// A successor of one chain that has answered nothing, so no pre-cut
-    /// transaction is admissible. Cases anchored at
+    /// The parent terminal a right child asks.
+    fn parent_terminal() -> Anchor {
+        Anchor {
+            shard: ShardId::leaf(1, 0),
+            height: BlockHeight::new(9),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::ZERO,
+        }
+    }
+
+    /// A split's right child whose parent has answered nothing, so no
+    /// pre-cut transaction is admissible. Cases anchored at
     /// `WeightedTimestamp::ZERO` never consult it, since nothing opens
     /// before an origin of zero.
     fn refuses_precut() -> Precut {
-        Precut::succeeding(vec![PredecessorTerminal {
-            shard: ShardId::leaf(1, 0),
-            height: BlockHeight::new(9),
-            block_hash: BlockHash::ZERO,
-            committed_txs_root: CommittedTxsRoot::ZERO,
-        }])
+        install_stub_protocol_statics();
+        let terminal = parent_terminal();
+        Precut::adopted(terminal.shard.children().1, &[terminal])
     }
 
-    /// The same successor, with `tx_hash` proven absent from its
-    /// predecessor's committed set.
-    fn admits_precut(tx_hash: TxHash) -> Precut {
+    /// The same right child, with the marker of the transaction `tx_hash`
+    /// ending at `validity_end` proven absent from its parent's terminal
+    /// state.
+    fn admits_precut(tx_hash: TxHash, validity_end: WeightedTimestamp) -> Precut {
         let mut precut = refuses_precut();
-        precut.record(precut.predecessors()[0].shard, tx_hash, true);
+        let terminal = parent_terminal();
+        precut.record(
+            terminal,
+            committed_tx_cell_key(terminal.shard, tx_hash, validity_end),
+            false,
+        );
         precut
     }
 
     /// A transaction opening before the chain's origin is dropped while
-    /// unresolved, and offered once every predecessor has proven it
-    /// absent — the whole point of the committed set, seen from the
-    /// proposer's side.
+    /// unresolved, and offered once the parent's terminal state has
+    /// proven its marker absent.
     #[test]
     fn select_transactions_offers_a_precut_tx_only_once_resolved_absent() {
         let cut = ts(10_000);
@@ -960,9 +1035,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
@@ -981,9 +1055,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
-                precut: &admits_precut(hash),
-                late_deliveries: &HashSet::new(),
+            Prefilter {
+                precut: &admits_precut(hash, ts(40_000)),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
@@ -1016,9 +1089,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
@@ -1044,9 +1116,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
@@ -1077,9 +1148,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
@@ -1134,9 +1204,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut fold,
             &txs,
@@ -1167,9 +1236,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
@@ -1181,57 +1249,165 @@ mod tests {
         );
     }
 
-    /// A transaction named a late delivery is offered past its validity
-    /// end while the delivery window is open, and dropped at the close;
-    /// one not named is dropped at the validity end as before.
+    /// The composer spends the section's bytes: the first claim that
+    /// does not fit is cut to the longest key prefix whose piece fits,
+    /// the piece passes admission, the section ends there, and the
+    /// remainder is a claim a next proposal carries.
     #[test]
-    fn select_transactions_offers_a_late_delivery_to_the_windows_close() {
-        let end = ts(1_000);
-        let range = TimestampRange::new(ts(500), end);
-        let delivery = tx_with_range(7, range);
-        let other = tx_with_range(8, range);
-        let late: HashSet<TxHash> = std::iter::once(delivery.hash()).collect();
-        let txs = vec![delivery.clone(), other];
-
-        let select = |anchor: WeightedTimestamp| -> Vec<TxHash> {
-            select_transactions(
-                &against(
-                    window_listing_no_packages(),
-                    anchor,
-                    WeightedTimestamp::ZERO,
-                    HashSet::new(),
-                    empty_dedup_index(),
-                )
-                .ctx(),
-                &Prefilter {
-                    precut: &refuses_precut(),
-                    late_deliveries: &late,
-                },
-                &mut TransactionsFold::beside(&ProvisionsFold::default()),
-                &txs,
-            )
-            .iter()
-            .map(|tx| tx.hash())
-            .collect()
-        };
-        assert_eq!(
-            select(end),
-            vec![delivery.hash()],
-            "at the end only the delivery"
-        );
-        assert_eq!(
-            select(
-                Window::Delivery
-                    .of(Deadline::of(end))
-                    .end
-                    .minus(Duration::from_millis(1))
-            ),
-            vec![delivery.hash()],
-            "and to the last moment of its window"
+    fn a_claim_past_the_budget_is_cut_to_its_longest_fitting_prefix() {
+        let (_, wide) = wide_claims(ShardId::leaf(1, 0));
+        let ctx = finalizations_against(CommitDedupIndex::new());
+        let mut fold = StateClaimsFold::default();
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, wide.clone());
+        assert!(!selected.is_empty() && selected.len() < wide.len());
+        assert!(state_claims_admit_block(
+            selected.iter().map(StateClaim::wire_weight).sum()
+        ));
+        let cut = selected.last().expect("something was carried");
+        let whole = &wide[selected.len() - 1];
+        assert_ne!(
+            cut, whole,
+            "the last claim carried is a piece of the one that did not fit"
         );
         assert!(
-            select(Window::Delivery.of(Deadline::of(end)).end).is_empty(),
-            "the close drops it"
+            whole.keys().starts_with(&cut.keys()),
+            "cut to a prefix of its keys",
+        );
+        assert!(
+            !state_claims_admit_block(
+                selected[..selected.len() - 1]
+                    .iter()
+                    .map(StateClaim::wire_weight)
+                    .sum::<usize>()
+                    + whole.wire_weight()
+            ),
+            "the whole did not fit",
+        );
+        let mut checked = StateClaimsFold::default();
+        assert!(
+            admit_all::<StateClaimsSection>(&ctx.ctx(), &mut checked, &selected).is_ok(),
+            "what the composer selected passes admission",
+        );
+
+        let carried = cut.keys();
+        let remainder = whole
+            .restrict(|key| !carried.contains(&key))
+            .expect("the cut left something");
+        let mut next = StateClaimsFold::default();
+        assert_eq!(
+            select_state_claims(&ctx.ctx(), &mut next, vec![remainder.clone()]),
+            vec![remainder],
+            "the remainder rides the next proposal whole",
+        );
+    }
+
+    /// The budget is spent in the order the composer offers, one
+    /// producer's claims in anchor order: with room for both, a claim at
+    /// `a1` and one at `a2 > a1` both ride; with room for one, the one
+    /// at `a1` rides whole and the one at `a2` is cut behind it, so no
+    /// reading at `a2` is carried while one at `a1` is held back.
+    #[test]
+    fn a_producers_older_anchor_rides_before_its_newer_one() {
+        let (_, at_a1) = wide_claims_at(ShardId::leaf(1, 0), 3);
+        let (_, at_a2) = wide_claims_at(ShardId::leaf(1, 0), 4);
+        let ctx = finalizations_against(CommitDedupIndex::new());
+        let is_whole = |carried: &StateClaim, offered: &[StateClaim]| offered.contains(carried);
+
+        let both = vec![at_a1[0].clone(), at_a2[0].clone()];
+        let mut fold = StateClaimsFold::default();
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, both.clone());
+        assert_eq!(selected.len(), 2, "with room for both, both ride");
+        assert!(selected.iter().all(|claim| is_whole(claim, &both)));
+
+        // `a1`'s claims until `a2`'s first no longer fits whole behind
+        // them, then `a2`'s first.
+        let mut offered: Vec<StateClaim> = Vec::new();
+        let mut weight = 0usize;
+        for claim in &at_a1 {
+            if !state_claims_admit_block(weight + at_a2[0].wire_weight()) {
+                break;
+            }
+            weight += claim.wire_weight();
+            offered.push(claim.clone());
+        }
+        let older = offered.len();
+        assert!(
+            older > 0 && state_claims_admit_block(weight),
+            "the fixture's a1 claims fit by themselves",
+        );
+        assert!(
+            !state_claims_admit_block(weight + at_a2[0].wire_weight()),
+            "and leave no room for a2's whole",
+        );
+        offered.push(at_a2[0].clone());
+        let mut fold = StateClaimsFold::default();
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, offered.clone());
+        let (carried_a1, carried_a2): (Vec<&StateClaim>, Vec<&StateClaim>) = selected
+            .iter()
+            .partition(|claim| claim.anchor.height == BlockHeight::new(3));
+        assert_eq!(carried_a1.len(), older, "every claim at a1 rides");
+        assert!(
+            carried_a1.iter().all(|claim| is_whole(claim, &offered)),
+            "and rides whole",
+        );
+        assert!(
+            carried_a2.iter().all(|claim| !is_whole(claim, &offered)),
+            "what rides at a2 is a piece cut behind a1's, never the whole",
+        );
+    }
+
+    /// The crossings whose ends share this shard ride in the room the
+    /// section has left: all of them into an empty section, a prefix of
+    /// them behind a section near its budget, and none behind a full
+    /// one. What does not fit waits a block.
+    #[test]
+    fn local_crossings_past_the_section_budget_wait_a_block() {
+        use hyperscale_vm_effects::{Hash32, IntentHash};
+
+        let crossing = |seed: u16| {
+            let [hi, lo] = seed.to_be_bytes();
+            let mut body = [lo; 31];
+            body[0] = hi;
+            CrossingId {
+                producer: Address::new(body, AddressClass::Component),
+                consumer: Address::new([0xC0; 31], AddressClass::Component),
+                intent: IntentHash(Hash32([lo; 32])),
+                local: 0,
+                output: 0,
+            }
+        };
+        let offered: Vec<CrossingId> = (0..200).map(crossing).collect();
+        assert_eq!(
+            trim_local_crossings(&[], offered.clone()),
+            offered,
+            "an empty section carries them all",
+        );
+
+        let (_, wide) = wide_claims(ShardId::leaf(1, 0));
+        let mut selected: Vec<StateClaim> = Vec::new();
+        let mut weight = 0usize;
+        for claim in wide {
+            if state_claims_admit_block(weight + claim.wire_weight()) {
+                weight += claim.wire_weight();
+                selected.push(claim);
+            }
+        }
+        let kept = trim_local_crossings(&selected, offered.clone());
+        assert!(
+            !kept.is_empty() && kept.len() < offered.len(),
+            "a section near its budget carries some and not all: {}",
+            kept.len(),
+        );
+        assert_eq!(kept, offered[..kept.len()], "the prefix offered");
+        let per_crossing =
+            3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES) + MAX_HELD_VALUE_BYTES + 4;
+        let carried = weight
+            + (kept.len() / (MAX_PROOFS_PER_QUERY / 3) + 1) * STATE_CLAIM_BYTES
+            + kept.len() * per_crossing;
+        assert!(state_claims_admit_block(carried), "and what is kept fits");
+        assert!(
+            !state_claims_admit_block(carried + per_crossing),
+            "one more would not",
         );
     }
 
@@ -1251,9 +1427,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
@@ -1281,9 +1456,8 @@ mod tests {
                 empty_dedup_index(),
             )
             .ctx(),
-            &Prefilter {
+            Prefilter {
                 precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
             },
             &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &[tx],

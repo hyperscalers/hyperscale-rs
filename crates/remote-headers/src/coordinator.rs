@@ -18,10 +18,10 @@ use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, ConsensusPublicKey, Epoch,
-    ForkFence, HeaderFetchCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup,
-    ShardForkProof, ShardId, TopologySchedule, TopologySnapshot, TxsInFlight, ValidatorId,
-    Verified, WeightedTimestamp,
+    CertifiedHeaderVerifyError, CommitProof, CommittedClock, ConsensusPublicKey, Epoch, ForkFence,
+    HeaderFetchCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup, ShardForkProof,
+    ShardId, TopologySchedule, TopologySnapshot, TxsInFlight, ValidatorId, Verified,
+    WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -228,7 +228,8 @@ pub struct RemoteHeaderCoordinator {
     /// doubling range until the height proves or the entry ages out.
     wanted_proofs: BTreeMap<(ShardId, BlockHeight), WantedProof>,
 
-    /// Gossip-timed fork fences: a verified fork proof stops the
+    /// The node's gossip-timed fork fence, engaged and cleared by the
+    /// node: a verified fork proof stops the
     /// `RemoteHeaderCommitted` promotion for that shard at or above the
     /// forked height — so no consumer opens a fenced block's provisions or
     /// execution certificates. Held until the shard's recovery completes;
@@ -250,14 +251,13 @@ pub struct RemoteHeaderCoordinator {
     /// shard hasn't sent headers within `HEADER_LIVENESS_TIMEOUT`.
     expected: BTreeMap<ShardId, ExpectedHeader>,
 
-    /// Current local committed height (updated on each block commit).
-    local_committed_height: BlockHeight,
+    /// The node's committed clock: the "now" reference for liveness
+    /// timeouts, independent of local block production rate.
+    clock: CommittedClock,
 
-    /// BFT-authenticated weighted timestamp of the last locally committed
-    /// block. Used as the "now" reference for liveness timeouts so they're
-    /// independent of local block production rate and deterministic across
-    /// validators.
-    local_committed_ts: WeightedTimestamp,
+    /// Whether a block has committed through this coordinator yet: the
+    /// edge the pre-commit entries are retro-stamped on.
+    committed_once: bool,
 
     /// This validator's home shard. Headers tagged with `local_shard` are
     /// ignored (we cert-verify our own headers through the shard pipeline).
@@ -277,9 +277,17 @@ pub struct RemoteHeaderCoordinator {
 }
 
 impl RemoteHeaderCoordinator {
-    /// Create a new remote header coordinator.
+    /// Create a new remote header coordinator with a clock and fence of
+    /// its own.
     #[must_use]
     pub fn new(local_shard: ShardId) -> Self {
+        Self::sharing(local_shard, CommittedClock::default(), ForkFence::new())
+    }
+
+    /// Create a remote header coordinator on the node's own `clock` and
+    /// `fork_fence`, shared with the coordinators beside this one.
+    #[must_use]
+    pub fn sharing(local_shard: ShardId, clock: CommittedClock, fork_fence: ForkFence) -> Self {
         Self {
             pending: HashMap::new(),
             verified: HashMap::new(),
@@ -290,11 +298,11 @@ impl RemoteHeaderCoordinator {
             recovery_frontiers: BTreeMap::new(),
             recoveries_evicted: BTreeMap::new(),
             wanted_proofs: BTreeMap::new(),
-            fork_fence: ForkFence::new(),
+            fork_fence,
             tips: HashMap::new(),
             expected: BTreeMap::new(),
-            local_committed_height: BlockHeight::new(0),
-            local_committed_ts: WeightedTimestamp::ZERO,
+            clock,
+            committed_once: false,
             local_shard,
             awaiting: AwaitingTopologyBuffer::new(),
         }
@@ -648,7 +656,7 @@ impl RemoteHeaderCoordinator {
             while self.verified.contains_key(&(shard, frontier.next())) {
                 frontier = frontier.next();
             }
-            let now = self.local_committed_ts;
+            let now = self.clock.now();
             if let Some(expected) = self.expected.get_mut(&shard) {
                 expected.last_verified_height = frontier;
                 expected.last_verified_at = Some(now);
@@ -681,22 +689,22 @@ impl RemoteHeaderCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         certified: &CertifiedBlock,
+        cleared: &[ShardId],
     ) -> Vec<Action> {
-        // A deadline clock, by the rule
-        // [`WeightedTimestamp::advanced_by_commit`] states: liveness
-        // baselines, the probe gate, the want-retry horizon and the
-        // departed-shard retirement are all read against this.
-        let new_ts = self
-            .local_committed_ts
-            .advanced_by_commit(certified.block().header().parent_qc().weighted_timestamp());
-        let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
-        self.local_committed_height = certified.block().height();
-        self.local_committed_ts = new_ts;
+        // The shard coordinator's commit has already advanced the shared
+        // clock past this block; this is a no-op there, and is what moves
+        // a coordinator that runs without one.
+        self.clock
+            .advance(certified.block().header().parent_qc().weighted_timestamp());
+        let new_ts = self.clock.now();
+        let first_commit = !self.committed_once;
+        self.committed_once = true;
 
-        // Retro-stamp entries recorded before the first local commit: remote
-        // headers can arrive (and verify) while `local_committed_ts` is
-        // still zero, which would otherwise make age computations report the
-        // full epoch on the very next commit and trigger a fallback storm.
+        // Retro-stamp entries recorded before the first local commit: on a
+        // fresh chain remote headers can arrive (and verify) while the
+        // clock still reads zero, which would otherwise make age
+        // computations report the full epoch on the very next commit and
+        // trigger a fallback storm.
         if first_commit {
             for expected in self.expected.values_mut() {
                 if expected.discovered_at == WeightedTimestamp::ZERO {
@@ -718,21 +726,16 @@ impl RemoteHeaderCoordinator {
         self.retire_departed(topology_schedule);
         self.observe_recoveries(topology_schedule.head());
 
-        // Gossip-timed fork fences hold until the attested recovery for
-        // their shard completes; the attested
-        // `lookup_for_shard_certified_fenced` admission gate governs
-        // validity over the fold-to-completion window. Clearing releases
-        // the promotions the fence withheld: everything proven below the
-        // recovery's frontier is canonical history whose ticks are still
-        // decidable, and stranding it would abort them.
-        let cleared = self
-            .fork_fence
-            .clear_completed(topology_schedule.head().completed_recoveries());
-        let mut actions = self.promote_withheld(&cleared);
+        // The node cleared its fork fence for `cleared` at the head of this
+        // commit's fan-out, their recoveries having completed. Clearing
+        // releases the promotions the fence withheld: everything proven
+        // below the recovery's frontier is canonical history whose ticks
+        // are still decidable, and stranding it would abort them.
+        let mut actions = self.promote_withheld(cleared);
         actions.extend(self.retry_wanted_proofs());
 
         // Check for timed-out remote shards.
-        let now = self.local_committed_ts;
+        let now = self.clock.now();
 
         for (&shard, expected) in &self.expected {
             // Liveness baseline: when we last verified a header from this
@@ -837,7 +840,7 @@ impl RemoteHeaderCoordinator {
                     }
                 })
                 .or_insert_with(|| ExpectedHeader {
-                    discovered_at: self.local_committed_ts,
+                    discovered_at: self.clock.now(),
                     last_verified_height: anchor_height,
                     last_verified_at: None,
                 });
@@ -863,7 +866,7 @@ impl RemoteHeaderCoordinator {
         let mut actions = vec![];
 
         for (&shard, expected) in &self.expected {
-            if !Self::shard_routable(topology_schedule, shard, self.local_committed_ts) {
+            if !Self::shard_routable(topology_schedule, shard, self.clock.now()) {
                 continue;
             }
 
@@ -1023,7 +1026,7 @@ impl RemoteHeaderCoordinator {
     /// absent from the routable set: a departure this can act on is one
     /// the schedule states, not one it fails to mention.
     fn retire_departed(&mut self, topology_schedule: &TopologySchedule) {
-        let now = self.local_committed_ts;
+        let now = self.clock.now();
         if now == WeightedTimestamp::ZERO {
             return;
         }
@@ -1076,20 +1079,6 @@ impl RemoteHeaderCoordinator {
         });
     }
 
-    /// Engage the gossip-timed fork fence for `shard`: stop promoting its
-    /// blocks *at or above* `fork_height` — no `RemoteHeaderCommitted`, so
-    /// no consumer opens a fenced block's provisions or execution
-    /// certificates. Idempotent; see [`ForkFence::engage`] for the
-    /// tightening and replay rules.
-    pub fn engage_fork_fence(
-        &mut self,
-        shard: ShardId,
-        fork_height: BlockHeight,
-        completed: &BTreeMap<ShardId, CompletedRecovery>,
-    ) {
-        self.fork_fence.engage(shard, fork_height, completed);
-    }
-
     /// A cross-shard consumer is parked on `(shard, height)` awaiting its
     /// commit proof, for a height at or below the shard's attested
     /// boundary — under the forward sync anchor, where no range fetch
@@ -1114,7 +1103,7 @@ impl RemoteHeaderCoordinator {
         if self.proven.contains(&key) || self.wanted_proofs.contains_key(&key) {
             return Vec::new();
         }
-        let now = self.local_committed_ts;
+        let now = self.clock.now();
         self.wanted_proofs.insert(
             key,
             WantedProof {
@@ -1153,7 +1142,7 @@ impl RemoteHeaderCoordinator {
         if self.wanted_proofs.is_empty() {
             return Vec::new();
         }
-        let now = self.local_committed_ts;
+        let now = self.clock.now();
         let proven = &self.proven;
         self.wanted_proofs.retain(|key, wanted| {
             !proven.contains(key) && now.elapsed_since(wanted.registered_at) <= RETENTION_HORIZON
@@ -2048,22 +2037,19 @@ mod tests {
             )
         };
 
-        coord.on_block_committed(&sched, &committed(1, 9_000));
-        assert_eq!(
-            coord.local_committed_ts,
-            WeightedTimestamp::from_millis(9_000)
-        );
+        coord.on_block_committed(&sched, &committed(1, 9_000), &[]);
+        assert_eq!(coord.clock.now(), WeightedTimestamp::from_millis(9_000));
 
-        coord.on_block_committed(&sched, &committed(2, 4_000));
+        coord.on_block_committed(&sched, &committed(2, 4_000), &[]);
         assert_eq!(
-            coord.local_committed_ts,
+            coord.clock.now(),
             WeightedTimestamp::from_millis(9_000),
             "a regressed anchor holds the clock where it is",
         );
 
-        coord.on_block_committed(&sched, &committed(3, 11_000));
+        coord.on_block_committed(&sched, &committed(3, 11_000), &[]);
         assert_eq!(
-            coord.local_committed_ts,
+            coord.clock.now(),
             WeightedTimestamp::from_millis(11_000),
             "and it still advances",
         );
@@ -2096,8 +2082,9 @@ mod tests {
                     height: BlockHeight::new(9),
                     weighted_timestamp: WeightedTimestamp::from_millis(ED),
                     witness_base: BeaconWitnessLeafCount::ZERO,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     handoff_complete,
+                    terminal_epoch: None,
                 },
             );
             let snapshot = shard_snapshot(2, &[0, 1, 2, 3], 0).with_boundaries(boundaries);
@@ -2123,7 +2110,7 @@ mod tests {
 
         // Unstamped: the window is open, the terminal crossing is still
         // being synced, and nothing is retired.
-        coord.local_committed_ts = WeightedTimestamp::from_millis(1_000_000);
+        coord.clock = CommittedClock::seeded(WeightedTimestamp::from_millis(1_000_000));
         coord.retire_departed(&stamped(None));
         assert!(coord.tips.contains_key(&departed), "an open window holds");
 
@@ -2132,11 +2119,11 @@ mod tests {
         let expiry = sched
             .handoff_evidence_expiry(departed)
             .expect("the stamp fixes an expiry");
-        coord.local_committed_ts = expiry;
+        coord.clock = CommittedClock::seeded(expiry);
         coord.retire_departed(&sched);
         assert!(coord.tips.contains_key(&departed), "at the expiry it holds");
 
-        coord.local_committed_ts = expiry.plus(Duration::from_millis(1));
+        coord.clock = CommittedClock::seeded(expiry.plus(Duration::from_millis(1)));
         coord.retire_departed(&sched);
 
         assert!(
@@ -2230,7 +2217,7 @@ mod tests {
 
         // The fallback is strictly for the zero clock: a committed clock
         // below every retained window still refuses to probe.
-        coord.local_committed_ts = WeightedTimestamp::from_millis(1);
+        coord.clock = CommittedClock::seeded(WeightedTimestamp::from_millis(1));
         let actions = coord.flush_expected_headers(&sched);
         assert!(
             !actions
@@ -2730,7 +2717,12 @@ mod tests {
         let remote = ShardId::leaf(2, 1);
         let mut coord = RemoteHeaderCoordinator::new(local);
         // Fork at height 5: promotion stops at or above 5.
-        coord.engage_fork_fence(remote, BlockHeight::new(5), &BTreeMap::new());
+        assert!(
+            coord
+                .fork_fence
+                .engage(remote, BlockHeight::new(5), &BTreeMap::new())
+                .is_some()
+        );
 
         // A commit-proven header AT the fork height is tracked but not
         // promoted — no `RemoteHeaderCommitted`, so no consumer opens it.
@@ -2767,7 +2759,12 @@ mod tests {
         let local = ShardId::leaf(2, 0);
         let remote = ShardId::leaf(2, 1);
         let mut coord = RemoteHeaderCoordinator::new(local);
-        coord.engage_fork_fence(remote, BlockHeight::new(5), &BTreeMap::new());
+        assert!(
+            coord
+                .fork_fence
+                .engage(remote, BlockHeight::new(5), &BTreeMap::new())
+                .is_some()
+        );
 
         let local_block = |h: u64| {
             certify(
@@ -2799,7 +2796,7 @@ mod tests {
                 .collect(),
             ),
         ));
-        coord.on_block_committed(&recovering, &local_block(1));
+        coord.on_block_committed(&recovering, &local_block(1), &[]);
         let w = chain_header(remote, 5, 5, None);
         let wc = chain_header(remote, 6, 6, Some(&w));
         coord.on_verified_remote_header_received(w, ValidatorId::new(1));
@@ -2824,7 +2821,10 @@ mod tests {
                 .collect(),
             ),
         ));
-        let actions = coord.on_block_committed(&recovered, &local_block(2));
+        let cleared = coord
+            .fork_fence
+            .clear_completed(recovered.head().completed_recoveries());
+        let actions = coord.on_block_committed(&recovered, &local_block(2), &cleared);
         assert_eq!(
             committed_heights(&actions),
             vec![5],
@@ -2951,7 +2951,7 @@ mod tests {
             ),
             1_000,
         );
-        coord.on_block_committed(&recovering, &block);
+        coord.on_block_committed(&recovering, &block, &[]);
         assert!(!coord.has_verified(remote, BlockHeight::new(5)));
         assert!(!coord.has_commit_proof(remote, BlockHeight::new(5)));
 
@@ -3042,7 +3042,7 @@ mod tests {
                 h * 1_000,
             )
         };
-        coord.on_block_committed(&sched, &local_block(1));
+        coord.on_block_committed(&sched, &local_block(1), &[]);
 
         // Registration issues the first fetch immediately; a duplicate
         // registration is a no-op.
@@ -3056,9 +3056,9 @@ mod tests {
 
         // Inside the retry interval nothing re-issues; past it the fetch
         // re-issues with a doubled range.
-        let actions = coord.on_block_committed(&sched, &local_block(2));
+        let actions = coord.on_block_committed(&sched, &local_block(2), &[]);
         assert!(commit_proof_fetches(&actions).is_empty());
-        let actions = coord.on_block_committed(&sched, &local_block(8));
+        let actions = coord.on_block_committed(&sched, &local_block(8), &[]);
         assert_eq!(commit_proof_fetches(&actions), vec![(5, 8)]);
 
         // The proof lands: the height promotes, the want clears, and no
@@ -3068,7 +3068,7 @@ mod tests {
         coord.on_verified_remote_header_received(w, ValidatorId::new(1));
         let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
         assert_eq!(committed_heights(&actions), vec![5]);
-        let actions = coord.on_block_committed(&sched, &local_block(20));
+        let actions = coord.on_block_committed(&sched, &local_block(20), &[]);
         assert!(commit_proof_fetches(&actions).is_empty());
     }
 

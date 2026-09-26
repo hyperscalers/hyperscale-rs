@@ -65,6 +65,7 @@ mod tests {
                 [seed; 31],
                 AddressClass::Component,
             ))]),
+            escrowed: Capped::empty(),
         }
     }
 

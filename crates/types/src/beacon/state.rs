@@ -32,15 +32,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::{DeclaredWork, PriceTable};
 
-use crate::beacon::constants::{HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
+use crate::beacon::constants::{
+    HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET, RESHAPE_READY_TTL_EPOCHS,
+};
 use crate::beacon::genesis::BeaconChainConfig;
 use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
-    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardFullness, ShardId, ShardTrie,
-    Stake, StakePoolId, StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
+    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, SettledTxsRoot, ShardFullness,
+    ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId, WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -357,20 +359,18 @@ pub struct ShardBoundary {
     /// parent never sets it — its children seed in the same fold that
     /// records its terminal, so there is nothing to wait for.
     pub terminal_delivered: bool,
-    /// The terminal header's [`TerminalRoots`] — the beacon-attested
-    /// commitments this shard left the chains that outlive it. `Some` only
-    /// on a terminated shard's boundary record, `None` for a live shard,
-    /// and projected onto [`ShardAnchor`](crate::ShardAnchor) for both its
-    /// readers.
+    /// The terminal header's settled-transaction root — the
+    /// beacon-attested commitment this shard left the counterparts that
+    /// outlive it. `Some` only on a terminated shard's boundary record,
+    /// `None` for a live shard, and projected onto
+    /// [`ShardAnchor`](crate::ShardAnchor).
     ///
-    /// This projection is the durable delivery. Both readers also take the
-    /// roots straight off the terminal header, which is the only path fast
-    /// enough while the successor's rule is live; but a successor derives
-    /// its `RecoveredState` afresh on every boot and cannot reconstruct
-    /// the roots from its own chain, so a restart inside the window — or a
-    /// validator rotated onto the successor committee after the flip —
-    /// reads them here or not at all.
-    pub terminal_roots: Option<TerminalRoots>,
+    /// This projection is the durable delivery. A counterpart also takes
+    /// the root straight off the terminal header; but a restart, or a
+    /// validator seated after the flip, cannot reconstruct it from its own
+    /// chain and reads it here or not at all. A successor reads its
+    /// presence as the mark of a terminal record.
+    pub terminal_settled_txs: Option<SettledTxsRoot>,
     /// Epoch the reshape that terminates this shard was admitted (split)
     /// or paired (merge), stamped at the reshape's execution alongside
     /// [`terminal_epoch`](Self::terminal_epoch). Floors the shard's
@@ -405,6 +405,34 @@ pub struct KeeperSeat {
     pub ready: bool,
 }
 
+/// When a reshape was admitted, and by when it must be ready.
+///
+/// Two epochs with two roles. `at` is the epoch whose fold admitted the
+/// split or paired the merge: a fact nothing moves, and the floor of the
+/// terminating shard's settled-transaction window, since counterpart
+/// fences hold straddlers from that fold on. `ready_by` is the readiness
+/// deadline: only a Skip fold moves it, forward one epoch, so a beacon
+/// stall does not cost a reshape the epochs it could not ready in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct Admission {
+    /// The epoch whose fold admitted the reshape.
+    pub at: Epoch,
+    /// The epoch at which an unready reshape is abandoned.
+    pub ready_by: Epoch,
+}
+
+impl Admission {
+    /// An admission at `epoch`, ready by
+    /// [`RESHAPE_READY_TTL_EPOCHS`] epochs later.
+    #[must_use]
+    pub const fn new(epoch: Epoch) -> Self {
+        Self {
+            at: epoch,
+            ready_by: epoch.saturating_add(RESHAPE_READY_TTL_EPOCHS),
+        }
+    }
+}
+
 /// An admitted, not-yet-executed shard reshape, keyed in
 /// [`BeaconState::pending_reshapes`] by its target: the splitting shard
 /// itself, or the parent a merge reforms under.
@@ -431,8 +459,8 @@ pub enum PendingReshape {
     Split {
         /// Epoch the shard's trigger last folded.
         last_asserted: Epoch,
-        /// Epoch the split was admitted — starts the readiness TTL.
-        admitted_at: Epoch,
+        /// When the split was admitted, and by when it must be ready.
+        admitted: Admission,
         /// Observer cohort drawn at admission, each seat assigned the
         /// child it syncs. Seats drop with the validator's jail or
         /// deactivation; the execution gate reads ready seats per
@@ -467,9 +495,9 @@ pub enum PendingReshape {
         /// Seats drop with the validator's jail or deactivation.
         /// Empty until paired.
         keepers: BTreeMap<ValidatorId, KeeperSeat>,
-        /// Epoch the merge paired and drew its keepers — starts the
-        /// readiness TTL. `None` until paired.
-        admitted_at: Option<Epoch>,
+        /// When the merge paired and drew its keepers, and by when it
+        /// must be ready. `None` until paired.
+        admitted: Option<Admission>,
         /// The children's final epoch window, stamped once the readiness
         /// gate passes and never moved after — both children share it, so
         /// they leave the trie on the same cut. `None` while the merge is
@@ -1701,16 +1729,16 @@ impl BeaconState {
             .collect();
         for (target, reshape) in &self.pending_reshapes {
             match reshape {
-                PendingReshape::Split { admitted_at, .. } => {
-                    floors.insert(*target, floor(*admitted_at));
+                PendingReshape::Split { admitted, .. } => {
+                    floors.insert(*target, floor(admitted.at));
                 }
                 PendingReshape::Merge {
-                    admitted_at: Some(at),
+                    admitted: Some(admitted),
                     ..
                 } => {
                     let (left, right) = target.children();
-                    floors.insert(left, floor(*at));
-                    floors.insert(right, floor(*at));
+                    floors.insert(left, floor(admitted.at));
+                    floors.insert(right, floor(admitted.at));
                 }
                 PendingReshape::Merge { .. } => {}
             }
@@ -1830,8 +1858,9 @@ impl BeaconState {
                         height: b.height,
                         weighted_timestamp: b.weighted_timestamp,
                         witness_base: b.witness_base,
-                        terminal_roots: b.terminal_roots,
+                        terminal_settled_txs: b.terminal_settled_txs,
                         handoff_complete: b.handoff_complete,
+                        terminal_epoch: b.terminal_epoch,
                     },
                 )
             })
@@ -2197,7 +2226,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         };
         state.boundaries.insert(child, pending(Epoch::new(4)));
@@ -2268,7 +2297,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         };
 
@@ -2287,7 +2316,7 @@ mod tests {
             splitting,
             PendingReshape::Split {
                 last_asserted: Epoch::new(1),
-                admitted_at: Epoch::new(1),
+                admitted: Admission::new(Epoch::new(1)),
                 cohort: BTreeMap::new(),
                 cohort_seed: Randomness::ZERO,
                 scheduled: None,
@@ -2331,7 +2360,7 @@ mod tests {
             PendingReshape::Merge {
                 halves: BTreeMap::new(),
                 keepers: BTreeMap::new(),
-                admitted_at: None,
+                admitted: None,
                 scheduled_terminal: None,
             },
         );
@@ -2571,7 +2600,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             })
             .witness_leaf_count = BeaconWitnessLeafCount::new(7);
@@ -2624,7 +2653,7 @@ mod tests {
             p,
             PendingReshape::Split {
                 last_asserted: Epoch::GENESIS,
-                admitted_at: Epoch::GENESIS,
+                admitted: Admission::new(Epoch::GENESIS),
                 cohort: BTreeMap::from([(
                     observer,
                     CohortSeat {

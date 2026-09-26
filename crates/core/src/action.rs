@@ -1,30 +1,32 @@
 //! Action types for the deterministic state machine.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
 use hyperscale_engine::legs::{Member, Runs};
-use hyperscale_storage::TickResolution;
+use hyperscale_engine::tick_select::ManifestInputs;
+use hyperscale_storage::{CommittedHere, MemberInputs, TickResolution};
 use hyperscale_types::{
-    AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
-    CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
+    AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
+    BlockVote, CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
-    ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
-    LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
-    PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, ShardForkProof,
-    ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
-    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
-    SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateEntry, SubstateKey, SweepFrontier,
-    TerminalRoots, TickId, Timeout, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId,
-    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
+    ExecutionCertificate, ExecutionVote, Finalization, FrontierInputs, GlobalReceiptRoot, Hash,
+    HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
+    PcVoteEquivocation, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
+    RatifyVote, ReadFence, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee,
+    RevealChain, Round, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
+    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
+    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot,
+    SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx,
+    ValidatorId, Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
 };
+use hyperscale_vm_effects::CrossingId;
 
 use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
 
@@ -359,6 +361,26 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
+    /// Prove the crossing records the committed block at `anchor` wrote
+    /// and push each to the committee of the shard owning its consumer.
+    ///
+    /// Emitted by the proposer of the block after `anchor`'s, whose
+    /// certified header is what proves the anchor to a consumer, so the
+    /// push lands beside its proof. Delegated to the execution pool,
+    /// where each target's keys are read at the block's own view, proved
+    /// at its root, built into held claims and sent as
+    /// `CrossingReadingsNotification`s.
+    PushCrossingReadings {
+        /// The block whose records are pushed.
+        block_hash: BlockHash,
+        /// That block's anchor: the claims' anchor and the proof's root.
+        anchor: Anchor,
+        /// The record keys to push, by the shard owning each consumer.
+        targets: BTreeMap<ShardId, Vec<SubstateKey>>,
+        /// Each target's committee.
+        shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,
+    },
+
     /// Fetch state entries and broadcast provisions for all cross-shard txs in a block.
     ///
     /// Only the block proposer emits this (once per block). Delegated to the
@@ -517,8 +539,11 @@ pub enum Action {
     VerifyProvisions {
         /// The provisions to verify (all from the same source block).
         provisions: Provisions,
-        /// The QC-verified committed block header from `RemoteHeaderCoordinator`.
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        /// The source anchor whose `state_root` the proof is checked
+        /// against — off the producing header for a pushed bundle, off
+        /// this node's own mirror of what it has commit-proven for a
+        /// pulled one.
+        anchor: Anchor,
     },
 
     /// Aggregate execution votes into an `ExecutionCertificate` (quorum reached).
@@ -711,14 +736,12 @@ pub enum Action {
         /// root and the state root. The thread pool merges the receipts' writes
         /// from these.
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        /// Hashes of the block's own transactions — its contribution to
-        /// the committed-transaction window a terminating boundary header
-        /// roots. Carried as hashes because that is all the root needs.
-        block_tx_hashes: Vec<TxHash>,
-        /// The committed cells the block writes, derived by the
-        /// coordinator under the block's own window. They fold with the
-        /// receipts' writes under the root being verified.
-        creations: Vec<(SubstateKey, Vec<u8>)>,
+        /// The committed markers the block writes, derived by the
+        /// coordinator from its transactions and the chain's origin. They
+        /// fold with the receipts' writes under the root being verified,
+        /// and a row whose own or inherited key the parent state holds
+        /// refuses the block.
+        creations: Vec<CommittedHere>,
         /// Block height being verified.
         block_height: BlockHeight,
         /// The header's `split_child_roots` claim, verified beside the
@@ -728,14 +751,15 @@ pub enum Action {
         /// final epoch before a split), resolved by the coordinator from
         /// the schedule.
         split_child_roots_required: bool,
-        /// Whether the block's window requires terminal roots — set on any
-        /// terminating boundary header (a split parent's or a merge
-        /// child's final epoch), broader than `split_child_roots_required`.
-        terminal_roots_required: bool,
-        /// The header's `terminal_roots` claim, recomputed beside the state
-        /// root over the committed retention window when the block
+        /// Whether the block's window requires the terminal settled root —
+        /// set on any terminating boundary header (a split parent's or a
+        /// merge child's final epoch), broader than
+        /// `split_child_roots_required`.
+        terminal_settled_txs_required: bool,
+        /// The header's `terminal_settled_txs` claim, recomputed beside the
+        /// state root over the committed retention window when the block
         /// terminates the shard at a boundary.
-        claimed_terminal_roots: Option<TerminalRoots>,
+        claimed_terminal_settled_txs: Option<SettledTxsRoot>,
         /// The block's parent-QC weighted timestamp — the anchor the
         /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
@@ -760,6 +784,25 @@ pub enum Action {
         /// still hold a straddler against. `None` when no retained window
         /// records one.
         settled_txs_window_floor: Option<WeightedTimestamp>,
+        /// What the block's claims do to the read frontier, folded under
+        /// the root being verified.
+        frontier: FrontierInputs,
+        /// What the block writes to tick membership, folded under the
+        /// root being verified.
+        members: MemberInputs,
+        /// What the read frontier judges of the block against the parent
+        /// state: its record presences, its absences and its late
+        /// deliveries' answers. A refusal refuses the state root.
+        fence: ReadFence,
+        /// The block's claims, whose readings license the crossing
+        /// settlements folded under the root, and among which the
+        /// parent-anchored ones are re-read from the verifier's own
+        /// parent view.
+        state_claims: Vec<StateClaim>,
+        /// The block's abandonment records, whose crossings named off
+        /// this shard's leaves are read from the verifier's own parent
+        /// view.
+        abandonment_records: Vec<AbandonmentRecord>,
     },
 
     /// Verify a block's beacon-witness root + leaf count.
@@ -857,9 +900,6 @@ pub enum Action {
         /// one-block lag (this block's own QC may carry a slightly later
         /// timestamp) is bounded by `MAX_VALIDITY_RANGE`.
         validity_anchor: WeightedTimestamp,
-        /// Transactions this shard only delivers for, admissible past
-        /// their validity end to the delivery window's close.
-        late_deliveries: HashSet<TxHash>,
     },
 
     /// Verify a block's provisions root.
@@ -893,10 +933,10 @@ pub enum Action {
 
     /// Verify a block's per-target-shard provisions commitments.
     ///
-    /// Recomputes `compute_provision_tx_roots(topology, transactions)` and
-    /// compares against the block header's `provision_tx_roots` by full-map
-    /// equality. Catches tampering with which txs are claimed to target
-    /// which shard.
+    /// Recomputes the per-target map from the block's transactions, its
+    /// certificates and its crossing re-offers, and compares against the
+    /// block header's `provision_tx_roots` by full-map equality. Catches
+    /// tampering with which txs are claimed to target which shard.
     ///
     /// Pure CPU operation — verified in parallel with other root verifications.
     VerifyProvisionTxRoots {
@@ -906,9 +946,6 @@ pub enum Action {
         expected: ProvisionTxRootsMap,
         /// Transactions in the block.
         transactions: SharedTransactions,
-        /// Certificates in the block, whose committed outcomes promise
-        /// crossing bundles.
-        certificates: SharedCertificates,
         /// Topology snapshot used to route txs to target shards.
         topology_snapshot: TopologySnapshot,
     },
@@ -950,21 +987,6 @@ pub enum Action {
         block_hash: BlockHash,
         /// Every name the block's records carry.
         entries: Vec<UnsettledTx>,
-        /// Every transaction the block's finalizations resolve without
-        /// deciding — a delivery or a leg — checked against the lapse
-        /// where the body says this shard delivers for it.
-        deliveries: Vec<TxHash>,
-        /// Every transaction the block's finalizations decide with
-        /// success by its own execution, for a member that awaits
-        /// nobody, checked against the deadline: past it a leg may
-        /// already have taken its crossing back.
-        successes: Vec<TxHash>,
-        /// The block's own anchor, which the lapse and the deadline are
-        /// read against.
-        anchor: WeightedTimestamp,
-        /// The trie of the anchor's window, which a delivery's body is
-        /// classified against.
-        trie: ShardTrie,
         /// The epoch grid, which places each name's stated commit anchor
         /// in the window that froze its figures. Carried rather than
         /// read off the store because it is a property of the chain
@@ -984,6 +1006,9 @@ pub enum Action {
     BuildProposal {
         /// Local shard producing this proposal.
         shard_id: ShardId,
+        /// Where the shard's chain begins: a transaction whose range
+        /// opened before it is also judged by an inherited marker.
+        chain_origin: WeightedTimestamp,
         /// Validator id of the proposer (this node).
         proposer: ValidatorId,
         /// Height of the new block.
@@ -1015,6 +1040,13 @@ pub enum Action {
         /// Proofs of counterparts' cells this proposer's fetches
         /// answered, for every replica to fold at commit.
         state_claims: Vec<StateClaim>,
+        /// The block's parent as an anchor: the one anchor a crossing
+        /// whose ends share this shard is read at.
+        parent_anchor: Anchor,
+        /// The crossings whose ends share this shard and whose
+        /// settlement the mirrors say is due, for the handler to read
+        /// at the parent and carry beside the claims.
+        local_crossings: Vec<CrossingId>,
         /// Prior fee-reservation demand per local payer among the
         /// candidate transactions — in-flight holds plus the uncommitted
         /// window, excluding the candidates themselves. The builder
@@ -1085,9 +1117,9 @@ pub enum Action {
         /// child, broader than `carry_split_child_roots`. When set, the
         /// handler computes the `settled_txs_root` over the committed
         /// retention window and stamps it into the header.
-        carry_terminal_roots: bool,
+        carry_terminal_settled_txs: bool,
         /// The schedule's settled-window floor for the shard at the block's
-        /// anchor, paired with `carry_terminal_roots` — extends the
+        /// anchor, paired with `carry_terminal_settled_txs` — extends the
         /// committed window walk back to the reshape's admission.
         settled_txs_window_floor: Option<WeightedTimestamp>,
         /// The block's **anchored** committee snapshot, resolved by the
@@ -1097,6 +1129,17 @@ pub enum Action {
         /// head, so a head-flipped proposer at a reshape boundary produces
         /// a header that resolves identically on every replica.
         classification_topology_snapshot: Arc<TopologySnapshot>,
+        /// What the offered claims do to the read frontier; the handler
+        /// recomputes it over the claims it keeps.
+        frontier: FrontierInputs,
+        /// What the read frontier judges of the offered content. The
+        /// handler drops whatever it refuses against the parent state.
+        fence: ReadFence,
+        /// What the block's member lines are named over: each member's
+        /// facts and what committed content up to the parent says of
+        /// them. The handler adds the block's own bundles and claims once
+        /// it has dropped what the block will not carry.
+        manifest: ManifestInputs,
     },
 
     /// Execute one tick's whole batch: the committing block's
@@ -1161,6 +1204,11 @@ pub enum Action {
         /// accumulator-start index, and the resulting
         /// `leaf_count_at_block_end` stamped into the block's metadata.
         witness: BeaconWitnessCommit,
+        /// The committed block's committee anchor — its parent's own
+        /// anchor — which classifies its content downstream. Carried from the
+        /// commit rather than read at fan-out, because a buffered run commits
+        /// in one step and a scalar read afterwards names only its last block.
+        committee_anchor: WeightedTimestamp,
     },
 
     /// Commit a block trusted via QC only — no cached `PreparedCommit` exists
@@ -1191,11 +1239,19 @@ pub enum Action {
         /// fact the recomputation reads beyond the block, resolved where
         /// the schedule is.
         creations: Vec<(SubstateKey, Vec<u8>)>,
+        /// What the block's claims do to the read frontier, folded under
+        /// the root the recomputation checks.
+        frontier: FrontierInputs,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
         /// Beacon-witness leaves to persist alongside the block in the
         /// same atomic write — see [`Self::CommitBlock`].
         witness: BeaconWitnessCommit,
+        /// The committed block's committee anchor — its parent's own
+        /// anchor — which classifies its content downstream. Carried from the
+        /// commit rather than read at fan-out, because a buffered run commits
+        /// in one step and a scalar read afterwards names only its last block.
+        committee_anchor: WeightedTimestamp,
     },
 
     /// Attach a certified-but-not-yet-committed block to the pending
@@ -1780,6 +1836,7 @@ impl Action {
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. }
             | Self::FetchAndBroadcastProvisions { .. }
+            | Self::PushCrossingReadings { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
             | Self::BroadcastShardForkProof { .. }
             | Self::BroadcastShardVoteEquivocation { .. }
@@ -1914,9 +1971,9 @@ impl Action {
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. } => ActionOwner::Execution,
 
-            Self::VerifyProvisions { .. } | Self::FetchAndBroadcastProvisions { .. } => {
-                ActionOwner::Provisions
-            }
+            Self::VerifyProvisions { .. }
+            | Self::FetchAndBroadcastProvisions { .. }
+            | Self::PushCrossingReadings { .. } => ActionOwner::Provisions,
 
             Self::SignAndBroadcastPcVote1 { .. }
             | Self::SignAndBroadcastPcVote2 { .. }

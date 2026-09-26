@@ -649,22 +649,6 @@ pub trait ProtocolStatics: Send + Sync {
         let _ = (owner, local, value);
         None
     }
-
-    /// Whether this committed cell is an escrow record — value a shard
-    /// holds for a crossing it issued, until a consumer claims it or the
-    /// issuer takes it back.
-    ///
-    /// Judged from the bytes as [`Self::sweepable_cell`] is, and asked
-    /// for the opposite reason: a record is deliberately outside every
-    /// sweep's reach, so nothing else tells a successor that the leaf it
-    /// just imported is an obligation. A store answers this only where
-    /// it inherits a prefix whole — a reshape successor's adoption — and
-    /// what it writes down is the key, the state being the value's
-    /// authority.
-    fn record_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
-        let _ = (owner, local, value);
-        false
-    }
 }
 
 static PROTOCOL_STATICS: OnceLock<Box<dyn ProtocolStatics>> = OnceLock::new();

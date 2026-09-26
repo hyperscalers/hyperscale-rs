@@ -5,14 +5,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip,
-    Hash, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor,
-    StateRoot, SubstateKey, ValidatorId, Verified, WeightedTimestamp,
+    Anchor, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin,
+    CommittedTip, Hash, Provisions, QuorumCertificate, ReadFrontier, SafeVoteRegisters,
+    ShardAnchor, StateRoot, ValidatorId, Verified, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
 use super::dedup_window::DedupWindow;
 use super::unresolved::ReplayWindow;
+use crate::MemberIndex;
 
 /// How many committed headers a restart replays into the delay estimate.
 ///
@@ -72,9 +73,9 @@ pub struct RecoveredState {
     /// [`RETENTION_HORIZON`]: hyperscale_types::RETENTION_HORIZON
     pub dedup: DedupWindow,
 
-    /// The chains this one succeeds, and the commitments they left — one
-    /// for a split child, two for a merged parent, empty for a chain born
-    /// at network genesis or recovered by any path but a reshape flip.
+    /// The chains this one succeeds, each as its terminal state — one for
+    /// a split child, two for a merged parent, empty for a chain born at
+    /// network genesis or recovered by any path but a reshape flip.
     ///
     /// Set only on the flip, which is the delivery fast enough to matter:
     /// the rule these relax retires `MAX_VALIDITY_RANGE` past the origin,
@@ -83,7 +84,7 @@ pub struct RecoveredState {
     /// projection instead, via
     /// `TopologySchedule::predecessor_terminals`, and until either lands
     /// the strict rule stands.
-    pub predecessors: Vec<PredecessorTerminal>,
+    pub predecessors: Vec<Anchor>,
 
     /// The provision bodies still held for the blocks that carried them.
     /// A stored block keeps only their hashes, so this is what puts them
@@ -184,26 +185,18 @@ pub struct RecoveredState {
     /// snap-sync, where the imported store carries no signing history.
     pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
 
-    /// The escrow records this store holds under the shard's prefix,
-    /// with their committed bytes.
-    ///
-    /// Value this shard owes an answer for, read from the leaves that
-    /// hold it and from nothing else — every start's first term, which
-    /// the commits after it add to and take from. Nothing else can name
-    /// them: the
-    /// entry that would is a fold over a chain a successor never
-    /// replays and a restart replays only a window of, and the cell is
-    /// outside every sweep's reach. The state is the authority, and it
-    /// is what every node holding the prefix has — which is what makes
-    /// the set a function of committed content rather than of how a
-    /// node got here.
-    ///
-    /// Read the same way however the store was reached: adopted whole
-    /// at a reshape seat, resumed after a restart, or imported by
-    /// snap-sync. A set seeded by an event one node witnessed and
-    /// another did not is a set two replicas compose different ticks
-    /// from.
-    pub escrow_records: Vec<(SubstateKey, Vec<u8>)>,
+    /// The read frontier the committed state holds: how far along each
+    /// producer this shard has read, which bounds the record presences
+    /// a block may carry and licenses the deletion of an answer. Read
+    /// off the state on every path that builds one, since it is state
+    /// and every seat holds it; the execution coordinator advances its
+    /// copy from here with the same rule the fold writes it by.
+    pub read_frontier: ReadFrontier,
+
+    /// The tick membership the committed state holds, read off it on
+    /// every path that builds one, as the read frontier is. `None` on a
+    /// fresh start, which holds no rows.
+    pub members: Option<MemberIndex>,
 
     /// The uncommitted blocks the store kept beside the safe-vote
     /// registers, above the committed tip and in height order.
@@ -233,7 +226,8 @@ impl RecoveredState {
     /// against `anchor.block_hash` by the fetch path; its `parent_qc`
     /// weighted timestamp is the tip's committee anchor, and
     /// `witness_leaf_hashes` is its verified accumulator window —
-    /// starting at the header's `beacon_witness_base`. `latest_qc`
+    /// starting at the header's `beacon_witness_base`. `read_frontier`
+    /// is the table the imported state holds. `latest_qc`
     /// stays `None` — the boundary block's own QC arrives structurally
     /// bound in [`anchor_qc`](Self::anchor_qc), and the coordinator
     /// adopts it only after verifying it against the anchor's resolved
@@ -246,6 +240,8 @@ impl RecoveredState {
         anchor_qc: QuorumCertificate,
         witness_leaf_hashes: Vec<Hash>,
         substate_bytes: u64,
+        read_frontier: ReadFrontier,
+        members: MemberIndex,
     ) -> Self {
         Self {
             committed_height: anchor.height,
@@ -289,7 +285,8 @@ impl RecoveredState {
                 ChainOrigin::ROOT
             },
             safe_vote_registers: BTreeMap::new(),
-            escrow_records: Vec::new(),
+            read_frontier,
+            members: Some(members),
             voted_blocks: Vec::new(),
             recent_headers: Vec::new(),
         }

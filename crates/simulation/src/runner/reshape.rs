@@ -40,8 +40,8 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, PredecessorTerminal, ShardId,
-    ValidatorId, Verified, shard_prefix_path,
+    Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, ShardId, ValidatorId,
+    Verified, shard_prefix_path,
 };
 use tracing::error;
 
@@ -160,12 +160,13 @@ impl SimulationRunner {
                 shard,
                 block,
                 creations,
+                frontier,
             } => {
                 let root = self
                     .reshape_stores
                     .get(&(host, shard))?
                     .storage
-                    .follow_block_writes(&block, &creations)
+                    .follow_block_writes(&block, &creations, &frontier)
                     .expect("reshape follow apply into the opened store");
                 Some(ReshapeEvent::Applied { shard, root })
             }
@@ -422,7 +423,7 @@ impl SimulationRunner {
         kind: AdoptKind,
         origin: ChainOrigin,
         genesis: Block,
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores.get(&(host, shard))?.storage.clone();
         let recovered = adopt_prepared_store(&storage, shard, kind, origin, &genesis, predecessors)
@@ -502,7 +503,14 @@ impl SimulationRunner {
         self.schedule_event(
             host,
             self.now,
-            HostEvent::protocol(shard, ProtocolEvent::BlockCommitted { certified }),
+            HostEvent::protocol(
+                shard,
+                ProtocolEvent::BlockCommitted {
+                    // A genesis block anchors its own committee.
+                    committee_anchor: certified.block().header().parent_qc().weighted_timestamp(),
+                    certified,
+                },
+            ),
         );
         for &validator in validators {
             self.hosts[host as usize].drop_pooled_vnode(validator);

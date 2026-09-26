@@ -102,9 +102,9 @@ pub use spc::{
     verify_empty_view_msg, verify_proposal_object,
 };
 pub use state::{
-    BeaconState, CohortSeat, CommitteeTransition, CompletedRecovery, JailReason, KeeperSeat,
-    KeptSeat, ObserverSeat, PendingReshape, PendingRotation, PendingWithdrawal, PoolConviction,
-    RecoveryCause, ScheduledSplit, ShardBoundary, ShardCommittee, ShardRecovery, SlotEffects,
-    StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
+    Admission, BeaconState, CohortSeat, CommitteeTransition, CompletedRecovery, JailReason,
+    KeeperSeat, KeptSeat, ObserverSeat, PendingReshape, PendingRotation, PendingWithdrawal,
+    PoolConviction, RecoveryCause, ScheduledSplit, ShardBoundary, ShardCommittee, ShardRecovery,
+    SlotEffects, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
 };
 pub use witness::{BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitnessPayload};

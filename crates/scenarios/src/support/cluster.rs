@@ -7,8 +7,8 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, Derivation, Event, PriceTable, ShardId, Signer, StateRoot,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    WeightedTimestamp,
+    SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxsInFlight, WeightedTimestamp,
 };
 
 use super::Budget;
@@ -63,6 +63,16 @@ pub fn submission_shards(snapshot: &TopologySnapshot, tx: &Transaction) -> Vec<S
 pub trait Cluster {
     /// Submit a transaction, routed to whichever host serves its source shard.
     fn submit(&mut self, tx: Arc<Transaction>);
+
+    /// Submit a transaction to a host of `shard`, whatever its source
+    /// shard would have been.
+    ///
+    /// What a client does when the shard that would run its transaction
+    /// is not the one routing would pick. The case is a late delivery:
+    /// the producing shard is long past the window it could include the
+    /// transaction in and refuses it, where the delivering shard admits
+    /// it on the record it consumes still standing.
+    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>);
 
     /// A derivation the cluster answers alike to — what a scenario reads
     /// a routed fact off a transaction it built itself through.
@@ -211,6 +221,22 @@ pub trait Cluster {
     /// fact about its blocks that no balance reads back once the
     /// reclaim and the settlement it races have both landed.
     fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)>;
+
+    /// Whether `shard`'s chain has carried a held reading of `key`, on
+    /// any live store of the shard: how a crossing record reaches the
+    /// shard that consumes it.
+    fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool;
+
+    /// Every crossing decline on `shard`'s chain naming `tx`: the height
+    /// each committed at and the record it refuses.
+    ///
+    /// An observation seam on [`Self::named_unsettled`]'s terms, and for
+    /// the same reason: a decline licenses a producer to credit its
+    /// value back, and whether a chain wrote one is a fact about its
+    /// blocks rather than a balance — a crossing nobody ever answered
+    /// and one refused in so many words leave the same value in the same
+    /// cell until the producer acts on the difference.
+    fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)>;
 
     /// Where `tx` landed on `shard`: the height it committed at (if any), and
     /// the height plus decision of its execution outcome (if any).

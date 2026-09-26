@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    BlockHeight, Epoch, EpochWindows, PredecessorTerminal, PriceTable, ReshapeThresholds,
-    ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
+    Anchor, BlockHeight, Epoch, EpochWindows, PriceTable, ReshapeThresholds, ShardAnchor, ShardId,
+    ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
 /// Per-shard committees for request **routing**, terminal-clamped.
@@ -115,6 +115,55 @@ impl<'a> WindowView<'a> {
     #[must_use]
     pub fn boundary(self, shard: ShardId) -> Option<ShardAnchor> {
         self.snapshot.boundary(shard)
+    }
+
+    /// Every shard whose terminal record this window carries and whose
+    /// chain it no longer runs, each with the cut its chain ended at.
+    ///
+    /// Read off this window's own records, so two replicas answer alike
+    /// however many older windows each still retains; a departure whose
+    /// record has dropped is one this window no longer attests.
+    pub fn departures(
+        self,
+        windows: EpochWindows,
+    ) -> impl Iterator<Item = (ShardId, WeightedTimestamp)> + 'a {
+        let trie = self.snapshot.shard_trie();
+        self.snapshot
+            .boundaries()
+            .filter(move |(shard, _)| !trie.contains(*shard))
+            .filter_map(move |(shard, anchor)| {
+                Some((shard, windows.window_of(anchor.terminal_epoch?).end))
+            })
+    }
+
+    /// Where departed `shard`'s chain ended, as this window's terminal
+    /// record says: the end of its terminal epoch's window. `None` while
+    /// `shard` runs in this window, or once its record has dropped.
+    #[must_use]
+    pub fn terminal_cut(self, shard: ShardId, windows: EpochWindows) -> Option<WeightedTimestamp> {
+        if self.snapshot.shard_trie().contains(shard) {
+            return None;
+        }
+        let epoch = self.snapshot.boundary(shard)?.terminal_epoch?;
+        Some(windows.window_of(epoch).end)
+    }
+
+    /// Whether departed `shard`'s terminal evidence is still readable at
+    /// `at`: this window carries its record, and the handoff-complete
+    /// stamp, if the beacon has landed it, has not aged past the evidence
+    /// window.
+    #[must_use]
+    pub fn evidence_readable(
+        self,
+        shard: ShardId,
+        at: WeightedTimestamp,
+        windows: EpochWindows,
+    ) -> bool {
+        self.snapshot.boundary(shard).is_some_and(|anchor| {
+            anchor
+                .handoff_complete
+                .is_none_or(|done| at <= windows.handoff_evidence_expiry(done))
+        })
     }
 }
 
@@ -363,6 +412,17 @@ impl TopologySchedule {
         Self::resolved(self.lookup_for_shard(shard, wt))
     }
 
+    /// Whether `wt` lands past `shard`'s terminal window: the
+    /// past-terminal half of [`at_for_shard`](Self::at_for_shard). A
+    /// window this schedule has not committed or has evicted answers
+    /// `false`, so a replica whose schedule lags reads the flip once it
+    /// catches up.
+    #[must_use]
+    pub fn past_terminal(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+        self.at_for_shard(shard, wt)
+            .is_some_and(|(_, past_terminal)| past_terminal)
+    }
+
     /// Collapse a lookup tuple to its resolved committee — `None` for
     /// [`NotYetCommitted`](ScheduleLookup::NotYetCommitted) and
     /// [`Evicted`](ScheduleLookup::Evicted) alike. The one adapter behind
@@ -593,6 +653,37 @@ impl TopologySchedule {
         self.certified_recovery_bridge(shard).is_some_and(|bridge| {
             self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge
         })
+    }
+
+    /// The attested frontier of the halt recovery `snapshot` records for
+    /// `shard`, where the block anchored at `anchor_wt` and certified under
+    /// a QC stamped `qc_wt` is the fresh committee's.
+    ///
+    /// The band [`committee_replaced_for_certified`](Self::committee_replaced_for_certified)
+    /// reads, off a snapshot the caller names rather than the head, so a
+    /// block-validity input reads one record on every replica: the
+    /// snapshot governing the block's own anchor.
+    #[must_use]
+    pub fn recovery_frontier(
+        &self,
+        snapshot: &TopologySnapshot,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> Option<BlockHeight> {
+        let (rotated_at, frontier) = snapshot
+            .pending_recoveries()
+            .get(&shard)
+            .map(|recovery| (recovery.rotated_at, recovery.attested_frontier))
+            .or_else(|| {
+                snapshot
+                    .completed_recoveries()
+                    .get(&shard)
+                    .map(|completed| (completed.rotated_at, completed.attested_frontier))
+            })?;
+        let bridge = rotated_at.next();
+        let replaced = self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge;
+        (!replaced).then_some(frontier)
     }
 
     /// Whether a cross-shard artifact from `shard` at `height` is fenced by
@@ -905,7 +996,8 @@ impl TopologySchedule {
             .map(|(epoch, _)| windows.window_of(*epoch).end)
     }
 
-    /// The chains `shard` succeeds, read off the beacon's own boundary
+    /// The chains `shard` succeeds, each as the terminal state its
+    /// markers are proven against, read off the beacon's own boundary
     /// records — one terminal for a split child, two for a merged parent,
     /// none for a chain born at network genesis.
     ///
@@ -924,14 +1016,12 @@ impl TopologySchedule {
     /// next.
     ///
     /// All or nothing. A candidate whose boundary record is not yet
-    /// folded, or carries no [`TerminalRoots`](crate::TerminalRoots) yet, takes the whole set
-    /// with it: a successor holding a *subset* of the chains it succeeds
-    /// reads one predecessor's absence proof as the whole answer and
-    /// admits what another predecessor committed, which is the replay
-    /// this rule exists to refuse. Holding none is the strict refusal the
-    /// successor already runs under, so nothing is lost by waiting — and
-    /// a caller only adopts when it holds nothing, so the next fold that
-    /// completes the set is what it takes.
+    /// folded, or carries no terminal settled root yet,
+    /// takes the whole set with it, so a successor never judges which
+    /// shape it was born by from part of the set. Holding none is the
+    /// strict refusal the successor already runs under, so nothing is lost
+    /// by waiting — and a caller only adopts while it holds nothing, so the
+    /// next fold that completes the set is what it takes.
     ///
     /// The two children's terminals fold independently and need not land
     /// together, so a merged parent reading this mid-window sees exactly
@@ -941,7 +1031,7 @@ impl TopologySchedule {
         &self,
         shard: ShardId,
         origin_wt: WeightedTimestamp,
-    ) -> Vec<PredecessorTerminal> {
+    ) -> Vec<Anchor> {
         if origin_wt == WeightedTimestamp::ZERO {
             // The network's first chain. Nothing ran before it, so nothing
             // offered to it can open before it began.
@@ -953,17 +1043,18 @@ impl TopologySchedule {
         // which reshape produced it, and the cut binding admits at most
         // one of the two shapes: a shard born at a cut has no children
         // that could have terminated at it.
-        let complete: Option<Vec<PredecessorTerminal>> = [shard.parent(), Some(left), Some(right)]
+        let complete: Option<Vec<Anchor>> = [shard.parent(), Some(left), Some(right)]
             .into_iter()
             .flatten()
             .filter(|candidate| self.terminal_cut_wt(*candidate) == Some(origin_wt))
             .map(|candidate| {
-                let anchor = self.head.boundary(candidate)?;
-                Some(PredecessorTerminal {
+                let record = self.head.boundary(candidate)?;
+                record.terminal_settled_txs?;
+                Some(Anchor {
                     shard: candidate,
-                    height: anchor.height,
-                    block_hash: anchor.block_hash,
-                    committed_txs_root: anchor.terminal_roots?.committed_txs,
+                    height: record.height,
+                    state_root: record.state_root,
+                    ts: record.weighted_timestamp,
                 })
             })
             .collect();
@@ -1092,7 +1183,7 @@ impl TopologySchedule {
     /// [`merge_pending`]: TopologySnapshot::merge_pending
     /// [`terminates_at_next_boundary`]: Self::terminates_at_next_boundary
     #[must_use]
-    pub(crate) fn termination_scheduled(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+    pub fn termination_scheduled(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
         let pending = self
             .forward_windows(wt)
             .into_iter()
@@ -1191,9 +1282,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, CommittedTxsRoot, CompletedRecovery, Hash,
-        NetworkDefinition, RecoveryCause, ReshapeSeat, SettledTxsRoot, ShardAnchor, ShardRecovery,
-        StateRoot, TerminalRoots, ValidatorSet,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, Hash, NetworkDefinition,
+        RecoveryCause, ReshapeSeat, SettledTxsRoot, ShardAnchor, ShardRecovery, StateRoot,
+        ValidatorSet,
     };
 
     fn snapshot() -> Arc<TopologySnapshot> {
@@ -1223,30 +1314,33 @@ mod tests {
 
     /// A snapshot whose head trie holds `live` and whose boundary map
     /// records `terminated` with the given committed-transaction root.
+    /// The state root `shard`'s boundary record carries.
+    fn terminal_root(shard: ShardId) -> StateRoot {
+        StateRoot::from_raw(Hash::from_bytes(format!("root-{shard:?}").as_bytes()))
+    }
+
     fn topology_with(
         live: &[ShardId],
-        terminated: &[(ShardId, Option<CommittedTxsRoot>)],
+        terminated: &[(ShardId, Option<SettledTxsRoot>)],
     ) -> Arc<TopologySnapshot> {
         let committees: HashMap<ShardId, Vec<ValidatorId>> =
             live.iter().map(|shard| (*shard, Vec::new())).collect();
         let boundaries: HashMap<ShardId, ShardAnchor> = terminated
             .iter()
-            .map(|(shard, committed)| {
+            .map(|(shard, settled)| {
                 (
                     *shard,
                     ShardAnchor {
-                        state_root: StateRoot::ZERO,
+                        state_root: terminal_root(*shard),
                         block_hash: BlockHash::from_raw(Hash::from_bytes(
                             format!("{shard:?}").as_bytes(),
                         )),
                         height: BlockHeight::new(41),
                         weighted_timestamp: WeightedTimestamp::ZERO,
                         witness_base: BeaconWitnessLeafCount::ZERO,
-                        terminal_roots: committed.map(|committed_txs| TerminalRoots {
-                            settled_txs: SettledTxsRoot::ZERO,
-                            committed_txs,
-                        }),
+                        terminal_settled_txs: *settled,
                         handoff_complete: None,
+                        terminal_epoch: None,
                     },
                 )
             })
@@ -1265,8 +1359,8 @@ mod tests {
         ))
     }
 
-    fn root_committed() -> CommittedTxsRoot {
-        CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed window"))
+    fn root_settled() -> SettledTxsRoot {
+        SettledTxsRoot::from_raw(Hash::from_bytes(b"settled window"))
     }
 
     /// A two-window schedule cut at 1000ms: `before` governs epoch 0,
@@ -1277,7 +1371,7 @@ mod tests {
     fn cut_at_1000(
         before: &[ShardId],
         after: &[ShardId],
-        terminated: &[(ShardId, Option<CommittedTxsRoot>)],
+        terminated: &[(ShardId, Option<SettledTxsRoot>)],
     ) -> TopologySchedule {
         let head = topology_with(after, terminated);
         let mut sched = TopologySchedule::new(1000, Epoch::new(0), topology_with(before, &[]));
@@ -1287,7 +1381,7 @@ mod tests {
     }
 
     /// A split child succeeds the parent that terminated at its origin,
-    /// and reads the parent's commitment off the boundary record.
+    /// and reads the parent's terminal state off the boundary record.
     #[test]
     fn a_split_child_succeeds_the_parent_that_terminated_at_its_cut() {
         let (left, right) = ShardId::ROOT.children();
@@ -1296,7 +1390,7 @@ mod tests {
         let sched = cut_at_1000(
             &[ShardId::ROOT],
             &[left, right],
-            &[(ShardId::ROOT, Some(root_committed()))],
+            &[(ShardId::ROOT, Some(root_settled()))],
         );
         let cut = WeightedTimestamp::from_millis(1000);
 
@@ -1304,21 +1398,18 @@ mod tests {
         assert_eq!(predecessors.len(), 1);
         assert_eq!(predecessors[0].shard, ShardId::ROOT);
         assert_eq!(predecessors[0].height, BlockHeight::new(41));
-        assert_eq!(predecessors[0].committed_txs_root, root_committed());
+        assert_eq!(predecessors[0].state_root, terminal_root(ShardId::ROOT));
     }
 
-    /// A merged parent succeeds both children — one absence proof settles
-    /// nothing, so both terminals have to be found.
+    /// A merged parent succeeds both children, and both terminals are
+    /// found.
     #[test]
     fn a_merged_parent_succeeds_both_children() {
         let (left, right) = ShardId::ROOT.children();
         let sched = cut_at_1000(
             &[left, right],
             &[ShardId::ROOT],
-            &[
-                (left, Some(root_committed())),
-                (right, Some(root_committed())),
-            ],
+            &[(left, Some(root_settled())), (right, Some(root_settled()))],
         );
 
         let predecessors =
@@ -1332,35 +1423,29 @@ mod tests {
     /// And both or neither. The two children's terminals fold
     /// independently and need not land together, so a merged parent
     /// reading this mid-window can see one with its roots and one
-    /// without — the ordinary state, not a corrupt one. Holding the one
-    /// would read its absence proof as the whole answer and admit what
-    /// the other child committed, so the partial set is refused entirely.
-    /// A caller adopts only while it holds nothing, so the fold that
-    /// completes the pair is the one it takes.
+    /// without — the ordinary state, not a corrupt one. The partial set
+    /// is refused entirely, and a caller adopts only while it holds
+    /// nothing, so the fold that completes the pair is the one it takes.
     #[test]
     fn a_merged_parent_holds_both_children_or_neither() {
         let (left, right) = ShardId::ROOT.children();
         let cut = WeightedTimestamp::from_millis(1000);
-        let succeeding = |terminated: &[(ShardId, Option<CommittedTxsRoot>)]| {
+        let succeeding = |terminated: &[(ShardId, Option<SettledTxsRoot>)]| {
             cut_at_1000(&[left, right], &[ShardId::ROOT], terminated)
                 .predecessor_terminals(ShardId::ROOT, cut)
         };
 
         assert_eq!(
-            succeeding(&[
-                (left, Some(root_committed())),
-                (right, Some(root_committed())),
-            ])
-            .len(),
+            succeeding(&[(left, Some(root_settled())), (right, Some(root_settled())),]).len(),
             2,
         );
         // The right child's terminal has folded, but without its roots.
         assert!(
-            succeeding(&[(left, Some(root_committed())), (right, None)]).is_empty(),
+            succeeding(&[(left, Some(root_settled())), (right, None)]).is_empty(),
             "one child's commitment is not the merged parent's answer",
         );
         // And the case where its boundary record has not folded at all.
-        assert!(succeeding(&[(left, Some(root_committed()))]).is_empty());
+        assert!(succeeding(&[(left, Some(root_settled()))]).is_empty());
     }
 
     /// The cut is what binds a terminal to a chain, not the shard tree. A
@@ -1373,7 +1458,7 @@ mod tests {
         let sched = cut_at_1000(
             &[ShardId::ROOT],
             &[left, right],
-            &[(ShardId::ROOT, Some(root_committed()))],
+            &[(ShardId::ROOT, Some(root_settled()))],
         );
 
         // The fixture is the one the positive case uses, so this asserts
@@ -1393,9 +1478,9 @@ mod tests {
         );
     }
 
-    /// A candidate whose boundary record carries no terminal roots is left
-    /// out: the successor keeps refusing everything from before its
-    /// origin, which is the rule the roots would have relaxed.
+    /// A candidate whose boundary record carries no terminal settled root
+    /// is left out: the successor keeps refusing everything from before
+    /// its origin until the record completes.
     #[test]
     fn a_terminal_without_roots_is_not_adopted() {
         let (left, right) = ShardId::ROOT.children();
@@ -1407,7 +1492,7 @@ mod tests {
             cut_at_1000(
                 &[ShardId::ROOT],
                 &[left, right],
-                &[(ShardId::ROOT, Some(root_committed()))],
+                &[(ShardId::ROOT, Some(root_settled()))],
             )
             .predecessor_terminals(left, cut)
             .len(),

@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest};
-use hyperscale_types::{BlockHeight, ShardId, ValidatorId, WeightedTimestamp};
+use hyperscale_types::{BlockHeight, CommittedClock, ShardId, ValidatorId, WeightedTimestamp};
 use tracing::warn;
 
 /// How long to wait before falling back to peer-fetch for missing
@@ -88,34 +88,28 @@ impl TimeoutEffect {
 /// verified.
 pub struct ExpectedProvisionTracker {
     expected: BTreeMap<Key, ExpectedProvision>,
-    local_committed_ts: WeightedTimestamp,
+    /// The node's committed clock, seeded at the recovered tip, so every
+    /// gate below reads a resumed chain's "now" before its next commit.
+    clock: CommittedClock,
+    /// Whether a block has committed through this tracker yet: the edge
+    /// the pre-commit entries are retro-stamped on.
+    committed_once: bool,
 }
 
 impl ExpectedProvisionTracker {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(clock: CommittedClock) -> Self {
         Self {
             expected: BTreeMap::new(),
-            local_committed_ts: WeightedTimestamp::ZERO,
+            clock,
+            committed_once: false,
         }
     }
 
-    /// Local committed weighted timestamp — the "now" reference for every
+    /// The node's committed clock — the "now" reference for every
     /// liveness decision. Read by the coordinator when stamping receipts
     /// and deadline-sweeping other sub-machines.
-    pub(crate) const fn local_ts(&self) -> WeightedTimestamp {
-        self.local_committed_ts
-    }
-
-    /// Resume the clock at the tip the store recovered, before any block
-    /// commits through this process.
-    ///
-    /// Every gate below reads this as "now", so an unseeded zero leaves
-    /// each of them vacuous for as long as a resumed chain takes to
-    /// commit its next block — admitting what peers refuse — and stamps
-    /// whatever arrives in that window with a deadline the next commit
-    /// reads as long past.
-    pub(crate) const fn seed_committed(&mut self, ts: WeightedTimestamp) {
-        self.local_committed_ts = ts;
+    pub(crate) fn local_ts(&self) -> WeightedTimestamp {
+        self.clock.now()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -136,8 +130,8 @@ impl ExpectedProvisionTracker {
     ) {
         self.expected
             .entry((source_shard, block_height))
-            .or_insert(ExpectedProvision {
-                discovered_at: self.local_committed_ts,
+            .or_insert_with(|| ExpectedProvision {
+                discovered_at: self.clock.now(),
                 source_block_ts,
                 requested: false,
                 proposer,
@@ -162,17 +156,17 @@ impl ExpectedProvisionTracker {
     /// entries so liveness decisions don't fire spuriously on the first
     /// commit.
     ///
-    /// Remote headers can arrive (and register expectations) while
-    /// `local_committed_ts` is still zero; without retro-stamping, every
-    /// such entry would report a ~57-year age on the next commit and
+    /// Remote headers can arrive (and register expectations) on a fresh
+    /// chain while the clock still reads zero; without retro-stamping,
+    /// every such entry would report a ~57-year age on the next commit and
     /// trigger a fallback fetch storm.
     pub(crate) fn record_block_committed(&mut self, ts: WeightedTimestamp) {
-        let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
-        // A deadline clock, by the rule
-        // [`WeightedTimestamp::advanced_by_commit`] states: the orphan
-        // cutoff and every receipt deadline are read against this, and one
-        // that runs backwards fires them twice.
-        self.local_committed_ts = self.local_committed_ts.advanced_by_commit(ts);
+        let first_commit = !self.committed_once;
+        self.committed_once = true;
+        // The shard coordinator's commit has already advanced the shared
+        // clock past this block; this is a no-op there, and is what moves
+        // a tracker that runs without one.
+        self.clock.advance(ts);
 
         if first_commit {
             for expected in self.expected.values_mut() {
@@ -281,7 +275,7 @@ impl ExpectedProvisionTracker {
 
 impl Default for ExpectedProvisionTracker {
     fn default() -> Self {
-        Self::new()
+        Self::new(CommittedClock::default())
     }
 }
 
@@ -297,7 +291,7 @@ mod tests {
 
     #[test]
     fn fresh_tracker_is_empty() {
-        let t = ExpectedProvisionTracker::new();
+        let t = ExpectedProvisionTracker::new(CommittedClock::default());
         assert_eq!(t.len(), 0);
         assert_eq!(t.local_ts(), WeightedTimestamp::ZERO);
     }
@@ -308,7 +302,7 @@ mod tests {
     /// backwards fires them twice.
     #[test]
     fn the_local_clock_does_not_run_backwards() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.record_block_committed(ts(9_000));
         assert_eq!(t.local_ts(), ts(9_000));
 
@@ -321,7 +315,7 @@ mod tests {
 
     #[test]
     fn register_inserts_expectation() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
@@ -333,7 +327,7 @@ mod tests {
 
     #[test]
     fn register_is_idempotent() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
@@ -351,7 +345,7 @@ mod tests {
 
     #[test]
     fn on_provisions_verified_clears_entry() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
@@ -365,7 +359,7 @@ mod tests {
 
     #[test]
     fn first_commit_retro_stamps_pregenesis_entries() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
@@ -385,7 +379,7 @@ mod tests {
 
     #[test]
     fn timeout_emits_effect_after_threshold() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.record_block_committed(ts(1_000));
         t.register(
             ShardId::leaf(2, 1),
@@ -420,7 +414,7 @@ mod tests {
 
     #[test]
     fn verified_before_timeout_never_emits() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.record_block_committed(ts(1_000));
         t.register(
             ShardId::leaf(2, 1),
@@ -440,7 +434,7 @@ mod tests {
 
     #[test]
     fn flush_all_bypasses_timeout() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.record_block_committed(ts(1_000));
         t.register(
             ShardId::leaf(2, 1),
@@ -464,7 +458,7 @@ mod tests {
 
     #[test]
     fn cleanup_orphans_drops_aged_entries() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.record_block_committed(ts(1_000));
         t.register(
             ShardId::leaf(2, 1),
@@ -491,7 +485,7 @@ mod tests {
     /// cross-shard tick aborts.
     #[test]
     fn cleanup_orphans_keeps_recent_source_despite_stale_discovery() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
 
         // Register while the local clock lags far behind the source block.
         t.record_block_committed(ts(1_000));
@@ -525,7 +519,7 @@ mod tests {
 
     #[test]
     fn cleanup_orphans_no_op_when_cutoff_zero() {
-        let mut t = ExpectedProvisionTracker::new();
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),

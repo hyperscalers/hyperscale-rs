@@ -17,9 +17,9 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchIds, ProtocolEvent};
 use hyperscale_storage::CommittedProvisions;
 use hyperscale_types::{
-    BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CompletedRecovery, ForkFence,
-    LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardId,
-    TopologySchedule, Verified, WeightedTimestamp,
+    Anchor, BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CommittedClock,
+    ForkFence, LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON,
+    ShardId, TopologySchedule, Verified,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -162,10 +162,11 @@ pub struct ProvisionCoordinator {
     /// only batches whose target shard matches ours are admitted.
     local_shard: ShardId,
 
-    /// Gossip-timed fork fences: provisions from a fenced shard at or above
-    /// its forked height are dropped like the attested recovery fence — but
-    /// engaged on gossip, not the beacon record. Held until the shard's
-    /// recovery completes; the attested
+    /// The node's gossip-timed fork fence, engaged and cleared by the node:
+    /// provisions from a fenced shard at or above its forked height are
+    /// dropped like the attested recovery fence — but engaged on gossip,
+    /// not the beacon record. Held until the shard's recovery completes;
+    /// the attested
     /// [`recovery_fences`](hyperscale_types::TopologySchedule::recovery_fences)
     /// govern validity over the fold-to-completion window.
     fork_fence: ForkFence,
@@ -192,12 +193,7 @@ impl ProvisionCoordinator {
     /// local [`ProvisionStore`].
     #[must_use]
     pub fn new(local_shard: ShardId) -> Self {
-        Self::with_config_and_store(
-            local_shard,
-            ProvisionConfig::default(),
-            Arc::new(ProvisionStore::new()),
-            Arc::new(CommittedProvisions::new()),
-        )
+        Self::with_config(local_shard, ProvisionConfig::default())
     }
 
     /// Create a new `ProvisionCoordinator` with the given config and a fresh
@@ -209,29 +205,35 @@ impl ProvisionCoordinator {
             config,
             Arc::new(ProvisionStore::new()),
             Arc::new(CommittedProvisions::new()),
+            CommittedClock::default(),
+            ForkFence::new(),
         )
     }
 
     /// Create a new `ProvisionCoordinator` wired to an externally-owned
     /// [`ProvisionStore`]. Production nodes share the store with the
     /// io-loop so `local_provision.request` handlers read from the same
-    /// source of truth this coordinator writes to.
+    /// source of truth this coordinator writes to. `clock` and
+    /// `fork_fence` are the node's own, shared with the coordinators
+    /// beside this one.
     #[must_use]
     pub fn with_config_and_store(
         local_shard: ShardId,
         config: ProvisionConfig,
         store: Arc<ProvisionStore>,
         committed_provisions: Arc<CommittedProvisions>,
+        clock: CommittedClock,
+        fork_fence: ForkFence,
     ) -> Self {
         let queue = QueuedProvisionBuffer::new(config.min_dwell_time);
         Self {
             headers: Arc::new(VerifiedHeaderBuffer::new()),
             pipeline: ProvisionPipeline::new(store),
-            expected: ExpectedProvisionTracker::new(),
+            expected: ExpectedProvisionTracker::new(clock),
             queue,
             committed_provisions,
             local_shard,
-            fork_fence: ForkFence::new(),
+            fork_fence,
             purged_fences: BTreeMap::new(),
         }
     }
@@ -296,14 +298,16 @@ impl ProvisionCoordinator {
         let committed: std::collections::HashSet<ProvisionHash> =
             manifest.provision_hashes().iter().copied().collect();
         self.queue.on_block_committed(&committed);
-        // Single retention cutoff for the orphan sweep — `local_ts -
-        // RETENTION_HORIZON` is the conservative point past which any
-        // expectation is provably useless on every shard.
+        // Single retention cutoff for the orphan sweep, one span for
+        // every source block. A crossing an outbound leg consumes is
+        // owed to that consumer past this, but what carries it there is
+        // the issuer offering it again off a fresh block — a fresh
+        // header, a fresh expectation — and not this one waiting.
         let retention_cutoff = local_ts.minus(RETENTION_HORIZON);
 
         // Drop truly orphaned expectations (and their headers) whose
-        // fallback fetch never resolved within `RETENTION_HORIZON`. Under
-        // normal operation a header is retained exactly while its provisions
+        // fallback fetch never resolved inside that span. Under normal
+        // operation a header is retained exactly while its provisions
         // are outstanding; this only catches entries that would otherwise
         // leak indefinitely. Each dropped key emits an `AbandonFetch` so
         // the io_loop's `ProvisionBinding` clears the matching in-flight.
@@ -340,13 +344,12 @@ impl ProvisionCoordinator {
         // frontier changes — a recovery folding, a fence engaging or
         // tightening — not four retains per fence per commit.
         let head = topology_schedule.head();
-        self.fork_fence.clear_completed(head.completed_recoveries());
         let mut frontiers: BTreeMap<ShardId, BlockHeight> = head
             .pending_recoveries()
             .iter()
             .map(|(&shard, recovery)| (shard, recovery.attested_frontier))
             .collect();
-        for (shard, frontier) in self.fork_fence.iter() {
+        for (shard, frontier) in self.fork_fence.engaged() {
             frontiers
                 .entry(shard)
                 .and_modify(|effective| *effective = (*effective).min(frontier))
@@ -397,21 +400,11 @@ impl ProvisionCoordinator {
         actions
     }
 
-    /// Engage the gossip-timed fork fence for `shard`: content at or above
-    /// `fork_height` is dropped like the attested recovery fence, purging
-    /// what already got through. Idempotent; see
-    /// [`ForkFence::engage`] for the tightening and replay rules.
-    pub fn engage_fork_fence(
-        &mut self,
-        shard: ShardId,
-        fork_height: BlockHeight,
-        completed: &BTreeMap<ShardId, CompletedRecovery>,
-    ) -> Vec<Action> {
-        self.fork_fence
-            .engage(shard, fork_height, completed)
-            .map_or_else(Vec::new, |frontier| {
-                self.purge_fenced_shard(shard, frontier)
-            })
+    /// The node engaged its fork fence for `shard` at `frontier`: purge
+    /// what already got through above it, rather than wait for the next
+    /// commit's sweep. Content arriving later is refused at receipt.
+    pub fn on_fork_fenced(&mut self, shard: ShardId, frontier: BlockHeight) -> Vec<Action> {
+        self.purge_fenced_shard(shard, frontier)
     }
 
     /// Whether a provision from `(shard, height)` is fenced — by the
@@ -641,7 +634,7 @@ impl ProvisionCoordinator {
                 actions.extend(build_verify_action(
                     self.local_shard,
                     provisions,
-                    Arc::clone(certified_header),
+                    certified_header,
                 ));
             }
         }
@@ -729,7 +722,7 @@ impl ProvisionCoordinator {
             // Admit directly via the verified path; reuses the
             // tombstone, queue, and `ProvisionsAdmitted` emission logic.
             let header = Arc::clone(&verified_header);
-            return self.on_state_provisions_verified(Ok(provisions), &header, now);
+            return self.on_state_provisions_verified(Ok(provisions), Anchor::of(&header), now);
         }
 
         // Header not yet verified — fall back to the raw buffer; the
@@ -847,7 +840,7 @@ impl ProvisionCoordinator {
                 );
                 return vec![];
             }
-            return build_verify_action(self.local_shard, provisions, verified_header)
+            return build_verify_action(self.local_shard, provisions, &verified_header)
                 .into_iter()
                 .collect();
         }
@@ -876,7 +869,7 @@ impl ProvisionCoordinator {
     pub fn on_state_provisions_verified(
         &mut self,
         result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        anchor: Anchor,
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
@@ -899,7 +892,7 @@ impl ProvisionCoordinator {
         // distinct batch verify against it, so the pending-block lookup
         // can find whichever hash the proposer committed.
         self.expected
-            .on_provisions_verified(certified_header.shard_id(), certified_header.height());
+            .on_provisions_verified(anchor.shard, anchor.height);
 
         let verified = match result {
             Ok(v) => v,
@@ -913,7 +906,7 @@ impl ProvisionCoordinator {
                 return actions;
             }
         };
-        let source_block_ts = certified_header.header().parent_qc().weighted_timestamp();
+        let source_block_ts = anchor.ts;
         let provisions_hash = verified.hash();
         let source_shard = verified.source_shard();
 
@@ -984,13 +977,6 @@ impl ProvisionCoordinator {
         self.pipeline.get_provisions_by_hash(hash)
     }
 
-    /// Resume the commit clock every deadline here is read against at
-    /// the tip the store recovered. See
-    /// [`ExpectedProvisionTracker::seed_committed`].
-    pub const fn seed_committed(&mut self, ts: WeightedTimestamp) {
-        self.expected.seed_committed(ts);
-    }
-
     /// Shared provision store — same `Arc` the io-loop request handler
     /// reads from to serve `local_provision.request` responses.
     #[must_use]
@@ -1020,11 +1006,11 @@ mod tests {
     use hyperscale_core::FetchRequest;
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
-        MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
-        ProvisionTxRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
-        TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable, WeightedTimestamp,
-        WitnessSources, compute_merkle_root,
+        AggregateSignature, Anchor, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
+        Hash, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
+        ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
+        StateRoot, TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable,
+        WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -1349,15 +1335,28 @@ mod tests {
     // Gossip-timed fork fence
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Engage the node's fence the way the node does: on the shared
+    /// handle, then the coordinator's purge.
+    fn engage(
+        coordinator: &mut ProvisionCoordinator,
+        shard: ShardId,
+        fork_height: BlockHeight,
+    ) -> Vec<Action> {
+        coordinator
+            .fork_fence
+            .engage(shard, fork_height, &BTreeMap::new())
+            .map_or_else(Vec::new, |frontier| {
+                coordinator.on_fork_fenced(shard, frontier)
+            })
+    }
+
     #[test]
     fn fork_fence_drops_at_and_above_fork_and_admits_below() {
         let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
         let source = ShardId::leaf(2, 1);
         // Fork at height 5: content at or above 5 is fenced.
         assert!(
-            coordinator
-                .engage_fork_fence(source, BlockHeight::new(5), &BTreeMap::new())
-                .is_empty(),
+            engage(&mut coordinator, source, BlockHeight::new(5)).is_empty(),
             "nothing held yet to purge"
         );
 
@@ -1434,7 +1433,7 @@ mod tests {
         assert_eq!(coordinator.memory_stats().pending_provisions, 1);
 
         // Engaging the fence purges everything above the fork frontier.
-        let actions = coordinator.engage_fork_fence(source, BlockHeight::new(5), &BTreeMap::new());
+        let actions = engage(&mut coordinator, source, BlockHeight::new(5));
         assert_eq!(coordinator.verified_remote_header_count(), 0);
         assert_eq!(coordinator.memory_stats().pending_provisions, 0);
         assert!(actions.iter().any(|a| matches!(a, Action::AbandonFetch(_))));
@@ -1466,7 +1465,7 @@ mod tests {
     fn fork_fence_holds_through_the_fold_and_lifts_on_completion() {
         let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
         let source = ShardId::leaf(2, 1);
-        coordinator.engage_fork_fence(source, BlockHeight::new(5), &BTreeMap::new());
+        engage(&mut coordinator, source, BlockHeight::new(5));
 
         // While fenced, an above-fork provision is dropped.
         let during = make_provisions(
@@ -1498,8 +1497,14 @@ mod tests {
         );
 
         // The recovery completes (the fresh committee's first crossing) —
-        // the fence clears and the same height parks normally.
+        // the node clears its fence, and the same height parks normally.
         let recovered = sched_recovered(source, BlockHeight::new(4));
+        assert_eq!(
+            coordinator
+                .fork_fence
+                .clear_completed(recovered.head().completed_recoveries()),
+            vec![source]
+        );
         coordinator.on_block_committed(&recovered, &make_block(BlockHeight::new(2)));
         let after = make_provisions(
             TxHash::from(Hash::from_bytes(b"after")),
@@ -1693,7 +1698,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -1739,7 +1744,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -1771,7 +1776,7 @@ mod tests {
         // Verification fails — no certified_header returned
         let actions = coordinator.on_state_provisions_verified(
             Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -1852,8 +1857,8 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { certified_header, .. }
-                if certified_header.height() == BlockHeight::new(10)
+            Action::VerifyProvisions { anchor, .. }
+                if anchor.height == BlockHeight::new(10)
         ));
     }
 
@@ -1884,8 +1889,8 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { certified_header, .. }
-                if certified_header.height() == BlockHeight::new(10)
+            Action::VerifyProvisions { anchor, .. }
+                if anchor.height == BlockHeight::new(10)
         ));
     }
 
@@ -1978,7 +1983,7 @@ mod tests {
         // Entire provisions fails verification
         let actions = coordinator.on_state_provisions_verified(
             Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2081,6 +2086,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = {
@@ -2099,6 +2105,18 @@ mod tests {
         CertifiedBlock::new_unchecked(block, qc)
     }
 
+    /// A coordinator on `leaf(2, 0)` whose node clock resumes at `at`.
+    fn resumed(at: WeightedTimestamp) -> ProvisionCoordinator {
+        ProvisionCoordinator::with_config_and_store(
+            ShardId::leaf(2, 0),
+            ProvisionConfig::default(),
+            Arc::new(ProvisionStore::new()),
+            Arc::new(CommittedProvisions::new()),
+            CommittedClock::seeded(at),
+            ForkFence::new(),
+        )
+    }
+
     /// A restart resumes a chain whose clock is already far past the
     /// retention horizon. Provisions gossip that lands before the first
     /// post-restart commit parks in the pending buffer, stamped with
@@ -2106,9 +2124,8 @@ mod tests {
     /// sweeps that buffer against the chain's real clock.
     #[test]
     fn a_bundle_parked_before_the_first_commit_after_a_restart_survives_it() {
-        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
         let resumed_at = BlockHeight::new(100_000);
-        coordinator.seed_committed(WeightedTimestamp::from_millis(
+        let mut coordinator = resumed(WeightedTimestamp::from_millis(
             resumed_at.inner() * TEST_BLOCK_INTERVAL_MS,
         ));
 
@@ -2142,8 +2159,7 @@ mod tests {
     /// clock its peers do, so it drops the same bundles.
     #[test]
     fn a_bundle_past_its_deadline_is_refused_at_receipt_after_a_restart() {
-        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
-        coordinator.seed_committed(WeightedTimestamp::from_millis(
+        let mut coordinator = resumed(WeightedTimestamp::from_millis(
             100_000 * TEST_BLOCK_INTERVAL_MS,
         ));
 
@@ -2230,7 +2246,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2377,7 +2393,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2421,7 +2437,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2459,6 +2475,7 @@ mod tests {
             provisions: Arc::new(Capped::from_array([provisions_verifiable])),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -2533,7 +2550,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions.clone(),
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
         assert_eq!(coordinator.queue.queue_len(), 1);
@@ -2624,7 +2641,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions.clone(),
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
         let committing_block =
@@ -2667,7 +2684,7 @@ mod tests {
         // The orphan sweep keys on the source block's weighted timestamp.
         // This synthetic header carries a genesis (zero) parent-QC timestamp,
         // so the entry ages out the first commit whose retention cutoff goes
-        // positive — i.e. once the local clock passes RETENTION_HORIZON.
+        // positive — i.e. once the local clock passes the retention span.
         let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
 
@@ -2761,7 +2778,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
 
@@ -2794,7 +2811,8 @@ mod tests {
         // Not yet past the orphan cutoff — still retained. The sweep keys on
         // the source block's weighted timestamp, which for this synthetic
         // header is the genesis (zero) parent-QC timestamp, so the entry ages
-        // out once the local clock first passes RETENTION_HORIZON.
+        // out once the local clock first passes the span an owed crossing's
+        // bundle is still wanted in.
         let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
         for h in 2..=orphan_cutoff_blocks {
@@ -2841,7 +2859,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
         assert_eq!(coordinator.queue.queue_len(), 1);
@@ -2989,7 +3007,7 @@ mod tests {
             Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                 provisions,
             ))),
-            &header,
+            Anchor::of(&header),
             now,
         );
     }
@@ -3137,7 +3155,7 @@ mod tests {
                         Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
                             provisions,
                         ))),
-                        &header,
+                        Anchor::of(&header),
                         LocalTimestamp::ZERO,
                     );
                 } else {

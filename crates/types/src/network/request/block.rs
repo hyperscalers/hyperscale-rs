@@ -7,12 +7,32 @@ use crate::network::response::GetBlockResponse;
 use crate::network::{MessageClass, NetworkMessage, Request};
 use crate::shard::inventory::Inventory;
 
+/// What the requester will do with the block it asks for.
+///
+/// The server cannot tell from the height. A joiner walking its history
+/// down below a boundary it imported and a validator catching up to
+/// execute ask for the same block at the same height, and only one of
+/// them runs it — so whether the block's provision bodies are
+/// load-bearing is the requester's fact, not the server's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub enum BlockIntent {
+    /// The requester commits the block and runs its execution tick, so
+    /// every provision body the block consumed has to ride with it and a
+    /// server that cannot supply one has not answered.
+    Execute,
+    /// The requester records the block beneath a committed frontier it
+    /// already holds — the metadata row, the transactions and the
+    /// certificates — and never executes it. Provision bodies answer
+    /// nothing here, so a server that retired them still holds
+    /// everything this asks for.
+    History,
+}
+
 /// Request to fetch a full Block by height during sync or catch-up.
 ///
-/// `target_height` carries the requester's catch-up goal so the serving
-/// peer can decide whether to return the block as `Live` (still within
-/// the execution window relative to the target) or `Sealed` (past the
-/// window, no provisions needed).
+/// `intent` says what the block is for, which is what decides whether it
+/// comes back `Live` with its provision bodies attached or `Sealed`
+/// without them.
 ///
 /// `inventory` advertises what the requester already has locally so the
 /// responder can elide transaction / certificate / provision bodies the
@@ -21,9 +41,8 @@ use crate::shard::inventory::Inventory;
 pub struct GetBlockRequest {
     /// Height of the block being requested.
     pub height: BlockHeight,
-    /// Height the requester is catching up to. Used by the serving peer
-    /// to pick between `Block::Live` and `Block::Sealed`.
-    pub target_height: BlockHeight,
+    /// What the requester will do with the block.
+    pub intent: BlockIntent,
     /// Per-category inventory of hashes already held locally. Bodies
     /// matching these filters may be omitted from the response.
     pub inventory: Inventory,
@@ -33,23 +52,11 @@ impl GetBlockRequest {
     /// Create a new block fetch request with no inventory advertised.
     /// Callers that participate in the elision scheme attach an inventory
     /// via [`Self::with_inventory`] immediately after construction.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `target_height < height` — a request for a block past
-    /// the stated sync target is a programming error in the caller (sync
-    /// always catches up forward).
     #[must_use]
-    pub fn new(height: BlockHeight, target_height: BlockHeight) -> Self {
-        assert!(
-            target_height >= height,
-            "GetBlockRequest: target_height ({}) must be >= height ({})",
-            target_height.inner(),
-            height.inner(),
-        );
+    pub fn new(height: BlockHeight, intent: BlockIntent) -> Self {
         Self {
             height,
-            target_height,
+            intent,
             inventory: Inventory::empty(),
         }
     }
@@ -93,9 +100,9 @@ mod tests {
 
     #[test]
     fn test_get_block_request() {
-        let request = GetBlockRequest::new(BlockHeight::new(42), BlockHeight::new(100));
+        let request = GetBlockRequest::new(BlockHeight::new(42), BlockIntent::Execute);
         assert_eq!(request.height, BlockHeight::new(42));
-        assert_eq!(request.target_height, BlockHeight::new(100));
+        assert_eq!(request.intent, BlockIntent::Execute);
         assert!(request.inventory.is_empty());
     }
 
@@ -109,17 +116,17 @@ mod tests {
             provision_have: None,
         };
         let req =
-            GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(10)).with_inventory(inv);
+            GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute).with_inventory(inv);
         assert!(!req.inventory.is_empty());
         assert!(req.inventory.tx_have.is_some());
     }
 
     #[test]
-    fn hbor_roundtrip_preserves_inventory() {
+    fn hbor_roundtrip_preserves_inventory_and_intent() {
         let mut bf: BloomFilter<TxHash> = BloomFilter::with_capacity(100, 0.01).unwrap();
         let h = TxHash::from(Hash::from_bytes(b"tx"));
         bf.insert(&h);
-        let req = GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(10)).with_inventory(
+        let req = GetBlockRequest::new(BlockHeight::new(1), BlockIntent::History).with_inventory(
             Inventory {
                 tx_have: Some(bf),
                 cert_have: None,
@@ -129,6 +136,7 @@ mod tests {
         let bytes = hbor_to_vec(&req).unwrap();
         let decoded: GetBlockRequest = hbor_from_slice(&bytes).unwrap();
         assert_eq!(req, decoded);
+        assert_eq!(decoded.intent, BlockIntent::History);
         assert!(decoded.inventory.tx_have.as_ref().unwrap().contains(&h));
     }
 }

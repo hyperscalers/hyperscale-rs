@@ -8,10 +8,11 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, Finalization, PreparedCommit, StateRoot, SubstateKey, Verifiable,
+    BlockHeight, Finalization, FrontierInputs, PreparedCommit, StateClaim, StateRoot, SubstateKey,
+    Verifiable,
 };
 
-use crate::{Anchored, BaseReadCache, JmtSnapshot};
+use crate::{Anchored, BaseReadCache, JmtSnapshot, MemberInputs};
 
 /// The block a new one builds on: what it committed, and the state it
 /// left behind.
@@ -67,6 +68,29 @@ pub struct ParentAnchor<'a> {
 /// Execution certificates are extracted from `block.certificates` (finalizations
 /// contain the ECs directly) — no separate parameter needed.
 ///
+/// What the chain itself writes for a block beyond its receipts: the
+/// committed cells it creates, the cells its sweep retires, what its
+/// claims do to the read frontier, the claims themselves, whose
+/// readings license the crossing settlements the fold removes, and
+/// what it does to tick membership.
+///
+/// Derived from the block and the schedule by whoever prepares the
+/// commit, so every reader of the root derives one set.
+#[derive(Clone, Copy)]
+pub struct ChainWrites<'a> {
+    /// The committed-transaction cells, one per transaction the block
+    /// carries.
+    pub creations: &'a [(SubstateKey, Vec<u8>)],
+    /// What the block's sweep retires.
+    pub removals: &'a [SubstateKey],
+    /// What the block's claims do to the read frontier.
+    pub frontier: &'a FrontierInputs,
+    /// The block's claims.
+    pub state_claims: &'a [StateClaim],
+    /// What the block writes to the tick membership family.
+    pub members: &'a MemberInputs,
+}
+
 /// All methods take `&self` — implementations use interior mutability.
 pub trait ShardChainWriter: Send + Sync + 'static {
     /// Compute speculative state root and return precomputed commit work
@@ -81,10 +105,9 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     /// The parent's height must be a committed height or have its tree
     /// nodes provided via `parent.pending`.
     ///
-    /// `creations` is what the chain itself writes for the block — the
-    /// committed-transaction cells, one per transaction it carries — and
-    /// `removals` is what its sweep retires; both fold with the
-    /// receipts' writes under the root this returns.
+    /// `chain` is what the chain itself writes for the block beyond the
+    /// receipts, and folds with their writes under the root this
+    /// returns.
     ///
     /// `block_height` is the height of the block being prepared (used as
     /// the JMT new version).
@@ -94,8 +117,7 @@ pub trait ShardChainWriter: Send + Sync + 'static {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
-        creations: &[(SubstateKey, Vec<u8>)],
-        removals: &[SubstateKey],
+        chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit);
 }

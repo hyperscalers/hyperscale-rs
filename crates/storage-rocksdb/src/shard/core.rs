@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -22,8 +23,8 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, GenesisCommit, JmtSnapshot, SubstateStore, Substates, SweepRows,
-    entry_leaf_value, index_leaf, pending_write, tree,
+    BaseReadCache, GenesisCommit, Indexed, JmtSnapshot, RowChange, SubstateStore, Substates,
+    SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
@@ -39,9 +40,10 @@ use tracing::field::Empty;
 use tracing::{Level, Span, instrument};
 
 use super::column_families::{
-    ALL_COLUMN_FAMILIES, CfHandles, EntriesCf, EntriesHistoryCf, HOT_WRITE_COLUMN_FAMILIES,
-    JmtNodesCf, PackageArtifactsCf, STATE_HISTORY_CF, StaleEntriesHistoryCf, StaleJmtNodesCf,
-    StaleStateHistoryCf, StateCf, StateHistoryCf, SubstateBytesCf, SweepIndexCf,
+    ALL_COLUMN_FAMILIES, CfHandles, CrossingIndexCf, EntriesCf, EntriesHistoryCf,
+    HOT_WRITE_COLUMN_FAMILIES, JmtNodesCf, PackageArtifactsCf, STATE_HISTORY_CF,
+    StaleEntriesHistoryCf, StaleJmtNodesCf, StaleStateHistoryCf, StateCf, StateHistoryCf,
+    SubstateBytesCf, SweepIndexCf,
 };
 use super::entry_key::VersionedEntryKeyCodec;
 use super::jmt_snapshot_store::SnapshotTreeStore;
@@ -98,6 +100,11 @@ pub struct RocksDbShardStorage {
     /// and letting a write that raises nothing (e.g. a timeout
     /// retransmit) skip the fsync entirely.
     pub(crate) vote_registers: Arc<Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>>,
+
+    /// The oldest version this node's own readers still name; `u64::MAX`
+    /// until one holds. Process-local rather than a column: a restarted
+    /// node's readers start where its store does.
+    pub(crate) retention_hold: Arc<AtomicU64>,
 }
 
 /// Fold what a batch `moved` in the sweep index into the rows it holds.
@@ -232,7 +239,7 @@ impl RocksDbShardStorage {
 
         let cold_write_buffer_size: usize = 16 * 1024 * 1024; // 16MB
 
-        let cf_descriptors: Vec<_> = ALL_COLUMN_FAMILIES
+        let mut cf_descriptors: Vec<_> = ALL_COLUMN_FAMILIES
             .iter()
             .copied()
             .map(|name| {
@@ -266,8 +273,28 @@ impl RocksDbShardStorage {
             })
             .collect();
 
-        let db = DB::open_cf_descriptors(&opts, dir.join("db"), cf_descriptors)
+        // A family on disk has to be opened whether or not this layer
+        // names it, and one it does not name is dropped once it is: a
+        // family an earlier layout wrote is otherwise a copy the store
+        // carries forever and nothing reads. A fresh directory lists
+        // nothing.
+        let stray: Vec<String> = DB::list_cf(&opts, dir.join("db"))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| !ALL_COLUMN_FAMILIES.contains(&name.as_str()))
+            .collect();
+        cf_descriptors.extend(
+            stray
+                .iter()
+                .map(|name| ColumnFamilyDescriptor::new(name, Options::default())),
+        );
+
+        let mut db = DB::open_cf_descriptors(&opts, dir.join("db"), cf_descriptors)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        for name in &stray {
+            db.drop_cf(name)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        }
 
         // Validate all expected column families exist at startup.
         // This fails fast instead of panicking on first access at runtime.
@@ -286,6 +313,7 @@ impl RocksDbShardStorage {
             root_path,
             checkpoints,
             vote_registers: Arc::new(Mutex::new(HashMap::new())),
+            retention_hold: Arc::new(AtomicU64::new(u64::MAX)),
         })
     }
 
@@ -541,15 +569,22 @@ impl RocksDbShardStorage {
         let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
         let mut sweep_rows = SweepRows::default();
         let artifacts_cf = PackageArtifactsCf::handle(&cf);
+        let crossing_cf = CrossingIndexCf::handle(&cf);
         for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
             let prior =
                 prior_slot.expect("every write must have a resolved prior (cache hit or fetched)");
-            let package = index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
+            let Indexed { package, crossing } =
+                index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
             // A cell that self-identifies as a package lands its artifact
             // in the content-addressed index, in the same atomic batch as
             // the state that carries it.
             if let (Some(package), Some(value)) = (package, change) {
                 batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
+            }
+            match crossing {
+                RowChange::Put => batch_put::<CrossingIndexCf>(batch, crossing_cf, key, &()),
+                RowChange::Delete => batch_delete::<CrossingIndexCf>(batch, crossing_cf, key),
+                RowChange::Keep => {}
             }
             if let Some(new_value) = change {
                 // No-op short-circuit: setting a key to the value it

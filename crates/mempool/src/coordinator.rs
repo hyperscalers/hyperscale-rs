@@ -56,10 +56,10 @@ use hyperscale_metrics::{
     record_expected_tx_dropped, record_transaction_aborted, record_transaction_rejected,
 };
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
-    LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId,
-    ShardTrie, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    TxResolution, Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
+    BlockHeight, CertifiedBlock, CommittedClock, Deadline, DeclaredWork, ForkFence, LocalTimestamp,
+    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId, ShardTrie,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxResolution,
+    Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -203,9 +203,8 @@ struct PoolEntry {
     /// `tx_phase_times` side cache.
     admitted_at: LocalTimestamp,
     /// The last instant this shard could still include the transaction:
-    /// its validity end, or the delivery window's close where this shard
-    /// may only be delivering for it. What the pool, the tombstone and
-    /// the body are retained to.
+    /// its validity end. What the pool, the tombstone and the body are
+    /// retained to.
     admissible_until: WeightedTimestamp,
     /// The core's verdict on a divided transaction, heard off its
     /// certificates before this shard's own leg finalized here. The
@@ -246,10 +245,10 @@ pub struct MempoolCoordinator {
     /// Current committed block height (for retry transaction creation).
     current_height: BlockHeight,
 
-    /// BFT-authenticated weighted timestamp of the last locally committed
-    /// block. "Now" reference for retention windows that must be deterministic
-    /// across validators and independent of block production rate.
-    current_ts: WeightedTimestamp,
+    /// The node's committed clock, shared with the shard coordinator that
+    /// advances it: the "now" reference for this pool's retention windows,
+    /// admission expiry and tombstone prune.
+    clock: CommittedClock,
 
     /// Cross-shard txs the mempool has been told to expect via verified
     /// provisions bundles, but has not yet seen on the wire (gossip / submit
@@ -260,12 +259,24 @@ pub struct MempoolCoordinator {
     expected_txs: ExpectedTxs,
 
     /// Cross-shard transactions parked outside contention until their
-    /// engagement evidence — the payer shard's bundle — arrives. Value is
-    /// the payer shard the evidence must come from. A parked transaction
-    /// is pooled, fetchable, and reported `Pending`, but holds no ready
-    /// slot and no conflict keys, so a payer that never commits cannot
-    /// camp this shard's keys through the deferral set.
-    parked_engagement: HashMap<TxHash, ShardId>,
+    /// engagement evidence — the payer shard's bundle — arrives. A
+    /// parked transaction is pooled, fetchable, and reported `Pending`,
+    /// but holds no ready slot and no conflict keys, so a payer that
+    /// never commits cannot camp this shard's keys through the deferral
+    /// set.
+    ///
+    /// Which shard's bundle releases each one is not stored: a cut moves
+    /// the payer's prefix, and a shard resolved at admission is the one
+    /// that held it then. The question is asked where it is answered, in
+    /// [`Self::on_engagement_evidence`], off the trie of the moment the
+    /// evidence arrives.
+    ///
+    /// What *is* stored is when the wait began.
+    parked_engagement: HashMap<TxHash, WeightedTimestamp>,
+
+    /// The producer anchors this node has commit-proven, which a pull
+    /// reads at. Empty until wired, which composes no pulls and is the
+    /// honest reading of a node that has proven nothing.
 
     /// Engagement evidence observed before its transaction arrived —
     /// `tx → (payer shard, deadline)`. Consulted at admission so the
@@ -280,7 +291,8 @@ pub struct MempoolCoordinator {
     /// declared keys admission reads off a transaction.
     local_shard: ShardId,
 
-    /// Gossip-timed fork fences. While engaged, admission rejects any
+    /// The node's gossip-timed fork fence, read here and engaged and
+    /// cleared by the node. While engaged, admission rejects any
     /// transaction touching a fenced shard — no point starting cross-shard
     /// work bound to a committee that is provably forked. A liveness
     /// quiesce only; safety rests on the provision fence. Held until the
@@ -317,31 +329,41 @@ impl MempoolCoordinator {
     /// variant.
     #[must_use]
     pub fn with_config(local_shard: ShardId, config: MempoolConfig) -> Self {
-        Self::with_tx_store(local_shard, config, Arc::new(TxStore::new()))
+        Self::with_tx_store(
+            local_shard,
+            config,
+            Arc::new(TxStore::new()),
+            CommittedClock::default(),
+            ForkFence::new(),
+        )
     }
 
     /// Create a new mempool state machine that shares its body store with
     /// the rest of the I/O loop. The same `Arc<TxStore>` should be held in
     /// the I/O loop's `caches` so inbound transaction-fetch handlers can
-    /// serve bodies without acquiring a mempool lock.
+    /// serve bodies without acquiring a mempool lock. `clock` and
+    /// `fork_fence` are the node's own, shared with the coordinators
+    /// beside this one.
     #[must_use]
     pub fn with_tx_store(
         local_shard: ShardId,
         config: MempoolConfig,
         tx_store: Arc<TxStore>,
+        clock: CommittedClock,
+        fork_fence: ForkFence,
     ) -> Self {
         Self {
             pool: BTreeMap::new(),
             tx_store,
             tombstones: TombstoneStore::new(),
             current_height: BlockHeight::new(0),
-            current_ts: WeightedTimestamp::ZERO,
+            clock,
             expected_txs: ExpectedTxs::new(),
             parked_engagement: HashMap::new(),
             engagement_seen: HashMap::new(),
             config,
             local_shard,
-            fork_fence: ForkFence::new(),
+            fork_fence,
             now: LocalTimestamp::ZERO,
         }
     }
@@ -391,17 +413,31 @@ impl MempoolCoordinator {
             return None;
         }
 
-        // Reject once nothing here could include it: past its validity
-        // end, or past the delivery window where this shard may only be
-        // delivering. The proposer applies the exact rule; this is the
-        // admission boundary that keeps dead entries out of the pool.
+        // A body this shard only takes delivery of is never included
+        // here: its owed crossings are the commit fold's to credit off
+        // the records' readings. It is not pooled and gets no status;
+        // gossip carries it on to the shards that commit it.
         let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
-        let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
-        if admissible_until <= self.current_ts {
+        if cross_shard
+            && !Classified::freeze(
+                tx.legs(),
+                tx.fee_payer(),
+                tx.accounts(),
+                topology_snapshot.shard_trie(),
+            )
+            .commits_at(self.local_shard)
+        {
+            return None;
+        }
+
+        // Reject once nothing here could include it: past its validity
+        // end.
+        let admissible_until = tx.validity_range().end_timestamp_exclusive;
+        if admissible_until <= self.clock.now() {
             tracing::debug!(
                 tx_hash = ?hash,
                 until_ms = admissible_until.as_millis(),
-                now_ms = self.current_ts.as_millis(),
+                now_ms = self.clock.now().as_millis(),
                 "Rejecting expired transaction"
             );
             return None;
@@ -453,7 +489,8 @@ impl MempoolCoordinator {
         if !self.fork_fence.is_empty()
             && self
                 .fork_fence
-                .iter()
+                .engaged()
+                .into_iter()
                 .any(|(s, _)| topology_snapshot.involves_shard(s, tx))
         {
             tracing::debug!(
@@ -465,8 +502,8 @@ impl MempoolCoordinator {
 
         // A cross-shard transaction at a non-payer shard enters
         // contention only once its engagement evidence exists.
-        if let Some(payer_shard) = self.engagement_park_target(topology_snapshot, tx, cross_shard) {
-            self.parked_engagement.insert(hash, payer_shard);
+        if self.parks_for_engagement(topology_snapshot, tx, cross_shard) {
+            self.parked_engagement.insert(hash, self.clock.now());
         }
         self.tx_store.insert(Arc::clone(tx));
         self.pool.insert(
@@ -712,18 +749,6 @@ impl MempoolCoordinator {
         actions
     }
 
-    /// Engage the gossip-timed fork-fence quiesce for `shard`: stop admitting
-    /// transactions that touch it. Idempotent; a liveness measure only. See
-    /// [`ForkFence::engage`] for the tightening and replay rules.
-    pub fn engage_fork_fence(
-        &mut self,
-        shard: ShardId,
-        fork_height: BlockHeight,
-        completed: &BTreeMap<ShardId, CompletedRecovery>,
-    ) {
-        self.fork_fence.engage(shard, fork_height, completed);
-    }
-
     /// Process a committed block: admit what it includes, mark it
     /// committed, and sweep the cross-shard expectations it satisfies or
     /// outlives.
@@ -747,23 +772,11 @@ impl MempoolCoordinator {
         let mut actions = Vec::new();
 
         self.current_height = height;
-        // A deadline clock, by the rule
-        // [`WeightedTimestamp::advanced_by_commit`] states: the admission
-        // gate, the expiry sweep and the tombstone prune all key off this,
-        // and an artifact a clock running backwards lets through is one
-        // this pool already decided about.
-        self.current_ts = self
-            .current_ts
-            .advanced_by_commit(block.header().parent_qc().weighted_timestamp());
-
-        // A gossip-timed fork fence holds until the attested recovery for
-        // its shard completes — clearing on the fold would reopen admission
-        // for the whole recovery window, letting cross-shard txs take locks
-        // and stall on fenced provisions.
-        if !self.fork_fence.is_empty() {
-            self.fork_fence
-                .clear_completed(topology_snapshot.completed_recoveries());
-        }
+        // The shard coordinator's commit has already advanced the shared
+        // clock past this block; advancing again is a no-op there, and is
+        // what moves a pool that runs without one.
+        self.clock
+            .advance(block.header().parent_qc().weighted_timestamp());
 
         // Ensure all committed transactions are in the mempool.
         // This handles the case where we fetched transactions to vote on a block
@@ -793,7 +806,7 @@ impl MempoolCoordinator {
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
             let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
-            let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
+            let admissible_until = tx.validity_range().end_timestamp_exclusive;
             self.pool.entry(hash).or_insert_with(|| {
                 tracing::debug!(
                     tx_hash = ?hash,
@@ -861,7 +874,7 @@ impl MempoolCoordinator {
                     continue;
                 }
                 self.expected_txs
-                    .record(tx_hash, source_shard, self.current_ts);
+                    .record(tx_hash, source_shard, self.clock.now());
             }
         }
 
@@ -873,7 +886,7 @@ impl MempoolCoordinator {
         // race and retention-horizon paths below.
         for (source_shard, ids) in self
             .expected_txs
-            .due_for_fetch(self.current_ts, EXPECTED_TX_GRACE)
+            .due_for_fetch(self.clock.now(), EXPECTED_TX_GRACE)
         {
             // Routability is the network's call: it resolves the source
             // committee against the terminal-clamped routing map, so a split
@@ -904,7 +917,7 @@ impl MempoolCoordinator {
         // fetch protocol keeps requesting forever.
         let dropped = self
             .expected_txs
-            .drop_past_horizon(self.current_ts, RETENTION_HORIZON);
+            .drop_past_horizon(self.clock.now(), RETENTION_HORIZON);
         if !dropped.is_empty() {
             let mut abandoned: Vec<TxHash> = Vec::with_capacity(dropped.len());
             for (tx_hash, source_shard) in dropped {
@@ -945,9 +958,7 @@ impl MempoolCoordinator {
                     let Some(entry) = self.pool.get_mut(&tx_hash) else {
                         continue;
                     };
-                    // A shard with legs on both sides of the core runs
-                    // them as two members, and the second finalizes
-                    // into the state the first already reported.
+                    // A status already reported is not reported again.
                     if matches!(entry.status, TransactionStatus::LegFinalized) {
                         continue;
                     }
@@ -999,84 +1010,39 @@ impl MempoolCoordinator {
         actions
     }
 
-    /// Record that local ECs were just formed for these transactions.
-    /// Add a transaction's nodes to the locked set.
-    /// Called when a transaction transitions TO a lock-holding state (Committed/Executed).
-    ///
-    /// Also blocks any ready transactions that conflict with the newly locked nodes.
-    ///
-    /// Scoped to local-shard nodes. A cross-shard tx's remote nodes are not
-    /// owned by this shard's state machine; their lifetime is gated by the
-    /// peer shard's finalization, which can stall independently. Locking
-    /// them here would permanently defer future local cross-shard txs that
-    /// share those remote nodes, cascading the stall.
-    /// Remove a transaction's nodes from the locked set.
-    /// Called when a transaction transitions FROM a lock-holding state (evicted).
-    ///
-    /// Also promotes any blocked transactions that were waiting on these nodes.
-    /// Scoped to local-shard nodes; mirrors [`Self::add_locked_nodes`].
-    /// Add a transaction to ready tracking when it becomes Pending. The
-    /// store decides whether it lands in the ready or deferred set based on
-    /// currently-locked and already-claimed nodes.
-    /// The payer shard a cross-shard transaction must show engagement
-    /// evidence from before entering contention, or `None` when the
-    /// The last instant this shard could still include `tx`.
-    ///
-    /// Its validity end, except where this shard only delivers for it —
-    /// frozen divided against the head trie with this shard outside the
-    /// core and every leg here a delivery — which is admissible to the
-    /// delivery window's close. The proposer reads the same predicate
-    /// against its block's own anchor, so what this widens is
-    /// retention: the body and the tombstone are held while a delivery
-    /// could still be composed from them, and for nothing else.
-    fn admissible_until(
-        &self,
-        topology_snapshot: &TopologySnapshot,
-        tx: &Transaction,
-        cross_shard: bool,
-    ) -> WeightedTimestamp {
-        let validity_end = tx.validity_range().end_timestamp_exclusive;
-        let delivers = cross_shard
-            && Classified::freeze(
-                tx.legs(),
-                tx.fee_payer(),
-                tx.accounts(),
-                topology_snapshot.shard_trie(),
-            )
-            .only_delivers_at(self.local_shard);
-        if delivers {
-            Window::Delivery.of(Deadline::of(validity_end)).end
-        } else {
-            validity_end
-        }
-    }
-
-    /// transaction is immediately ready: not VM, not cross-shard, this
-    /// shard is the payer's, or the evidence already arrived.
-    fn engagement_park_target(
+    /// Whether `tx` waits for its payer's engagement evidence before
+    /// entering contention: not where it is immediately ready — not
+    /// cross-shard, this shard is the payer's, or the evidence already
+    /// arrived.
+    fn parks_for_engagement(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         tx: &Arc<Verified<Transaction>>,
         cross_shard: bool,
-    ) -> Option<ShardId> {
+    ) -> bool {
         if !cross_shard {
-            return None;
+            return false;
         }
-        let payer_shard = topology_snapshot
-            .shard_trie()
-            .shard_for_prefix(tx.fee_payer());
-        if payer_shard == self.local_shard {
-            return None;
-        }
+        let Some(payer_shard) = self.payer_shard(topology_snapshot.shard_trie(), tx) else {
+            return false;
+        };
         let engaged = self
             .engagement_seen
             .get(&tx.hash())
             .is_some_and(|(seen, _)| *seen == payer_shard);
         if engaged {
             self.engagement_seen.remove(&tx.hash());
-            return None;
+            return false;
         }
-        Some(payer_shard)
+        true
+    }
+
+    /// The shard whose bundle is `tx`'s engagement evidence under
+    /// `trie`, or `None` where this shard is the payer's and there is
+    /// nothing to wait for.
+    fn payer_shard(&self, trie: &ShardTrie, tx: &Transaction) -> Option<ShardId> {
+        let payer_shard = trie.shard_for_prefix(tx.fee_payer());
+        (payer_shard != self.local_shard).then_some(payer_shard)
     }
 
     /// Record engagement evidence: a verified or committed bundle from
@@ -1084,27 +1050,36 @@ impl MempoolCoordinator {
     /// into contention; evidence for transactions not yet admitted is
     /// remembered until the retention tier expires it, covering the
     /// bundle-before-transaction arrival order.
+    ///
+    /// Whether `source` is the shard a park waits on is asked against
+    /// `trie` here rather than remembered from admission. A cut moves
+    /// the payer's prefix, and the shard that held it may terminate
+    /// without ever including the transaction — the successor includes
+    /// it and bundles under its own name, which a remembered shard would
+    /// not match, leaving the transaction `Pending` and unselectable
+    /// until its window closed with no verdict anywhere.
     pub fn on_engagement_evidence(
         &mut self,
+        trie: &ShardTrie,
         source: ShardId,
         tx_hashes: impl IntoIterator<Item = TxHash>,
     ) {
-        let deadline = self.current_ts.plus(RETENTION_HORIZON);
+        let deadline = self.clock.now().plus(RETENTION_HORIZON);
         for hash in tx_hashes {
-            match self.parked_engagement.get(&hash) {
-                Some(&payer_shard) if payer_shard == source => {
+            if self.parked_engagement.contains_key(&hash) {
+                let waits_on = self
+                    .pool
+                    .get(&hash)
+                    .and_then(|entry| self.payer_shard(trie, &entry.tx));
+                if waits_on == Some(source) {
                     // Unparked: a Pending entry no longer parked is
                     // selectable by construction.
                     self.parked_engagement.remove(&hash);
                 }
-                Some(_) => {}
-                None => {
-                    if !self.pool.contains_key(&hash) && !self.is_tombstoned(&hash) {
-                        self.engagement_seen
-                            .entry(hash)
-                            .or_insert((source, deadline));
-                    }
-                }
+            } else if !self.pool.contains_key(&hash) && !self.is_tombstoned(&hash) {
+                self.engagement_seen
+                    .entry(hash)
+                    .or_insert((source, deadline));
             }
         }
     }
@@ -1123,7 +1098,7 @@ impl MempoolCoordinator {
             pool.get(hash)
                 .is_some_and(|entry| entry.status == TransactionStatus::Pending)
         });
-        let now = self.current_ts;
+        let now = self.clock.now();
         self.engagement_seen
             .retain(|_, (_, deadline)| *deadline > now);
     }
@@ -1245,19 +1220,23 @@ impl MempoolCoordinator {
     }
 
     /// Transactions still awaiting inclusion whose validity window opened
-    /// before `wt`. Parked ones included: a reshape successor refuses
-    /// them all until it can prove them absent from what its predecessor
-    /// committed, so being unselectable for another reason doesn't make
-    /// the question moot.
+    /// before `wt`, each with the end of its range, which names its
+    /// committed marker. Parked ones included: a split's right child
+    /// refuses them all until its parent's terminal state proves their
+    /// markers absent, so being unselectable for another reason doesn't
+    /// make the question moot.
     #[must_use]
-    pub fn pending_opening_before(&self, wt: WeightedTimestamp) -> Vec<TxHash> {
+    pub fn pending_opening_before(
+        &self,
+        wt: WeightedTimestamp,
+    ) -> Vec<(TxHash, WeightedTimestamp)> {
         self.pool
             .iter()
             .filter(|(_, entry)| {
                 matches!(entry.status, TransactionStatus::Pending)
                     && entry.tx.validity_range().start_timestamp_inclusive < wt
             })
-            .map(|(hash, _)| *hash)
+            .map(|(hash, entry)| (*hash, entry.tx.validity_range().end_timestamp_exclusive))
             .collect()
     }
 
@@ -1270,17 +1249,10 @@ impl MempoolCoordinator {
         self.pending_count() >= self.config.max_pending
     }
 
-    /// Seed the committed frontier a restart resumes at.
-    ///
-    /// The admission gate compares a transaction's admissibility deadline
-    /// against [`Self::current_ts`], and the only other thing that moves
-    /// that clock is a commit. Left at zero the comparison is vacuous, so
-    /// a restarted node admits every gossiped transaction — expired ones
-    /// included — until its first commit lands. Execution's commit
-    /// frontier seeds from the same recovered tip for the same reason.
-    pub const fn seed_committed(&mut self, height: BlockHeight, ts: WeightedTimestamp) {
+    /// Seed the committed height a restart resumes at. The clock arrives
+    /// seeded with the recovered tip's anchor.
+    pub const fn seed_committed(&mut self, height: BlockHeight) {
         self.current_height = height;
-        self.current_ts = ts;
     }
 
     /// Get the mempool configuration.
@@ -1348,9 +1320,8 @@ impl MempoolCoordinator {
     /// Drop tombstones whose own deadline has passed `current_ts`, and
     /// drop the matching bodies from [`Self::tx_store`]. The deadline is
     /// the `admissible_until` that let the transaction in — its validity
-    /// end, or the close of the delivery window that end opens where this
-    /// shard only delivers for it — so a tombstone stops refusing exactly
-    /// where admission stops taking it. Past that the validator-side
+    /// end — so a tombstone stops refusing exactly where admission stops
+    /// taking it. Past that the validator-side
     /// validity check rejects any re-submission, so the tombstone is no
     /// longer load-bearing for correctness and the body is no longer
     /// fetchable. Anchored on `current_ts` (updated in
@@ -1358,7 +1329,7 @@ impl MempoolCoordinator {
     ///
     /// Returns the number of tombstones dropped.
     pub fn cleanup_expired_tombstones(&mut self) -> usize {
-        let removed = self.tombstones.prune_tombstones(self.current_ts);
+        let removed = self.tombstones.prune_tombstones(self.clock.now());
         let count = removed.len();
         if !removed.is_empty() {
             self.tx_store.evict(removed);
@@ -1390,7 +1361,7 @@ impl MempoolCoordinator {
     ///
     /// Returns the number of entries dropped.
     pub fn cleanup_expired_pending(&mut self) -> usize {
-        let now = self.current_ts;
+        let now = self.clock.now();
         let expired: Vec<TxHash> = self
             .pool
             .iter()
@@ -1429,7 +1400,7 @@ impl MempoolCoordinator {
     /// participate in untouched.
     #[must_use]
     pub fn pending_for_handback(&self) -> Vec<Arc<Transaction>> {
-        let now = self.current_ts;
+        let now = self.clock.now();
         self.pool
             .values()
             .filter(|entry| matches!(entry.status, TransactionStatus::Pending))
@@ -1539,6 +1510,7 @@ mod tests {
                 provisions: Arc::new(Capped::from_array([Arc::new(provision.into())])),
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             },
             sealed @ Block::Sealed { .. } => sealed,
@@ -1574,18 +1546,18 @@ mod tests {
         };
 
         mempool.on_block_committed(&topology_snapshot, &committed(1, 9_000));
-        assert_eq!(mempool.current_ts, WeightedTimestamp::from_millis(9_000));
+        assert_eq!(mempool.clock.now(), WeightedTimestamp::from_millis(9_000));
 
         mempool.on_block_committed(&topology_snapshot, &committed(2, 4_000));
         assert_eq!(
-            mempool.current_ts,
+            mempool.clock.now(),
             WeightedTimestamp::from_millis(9_000),
             "a regressed anchor holds the clock where it is",
         );
 
         mempool.on_block_committed(&topology_snapshot, &committed(3, 11_000));
         assert_eq!(
-            mempool.current_ts,
+            mempool.clock.now(),
             WeightedTimestamp::from_millis(11_000),
             "and it still advances",
         );
@@ -2926,7 +2898,7 @@ mod tests {
     /// Force-set `current_ts` for tests that need to control the admission /
     /// sweep clock without going through a full block commit.
     fn set_current_ts(mempool: &mut MempoolCoordinator, ts: WeightedTimestamp) {
-        mempool.current_ts = ts;
+        mempool.clock = CommittedClock::seeded(ts);
     }
 
     #[test]
@@ -2988,7 +2960,8 @@ mod tests {
         );
 
         let mut seeded = MempoolCoordinator::new(ShardId::ROOT);
-        seeded.seed_committed(BlockHeight::new(42), WeightedTimestamp::from_millis(2_000));
+        seeded.seed_committed(BlockHeight::new(42));
+        seeded.clock = CommittedClock::seeded(WeightedTimestamp::from_millis(2_000));
         seeded.on_transaction_gossip(
             &topology_snapshot,
             Arc::clone(&tx),
@@ -3135,7 +3108,12 @@ mod tests {
 
         // With the fence engaged for that shard, admission is rejected — no
         // point starting cross-shard work bound to a forked committee.
-        mempool.engage_fork_fence(fenced_shard, BlockHeight::new(5), &BTreeMap::new());
+        assert!(
+            mempool
+                .fork_fence
+                .engage(fenced_shard, BlockHeight::new(5), &BTreeMap::new())
+                .is_some()
+        );
         mempool.on_submit_transaction(
             &topology_snapshot,
             Arc::new(verified(tx)),
@@ -3169,16 +3147,24 @@ mod tests {
         );
     }
 
+    /// Admission follows the node's fence: the node clears it when the
+    /// recovery completes, and the pool reads the cleared handle with no
+    /// step of its own.
     #[test]
-    fn fork_fence_holds_admission_until_the_recovery_completes() {
-        use hyperscale_types::{Epoch, RecoveryCause, ShardRecovery};
+    fn fork_fence_holds_admission_until_the_node_clears_it() {
+        use hyperscale_types::{CompletedRecovery, Epoch};
 
         let topology_snapshot = make_cross_shard_topology();
         let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
 
         let prefix = test_prefix(7);
         let fenced_shard = topology_snapshot.shard_for_prefix(prefix);
-        mempool.engage_fork_fence(fenced_shard, BlockHeight::new(5), &BTreeMap::new());
+        let node_fence = mempool.fork_fence.clone();
+        assert!(
+            node_fence
+                .engage(fenced_shard, BlockHeight::new(5), &BTreeMap::new())
+                .is_some()
+        );
 
         let submit = |mempool: &mut MempoolCoordinator, seed: u8| {
             let tx = test_transaction_with_prefixes(&[seed], &[], &[prefix]);
@@ -3191,21 +3177,6 @@ mod tests {
             hash
         };
 
-        // The recovery folds — the fence must hold through the whole
-        // recovery window, or txs flow back in, take locks, and stall on
-        // provisions the recovery fence still rejects.
-        let recovering = topology_snapshot.clone().with_pending_recoveries(
-            std::iter::once((
-                fenced_shard,
-                ShardRecovery {
-                    cause: RecoveryCause::Fork,
-                    rotated_at: Epoch::new(2),
-                    retained: Vec::new(),
-                    attested_frontier: BlockHeight::new(4),
-                },
-            ))
-            .collect(),
-        );
         let block = make_live_block(
             ShardId::leaf(1, 0),
             BlockHeight::new(1),
@@ -3214,16 +3185,15 @@ mod tests {
             vec![],
             vec![],
         );
-        mempool.on_block_committed(&recovering, &certify(block, TEST_BLOCK_INTERVAL_MS));
-        let mid_window = submit(&mut mempool, 7);
+        mempool.on_block_committed(&topology_snapshot, &certify(block, TEST_BLOCK_INTERVAL_MS));
+        let fenced = submit(&mut mempool, 7);
         assert!(
-            mempool.status(&mid_window).is_none(),
-            "a folded-but-incomplete recovery must not reopen admission"
+            mempool.status(&fenced).is_none(),
+            "a commit alone does not reopen admission"
         );
 
-        // The recovery completes — the fence clears and admission reopens.
-        let recovered = topology_snapshot.clone().with_completed_recoveries(
-            std::iter::once((
+        let cleared = node_fence.clear_completed(
+            &std::iter::once((
                 fenced_shard,
                 CompletedRecovery {
                     rotated_at: Epoch::new(2),
@@ -3232,19 +3202,11 @@ mod tests {
             ))
             .collect(),
         );
-        let block = make_live_block(
-            ShardId::leaf(1, 0),
-            BlockHeight::new(2),
-            1_234_567_890,
-            ValidatorId::new(0),
-            vec![],
-            vec![],
-        );
-        mempool.on_block_committed(&recovered, &certify(block, 2 * TEST_BLOCK_INTERVAL_MS));
+        assert_eq!(cleared, vec![fenced_shard]);
         let after = submit(&mut mempool, 8);
         assert!(
             mempool.status(&after).is_some(),
-            "a completed recovery reopens admission"
+            "the node's clear reopens admission"
         );
     }
 
@@ -3358,6 +3320,64 @@ mod tests {
         );
     }
 
+    /// A park follows its payer's prefix across a cut.
+    ///
+    /// Which shard's bundle releases a park is asked where the evidence
+    /// arrives, against the trie of that moment, and a reshape moves the
+    /// prefix out from under it. The shard that held it may terminate
+    /// without ever including the transaction — the successor includes
+    /// it and bundles under its own name — so a park held to the old one
+    /// would wait on a chain that will never speak again, and the
+    /// transaction would reach no verdict anywhere.
+    #[test]
+    fn a_park_follows_its_payers_prefix_across_a_cut() {
+        let committee = TestCommittee::new(4, 42);
+        let before = committee.topology_snapshot(2);
+        let after = committee.topology_snapshot(4);
+        let local = ShardId::leaf(1, 0);
+        let mut mempool = MempoolCoordinator::new(local);
+
+        // A set top bit routes to leaf(1, 0)'s sibling before the cut,
+        // and to one of that sibling's children after it.
+        let local_owner = test_principal(0x01);
+        let payer_owner = test_principal(0x81);
+        let held_by_before = before.shard_trie().shard_for_prefix(payer_owner.address());
+        let held_by_after = after.shard_trie().shard_for_prefix(payer_owner.address());
+        assert_ne!(
+            held_by_before, held_by_after,
+            "the fixture has to move the payer's prefix, or it tests nothing",
+        );
+
+        let parked = stub_vm(payer_owner, &[local_owner.address(), payer_owner.address()]);
+        let parked_hash = parked.hash();
+        mempool.on_transaction_gossip(&before, Arc::clone(&parked), false, LocalTimestamp::ZERO);
+        assert_eq!(mempool.parked_count(), 1);
+
+        // Before the cut, the shard that holds the prefix releases it.
+        mempool.on_engagement_evidence(before.shard_trie(), held_by_after, [parked_hash]);
+        assert_eq!(
+            mempool.parked_count(),
+            1,
+            "a shard that holds nothing of the payer's speaks for nothing",
+        );
+
+        // Past the cut, that same shard is the one it waits on, and the
+        // one that used to hold the prefix is not.
+        mempool.on_engagement_evidence(after.shard_trie(), held_by_before, [parked_hash]);
+        assert_eq!(
+            mempool.parked_count(),
+            1,
+            "the shard that used to hold the prefix speaks for nothing now",
+        );
+
+        mempool.on_engagement_evidence(after.shard_trie(), held_by_after, [parked_hash]);
+        assert_eq!(
+            mempool.parked_count(),
+            0,
+            "the successor's bundle is the evidence the park waits for",
+        );
+    }
+
     #[test]
     fn cross_shard_tx_parks_until_engagement_evidence() {
         let topology = TestCommittee::new(4, 42).topology_snapshot(2);
@@ -3410,13 +3430,13 @@ mod tests {
         assert_eq!(ready, vec![local_hash]);
 
         // Evidence from the wrong shard promotes nothing.
-        mempool.on_engagement_evidence(local, [parked_hash]);
+        mempool.on_engagement_evidence(topology.shard_trie(), local, [parked_hash]);
         assert_eq!(mempool.parked_count(), 1);
 
         // The payer's bundle unparks the transaction. Nothing arbitrates
         // their shared key any more — both legs are selectable, and the
         // batch they land in is what sequences them.
-        mempool.on_engagement_evidence(payer_shard, [parked_hash]);
+        mempool.on_engagement_evidence(topology.shard_trie(), payer_shard, [parked_hash]);
         assert_eq!(mempool.parked_count(), 0);
         let mut ready: Vec<TxHash> = mempool
             .ready_transactions(
@@ -3447,7 +3467,7 @@ mod tests {
         let tx = stub_vm(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let hash = tx.hash();
 
-        mempool.on_engagement_evidence(payer_shard, [hash]);
+        mempool.on_engagement_evidence(topology.shard_trie(), payer_shard, [hash]);
         mempool.on_transaction_gossip(&topology, Arc::clone(&tx), false, LocalTimestamp::ZERO);
 
         assert_eq!(mempool.parked_count(), 0);

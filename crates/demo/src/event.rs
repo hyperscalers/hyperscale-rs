@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use hyperscale_simulation::{DeliveryDrain, DeliveryRecord};
 use hyperscale_types::{
-    BlockHeight, ExecutionOutcome, Finalization, MessageClass, Provisions, Round, ShardId, TickId,
-    TxHash, TxOutcome,
+    Anchor, BlockHeight, ExecutionOutcome, Finalization, MessageClass, Provisions, Round, ShardId,
+    TickId, TxHash, TxOutcome,
 };
 use serde::Serialize;
 
@@ -114,6 +114,25 @@ pub enum TraceKind {
     /// nothing runs back.
     #[serde(rename_all = "camelCase")]
     ProvisionsVerified {
+        from: ShardPath,
+        from_height: u64,
+        to: ShardPath,
+        to_height: u64,
+        txs: Vec<TxLabel>,
+    },
+    /// Owed crossings credited on `to`: the records read at `(from,
+    /// fromHeight)` and credited in the block at `(to, toHeight)` by its
+    /// commit fold.
+    ///
+    /// Drawn as an arc from the block that wrote the records to the one
+    /// that credited them. Derived at the destination from the block's
+    /// state claims: a record's reading reaches a block only against a
+    /// proof checked at the producer's commit-proven root, so the arc
+    /// stands for a proof that checked out. A transfer draws one: its
+    /// payer's shard settles it alone, and the recipient's shard never
+    /// includes it and credits it here.
+    #[serde(rename_all = "camelCase")]
+    CrossingCredited {
         from: ShardPath,
         from_height: u64,
         to: ShardPath,
@@ -394,6 +413,25 @@ impl TraceEvent {
                 to: to.into(),
                 to_height: to_height.inner(),
                 txs: delivered.into_iter().map(TxLabel::from).collect(),
+            },
+        }
+    }
+
+    pub(crate) fn crossing_credited(
+        wt: u64,
+        anchor: &Anchor,
+        to: ShardId,
+        to_height: BlockHeight,
+        credited: Vec<TxHash>,
+    ) -> Self {
+        Self {
+            wt,
+            kind: TraceKind::CrossingCredited {
+                from: anchor.shard.into(),
+                from_height: anchor.height.inner(),
+                to: to.into(),
+                to_height: to_height.inner(),
+                txs: credited.into_iter().map(TxLabel::from).collect(),
             },
         }
     }

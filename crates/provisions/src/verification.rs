@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    CertifiedBlockHeader, Hash, ProvisionTxRoot, Provisions, ShardId, Verified, compute_merkle_root,
+    Anchor, CertifiedBlockHeader, Hash, ProvisionTxRoot, Provisions, ShardId, Verified,
+    compute_merkle_root,
 };
 use tracing::warn;
 
@@ -24,7 +25,7 @@ use tracing::warn;
 pub fn build_verify_action(
     local_shard: ShardId,
     provisions: Provisions,
-    certified_header: Arc<Verified<CertifiedBlockHeader>>,
+    certified_header: &Arc<Verified<CertifiedBlockHeader>>,
 ) -> Option<Action> {
     let Some(expected_root) = certified_header
         .header()
@@ -64,6 +65,6 @@ pub fn build_verify_action(
 
     Some(Action::VerifyProvisions {
         provisions,
-        certified_header,
+        anchor: Anchor::of(certified_header),
     })
 }

@@ -26,6 +26,7 @@ pub(crate) mod caches;
 pub(crate) mod commit;
 pub(crate) mod consensus;
 pub(crate) mod cross_shard;
+pub(crate) mod crossing_index;
 pub(crate) mod instances;
 pub(crate) mod io;
 pub(crate) mod mempool;
@@ -543,8 +544,9 @@ where
                 certified,
                 source,
                 witness,
+                committee_anchor,
             } => {
-                self.handle_qc_only_commit_prepared(certified, source, witness);
+                self.handle_qc_only_commit_prepared(certified, source, witness, committee_anchor);
             }
             ShardScopedInput::QcOnlyCommitDiverged(div) => {
                 handle_qc_only_commit_diverged(&div);
@@ -569,7 +571,7 @@ where
         // for: what it runs is behind the records it names, so those are
         // what this asks the shards holding them for, and the code
         // follows once they seat a derivation.
-        if let ProtocolEvent::BlockCommitted { certified } = &event {
+        if let ProtocolEvent::BlockCommitted { certified, .. } = &event {
             let mut packages: Vec<Hash> = Vec::new();
             let mut records: Vec<Address> = Vec::new();
             for tx in certified.block().transactions().iter() {
@@ -652,8 +654,14 @@ where
                 .initialize_genesis(now, genesis);
             self.drain_actions(vnode_idx, actions);
         }
+        // A genesis block has no parent to anchor its committee on; its own
+        // anchor is the chain origin's, the committee anchor of block one.
+        let committee_anchor = genesis.header().parent_qc().weighted_timestamp();
         self.step(ShardScopedInput::Protocol(Box::new(
-            ProtocolEvent::BlockCommitted { certified },
+            ProtocolEvent::BlockCommitted {
+                certified,
+                committee_anchor,
+            },
         )));
 
         self.seed_genesis_substate_frontier(genesis);

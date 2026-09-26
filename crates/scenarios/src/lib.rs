@@ -23,6 +23,7 @@ mod faults;
 mod fees;
 mod liveness;
 mod multi_vnode;
+mod pushes;
 mod reshape;
 mod route;
 mod route_reshape;
@@ -33,8 +34,10 @@ mod witnesses;
 
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use execution::{
-    a_delivery_cut_off_past_its_window_is_reclaimed, a_failed_attempt_still_attests_work,
-    a_healed_network_does_not_revive_a_closed_delivery,
+    a_delivery_cut_off_past_its_window_is_owed,
+    a_delivery_lands_past_every_window_once_its_record_arrives,
+    a_failed_attempt_still_attests_work, a_healed_network_delivers_past_the_old_window,
+    a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_runs_where_it_was_never_committed,
@@ -66,6 +69,13 @@ pub use fees::{
 };
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
+pub use pushes::{
+    a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
+    a_rejoined_producer_asks_a_lost_answer,
+    a_replica_that_missed_the_credit_commits_it_from_the_block,
+    a_withheld_fallback_is_asked_by_an_honest_validator,
+    an_answer_written_past_the_deadline_is_read_on_a_later_ask,
+};
 pub use reshape::{
     MAX_REPLAY_PROBES, grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
     merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,
@@ -75,16 +85,18 @@ pub use reshape::{
 };
 pub use route::{
     FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport, SECOND_VENUE_SHARD, TRADER_SHARD,
+    a_crossing_the_consumer_refuses_is_declined,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
-    route_genesis_accounts,
+    a_route_whose_core_never_combines_holds_its_input, route_genesis_accounts,
 };
 pub use route_reshape::{
     MERGE_TRAIN, SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_hands_on_what_it_never_took,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
+    a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
@@ -96,8 +108,10 @@ pub use route_reshape::{
     merging_caller_genesis_accounts, split_train_genesis_accounts,
 };
 pub use straddler::{
-    a_delivery_is_reclaimed_when_its_deliverer_splits,
-    a_record_is_decided_by_the_successor_when_its_issuer_splits, isolate_ec_intake,
+    a_delivery_is_owed_when_its_deliverer_splits,
+    a_record_is_owed_by_the_successor_when_its_issuer_splits,
+    a_skip_deferred_split_keeps_every_settlement_in_its_window,
+    an_owed_crossing_a_merge_converges_is_credited_on_the_successor, isolate_ec_intake,
     merge_straddler_atomic, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
 };
@@ -107,7 +121,7 @@ pub use support::{
 };
 pub use transactions::livelock_resolves_promptly;
 pub use venue::{
-    SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, VENUE_SHARD, VenueReport, WIDE_VENUE_SHARD,
+    SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, StockedVenue, VENUE_SHARD, VenueReport, WIDE_VENUE_SHARD,
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,

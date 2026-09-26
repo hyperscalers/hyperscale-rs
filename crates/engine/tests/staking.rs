@@ -4,7 +4,7 @@
 //! Every case here runs against a world with a stake pool seated in it,
 //! which is what makes the delegation's events beacon facts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
@@ -15,21 +15,24 @@ use hyperscale_engine::genesis::{
     GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, stake_unit,
     staking_artifact,
 };
+use hyperscale_engine::legs::{Classified, Member, Runs, never_answer};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
-    genesis_writes,
+    TickTxInput, genesis_writes,
 };
-use hyperscale_storage::Substates;
+use hyperscale_hbor::Bytes;
+use hyperscale_storage::{Substates, entry_leaf_rows};
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey,
-    MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, ShardId,
-    ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
-    Verified, WeightedTimestamp, absorb_committed_cells,
+    EscrowedValue, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
+    ProvisionalHolds, SettledEntries, ShardId, ShardTrie, Stake, StakePoolId, StakePoolSeat,
+    SubstateEntry, SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp,
+    absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    ChainRecords, Composed, IntentHeader, holdings_collection, instance_data_key, package_hash,
-    resource_record_key,
+    Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, IntentHeader, Kind,
+    holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{IntentBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, instantiate, staking};
@@ -709,5 +712,434 @@ fn a_delegation_needs_no_operator() {
         signed_stake(pool_at(POOL_ID), 500)
             .try_derived(executor.derivation().as_ref())
             .is_ok()
+    );
+}
+
+/// Two pool seats whose addresses fall on different leaves of `trie`,
+/// so a delegation into both is a core spanning two shards.
+fn seats_apart(trie: &ShardTrie) -> [u32; 2] {
+    let first = trie.shard_for_prefix(pool_at(POOL_ID).address());
+    let other = (1..=64u32)
+        .find(|id| *id != POOL_ID && trie.shard_for_prefix(pool_at(*id).address()) != first)
+        .expect("some seat sits on another leaf");
+    [POOL_ID, other]
+}
+
+/// A signing seed whose account sits on none of `taken`'s leaves.
+fn seed_away_from(trie: &ShardTrie, taken: &[ShardId]) -> u8 {
+    (1..=u8::MAX)
+        .find(|seed| !taken.contains(&trie.shard_for_prefix(account_of(*seed))))
+        .expect("some key's account sits on a third leaf")
+}
+
+/// `payer.withdraw -> pool.stake -> payer.deposit(units)` once into each
+/// of two seats: the payer's withdraws are inbound legs, the two stakes
+/// a core, the deposits deliveries back.
+fn signed_double_stake(seed: u8, seats: [u32; 2], amount: u128) -> Transaction {
+    let key = key_of(seed);
+    let from = account_of(seed);
+    let staking = package_hash(&ProtocolHasher, staking_artifact());
+    let metas = seats.map(|id| pool_meta(staking, &seat(id)));
+    let chain = client().records();
+    let composed = Composed::new(&chain, &metas, &ProtocolHasher);
+    let mut b = IntentBuilder::new(&composed, &ProtocolHasher, from, HEADER);
+    for meta in &metas {
+        let pool = meta.address(&ProtocolHasher);
+        let funds = account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount)
+            .expect("an account withdraws");
+        let units = staking::Staking::at(pool)
+            .stake(&mut b, funds)
+            .expect("a pool takes a delegation");
+        account::deposit(&mut b, from, units).expect("an account banks its position");
+    }
+    let tree = b.build().expect("the intent declares no hole");
+    Transaction::new(client().sign_tree(&tree, &[&key], terms(1_000)))
+}
+
+/// A delegation divided across a four-leaf trie: the payer on one leaf,
+/// the two pools it delegates to on two others, so the core spans two
+/// shards and each core member consumes what the payer's legs hand
+/// across, awaits its sibling, and holds no vault. A core of one shard
+/// awaits nobody, and a core's own nodes run on every core shard, so
+/// nothing short of this shape can be refused by a sibling.
+struct DividedStake {
+    executor: Executor,
+    trie: ShardTrie,
+    seats: [u32; 2],
+    payer: u8,
+    tx: Arc<Verified<Transaction>>,
+    classified: Classified,
+    /// The payer's shard: the legs.
+    payer_shard: ShardId,
+    /// The shard whose pool `seats[0]` is: the core member under test.
+    core: ShardId,
+    /// The other core shard, whose certificate `core` awaits.
+    sibling: ShardId,
+}
+
+fn divided_stake() -> DividedStake {
+    let trie = ShardTrie::uniform(2);
+    let seats = seats_apart(&trie);
+    let core = trie.shard_for_prefix(pool_at(seats[0]).address());
+    let sibling = trie.shard_for_prefix(pool_at(seats[1]).address());
+    let payer = seed_away_from(&trie, &[core, sibling]);
+    let payer_shard = trie.shard_for_prefix(account_of(payer));
+    let executor = seated(&seats.map(seat), ExecutionMode::Serial);
+    let raw = signed_double_stake(payer, seats, 500);
+    raw.try_derived(executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
+    assert!(
+        classified.decomposed(),
+        "a payer's legs into a core of two divide"
+    );
+    assert_eq!(
+        classified.core(),
+        &BTreeSet::from([core, sibling]),
+        "the two stakes are a core spanning two leaves",
+    );
+    DividedStake {
+        executor,
+        trie,
+        seats,
+        payer,
+        tx,
+        classified,
+        payer_shard,
+        core,
+        sibling,
+    }
+}
+
+impl DividedStake {
+    /// The genesis store, with `pools` seated.
+    fn store(&self, pools: &[u32]) -> MapDb {
+        let seats: Vec<StakePoolSeat> = pools.iter().map(|id| seat(*id)).collect();
+        MapDb::genesis(&[(account_of(self.payer), 10_000)], &seats)
+    }
+
+    /// What a counterpart provisions a member with: every cell and entry
+    /// `store` holds under `shard`'s prefixes, as the leaves a bundle
+    /// carries them. A core runs every core node, so a member of a core
+    /// of two reads its sibling's pool through what the sibling
+    /// provisioned.
+    fn provisioned(&self, store: &MapDb, shard: ShardId) -> Vec<Arc<Vec<SubstateEntry>>> {
+        let cells = store
+            .cells
+            .iter()
+            .filter(|(key, _)| self.trie.shard_for_prefix(key.owner) == shard)
+            .map(|(key, value)| (*key, Some(value.clone())));
+        let entries: SettledEntries = store
+            .entries
+            .iter()
+            .filter(|(key, _)| self.trie.shard_for_prefix(key.owner) == shard)
+            .map(|(key, value)| (*key, Some(value.clone())))
+            .collect();
+        let leaves = cells
+            .chain(entry_leaf_rows(&entries))
+            .map(|(key, value)| {
+                SubstateEntry::new(
+                    key,
+                    value.map(|bytes| Bytes::new(bytes).expect("a genesis leaf fits a cell")),
+                )
+            })
+            .collect();
+        vec![Arc::new(leaves)]
+    }
+
+    /// Run `local`'s member on its first side against `store`, handed
+    /// `arrivals` and `provisions`.
+    fn run(
+        &self,
+        store: &MapDb,
+        local: ShardId,
+        arrivals: &[EscrowedValue],
+        provisions: &[Arc<Vec<SubstateEntry>>],
+    ) -> ExecutedTx {
+        let ctx = TickBatchContext {
+            local_shard: local,
+            shard_trie: &self.trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: self.tx.hash(),
+            transaction: Some(&self.tx),
+            provisions,
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Shape(Member::of(
+                self.classified.clone(),
+                local,
+                BTreeSet::from([self.payer_shard, self.core, self.sibling]),
+            )),
+            arrivals,
+        };
+        self.executor
+            .execute_tick_batch(&ctx, store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
+    }
+
+    /// What the payer's shard hands across: one withdraw per pool, read
+    /// off the record cells its legs wrote, as a consumer's arrival index
+    /// reads the proven record.
+    fn handed(&self, store: &MapDb) -> Vec<EscrowedValue> {
+        let legs = self.run(store, self.payer_shard, &[], &[]);
+        let ConsensusReceipt::Succeeded { writes, .. } = &legs.consensus else {
+            panic!("the payer's legs must succeed: {:?}", legs.metadata);
+        };
+        let handed: Vec<EscrowedValue> = self
+            .classified
+            .edges()
+            .iter()
+            .filter_map(|edge| {
+                let record = edge.crossing.id.record_key(&ProtocolHasher);
+                let cell = CrossingCell::from_bytes(writes.cells.get(&record)?.as_deref()?)?;
+                Some(EscrowedValue {
+                    node: edge.producer,
+                    output: edge.output,
+                    resource: cell.resource,
+                    amount: cell.amount,
+                    record,
+                })
+            })
+            .collect();
+        assert_eq!(handed.len(), 2, "one withdraw crosses to each pool");
+        handed
+    }
+
+    /// The edge `core` consumes whose decline cell it holds: the
+    /// withdraw into its own pool. The other withdraw arrives too, but
+    /// its claim and decline sit under the sibling's pool.
+    fn own_edge(&self) -> CrossingEdge<ShardId> {
+        let edges: Vec<_> = self
+            .classified
+            .refusable_consumed(self.core)
+            .filter(|edge| {
+                self.trie.shard_for_prefix(
+                    edge.crossing
+                        .id
+                        .answer_key(&ProtocolHasher, Answered::Taken)
+                        .owner,
+                ) == self.core
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "the core holds one of the two crossings' answers"
+        );
+        edges.into_iter().next().expect("one edge")
+    }
+
+    /// The one `Never` the core member writes: for the crossing it
+    /// consumes, may refuse, and holds the decline cell of.
+    fn never(&self) -> (SubstateKey, Vec<u8>) {
+        never_answer(
+            self.tx.hash(),
+            self.tx.validity_range().end_timestamp_exclusive.as_millis(),
+            &self.own_edge(),
+        )
+    }
+}
+
+/// The `Never` cells a refusal receipt writes, with the movements beside
+/// them.
+fn answers_of(executed: &ExecutedTx) -> (Vec<(SubstateKey, Vec<u8>)>, usize) {
+    let writes = executed
+        .refusal_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("the member names a refusal receipt with writes");
+    let cells = writes
+        .cells
+        .iter()
+        .map(|(key, value)| (*key, value.clone().expect("an answer is an absolute write")))
+        .collect();
+    (cells, writes.movements.len())
+}
+
+/// A multi-core member that completes here, holds no vault here and can
+/// still be refused by its sibling names a refusal receipt carrying its
+/// `Never`, byte-equal to the one derivation, and nothing else; the
+/// refusal receipt is what settles once the sibling's certificate
+/// refuses the transaction.
+#[test]
+fn a_consumer_completed_here_and_refused_elsewhere_writes_never() {
+    let divided = divided_stake();
+    let store = divided.store(&divided.seats);
+    let handed = divided.handed(&store);
+
+    let core = divided.run(
+        &store,
+        divided.core,
+        &handed,
+        &divided.provisioned(&store, divided.sibling),
+    );
+    assert!(
+        matches!(core.consensus, ConsensusReceipt::Succeeded { .. }),
+        "the core member's stakes complete: {:?}",
+        core.metadata,
+    );
+    assert_eq!(
+        answers_of(&core),
+        (vec![divided.never()], 0),
+        "one Never for the crossing whose decline cell it holds, and no charge: the vault \
+         is not here",
+    );
+}
+
+/// A core member that aborts names a refusal receipt whose writes are
+/// one `Never` per escrowed crossing it consumes, whether the kernel
+/// refused it or the plan could not be built before the kernel ran.
+#[test]
+fn an_aborted_consumer_writes_never_at_each_refusable_edge() {
+    let divided = divided_stake();
+    let store = divided.store(&divided.seats);
+    let handed = divided.handed(&store);
+
+    // The core's own pool is seated in the executor's records and absent
+    // from the state it runs against, so the stake fails inside the
+    // kernel.
+    let sibling_only = divided.store(&divided.seats[1..]);
+    let refused = divided.run(
+        &sibling_only,
+        divided.core,
+        &handed,
+        &divided.provisioned(&sibling_only, divided.sibling),
+    );
+    assert!(
+        matches!(refused.consensus, ConsensusReceipt::Failed),
+        "a stake into a pool the state does not hold fails: {:?}",
+        refused.consensus,
+    );
+    assert_eq!(
+        answers_of(&refused),
+        (vec![divided.never()], 0),
+        "the kernel path writes the one Never",
+    );
+
+    // Handed nothing, the member's plan cannot be built: refused before
+    // the kernel ran, and answering the same way.
+    let unbuilt = divided.run(
+        &store,
+        divided.core,
+        &[],
+        &divided.provisioned(&store, divided.sibling),
+    );
+    assert!(
+        matches!(unbuilt.consensus, ConsensusReceipt::Failed),
+        "a member whose arrival never came is refused before the kernel: {:?}",
+        unbuilt.consensus,
+    );
+    assert_eq!(
+        answers_of(&unbuilt),
+        (vec![divided.never()], 0),
+        "the pre-kernel path writes the one Never",
+    );
+}
+
+/// Where an answer already stands at the claim key or the decline key,
+/// the refusal receipt carries no `Never` for that edge and the member
+/// does not trap: it fails with the one "already answered" outcome and
+/// names no receipt, since nothing else is settled apart here.
+#[test]
+fn never_is_skipped_where_an_answer_stands() {
+    let divided = divided_stake();
+    let store = divided.store(&divided.seats);
+    let handed = divided.handed(&store);
+    let edge = divided.own_edge();
+    let (never, bytes) = divided.never();
+
+    for (name, key, value) in [
+        (
+            "the claim",
+            edge.crossing
+                .id
+                .answer_key(&ProtocolHasher, Answered::Taken),
+            vec![1u8],
+        ),
+        ("the decline", never, bytes),
+    ] {
+        let mut answered = divided.store(&divided.seats);
+        answered.cells.insert(key, value);
+        let executed = divided.run(
+            &answered,
+            divided.core,
+            &handed,
+            &divided.provisioned(&answered, divided.sibling),
+        );
+        assert!(
+            matches!(executed.consensus, ConsensusReceipt::Failed),
+            "with {name} standing the take is refused: {:?}",
+            executed.consensus,
+        );
+        assert!(
+            executed.refusal_receipt.is_none(),
+            "with {name} standing no Never is written and nothing else is owed here",
+        );
+    }
+}
+
+/// For every edge of a frozen star, the producer's departure is
+/// escrowed exactly where the consumer may refuse it: the two are read
+/// off one flag, so an owed crossing is never answered `Never` and an
+/// escrowed one always can be.
+#[test]
+fn a_departure_is_escrowed_exactly_where_its_consumer_may_refuse() {
+    let divided = divided_stake();
+    let store = divided.store(&divided.seats);
+    let handed = divided.handed(&store);
+    let plans = [
+        divided
+            .classified
+            .plan(
+                &[],
+                divided.payer_shard,
+                divided.tx.validity_range().end_timestamp_exclusive,
+            )
+            .expect("the payer's shard plans its legs"),
+        divided
+            .classified
+            .plan(
+                &handed,
+                divided.core,
+                divided.tx.validity_range().end_timestamp_exclusive,
+            )
+            .expect("the core plans on what it was handed"),
+    ];
+
+    let mut kinds = BTreeSet::new();
+    for edge in divided.classified.edges() {
+        let Some(departure) = plans
+            .iter()
+            .find_map(|plan| plan.legs.departure(edge.producer, edge.output))
+        else {
+            continue;
+        };
+        let refusable = edge.to.iter().any(|shard| {
+            divided
+                .classified
+                .refusable_consumed(*shard)
+                .any(|named| named == edge)
+        });
+        assert_eq!(
+            departure.crossing.kind == Kind::Escrowed,
+            refusable,
+            "edge {}:{} departs {:?} and is refusable: {refusable}",
+            edge.producer,
+            edge.output,
+            departure.crossing.kind,
+        );
+        kinds.insert(departure.crossing.kind == Kind::Escrowed);
+    }
+    assert_eq!(
+        kinds,
+        BTreeSet::from([false, true]),
+        "the fixture departs one of each kind",
     );
 }

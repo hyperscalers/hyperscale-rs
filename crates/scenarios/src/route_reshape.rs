@@ -17,11 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::genesis::GenesisPackages;
+use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId,
-    SubstateKey, TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    WeightedTimestamp, Window,
+    BlockHeight, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
+    TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, WeightedTimestamp,
 };
 
 use crate::reshape::split_lifecycle;
@@ -997,9 +997,9 @@ fn departing_route<C: Cluster>(c: &mut C) -> DepartingRoute {
 /// not pay.
 fn submit_departing_route<C: Cluster>(
     c: &mut C,
-    route: &DepartingRoute,
+    route: &mut DepartingRoute,
     charges: &mut Charges,
-) -> (TxHash, TxsInFlight, u128, WeightedTimestamp) {
+) -> (TxHash, TxsInFlight, u128) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
     let baseline = c
         .committed_txs_in_flight(survivor)
@@ -1014,6 +1014,14 @@ fn submit_departing_route<C: Cluster>(
         0,
         validity,
     );
+    // The records the route's crossings write are value the world still
+    // holds while they stand; the output's is the one a departure can
+    // leave owed to the trader.
+    route.protocol_resource.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario route derives")
+            .legs,
+    ));
     let hash = charges.submit(c, tx);
     assert!(
         c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
@@ -1040,7 +1048,6 @@ fn submit_departing_route<C: Cluster>(
         hash,
         baseline,
         held(c, route.trader.address(), *PROTOCOL_RESOURCE),
-        validity.end_timestamp_exclusive,
     )
 }
 
@@ -1310,7 +1317,7 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
         reserve_cell(&leaving.meta, *PROTOCOL_RESOURCE),
         reserve_cell(&staying.meta, *PROTOCOL_RESOURCE),
     ];
-    let protocol_resource = World::open(c, *PROTOCOL_RESOURCE, [trader.address()], reserves);
+    let mut protocol_resource = World::open(c, *PROTOCOL_RESOURCE, [trader.address()], reserves);
 
     // A vote crosses both venue shards, so it has to be cast while they
     // can still hear each other — but it carries an activation far
@@ -1335,6 +1342,13 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
         0,
         validity_around(c.now()),
     );
+    // A record the cut leaves standing is value the world still holds,
+    // counted rather than reported as a strand.
+    protocol_resource.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario route derives")
+            .legs,
+    ));
     let hash = charges.submit(c, tx);
     assert!(
         c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
@@ -1406,7 +1420,144 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
     );
     assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
     c.clear_drops();
-    let _ = protocol_resource;
+    // The trader holds its input again and neither venue settled, so no
+    // record stands and the reserves are untouched.
+    protocol_resource.assert_settled(
+        c,
+        &charges,
+        "a route committed before its departure was voted",
+    );
+}
+
+/// A route the surviving venue accepted before its counterpart's split
+/// was projected is not torn: if the survivor settled it, the departing
+/// venue's side applied too, on it or on its successor.
+///
+/// [`a_route_committed_before_its_departure_was_voted_still_resolves`]
+/// with the certificate channel cut one way. The survivor still receives
+/// the departing venue's certificate and finalizes the route at an
+/// anchor where the departure is not yet scheduled, so the fence holds
+/// nothing; the departing venue never receives the survivor's, and
+/// reaches its terminal with the route unsettled. What the pre-boundary
+/// hold in the settled-set fence cannot see is an accept that landed
+/// before the hold armed.
+///
+/// Two things make the result trustworthy: the cut fired, and the
+/// survivor's finalization landed before the departure was admitted —
+/// without both the scenario proves nothing. The oracle is the
+/// departing venue's reserve, which moves exactly when its side applied,
+/// and the conservation of the trader and both reserves.
+///
+/// # Panics
+///
+/// Panics as the scenario it follows does, if the positive control does
+/// not hold, and if the route is torn: the survivor accepted and the
+/// departing venue's side applied nowhere, or the world does not
+/// balance.
+pub fn a_route_accepted_before_its_venues_split_is_projected_is_not_torn<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
+    let mut taken = Vec::new();
+    let leaving = stand_up_venue(c, departing, &mut taken);
+    let (grown_left, grown_right) = LATE_MERGED_PARENT.children();
+    assert!(
+        await_serves(c, grown_left, epochs(28)) && await_serves(c, grown_right, epochs(28)),
+        "the grow's own split must have run before the route commits",
+    );
+    let staying = stand_up_venue(c, survivor, &mut taken);
+    let (key, trader) = grind_onto(LATE_TRADER_SHARD, &mut taken);
+    let leaving_reserve = reserve_cell(&leaving.meta, *PROTOCOL_RESOURCE);
+    let reserves = [
+        leaving_reserve,
+        reserve_cell(&staying.meta, *PROTOCOL_RESOURCE),
+    ];
+    let mut protocol_resource = World::open(c, *PROTOCOL_RESOURCE, [trader.address()], reserves);
+    let leaving_held = held_at(c, leaving_reserve);
+
+    let activates_at = cast_late_threshold_vote(c, LATE_SPLIT_BYTES, LATE_VOTE_LEAD_EPOCHS);
+
+    // One way only: the departing venue never holds the survivor's
+    // certificate, while the survivor holds the departing venue's and
+    // settles the route on it.
+    let cut = isolate_ec_intake(c, departing, survivor);
+    let mut charges = Charges::default();
+    let tx = build_route_tx(
+        &key,
+        trader,
+        (&leaving.meta, &staying.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    protocol_resource.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario route derives")
+            .legs,
+    ));
+    let hash = charges.submit(c, tx);
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
+            && c.chain_fate(departing, hash).0.is_some()),
+        "both shards must commit the route while both are live",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).1.is_some()),
+        "the survivor must finalize the route on the departing venue's certificate",
+    );
+    // The positive control: the finalization landed before the departure
+    // was admitted, where the fence's pre-boundary hold could not have
+    // deferred it, and the cut is what kept the departing venue from the
+    // survivor's certificate.
+    assert!(
+        merge_keeper_count(c, LATE_MERGED_PARENT).is_none(),
+        "the survivor's finalization must land before the departure is admitted; the vote \
+         activates at {activates_at:?}",
+    );
+    assert!(
+        cut.fired() > 0,
+        "the cut must have dropped something, or the departing venue was never kept from the \
+         survivor's certificate",
+    );
+    let survivor_fate = c.chain_fate(survivor, hash).1.map(|(_, decision)| decision);
+
+    assert!(
+        c.run_until(epochs(28), |c| c.beacon_state().is_some_and(|s| s
+            .params
+            .reshape_thresholds
+            .split_bytes
+            == LATE_SPLIT_BYTES)),
+        "the late vote must activate at {activates_at:?}",
+    );
+    assert!(
+        await_merge_keeper_count(c, LATE_MERGED_PARENT, 3, epochs(28)),
+        "the activated threshold must pair the departing venue's shard with its sibling",
+    );
+    assert!(
+        await_serves(c, LATE_MERGED_PARENT, epochs(28)),
+        "the merged parent must be served within budget",
+    );
+    c.clear_drops();
+
+    // The oracle: an accept on the survivor is an accept on both sides,
+    // or the route is torn. The departing venue's reserve moves exactly
+    // when its leg applied — on the venue itself, or carried into the
+    // successor that inherited its keyspace.
+    if survivor_fate == Some(TransactionDecision::Accept) {
+        assert!(
+            c.run_until(epochs(12), |c| held_at(c, leaving_reserve) != leaving_held),
+            "the survivor accepted the route and the departing venue's side applied nowhere: \
+             the route is torn; the departing venue reached {:?}",
+            c.chain_fate(departing, hash).1,
+        );
+    }
+    protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(12),
+        "a route accepted before its venue's split was projected",
+    );
 }
 
 /// A route through a departing venue releases the surviving venue's
@@ -1432,7 +1583,7 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
 /// reserve moves, or if either side of the pair is not conserved.
 pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCluster>(c: &mut C) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
-    let route = departing_route(c);
+    let mut route = departing_route(c);
     // Neither venue may hold the other's certificate. Provisions and
     // headers still flow, so each venue commits the route and runs its
     // own core leg, which is the state under test.
@@ -1441,7 +1592,7 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         isolate_ec_intake(c, survivor, departing),
     ];
     let mut charges = Charges::default();
-    let (hash, baseline, paid, ..) = submit_departing_route(c, &route, &mut charges);
+    let (hash, baseline, paid) = submit_departing_route(c, &mut route, &mut charges);
 
     // The cut. The departing venue's cells land under a child, and its
     // settled set reaches the survivor.
@@ -1489,11 +1640,9 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
             .settles(c, charges.burned(c))),
         "a route through a departing venue: the world must settle against the burn alone",
     );
-    route.protocol_resource.assert_settled(
-        c,
-        charges.burned(c),
-        "a route through a departing venue",
-    );
+    route
+        .protocol_resource
+        .assert_settled(c, &charges, "a route through a departing venue");
     charges.assert_each_fits_a_full_block(c);
     route.units.assert_settles_within(
         c,
@@ -1531,10 +1680,10 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
     c: &mut C,
 ) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
-    let route = departing_route(c);
+    let mut route = departing_route(c);
     let cut = isolate_ec_intake(c, survivor, departing);
     let mut charges = Charges::default();
-    let (hash, baseline, paid, validity_end) = submit_departing_route(c, &route, &mut charges);
+    let (hash, baseline, paid) = submit_departing_route(c, &mut route, &mut charges);
     assert!(
         c.run_until(epochs(12), |c| matches!(
             c.chain_fate(departing, hash).1,
@@ -1569,31 +1718,16 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
          against {baseline:?}",
         c.committed_txs_in_flight(survivor),
     );
-    // The output is a delivery to the trader, admissible to the delivery
-    // window's close. On a clock the window outlasts, the trader banks
-    // it. On a clock whose epochs outrun the window the survivor settles
-    // after it and the delivery can no longer be admitted — but the
-    // claim cell the lapse probe asks about outlives the window it
-    // answers for, so the absence is proved against a live cell and the
-    // issuer takes the output back. Past the window the trader is out
-    // its input; the world is not, on either clock.
-    let banked = c.run_until(epochs(8), |c| {
-        held(c, route.trader.address(), *PROTOCOL_RESOURCE) > paid
-    });
-    if !banked {
-        let clock = WeightedTimestamp::ZERO.plus(c.now());
-        assert!(
-            clock >= Window::Delivery.of(Deadline::of(validity_end)).end,
-            "the route must bank its output for the trader while its delivery window is open; \
-             holds {} against {paid}",
-            held(c, route.trader.address(), *PROTOCOL_RESOURCE),
-        );
-        assert_eq!(
-            held(c, route.trader.address(), *PROTOCOL_RESOURCE),
-            paid,
-            "past its delivery window the output never reaches the trader",
-        );
-    }
+    // The output is owed to the trader: nothing closes its window and
+    // nothing takes it back, and the trader's fold banks it whenever the
+    // record's reading lands.
+    assert!(
+        c.run_until(epochs(8), |c| {
+            held(c, route.trader.address(), *PROTOCOL_RESOURCE) > paid
+        }),
+        "the route must bank its output for the trader; holds {} against {paid}",
+        held(c, route.trader.address(), *PROTOCOL_RESOURCE),
+    );
     route.protocol_resource.assert_settles_within(
         c,
         &charges,
@@ -1632,7 +1766,7 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let setup = split_train_setup(SPLIT_TRAIN);
     split_lifecycle(c);
-    let world = train_world(c, &setup.legs);
+    let mut world = train_world(c, &setup.legs);
     let mut charges = Charges::default();
 
     let sent = drive_train(
@@ -1640,12 +1774,13 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
         splitter,
         &setup.legs,
         &mut charges,
+        &mut world,
         |c| split_admitted(c, splitter),
         |c| cast_splitter_vote(c, straddler_split_bytes()),
     );
 
     let children = <[ShardId; 2]>::from(splitter.children());
-    assert_train_fates(c, splitter, &children, &sent);
+    assert_train_fates(c, splitter, &children, &sent, &world);
     world.assert_settles_within(c, &charges, epochs(8), "a train across a split's admission");
 }
 
@@ -1678,7 +1813,7 @@ pub fn a_train_into_a_merging_shard_strands_nothing<C: Cluster>(c: &mut C) {
         (0..4).all(|path| await_serves(c, ShardId::leaf(2, path), epochs(4))),
         "the grown four-shard topology must seat every quarter",
     );
-    let world = train_world(c, &setup.legs);
+    let mut world = train_world(c, &setup.legs);
     let mut charges = Charges::default();
 
     let sent = drive_train(
@@ -1686,11 +1821,12 @@ pub fn a_train_into_a_merging_shard_strands_nothing<C: Cluster>(c: &mut C) {
         merging,
         &setup.legs,
         &mut charges,
+        &mut world,
         |c| merge_keeper_count(c, parent).is_some(),
         |_| {},
     );
 
-    assert_train_fates(c, merging, &[parent], &sent);
+    assert_train_fates(c, merging, &[parent], &sent, &world);
     world.assert_settles_within(c, &charges, epochs(8), "a train across a merge's pairing");
 }
 
@@ -1725,6 +1861,7 @@ fn drive_train<C: Cluster>(
     terminating: ShardId,
     legs: &[(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)],
     charges: &mut Charges,
+    world: &mut World,
     pending: impl Fn(&C) -> bool,
     arm: impl FnOnce(&mut C),
 ) -> Vec<(TxHash, PrincipalAddr, Phase)> {
@@ -1741,6 +1878,7 @@ fn drive_train<C: Cluster>(
         c,
         legs.next().expect("a funded leg"),
         charges,
+        world,
         &mut sent,
         &mut admitted_once,
         &pending,
@@ -1751,7 +1889,16 @@ fn drive_train<C: Cluster>(
 
     let mut draining = 0;
     for leg in legs {
-        if send_leg(c, leg, charges, &mut sent, &mut admitted_once, &pending) == Phase::Draining {
+        if send_leg(
+            c,
+            leg,
+            charges,
+            world,
+            &mut sent,
+            &mut admitted_once,
+            &pending,
+        ) == Phase::Draining
+        {
             draining += 1;
             if draining >= PAST_THE_GATE {
                 break;
@@ -1782,22 +1929,23 @@ fn drive_train<C: Cluster>(
 }
 
 /// Every transfer's fate, once `terminating` has reached its terminal and
-/// nothing more can be included: whether it settled the transfer before
-/// its terminal is what decides between a settlement there and the
-/// successor's delivery or a reclaim, and a recipient is credited exactly
-/// when its payer's transfer was accepted and some chain delivered it.
+/// nothing more can be included: a recipient is credited exactly when its
+/// payer's transfer was accepted, by the fold of whichever chain held its
+/// prefix when the record's reading landed — the leaving shard or a
+/// successor — and no chain holding the recipient ever includes the
+/// transfer. Nothing accepted is left standing in its record.
 ///
 /// # Panics
 ///
-/// Panics if a successor is not served within budget, if a transfer sent
-/// while the shard was live was not settled by it, if any transfer
-/// reaches a fate its phase does not allow, if a credit disagrees with a
-/// verdict, or if the train never reached the coast.
+/// Panics if a successor is not served within budget, if a chain holding
+/// the recipient includes a transfer, if a credit disagrees with a
+/// verdict, or if an accepted payment is left standing.
 fn assert_train_fates<C: Cluster>(
     c: &mut C,
     terminating: ShardId,
     successors: &[ShardId],
     sent: &[(TxHash, PrincipalAddr, Phase)],
+    world: &World,
 ) {
     for &successor in successors {
         assert!(
@@ -1805,97 +1953,36 @@ fn assert_train_fates<C: Cluster>(
             "successor {successor} must be served within budget",
         );
     }
-    let mut never_included = 0;
     for (hash, to, phase) in sent {
-        let (included, settled) = c.chain_fate(terminating, *hash);
-        // Settled means settled in the recipient's favour. An abort on
-        // the leaving shard leaves the transfer exactly where a transfer
-        // it never settled is left — no credit given, the payment to
-        // come back — so it owes `CarriedOrReclaimed`, and reading the
-        // decision is what tells the two apart.
-        let settled = settled.is_some_and(|(_, decision)| decision != TransactionDecision::Aborted);
-        assert!(
-            settled || *phase != Phase::Live,
-            "a transfer sent {phase:?} must be settled by the leaving shard",
-        );
-        never_included += usize::from(included.is_none());
-        let taken = match (included.is_some(), settled) {
-            (_, true) => "settled",
-            (true, false) => "included but never settled in the recipient's favour",
-            (false, false) => "never included",
-        };
         let status = await_tx_terminal(c, *hash, epochs(12));
-        // The credit is the recipient's chain's to give: the leaving
-        // shard's or, for a transfer it never settled, whichever
-        // successor took the recipient's prefix. A transfer accepted by
-        // its payer and by no chain holding the recipient is one whose
-        // delivery lapsed, and the reclaim returns the payment — the
-        // world's conservation is what reads that.
-        let delivered = std::iter::once(terminating)
-            .chain(successors.iter().copied())
-            .any(|shard| {
-                c.chain_fate(shard, *hash)
-                    .1
-                    .is_some_and(|(_, decision)| decision == TransactionDecision::Accept)
-            });
-        let credited = match (fate_owed(*phase, settled), status, delivered) {
-            (
-                Fate::Settled | Fate::CarriedOrReclaimed,
-                Some(TransactionStatus::Completed(TransactionDecision::Accept)),
-                true,
-            ) => 10 + STRADDLER_PAYMENT,
-            (
-                Fate::CarriedOrReclaimed,
-                Some(TransactionStatus::Completed(
-                    TransactionDecision::Accept | TransactionDecision::Aborted,
-                )),
-                false,
-            ) => 10,
-            (owed, other, delivered) => panic!(
-                "a transfer sent {phase:?} and {taken} by the leaving shard owes {owed:?} and \
-                 reached {other:?}, delivered = {delivered}",
-            ),
+        let credited = match status {
+            Some(TransactionStatus::Completed(TransactionDecision::Accept)) => {
+                10 + STRADDLER_PAYMENT
+            }
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted)) => 10,
+            other => panic!("a transfer sent {phase:?} reached {other:?}, tx = {hash}"),
         };
         assert!(
             c.run_until(epochs(8), |c| held(c, to.address(), *PROTOCOL_RESOURCE)
                 == credited),
-            "a recipient of a transfer sent {phase:?} and {taken} by the leaving shard must \
-             hold {credited}; holds {}",
+            "a recipient of a transfer sent {phase:?} and {status:?} must hold {credited}; \
+             holds {}",
             held(c, to.address(), *PROTOCOL_RESOURCE),
         );
+        for shard in std::iter::once(terminating).chain(successors.iter().copied()) {
+            assert!(
+                c.chain_fate(shard, *hash).0.is_none(),
+                "a chain holding the recipient never includes a transfer it only takes \
+                 delivery of; {shard} included one sent {phase:?}",
+            );
+        }
     }
+    let standing = world.standing(c);
     assert!(
-        never_included > 0,
-        "the train has to reach the leaving shard's coast, or nothing here crosses the cut",
+        standing.is_empty(),
+        "every accepted payment is credited, and nothing stands in its record; \
+         standing = {standing:?}",
     );
-}
-
-/// What a transfer's phase leaves open once the leaving shard has
-/// terminated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fate {
-    /// Settled on a chain that credited the recipient: the leaving shard
-    /// settled it before its terminal, whatever it was doing at the time.
-    Settled,
-    /// Aborted on the payer's chain, carried by the successor that took
-    /// the recipient's prefix, or, if nothing delivered it, reclaimed on
-    /// the successor's proof that nothing did.
-    CarriedOrReclaimed,
-}
-
-/// The fate a phase owes a transfer the leaving shard did or did not
-/// settle.
-///
-/// One shape takes two fates, and it is the one the reshape opens: a
-/// transfer the leaving shard's terminal overtook — never included, or
-/// included and abandoned by the terminal sweep — races the delivery
-/// window's close. A live shard settles everything it takes, so a run
-/// that crossed no cut satisfies no disjunction here.
-const fn fate_owed(phase: Phase, settled: bool) -> Fate {
-    match (phase, settled) {
-        (Phase::Live, _) | (Phase::Departing | Phase::Draining, true) => Fate::Settled,
-        (Phase::Departing | Phase::Draining, false) => Fate::CarriedOrReclaimed,
-    }
 }
 
 /// Submit one of the train's legs, recording the leaving shard's phase
@@ -1919,6 +2006,7 @@ fn send_leg<C: Cluster>(
     c: &mut C,
     (key, from, to): &(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
     charges: &mut Charges,
+    world: &mut World,
     sent: &mut Vec<(TxHash, PrincipalAddr, Phase)>,
     admitted_once: &mut bool,
     pending: impl Fn(&C) -> bool,
@@ -1927,6 +2015,15 @@ fn send_leg<C: Cluster>(
     *admitted_once |= pending;
     let phase = phase_of(pending, *admitted_once);
     let tx = build_transfer_tx(key, *from, *to, STRADDLER_PAYMENT, validity_around(c.now()));
+    // A leg the cut costs its delivery leaves its crossing owed,
+    // standing in the record until the successor holding the
+    // recipient's prefix claims it. That is value the world still
+    // holds.
+    world.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    ));
     sent.push((charges.submit(c, tx), *to, phase));
     phase
 }

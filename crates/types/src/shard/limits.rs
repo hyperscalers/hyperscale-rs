@@ -9,7 +9,7 @@
 //! limits down on a single node only degrades that node's responsiveness
 //! without reducing the protocol-wide load it has to keep up with.
 
-use hyperscale_jmt::MAX_PROOF_CLAIMS;
+use hyperscale_jmt::{MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES};
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
     MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS, VERIFY_WEIGHT,
@@ -137,11 +137,7 @@ pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 5 * MAX_TXS_PER_BLOCK;
 /// Twice the creation cap, so a backlog drains rather than holding
 /// station: a shard that fell behind under peak load catches up in
 /// bounded time once the load stops, and one running at the creation cap
-/// still removes what it creates with room to spare. The margin is also
-/// what carries the one family member no block budgets at creation — a
-/// reclaim's claim is written where the reclaim runs, one per record and
-/// never beside the record's own claim, so it adds at most the record's
-/// own rate to what the sweep must retire.
+/// still removes what it creates with room to spare.
 pub const MAX_SWEEP_PER_BLOCK: usize = 2 * MAX_SWEEPABLE_CREATED_PER_BLOCK;
 
 /// The removal cap must outrun the creation cap, or the resident
@@ -240,6 +236,11 @@ pub const MAX_PROOFS_PER_QUERY: usize = 256;
 /// for small-to-mid-shard topologies; widening the topology may require
 /// revisiting.
 pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
+
+/// Hard cap on the transactions one block's provisions name between
+/// them, and so on the [`Engagements`](crate::Engagements) a sealed block
+/// keeps of them: one entry per named transaction.
+pub const MAX_ENGAGEMENTS_PER_BLOCK: usize = MAX_TXS_PER_BLOCK;
 /// The most leaves one cells query may be answered over, keys and
 /// range entries together.
 ///
@@ -297,18 +298,61 @@ const CELLS_ANSWER_FIXED_BYTES: usize = MAX_MERKLE_PROOF_LEN + 64 * 1024;
 /// proof at the decoder's cap still fits the frame that carries it.
 const _: () = assert!(MAX_CELLS_RESPONSE_BYTES + CELLS_ANSWER_FIXED_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
-/// Hard cap on the state claims a block can carry.
+/// The decode cap on the state claims a block can carry.
 ///
-/// One claim answers one fetch against one counterpart height; the
-/// proposer offers what its own fetches read and the rest waits a
-/// block. This bounds the section's bytes, and nothing else: the vote
-/// fence withholds the vote on the whole block, so a single claim no
-/// voter can check already couples every transaction beside it to a
-/// counterpart's silence, and no cap above one changes that. What
-/// bounds the coupling is the round timer, which prices a block held
-/// at the fence at the ordinary timeout rather than the progress
-/// window — see `has_own_work_at_round` in `hyperscale-shard`.
+/// A count and nothing more: the section is spent by the byte, proof
+/// included, against [`MAX_STATE_CLAIMS_BYTES`], and that is what the
+/// composer fills to and admission checks. A block whose claims are
+/// each a single cell at the measured size carries this many of them.
 pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
+
+/// The decode cap on the lines a block's tick manifest carries: a tick
+/// holds at most what the drain admits.
+pub const MAX_TICK_LINES_PER_BLOCK: usize = MAX_UNSETTLED_PER_BLOCK;
+
+/// The decode cap on the holds one member line carries.
+///
+/// One per declared access, and a declared access costs its owner and
+/// its local half inside the call body, the same division that bounds
+/// [`MAX_PREFIXES_PER_TX`].
+pub const MAX_HOLDS_PER_MEMBER: usize = MAX_PREFIXES_PER_TX;
+
+/// Byte budget a block's tick manifest spends.
+///
+/// Its own term of the frame, outside the evidence and claims budgets.
+/// Lines are charged in the order they apply: members first, then
+/// discards, and a proposer stops at the first that does
+/// not fit and leaves the rest to the next block.
+pub const MAX_TICK_MANIFEST_BYTES: usize = 1024 * 1024;
+
+/// Whether a block may still carry tick lines weighing `weight` between
+/// them.
+///
+/// The one reading of the budget, so the composer that fills the
+/// section and the admission that checks it stop at the same place.
+#[must_use]
+pub const fn tick_manifest_admits_block(weight: usize) -> bool {
+    weight <= MAX_TICK_MANIFEST_BYTES
+}
+
+/// Bytes one [`TickLine`](crate::TickLine) costs before its holds.
+pub const TICK_LINE_BYTES: usize = 64;
+
+/// Bytes one hold of a member line costs: a declared access and its
+/// mode.
+pub const TICK_HOLD_BYTES: usize = 160;
+
+/// Bytes one shard of a member line's reach costs.
+pub const TICK_REACH_BYTES: usize = 16;
+
+/// Any single line fits an empty manifest, so no line is ever left
+/// waiting on a budget it can never meet.
+const _: () = assert!(
+    TICK_LINE_BYTES
+        + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES
+        + MAX_PREFIXES_PER_TX * TICK_REACH_BYTES
+        <= MAX_TICK_MANIFEST_BYTES
+);
 
 /// Byte budget the abandonment records of one block share.
 ///
@@ -343,15 +387,97 @@ pub const ABANDONMENT_RECORD_BYTES: usize = 32;
 /// Bytes one [`UnsettledTx`](crate::UnsettledTx) costs before its reach.
 pub const UNSETTLED_TX_BYTES: usize = 160;
 
+/// Bytes one escrowed record of an [`UnsettledTx`](crate::UnsettledTx)
+/// costs: its key.
+pub const ESCROWED_RECORD_BYTES: usize = 48;
+
+/// Bytes one [`UnclaimedCrossing`](crate::UnclaimedCrossing) costs.
+pub const UNCLAIMED_CROSSING_BYTES: usize = 112;
+
 /// Bytes one [`RoutePrefix`](crate::RoutePrefix) of a name's reach
 /// costs.
 pub const ROUTE_PREFIX_BYTES: usize = size_of::<RoutePrefix>();
 
-/// Bytes one [`StateClaim`](crate::StateClaim) costs before its cells.
-const STATE_CLAIM_BYTES: usize = 64;
+/// Bytes one [`StateClaim`](crate::StateClaim) costs before its cells
+/// and its proof: the anchor, both length prefixes and the framing.
+pub const STATE_CLAIM_BYTES: usize = 64;
 
-/// Bytes one cell of a claim costs: the key and the reading of it.
-const STATE_CLAIM_CELL_BYTES: usize = 82;
+/// Bytes one cell of a claim costs: the key and the reading of it,
+/// before any value the reading carries.
+pub const STATE_CLAIM_CELL_BYTES: usize = 83;
+
+/// Bytes one crossing a claim's reading speaks for costs: the key it
+/// names and the identity that derives it, framed.
+pub const STATE_CLAIM_CROSSING_BYTES: usize = 160;
+
+/// The widest value a claim's cell may carry: a crossing record, the
+/// one cell a reading carries the value of. `hyperscale-shard` holds it
+/// to the record cell's own width, which this crate cannot see.
+pub const MAX_HELD_VALUE_BYTES: usize = 256;
+
+/// The measured 99th-percentile encoding of a one-cell claim: its
+/// terms, one cell and the proof of it, over a state tree of twenty
+/// thousand leaves spread across as many owners.
+///
+/// Measured by `wire_budget.rs`, which holds the constant to what it
+/// measures, so a change to the encoding or the method moves this and,
+/// through it, the section's budget.
+pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 771;
+
+/// What the frame leaves for the claims section once every other
+/// section of a proposal is at its cap.
+pub const STATE_CLAIMS_HEADROOM: usize = MAX_WIRE_MESSAGE_BYTES
+    - 1
+    - PROPOSAL_FIXED_BYTES
+    - MAX_TXS_PER_BLOCK * HASH_BYTES
+    - MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
+    - MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
+    - MAX_PROPOSAL_EVIDENCE_BYTES
+    - MAX_TICK_MANIFEST_BYTES;
+
+/// The granularity the claims budget is rounded to.
+const STATE_CLAIMS_ROUNDING: usize = 16 * 1024;
+
+/// Byte budget the state claims of one block share, proofs included.
+///
+/// A full section carries the decode cap's count of single-cell claims
+/// at the measured size, unless the frame cannot hold that many, in
+/// which case it carries what the frame leaves and nothing else in the
+/// proposal is resized to make room. `wire_budget.rs` states which of
+/// the two binds.
+pub const MAX_STATE_CLAIMS_BYTES: usize = {
+    let measured = (MAX_STATE_CLAIMS_PER_BLOCK * SINGLE_CELL_CLAIM_P99_BYTES)
+        .div_ceil(STATE_CLAIMS_ROUNDING)
+        * STATE_CLAIMS_ROUNDING;
+    let headroom = STATE_CLAIMS_HEADROOM / STATE_CLAIMS_ROUNDING * STATE_CLAIMS_ROUNDING;
+    if measured < headroom {
+        measured
+    } else {
+        headroom
+    }
+};
+
+/// Whether a block may still carry claims weighing `weight` between
+/// them.
+///
+/// The one reading of the budget, so the composer that fills the
+/// section and the admission that checks it stop at the same place.
+#[must_use]
+pub const fn state_claims_admit_block(weight: usize) -> bool {
+    weight <= MAX_STATE_CLAIMS_BYTES
+}
+
+/// Any single-cell claim fits an empty section: the widest one-claim
+/// proof the wire format can write, under the claim's own terms, with
+/// the widest value a cell may carry.
+const _: () = assert!(
+    MAX_STATE_CLAIMS_BYTES
+        >= STATE_CLAIM_BYTES
+            + STATE_CLAIM_CELL_BYTES
+            + MAX_HELD_VALUE_BYTES
+            + 4
+            + MAX_SINGLE_CLAIM_PROOF_BYTES
+);
 
 /// Bytes a hash-only entry of a manifest costs.
 const HASH_BYTES: usize = 32;
@@ -361,7 +487,7 @@ const HASH_BYTES: usize = 32;
 const PROPOSAL_FIXED_BYTES: usize = 64 * 1024;
 
 /// The widest a proposal can encode: every section at its own cap, and
-/// the record section at its byte budget.
+/// the record, claim and tick manifest sections at their byte budgets.
 ///
 /// The per-item figures above are upper bounds on the real encoding,
 /// which `wire_budget.rs` holds them to by encoding a maximal value of
@@ -372,8 +498,8 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
     + MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
     + MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
     + MAX_PROPOSAL_EVIDENCE_BYTES
-    + MAX_STATE_CLAIMS_PER_BLOCK
-        * (STATE_CLAIM_BYTES + MAX_PROOFS_PER_QUERY * STATE_CLAIM_CELL_BYTES);
+    + MAX_STATE_CLAIMS_BYTES
+    + MAX_TICK_MANIFEST_BYTES;
 
 /// INV-WIRE-1: a proposal every section of which is at its cap still
 /// fits the frame that carries it. The transports drop an oversize

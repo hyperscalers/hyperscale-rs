@@ -1,5 +1,7 @@
 //! The retention floor over the version-time column.
 
+use std::sync::atomic::Ordering;
+
 use hyperscale_storage::retire_dated;
 use hyperscale_types::WeightedTimestamp;
 use rocksdb::WriteBatch;
@@ -51,6 +53,7 @@ impl RocksDbShardStorage {
         let retired = retire_dated(
             floor,
             version,
+            self.retention_hold.load(Ordering::Relaxed),
             tip_ts,
             typed_cf::iter_from::<VersionTimeCf>(&self.db, handle, &floor),
         );

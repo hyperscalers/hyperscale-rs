@@ -15,13 +15,14 @@ use hyperscale_vm_types::{
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
-    AbortCharge, AggregateSignature, Attested, Block, BlockHash, BlockHeader, BlockHeaderParts,
-    BlockHeight, BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeclaredKey, Derivation,
-    DerivationError, Derived, EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptHash, Hash, MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp,
-    ProtocolStatics, QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId, ShardLoad,
-    SignerBitfield, StateRoot, StateWrites, StoredReceipt, TickHalf, TickId, TimestampRange,
+    AbortCharge, AggregateSignature, Anchor, Attested, Block, BlockHash, BlockHeader,
+    BlockHeaderParts, BlockHeight, BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader,
+    ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
+    DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt, ExecutionCertificate,
+    ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins, MerkleInclusionProof,
+    NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Role,
+    Round, Routing, Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, StateClaim,
+    StateRoot, StateWrites, StoredReceipt, TickHalf, TickId, TickLine, TimestampRange,
     TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome,
     ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
     WitnessSources, compute_global_receipt_root, install_protocol_statics,
@@ -372,8 +373,92 @@ pub fn make_live_block(
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
+        tick_manifest: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
+}
+
+/// `certified` naming each of its own transactions as a determined member,
+/// in hash order: what a proposer names for single-shard transactions,
+/// every one ready in the block that commits it.
+#[must_use]
+pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
+    let mut hashes: Vec<TxHash> = certified
+        .block()
+        .transactions()
+        .iter()
+        .map(|tx| tx.hash())
+        .collect();
+    hashes.sort_unstable();
+    naming(
+        certified,
+        hashes
+            .into_iter()
+            .map(|tx| TickLine::Member {
+                tx,
+                joins: Joins::Executes,
+                settlement: Settlement::Alone,
+                holds: Capped::empty(),
+                reach: Capped::empty(),
+            })
+            .collect(),
+    )
+}
+
+/// `certified` with its tick manifest replaced by `lines`, header and
+/// certificate untouched: a fixture's block naming what its own commit
+/// seated, for a replay that seats from the manifest.
+///
+/// # Panics
+///
+/// If `lines` overruns the manifest's cap.
+#[must_use]
+pub fn naming(certified: &CertifiedBlock, lines: Vec<TickLine>) -> CertifiedBlock {
+    let manifest = Arc::new(Capped::new(lines).expect("a fixture names under the cap"));
+    let (block, qc) = certified.clone().into_parts();
+    let block = match block {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest: manifest,
+            witness_sources,
+        },
+        Block::Sealed {
+            header,
+            transactions,
+            certificates,
+            provision_hashes,
+            engagements,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } => Block::Sealed {
+            header,
+            transactions,
+            certificates,
+            provision_hashes,
+            engagements,
+            abandonment_records,
+            state_claims,
+            tick_manifest: manifest,
+            witness_sources,
+        },
+    };
+    CertifiedBlock::new_unchecked(block, qc)
 }
 
 /// Pair a block with a minimal valid `QuorumCertificate` so it satisfies
@@ -797,6 +882,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         } => Block::Live {
             header: restamp(header),
@@ -805,6 +891,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         },
         Block::Sealed {
@@ -812,16 +899,20 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             transactions,
             certificates,
             provision_hashes,
+            engagements,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         } => Block::Sealed {
             header: restamp(header),
             transactions,
             certificates,
             provision_hashes,
+            engagements,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         },
     }
@@ -967,21 +1058,9 @@ pub fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> F
 /// the outcome decides nothing, since the transaction's core decides it.
 #[must_use]
 pub fn make_leg_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
-    make_undecided_finalization(block_height, tx_hash, TransactionDecision::Accept)
-}
-
-/// A finalization at `block_height` whose outcome for `tx_hash` decides
-/// nothing whichever way it went: a leg's success, or a delivery's
-/// outcome either way.
-#[must_use]
-pub fn make_undecided_finalization(
-    block_height: BlockHeight,
-    tx_hash: TxHash,
-    decision: TransactionDecision,
-) -> Finalization {
     finalization_of(
         block_height,
-        vec![TxOutcome::new(tx_hash, outcome_of(decision)).as_role(Role::Delivery)],
+        vec![TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)).as_role(Role::Leg)],
     )
 }
 
@@ -1259,10 +1338,6 @@ impl ProtocolStatics for StubVmStatics {
             && SweepBucket::claimed_by(LocalKey(local)) == SweepBucket::of(expiry))
         .then_some(expiry)
     }
-
-    fn record_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
-        value.first() == Some(&STUB_RECORD_MARKER)
-    }
 }
 
 /// The local-key first byte the stub judges a package cell by, in place
@@ -1278,20 +1353,6 @@ pub const STUB_PACKAGE_MARKER: u8 = 0xAB;
 /// the half of the judgement a storage backend's index depends on, so a
 /// stub that skipped it would be testing nothing.
 pub const STUB_SWEEPABLE_MARKER: u8 = 0xCD;
-
-/// The value's first byte the stub judges an escrow record by.
-///
-/// No key rule stands beside it, which is the point: a record's key
-/// carries no bucket, so nothing about where it sits says what it is and
-/// the value is the whole of the judgement.
-pub const STUB_RECORD_MARKER: u8 = 0xEF;
-
-/// A stub escrow record's value, which [`StubVmStatics`] judges a record
-/// wherever it sits.
-#[must_use]
-pub fn stub_record_cell(body: u8) -> Vec<u8> {
-    vec![STUB_RECORD_MARKER, body]
-}
 
 /// A stub sweepable cell's value and the local key it must sit at for
 /// [`StubVmStatics`] to judge it sweepable.
@@ -1340,7 +1401,6 @@ pub fn leg_shape(target: Address, role: LegRole, edges: &[(u32, u32)]) -> LegSha
         declares: vec![target],
         intent: IntentHash(Hash32([7; 32])),
         local: 0,
-        expiry_ms: 1_000,
     }
 }
 
@@ -1536,6 +1596,26 @@ pub fn state_and_proof(
     present: &[SubstateKey],
     asked: &[SubstateKey],
 ) -> (StateRoot, MerkleInclusionProof) {
+    let holding: Vec<(SubstateKey, Vec<u8>)> = present
+        .iter()
+        .map(|key| (*key, key.to_bytes().to_vec()))
+        .collect();
+    state_and_proof_holding(shard, &holding, asked)
+}
+
+/// [`state_and_proof`] over a tree whose `present` leaves hold the
+/// values given, for a claim whose held value has to decode as
+/// something.
+///
+/// # Panics
+///
+/// As [`state_and_proof`].
+#[must_use]
+pub fn state_and_proof_holding(
+    shard: ShardId,
+    present: &[(SubstateKey, Vec<u8>)],
+    asked: &[SubstateKey],
+) -> (StateRoot, MerkleInclusionProof) {
     use std::collections::BTreeMap;
 
     use hyperscale_jmt::{
@@ -1568,18 +1648,19 @@ pub fn state_and_proof(
         "the tree's unrelated leaf is not a key a test may ask about",
     );
     assert!(
-        present.iter().chain(asked).all(under),
+        present.iter().map(|(key, _)| key).chain(asked).all(under),
         "a fixture proof for a shard speaks only for keys that shard owns",
     );
     let mut store = MemoryStore::new();
+    let unrelated_value = unrelated.to_bytes().to_vec();
     let updates: BTreeMap<JmtKey, Option<LeafValue>> = present
         .iter()
-        .chain(std::iter::once(&unrelated))
-        .map(|key| {
-            let value = key.to_bytes().to_vec();
+        .map(|(key, value)| (key, value))
+        .chain(std::iter::once((&unrelated, &unrelated_value)))
+        .map(|(key, value)| {
             (
                 key.to_bytes(),
-                Some(LeafValue::new(jmt_value_hash(&value), value.len() as u64)),
+                Some(LeafValue::new(jmt_value_hash(value), value.len() as u64)),
             )
         })
         .collect();
@@ -1591,6 +1672,36 @@ pub fn state_and_proof(
     let proof = Tree::<Blake3Hasher, 1>::prove(&store, &NodeKey::new(1, root_path), &jmt_keys)
         .expect("every key proves against a held version");
     (root, MerkleInclusionProof::new(proof.encode()))
+}
+
+/// A claim over `asked` at `shard`'s `height`, proven against a
+/// one-version tree holding `leaves`.
+///
+/// Built as [`state_and_proof`] builds the tree: what a test hands
+/// admission in place of a composer's fetch. The anchor's clock is one
+/// second per height.
+///
+/// # Panics
+///
+/// As [`state_and_proof`].
+#[must_use]
+pub fn proven_claim(
+    shard: ShardId,
+    height: u64,
+    leaves: &[SubstateKey],
+    asked: &[SubstateKey],
+) -> StateClaim {
+    let (state_root, proof) = state_and_proof(shard, leaves, asked);
+    let anchor = Anchor {
+        shard,
+        height: BlockHeight::new(height),
+        state_root,
+        ts: WeightedTimestamp::from_millis(height * 1_000),
+    };
+    let cells = proof
+        .inclusions(state_root, shard, asked)
+        .expect("the fixture proof answers for its keys");
+    StateClaim::new(anchor, cells, proof)
 }
 
 #[cfg(test)]

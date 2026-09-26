@@ -73,8 +73,8 @@
 //   - Both licenses are half-open windows, not floors: the cells a probe
 //     asks about are swept at their own expiry — `sweepable_expiry` in
 //     crates/storage/src/shard/sweep.rs reads it off the cell,
-//     `ARTIFACT_GRACE_MS` for the committed cell and `CROSSING_GRACE_MS`
-//     for the claim cell — and a non-inclusion proof of a swept cell is
+//     `ARTIFACT_GRACE_MS` for the committed cell — and a non-inclusion
+//     proof of a swept cell is
 //     honest and says nothing. Each window ends exactly at that sweep,
 //     which crates/types/src/time/timeouts.rs pins as a compile-time
 //     equality; `sweep` and `sweepClaim` here are what make it

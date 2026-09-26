@@ -13,21 +13,23 @@ use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, SubstateKey,
-    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, MAX_VALIDITY_RANGE, PendingReshape,
+    PrincipalAddr, RETENTION_HORIZON, ShardId, SubstateKey, TransactionDecision, TransactionStatus,
+    TxHash, WeightedTimestamp,
 };
 
+use crate::faults::BEACON_COMMIT_CHANNELS;
 use crate::reshape::split_lifecycle;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, committee_size, declared_price, held, split_admitted,
-    vault_balance,
+    anchored_genesis_height, beacon_epoch, clock, committee_size, declared_price, held,
+    split_admitted, vault_balance,
 };
 use crate::support::tx::{
-    MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
-    STRADDLER_SURVIVOR, build_reshape_threshold_vote_tx, build_transfer_tx, merge_straddler_setup,
-    pool_operator, split_issuer_straddler_setup, split_straddler_setup, validity_around,
-    voted_split_bytes,
+    MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, PaymentLeg,
+    STRADDLER_SPLITTER, STRADDLER_SURVIVOR, build_leg_payment_tx, build_reshape_threshold_vote_tx,
+    build_transfer_tx, merge_convergence_setup, merge_straddler_setup, pool_operator,
+    split_issuer_straddler_setup, split_straddler_setup, validity_around, voted_split_bytes,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor,
@@ -108,21 +110,116 @@ pub fn straddler_split_bytes() -> u64 {
 /// Panics if the grow or split misses its budget, or the settled-transaction fence is
 /// breached (a one-sided application, a mismatch, or a hung straddler).
 pub fn split_straddler_atomic(c: &mut impl Cluster) {
-    let run = split_straddler_run(c, |_| {});
+    let run = split_straddler_run(c, |_| {}, |_, _| {});
     assert_fence_held(c, run.splitter, run.terminal_b, &run.probes);
     run.assert_conserved(c);
 }
 
-/// Verify a split straddler settles atomically when the terminating splitter is
-/// isolated from the survivor's execution certificate.
+/// A split whose beacon stalls between admission and the gate keeps every
+/// settlement in its window.
 ///
-/// The same choreography as [`split_straddler_atomic`], but with the splitter's
-/// EC intake cut ([`isolate_ec_intake`]) once committees stabilize: provisions
-/// still flow, so the splitter executes each straddler and produces its own EC,
-/// but never receives the survivor's and so settles none. The pre-boundary
-/// settlement fence must hold atomicity anyway — the survivor cannot finalize a
-/// straddler naming the splitter while the splitter has an admitted terminating
-/// reshape, so no straddler resolves one-sided.
+/// The settled floor is the admission epoch, so a straddler the splitter
+/// settles while the beacon commits only skip blocks is named by the
+/// splitter's settled set and the survivor applies it. Every beacon epoch
+/// from admission on commits as a skip, for long enough that a floor
+/// sliding with the readiness deadline would sit above a settlement the
+/// fence is still holding; the stall is then lifted and the run judged as
+/// any split straddler is.
+///
+/// # Panics
+///
+/// As [`split_straddler_atomic`], and if the beacon does not keep
+/// committing skips, seats a contribution during the stall, moves the
+/// admission, or no settling probe settles below where a slid floor would
+/// sit.
+pub fn a_skip_deferred_split_keeps_every_settlement_in_its_window<C: FaultableCluster>(c: &mut C) {
+    let splitter = STRADDLER_SPLITTER;
+    let run = split_straddler_run(
+        c,
+        |c| {
+            for channel in BEACON_COMMIT_CHANNELS {
+                c.drop_type(channel);
+            }
+        },
+        |c, probes| {
+            let state = c.beacon_state().expect("a committed beacon state");
+            let epoch_ms = state.chain_config.epoch_duration_ms;
+            let Some(PendingReshape::Split { admitted, .. }) =
+                state.pending_reshapes.get(&splitter)
+            else {
+                panic!("the splitter's split is admitted before the settling ticks go");
+            };
+            let admitted = admitted.at;
+            let stalled_at = state.current_epoch;
+            let last_live = state.boundaries[&splitter].last_live_epoch;
+            drop(state);
+
+            // Long enough that a floor sliding with the deadline would sit
+            // above the span the settling probes land in, under either
+            // epoch length.
+            let horizon_epochs = RETENTION_HORIZON.as_millis().div_ceil(u128::from(epoch_ms));
+            let k = stalled_at.inner() - admitted.inner()
+                + u64::try_from(horizon_epochs).expect("a horizon of epochs")
+                + 2;
+            let budget = |n: u64| epochs(u32::try_from(n).expect("an epoch budget"));
+
+            // A settling probe lands on the splitter early in the stall,
+            // below where a slid floor would sit.
+            assert!(
+                c.run_until(epochs(3), |c| probes
+                    .iter()
+                    .any(|probe| chain_settled(c, splitter, *probe))),
+                "a settling probe must settle on the splitter while the stall stands",
+            );
+            // Observed now, so it landed no later than now: below the
+            // floor a stall of `k` skips would slide the window to.
+            let slid_floor = WeightedTimestamp::from_millis(
+                (stalled_at.inner() + k) * epoch_ms - RETENTION_HORIZON.as_secs() * 1000,
+            );
+            let observed = clock(c);
+            assert!(
+                observed < slid_floor,
+                "the settlement must land below where a slid floor would sit; observed at \
+                 {observed:?} against {slid_floor:?}",
+            );
+
+            let stall_end = stalled_at.saturating_add(k);
+            assert!(
+                c.run_until(budget(k + 4), |c| beacon_epoch(c)
+                    .is_some_and(|e| e >= stall_end)),
+                "the beacon must keep committing skip blocks through the stall; at {:?} \
+                 against {stall_end:?}",
+                beacon_epoch(c),
+            );
+            let state = c.beacon_state().expect("a committed beacon state");
+            assert_eq!(
+                state.boundaries[&splitter].last_live_epoch, last_live,
+                "a beacon committing only skips must seat no contribution",
+            );
+            let Some(PendingReshape::Split { admitted: held, .. }) =
+                state.pending_reshapes.get(&splitter)
+            else {
+                panic!("the split must survive the stall: its deadline moves with the skips");
+            };
+            assert_eq!(held.at, admitted, "a skip never moves the admission");
+            drop(state);
+            c.clear_drops();
+        },
+    );
+    assert_fence_held(c, run.splitter, run.terminal_b, &run.probes);
+    run.assert_conserved(c);
+}
+
+/// Verify a split straddler settles atomically when the survivor is isolated
+/// from the terminating splitter's execution certificate.
+///
+/// The same choreography as [`split_straddler_atomic`], but with the
+/// survivor's EC intake cut ([`isolate_ec_intake`]) once committees stabilize.
+/// The splitter is each straddler's core and the survivor runs its leg, whose
+/// certificate stays home; what crosses is the core's verdict to the leg's
+/// producer, and that is what the cut withholds. The survivor never hears the
+/// splitter's verdict, and the pre-boundary settlement fence must hold
+/// atomicity anyway, so no straddler resolves one-sided.
 ///
 /// Requires disjoint splitter/survivor committees (no shared host), or a
 /// co-hosted vnode bridges the EC across in-process, which no network rule
@@ -134,14 +231,18 @@ pub fn split_straddler_atomic(c: &mut impl Cluster) {
 /// one-sided (the survivor applies one the splitter never settled).
 pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
     let mut cut = None;
-    let run = split_straddler_run(c, |c| {
-        cut = Some(isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR));
-    });
+    let run = split_straddler_run(
+        c,
+        |c| {
+            cut = Some(isolate_ec_intake(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER));
+        },
+        |_, _| {},
+    );
     let cut = cut.expect("the fault seam runs before any straddler is submitted");
     let one_sided = straddler_one_sided_count(c, run.splitter, run.terminal_b, &run.probes);
     assert!(
         cut.fired() > 0,
-        "the splitter's certificate intake must actually have been exercised and cut, or no \
+        "the survivor's certificate intake must actually have been exercised and cut, or no \
          straddler was ever held one-sided to begin with",
     );
     assert_eq!(
@@ -268,16 +369,13 @@ impl StraddlerRun {
 
 /// Everything a setup's straddlers can reach: each leg's payer and
 /// recipient. The ballast holds the byte skew and never spends.
-fn straddler_world<C: Cluster>(
-    c: &C,
-    straddlers: &[(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)],
-) -> World {
+fn straddler_world<C: Cluster>(c: &C, straddlers: &[PaymentLeg]) -> World {
     World::open(
         c,
         *PROTOCOL_RESOURCE,
         straddlers
             .iter()
-            .flat_map(|(_, from, to)| [from.address(), to.address()]),
+            .flat_map(|(_, from, _, to)| [from.address(), to.address()]),
         [],
     )
 }
@@ -290,7 +388,9 @@ fn straddler_world<C: Cluster>(
 /// for the caller to judge. `before_settling` runs once after the split is
 /// admitted (committees stable, splitter still live) and before the settling
 /// ticks are submitted — the seam a fault probe uses to install a rule keyed on
-/// the live committees.
+/// the live committees. `while_settling` runs once the settling ticks are
+/// submitted and before the gate is waited for, with their hashes — the
+/// seam a scenario uses to hold the beacon while the splitter settles.
 ///
 /// # Panics
 ///
@@ -299,6 +399,7 @@ fn straddler_world<C: Cluster>(
 pub fn split_straddler_run<C: Cluster>(
     c: &mut C,
     mut before_settling: impl FnMut(&mut C),
+    mut while_settling: impl FnMut(&mut C, &[TxHash]),
 ) -> StraddlerRun {
     let splitter = STRADDLER_SPLITTER;
     let (child_left, child_right) = splitter.children();
@@ -318,9 +419,10 @@ pub fn split_straddler_run<C: Cluster>(
     // Settling ticks: submitted while the splitter still commits real blocks, so
     // it finalizes them before its terminal cut — they settle atomically.
     let half = setup.straddlers.len() / 2;
-    for (key, from, to) in setup.straddlers.iter().take(half) {
-        probes.push(submit_straddler(c, &mut charges, key, *from, *to));
+    for leg in setup.straddlers.iter().take(half) {
+        probes.push(submit_straddler(c, &mut charges, leg));
     }
+    while_settling(c, &probes);
 
     // Advance until the gate drains the splitter from `pending_reshapes`: the
     // settling ticks finalize on it in this window, and it then coasts to its
@@ -333,8 +435,8 @@ pub fn split_straddler_run<C: Cluster>(
     // Straddling ticks: submitted all at once during the coast — the splitter is
     // still the active leaf, so the survivor provisions to it, but its empty
     // coast blocks settle nothing, leaving them in flight when it terminates.
-    for (key, from, to) in setup.straddlers.iter().skip(half) {
-        probes.push(submit_straddler(c, &mut charges, key, *from, *to));
+    for leg in setup.straddlers.iter().skip(half) {
+        probes.push(submit_straddler(c, &mut charges, leg));
     }
 
     // The split executes: both children seat and commit past genesis.
@@ -372,18 +474,38 @@ pub fn split_straddler_run<C: Cluster>(
     }
 }
 
-/// A leg issued under a cut crossing bundle, with what the scenario
+/// A leg issued with its record's push cut, with what the scenario
 /// reading its fate needs.
 struct CutLeg {
     hash: TxHash,
     price: u128,
-    lapse: WeightedTimestamp,
-    broadcast_dropped: FaultHandle,
-    fetch_dropped: FaultHandle,
+    /// Past every instant the delivery window used to close at, which
+    /// is where a cut-off crossing used to be taken back.
+    past_window: WeightedTimestamp,
+    /// The record cells the leg's crossings write: value the world still
+    /// holds while they stand.
+    records: Vec<SubstateKey>,
+    cuts: RecordCuts,
 }
 
-/// Cast the splitter's vote, wait out its activation epoch, cut both
-/// channels a crossing bundle travels, and submit the transfer.
+/// The one channel a record reaches its consumer by, cut: its push.
+struct RecordCuts {
+    push: FaultHandle,
+}
+
+impl RecordCuts {
+    /// The cut must actually have been exercised, or the scenario held
+    /// nothing back.
+    fn assert_exercised(&self) {
+        assert!(
+            self.push.fired() > 0,
+            "the record's push must actually have been exercised and cut"
+        );
+    }
+}
+
+/// Cast the splitter's vote, wait out its activation epoch, cut the
+/// record's push, and submit the transfer.
 ///
 /// The vote goes first because it activates epochs later and the split
 /// is admitted only after that; the leg goes in at the activation epoch,
@@ -392,7 +514,7 @@ struct CutLeg {
 /// names the successor from the start and asks nothing of an
 /// inheritance. As late as that so the lapse falls past the cut, which
 /// is what puts the proof on the successor.
-fn issue_a_leg_under_a_cut_bundle<C: FaultableCluster>(
+fn issue_a_leg_under_a_cut_push<C: FaultableCluster>(
     c: &mut C,
     charges: &mut Charges,
     payer_key: &Ed25519PrivateKey,
@@ -406,55 +528,66 @@ fn issue_a_leg_under_a_cut_bundle<C: FaultableCluster>(
         .chain_config
         .epoch_duration_ms;
     cast_splitter_vote(c, straddler_split_bytes());
-    let activation = cast_at.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
+    let lead = vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
+    let activation = cast_at.inner() + lead;
+    // The wait covers the lead the harness's fold budget sets, which is
+    // longer on a wall-clock harness than on the simulator.
+    let budget = epochs(u32::try_from(lead + 4).expect("a lead of a few epochs"));
     assert!(
-        await_beacon_epoch(c, activation, epochs(8)),
+        await_beacon_epoch(c, activation, budget),
         "the vote's activation epoch must open within budget",
     );
-    let broadcast_dropped = c.drop_type("provisions.broadcast");
-    let fetch_dropped = c.drop_type("provision.request");
+    let cuts = RecordCuts {
+        push: c.drop_type("crossing.readings"),
+    };
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(payer_key, payer, recipient, STRADDLER_PAYMENT, validity);
     let price = declared_price(c, &tx);
-    let lapse = Window::Lapse.of(Deadline::of_transaction(&tx)).start;
+    let past_window = Deadline::of_transaction(&tx).at().plus(MAX_VALIDITY_RANGE);
+    let records = crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    );
     let hash = charges.submit(c, tx);
     CutLeg {
         hash,
         price,
-        lapse,
-        broadcast_dropped,
-        fetch_dropped,
+        past_window,
+        records,
+        cuts,
     }
 }
 
-/// A delivery cut off across its deliverer's split is reclaimed on the
-/// successor's proof.
+/// A delivery cut off across its deliverer's split stays owed to the
+/// successor that inherits it, and is credited there once the record
+/// can reach it.
 ///
 /// The cut-off delivery's shape with the delivering shard leaving part
 /// way: the survivor's payer pays and issues the crossing while the
-/// splitter is live, both channels the bundle travels are cut so no
-/// chain ever claims it, and the splitter is voted down and terminates.
-/// A departed chain supplies no header past the lapse, so the claim
-/// cell is proved absent where its prefix sits by then — on the child
-/// that inherited the recipient — and the payment comes back on that
-/// proof. On a clock whose epochs outlast the lapse the splitter's own
-/// header past it answers first; the reclaim lands either way.
+/// splitter is live, the record's push is cut so no chain ever reads
+/// it, and the splitter is voted down and terminates. The crossing is
+/// the consumer's, and a cut does not change whose it is: the value
+/// waits in the record until the successor holding the recipient reads
+/// it, and is credited exactly once. No chain ever includes the
+/// transfer at the recipient's end.
 ///
 /// # Panics
 ///
 /// Panics if the survivor does not commit the leg before the vote, if
-/// the leg does not accept alone, if the bundle channels are never
-/// exercised, if the delivery lands on any chain, if the children are
-/// not served within budget, if the payment is not back within the
-/// reclaim's room, or if the world does not conserve.
-pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut C) {
+/// the leg does not accept alone, if the push is never exercised, if any
+/// chain holding the recipient includes the transfer, if the children
+/// are not served within budget, if the payment comes back to the payer,
+/// if the recipient is credited while the cut stands, or if it is not
+/// credited once the cut lifts.
+pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
     let setup = split_straddler_setup();
-    let (payer_key, payer, recipient) = &setup.straddlers[0];
+    let (payer_key, payer, _, recipient) = &setup.straddlers[0];
 
     split_lifecycle(c);
-    let world = World::open(
+    let mut world = World::open(
         c,
         *PROTOCOL_RESOURCE,
         [payer.address(), recipient.address()],
@@ -467,10 +600,11 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
     let CutLeg {
         hash,
         price,
-        lapse,
-        broadcast_dropped,
-        fetch_dropped,
-    } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
+        past_window,
+        records,
+        cuts,
+    } = issue_a_leg_under_a_cut_push(c, &mut charges, payer_key, *payer, *recipient);
+    world.owing(records);
     assert!(
         c.run_until(epochs(2), |c| c.chain_fate(survivor, hash).0.is_some()),
         "the survivor must commit the leg while the splitter is live",
@@ -481,9 +615,6 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
          prefix, and the split's admission is the conservative marker of that: \
          past the cut the delivery is the successor's from the start",
     );
-    // Read before the admission is awaited: on a clock whose epochs
-    // outlast the lapse the reclaim lands inside that wait, and the
-    // payment would be back before it was seen to leave.
     let verdict = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(
@@ -514,83 +645,104 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
         "both splitter children must be served within budget",
     );
 
-    // Past the lapse, with the cut standing the whole way: no chain that
-    // ever held the recipient had a bundle to claim from.
+    // Past every instant the delivery window used to close at, with the
+    // cut standing the whole way: no chain that ever held the recipient
+    // had a reading to credit from.
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
-        c.run_until(epochs(12), |c| clock(c) >= lapse),
-        "the cut must stand past the lapse",
+        c.run_until(epochs(12), |c| clock(c) >= past_window),
+        "the cut must stand past where the delivery used to lapse",
     );
-    assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
-        "both bundle channels must actually have been exercised and cut"
-    );
+    cuts.assert_exercised();
     for shard in [splitter, child_left, child_right] {
-        let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
         assert!(
-            fate != Some(TransactionDecision::Accept),
-            "the delivery must never have landed while its bundle was cut off; {shard} reached \
-             {fate:?}",
+            c.chain_fate(shard, hash).0.is_none(),
+            "a chain holding the recipient never includes a transfer it only takes delivery \
+             of; {shard} did",
         );
     }
 
-    // The reclaim: the successor's chain passes the lapse, the survivor
-    // proves the claim cell absent there, and the payment comes back.
-    // The price stays paid — the leg ran and burned it.
+    // Nothing takes the crossing back, on either side of the cut: the
+    // payer stays debited for the payment as well as the price, and the
+    // value waits in the record for the successor that holds the
+    // recipient's prefix.
     assert!(
-        c.run_until(epochs(10), |c| vault_balance(c, survivor, *payer)
-            == before - price),
-        "the payer must get its payment back once the lapse is proved on the successor; \
-         holds {}",
+        c.run_until(epochs(10), |c| clock(c)
+            >= past_window.plus(MAX_VALIDITY_RANGE)),
+        "run on past the room the old reclaim had",
+    );
+    assert_eq!(
         vault_balance(c, survivor, *payer),
+        before - STRADDLER_PAYMENT - price,
+        "the payment must not come back: the crossing is the recipient's",
     );
     assert_eq!(
         held(c, recipient.address(), *PROTOCOL_RESOURCE),
         recipient_before,
-        "the recipient was never credited",
+        "and the recipient is not credited while its record is cut off",
     );
+
     c.clear_drops();
-    world.assert_settles_within(
-        c,
-        &charges,
-        epochs(4),
-        "a delivery cut off across its deliverer's split",
+    assert_credited_once_the_cut_lifts(c, *recipient, recipient_before);
+    assert_eq!(
+        vault_balance(c, survivor, *payer),
+        before - STRADDLER_PAYMENT - price,
+        "the payer stays debited: the crossing was delivered, not returned",
+    );
+    world.assert_settles_within(c, &charges, epochs(4), "a delivery owed across a split");
+}
+
+/// With the cut lifted, the payer's shard pushes the standing record
+/// again, to whichever child holds the recipient's prefix now, and that
+/// child's fold credits it once.
+fn assert_credited_once_the_cut_lifts<C: FaultableCluster>(
+    c: &mut C,
+    recipient: PrincipalAddr,
+    before: u128,
+) {
+    assert!(
+        c.run_until(epochs(8), |c| held(
+            c,
+            recipient.address(),
+            *PROTOCOL_RESOURCE
+        ) == before + STRADDLER_PAYMENT),
+        "the successor holding the recipient must credit it once the record can reach it; \
+         holds {}",
+        held(c, recipient.address(), *PROTOCOL_RESOURCE),
     );
 }
 
-/// A record inherited across its issuer's split is decided by the
-/// successor that holds it.
+/// A record inherited across its issuer's split still owes its
+/// consumer, and the successor holding it takes nothing back.
 ///
-/// The mirror of [`a_delivery_is_reclaimed_when_its_deliverer_splits`]:
-/// what the cut carries here is the crossing's *record*, not its
-/// delivery. The splitter's payer pays and issues the crossing, both
-/// channels the bundle travels are cut so the survivor never claims it,
-/// and the splitter is then voted down and terminates. The record
-/// passes to the child that inherits the payer's prefix, and that child
-/// — holding a leaf and no body — decides it against the claim key the
-/// leaf names, credits the payment back and deletes the record.
+/// The mirror of [`a_delivery_is_owed_when_its_deliverer_splits`]: what
+/// the cut carries here is the crossing's *record*, not its delivery.
+/// The splitter's payer pays and issues the crossing, the record's push
+/// is cut so the survivor never credits it, and the
+/// splitter is then voted down and terminates. The record passes to the
+/// child that inherits the payer's prefix — and that child, holding a
+/// leaf and no body, finds a record naming nobody to take it back and
+/// leaves it standing.
 ///
-/// This is the case the terminal evidence span buys and the inherited
-/// seat spends: the claim cell has to outlive the cut for the successor
-/// to have anything to ask about, and the record has to carry its
-/// consumer's claim for the successor to know what to ask.
+/// A successor inheriting a leaf is exactly where crediting the
+/// producing frame would be least defensible: it has no body to read,
+/// so it could not tell whose the value was even if the record named a
+/// cell. The record carrying its own recourse is what settles it.
 ///
 /// # Panics
 ///
 /// Panics if the splitter does not commit the leg before the vote, if
-/// the leg does not accept alone, if the bundle channels are never
-/// exercised, if the delivery lands on any chain, if the children are
-/// not served within budget, if the payment is not back on the
-/// inheriting child within the reclaim's room, or if the world does not
-/// conserve.
-pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableCluster>(c: &mut C) {
+/// the leg does not accept alone, if the push is never exercised, if the
+/// delivery lands on any chain, if the children are not served within
+/// budget, or if any child credits the payment back.
+pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableCluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
     let setup = split_issuer_straddler_setup();
-    let (payer_key, payer, recipient) = &setup.straddlers[0];
+    let (payer_key, payer, _, recipient) = &setup.straddlers[0];
 
     split_lifecycle(c);
-    let world = World::open(
+    let mut world = World::open(
         c,
         *PROTOCOL_RESOURCE,
         [payer.address(), recipient.address()],
@@ -603,10 +755,11 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
     let CutLeg {
         hash,
         price,
-        lapse,
-        broadcast_dropped,
-        fetch_dropped,
-    } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
+        past_window,
+        records,
+        cuts,
+    } = issue_a_leg_under_a_cut_push(c, &mut charges, payer_key, *payer, *recipient);
+    world.owing(records);
     assert!(
         c.run_until(epochs(2), |c| c.chain_fate(splitter, hash).0.is_some()),
         "the splitter must commit the leg while it still owns the payer's prefix",
@@ -646,27 +799,25 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
         "both splitter children must be served within budget",
     );
 
-    // Past the lapse with the cut standing: the survivor never had a
-    // bundle to claim from, so its claim cell is absent and stays so.
+    // Past every instant the delivery window used to close at, with the
+    // cut standing: the survivor never had a reading to credit from, so
+    // its claim cell is absent and stays so.
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
-        c.run_until(epochs(12), |c| clock(c) >= lapse),
-        "the cut must stand past the lapse",
+        c.run_until(epochs(12), |c| clock(c) >= past_window),
+        "the cut must stand past where the delivery used to lapse",
     );
-    assert!(
-        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
-        "both bundle channels must actually have been exercised and cut"
-    );
+    cuts.assert_exercised();
     let fate = c.chain_fate(survivor, hash).1.map(|(_, decision)| decision);
     assert!(
         fate != Some(TransactionDecision::Accept),
-        "the delivery must never have landed while its bundle was cut off; {survivor} reached \
+        "the delivery must never have landed while its record was cut off; {survivor} reached \
          {fate:?}",
     );
 
-    // The successor decides what it inherited: the payment comes back on
-    // whichever child took the payer's prefix. The price stays paid —
-    // the leg ran and burned it.
+    // The successor leaves what it inherited alone: no child credits the
+    // payment back, and the value stands in the record for the consumer
+    // that is still owed it.
     let inheritor = |c: &C| {
         [child_left, child_right]
             .into_iter()
@@ -675,23 +826,22 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
             .expect("two children")
     };
     assert!(
-        c.run_until(epochs(10), |c| inheritor(c) == before - price),
-        "the successor must credit the payment back once the claim is proved absent; \
-         children hold {}",
+        c.run_until(epochs(10), |c| clock(c)
+            >= past_window.plus(MAX_VALIDITY_RANGE)),
+        "run on past the room the old reclaim had",
+    );
+    assert_eq!(
         inheritor(c),
+        before - STRADDLER_PAYMENT - price,
+        "no child may credit the payment back: the crossing is the recipient's",
     );
     assert_eq!(
         held(c, recipient.address(), *PROTOCOL_RESOURCE),
         recipient_before,
-        "the recipient was never credited",
+        "and the recipient is not credited until its delivery runs",
     );
     c.clear_drops();
-    world.assert_settles_within(
-        c,
-        &charges,
-        epochs(4),
-        "a record inherited across its issuer's split",
-    );
+    world.assert_settled(c, &charges, "a record owed by the successor");
 }
 
 /// Verify a surviving sibling's second-generation split seats correctly.
@@ -814,7 +964,7 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
         .straddlers
         .iter()
         .take(half)
-        .map(|(key, from, to)| submit_straddler(c, &mut charges, key, *from, *to))
+        .map(|leg| submit_straddler(c, &mut charges, leg))
         .collect();
     probes.extend_from_slice(&settling);
     assert!(
@@ -835,8 +985,8 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
     // Straddling ticks: submitted once the merge has paired and `leaf(2, 0)` is
     // coasting to its terminal — the survivor still provisions to it, but its
     // coast blocks settle nothing, leaving them in flight when it terminates.
-    for (key, from, to) in setup.straddlers.iter().skip(half) {
-        probes.push(submit_straddler(c, &mut charges, key, *from, *to));
+    for leg in setup.straddlers.iter().skip(half) {
+        probes.push(submit_straddler(c, &mut charges, leg));
     }
 
     // Drive the merge to fire: the keepers' ready signals collapse the children
@@ -884,6 +1034,102 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(8), "straddlers across a merge");
 }
 
+/// An owed crossing whose two ends a merge puts on one shard is credited
+/// by the successor off its own parent's reading, once.
+///
+/// The payer sits on one merging child and the recipient on the other.
+/// Every record push is cut for the whole run, so the transfer accepts on
+/// the payer's child and its record stands while the recipient's child
+/// never hears of it. The pair merges with the crossing unanswered. The
+/// successor holds both prefixes, reads the record at its own parent as
+/// the value it holds, and its fold credits the recipient and writes the
+/// `Taken` that retires the record. Neither the recipient's child nor the
+/// successor ever includes the transfer. Requires the
+/// [`merge_convergence_setup`] genesis.
+///
+/// # Panics
+///
+/// Panics if the transfer does not accept, if the credit lands before the
+/// merge, if the merge does not execute or its successor never credits,
+/// or if any chain holding the recipient includes the transfer.
+pub fn an_owed_crossing_a_merge_converges_is_credited_on_the_successor<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let merge_left = MERGE_STRADDLER_LEFT;
+    let merge_right = MERGE_STRADDLER_RIGHT;
+    let merge_parent = merge_left.parent().expect("a depth-2 leaf has a parent");
+    let (payer_key, payer, recipient) = merge_convergence_setup().converging;
+    assert!(
+        await_serves(c, merge_left, epochs(4)) && await_serves(c, merge_right, epochs(4)),
+        "the grown four-shard topology must seat the merging pair",
+    );
+
+    let pushes = c.drop_type("crossing.readings");
+    let recipient_before = vault_balance(c, merge_right, recipient);
+    let mut world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [payer.address(), recipient.address()],
+        [],
+    );
+    let mut charges = Charges::default();
+    let tx = build_transfer_tx(&payer_key, payer, recipient, 100, validity_around(c.now()));
+    let records = crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    );
+    let [record] = records.as_slice() else {
+        panic!("a transfer crosses once: {records:?}");
+    };
+    world.owing([*record]);
+    let hash = charges.submit(c, tx);
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's child accepts the transfer; verdict = {verdict:?}",
+    );
+
+    assert!(
+        await_merge_keeper_count(c, merge_parent, 3, epochs(24)),
+        "the light merging pair must pair a keeper quorum within budget",
+    );
+    assert_eq!(
+        vault_balance(c, merge_right, recipient),
+        recipient_before,
+        "the recipient's child is never credited while every push is cut",
+    );
+    assert!(
+        c.run_until(epochs(16), |c| merge_executed(c, merge_parent)),
+        "the merge must gate within budget",
+    );
+    assert!(
+        await_serves(c, merge_parent, epochs(28)),
+        "the merged parent must be served within budget",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| vault_balance(c, merge_parent, recipient)
+            == recipient_before + 100),
+        "the successor credits the converged crossing off its own reading; holds {}",
+        vault_balance(c, merge_parent, recipient),
+    );
+    assert!(
+        pushes.fired() > 0,
+        "the record's push was exercised and cut"
+    );
+    for shard in [merge_right, merge_parent] {
+        assert!(
+            c.chain_fate(shard, hash).0.is_none(),
+            "{shard:?} holds the recipient and never includes the transfer",
+        );
+    }
+    c.clear_drops();
+    world.assert_settles_within(c, &charges, epochs(8), "an owed crossing a merge converged");
+}
+
 /// Whether the merge into `parent` has executed: the reformed parent is seated
 /// in the lookahead committee set and no longer pending.
 fn merge_executed<C: Cluster>(c: &C, parent: ShardId) -> bool {
@@ -911,57 +1157,17 @@ pub fn chain_settled<C: Cluster>(c: &C, shard: ShardId, hash: TxHash) -> bool {
 /// The payment every straddler leg carries.
 pub const STRADDLER_PAYMENT: u128 = 100;
 
-/// Build a straddler transfer (payer → counterpart-shard recipient) bracketing
-/// the current clock, submit it, and return its hash.
+/// Build a straddler payment (payer → counterpart-shard recipient)
+/// bracketing the current clock, submit it, and return its hash.
 ///
-/// Each leg draws its own payer and recipient, so no two straddlers share
-/// signed content — hash dedup would otherwise read them as one transaction.
-pub fn submit_straddler<C: Cluster>(
-    c: &mut C,
-    charges: &mut Charges,
-    key: &Ed25519PrivateKey,
-    from: PrincipalAddr,
-    to: PrincipalAddr,
-) -> TxHash {
-    submit_straddler_deriving(c, charges, key, from, to).0
-}
-
-/// [`submit_straddler`], also reporting the record cells its crossings
-/// write — where the value it escrows sits until something disposes of
-/// it.
-///
-/// A record cell is value rather than derived state, so nothing sweeps
-/// it on a clock; a scenario that outlasts every window and reads the
-/// cell is reading whether that holds.
-pub fn submit_straddler_recording<C: Cluster>(
-    c: &mut C,
-    charges: &mut Charges,
-    key: &Ed25519PrivateKey,
-    from: PrincipalAddr,
-    to: PrincipalAddr,
-) -> (TxHash, Vec<SubstateKey>) {
-    let (hash, records) = submit_straddler_deriving(c, charges, key, from, to);
-    (hash, records)
-}
-
-/// [`submit_straddler`], also reporting what the transaction reserves
-/// against its shards' drains.
-///
-fn submit_straddler_deriving<C: Cluster>(
-    c: &mut C,
-    charges: &mut Charges,
-    key: &Ed25519PrivateKey,
-    from: PrincipalAddr,
-    to: PrincipalAddr,
-) -> (TxHash, Vec<SubstateKey>) {
-    let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
-    let records = crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
-            .expect("a scenario transfer derives")
-            .legs,
-    );
-    let hash = charges.submit(c, tx);
-    (hash, records)
+/// The recipient signs the deposit as a request the payer composes, so
+/// the transaction acts as the recipient and runs whole: both shards
+/// commit it, which is what a fence across a reshape is about. Each leg
+/// draws its own payer and recipient, so no two straddlers share signed
+/// content — hash dedup would otherwise read them as one transaction.
+pub fn submit_straddler<C: Cluster>(c: &mut C, charges: &mut Charges, leg: &PaymentLeg) -> TxHash {
+    let tx = build_leg_payment_tx(leg, STRADDLER_PAYMENT, validity_around(c.now()));
+    charges.submit(c, tx)
 }
 
 /// Assert the settled-transaction fence held for `probes`: every straddler the
@@ -1056,7 +1262,7 @@ fn straddler_tally<C: Cluster>(
 ///
 /// A one-sided straddler is one the survivor finalized on a decision the
 /// splitter never settled by its terminal block. Zero when the fence holds; a
-/// probe that cuts the survivor→splitter EC channel across the boundary watches
+/// probe that cuts the splitter→survivor EC channel across the boundary watches
 /// whether it goes positive.
 #[must_use]
 pub fn straddler_one_sided_count<C: Cluster>(

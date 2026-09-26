@@ -26,15 +26,15 @@ use std::time::Duration;
 use hyperscale_shard::committed_cells_for;
 use hyperscale_storage::ImportProgress;
 use hyperscale_types::network::request::{
-    GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
+    BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
 };
 use hyperscale_types::network::response::{
     GetBlockResponse, GetRemoteHeadersResponse, GetStateRangeResponse,
 };
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, LocalTimestamp, NetworkDefinition,
-    PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateKey,
-    SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
+    Anchor, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, FrontierInputs,
+    LocalTimestamp, NetworkDefinition, QuorumCertificate, ShardAnchor, ShardId, StateRoot,
+    SubstateKey, SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
@@ -150,6 +150,8 @@ pub enum ReshapeRequest {
         /// The committed cells the block wrote, classified under its own
         /// window.
         creations: Vec<(SubstateKey, Vec<u8>)>,
+        /// What the block's claims did to the read frontier.
+        frontier: FrontierInputs,
     },
     /// Sign a ready signal for `validator` attesting the sync of `child`,
     /// anchored at `anchor`, and notify `recipients` — the target committee
@@ -181,7 +183,7 @@ pub enum ReshapeRequest {
         /// The terminals this duty succeeds, read off the same headers
         /// the genesis derives from — one for a split child, two for a
         /// merged parent.
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     },
     /// Seat the prepared `shard` — install its genesis and run consensus. No
     /// response (terminal).
@@ -306,7 +308,7 @@ enum ObserverPhase {
         /// The derived genesis block.
         genesis: Box<Block>,
         /// The terminals this duty succeeds.
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -491,8 +493,9 @@ fn terminal_anchor(header: &BlockHeader) -> ShardAnchor {
         height: header.height(),
         weighted_timestamp: header.parent_qc().weighted_timestamp(),
         witness_base: header.beacon_witness_base(),
-        terminal_roots: header.terminal_roots(),
+        terminal_settled_txs: header.settled_txs_root(),
         handoff_complete: None,
+        terminal_epoch: None,
     }
 }
 
@@ -521,14 +524,14 @@ enum KeeperPhase {
         anchor: Option<Box<ShardAnchor>>,
         left: Box<KeeperHalf>,
         right: Box<KeeperHalf>,
-        derived: Option<(ChainOrigin, Box<Block>, Vec<PredecessorTerminal>)>,
+        derived: Option<(ChainOrigin, Box<Block>, Vec<Anchor>)>,
         finalize_requested: bool,
     },
     /// Union imported; awaiting the next advance to emit the adopt.
     Adopting {
         origin: ChainOrigin,
         genesis: Box<Block>,
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -574,7 +577,7 @@ enum ParentHalfPhase {
         /// The derived genesis block.
         genesis: Box<Block>,
         /// The terminals this duty succeeds.
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
         /// Whether the seed request is already in flight.
         requested: bool,
     },
@@ -594,7 +597,7 @@ enum ParentHalfPhase {
         /// The derived genesis block.
         genesis: Box<Block>,
         /// The terminals this duty succeeds.
-        predecessors: Vec<PredecessorTerminal>,
+        predecessors: Vec<Anchor>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -1230,10 +1233,12 @@ impl ReshapeOrchestrator {
                 }
                 if let Some(block) = tail.take_apply() {
                     let creations = committed_cells_for(&block);
+                    let frontier = FrontierInputs::of_block(&block, view.schedule().windows());
                     out.push(ReshapeRequest::ApplyFollow {
                         shard: child,
                         block,
                         creations,
+                        frontier,
                     });
                 }
             }
@@ -1244,7 +1249,7 @@ impl ReshapeOrchestrator {
                         duty: child,
                         from: child,
                         kind: FetchKind::Block {
-                            request: GetBlockRequest::new(terminal, terminal),
+                            request: GetBlockRequest::new(terminal, BlockIntent::Execute),
                         },
                     });
                     *requested = true;
@@ -1712,7 +1717,7 @@ impl ReshapeOrchestrator {
                         duty: child,
                         from: parent,
                         kind: FetchKind::Block {
-                            request: GetBlockRequest::new(terminal, terminal),
+                            request: GetBlockRequest::new(terminal, BlockIntent::Execute),
                         },
                     });
                     *requested = true;
@@ -1765,7 +1770,7 @@ fn anchored_split_genesis(
     terminal: &BlockHeader,
     qc: &QuorumCertificate,
     anchor: &ShardAnchor,
-) -> Option<(Block, ChainOrigin, Option<PredecessorTerminal>)> {
+) -> Option<(Block, ChainOrigin, Option<Anchor>)> {
     let (genesis, origin) =
         split_genesis_from_terminal(child, terminal, qc, anchor.weighted_timestamp)
             .inspect_err(|error| {
@@ -1781,7 +1786,7 @@ fn anchored_split_genesis(
         );
         return None;
     }
-    Some((genesis, origin, terminal.as_predecessor_terminal()))
+    Some((genesis, origin, terminal.as_terminal_anchor()))
 }
 
 /// Whether the parent's terminal is commit-proven — the gate the flip
@@ -1875,7 +1880,7 @@ fn advance_keeper_half(
             duty,
             from: half.child,
             kind: FetchKind::Block {
-                request: GetBlockRequest::new(terminal, terminal),
+                request: GetBlockRequest::new(terminal, BlockIntent::Execute),
             },
         });
         half.terminal_requested = true;
@@ -1929,8 +1934,9 @@ mod tests {
             height: BlockHeight::new(8),
             weighted_timestamp: wt,
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         }
     }
 

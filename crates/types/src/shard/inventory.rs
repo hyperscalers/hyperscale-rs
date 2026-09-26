@@ -25,9 +25,10 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
-    Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, StateClaim, Transaction, TxHash, Verifiable, WitnessSources,
+    Engagements, Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, StateClaim, TickManifest,
+    Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -112,9 +113,13 @@ pub struct ElidedCertifiedBlock {
     /// a verdict is composed on, so a hop that dropped them would hand
     /// back a block that cannot answer for itself.
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
-    /// The block's state claims, always inline: they are small, and the
-    /// receiver folds them at commit.
+    /// The block's state claims, always inline with their proofs: the
+    /// section is bounded by its own byte budget, and the receiver
+    /// checks and folds them from the block at commit.
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    /// The block's tick manifest, always inline: both forms keep it, and
+    /// the receiver folds it at commit.
+    tick_manifest: TickManifest,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
@@ -134,8 +139,14 @@ pub struct ElidedCertifiedBlock {
 pub enum ElidedProvisions {
     /// Block was `Live` at serve time.
     Live(ElidedProvisionBodies),
-    /// Block was `Sealed` at serve time; hashes only.
-    Sealed(Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>),
+    /// Block was `Sealed` at serve time: the hashes, and the engagements
+    /// the dropped bodies named, which the receiver folds at commit.
+    Sealed {
+        /// Content hashes of the dropped bodies.
+        hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
+        /// What the dropped bodies named.
+        engagements: Engagements,
+    },
 }
 
 impl ElidedCertifiedBlock {
@@ -198,7 +209,6 @@ impl ElidedCertifiedBlock {
     ) -> Self {
         let qc = qc.into();
         let header = block.header().clone();
-        let is_live = block.is_live();
 
         // One row per element, so every elided list keeps the cap the
         // block's own field already met.
@@ -222,25 +232,32 @@ impl ElidedCertifiedBlock {
             (id, body)
         });
 
-        let provisions = if is_live {
-            let entries: Vec<_> = block
-                .provisions()
-                .iter()
-                .map(|p| {
-                    let hash = p.hash();
-                    let body = if matches_filter(inventory.provision_have.as_ref(), &hash) {
-                        None
-                    } else {
-                        Some(Arc::clone(p))
-                    };
-                    (hash, body)
-                })
-                .collect();
-            ElidedProvisions::Live(
-                Capped::new(entries).expect("one row per provision the block carries"),
-            )
-        } else {
-            ElidedProvisions::Sealed(block.provision_hashes())
+        let provisions = match block {
+            Block::Live { provisions, .. } => {
+                let entries: Vec<_> = provisions
+                    .iter()
+                    .map(|p| {
+                        let hash = p.hash();
+                        let body = if matches_filter(inventory.provision_have.as_ref(), &hash) {
+                            None
+                        } else {
+                            Some(Arc::clone(p))
+                        };
+                        (hash, body)
+                    })
+                    .collect();
+                ElidedProvisions::Live(
+                    Capped::new(entries).expect("one row per provision the block carries"),
+                )
+            }
+            Block::Sealed {
+                provision_hashes,
+                engagements,
+                ..
+            } => ElidedProvisions::Sealed {
+                hashes: (**provision_hashes).clone(),
+                engagements: (**engagements).clone(),
+            },
         };
 
         Self {
@@ -251,6 +268,7 @@ impl ElidedCertifiedBlock {
             provisions,
             abandonment_records: block.abandonment_records().clone(),
             state_claims: block.state_claims().clone(),
+            tick_manifest: block.tick_manifest().clone(),
             witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
@@ -324,7 +342,7 @@ impl ElidedCertifiedBlock {
                     })
                 })
             })),
-            ElidedProvisions::Sealed(_) => None,
+            ElidedProvisions::Sealed { .. } => None,
         };
 
         if !miss.is_empty() {
@@ -343,16 +361,25 @@ impl ElidedCertifiedBlock {
                     provisions: Arc::new(provisions),
                     abandonment_records: Arc::new(self.abandonment_records.clone()),
                     state_claims: Arc::new(self.state_claims.clone()),
+                    tick_manifest: Arc::new(self.tick_manifest.clone()),
                     witness_sources: Arc::new(self.witness_sources.clone()),
                 }
             }
-            (None, ElidedProvisions::Sealed(hashes)) => Block::Sealed {
+            (
+                None,
+                ElidedProvisions::Sealed {
+                    hashes,
+                    engagements,
+                },
+            ) => Block::Sealed {
                 header: self.header.as_unverified().clone(),
                 transactions: txs,
                 certificates: certs,
                 provision_hashes: Arc::new(hashes.clone()),
+                engagements: Arc::new(engagements.clone()),
                 abandonment_records: Arc::new(self.abandonment_records.clone()),
                 state_claims: Arc::new(self.state_claims.clone()),
+                tick_manifest: Arc::new(self.tick_manifest.clone()),
                 witness_sources: Arc::new(self.witness_sources.clone()),
             },
             (None, ElidedProvisions::Live(_)) => {
@@ -478,6 +505,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -531,6 +559,7 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         }
     }
@@ -714,6 +743,95 @@ mod tests {
             )
             .expect("second pass with topup body should succeed");
         assert_eq!(recovered.block(), &block);
+    }
+
+    /// A block's engagements are one set whatever form carries it: the
+    /// bodies derive it on a live block, a sealed block keeps it, and
+    /// every hop between the forms, the elided wire form and the stored
+    /// metadata preserves it. The root is a function of the set alone.
+    #[test]
+    fn the_engagement_list_survives_every_block_form() {
+        use std::collections::BTreeSet;
+
+        use crate::{
+            BlockMetadata, Engagement, EngagementRoot, MerkleInclusionProof, ProvisionEntry,
+            SetRoot,
+        };
+
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let batch = |source: ShardId, height: u64, seeds: &[u8]| {
+            Arc::new(Verifiable::from(Provisions::new(
+                source,
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                WeightedTimestamp::ZERO,
+                MerkleInclusionProof::dummy(),
+                Capped::new(
+                    seeds
+                        .iter()
+                        .map(|seed| ProvisionEntry::new(tx(*seed), Capped::empty()))
+                        .collect(),
+                )
+                .expect("a list written out in a test"),
+            )))
+        };
+        let left = ShardId::leaf(1, 0);
+        let right = ShardId::leaf(1, 1);
+        let batches = vec![
+            batch(right, 4, &[2]),
+            batch(right, 3, &[1, 2]),
+            batch(left, 9, &[]),
+            batch(left, 7, &[3]),
+        ];
+        let expected: Vec<Engagement> = [(left, 3, 7), (right, 1, 3), (right, 2, 3), (right, 2, 4)]
+            .into_iter()
+            .map(|(source, seed, height)| Engagement {
+                source,
+                tx_hash: tx(seed),
+                source_height: BlockHeight::new(height),
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let live_with = |provisions: Vec<Arc<Verifiable<Provisions>>>| Block::Live {
+            header: BlockHeader::new(BlockHeaderParts::default()),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::new(provisions).expect("a list written out in a test")),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let live = live_with(batches.clone());
+        assert_eq!(*live.engagements(), expected[..]);
+        let reordered = live_with(batches.iter().rev().cloned().collect());
+        assert_eq!(
+            EngagementRoot::over(live.engagements().iter()),
+            EngagementRoot::over(reordered.engagements().iter()),
+            "the root is the set's, whatever order the bodies ride in"
+        );
+
+        let sealed = live.clone().into_sealed();
+        assert!(!sealed.is_live());
+        assert_eq!(*sealed.engagements(), expected[..]);
+        let relived = sealed.clone().into_live(Arc::new(
+            Capped::new(batches).expect("a list written out in a test"),
+        ));
+        assert_eq!(*relived.engagements(), expected[..]);
+
+        for block in [&live, &sealed] {
+            let qc = create_test_qc(block);
+            let rehydrated = ElidedCertifiedBlock::elide(block, qc, &Inventory::empty())
+                .try_rehydrate(|_| None, |_| None, |_| None)
+                .expect("every body rides inline");
+            assert_eq!(rehydrated.block().is_live(), block.is_live());
+            assert_eq!(*rehydrated.block().engagements(), expected[..]);
+        }
+
+        let stored = BlockMetadata::from_block(&live, create_test_qc(&live));
+        assert_eq!(stored.engagements()[..], expected[..]);
     }
 
     /// Forge an `ElidedCertifiedBlock` whose `transactions` length claims

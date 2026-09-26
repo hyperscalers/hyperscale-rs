@@ -28,7 +28,9 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_engine::CodeAvailability;
-use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
+use hyperscale_execution::{
+    CrossingIndexSlot, ExecCertStore, ExecutionCoordinator, FinalizationStore,
+};
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
     OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
@@ -107,6 +109,7 @@ impl NodeStateMachine {
         tx_store: Arc<TxStore>,
         exec_cert_store: Arc<ExecCertStore>,
         finalization_store: Arc<FinalizationStore>,
+        crossing_index: Arc<CrossingIndexSlot>,
     ) -> Self {
         let verifier = Arc::clone(beacon_coordinator.verifier());
         Self {
@@ -127,6 +130,7 @@ impl NodeStateMachine {
                 tx_store,
                 exec_cert_store,
                 finalization_store,
+                crossing_index,
             )),
         }
     }
@@ -211,7 +215,7 @@ impl NodeStateMachine {
 
     /// Get a reference to the execution coordinator.
     #[must_use]
-    pub(crate) const fn execution_coordinator(&self) -> &ExecutionCoordinator {
+    pub const fn execution_coordinator(&self) -> &ExecutionCoordinator {
         &self.participation().execution_coordinator
     }
 
@@ -329,7 +333,10 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ── Cross-coordinator orchestration (drives the beacon too) ────
-            ProtocolEvent::BlockCommitted { certified } => self.on_block_committed(&certified),
+            ProtocolEvent::BlockCommitted {
+                certified,
+                committee_anchor,
+            } => self.on_block_committed(&certified, committee_anchor),
             ProtocolEvent::RemoteHeaderAdmitted { certified_header } => {
                 self.on_remote_header_admitted(&certified_header)
             }
@@ -425,6 +432,7 @@ impl StateMachine for NodeStateMachine {
             // ── Provisions ───────────────────────────────────────────────
             evt @ (ProtocolEvent::VerifiedProvisionsReceived { .. }
             | ProtocolEvent::UnverifiedProvisionsReceived { .. }
+            | ProtocolEvent::CrossingReadingsReceived { .. }
             | ProtocolEvent::StateProvisionsVerified { .. }
             | ProtocolEvent::ProvisionsAdmitted { .. }
             | ProtocolEvent::OutboundProvisionBroadcast { .. }
@@ -459,8 +467,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncComplete { .. }
             | ProtocolEvent::SettledTxsReconstructed { .. }
-            | ProtocolEvent::FetchedStateProofVerified { .. }
-            | ProtocolEvent::PrecutResolutionsReceived { .. }) => {
+            | ProtocolEvent::FetchedStateProofVerified { .. }) => {
                 self.with_shard(move |s, sched| s.handle_sync(sched, evt))
             }
 
@@ -523,17 +530,21 @@ impl StateMachine for NodeStateMachine {
                     expected_root: ready.expected_root,
                     expected_local_receipt_root: ready.expected_local_receipt_root,
                     finalizations: ready.finalizations,
-                    block_tx_hashes: ready.block_tx_hashes,
                     creations: ready.creations,
                     block_height: ready.block_height,
                     claimed_split_child_roots: ready.claimed_split_child_roots,
                     split_child_roots_required: ready.split_child_roots_required,
-                    terminal_roots_required: ready.terminal_roots_required,
-                    claimed_terminal_roots: ready.claimed_terminal_roots,
+                    terminal_settled_txs_required: ready.terminal_settled_txs_required,
+                    claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
                     parent_weighted_timestamp: ready.parent_weighted_timestamp,
                     settled_txs_window_floor: ready.settled_txs_window_floor,
                     parent_sweep_frontier: ready.parent_sweep_frontier,
                     claimed_sweep_frontier: ready.claimed_sweep_frontier,
+                    frontier: ready.frontier,
+                    members: ready.members,
+                    fence: ready.fence,
+                    state_claims: ready.state_claims,
+                    abandonment_records: ready.abandonment_records,
                 });
             }
 

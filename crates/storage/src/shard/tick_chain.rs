@@ -505,12 +505,21 @@ where
     /// and that tick then finds neither the fold nor a base old enough to
     /// hold it. Two replicas at different execution positions would
     /// derive different receipts from one committed chain.
+    ///
+    /// The base is held at that same floor. A fold resolves against the
+    /// base as of [`Self::view_at`]'s anchor, which is never below it, so
+    /// retaining the fold and letting the history under it be collected
+    /// answers a queued tick with a panic rather than a baseline — and
+    /// the retention horizon alone permits exactly that, because it is
+    /// measured against a tip clock that a halt recovery moves by the
+    /// whole halt.
     pub fn prune_persisted(&self, persisted: BlockHeight) {
         {
             let mut recorded = write_or_recover(&self.persisted);
             *recorded = (*recorded).max(persisted);
         }
         let floor = persisted.min(*read_or_recover(&self.executed));
+        self.base.hold_retention_at(floor);
         write_or_recover(&self.entries).retain(|_, entry| !entry.covered_by(floor));
     }
 
@@ -737,6 +746,9 @@ mod tests {
         /// Anchor heights `snapshot_at` was asked for, so a test can pin
         /// which version a tick read the base at.
         anchors: Mutex<Vec<BlockHeight>>,
+        /// Heights the chain held history at, so a test can pin the
+        /// floor a pruning publishes.
+        holds: Mutex<Vec<BlockHeight>>,
     }
 
     impl StubStore {
@@ -759,6 +771,7 @@ mod tests {
                 ]),
                 tip: height,
                 anchors: Mutex::new(Vec::new()),
+                holds: Mutex::new(Vec::new()),
             }
         }
 
@@ -829,6 +842,10 @@ mod tests {
         }
         fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
             None
+        }
+
+        fn hold_retention_at(&self, height: BlockHeight) {
+            lock_or_recover(&self.holds).push(height);
         }
     }
 
@@ -1059,6 +1076,7 @@ mod tests {
             .collect(),
             tip: BlockHeight::new(9),
             anchors: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
         });
         let chain = TickChain::new(store);
         let w = tick(3);
@@ -1128,6 +1146,7 @@ mod tests {
             .collect(),
             tip: BlockHeight::new(9),
             anchors: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
         });
         let chain = TickChain::new(store);
         chain.resolve(
@@ -1249,6 +1268,38 @@ mod tests {
             *lock_or_recover(&store.anchors),
             vec![BlockHeight::new(4), BlockHeight::new(9)],
             "the anchor is the tick, clamped to what has persisted"
+        );
+    }
+
+    /// The base is held at the floor the folds are evicted at, so no
+    /// anchor a queued tick can still name is collected out from under
+    /// it. Execution behind the persisted tip is what makes the two
+    /// numbers differ, and the hold takes the lower of them.
+    #[test]
+    fn the_base_is_held_at_the_floor_the_folds_are_evicted_at() {
+        let store = Arc::new(StubStore::settling(
+            key(1),
+            b"base",
+            BlockHeight::new(9),
+            b"settled",
+        ));
+        let chain = TickChain::new(Arc::clone(&store));
+        chain.append(BlockHeight::new(4), TickOutput::default());
+        chain.prune_persisted(BlockHeight::new(9));
+
+        assert_eq!(
+            *lock_or_recover(&store.holds),
+            vec![BlockHeight::new(4)],
+            "the hold is what has executed, which trails what has persisted"
+        );
+
+        chain.append(BlockHeight::new(9), TickOutput::default());
+        chain.prune_persisted(BlockHeight::new(9));
+
+        assert_eq!(
+            lock_or_recover(&store.holds).last().copied(),
+            Some(BlockHeight::new(9)),
+            "execution catching up releases the history it was holding"
         );
     }
 

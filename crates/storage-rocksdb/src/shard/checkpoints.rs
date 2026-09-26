@@ -19,13 +19,13 @@ use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, SubstateStore, Substates,
-    SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell, key_under_prefix,
-    prefix_low_key,
+    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, MemberIndex, SubstateStore,
+    Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, key_under_prefix,
+    load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, StateRoot, SubstateKey, SubstateLeaf,
-    shard_prefix_path,
+    Block, BlockHeight, CertifiedBlock, ChainOrigin, FrontierInputs, ReadFrontier, ShardId,
+    StateRoot, SubstateKey, SubstateLeaf,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::checkpoint::Checkpoint;
@@ -33,8 +33,8 @@ use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
-    ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, EntriesCf, ImportStagingCf, JmtNodesCf,
-    PackageArtifactsCf, StateCf, SubstateBytesCf,
+    ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, CrossingIndexCf, EntriesCf, ImportStagingCf,
+    JmtNodesCf, PackageArtifactsCf, StateCf, SubstateBytesCf,
 };
 use super::core::{RocksDbShardStorage, fold_sweep_rows};
 use super::entry_key::scan_entries;
@@ -62,6 +62,7 @@ fn index_imported_leaves(
     let state_cf = StateCf::handle(cf);
     let entries_cf = EntriesCf::handle(cf);
     let artifacts_cf = PackageArtifactsCf::handle(cf);
+    let crossing_cf = CrossingIndexCf::handle(cf);
     let mut sweep_rows = SweepRows::default();
     for leaf in leaves {
         batch_put::<StateCf>(batch, state_cf, &leaf.key, &leaf.value.to_vec());
@@ -69,7 +70,11 @@ fn index_imported_leaves(
             entry,
             package,
             sweep,
+            crossing,
         } = LeafRows::of(leaf.key, &leaf.value);
+        if crossing {
+            batch_put::<CrossingIndexCf>(batch, crossing_cf, &leaf.key, &());
+        }
         if let Some((entry_key, value)) = entry {
             batch_put::<EntriesCf>(batch, entries_cf, &entry_key, &value);
         }
@@ -516,13 +521,24 @@ impl Substates for CheckpointStore {
 impl BoundaryStore for RocksDbShardStorage {
     type Boundary = CheckpointStore;
 
-    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
+    fn crossing_rows(&self, under: &NibblePath) -> Vec<SubstateKey> {
         let cf = self.cf();
-        let prefix = shard_prefix_path(shard);
-        iter_from::<StateCf>(&self.db, StateCf::handle(&cf), &prefix_low_key(&prefix))
-            .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
-            .filter(|(key, value)| is_record_cell(*key, value))
-            .collect()
+        iter_from::<CrossingIndexCf>(
+            &self.db,
+            CrossingIndexCf::handle(&cf),
+            &prefix_low_key(under),
+        )
+        .map(|(key, ())| key)
+        .take_while(|key| key_under_prefix(&key.to_bytes(), under))
+        .collect()
+    }
+
+    fn read_frontier(&self, shard: ShardId) -> ReadFrontier {
+        load_read_frontier(self, shard)
+    }
+
+    fn member_index(&self, shard: ShardId) -> MemberIndex {
+        MemberIndex::load(self, shard)
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
@@ -630,6 +646,7 @@ impl BoundaryStore for RocksDbShardStorage {
         &self,
         block: &Block,
         creations: &[(SubstateKey, Vec<u8>)],
+        frontier: &FrontierInputs,
     ) -> Result<StateRoot, String> {
         let height = block.height();
         let _commit_guard = self
@@ -649,8 +666,14 @@ impl BoundaryStore for RocksDbShardStorage {
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let filtered =
-            followed_block_writes(self, &self.snapshot(), block, creations, &self.root_path);
+        let filtered = followed_block_writes(
+            self,
+            &self.snapshot(),
+            block,
+            creations,
+            frontier,
+            &self.root_path,
+        );
         if filtered.is_empty() {
             return Ok(base_root);
         }
@@ -718,12 +741,17 @@ mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
-        test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
-        test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
-        test_import_gate_reads_the_trie,
+        test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_presence_below_the_deleting_absence_is_refused,
+        test_an_owed_credit_composes_with_a_receipt_on_its_vault,
+        test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
+        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
+        test_crossing_index_equals_the_leaves, test_followed_halves_fold_the_settlements,
+        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
+        test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, ShardChainReader, SubstateStore};
-    use hyperscale_types::AddressClass;
+    use hyperscale_types::{AddressClass, shard_prefix_path};
     use tempfile::TempDir;
 
     use super::*;
@@ -891,15 +919,103 @@ mod tests {
         test_boundary_import_roundtrip(&storage, &fresh);
     }
 
-    /// A store answers for the escrow records its state holds, which is
-    /// what a merge successor's adoption reads its obligations off.
+    /// The crossing index equals the leaves across commits, deletes and
+    /// an import, and a reopened store holds the index a running one does.
     #[test]
-    fn escrow_records_are_read_off_the_state() {
+    fn the_crossing_index_equals_the_leaves() {
+        let (dir, fresh_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let storage = open_storage(dir.path());
+        test_crossing_index_equals_the_leaves(&storage, &open_storage(fresh_dir.path()));
+        let running = storage.crossing_rows(&NibblePath::empty());
+        drop(storage);
+        assert_eq!(
+            open_storage(dir.path()).crossing_rows(&NibblePath::empty()),
+            running,
+            "a reopened store holds the index a running one does",
+        );
+    }
+
+    /// A store answers for the read frontier its state holds, the same
+    /// whether it is running or resumed.
+    #[test]
+    fn the_read_frontier_is_read_off_the_state() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        test_escrow_records_are_read_off_the_state(&storage, |shard| {
+        test_the_read_frontier_is_read_off_the_state(&storage, |shard| {
             storage.load_recovered_state(shard)
         });
+    }
+
+    /// A split follower on each half rebuilds the parent's raise from
+    /// the copy on its half, and the halves recompose the parent's root.
+    #[test]
+    fn followed_halves_hold_the_read_frontier() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_followed_halves_hold_the_read_frontier(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A split follower on each half folds the settlements landing on
+    /// its half, and the halves recompose the parent's root.
+    #[test]
+    fn followed_halves_fold_the_settlements() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_followed_halves_fold_the_settlements(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A committed marker refuses its transaction after a restart, after
+    /// a snap sync, and through a pending ancestor alone.
+    #[test]
+    fn a_committed_marker_refuses_its_transaction_on_every_view() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        test_a_committed_marker_refuses_its_transaction_on_every_view(
+            &open_storage(dirs[0].path()),
+            &open_storage(dirs[1].path()),
+            &open_storage(dirs[2].path()),
+        );
+    }
+
+    /// A block crediting an owed crossing lands one root committed,
+    /// followed whole and followed in halves.
+    #[test]
+    fn an_owed_credit_lands_one_root_on_every_path() {
+        let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_an_owed_credit_lands_one_root_on_every_path(
+            &open_storage(dirs[0].path()),
+            &open_storage(dirs[1].path()),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[3].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// An owed credit composes with a receipt's movement on its vault.
+    #[test]
+    fn an_owed_credit_composes_with_a_receipt_on_its_vault() {
+        let dir = TempDir::new().unwrap();
+        test_an_owed_credit_composes_with_a_receipt_on_its_vault(&open_storage(dir.path()));
+    }
+
+    /// The frontier a credit and its deletion leave refuses a presence
+    /// below the deleting absence, whole and on the consumer's half.
+    #[test]
+    fn a_presence_below_the_deleting_absence_is_refused() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_presence_below_the_deleting_absence_is_refused(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
     }
 
     #[test]

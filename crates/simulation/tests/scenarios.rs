@@ -15,28 +15,33 @@ use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
     cross_shard_genesis_accounts, genesis_accounts, halt_recovery_split_bytes,
-    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts, merge_split_bytes,
-    merge_straddler_setup, native_pq_genesis_accounts, nullifier_race_genesis_accounts,
-    overdraw_genesis_accounts, participant_sweep_genesis_accounts, probe_train_genesis_accounts,
-    remote_delegator, reshape_lifecycle_accounts, securify_genesis_accounts,
-    shared_recipient_genesis_accounts, split_issuer_straddler_setup, split_straddler_setup,
-    staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
-    unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
+    merge_convergence_setup, merge_split_bytes, merge_straddler_setup, native_pq_genesis_accounts,
+    nullifier_race_genesis_accounts, overdraw_genesis_accounts, participant_sweep_genesis_accounts,
+    probe_train_genesis_accounts, remote_delegator, reshape_lifecycle_accounts,
+    securify_genesis_accounts, shared_recipient_genesis_accounts, split_issuer_straddler_setup,
+    split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
+    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Budget, Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_delivery_cut_off_past_its_window_is_reclaimed,
-    a_delivery_is_reclaimed_when_its_deliverer_splits,
+    a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
+    a_delivery_is_owed_when_its_deliverer_splits,
+    a_delivery_lands_past_every_window_once_its_record_arrives,
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
-    a_healed_network_does_not_revive_a_closed_delivery,
+    a_healed_network_delivers_past_the_old_window,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
+    a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
+    a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_priority_is_charged_over_the_table_price,
     a_published_package_runs_where_it_was_never_committed,
-    a_record_is_decided_by_the_successor_when_its_issuer_splits,
+    a_record_is_owed_by_the_successor_when_its_issuer_splits,
+    a_replica_that_missed_the_credit_commits_it_from_the_block,
+    a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
@@ -51,10 +56,13 @@ use hyperscale_scenarios::{
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
-    abort_converges, attested_load_reaches_the_beacon,
-    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
-    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    a_withheld_fallback_is_asked_by_an_honest_validator, abort_converges,
+    an_answer_written_past_the_deadline_is_read_on_a_later_ask,
+    an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
+    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
+    cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -86,6 +94,11 @@ use hyperscale_scenarios::{
     unbound_remote_payer_engages_nothing, venue_genesis_accounts, venue_genesis_accounts_on,
     wide_swapper_shards, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
     withdrawals_compose_over_one_vault, zipf_payments,
+};
+#[cfg(feature = "production-epochs")]
+use hyperscale_scenarios::{
+    a_route_whose_core_never_combines_holds_its_input,
+    a_skip_deferred_split_keeps_every_settlement_in_its_window,
 };
 use hyperscale_simulation::ExecutionMode;
 use hyperscale_storage::ShardChainReader;
@@ -555,6 +568,11 @@ fn cross_shard_transfer_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     cross_shard_transfer(&mut cluster);
+    assert_eq!(
+        cluster.metric("crossing_fallback_asks", None),
+        0,
+        "with no loss the answer and the removal both arrive by push",
+    );
 }
 
 #[test]
@@ -597,8 +615,7 @@ fn events_land_on_their_emitters_home_shard_sim() {
 
 #[test]
 fn attested_load_reaches_the_beacon_sim() {
-    let mut cluster =
-        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    let mut cluster = venue_cluster(42);
     attested_load_reaches_the_beacon(&mut cluster);
 }
 
@@ -710,6 +727,11 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
 fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
     let mut cluster = venue_cluster(42);
     a_swap_charges_its_caller_its_input_and_one_price(&mut cluster, epochs(40));
+    assert_eq!(
+        cluster.metric("crossing_fallback_asks", None),
+        0,
+        "an escrowed crossing's answers and removals arrive by push",
+    );
 }
 
 #[test]
@@ -738,6 +760,11 @@ fn a_route_settles_across_two_venues_sim() {
         "two-venue route: {} routes settled in {:?}",
         report.submitted, report.elapsed,
     );
+    assert_eq!(
+        cluster.metric("crossing_fallback_asks", None),
+        0,
+        "every hop's answers and removals arrive by push",
+    );
 }
 
 #[test]
@@ -759,6 +786,30 @@ fn route_cluster_on_dedicated_hosts() -> SimCluster {
         &route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
+}
+
+/// The refusal's own shape: a venue refuses its member, and the `Never`
+/// rides its rejecting finalization. Sim-only for the same reason as its
+/// neighbours — the conservation runs to the producer's own reclaim.
+#[test]
+fn a_crossing_the_consumer_refuses_is_declined_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(a_crossing_the_consumer_refuses_is_declined);
+}
+
+/// The cut-off route's other outcome: the same cut, held past the close
+/// of the core window, so the core is held by its silent sibling and
+/// the input stays locked until the cut lifts. Sim-only — the span runs
+/// past the close of `Window::Core`, minutes of weighted time.
+///
+/// Under the production epoch length only: at the default 30 s epoch the
+/// route accepts once the cut lifts, but its output is never banked and
+/// the trader's input record stays locked.
+#[cfg(feature = "production-epochs")]
+#[test]
+fn a_route_whose_core_never_combines_holds_its_input_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(a_route_whose_core_never_combines_holds_its_input);
 }
 
 #[test]
@@ -796,17 +847,84 @@ fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took_sim() {
 }
 
 #[test]
-fn a_delivery_cut_off_past_its_window_is_reclaimed_sim() {
+fn a_delivery_cut_off_past_its_window_is_owed_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
-    cluster.run_faultable(a_delivery_cut_off_past_its_window_is_reclaimed);
+    cluster.run_faultable(a_delivery_cut_off_past_its_window_is_owed);
 }
 
 #[test]
-fn a_healed_network_does_not_revive_a_closed_delivery_sim() {
+fn a_delivery_lands_past_every_window_once_its_record_arrives_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
-    cluster.run_faultable(a_healed_network_does_not_revive_a_closed_delivery);
+    cluster.run_faultable(a_delivery_lands_past_every_window_once_its_record_arrives);
+}
+
+#[test]
+fn a_leg_whose_core_never_answers_inside_its_window_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &[(remote_delegator().1, 1_000_000)],
+    );
+    cluster.run_faultable(a_leg_whose_core_never_answers_inside_its_window);
+}
+
+#[test]
+fn a_healed_network_delivers_past_the_old_window_sim() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    cluster.run_faultable(a_healed_network_delivers_past_the_old_window);
+}
+
+#[test]
+fn a_lost_answer_push_is_asked_past_the_deadline_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_lost_answer_push_is_asked_past_the_deadline);
+}
+
+#[test]
+fn a_replica_that_missed_the_credit_commits_it_from_the_block_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_replica_that_missed_the_credit_commits_it_from_the_block);
+}
+
+#[test]
+fn a_withheld_fallback_is_asked_by_an_honest_validator_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_withheld_fallback_is_asked_by_an_honest_validator);
+}
+
+#[test]
+fn a_lost_removal_push_is_asked_past_the_deadline_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_lost_removal_push_is_asked_past_the_deadline);
+}
+
+#[test]
+fn an_answer_written_past_the_deadline_is_read_on_a_later_ask_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(an_answer_written_past_the_deadline_is_read_on_a_later_ask);
 }
 
 #[test]
@@ -1627,6 +1745,18 @@ fn a_route_committed_before_its_departure_was_voted_still_resolves_sim() {
     cluster.run_faultable(a_route_committed_before_its_departure_was_voted_still_resolves);
 }
 
+/// The pre-boundary hold in the settled-set fence cannot reach an accept
+/// that landed before the hold armed: the survivor settles the route on
+/// the departing venue's certificate, the departing venue never receives
+/// the survivor's and reaches its terminal with the route unsettled, and
+/// its side applies nowhere.
+#[test]
+#[ignore = "a route accepted before its sibling's split is projected tears"]
+fn a_route_accepted_before_its_venues_split_is_projected_is_not_torn_sim() {
+    let mut cluster = late_departing_route_cluster();
+    cluster.run_faultable(a_route_accepted_before_its_venues_split_is_projected_is_not_torn);
+}
+
 /// The route topology grown to four shards on dedicated pool hosts, with
 /// a cohort to spare for the first venue's split and the reshape trigger
 /// armed above every quarter until the scenario votes it down.
@@ -1652,8 +1782,11 @@ fn a_route_the_departing_venue_settled_is_settled_by_the_survivor_sim() {
 
 /// Drive a train of transfers into the splitter across its split at `seed`.
 fn a_train_into_a_splitter_strands_nothing_at_seed(seed: u64) {
-    let mut cluster =
-        SimCluster::with_accounts(&straddler_config(), seed, &split_train_genesis_accounts());
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &straddler_config(),
+        seed,
+        &split_train_genesis_accounts(),
+    );
     a_train_into_a_splitter_strands_nothing(&mut cluster);
 }
 
@@ -1695,6 +1828,17 @@ fn split_straddler_atomic_sim() {
     split_straddler_atomic(&mut cluster);
 }
 
+/// Under the production epoch length only: at the default 30 s epoch a
+/// split admitted before a beacon stall does not ready before its
+/// deadline, so the run never reaches the cut whose fence this reads.
+#[cfg(feature = "production-epochs")]
+#[test]
+fn a_skip_deferred_split_keeps_every_settlement_in_its_window_sim() {
+    let setup = split_straddler_setup();
+    let mut cluster = SimCluster::with_accounts(&straddler_config(), 11, &setup.accounts);
+    cluster.run_faultable(a_skip_deferred_split_keeps_every_settlement_in_its_window);
+}
+
 /// Assert straddler atomicity under an asymmetric EC partition across a split
 /// boundary at `seed`.
 ///
@@ -1714,20 +1858,20 @@ fn split_straddler_ec_partition_atomic_at_seed(seed: u64) {
 }
 
 #[test]
-fn a_delivery_is_reclaimed_when_its_deliverer_splits_sim() {
+fn a_delivery_is_owed_when_its_deliverer_splits_sim() {
     let setup = split_straddler_setup();
     let mut cluster = SimCluster::with_accounts(&straddler_config(), 11, &setup.accounts);
-    cluster.run_faultable(a_delivery_is_reclaimed_when_its_deliverer_splits);
+    cluster.run_faultable(a_delivery_is_owed_when_its_deliverer_splits);
 }
 
 /// A record inherited across its issuer's split, decided by the child
 /// that took the payer's prefix — the case the terminal evidence span
 /// buys and the inherited seat spends.
 #[test]
-fn a_record_is_decided_by_the_successor_when_its_issuer_splits_sim() {
+fn a_record_is_owed_by_the_successor_when_its_issuer_splits_sim() {
     let setup = split_issuer_straddler_setup();
     let mut cluster = SimCluster::with_accounts(&straddler_config(), 11, &setup.accounts);
-    cluster.run_faultable(a_record_is_decided_by_the_successor_when_its_issuer_splits);
+    cluster.run_faultable(a_record_is_owed_by_the_successor_when_its_issuer_splits);
 }
 
 #[test]
@@ -1774,6 +1918,14 @@ fn merge_straddler_config() -> ScenarioConfig {
         split_bytes: merge_split_bytes(&GenesisPackages::protocol()),
         latency: Duration::from_millis(150),
     }
+}
+
+#[test]
+fn an_owed_crossing_a_merge_converges_is_credited_on_the_successor_sim() {
+    let setup = merge_convergence_setup();
+    let mut cluster =
+        SimCluster::with_grown_accounts(&merge_straddler_config(), 11, &setup.accounts);
+    cluster.run_faultable(an_owed_crossing_a_merge_converges_is_credited_on_the_successor);
 }
 
 #[test]

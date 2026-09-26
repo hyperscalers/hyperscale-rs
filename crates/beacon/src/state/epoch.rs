@@ -1060,7 +1060,7 @@ fn record_boundaries(
                 terminal_epoch: marks.terminal_epoch,
                 handoff_complete: marks.handoff_complete,
                 terminal_delivered: marks.terminal_delivered,
-                terminal_roots: header.terminal_roots(),
+                terminal_settled_txs: header.settled_txs_root(),
                 reshape_admitted_epoch: marks.reshape_admitted_epoch,
             },
         );
@@ -1312,7 +1312,7 @@ fn seed_split_children(
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -1425,7 +1425,7 @@ fn compose_merge_parent(
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         },
     );
@@ -1438,6 +1438,7 @@ fn compose_merge_parent(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_hbor::Capped;
@@ -1445,12 +1446,12 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BASIS_POINTS, BeaconProposal, BeaconWitnessLeafCount,
         BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin,
-        CommittedTxsRoot, DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash,
-        MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable,
-        QuorumCertificate, ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
+        DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash, MAX_RANGE_PROOF_NODES,
+        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable, QuorumCertificate,
+        RETENTION_HORIZON, ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
         ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
         SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS,
-        TerminalRoots, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
+        TopologySchedule, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
         compute_merkle_root, compute_range_proof, derive_reshape_trigger,
     };
 
@@ -1487,7 +1488,7 @@ mod tests {
         root: BeaconWitnessRoot,
         leaf_count: u64,
         split_child_roots: Option<SplitChildRoots>,
-        terminal_roots: Option<TerminalRoots>,
+        terminal_settled_txs: Option<SettledTxsRoot>,
     ) -> BlockHeader {
         let parent_qc = QuorumCertificate::new(
             BlockHash::ZERO,
@@ -1508,7 +1509,7 @@ mod tests {
             beacon_witness_root: root,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
             split_child_roots,
-            terminal_roots,
+            terminal_settled_txs,
             ..Default::default()
         })
     }
@@ -1554,7 +1555,7 @@ mod tests {
         state_root: StateRoot,
         payloads: Vec<ShardWitnessPayload>,
         split_child_roots: Option<SplitChildRoots>,
-        terminal_roots: Option<TerminalRoots>,
+        terminal_settled_txs: Option<SettledTxsRoot>,
     ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let leaf_count = payloads.len() as u64;
         let leaf_hashes: Vec<Hash> = payloads
@@ -1574,7 +1575,7 @@ mod tests {
             root,
             leaf_count,
             split_child_roots,
-            terminal_roots,
+            terminal_settled_txs,
         );
         let range_proof = compute_range_proof(&leaf_hashes, 0, leaf_hashes.len());
         (header, payloads, range_proof)
@@ -1961,7 +1962,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2021,7 +2022,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2418,7 +2419,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2517,7 +2518,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2595,7 +2596,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3175,7 +3176,7 @@ mod tests {
         pair: SplitChildRoots,
         state_root: StateRoot,
         leaf_count: u64,
-        terminal_roots: Option<TerminalRoots>,
+        terminal_settled_txs: Option<SettledTxsRoot>,
     ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
@@ -3190,7 +3191,7 @@ mod tests {
             state_root,
             payloads,
             Some(pair),
-            terminal_roots,
+            terminal_settled_txs,
         )
     }
 
@@ -3218,7 +3219,7 @@ mod tests {
                 terminal_epoch: Some(Epoch::new(1)),
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3241,7 +3242,7 @@ mod tests {
                     terminal_epoch: None,
                     handoff_complete: None,
                     terminal_delivered: false,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3576,7 +3577,7 @@ mod tests {
         );
     }
 
-    /// The evidence window outlives the fold that first carries the roots.
+    /// The evidence window outlives the fold that first carries the root.
     ///
     /// A terminal block satisfies `parent ≤ cut < qc`, so it cannot exist
     /// until the window after the one it closes, and the beacon block for
@@ -3584,27 +3585,24 @@ mod tests {
     /// the contribution folds one window later again. At a production
     /// 300s epoch that is 600s past the cut, so a window measured in
     /// transaction-artifact retention (144s) would drop the record on the
-    /// very fold that first gave it roots to project, and no counterpart
+    /// very fold that first gave it a root to project, and no counterpart
     /// would ever read a departed shard's settled set.
     ///
     /// The successors are live here, so nothing but the window itself is
     /// holding the record.
     #[test]
-    fn terminal_roots_land_inside_the_evidence_window() {
+    fn terminal_settled_txs_land_inside_the_evidence_window() {
         let (mut state, parent, pair, composed) = terminating_state();
         // Production epochs: the cut moves to 600_000ms, and the fold that
-        // carries the roots opens at 900_000ms.
+        // carries the root opens at 900_000ms.
         state.chain_config.epoch_duration_ms = 300_000;
         for child in <[ShardId; 2]>::from(parent.children()) {
             state.advanced.insert(child);
         }
 
-        let roots = TerminalRoots {
-            settled_txs: SettledTxsRoot::from_raw(Hash::from_bytes(b"settled")),
-            committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed")),
-        };
+        let root = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
         let (header, payloads, range_proof) =
-            terminal_block_with_witnesses(parent, 9, 599_000, pair, composed, 3, Some(roots));
+            terminal_block_with_witnesses(parent, 9, 599_000, pair, composed, 3, Some(root));
         let (committed, contributions) = contribution_for(
             parent,
             header,
@@ -3627,11 +3625,11 @@ mod tests {
         let record = state
             .boundaries
             .get(&parent)
-            .expect("the record survives the fold that first carries its roots");
+            .expect("the record survives the fold that first carries its root");
         assert_eq!(
-            record.terminal_roots,
-            Some(roots),
-            "and it carries them, for a surviving counterpart to read",
+            record.terminal_settled_txs,
+            Some(root),
+            "and it carries it, for a surviving counterpart to read",
         );
     }
 
@@ -3801,7 +3799,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3826,7 +3824,7 @@ mod tests {
                     terminal_epoch: Some(Epoch::new(1)),
                     handoff_complete: None,
                     terminal_delivered: true,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3935,13 +3933,8 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let total = MAX_WITNESSES_PER_SHARD as u64 + 6;
         let root = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled transaction"));
-        let roots = TerminalRoots {
-            settled_txs: root,
-            committed_txs: CommittedTxsRoot::ZERO,
-        };
-
         let (header, payloads, _range_proof) =
-            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, Some(roots));
+            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, Some(root));
         let first_chunk = sub_chunk(&payloads, 0, MAX_WITNESSES_PER_SHARD);
         let (committed, contributions) = contribution_for(parent, header, first_chunk, 2_500);
         record_boundaries(
@@ -3955,7 +3948,7 @@ mod tests {
         );
 
         let folded = state.boundaries.get(&parent).expect("lingers mid-drain");
-        assert_eq!(folded.terminal_roots.map(|r| r.settled_txs), Some(root));
+        assert_eq!(folded.terminal_settled_txs, Some(root));
 
         // The projection carries the root onto the anchor regardless of
         // trie membership: a terminated parent leaves the trie, but its
@@ -3964,7 +3957,7 @@ mod tests {
             .derive_topology_snapshot(net())
             .boundary(parent)
             .expect("terminal record projects");
-        assert_eq!(anchor.terminal_roots.map(|r| r.settled_txs), Some(root));
+        assert_eq!(anchor.terminal_settled_txs, Some(root));
     }
 
     // ─── merge parent composition ────────────────────────────────────────
@@ -3998,7 +3991,7 @@ mod tests {
                     terminal_epoch: Some(Epoch::new(1)),
                     handoff_complete: None,
                     terminal_delivered: false,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -4021,7 +4014,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -4423,7 +4416,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             }
         }
@@ -4551,6 +4544,25 @@ mod tests {
         );
     }
 
+    /// A Skip fold: the epoch advances with no witnesses and no
+    /// contributions.
+    fn skip_fold(state: &mut BeaconState) {
+        let next = state.current_epoch.next();
+        apply_epoch(&BlsVerifier, state, &net(), next, ApplyEpochInput::Skip);
+    }
+
+    /// [`assert_lookahead_becomes_the_active_entry`] across a Skip fold.
+    fn assert_lookahead_becomes_the_active_entry_on_a_skip(state: &mut BeaconState, what: &str) {
+        let lookahead = window_frozen_view(&state.derive_next_topology_snapshot(net()));
+        skip_fold(state);
+        let active = window_frozen_view(&state.derive_topology_snapshot(net()));
+        assert_eq!(
+            lookahead, active,
+            "the lookahead written before {what} must equal the active entry \
+             re-derived at that window's promotion",
+        );
+    }
+
     /// The two writes agree across every fold a reshape passes through:
     /// admission, the readiness gate that schedules the cut, and the fold
     /// at the cut that applies it. The scheduling fold is the one that
@@ -4586,6 +4598,11 @@ mod tests {
         );
         assert_lookahead_becomes_the_active_entry(&mut state, "a split admission");
 
+        // A beacon stall between admission and the gate: two Skip folds,
+        // each moving the readiness deadline and leaving the floor.
+        assert_lookahead_becomes_the_active_entry_on_a_skip(&mut state, "the first skip");
+        assert_lookahead_becomes_the_active_entry_on_a_skip(&mut state, "the second skip");
+
         // Every observer readies, so the next fold's gate schedules the cut.
         let seats: Vec<(ValidatorId, ShardId)> = match &state.pending_reshapes[&p] {
             PendingReshape::Split { cohort, .. } => {
@@ -4612,6 +4629,121 @@ mod tests {
         assert!(
             state.pending_reshapes.is_empty(),
             "the cut must have applied for this to cover the applying fold",
+        );
+    }
+
+    /// The fence never arms below the floor: at every instant from the
+    /// admitting window to the cut at which a straddler naming the shard
+    /// is held, the settled window reaches back to the admission, however
+    /// many Skip folds sit between admission and the gate. A floor taken
+    /// from the first frozen window showing the split pending, or from
+    /// the cut, sits above such an instant and fails here.
+    #[test]
+    fn the_fence_never_arms_below_the_floor() {
+        const EPOCH_MS: u64 = 400_000;
+        let p = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(4);
+        state.chain_config.shard_size = 4;
+        state.chain_config.epoch_duration_ms = EPOCH_MS;
+        state.shard_committees = state.next_shard_committees.clone();
+        for i in 0..4u64 {
+            state.validators.insert(
+                ValidatorId::new(1000 + i),
+                validator_record(1000 + i, 0, ValidatorStatus::Pooled),
+            );
+        }
+        apply_next_epoch(&mut state, &[]);
+        // The schedule as the beacon coordinator keeps it: each fold
+        // records its window and publishes the next one's projection.
+        let publish = |state: &BeaconState, schedule: &mut TopologySchedule| {
+            schedule.insert(
+                state.current_epoch,
+                Arc::new(state.derive_topology_snapshot(net())),
+            );
+            schedule.insert_lookahead(
+                state.current_epoch.next(),
+                Arc::new(state.derive_next_topology_snapshot(net())),
+            );
+        };
+        let mut schedule = TopologySchedule::new(
+            EPOCH_MS,
+            state.current_epoch,
+            Arc::new(state.derive_topology_snapshot(net())),
+        );
+        publish(&state, &mut schedule);
+
+        // The admitting fold folds the trigger and publishes the split
+        // pending.
+        apply_next_epoch(&mut state, &[]);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
+        );
+        let admitted = state.current_epoch;
+        publish(&state, &mut schedule);
+
+        // A stall: three Skip folds.
+        for _ in 0..3 {
+            skip_fold(&mut state);
+            publish(&state, &mut schedule);
+        }
+
+        // The observers ready; the next fold's gate schedules the cut, and
+        // the fold after applies it.
+        let seats: Vec<(ValidatorId, ShardId)> = match &state.pending_reshapes[&p] {
+            PendingReshape::Split { cohort, .. } => {
+                cohort.iter().map(|(id, seat)| (*id, seat.child)).collect()
+            }
+            PendingReshape::Merge { .. } => panic!("a split was admitted"),
+        };
+        for (validator, child) in seats {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                p,
+                &ShardWitnessPayload::ReshapeReady { validator, child },
+            );
+        }
+        apply_next_epoch(&mut state, &[]);
+        let cut = state.pending_reshapes[&p]
+            .scheduled_terminal()
+            .expect("the gate schedules the cut");
+        publish(&state, &mut schedule);
+        apply_next_epoch(&mut state, &[]);
+        assert!(state.pending_reshapes.is_empty(), "the cut applies");
+        publish(&state, &mut schedule);
+
+        let floor = WeightedTimestamp::from_millis(
+            admitted.inner() * EPOCH_MS - RETENTION_HORIZON.as_secs() * 1000,
+        );
+        let mut held = 0;
+        let step = EPOCH_MS / 8;
+        let mut wt_ms = admitted.inner() * EPOCH_MS;
+        while wt_ms <= cut.inner() * EPOCH_MS {
+            let wt = WeightedTimestamp::from_millis(wt_ms);
+            if schedule.termination_scheduled(p, wt) {
+                held += 1;
+                let read = schedule
+                    .settled_window_floor(p, wt)
+                    .expect("a held instant reads a floor");
+                assert!(
+                    read <= floor,
+                    "at {wt_ms} ms the fence holds but the floor {read:?} sits above the \
+                     admission's {floor:?}",
+                );
+            }
+            wt_ms += step;
+        }
+        assert!(
+            held > 0,
+            "the fence must hold somewhere in the span, or nothing was checked"
         );
     }
 
@@ -4655,7 +4787,7 @@ mod tests {
                     terminal_epoch: None,
                     handoff_complete: None,
                     terminal_delivered: false,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -5172,7 +5304,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         }
     }

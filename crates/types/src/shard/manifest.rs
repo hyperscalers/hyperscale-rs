@@ -5,9 +5,9 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
-    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    Engagements, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    QuorumCertificate, StateClaim, TxHash, Verifiable, WitnessSources,
+    QuorumCertificate, StateClaim, TickManifest, TxHash, Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -28,10 +28,15 @@ pub struct BlockManifest {
     /// the records themselves however long after the terminal they came
     /// from, and there is no later source to fetch them from.
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
-    /// The block's state claims, mirrored verbatim: they are small, and
-    /// a voter checks each against a proof of its own rather than
-    /// against anything it could fetch back from a later source.
+    /// The block's state claims, mirrored verbatim with their proofs:
+    /// the section is bounded by its own byte budget, and a claim is
+    /// checked from the block rather than against anything a voter
+    /// could fetch back from a later source.
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    /// The block's tick manifest, mirrored verbatim: a voter checks each
+    /// line against committed content, and every seat folds the lines
+    /// the block names.
+    tick_manifest: TickManifest,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
@@ -49,6 +54,7 @@ impl Default for BlockManifest {
             provision_hashes: Capped::empty(),
             abandonment_records: Capped::empty(),
             state_claims: Capped::empty(),
+            tick_manifest: Capped::empty(),
             witness_sources: WitnessSources::empty(),
         }
     }
@@ -64,6 +70,7 @@ impl BlockManifest {
         provision_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
         abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
         state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+        tick_manifest: TickManifest,
         witness_sources: WitnessSources,
     ) -> Self {
         Self {
@@ -72,6 +79,7 @@ impl BlockManifest {
             provision_hashes,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         }
     }
@@ -113,6 +121,12 @@ impl BlockManifest {
         &self.state_claims
     }
 
+    /// The block's tick manifest.
+    #[must_use]
+    pub const fn tick_manifest(&self) -> &TickManifest {
+        &self.tick_manifest
+    }
+
     /// The block's beacon-witness inputs.
     #[must_use]
     pub const fn witness_sources(&self) -> &WitnessSources {
@@ -148,6 +162,7 @@ impl BlockManifest {
             provision_hashes,
             block.abandonment_records().clone(),
             block.state_claims().clone(),
+            block.tick_manifest().clone(),
             block.witness_sources().as_ref().clone(),
         )
     }
@@ -171,6 +186,11 @@ impl BlockManifest {
 pub struct BlockMetadata {
     header: BlockHeader,
     manifest: BlockManifest,
+    /// The engagements the block's provisions named, kept beside the
+    /// manifest rather than in it: a proposal derives them from the
+    /// bodies it carries, and only the stored form, which drops the
+    /// bodies, has to keep them.
+    engagements: Engagements,
     qc: Verifiable<QuorumCertificate>,
     beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
 }
@@ -189,6 +209,13 @@ impl BlockMetadata {
     /// Storage backends call this so the fetch responder can map
     /// `committed_block_hash` to a `(first_leaf, last_leaf)` range without
     /// re-walking history.
+    ///
+    /// # Panics
+    ///
+    /// If the block's provisions name more than
+    /// [`MAX_ENGAGEMENTS_PER_BLOCK`](crate::MAX_ENGAGEMENTS_PER_BLOCK)
+    /// transactions, which the provisions section refuses of any block a
+    /// chain commits.
     #[must_use]
     pub fn from_block_with_witness_count(
         block: &Block,
@@ -198,6 +225,8 @@ impl BlockMetadata {
         Self {
             header: block.header().clone(),
             manifest: BlockManifest::from_block(block),
+            engagements: Capped::new(block.engagements().into_owned())
+                .expect("the provisions section caps what a block's provisions name"),
             qc: qc.into(),
             beacon_witness_leaf_count_at_block_end,
         }
@@ -213,6 +242,12 @@ impl BlockMetadata {
     #[must_use]
     pub const fn manifest(&self) -> &BlockManifest {
         &self.manifest
+    }
+
+    /// The engagements the block's provisions named.
+    #[must_use]
+    pub const fn engagements(&self) -> &Engagements {
+        &self.engagements
     }
 
     /// Quorum certificate that commits this block.
@@ -235,12 +270,14 @@ impl BlockMetadata {
     ) -> (
         BlockHeader,
         BlockManifest,
+        Engagements,
         Verifiable<QuorumCertificate>,
         BeaconWitnessLeafCount,
     ) {
         (
             self.header,
             self.manifest,
+            self.engagements,
             self.qc,
             self.beacon_witness_leaf_count_at_block_end,
         )

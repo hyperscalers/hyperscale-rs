@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, Licence};
+use hyperscale_engine::legs::Classified;
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
     AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE,
@@ -30,6 +30,8 @@ use hyperscale_types::{
     TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window,
 };
+use hyperscale_vm_effects::{Answered, Kind};
+use hyperscale_vm_types::ProtocolHasher;
 
 /// What the chain read of one cell a counterpart was asked about:
 /// which question the cell answers, and what it said.
@@ -45,6 +47,25 @@ struct Reading {
     inclusion: Inclusion,
 }
 
+/// How far a tick of this shard's has spoken for a transaction, in the
+/// order the ranks outrank each other: a tick discarded, wedged or
+/// refused never lowers it, and a second abandonment composes the same
+/// answer a first did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Certified {
+    /// No tick of this shard's has taken the transaction.
+    No,
+    /// A tick took it as an abandonment: no execution of ours ran, so
+    /// no counterpart holds a certificate of ours to combine an accept
+    /// with, and the abandonment's own answer is the only one this
+    /// shard gives.
+    ByAbandonment,
+    /// A tick took it as an executing member. Its certificate may be
+    /// out and a sibling may have combined an accept with it, so no
+    /// later exit of this shard's may answer for it.
+    ByExecution,
+}
+
 /// One committed transaction's outstanding account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Owed {
@@ -55,15 +76,17 @@ struct Owed {
     /// them from and must release exactly what was taken, and because a
     /// record naming the transaction restates exactly these.
     figures: UnsettledTx,
-    /// Whether a tick of this shard's took the transaction as a member.
+    /// How far a tick of this shard's has spoken for the transaction.
     ///
     /// What it answers is whether a certificate of ours is out where a
     /// counterpart could settle against it, which is what decides whether
-    /// this shard may speak for the transaction alone. The account is
-    /// where it belongs rather than the tick that produced it: the
-    /// certificate outlives the tick, and a shard that could not say
-    /// whether it had issued one would have to assume it had.
-    certified: bool,
+    /// this shard may speak for the transaction alone, and whether that
+    /// certificate came from an execution, which is what decides whether
+    /// an abandonment may still answer for it. The account is where it
+    /// belongs rather than the tick that produced it: the certificate
+    /// outlives the tick, and a shard that could not say whether it had
+    /// issued one would have to assume it had.
+    certified: Certified,
     /// What this shard's part in the transaction is, which decides what
     /// the entry waits on and what ends it, with whatever it keeps for
     /// the settlement of what it issued.
@@ -82,17 +105,6 @@ struct Owed {
     /// is a block carrying the abort — and the departure that covered it
     /// is the one clock both the entry and the record are stated in.
     departed_by: Option<ShardId>,
-    /// Where a consumer's certificate spoke a claiming success for this
-    /// transaction, if one has.
-    ///
-    /// The cue to ask, never the answer. A certificate says a
-    /// counterpart's execution succeeded; whether it wrote the claim its
-    /// success promises is a question about that shard's committed
-    /// state, and only its state answers. Opening the probe here rather
-    /// than at the deadline is what keeps a retirement as prompt as that
-    /// state can show it, which is one [`CLAIM_VISIBILITY_LAG`](hyperscale_types::CLAIM_VISIBILITY_LAG) past the
-    /// anchor kept here.
-    cued: Option<WeightedTimestamp>,
     /// The core shards whose certificates accepted it. A core shard's
     /// tick closes on every other core shard's certificate, so one
     /// saying it succeeded is not the transaction accepted — that is
@@ -110,14 +122,6 @@ struct Owed {
 }
 
 impl Owed {
-    /// Whether the chain read `claim` present on some shard: the
-    /// consumer holds the crossing the cell was asked about.
-    fn claimed(&self, claim: SubstateKey) -> bool {
-        self.readings.iter().any(|(&(_, key), reading)| {
-            key == claim && matches!(reading.inclusion, Inclusion::Present(_))
-        })
-    }
-
     /// The questions the chain read absent, each an answer that the
     /// counterpart asked can never settle the transaction.
     fn absences(&self) -> impl Iterator<Item = Probed> + '_ {
@@ -126,35 +130,45 @@ impl Owed {
         })
     }
 
+    /// Whether the chain read a consumer's `Never` present: the
+    /// consumer's own word that it will never take the crossing.
+    fn declined(&self) -> bool {
+        self.readings.values().any(|reading| {
+            reading.probed == Probed::Decline && matches!(reading.inclusion, Inclusion::Present(_))
+        })
+    }
+
     /// Whether the chain has established that no counterpart can settle
-    /// the transaction: a departed shard's record names it, or a cell a
+    /// the transaction: a departed shard's record names it, a cell a
     /// counterpart would have written was read absent inside its
-    /// window. Either licenses the abandonment or the reclaim, and puts
-    /// every question the entry asks to rest.
+    /// window, or a consumer's `Never` was read present. Any of the
+    /// three licenses the abandonment or the reclaim, and puts every
+    /// question the entry asks to rest.
     fn covered(&self) -> bool {
-        self.departed_by.is_some() || self.absences().next().is_some()
+        self.departed_by.is_some() || self.absences().next().is_some() || self.declined()
     }
 
     /// What the evidence covering the entry established of the
     /// transaction, where it established a verdict at all: a departure
     /// or a core's committed cell absent says the core never took it,
-    /// which aborts the transaction; a delivery's claim absent says only
-    /// that the delivery lapsed, and the core decided.
+    /// and a consumer's `Never` says it refused it, which aborts the
+    /// transaction either way.
+    ///
+    /// Every way of being covered is one of those three, so this is
+    /// [`Self::covered`] with the verdict said out loud rather than a
+    /// second reading of the same rows: a reading that answers nothing
+    /// never reaches `readings` at all.
     fn abandoned_verdict(&self) -> Option<TransactionDecision> {
-        (self.departed_by.is_some() || self.absences().any(|probed| matches!(probed, Probed::Core)))
-            .then_some(TransactionDecision::Aborted)
+        self.covered().then_some(TransactionDecision::Aborted)
     }
 
     /// The moment the entry stops being settleable and becomes the
-    /// shard's to abandon: the transaction's deadline, or for a delivery
-    /// the close of its window, past which the crossing it would claim
-    /// lapses and its issuer may reclaim it.
-    fn opens(&self) -> WeightedTimestamp {
-        if self.part.is_delivery() {
-            Window::Delivery.of(self.figures.deadline).end
-        } else {
-            self.figures.deadline.at()
-        }
+    /// shard's to abandon: the transaction's deadline. A delivery never
+    /// reaches this — the crossing it claims is owed to this shard and
+    /// nothing takes it back, so there is no instant at which giving up
+    /// on it would be right.
+    const fn opens(&self) -> WeightedTimestamp {
+        self.figures.deadline.at()
     }
 
     /// Where a tick may abandon the entry: from its opening, for the one
@@ -162,6 +176,11 @@ impl Owed {
     fn abandon_window(&self) -> Range<WeightedTimestamp> {
         let opens = self.opens();
         opens..opens.plus(MAX_VALIDITY_RANGE)
+    }
+
+    /// Whether an executing tick of this shard's took the transaction.
+    const fn executed(&self) -> bool {
+        matches!(self.certified, Certified::ByExecution)
     }
 }
 
@@ -206,24 +225,17 @@ pub struct Unanswerable {
 /// What this shard's part in a transaction is, which decides what the
 /// entry waits on and what ends it.
 ///
-/// Two of the parts hold nothing beyond their account: a whole shape
-/// and a delivery are decided by their own finalization or abandoned at
-/// their window. The rest keep the body and the classification a
-/// settlement is composed from, and a leg entry — a leg's, or a
-/// resolved issuer's — keeps beside them where that settlement stands.
+/// A whole shape holds nothing beyond its account: it is decided by its
+/// own finalization or abandoned at its deadline. The rest keep the
+/// body and the classification the work they run is composed from, and
+/// a leg entry — a leg's, or a resolved issuer's — keeps beside them
+/// where its settlement stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
     /// This shard's verdict is the transaction's, or a share of it: the
     /// entry is abandonable at its deadline and released by that
     /// verdict.
     Whole,
-    /// This shard only delivers: a leg outside the core that bears no
-    /// verdict and issues nothing, admissible to the delivery window's
-    /// close, which is its deadline. Abandoned there like a whole entry
-    /// — and, unlike one, out of any tick still holding it, since past
-    /// the close the crossing it would claim lapses and its issuer may
-    /// reclaim it.
-    Delivery,
     /// A leg outside the core, held for the settlement of what it
     /// issued: never abandoned, probed past the deadline, released by
     /// the reclaim or the retirement.
@@ -245,10 +257,14 @@ pub enum Part {
 pub struct LegEntry {
     /// The body and the classification the settlement derives from.
     kept: Kept,
-    /// Which tick of this shard's has taken the entry's records — a
-    /// reclaim or a retirement — so the finalization naming the hash
-    /// next is that member's.
-    taken: Option<Licence>,
+    /// Whether a tick of this shard's has taken the entry's records for
+    /// the reclaim, so the finalization naming the hash next is that
+    /// member's.
+    reclaiming: bool,
+    /// The records this entry issued here that the commit fold has
+    /// removed on their consumers' `Taken`: what the entry closes on,
+    /// once every one of them is here.
+    gone: BTreeSet<SubstateKey>,
     /// Whether a committed finalization of this shard's settled the
     /// transaction's price: a leg's own, which burned it inside its
     /// writes, or the verdict that made an issuer a remainder.
@@ -264,9 +280,23 @@ impl LegEntry {
     const fn unsettled(kept: Kept, charged: bool) -> Self {
         Self {
             kept,
-            taken: None,
+            reclaiming: false,
+            gone: BTreeSet::new(),
             charged,
         }
+    }
+
+    /// Whether the commit fold has closed what this entry waited on:
+    /// every record it issued here removed on its consumer's `Taken`,
+    /// nothing covering it and no reclaim taking its records. Every
+    /// input is committed content. A shard's owed crossings arrive by
+    /// its commit fold and owe it nothing, so a shard with legs on both
+    /// sides of the core closes on its records alone.
+    fn settled(&self, local: ShardId) -> bool {
+        let issued = self.kept.issued(local);
+        !issued.is_empty()
+            && issued.iter().all(|record| self.gone.contains(record))
+            && !self.reclaiming
     }
 }
 
@@ -274,11 +304,6 @@ impl Part {
     /// A whole entry.
     pub(crate) const fn whole() -> Self {
         Self::Whole
-    }
-
-    /// A delivery.
-    pub(crate) const fn delivery() -> Self {
-        Self::Delivery
     }
 
     /// A leg outside the core, with the body and classification its
@@ -305,18 +330,13 @@ impl Part {
         matches!(self, Self::Remainder(_))
     }
 
-    /// Whether the entry only delivers.
-    const fn is_delivery(&self) -> bool {
-        matches!(self, Self::Delivery)
-    }
-
     /// Whether a core issuer still holds crossings its deliveries owe a
     /// claim for, so its verdict resolves the transaction and leaves the
     /// entry standing for the reclaim.
     fn issued(&self, local: ShardId) -> bool {
         match self {
             Self::Core(kept) => !kept.deliveries(local).is_empty(),
-            Self::Whole | Self::Delivery | Self::Leg(_) | Self::Remainder(_) => false,
+            Self::Whole | Self::Leg(_) | Self::Remainder(_) => false,
         }
     }
 
@@ -339,19 +359,18 @@ impl Part {
     }
 
     /// Record that a tick of this shard's has taken a leg entry's
-    /// records on `licence`.
-    const fn take(&mut self, licence: Licence) {
+    /// records for the reclaim.
+    const fn take_reclaim(&mut self) {
         if let Some(held) = self.held_mut() {
-            held.taken = Some(licence);
+            held.reclaiming = true;
         }
     }
 
-    /// The licence a tick has taken a leg entry's records on, if one
-    /// has.
-    const fn taken(&self) -> Option<Licence> {
-        match self.held() {
-            Some(held) => held.taken,
-            None => None,
+    /// Record that the commit fold removed `record`, one this entry
+    /// issued, on its consumer's `Taken`.
+    fn mark_gone(&mut self, record: SubstateKey) {
+        if let Some(held) = self.held_mut() {
+            held.gone.insert(record);
         }
     }
 
@@ -359,24 +378,33 @@ impl Part {
     const fn held(&self) -> Option<&LegEntry> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(held),
-            Self::Whole | Self::Delivery | Self::Core(_) => None,
+            Self::Whole | Self::Core(_) => None,
         }
     }
 
     const fn held_mut(&mut self) -> Option<&mut LegEntry> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(held),
-            Self::Whole | Self::Delivery | Self::Core(_) => None,
+            Self::Whole | Self::Core(_) => None,
         }
     }
 
-    /// What the entry keeps beside its account, where it keeps anything.
+    /// What the entry keeps beside its account, where it keeps
+    /// anything: every part but a whole shape, which is decided by its
+    /// own finalization and composes nothing.
     const fn kept(&self) -> Option<&Kept> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(&held.kept),
             Self::Core(kept) => Some(kept),
-            Self::Whole | Self::Delivery => None,
+            Self::Whole => None,
         }
+    }
+
+    /// What an entry that issues crossings of its own composes their
+    /// settlement from, and whose core a mirrored verdict and a probe
+    /// are read off.
+    const fn settling(&self) -> Option<&Kept> {
+        self.kept()
     }
 
     /// The part `local` plays in a transaction frozen as `classified`,
@@ -385,39 +413,15 @@ impl Part {
     /// Read off the classification the committing block froze, at the
     /// same commit, so a rebuilt ledger marks the same entries: the
     /// freeze is a function of the block and the placement it committed
-    /// under, and the replay re-freezes both.
-    ///
-    /// Classifies **a shard's one entry**, which covers both members a
-    /// shard may run, and so asks `only_delivers_at` — every leg here is
-    /// a delivery — rather than any member's side. Not the same question
-    /// as [`Membership::of`](crate::tick_state::Membership::of), whose
-    /// branch looks alike and answers `Delivery` for the delivering
-    /// member of a shard this calls a leg. A shard with legs on both
-    /// sides of the core holds one entry, and it is the leg's: the
-    /// delivering member bears no verdict and owes no reclaim, so an
-    /// entry marked `Delivery` for it would abandon at the delivery
-    /// window's close what the leg is still owed a reclaim of.
+    /// under, and the replay re-freezes both. A shard only ever holds an
+    /// entry for a transaction it commits, so a divided one here is a
+    /// core member or a leg.
     fn of(local: ShardId, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) -> Self {
         if !classified.decomposed() {
             return Self::whole();
         }
-        let in_core = classified.core().contains(&local);
-        if !in_core && classified.only_delivers_at(local) {
-            return Self::delivery();
-        }
-        // Block-container entries decoded from the wire land as
-        // `Unverified`; lift via `from_persisted` under the same
-        // BFT-transitive trust that gates the containing block. Honest
-        // live-consensus blocks already carry `Verified` entries.
-        let body: Arc<Verified<Transaction>> = match (**tx).clone().into_verified() {
-            Ok(verified) => Arc::new(verified),
-            Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
-        };
-        let kept = Kept {
-            body,
-            classified: classified.clone(),
-        };
-        if in_core {
+        let kept = Kept::of(tx, classified);
+        if classified.core().contains(&local) {
             Self::core(kept)
         } else {
             Self::leg(kept)
@@ -438,6 +442,24 @@ pub struct Kept {
 }
 
 impl Kept {
+    /// The body and the classification an entry keeps, read off the
+    /// classification the committing block froze.
+    ///
+    /// Block-container entries decoded from the wire land as
+    /// `Unverified`; lift via `from_persisted` under the same
+    /// BFT-transitive trust that gates the containing block. Honest
+    /// live-consensus blocks already carry `Verified` entries.
+    pub(crate) fn of(tx: &Verifiable<Transaction>, classified: &Classified) -> Self {
+        let body: Arc<Verified<Transaction>> = match tx.clone().into_verified() {
+            Ok(verified) => Arc::new(verified),
+            Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
+        };
+        Self {
+            body,
+            classified: classified.clone(),
+        }
+    }
+
     /// Whose refusal is the transaction's, and whose committed cells a
     /// probe asks about. An issuer in the core holds the core it is
     /// part of, itself included; the prober skips this shard, since
@@ -447,14 +469,40 @@ impl Kept {
         self.classified.core()
     }
 
-    /// The claim cells deliveries elsewhere write for the crossings
-    /// `local` issued, each under the shard that was to deliver it when
-    /// the transaction committed — what a lapse probe asks about once
-    /// the delivery window has closed. The cell follows its prefix to a
-    /// departed deliverer's successor, which [`Ledger::questions`]
+    /// The record cells `local` writes for the crossings it issued, of
+    /// either kind: what the commit fold removes one by one as their
+    /// consumers' `Taken` is read, and what the entry closes on.
+    fn issued(&self, local: ShardId) -> Vec<SubstateKey> {
+        self.classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == local)
+            .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+            .collect()
+    }
+
+    /// The claim cells the consumers' folds write for the owed crossings
+    /// `local` issued, each under the shard that held the consumer when
+    /// the transaction committed. The cell follows its prefix to a
+    /// departed consumer's successor, which [`Ledger::questions`]
     /// resolves off the trie it is given.
     fn deliveries(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.classified.delivered_claims(local)
+        self.answers(local, Kind::Owed, Answered::Taken)
+    }
+
+    /// The answer cells in `answered`'s role that consumers of the
+    /// `kind` crossings `local` issued write, each under the consumer's
+    /// frozen home.
+    fn answers(
+        &self,
+        local: ShardId,
+        kind: Kind,
+        answered: Answered,
+    ) -> Vec<(ShardId, SubstateKey)> {
+        self.classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == local && edge.crossing.kind == kind)
+            .map(|(edge, home)| (home, edge.crossing.id.answer_key(&ProtocolHasher, answered)))
+            .collect()
     }
 
     /// The claim cells core consumers write for the crossings a leg on
@@ -464,26 +512,22 @@ impl Kept {
     /// core is the core's, so nothing a core shard produces is claimed
     /// by a core it is not in.
     fn claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.classified.core_claims(local)
+        self.answers(local, Kind::Escrowed, Answered::Taken)
     }
 
-    /// Every claim cell a consumer elsewhere writes for what `local`
-    /// issued, whichever side consumes it.
-    fn every_claim(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        let mut claims = self.claims(local);
-        claims.extend(self.deliveries(local));
-        claims
+    /// The decline cells core consumers write for the escrowed crossings
+    /// `local` issued: the `Never` beside each of [`Self::claims`].
+    fn declines(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        self.answers(local, Kind::Escrowed, Answered::Never)
     }
 }
 
 /// A leg entry a committed record has licensed a settlement of, with
 /// what the settlement is composed from.
 ///
-/// One shape for both, because the terms are the same ones: which
-/// records, off which body, under which classification, and whether the
-/// price is still owed. What differs is the licence, which is the
-/// selector's — [`Ledger::reclaimable`] or
-/// [`Ledger::retirable`] — and not a field here.
+/// Which records, off which body, under which classification, and
+/// whether the price is still owed: what [`Ledger::reclaimable`] hands
+/// the composer.
 #[derive(Debug, Clone)]
 pub struct Settleable {
     /// The transaction.
@@ -493,12 +537,10 @@ pub struct Settleable {
     /// The classification its committing block froze.
     pub(crate) classified: Classified,
     /// Whether a committed finalization of this shard's settled the
-    /// price, so the settlement charges nothing.
-    ///
-    /// Always true for a retirable entry — a resolved issuer is charged
-    /// where it resolves, and a leg is charged when its own finalization
-    /// commits, which is before a retirement can be composed for it — so
-    /// only a reclaim ever reads a `false` here.
+    /// price, so the reclaim charges nothing: a resolved issuer is
+    /// charged where it resolves, and a leg when its own finalization
+    /// commits. A leg that never ran, or whose tick was discarded before
+    /// its finalization committed, owes it on the reclaim's.
     pub(crate) charged: bool,
 }
 
@@ -523,22 +565,16 @@ pub struct Question {
     /// The entry's deadline, which every window an answer is held to
     /// is read off.
     pub(crate) deadline: Deadline,
-    /// Where a consumer's claiming success was spoken, if one has been
-    /// heard: the anchor that opens a presence question ahead of the
-    /// deadline, and that the cell it asks about becomes readable one
-    /// [`CLAIM_VISIBILITY_LAG`](hyperscale_types::CLAIM_VISIBILITY_LAG) past.
-    pub(crate) cued: Option<WeightedTimestamp>,
 }
 
 impl Question {
     /// Whether the question is worth putting at `now`, the chain's
-    /// committed clock: past the deadline, or cued by a consumer's
-    /// claiming success. The deadline opens the absence — before it the
-    /// core may still legitimately commit, so absence says nothing —
-    /// and the cue opens the presence, which needs no window at all.
+    /// committed clock: past the deadline. Before it the core may still
+    /// legitimately commit, so an absence says nothing, and a presence
+    /// arrives by push.
     #[must_use]
     pub(crate) fn open_at(self, now: WeightedTimestamp) -> bool {
-        self.deadline.passed(now) || self.cued.is_some()
+        self.deadline.passed(now)
     }
 }
 
@@ -546,15 +582,9 @@ impl Question {
 /// names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Meaning {
-    /// The retirement's: every consumer claimed, so the transaction was
-    /// accepted, whatever this member's own outcome says of the records.
-    Retired,
     /// A leg finalizing here without deciding: it ran, and the core
     /// decides the transaction.
     LegRan,
-    /// A delivery that succeeded claimed what an accepted core issued,
-    /// which is the verdict.
-    Delivered,
     /// The reclaim of what a leg issued, reporting what the evidence
     /// covering it established of the transaction — a departure, or a
     /// core that never took it, aborts it; a delivery that lapsed says
@@ -569,14 +599,7 @@ enum Meaning {
 fn meaning(owed: Option<&Owed>, deciding: bool, decision: TransactionDecision) -> Meaning {
     let accepted = decision == TransactionDecision::Accept;
     match owed {
-        Some(owed) if owed.part.taken() == Some(Licence::Claimed) => Meaning::Retired,
-        _ if !deciding => {
-            if accepted && owed.is_some_and(|owed| owed.part.is_delivery()) {
-                Meaning::Delivered
-            } else {
-                Meaning::LegRan
-            }
-        }
+        _ if !deciding => Meaning::LegRan,
         Some(owed) if accepted && owed.part.is_leg() => {
             Meaning::Reclaimed(owed.abandoned_verdict())
         }
@@ -673,12 +696,12 @@ impl Ledger {
                     tx,
                     committed,
                     classified.local_price(tx, self.local, prices),
+                    classified.escrowed_records(self.local),
                     prices,
                 ),
-                certified: false,
+                certified: Certified::No,
                 part: Part::of(self.local, tx, classified),
                 departed_by: None,
-                cued: None,
                 accepted: BTreeSet::new(),
                 readings: BTreeMap::new(),
             };
@@ -714,7 +737,7 @@ impl Ledger {
     pub(crate) fn leg_core(&self, tx_hash: TxHash) -> Option<&BTreeSet<ShardId>> {
         self.owed
             .get(&tx_hash)
-            .and_then(|owed| owed.part.kept())
+            .and_then(|owed| owed.part.settling())
             .map(Kept::core)
     }
 
@@ -724,25 +747,6 @@ impl Ledger {
     pub(crate) fn core_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         self.leg_core(tx_hash)
             .is_some_and(|core| core.contains(&shard))
-    }
-
-    /// Whether `shard` consumes a crossing this shard issued for the
-    /// transaction — a core consumer's or a delivery's — so that its
-    /// acceptance is the claim the record here was held for.
-    ///
-    /// Matched on the claim's prefix rather than on the shard the
-    /// commit froze, because a claim cell follows its prefix across a
-    /// cut and the prober already asks whoever holds it now. Reading the
-    /// frozen shard alone would drop the successor's answer to the
-    /// question this ledger asked it.
-    #[must_use]
-    pub(crate) fn consumer_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        let kept = self.owed.get(&tx_hash).and_then(|owed| owed.part.kept());
-        kept.is_some_and(|kept| {
-            kept.every_claim(self.local)
-                .iter()
-                .any(|(_, claim)| ShardTrie::shard_owns_prefix(shard, claim.owner))
-        })
     }
 
     /// Mirror a core shard's acceptance, and say whether it was the last
@@ -766,8 +770,18 @@ impl Ledger {
 
     /// Record what the chain read of `key` on `shard` for `tx_hash`,
     /// the question `probed` asks. First reading wins: `false` says the
-    /// cell was already read, or the transaction is not held here, and
-    /// a later claim adds nothing.
+    /// cell was already read, the transaction is not held here, or the
+    /// reading answers nothing — and a later claim adds nothing.
+    ///
+    /// A reading [`Probed::read`] does not admit is refused here rather
+    /// than only at the fold that fetches one, because what it would
+    /// leave behind is not a spare row: [`Self::covered`] counts any
+    /// absence, so an absence that answers nothing would license a
+    /// reclaim. Capped at the store, the set of absences an entry can
+    /// hold is exactly the one `Probed::read` admits — the committed
+    /// cell's — which is what lets
+    /// [`Self::abandoned_verdict`] read it off `covered` rather than
+    /// filtering for it a second time.
     pub(crate) fn record_reading(
         &mut self,
         tx_hash: TxHash,
@@ -776,6 +790,9 @@ impl Ledger {
         probed: Probed,
         inclusion: Inclusion,
     ) -> bool {
+        if probed.read(inclusion).is_none() {
+            return false;
+        }
         let Some(owed) = self.owed.get_mut(&tx_hash) else {
             return false;
         };
@@ -788,27 +805,13 @@ impl Ledger {
         }
     }
 
-    /// Note that a consumer's certificate spoke a claiming success for
-    /// `tx_hash` at `at`, which opens its probe.
-    ///
-    /// The anchor is kept rather than a flag: it is where the writing
-    /// execution ran, so it is what the probe holds its own anchor to,
-    /// and every member reads it off the same certificate. Where more
-    /// than one consumer speaks, the earliest stands — the entry is
-    /// asked about as soon as any cell it waits on could be there.
-    pub(crate) fn cue_probe(&mut self, tx_hash: TxHash, at: WeightedTimestamp) {
-        if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.cued = Some(owed.cued.map_or(at, |cued| cued.min(at)));
-        }
-    }
-
     /// Every question this ledger has open, under `trie`, whatever the
     /// clock: for each entry nothing has answered for, each other core
-    /// shard's committed cell, each delivery's claim on the shard that
-    /// was to deliver it and on whatever shard holds the cell's prefix
-    /// now, and each core consumer's claim on the shard holding the
-    /// consumer's target and on whatever holds the prefix now — each
-    /// less the cells the chain has already read.
+    /// shard's committed cell, each core consumer's claim and decline on
+    /// the shard holding the consumer's target and on whatever holds the
+    /// prefix now, and each delivery's claim on the shard that was to
+    /// deliver it and on whatever shard holds the cell's prefix now —
+    /// each less the cells the chain has already read.
     ///
     /// Whatever the clock, because a claim the chain committed is read
     /// against these too, and the claim's own anchor says whether the
@@ -829,7 +832,7 @@ impl Ledger {
             if owed.covered() {
                 continue;
             }
-            let Some(kept) = owed.part.kept() else {
+            let Some(kept) = owed.part.settling() else {
                 continue;
             };
             let deadline = owed.figures.deadline;
@@ -840,7 +843,6 @@ impl Ledger {
                     key,
                     probed,
                     deadline,
-                    cued: owed.cued,
                 })
             };
             // What an entry asks about is what it waits on. A leg waits
@@ -849,6 +851,14 @@ impl Ledger {
             // whose certificates its own settlement needs. Its
             // deliveries are what it waits on once it has a verdict, as
             // the remainder its acceptance leaves.
+            //
+            // A sibling that refused keeps its committed cell, so the
+            // cell reads present and answers nothing here: what covers
+            // the waiting core is the sibling's certificate, pushed by
+            // its outbound tracker and servable by transaction inside
+            // its retention. Losing that road costs liveness only — a
+            // presence licenses no credit, so nothing is taken back on
+            // it.
             questions.extend(
                 kept.core()
                     .iter()
@@ -861,19 +871,29 @@ impl Ledger {
             if !owed.part.is_leg() {
                 continue;
             }
-            for (delivered_by, claim) in kept.deliveries(local) {
-                questions.extend(
-                    BTreeSet::from([delivered_by, trie.shard_for_prefix(claim.owner)])
-                        .into_iter()
-                        .filter_map(|shard| question(shard, claim, Probed::Delivery)),
-                );
-            }
+            // One question per answer cell, whichever kind of consumer
+            // writes it: a claim or a decline answers by being present
+            // and by nothing else, so the side it was issued to changes
+            // nothing about what is asked. A core consumer is asked for
+            // both of its answers — it took the crossing, or it never
+            // will — and a delivery for its claim alone, since nothing
+            // takes an owed crossing back. Asked of the shard the
+            // classification homed the consumer on and of whoever holds
+            // its prefix now, which are the same shard until a cut moves
+            // it.
+            let asked = |consumer: ShardId, key: SubstateKey, probed: Probed| {
+                BTreeSet::from([consumer, trie.shard_for_prefix(key.owner)])
+                    .into_iter()
+                    .filter_map(move |shard| question(shard, key, probed))
+            };
             for (consumer, claim) in kept.claims(local) {
-                questions.extend(
-                    BTreeSet::from([consumer, trie.shard_for_prefix(claim.owner)])
-                        .into_iter()
-                        .filter_map(|shard| question(shard, claim, Probed::Claim)),
-                );
+                questions.extend(asked(consumer, claim, Probed::Claim));
+            }
+            for (consumer, decline) in kept.declines(local) {
+                questions.extend(asked(consumer, decline, Probed::Decline));
+            }
+            for (consumer, claim) in kept.deliveries(local) {
+                questions.extend(asked(consumer, claim, Probed::Claim));
             }
         }
         questions
@@ -885,22 +905,22 @@ impl Ledger {
         self.owed.contains_key(&tx_hash)
     }
 
-    /// Whether an entry here will compose the disposal of the records
-    /// `tx_hash` issued on this shard, so the leaves are not the leaf
-    /// path's to settle beside it.
+    /// Whether an entry here will compose the disposal of the record at
+    /// `key`, so the leaf road leaves it to that entry.
     ///
-    /// The entries that keep a classification are exactly those: a leg
-    /// and a remainder settle what they issued, and a core member
-    /// becomes a remainder at its own verdict. A whole entry keeps
-    /// none — including one a record reconstructed, which carries the
-    /// figures an abandonment restates and nothing a settlement is
-    /// composed from. That entry gives the verdict and the reservation
-    /// back; the leaves are answered for where they are.
+    /// The entries that issue are exactly those: a leg and a remainder
+    /// settle what they issued, and a core member becomes a remainder
+    /// at its own verdict. A delivery and a whole entry issue none —
+    /// the whole one including a record reconstructed it, which carries
+    /// the figures an abandonment restates and nothing a settlement is
+    /// composed from. Scans the entries, as [`Self::untaken_legs`] does.
     #[must_use]
-    pub(crate) fn settles_records(&self, tx_hash: TxHash) -> bool {
-        self.owed
-            .get(&tx_hash)
-            .is_some_and(|owed| owed.part.kept().is_some())
+    pub(crate) fn settles_record(&self, key: SubstateKey) -> bool {
+        self.owed.values().any(|owed| {
+            owed.part
+                .settling()
+                .is_some_and(|kept| kept.issued(self.local).contains(&key))
+        })
     }
 
     /// Every leg entry no tick has taken the records of yet, with what
@@ -913,7 +933,7 @@ impl Ledger {
     fn untaken_legs(&self) -> impl Iterator<Item = (TxHash, &Owed, &LegEntry)> {
         self.owed.iter().filter_map(|(tx_hash, owed)| {
             let held = owed.part.held()?;
-            held.taken.is_none().then_some((*tx_hash, owed, held))
+            (!held.reclaiming).then_some((*tx_hash, owed, held))
         })
     }
 
@@ -950,59 +970,61 @@ impl Ledger {
     /// reclaim's and releases the entry.
     pub(crate) fn admit_reclaim(&mut self, tx_hash: TxHash) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.part.take(Licence::Unclaimed);
+            owed.part.take_reclaim();
         }
     }
 
-    /// The leg entries committed claims have licensed the retirement of
-    /// and no tick has taken yet: every crossing this shard issued has
-    /// its claim cell read present on some shard, no record covers the
-    /// entry as unsettled, and nothing is taking it back. Read off
-    /// committed content alone, like [`Self::reclaimable`], so every
-    /// replica composes the same.
+    /// Record that the commit fold removed `record` on its consumer's
+    /// `Taken`, on the entry `tx_hash` names.
+    pub(crate) fn settled(&mut self, record: SubstateKey) {
+        let local = self.local;
+        for owed in self.owed.values_mut() {
+            if owed
+                .part
+                .held()
+                .is_some_and(|held| held.kept.issued(local).contains(&record))
+            {
+                owed.part.mark_gone(record);
+            }
+        }
+    }
+
+    /// Close every leg entry the commit fold has settled, and say what
+    /// each closes as: the transaction was accepted, since every record
+    /// it issued here was taken.
     ///
-    /// A claim is answered by whoever holds its prefix, which after a
-    /// cut is the frozen consumer's successor — the same widening
-    /// [`Self::consumer_holds`] makes, and for the same reason — so the
-    /// cell is what is held to, not the shard it was read on.
-    #[must_use]
-    pub(crate) fn retirable(&self) -> Vec<Settleable> {
-        self.untaken_legs()
-            .filter(|(_, owed, _)| !owed.covered())
-            .filter_map(|(tx_hash, owed, held)| {
-                let claims: Vec<SubstateKey> = held
-                    .kept
-                    .every_claim(self.local)
-                    .into_iter()
-                    .map(|(_, claim)| claim)
-                    .collect();
-                (!claims.is_empty() && claims.iter().all(|claim| owed.claimed(*claim))).then(|| {
-                    Settleable {
-                        tx_hash,
-                        body: Arc::clone(&held.kept.body),
-                        classified: held.kept.classified.clone(),
-                        charged: held.charged,
-                    }
-                })
+    /// No finalization drives this close, so `resolutions_of` never
+    /// reports it: this is the one reading of it, taken once per commit
+    /// after the fold's removals and the block's own finalizations have
+    /// been applied. A remainder closes the same way, restating a verdict
+    /// the mempool already holds.
+    pub(crate) fn closes(&mut self) -> Vec<(TxHash, TxResolution)> {
+        let local = self.local;
+        let closed: Vec<TxHash> = self
+            .owed
+            .iter()
+            .filter(|(_, owed)| {
+                !owed.covered() && owed.part.held().is_some_and(|held| held.settled(local))
             })
-            .collect()
-    }
-
-    /// Record that a tick of this shard's has admitted the retirement
-    /// of `tx_hash`'s records, so the finalization naming the hash next
-    /// is the retirement's and releases the entry.
-    pub(crate) fn admit_retire(&mut self, tx_hash: TxHash) {
-        if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.part.take(Licence::Claimed);
+            .map(|(tx_hash, _)| *tx_hash)
+            .collect();
+        for tx_hash in &closed {
+            self.owed.remove(tx_hash);
         }
+        closed
+            .into_iter()
+            .map(|tx_hash| (tx_hash, TxResolution::Decided(TransactionDecision::Accept)))
+            .collect()
     }
 
     /// Record that a tick of this shard's has taken `tx_hash` as a member,
     /// and so will speak for it in a certificate a counterpart can settle
-    /// against.
-    pub(crate) fn certify(&mut self, tx_hash: TxHash) {
+    /// against. The rank only ever rises: a tick lost after an execution
+    /// took the transaction leaves its certificate out there, and an
+    /// abandonment composed after one never lowers what it answers.
+    pub(crate) fn certify(&mut self, tx_hash: TxHash, how: Certified) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.certified = true;
+            owed.certified = owed.certified.max(how);
         }
     }
 
@@ -1010,9 +1032,46 @@ impl Ledger {
     /// question that decides whether a verdict on it is this shard's alone
     /// to reach. False for a transaction this ledger does not hold, which
     /// is the same answer it gives for one no tick ever took.
+    #[cfg(test)]
+    fn is_certified(&self, tx_hash: TxHash) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.certified != Certified::No)
+    }
+
+    /// Whether an executing tick of this shard's took `tx_hash`, so a
+    /// certificate of ours a counterpart may have settled against is
+    /// out. False for a transaction this ledger does not hold.
     #[must_use]
-    pub(crate) fn is_certified(&self, tx_hash: TxHash) -> bool {
-        self.owed.get(&tx_hash).is_some_and(|owed| owed.certified)
+    pub(crate) fn executed(&self, tx_hash: TxHash) -> bool {
+        self.owed.get(&tx_hash).is_some_and(Owed::executed)
+    }
+
+    /// The classification an abandonment of `tx_hash` answers from,
+    /// where it answers at all: a held core entry no execution of ours
+    /// took and no record covers.
+    ///
+    /// Every term is committed content or a fold of it. The part and
+    /// the classification are the committing block's, the rank is set
+    /// by a composition every replica makes at the same commit, and the
+    /// record is committed. The last term is what keeps a replica that
+    /// held the block and one that reconstructed the entry from a
+    /// record composing the same receipt: an entry a record covers is
+    /// charge-only on both, and its producer reclaims off the record.
+    ///
+    /// Such an entry never reached an executing tick, so its member
+    /// never ran and wrote no answer, and nothing else writes its claim
+    /// or decline key: the abandonment writes `Never` to a key that
+    /// holds nothing, and a second abandonment writes the same bytes.
+    #[must_use]
+    pub(crate) fn abandonment_answers(&self, tx_hash: TxHash) -> Option<&Classified> {
+        let owed = self.owed.get(&tx_hash)?;
+        match &owed.part {
+            Part::Core(kept) if !owed.executed() && owed.departed_by.is_none() => {
+                Some(&kept.classified)
+            }
+            _ => None,
+        }
     }
 
     /// Take what a committed block says departed shards left unsettled.
@@ -1031,9 +1090,10 @@ impl Ledger {
     /// abandonable set than its peers at the same frontier, and could not
     /// sign the tick they compose.
     ///
-    /// A reconstructed entry is `certified`, because a record names
-    /// nothing else, and runs whole: it holds no body to reclaim with,
-    /// and what a record licenses on a name it never held is the abort.
+    /// A reconstructed entry is certified by execution, because a record
+    /// names nothing else, and runs whole: it holds no body to reclaim
+    /// with, and what a record licenses on a name it never held is the
+    /// abort.
     ///
     /// Returns how many it reconstructed, which is how far short this
     /// replica's replay window fell — or how long after the block it was
@@ -1054,10 +1114,9 @@ impl Ledger {
                     entry.tx_hash,
                     Owed {
                         figures: entry.clone(),
-                        certified: true,
+                        certified: Certified::ByExecution,
                         part: Part::whole(),
                         departed_by: Some(record.shard()),
-                        cued: None,
                         accepted: BTreeSet::new(),
                         readings: BTreeMap::new(),
                     },
@@ -1089,22 +1148,13 @@ impl Ledger {
         self.owed
             .iter()
             .filter(|(_, owed)| {
-                owed.certified
+                owed.certified != Certified::No
                     && !owed.part.is_remainder()
                     && !owed.covered()
                     && self.party_to_entry(owed, shard, cut)
             })
             .map(|(_, owed)| owed.figures.clone())
             .collect()
-    }
-
-    /// Whether this shard only delivers for `tx_hash`, so no outcome of
-    /// its own bears the verdict and the lapse is what bounds it.
-    #[must_use]
-    pub(crate) fn is_delivery(&self, tx_hash: TxHash) -> bool {
-        self.owed
-            .get(&tx_hash)
-            .is_some_and(|owed| owed.part.is_delivery())
     }
 
     /// Whether committed content has established that `tx_hash` can
@@ -1268,9 +1318,6 @@ impl Ledger {
                     deciding.contains(&tx_hash),
                     decision,
                 ) {
-                    Meaning::Retired | Meaning::Delivered => {
-                        TxResolution::Decided(TransactionDecision::Accept)
-                    }
                     Meaning::LegRan => TxResolution::LegFinalized,
                     Meaning::Reclaimed(Some(decided)) | Meaning::Verdict(decided) => {
                         TxResolution::Decided(decided)
@@ -1288,13 +1335,12 @@ impl Ledger {
     /// path covers them all.
     ///
     /// A leg entry is released by a finalization that decides the
-    /// transaction, or by the retirement's, which decides nothing and
-    /// is the last word here all the same: a leg that succeeded bears
-    /// no verdict, so the entry stays for the member a tick takes its
-    /// records with — the reclaim, whose finalization decides it, or
-    /// the retirement. A leg that failed is the transaction's end on
-    /// this shard — it issued nothing, so there is nothing to reclaim —
-    /// and its own finalization releases it.
+    /// transaction: a leg that succeeded bears no verdict, so the entry
+    /// stays for the reclaim, whose finalization decides it, or for the
+    /// commit fold, which closes it once every record it issued was
+    /// taken. A leg that failed is the transaction's end on this shard
+    /// — it issued nothing, so there is nothing to reclaim — and its own
+    /// finalization releases it.
     pub(crate) fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         let local = self.local;
         for finalization in finalizations {
@@ -1343,6 +1389,15 @@ impl Ledger {
     /// stays accountable, and offering it again here is exactly what that
     /// must not cost.
     ///
+    /// It binds only an entry an executing tick took. One no execution
+    /// of ours ever ran has no executing tick to discard and no
+    /// certificate a counterpart could have settled against, so aborting
+    /// it at any age spends nothing, and it is offered until an
+    /// abandonment's committed finalization releases it: never composed,
+    /// or composed and discarded, its abort is the one exit that could
+    /// otherwise fall silent. A chain that halts past the window and
+    /// recovers composes it on its first commit.
+    ///
     /// Read off committed content alone — the ledger is a fold over
     /// committed blocks and `now` is the committed weighted timestamp —
     /// so every replica at the same frontier names the same set, which is
@@ -1358,10 +1413,35 @@ impl Ledger {
             .filter(|(_, owed)| !owed.part.is_leg())
             .filter(|(_, owed)| {
                 let window = owed.abandon_window();
-                now >= window.start && (owed.covered() || now < window.end)
+                now >= window.start && (owed.covered() || !owed.executed() || now < window.end)
             })
             .map(|(_, owed)| owed.figures.clone())
             .collect()
+    }
+
+    /// Let go of `tx_hash` with no outcome: a committed line said no
+    /// counterpart is left to answer for it.
+    pub(crate) fn forget(&mut self, tx_hash: TxHash) {
+        self.owed.remove(&tx_hash);
+    }
+
+    /// Whether a committed departure names `tx_hash`: the one covering a
+    /// member a tick holds is abandoned on.
+    #[must_use]
+    pub(crate) fn departed(&self, tx_hash: TxHash) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.departed_by.is_some())
+    }
+
+    /// The figures an abandonment of `tx_hash` restates, where the entry
+    /// is one an abandonment can answer for: held, and not a leg's.
+    #[must_use]
+    pub(crate) fn abandonment_figures(&self, tx_hash: TxHash) -> Option<UnsettledTx> {
+        self.owed
+            .get(&tx_hash)
+            .filter(|owed| !owed.part.is_leg())
+            .map(|owed| owed.figures.clone())
     }
 
     /// Drop the entries nothing can still decide.
@@ -1394,16 +1474,19 @@ impl Ledger {
     /// can be composed for the transaction at all.
     ///
     /// A leg entry has a clock of its own, and it is the transaction's:
-    /// `deadline + 2 * MAX_VALIDITY_RANGE`, which is the validity end plus
-    /// the escrow grace — the moment the claim cell both its members are
-    /// proved against sweeps, one validity range past the lapse a
-    /// delivery's absence is proved at, so a lapse proved at the earliest
-    /// has a validity range to become a committed reclaim. Past it there is nothing to take
-    /// back, whatever evidence arrives, so the entry goes on that reading
-    /// alone. Dropping gives a reclaim up; it never licenses one. A
-    /// record's evidence does not extend it, and no counterpart's silence
-    /// shortens it: a reclaim waits on a record, and the record's arms
-    /// are the evidence, not the counterpart's answerability.
+    /// the close of [`Window::LegEntry`]. Not a sweep — no crossing cell
+    /// sweeps — but the end of the room this entry has to turn evidence
+    /// into a committed reclaim, floored at the span a core's committed
+    /// cell has to be provable absent in so a reading taken at the
+    /// latest still has room to become one.
+    ///
+    /// Past it the **entry** composes nothing, whatever evidence
+    /// arrives, and it goes on that reading alone. What it does not end
+    /// is the crossing: the record stands in `held`, which no clock
+    /// prunes, and a consumer's answer reaching the producer later
+    /// settles it from the leaf. Dropping gives this road up; it never
+    /// licenses a reclaim. A record's evidence does not extend it, and
+    /// no counterpart's silence shortens it.
     ///
     /// Returns the transactions dropped because every counterpart has
     /// fallen silent. Each carries whether a committed record had covered
@@ -1415,10 +1498,17 @@ impl Ledger {
         let mut unanswerable = Vec::new();
         let mut entries = std::mem::take(&mut self.owed);
         entries.retain(|tx_hash, owed| {
-            // A leg entry goes at its horizon, where the claim
-            // cell both its members are proved against is swept:
-            // past it neither the reclaim nor the retirement can
-            // be composed, whatever evidence lands. Short of it
+            // A core entry no execution of ours took leaves only by an
+            // abandonment's committed finalization: no clock bounds an
+            // abort that spends nothing, and dropping the entry would be
+            // the silent exit its producer could never read.
+            if !owed.executed() && matches!(owed.part, Part::Core(_)) {
+                return true;
+            }
+            // A leg entry goes at its horizon: past it neither the
+            // reclaim nor the retirement can be composed *here*,
+            // whatever evidence lands, because this is the road that
+            // reads an entry. The leaf's road stays open. Short of it
             // only the finalization that decides it ends it.
             if owed.part.is_leg() || owed.absences().next().is_some() {
                 return Window::LegEntry.of(owed.figures.deadline).end > now;
@@ -1445,7 +1535,7 @@ impl Ledger {
             // something: a transaction that never left this shard has
             // nobody to fall silent, and its own deadline decides it
             // as it decides any other.
-            if owed.certified && self.remote_routes(owed).next().is_some() {
+            if owed.certified != Certified::No && self.remote_routes(owed).next().is_some() {
                 if answerable {
                     return true;
                 }
@@ -1494,10 +1584,10 @@ impl Ledger {
 mod tests {
     use std::time::Duration;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_storage::committed_tx_cell_key;
     use hyperscale_types::test_utils::{
-        make_finalization, make_leg_finalization, make_undecided_finalization, stub_transaction,
-        test_prefix, test_principal,
+        make_finalization, make_leg_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
         AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, MAX_FINALIZATION_DELAY,
@@ -1536,16 +1626,34 @@ mod tests {
         classified
     }
 
+    /// The decline cell the core writes beside [`core_claim`] where it
+    /// refuses what `classified` says `LOCAL` issued.
+    fn core_decline(classified: &Classified) -> (ShardId, SubstateKey) {
+        one_answer(classified, Kind::Escrowed, Answered::Never, "to the core")
+    }
+
+    /// The one answer cell in `answered`'s role that the consumer of the
+    /// `kind` crossing `LOCAL` issued writes, under that consumer's
+    /// frozen home.
+    fn one_answer(
+        classified: &Classified,
+        kind: Kind,
+        answered: Answered,
+        to: &str,
+    ) -> (ShardId, SubstateKey) {
+        let answers: Vec<(ShardId, SubstateKey)> = classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == LOCAL && edge.crossing.kind == kind)
+            .map(|(edge, home)| (home, edge.crossing.id.answer_key(&ProtocolHasher, answered)))
+            .collect();
+        assert_eq!(answers.len(), 1, "the fixture issues one crossing {to}");
+        answers[0]
+    }
+
     /// The claim cell the core writes for what `classified` says `LOCAL`
     /// issued, under the shard holding the consumer's target.
     fn core_claim(classified: &Classified) -> (ShardId, SubstateKey) {
-        let claims = classified.core_claims(LOCAL);
-        assert_eq!(
-            claims.len(),
-            1,
-            "the fixture issues one crossing to the core"
-        );
-        claims[0]
+        one_answer(classified, Kind::Escrowed, Answered::Taken, "to the core")
     }
 
     /// The committed cell `shard` writes for `tx`.
@@ -1560,13 +1668,7 @@ mod tests {
     /// The claim cell a delivery writes for what `classified` says
     /// `LOCAL` issued, under the shard that delivers it.
     fn delivered_claim(classified: &Classified) -> (ShardId, SubstateKey) {
-        let claims = classified.delivered_claims(LOCAL);
-        assert_eq!(
-            claims.len(),
-            1,
-            "the fixture issues one crossing to a delivery"
-        );
-        claims[0]
+        one_answer(classified, Kind::Owed, Answered::Taken, "to a delivery")
     }
 
     /// The two depth-2 shards a delivery fixture places off `LOCAL`,
@@ -1708,6 +1810,7 @@ mod tests {
             charge: charge(tx),
             committed: committed_at(tx),
             reach: tx.routing().all_routes(),
+            escrowed: Capped::empty(),
         }
     }
 
@@ -1722,6 +1825,7 @@ mod tests {
             tx,
             committed_at(tx),
             tx.price(&PriceTable::GENESIS),
+            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .charge
@@ -1826,7 +1930,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         ledger.prune(deadline.plus(MAX_VALIDITY_RANGE));
@@ -1849,7 +1953,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(15, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert_eq!(
@@ -1884,7 +1988,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(9, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
@@ -1913,7 +2017,7 @@ mod tests {
             "the fixture reaches a prefix both departures own",
         );
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let first = ms(200_000);
         let second = ms(800_000);
@@ -1945,7 +2049,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(16, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
@@ -1972,7 +2076,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(18, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
@@ -2067,7 +2171,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(17, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let past = deadline.plus(MAX_VALIDITY_RANGE);
@@ -2097,7 +2201,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(18, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(500_000),
@@ -2121,7 +2225,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx_over(HERE, HERE.wrapping_add(1), 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert!(
@@ -2144,7 +2248,7 @@ mod tests {
         // and `0b11…`.
         let tx = tx_over(HERE, 0xC0, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let cut = ms(500_000);
         ledger.record_terminal(ShardId::leaf(2, 2), cut, Some(expiry(cut)));
@@ -2160,7 +2264,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx_over(HERE, HERE.wrapping_add(1), 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(!ledger.reaches_beyond(tx.hash()), "nothing of it is remote");
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
@@ -2179,8 +2283,126 @@ mod tests {
 
         commit(&mut ledger, &tx);
         assert!(!ledger.is_certified(tx.hash()), "committed says nothing");
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(ledger.is_certified(tx.hash()));
+    }
+
+    /// The rank only rises: an abandonment composed after an execution
+    /// took the transaction never lowers what this shard has said, and
+    /// an execution outranks an abandonment whichever came first. Either
+    /// certifies.
+    #[test]
+    fn an_execution_certificate_outranks_an_abandonment() {
+        let mut ledger = Ledger::new(LOCAL);
+        let tx = tx(13, 60_000);
+        commit(&mut ledger, &tx);
+        assert!(!ledger.is_certified(tx.hash()));
+        assert!(!ledger.executed(tx.hash()));
+
+        ledger.certify(tx.hash(), Certified::ByAbandonment);
+        assert!(ledger.is_certified(tx.hash()));
+        assert!(!ledger.executed(tx.hash()));
+
+        ledger.certify(tx.hash(), Certified::ByExecution);
+        assert!(ledger.executed(tx.hash()));
+
+        ledger.certify(tx.hash(), Certified::ByAbandonment);
+        assert!(
+            ledger.executed(tx.hash()),
+            "an abandonment after an execution leaves the certificate out there",
+        );
+        assert!(ledger.is_certified(tx.hash()));
+    }
+
+    /// Past its abandon window a core entry no execution of ours took is
+    /// still offered and still held, an abandonment already composed
+    /// included: it spends nothing to abort at any age, and dropping it
+    /// would be the silent exit its producer could never read. One an
+    /// executing tick took is bounded by the window as before.
+    #[test]
+    fn an_uncertified_entry_outlives_its_abandon_window() {
+        let tx = tx(14, 60_000);
+        for how in [Certified::No, Certified::ByAbandonment] {
+            let mut ledger = Ledger::new(LOCAL);
+            commit_as(&mut ledger, &tx, &two_shard_core());
+            ledger.certify(tx.hash(), how);
+            let past = ledger.owed[&tx.hash()]
+                .abandon_window()
+                .end
+                .plus(Duration::from_secs(1));
+            assert!(
+                ledger
+                    .past_deadline(past)
+                    .iter()
+                    .any(|entry| entry.tx_hash == tx.hash()),
+                "{how:?}: still offered past its window",
+            );
+            ledger.prune(past);
+            assert_eq!(ledger.len(), 1, "{how:?}: and still held");
+        }
+
+        let mut ledger = Ledger::new(LOCAL);
+        commit_as(&mut ledger, &tx, &two_shard_core());
+        ledger.certify(tx.hash(), Certified::ByExecution);
+        let past = ledger.owed[&tx.hash()]
+            .abandon_window()
+            .end
+            .plus(Duration::from_secs(1));
+        assert!(
+            ledger.past_deadline(past).is_empty(),
+            "an executed entry is offered inside its window alone",
+        );
+    }
+
+    /// An abandonment answers exactly where no execution of ours spoke
+    /// and no record does, and answers the same on a replica that held
+    /// the block and one that met the transaction in a record.
+    ///
+    /// Beside
+    /// [`a_reconstructed_entry_names_the_same_parties_as_a_registered_one`]:
+    /// the receipt an abandonment composes reaches the receipt root, so
+    /// the two replicas have to compose the same one. A reconstructed
+    /// entry runs whole and holds no classification, so it answers with
+    /// the charge alone; a record covering the transaction flips the
+    /// seated replica to the same answer.
+    #[test]
+    fn an_abandonment_writes_never_identically_on_a_seated_replica() {
+        let tx = tx(8, 60_000);
+        let record = AbandonmentRecord::new(PARTNER, ms(70_000), [names(&tx)]);
+
+        let mut seated = Ledger::new(LOCAL);
+        commit_as(&mut seated, &tx, &two_shard_core());
+        assert_eq!(
+            seated.abandonment_answers(tx.hash()),
+            Some(&two_shard_core()),
+            "a held core entry no execution took answers off its classification",
+        );
+        seated.certify(tx.hash(), Certified::ByAbandonment);
+        assert!(
+            seated.abandonment_answers(tx.hash()).is_some(),
+            "an abandonment composed and lost does not silence the next",
+        );
+
+        let mut entrant = Ledger::new(LOCAL);
+        entrant.record_abandonment_records(std::slice::from_ref(&record));
+        assert!(
+            entrant.abandonment_answers(tx.hash()).is_none(),
+            "a reconstructed entry answers with the charge alone",
+        );
+
+        seated.record_abandonment_records(&[record]);
+        assert!(
+            seated.abandonment_answers(tx.hash()).is_none(),
+            "a record covering the transaction gives the seated replica the entrant's answer",
+        );
+
+        let mut executed = Ledger::new(LOCAL);
+        commit_as(&mut executed, &tx, &two_shard_core());
+        executed.certify(tx.hash(), Certified::ByExecution);
+        assert!(
+            executed.abandonment_answers(tx.hash()).is_none(),
+            "an executed entry never answers: its certificate may be out",
+        );
     }
 
     /// A counterpart is whoever owns the keyspace the transaction reaches
@@ -2222,7 +2444,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(14, 600_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         // Before the block that committed the transaction here.
         let stale = ms(400_000);
         assert!(
@@ -2249,7 +2471,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         let cut = ms(100_000);
         ledger.record_terminal(PARTNER, cut, None);
         ledger.record_abandonment_records(&[AbandonmentRecord::new(PARTNER, cut, [names(&tx)])]);
@@ -2286,49 +2508,6 @@ mod tests {
         );
     }
 
-    /// A delivery-only entry runs on the delivery window's clock: not
-    /// abandoned at the transaction's deadline, abandoned at the window's
-    /// close if it never ran, released by its own finalization if it did,
-    /// and never a leg — nothing to reclaim, nothing to probe.
-    #[test]
-    fn a_delivery_entry_lives_to_the_windows_close() {
-        let mut ledger = Ledger::new(LOCAL);
-        let tx = tx(4, 60_000);
-        commit(&mut ledger, &tx);
-        ledger.seed(tx.hash(), Part::delivery());
-        assert!(ledger.is_delivery(tx.hash()));
-        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
-        let close = Window::Delivery.of(Deadline::of(ms(60_000))).end;
-
-        assert!(
-            ledger.past_deadline(deadline).is_empty(),
-            "the transaction's deadline abandons no delivery"
-        );
-        assert!(
-            ledger.questions(&ShardTrie::uniform(1)).is_empty(),
-            "and nothing probes for it"
-        );
-        let abandonable = ledger.past_deadline(close);
-        assert_eq!(
-            abandonable.len(),
-            1,
-            "the window's close abandons one never run"
-        );
-        assert_eq!(abandonable[0].tx_hash, tx.hash());
-
-        let mut delivered = Ledger::new(LOCAL);
-        commit(&mut delivered, &tx);
-        delivered.seed(tx.hash(), Part::delivery());
-        delivered.certify(tx.hash());
-        let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
-        delivered.release_resolved(&[Arc::new(Verifiable::from(own))]);
-        assert_eq!(
-            delivered.len(),
-            0,
-            "a delivery's own finalization releases it"
-        );
-    }
-
     /// A leg entry is probeable from its deadline and not a moment
     /// before, and only while no record covers it; an entry this shard
     /// ran whole is never probed, since nothing it awaits is a core.
@@ -2339,27 +2518,29 @@ mod tests {
         let whole = tx(5, 60_000);
         commit_as(&mut ledger, &leg, &classified());
         commit(&mut ledger, &whole);
-        ledger.certify(leg.hash());
-        ledger.certify(whole.hash());
+        ledger.certify(leg.hash(), Certified::ByExecution);
+        ledger.certify(whole.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let questions = ledger.questions(&ShardTrie::uniform(1));
         let (consumer, claim) = core_claim(&classified());
+        let (_, decline) = core_decline(&classified());
         let question = |key, probed| Question {
             tx_hash: leg.hash(),
             shard: PARTNER,
             key,
             probed,
             deadline: Deadline::of(ms(60_000)),
-            cued: None,
         };
         assert_eq!(
             questions,
             vec![
                 question(core_cell(PARTNER, &leg), Probed::Core),
                 question(claim, Probed::Claim),
+                question(decline, Probed::Decline),
             ],
-            "the leg asks the core for its committed cell and its claim, and the whole entry asks nothing"
+            "the leg asks the core for its committed cell and both its answers, and the whole \
+             entry asks nothing"
         );
         assert_eq!(consumer, PARTNER);
         assert!(
@@ -2392,15 +2573,24 @@ mod tests {
     }
 
     /// A leg whose counterpart is a delivery is probeable past the
-    /// deadline like any other, and carries the claim cells the probe
-    /// asks about; a record over the lapse covers it and licenses the
-    /// reclaim.
+    /// deadline like any other and carries the claim cells the probe
+    /// asks about; what covers it is the core's committed cell read
+    /// absent, and a claim read absent covers nothing.
+    ///
+    /// The two readings are not interchangeable and only one of them is
+    /// evidence: a committed cell is written at inclusion and by nothing
+    /// else, so its absence says the core never took the transaction; a
+    /// claim is written by the execution that takes the
+    /// crossing, so its absence says only that nobody has taken it yet.
+    /// [`Probed::read`] admits the first and refuses the second, and
+    /// [`Ledger::record_reading`] is held to the same rule so an entry
+    /// cannot hold an absence that answers nothing.
     #[test]
     fn a_leg_delivered_elsewhere_is_probeable_with_its_claims() {
         let mut ledger = Ledger::new(LOCAL);
         let leg = tx(6, 60_000);
         commit_as(&mut ledger, &leg, &delivering());
-        ledger.certify(leg.hash());
+        ledger.certify(leg.hash(), Certified::ByExecution);
 
         let (delivered_by, claim) = delivered_claim(&delivering());
         let question = |shard, key, probed| Question {
@@ -2409,39 +2599,66 @@ mod tests {
             key,
             probed,
             deadline: Deadline::of(ms(60_000)),
-            cued: None,
         };
         assert_eq!(delivered_by, DELIVERER);
         assert_eq!(
             ledger.questions(&delivery_trie()),
             vec![
                 question(BEARER, core_cell(BEARER, &leg), Probed::Core),
-                question(DELIVERER, claim, Probed::Delivery),
+                question(DELIVERER, claim, Probed::Claim),
             ],
         );
-        ledger.record_reading(
-            leg.hash(),
-            DELIVERER,
-            claim,
-            Probed::Delivery,
-            Inclusion::Absent,
+        assert!(
+            !ledger.record_reading(
+                leg.hash(),
+                DELIVERER,
+                claim,
+                Probed::Claim,
+                Inclusion::Absent,
+            ),
+            "a claim read absent answers nothing, so the entry does not hold it",
+        );
+        assert_eq!(
+            ledger.questions(&delivery_trie()).len(),
+            2,
+            "and the questions both stand, because neither was answered",
+        );
+        assert!(
+            ledger.reclaimable().is_empty(),
+            "nothing licenses the reclaim on a silence",
+        );
+
+        assert!(
+            ledger.record_reading(
+                leg.hash(),
+                BEARER,
+                core_cell(BEARER, &leg),
+                Probed::Core,
+                Inclusion::Absent,
+            ),
+            "the core's committed cell absent is the reading that answers",
         );
         assert!(
             ledger.questions(&delivery_trie()).is_empty(),
             "covered once"
         );
-        assert_eq!(
-            ledger.reclaimable().len(),
-            1,
-            "and the lapse licenses the reclaim"
-        );
+        assert_eq!(ledger.reclaimable().len(), 1, "and it licenses the reclaim");
     }
 
     /// An issuer in the core is released by its own verdict like any
     /// entry — unless it accepted with deliveries owed, when it stays on
     /// as a remainder: never abandoned, named by no departure, probed
-    /// past the deadline for its claims, reclaimed on a claim read
-    /// absent past the lapse, and released by the reclaim's finalization.
+    /// past the deadline for its claims, and released by the reclaim's
+    /// finalization.
+    ///
+    /// **A remainder asks one question and a silence never answers it.**
+    /// Its only question is its delivery's claim, whose absence says
+    /// nothing at any anchor — so nothing a clock reaches covers it, and
+    /// the one thing that does is a departure naming the transaction:
+    /// the chain that was to deliver is gone, so no claim is coming from
+    /// anywhere. The crossing behind it is owed, and an owed crossing is
+    /// never credited back — the reclaim this licenses releases the
+    /// entry and leaves the record standing.
     #[test]
     fn an_issuer_that_accepted_stays_on_as_a_remainder_for_its_deliveries() {
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
@@ -2449,7 +2666,7 @@ mod tests {
             let tx = tx(8, 60_000);
             let mut ledger = Ledger::new(LOCAL);
             commit_as(&mut ledger, &tx, &issuing());
-            ledger.certify(tx.hash());
+            ledger.certify(tx.hash(), Certified::ByExecution);
             let finalization = make_finalization(BlockHeight::new(1), tx.hash(), decision);
             ledger.release_resolved(&[Arc::new(Verifiable::from(finalization))]);
             (ledger, tx)
@@ -2472,21 +2689,39 @@ mod tests {
                 tx_hash: tx.hash(),
                 shard: delivered_by,
                 key: claim,
-                probed: Probed::Delivery,
+                probed: Probed::Claim,
                 deadline: Deadline::of(ms(60_000)),
-                cued: None,
             }],
             "a remainder asks about its deliveries, and never about itself"
         );
-        ledger.record_reading(
-            tx.hash(),
-            PARTNER,
-            claim,
-            Probed::Delivery,
-            Inclusion::Absent,
+        assert!(
+            !ledger.record_reading(
+                tx.hash(),
+                delivered_by,
+                claim,
+                Probed::Claim,
+                Inclusion::Absent
+            ),
+            "the delivery's silence answers nothing, so the entry does not hold it",
         );
+        assert!(
+            ledger.reclaimable().is_empty(),
+            "and a remainder is never reclaimed on a delivery that has not spoken",
+        );
+
+        let cut = ms(500_000);
+        ledger.record_terminal(delivered_by, cut, Some(expiry(cut)));
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
+            delivered_by,
+            cut,
+            [names(&tx)],
+        )]);
         let reclaims = ledger.reclaimable();
-        assert_eq!(reclaims.len(), 1);
+        assert_eq!(
+            reclaims.len(),
+            1,
+            "the departure of the chain that was to deliver is what covers it",
+        );
         assert!(
             reclaims[0].charged,
             "the issuer ran, so its reclaim is charged nothing"
@@ -2506,7 +2741,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(4, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let own = make_leg_finalization(BlockHeight::new(1), tx.hash());
         ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
@@ -2542,7 +2777,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(7, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(1_000),
@@ -2620,26 +2855,6 @@ mod tests {
             decided(&leg, TransactionDecision::Aborted),
             "the reclaim of a leg its core never took reports an abort"
         );
-
-        let delivery = tx(3, 60_000);
-        commit(&mut ledger, &delivery);
-        ledger.seed(delivery.hash(), Part::delivery());
-        assert_eq!(
-            fw(
-                &ledger,
-                make_undecided_finalization(h, delivery.hash(), TransactionDecision::Accept)
-            ),
-            decided(&delivery, TransactionDecision::Accept),
-            "a delivery that succeeded claimed what an accepted core issued"
-        );
-        assert_eq!(
-            fw(
-                &ledger,
-                make_undecided_finalization(h, delivery.hash(), TransactionDecision::Reject)
-            ),
-            vec![(delivery.hash(), TxResolution::LegFinalized)],
-            "a delivery that failed decides nothing, and the value waits for a later claim"
-        );
     }
 
     /// A reconstructed entry answers "who was party" the same as the
@@ -2664,7 +2879,7 @@ mod tests {
         // The replica that was seated when the block committed.
         let mut seated = Ledger::new(LOCAL);
         commit(&mut seated, &tx);
-        seated.certify(tx.hash());
+        seated.certify(tx.hash(), Certified::ByExecution);
         seated.record_abandonment_records(std::slice::from_ref(&record));
 
         // The replica rotated in afterwards, which meets the transaction
@@ -2711,27 +2926,19 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
-        assert!(
-            ledger.consumer_holds(tx.hash(), SUCCESSOR),
-            "the shard holding the claim's prefix consumes what the leg issued",
-        );
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let (_, claim) = core_claim(&classified());
-        ledger.record_reading(
-            tx.hash(),
-            SUCCESSOR,
-            claim,
-            Probed::Claim,
-            Inclusion::Present([7; 32]),
+        assert!(
+            ledger.record_reading(
+                tx.hash(),
+                SUCCESSOR,
+                claim,
+                Probed::Claim,
+                Inclusion::Present([7; 32]),
+            ),
+            "the successor's claim answers the question the entry asked",
         );
-        let retirable = ledger.retirable();
-        assert_eq!(
-            retirable.len(),
-            1,
-            "the successor claimed, so the record has nothing left to hold",
-        );
-        assert_eq!(retirable[0].tx_hash, tx.hash());
     }
 
     /// A committed claim reading the consumer's cell present is what
@@ -2739,47 +2946,114 @@ mod tests {
     /// certificate — once every consumer has claimed; the retirement's
     /// own finalization releases the entry, and a claimed entry is
     /// neither reclaimable nor abandonable meanwhile.
+    /// A consumer's `Never` read present covers the entry: the reclaim
+    /// is licensed, the retirement is not, the entry asks nothing more,
+    /// and an absence of the `Never` answers nothing.
     #[test]
-    fn a_committed_claim_licenses_the_retirement_and_its_finalization_releases_the_entry() {
+    fn a_never_read_present_licenses_the_reclaim() {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
-        assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
-
-        let (_, claim) = core_claim(&classified());
-        ledger.record_reading(
-            tx.hash(),
-            PARTNER,
-            claim,
-            Probed::Claim,
-            Inclusion::Present([7; 32]),
-        );
-        let retirable = ledger.retirable();
-        assert_eq!(retirable.len(), 1, "every consumer claimed");
-        assert_eq!(retirable[0].tx_hash, tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(
             ledger.reclaimable().is_empty(),
-            "a claim is a settlement, not evidence for a reclaim"
-        );
-        assert!(
-            ledger.past_deadline(ms(200_000)).is_empty(),
-            "and abandons nothing"
+            "nothing reclaims on a clock"
         );
 
-        ledger.admit_retire(tx.hash());
-        assert!(ledger.retirable().is_empty(), "a tick has taken it");
-        let retirement = make_leg_finalization(BlockHeight::new(9), tx.hash());
+        let (consumer, decline) = core_decline(&classified());
+        assert!(
+            !ledger.record_reading(
+                tx.hash(),
+                consumer,
+                decline,
+                Probed::Decline,
+                Inclusion::Absent
+            ),
+            "the Never absent says only that the consumer has not refused",
+        );
+        assert!(ledger.record_reading(
+            tx.hash(),
+            consumer,
+            decline,
+            Probed::Decline,
+            Inclusion::Present([7; 32]),
+        ));
+        let reclaimable = ledger.reclaimable();
         assert_eq!(
-            ledger.resolutions_of(&[Arc::new(Verifiable::from(retirement.clone()))]),
+            reclaimable.len(),
+            1,
+            "the consumer's own word licenses the reclaim"
+        );
+        assert_eq!(reclaimable[0].tx_hash, tx.hash());
+        assert!(
+            ledger.questions(&ShardTrie::uniform(1)).is_empty(),
+            "and the entry asks nothing more"
+        );
+    }
+
+    /// The commit fold closes a leg entry once every record it issued
+    /// here has been removed on its consumer's `Taken`: the close is the
+    /// transaction accepted, reported once, with no member composed and
+    /// no finalization driving it. A record still standing, a reclaim
+    /// in flight, or evidence covering the entry keeps it open.
+    #[test]
+    fn a_settled_record_closes_the_entry_with_an_accept() {
+        let mut ledger = Ledger::new(LOCAL);
+        let tx = tx(8, 60_000);
+        commit_as(&mut ledger, &tx, &classified());
+        ledger.certify(tx.hash(), Certified::ByExecution);
+        let record = classified()
+            .crossings()
+            .find(|(edge, _)| edge.from == LOCAL)
+            .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+            .expect("the leg issues one crossing");
+        assert!(ledger.closes().is_empty(), "nothing closes on a clock");
+
+        ledger.settled(record);
+        assert_eq!(
+            ledger.closes(),
             vec![(
                 tx.hash(),
                 TxResolution::Decided(TransactionDecision::Accept)
             )],
-            "the retirement says every consumer claimed: the transaction was accepted"
+            "every record issued here was taken: the transaction was accepted",
         );
-        ledger.release_resolved(&[Arc::new(Verifiable::from(retirement))]);
-        assert_eq!(ledger.len(), 0, "the retirement's finalization releases it");
+        assert_eq!(ledger.len(), 0, "and the fold's close releases the entry");
+        assert!(ledger.closes().is_empty(), "reported once");
+
+        // A reclaim in flight keeps the entry for the reclaim's own
+        // finalization.
+        let mut reclaiming = Ledger::new(LOCAL);
+        commit_as(&mut reclaiming, &tx, &classified());
+        reclaiming.admit_reclaim(tx.hash());
+        reclaiming.settled(record);
+        assert!(reclaiming.closes().is_empty());
+        assert_eq!(reclaiming.len(), 1);
+    }
+
+    /// A mixed shard's entry, issuing on one side of the core and taking
+    /// delivery on the other, closes on its records alone: what the core
+    /// returns to it is its commit fold's credit and owes the entry
+    /// nothing.
+    #[test]
+    fn a_mixed_shards_entry_closes_on_its_records_alone() {
+        let mut ledger = Ledger::new(LOCAL);
+        let tx = tx(8, 60_000);
+        commit_as(&mut ledger, &tx, &classified());
+        ledger.seed(tx.hash(), Part::leg(Kept::of(&tx, &classified())));
+        let record = classified()
+            .crossings()
+            .find(|(edge, _)| edge.from == LOCAL)
+            .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+            .expect("the leg issues one crossing");
+        ledger.settled(record);
+        assert_eq!(
+            ledger.closes(),
+            vec![(
+                tx.hash(),
+                TxResolution::Decided(TransactionDecision::Accept)
+            )],
+        );
     }
 
     /// A leg that failed is the transaction's end on this shard: its
@@ -2791,7 +3065,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(5, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
 
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Reject);
         ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
@@ -2820,7 +3094,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(6, 60_000);
         commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(
             ledger.reclaimable().is_empty(),
             "nothing is reclaimed on a clock"
@@ -2893,7 +3167,7 @@ mod tests {
             lapsed.hash(),
             DELIVERER,
             claim,
-            Probed::Delivery,
+            Probed::Claim,
             Inclusion::Absent,
         );
         assert!(
@@ -2911,7 +3185,7 @@ mod tests {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &two_shard_core());
-        ledger.certify(tx.hash());
+        ledger.certify(tx.hash(), Certified::ByExecution);
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let past = deadline.plus(MAX_VALIDITY_RANGE);
         assert!(!ledger.is_covered(tx.hash()));
@@ -2950,7 +3224,7 @@ mod tests {
             let mut ledger = Ledger::new(LOCAL);
             let tx = tx(5, 60_000);
             commit_as(&mut ledger, &tx, &classified());
-            ledger.certify(tx.hash());
+            ledger.certify(tx.hash(), Certified::ByExecution);
             if covered {
                 ledger.record_abandonment_records(&[AbandonmentRecord::new(
                     PARTNER,

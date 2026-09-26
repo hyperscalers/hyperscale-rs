@@ -16,8 +16,8 @@ use thiserror::Error;
 use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificateVerifyError, ExecutionOutcome, FinalizationHash, GlobalReceiptHash, Hash,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, SubstateKey, TickId,
-    TransactionDecision, TxClaim, TxHash, TxOutcome, Verifiable, Verified, Verify,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId, TransactionDecision,
+    TxClaim, TxHash, TxOutcome, Verifiable, Verified, Verify,
 };
 
 /// Cap on execution certificates accepted in a single [`Finalization`] at
@@ -117,9 +117,13 @@ fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
 ///
 /// A transaction settles its own effects only if every participant
 /// accepted it. Otherwise the effects are discarded — that is what makes
-/// a cross-shard abort atomic — and what is left is the charge the
-/// outcome named beside them, which is how an attempt nobody applied
-/// still costs its payer.
+/// a cross-shard abort atomic — and what is left is the refusal receipt
+/// the outcome named beside them: the payer's charge, which is how an
+/// attempt nobody applied still costs its payer, and the consumer's
+/// `Never` for every refusable crossing it consumed, which is how its
+/// producers learn the value is theirs to credit back. Per shard,
+/// exactly one of a take inside the effects and a `Never` inside the
+/// refusal receipt can settle.
 ///
 /// Every participant *accepted* it, not every participant present: a set
 /// of certificates missing one is a transaction with no verdict yet, and
@@ -135,9 +139,10 @@ fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
 pub enum Settles {
     /// The transaction's own effects, under this receipt hash.
     Effects(GlobalReceiptHash),
-    /// The charge named beside the outcome, under this receipt hash.
-    Charge(GlobalReceiptHash),
-    /// The canonical failure record — a failure owing no charge.
+    /// The refusal receipt named beside the outcome, under this receipt
+    /// hash: the charge and the `Never` answers.
+    Refusal(GlobalReceiptHash),
+    /// The canonical failure record — a failure owing nothing apart.
     Failure,
     /// Nothing at all.
     Nothing,
@@ -166,9 +171,10 @@ pub fn settles(outcome: &TxOutcome, refused: &BTreeSet<TxHash>) -> Settles {
             Settles::Effects(*receipt_hash)
         }
         // Refused here, or completed here and refused by a counterpart.
-        // Either way the effects are gone and the charge is what is left.
-        _ => match (outcome.fee_receipt(), outcome.outcome()) {
-            (Some(charge), _) => Settles::Charge(charge),
+        // Either way the effects are gone and the refusal receipt is
+        // what is left.
+        _ => match (outcome.refusal_receipt(), outcome.outcome()) {
+            (Some(refusal), _) => Settles::Refusal(refusal),
             (None, ExecutionOutcome::Failed) => Settles::Failure,
             (None, _) => Settles::Nothing,
         },
@@ -676,7 +682,7 @@ impl Finalization {
         let mut receipt_iter = self.receipts.iter();
         for outcome in local_ec.tx_outcomes() {
             let ec_kind = match settles(outcome, &refused) {
-                Settles::Effects(hash) | Settles::Charge(hash) => Some(hash),
+                Settles::Effects(hash) | Settles::Refusal(hash) => Some(hash),
                 Settles::Failure => None,
                 Settles::Nothing => continue,
             };
@@ -739,9 +745,9 @@ impl Finalization {
     /// counterpart refused it moved nothing, and a shard applying its own
     /// half regardless would move value one-sidedly.
     ///
-    /// A charge is not an effect. The fee receipt an outcome names
+    /// A refusal receipt is not an effect. The one an outcome names
     /// settles whatever the verdict, which is what makes a refused
-    /// attempt cost its payer something.
+    /// attempt cost its payer something and answer its producers.
     ///
     /// The [`settles`] rule the receipts were built under, re-read
     /// against the certificate rather than trusted: a tick arriving from
@@ -749,7 +755,7 @@ impl Finalization {
     /// anything that reaches state by another road.
     ///
     /// It bites in one direction only. A refused transaction settles the
-    /// charge its outcome named and nothing else, and one no set of
+    /// refusal receipt its outcome named and nothing else, and one no set of
     /// certificates decides — a participant it names has not reported —
     /// settles nothing at all, because the failure to stop there moves
     /// value one-sidedly. Anything the certificates refuse nothing of and
@@ -772,12 +778,20 @@ impl Finalization {
         let uncovered = self.uncovered_transactions();
         // Per transaction, not a bare set of hashes: two legs of one payer
         // owing the same floor produce byte-identical charges, and a set
-        // would let either stand in for the other.
-        let mut charges: HashMap<TxHash, GlobalReceiptHash> = HashMap::new();
-        for ec in &self.execution_certificates {
+        // would let either stand in for the other. Off the local
+        // certificate only: two core shards name different refusal
+        // receipts for one transaction, each carrying its own answers,
+        // and a map filled across every certificate would keep whichever
+        // came last.
+        let mut refusals: HashMap<TxHash, GlobalReceiptHash> = HashMap::new();
+        for ec in self
+            .execution_certificates
+            .iter()
+            .filter(|ec| ec.tick_id() == &self.tick_id)
+        {
             for outcome in ec.tx_outcomes() {
-                if let Settles::Charge(hash) = settles(outcome, &refused) {
-                    charges.insert(outcome.tx_hash(), hash);
+                if let Settles::Refusal(hash) = settles(outcome, &refused) {
+                    refusals.insert(outcome.tx_hash(), hash);
                 }
             }
         }
@@ -786,27 +800,11 @@ impl Finalization {
             .filter(|receipt| {
                 !uncovered.contains_key(&receipt.tx_hash)
                     && (!refused.contains(&receipt.tx_hash)
-                        || charges.get(&receipt.tx_hash) == Some(&receipt.consensus.receipt_hash()))
+                        || refusals.get(&receipt.tx_hash)
+                            == Some(&receipt.consensus.receipt_hash()))
             })
             .cloned()
             .collect()
-    }
-
-    /// The committed cells this shard's own outcomes retract: what the
-    /// block settling this finalization deletes beside the sweep's
-    /// removals. Only the local certificate's, since a committed cell is
-    /// written under the shard that included the transaction and a
-    /// counterpart's retractions are that counterpart's to apply.
-    pub fn retractions(&self) -> impl Iterator<Item = SubstateKey> + '_ {
-        // Read off the certificates by tick rather than through the
-        // local-certificate accessor, which is a lookup that must
-        // succeed: a malformed finalization needs no special case on the
-        // commit path.
-        self.execution_certificates
-            .iter()
-            .filter(|ec| ec.tick_id() == &self.tick_id)
-            .flat_map(|ec| ec.tx_outcomes())
-            .filter_map(TxOutcome::retracts)
     }
 
     /// Aggregate per-tx decisions across all ECs (Aborted > Reject > Accept).
@@ -982,8 +980,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AggregateSignature, BlockHeight, ExecutionVote, Hash, ShardId, SignerBitfield, ValidatorId,
-        WeightedTimestamp, compute_global_receipt_root,
+        AggregateSignature, BlockHeight, ExecutionVote, GlobalReceiptRoot, Hash, ShardId,
+        SignerBitfield, StateWrites, ValidatorId, WeightedTimestamp, compute_global_receipt_root,
     };
 
     /// The half is part of what a finalization is, so it is part of its
@@ -1023,6 +1021,84 @@ mod tests {
             determined.receipt_hash(),
             legs.receipt_hash(),
             "a flipped half must not pass under the hash the block commits to",
+        );
+    }
+
+    /// For one outcome, `settles` returns the transaction's effects or
+    /// its refusal receipt and never both; and a tick whose sibling
+    /// certificate names a different refusal receipt for the same
+    /// transaction settles the local one. Two core shards each carry
+    /// their own `Never` answers, so the receipts differ, and a map
+    /// filled across every certificate would keep whichever came last.
+    #[test]
+    fn a_refusal_receipt_is_the_local_certificates() {
+        let tx = TxHash::from(Hash::from_bytes(&[1; 4]));
+        let effects = GlobalReceiptHash::from_raw(Hash::from_bytes(b"effects"));
+        let ours = GlobalReceiptHash::from_raw(Hash::from_bytes(b"ours"));
+        let theirs = GlobalReceiptHash::from_raw(Hash::from_bytes(b"theirs"));
+        let accepted = TxOutcome::with_refusal(
+            tx,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: effects,
+            },
+            ours,
+        );
+        assert_eq!(
+            settles(&accepted, &BTreeSet::new()),
+            Settles::Effects(effects),
+            "accepted everywhere, the effects settle and the refusal receipt does not",
+        );
+        assert_eq!(
+            settles(&accepted, &BTreeSet::from([tx])),
+            Settles::Refusal(ours),
+            "refused elsewhere, the effects go and the refusal receipt is what is left",
+        );
+        let refused = TxOutcome::with_refusal(tx, ExecutionOutcome::Failed, ours);
+        assert_eq!(settles(&refused, &BTreeSet::new()), Settles::Refusal(ours));
+
+        let local_wid = tick_id(0, 7, &[]);
+        let remote_wid = tick_id(1, 3, &[]);
+        let receipt = |hash: GlobalReceiptHash| StoredReceipt {
+            tx_hash: tx,
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: hash,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+            metadata: None,
+        };
+        let certificate = |wid: TickId, refusal: GlobalReceiptHash| {
+            Arc::new(ExecutionCertificate::new(
+                wid,
+                WeightedTimestamp::from_millis(1),
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([TxOutcome::with_refusal(
+                    tx,
+                    ExecutionOutcome::Failed,
+                    refusal,
+                )]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(2),
+            ))
+        };
+        let tick = Finalization::new(
+            local_wid,
+            TickHalf::Determined,
+            &Capped::from_array([
+                certificate(remote_wid, theirs),
+                certificate(local_wid, ours),
+            ]),
+            Capped::from_array([]),
+        )
+        .with_receipts(Capped::from_array([receipt(ours), receipt(theirs)]));
+        assert_eq!(
+            tick.settling_receipts()
+                .iter()
+                .map(|receipt| receipt.consensus.receipt_hash())
+                .collect::<Vec<_>>(),
+            vec![ours],
+            "the local certificate's refusal receipt settles, and the sibling's does not",
         );
     }
 

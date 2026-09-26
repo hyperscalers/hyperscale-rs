@@ -6,8 +6,7 @@
 //! system uses (see [`StoredReceipt`](hyperscale_types::StoredReceipt)).
 
 use hyperscale_types::{
-    ConsensusReceipt, EscrowedValue, ExecutionMetadata, ExecutionOutcome, StoredReceipt, TxHash,
-    TxOutcome,
+    ConsensusReceipt, ExecutionMetadata, ExecutionOutcome, StoredReceipt, TxHash, TxOutcome,
 };
 
 /// Engine output for one transaction — a [`ConsensusReceipt`] paired with
@@ -23,18 +22,17 @@ pub struct ExecutedTx {
     /// Node-local diagnostics (fees, logs, error). Never crosses the wire;
     /// dropped when this record is forwarded to a peer.
     pub metadata: ExecutionMetadata,
-    /// A receipt carrying the payer's fee debit and nothing else: the
-    /// class charge of a failed or infeasible attempt, or the floor a
-    /// cross-shard leg holds in reserve against a tick abort. Built
-    /// beside the execution receipt because a transaction whose effects
-    /// are discarded still owes its charge, and state moves only through
-    /// receipts. Present only where this shard is the fee payer of an
-    /// outcome that charges one.
-    pub fee_receipt: Option<ConsensusReceipt>,
-    /// What this execution escrowed out, one entry per departing edge.
-    /// Empty for a member that ran the whole shape, which hands nothing
-    /// to anyone.
-    pub escrowed: Vec<EscrowedValue>,
+    /// A receipt carrying what the member settles apart from the
+    /// transaction's own effects: the payer's fee debit — the class
+    /// charge of a failed or infeasible attempt, or the floor a
+    /// cross-shard leg holds in reserve against a tick abort — and the
+    /// `Never` answer of every refusable crossing the member consumed,
+    /// where it was or can still be refused. Built beside the execution
+    /// receipt because a transaction whose effects are discarded still
+    /// owes its charge and its answers, and state moves only through
+    /// receipts. Present only where this shard pays for the outcome or
+    /// holds a decline cell to write.
+    pub refusal_receipt: Option<ConsensusReceipt>,
 }
 
 impl ExecutedTx {
@@ -51,8 +49,7 @@ impl ExecutedTx {
             tx_hash,
             consensus,
             metadata,
-            fee_receipt: None,
-            escrowed: Vec::new(),
+            refusal_receipt: None,
         }
     }
 
@@ -63,8 +60,7 @@ impl ExecutedTx {
             tx_hash,
             consensus: ConsensusReceipt::Failed,
             metadata: ExecutionMetadata::empty(),
-            fee_receipt: None,
-            escrowed: Vec::new(),
+            refusal_receipt: None,
         }
     }
 
@@ -77,7 +73,7 @@ impl ExecutedTx {
     /// Project the small, copyable [`TxOutcome`] used in execution votes
     /// — drops `database_updates`, `application_events`, and metadata.
     #[must_use]
-    pub fn outcome(&self) -> TxOutcome {
+    pub const fn outcome(&self) -> TxOutcome {
         let outcome = match &self.consensus {
             ConsensusReceipt::Succeeded { receipt_hash, .. } => ExecutionOutcome::Succeeded {
                 receipt_hash: *receipt_hash,
@@ -85,7 +81,6 @@ impl ExecutedTx {
             ConsensusReceipt::Failed => ExecutionOutcome::Failed,
         };
         TxOutcome::new(self.tx_hash, outcome)
-            .escrowing(self.escrowed.iter().map(|issued| issued.record))
     }
 }
 

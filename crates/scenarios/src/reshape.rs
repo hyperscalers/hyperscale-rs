@@ -4,15 +4,18 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_types::{
     BlockHeight, MAX_VALIDITY_RANGE, ShardId, TimestampRange, Transaction, WeightedTimestamp,
 };
 
-use crate::support::conservation::{Charges, probe_world};
+use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::query::{
     clock, committee_size, epoch_duration_ms, live_shards, scheduled_terminal_epoch,
 };
-use crate::support::tx::{build_probe_transfer_tx, validity_around};
+use crate::support::tx::{
+    LEFT_PROBE_SENDER, build_probe_transfer_tx, build_probe_transfer_tx_from, validity_around,
+};
 use crate::support::wait::{
     assert_height_frozen, await_beacon_epoch, await_blocks, await_height, await_merge_keeper_count,
     await_root_matches_anchor, await_serves, await_serves_ahead_of_anchor, await_split_admitted,
@@ -161,12 +164,13 @@ fn shard_live<C: Cluster>(c: &C, shard: ShardId) -> bool {
 /// A transaction the terminating parent committed cannot commit again on
 /// either child.
 ///
-/// The parent's `CommitDedupIndex` dies with its chain and both children
-/// construct their own empty, so nothing a child holds refuses the
-/// resubmission: its QC chain is empty, its mempool holds no tombstone
-/// from the parent's sweep, and the transaction's own validity window
-/// still contains its anchor. The replay is refused only if a child
-/// inherits what its parent committed.
+/// Nothing node-local refuses the resubmission on a child: its QC chain
+/// is empty, its mempool holds no tombstone from the parent's sweep, and
+/// the transaction's own validity window still contains its anchor. The
+/// parent's committed marker is what refuses it. The train's payer routes
+/// to the right child, which holds none of its parent's markers, so the
+/// refusal there is a proof of the marker's presence in the parent's
+/// terminal state.
 ///
 /// Requires [`probe_train_genesis_accounts`] funding and a config with
 /// `split_bytes = 0` and one cohort of pool surplus.
@@ -182,14 +186,14 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
     let (left, right) = root.children();
 
-    let world = probe_world(c);
+    let mut world = probe_world(c);
     let mut charges = Charges::default();
     let spacing = measure_probe_spacing(c, &mut charges, root);
     assert!(
         await_split_admitted(c, root, epochs(8)),
         "beacon did not admit the root split within budget"
     );
-    let probes = run_probe_train(c, &mut charges, root, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, root, spacing, |c| {
         [left, right].iter().all(|&child| shard_live(c, child))
     });
     let replay = pick_replay(c, root, &probes);
@@ -253,6 +257,7 @@ fn measure_probe_spacing(c: &mut impl Cluster, charges: &mut Charges, shard: Sha
 fn run_probe_train<C: Cluster>(
     c: &mut C,
     charges: &mut Charges,
+    world: &mut World,
     terminating: ShardId,
     spacing: u64,
     handed_over: impl Fn(&C) -> bool,
@@ -262,6 +267,15 @@ fn run_probe_train<C: Cluster>(
     while probes.len() < MAX_REPLAY_PROBES as usize && !live(c) {
         let probe = Arc::new(build_probe_transfer_tx(validity_around(c.now())));
         charges.record(&probe);
+        // A probe whose delivery the cut costs leaves its crossing owed,
+        // standing in the record until whoever holds the recipient's
+        // prefix claims it. That is value the world still holds.
+        world.owing(crossing_records(
+            &probe
+                .try_derived(c.derivation().as_ref())
+                .expect("a scenario transfer derives")
+                .legs,
+        ));
         probes.push(Arc::clone(&probe));
         c.submit(probe);
         let from = committed_height(c, terminating);
@@ -309,9 +323,9 @@ fn pick_replay(
         )
 }
 
-/// A transaction signed for a window that opened before `successor`'s
-/// origin, built after the cut so no chain before it can have committed
-/// it.
+/// A transaction paid by `sender(payer)`, signed for a window that opened
+/// before `successor`'s origin, built after the cut so no chain before it
+/// can have committed it.
 ///
 /// This is finding 2's population seen from the client side: a window
 /// opened before the boundary, submitted where nothing that ran before
@@ -329,7 +343,7 @@ fn pick_replay(
 /// Panics if `successor` reports no origin, if its origin is network
 /// genesis (nothing predates that, so the probe would not be pre-cut), or
 /// if the built window no longer contains the current clock.
-fn build_precut_probe(c: &impl Cluster, successor: ShardId) -> Arc<Transaction> {
+fn build_precut_probe(c: &impl Cluster, successor: ShardId, payer: u8) -> Arc<Transaction> {
     let cut = c
         .chain_origin_anchor(successor)
         .expect("the successor is live, so it reports the origin it started at");
@@ -347,7 +361,7 @@ fn build_precut_probe(c: &impl Cluster, successor: ShardId) -> Arc<Transaction> 
         "a probe opening before the cut ({cut:?}) must still be signed for now ({anchor:?}) — \
          the successor came up more than a validity window after its predecessor terminated",
     );
-    Arc::new(build_probe_transfer_tx(range))
+    Arc::new(build_probe_transfer_tx_from(payer, range))
 }
 
 /// How far before the cut [`build_precut_probe`] opens its window. Any
@@ -370,12 +384,15 @@ const PRECUT_PROBE_LIFE: Duration = MAX_VALIDITY_RANGE.saturating_sub(Duration::
 /// replay because its shard committed it, the stranded one because it was
 /// submitted no later.
 ///
-/// The stranded probe is the population the pre-cut rule strands. Nothing
-/// the successor holds can tell it from a replay — its own chain never saw
-/// either — so admitting it takes an absence proof against the
-/// predecessor's `committed_txs_root`, fetched from the departed
-/// committee. Without that the successor defers forever and the
-/// transaction never reaches an outcome anywhere.
+/// The stranded probes are the population the pre-cut rule strands, one
+/// on each child, and the two children answer for them differently. The
+/// left child holds its parent's committed markers under its own owner,
+/// so its parent view reads the absence directly. The right child holds
+/// none of them, and admitting its probe takes a proof of the marker's
+/// absence from the parent's terminal state, fetched from the departed
+/// committee. The probe train's payer routes to the right child, so the
+/// replay is the right child's to refuse, by a proof of its marker's
+/// presence.
 ///
 /// Requires [`probe_train_genesis_accounts`] funding and a config with
 /// `split_bytes = 0` and one cohort of pool surplus.
@@ -391,29 +408,36 @@ pub fn split_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
     let (left, right) = root.children();
 
-    let world = probe_world(c);
+    let mut world = probe_world(c);
     let mut charges = Charges::default();
     let spacing = measure_probe_spacing(c, &mut charges, root);
     assert!(
         await_split_admitted(c, root, epochs(8)),
         "beacon did not admit the root split within budget"
     );
-    let probes = run_probe_train(c, &mut charges, root, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, root, spacing, |c| {
         [left, right].iter().all(|&child| shard_live(c, child))
     });
     let replay = pick_replay(c, root, &probes);
-    let stranded = build_precut_probe(c, left);
-    let (replayed, stranded_hash) = (replay.hash(), charges.record(&stranded));
+    let stranded = [
+        (right, build_precut_probe(c, right, 0)),
+        (left, build_precut_probe(c, left, LEFT_PROBE_SENDER)),
+    ];
+    let replayed = replay.hash();
 
     c.submit(replay);
-    c.submit(stranded);
-    assert!(
-        c.run_until(epochs(8), |c| [left, right]
-            .iter()
-            .any(|&child| c.chain_fate(child, stranded_hash).1.is_some())),
-        "{stranded_hash} opened before the cut and no predecessor ever committed it, \
-         so a successor proving it absent must carry it to an outcome",
-    );
+    for (_, probe) in &stranded {
+        charges.record(probe);
+        c.submit(Arc::clone(probe));
+    }
+    for (child, probe) in &stranded {
+        let hash = probe.hash();
+        assert!(
+            c.run_until(epochs(8), |c| c.chain_fate(*child, hash).1.is_some()),
+            "{hash} opened before the cut and its parent never committed it, \
+             so child {child} must carry it to an outcome",
+        );
+    }
 
     for child in [left, right] {
         assert!(
@@ -425,7 +449,7 @@ pub fn split_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
         c,
         &charges,
         epochs(8),
-        "a probe train, a replay and a stranded probe",
+        "a probe train, a replay and a stranded probe on each child",
     );
 }
 
@@ -579,11 +603,12 @@ const POST_CUT_PROBE_LIFE: Duration = MAX_VALIDITY_RANGE.saturating_sub(Duration
 /// The same separation across a merge, where the successor has two
 /// predecessors instead of one.
 ///
-/// A merged parent may admit a pre-cut transaction only once it is absent
-/// from **both** children's committed sets — a proof from one says nothing
-/// about what the other committed. The probes land on whichever child
-/// holds their payer, so the stranded one is answered by that child and by
-/// its sibling, which never saw it at all; admitting it takes both.
+/// A merged parent holds both children's committed markers in its own
+/// state: the left child's under the parent's own owner, the right
+/// child's under the owner of the parent's right half, which a
+/// transaction older than the merge is also judged by. The probes land on
+/// whichever child holds their payer, so the replay is refused by that
+/// child's marker and the stranded probe is admitted with neither present.
 ///
 /// Requires the [`merge_lifecycle`] preconditions plus
 /// [`probe_train_genesis_accounts`] funding.
@@ -606,9 +631,8 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     );
 
     // The probes all share a payer, so they land on one child; the
-    // reformed parent succeeds both regardless, and the sibling that
-    // never saw them is the second answer it has to collect.
-    let world = probe_world(c);
+    // reformed parent reads that child's markers in its own state.
+    let mut world = probe_world(c);
     let mut charges = Charges::default();
     let payer_child = probe_payer_shard(c, &mut charges, root);
     let spacing = measure_probe_spacing(c, &mut charges, payer_child);
@@ -616,12 +640,12 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     // so serving is no signal. Its height line continues from the taller
     // child, so passing the child it succeeds is: nothing the departed
     // root chain froze at can reach there.
-    let probes = run_probe_train(c, &mut charges, payer_child, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, payer_child, spacing, |c| {
         c.serves_shard(root) && committed_height(c, root) > committed_height(c, payer_child)
     });
 
     let replay = pick_replay(c, payer_child, &probes);
-    let stranded = build_precut_probe(c, root);
+    let stranded = build_precut_probe(c, root, 0);
     let (replayed, stranded_hash) = (replay.hash(), charges.record(&stranded));
 
     c.submit(replay);

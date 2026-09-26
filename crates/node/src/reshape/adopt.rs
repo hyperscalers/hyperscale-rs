@@ -9,8 +9,8 @@
 //! selection, and the acceptance check — so both harnesses call one gate
 //! rather than re-deriving any part of it.
 
-use hyperscale_storage::{AdoptSource, BoundaryStore, RecoveredState};
-use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, ShardId, StateRoot, SubstateKey};
+use hyperscale_storage::{AdoptSource, BoundaryStore, MemberIndex, RecoveredState};
+use hyperscale_types::{Anchor, Block, ChainOrigin, ReadFrontier, ShardId, StateRoot};
 
 use super::orchestrator::AdoptKind;
 
@@ -40,7 +40,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     kind: AdoptKind,
     origin: ChainOrigin,
     genesis: &Block,
-    predecessors: Vec<PredecessorTerminal>,
+    predecessors: Vec<Anchor>,
 ) -> Result<RecoveredState, String> {
     let source = match kind {
         AdoptKind::Split => AdoptSource::FollowedTip,
@@ -53,25 +53,16 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     let substate_bytes = storage
         .substate_bytes_at_version(origin.genesis_height.inner())
         .unwrap_or(0);
-    // A seat's obligations come from the leaves it imported and from
-    // nothing else, whichever way it was seated. The value a predecessor
-    // escrowed arrives with the prefix and no chain here names it: a
-    // merged parent's chain begins at the import, a memory clone holds
-    // no blocks at all, and the predecessor drops its ledger at the cut.
-    // So the state is the authority for every kind, and it is what every
-    // keeper imported.
-    //
-    // A cloned store carrying the predecessor's blocks composes nothing
-    // twice on top of this: the replay walk stops at this chain's own
-    // origin, so it never reaches a block the predecessor committed.
-    let escrow_records = storage.escrow_records(shard);
+    let read_frontier = storage.read_frontier(shard);
+    let members = storage.member_index(shard);
     verified_recovered_state(
         adopted,
         genesis.header().state_root(),
         origin,
         substate_bytes,
         predecessors,
-        escrow_records,
+        read_frontier,
+        members,
     )
 }
 
@@ -85,8 +76,9 @@ fn verified_recovered_state(
     expected: StateRoot,
     origin: ChainOrigin,
     substate_bytes: u64,
-    predecessors: Vec<PredecessorTerminal>,
-    escrow_records: Vec<(SubstateKey, Vec<u8>)>,
+    predecessors: Vec<Anchor>,
+    read_frontier: ReadFrontier,
+    members: MemberIndex,
 ) -> Result<RecoveredState, String> {
     if adopted != expected {
         return Err(format!(
@@ -97,14 +89,19 @@ fn verified_recovered_state(
         substate_bytes,
         chain_origin: origin,
         predecessors,
-        escrow_records,
+        read_frontier,
+        members: Some(members),
         ..RecoveredState::default()
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, ChainOrigin, Hash, StateRoot, WeightedTimestamp};
+    use hyperscale_storage::MemberIndex;
+    use hyperscale_types::{
+        BlockHeight, ChainOrigin, Epoch, Hash, ReadFrontier, ReadMark, ShardId, StateRoot,
+        WeightedTimestamp,
+    };
 
     use super::verified_recovered_state;
 
@@ -115,14 +112,31 @@ mod tests {
         }
     }
 
+    /// A seat boots from the root it adopted, and carries the read
+    /// frontier the adopted state holds into the coordinator's copy.
     #[test]
     fn matching_root_yields_the_seat_state() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"adopted"));
-        let recovered =
-            verified_recovered_state(root, root, origin(), 4_096, Vec::new(), Vec::new())
-                .expect("matches");
+        let read_frontier = ReadFrontier::from_entries([(
+            ShardId::leaf(1, 1),
+            ReadMark {
+                epoch: Epoch::new(2),
+                height: BlockHeight::new(40),
+            },
+        )]);
+        let recovered = verified_recovered_state(
+            root,
+            root,
+            origin(),
+            4_096,
+            Vec::new(),
+            read_frontier.clone(),
+            MemberIndex::empty(ShardId::ROOT),
+        )
+        .expect("matches");
         assert_eq!(recovered.substate_bytes, 4_096);
         assert_eq!(recovered.chain_origin, origin());
+        assert_eq!(recovered.read_frontier, read_frontier);
     }
 
     #[test]
@@ -130,8 +144,16 @@ mod tests {
         let adopted = StateRoot::from_raw(Hash::from_bytes(b"adopted"));
         let expected = StateRoot::from_raw(Hash::from_bytes(b"beacon"));
         assert!(
-            verified_recovered_state(adopted, expected, origin(), 0, Vec::new(), Vec::new())
-                .is_err()
+            verified_recovered_state(
+                adopted,
+                expected,
+                origin(),
+                0,
+                Vec::new(),
+                ReadFrontier::default(),
+                MemberIndex::empty(ShardId::ROOT),
+            )
+            .is_err()
         );
     }
 }

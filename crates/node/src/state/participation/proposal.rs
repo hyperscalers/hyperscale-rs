@@ -13,6 +13,7 @@ use hyperscale_types::{
     AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId, StateClaim,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
 };
+use hyperscale_vm_effects::CrossingId;
 
 use super::ShardParticipation;
 
@@ -23,6 +24,7 @@ pub(in crate::state) struct ProposalInputs {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
+    pub(crate) local_crossings: Vec<CrossingId>,
 }
 
 impl ShardParticipation {
@@ -56,12 +58,13 @@ impl ShardParticipation {
         let Offers {
             state_claims,
             abandonment_records,
+            local_crossings,
         } = self.execution_coordinator.offers();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
         // transaction only beside its payer bundle — this proposal's
-        // own provisions — or after an earlier block absorbed it. The
+        // own provisions — or after a committed block engaged it. The
         // bundle is the transaction commit proof (verified against a
         // commit-proven payer header), so locks engage only on committed
         // payer evidence; a mis-paired inclusion is backstopped by the
@@ -93,12 +96,13 @@ impl ShardParticipation {
             provisions,
             abandonment_records,
             state_claims,
+            local_crossings,
         }
     }
 
-    /// Whether the engagement evidence for `tx` is in hand: not a
-    /// transaction, single-shard, our shard is the payer's, the payer's
-    /// bundle rides in `queued`, or an earlier block already absorbed it.
+    /// Whether the engagement evidence for `tx` is in hand: it is
+    /// single-shard, our shard is the payer's, the payer's bundle rides
+    /// in `queued`, or a committed block's engagements name it.
     fn engagement_held(
         &self,
         tx: &Arc<Verified<Transaction>>,
@@ -113,8 +117,8 @@ impl ShardParticipation {
             return true;
         }
         let tx_hash = tx.hash();
-        self.execution_coordinator
-            .has_provisions_from(tx_hash, payer_shard)
+        self.shard_coordinator
+            .engaged_committed(payer_shard, tx_hash, topology)
             || riding.contains(&(payer_shard, tx_hash))
     }
 
@@ -154,6 +158,7 @@ impl ShardParticipation {
             inputs.provisions,
             inputs.abandonment_records,
             inputs.state_claims,
+            inputs.local_crossings,
         )
     }
 }

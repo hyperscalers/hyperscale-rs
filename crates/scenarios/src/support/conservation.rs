@@ -9,19 +9,23 @@
 //! transaction a receipt committed for burned its declared price, once,
 //! whatever the verdict was. [`Charges`] keeps that sum.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     Address, ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
     TransactionStatus, TxHash,
 };
 
-use super::query::{MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at};
-use super::tx::{recipient, sender};
+use super::query::{
+    Locked, MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at, locked_at,
+    owed_at, unclaimable_at,
+};
+use super::tx::{LEFT_PROBE_SENDER, recipient, sender};
 use super::{Budget, Cluster};
 
 /// How long a settled world is held settled before it is asserted.
@@ -36,12 +40,17 @@ use super::{Budget, Cluster};
 const SETTLED_TAIL: Duration = Duration::from_secs(5);
 
 /// The world a [`build_probe_transfer_tx`](super::tx::build_probe_transfer_tx)
-/// train reaches: the first genesis-funded sender and recipient, in protocol resource.
+/// train reaches: the two probe senders and the recipient, in protocol
+/// resource.
 pub fn probe_world<C: Cluster + ?Sized>(c: &C) -> World {
     World::open(
         c,
         *PROTOCOL_RESOURCE,
-        [sender(0).1.address(), recipient(0).address()],
+        [
+            sender(0).1.address(),
+            sender(LEFT_PROBE_SENDER).1.address(),
+            recipient(0).address(),
+        ],
         [],
     )
 }
@@ -52,7 +61,30 @@ pub struct World {
     resource: ResourceAddr,
     holders: Vec<Address>,
     cells: Vec<SubstateKey>,
+    /// Record cells a scenario's crossings may leave standing. A
+    /// crossing an outbound leg consumes is owed to that consumer until
+    /// it claims, so its value sits in the record rather than in any
+    /// account — held, not stranded, and counted here so the two sides
+    /// still balance.
+    owed: Vec<SubstateKey>,
     before: u128,
+    /// Whether anything has read the world since it was opened. A world
+    /// nobody read asserted nothing, so one that drops unread fails its
+    /// scenario.
+    read: Cell<bool>,
+}
+
+/// Refused here rather than by `#[must_use]`, which a binding satisfies
+/// without a read. Silent while a panic is already unwinding, so the
+/// scenario's own failure is the one reported.
+impl Drop for World {
+    fn drop(&mut self) {
+        assert!(
+            self.read.get() || std::thread::panicking(),
+            "{:?}: a conservation world was opened and never read",
+            self.resource,
+        );
+    }
 }
 
 impl World {
@@ -74,7 +106,9 @@ impl World {
             resource,
             holders: holders.into_iter().collect(),
             cells: cells.into_iter().collect(),
+            owed: Vec::new(),
             before: 0,
+            read: Cell::new(false),
         };
         world.before = world.held(c);
         assert!(
@@ -82,25 +116,98 @@ impl World {
             "the conservation check has to be reading something, or it holds \
              trivially at zero",
         );
+        world.read.set(false);
         world
     }
 
     /// What the world summed to when it was opened.
     #[must_use]
-    pub const fn before(&self) -> u128 {
+    pub fn before(&self) -> u128 {
+        self.read.set(true);
         self.before
+    }
+
+    /// Count the crossings `records` may leave standing as value the
+    /// world still holds.
+    ///
+    /// Registered after submission rather than at [`Self::open`],
+    /// because a record cell's key is derived from the transaction and
+    /// the value only reaches it once the producing leg runs. A key
+    /// whose record never stands reads zero, so registering one costs
+    /// nothing.
+    pub fn owing(&mut self, records: impl IntoIterator<Item = SubstateKey>) {
+        self.owed.extend(records);
     }
 
     /// What the world sums to now.
     #[must_use]
     pub fn held<C: Cluster + ?Sized>(&self, c: &C) -> u128 {
+        self.read.set(true);
         let vaults = self
             .holders
             .iter()
             .fold(0u128, |sum, owner| sum + held(c, *owner, self.resource));
-        self.cells
+        let cells = self
+            .cells
             .iter()
-            .fold(vaults, |sum, cell| sum + held_at(c, *cell))
+            .fold(vaults, |sum, cell| sum + held_at(c, *cell));
+        self.owed.iter().fold(cells, |sum, record| {
+            sum + owed_at(c, *record, self.resource)
+        })
+    }
+
+    /// Every record this world registered that nothing can claim any
+    /// more: standing, with no claim answering it, past the close of its
+    /// own delivery window.
+    #[must_use]
+    pub fn stranded<C: Cluster + ?Sized>(&self, c: &C) -> Vec<(SubstateKey, u128)> {
+        self.read.set(true);
+        self.owed
+            .iter()
+            .filter_map(|cell| {
+                let amount = unclaimable_at(c, *cell, self.resource);
+                (amount > 0).then_some((*cell, amount))
+            })
+            .collect()
+    }
+
+    /// Every record this world registered that still holds value:
+    /// standing, with no claim answering it, whatever its window says.
+    ///
+    /// [`stranded`](Self::stranded) without the window. A record inside
+    /// its window is in flight and one past it is stranded; both stand
+    /// here, which is what a scenario that expects a delivery to be
+    /// owed reads.
+    #[must_use]
+    pub fn standing<C: Cluster + ?Sized>(&self, c: &C) -> Vec<(SubstateKey, u128)> {
+        self.read.set(true);
+        self.owed
+            .iter()
+            .filter_map(|cell| {
+                let amount = owed_at(c, *cell, self.resource);
+                (amount > 0).then_some((*cell, amount))
+            })
+            .collect()
+    }
+
+    /// Every crossing record the world can name that stands unanswered:
+    /// the records of every transaction `charges` recorded, and the ones
+    /// [`owing`](Self::owing) registered. Value locked rather than
+    /// stranded — a record in flight reads the same way — so this
+    /// reports and asserts nothing; a scenario that constructs a lock
+    /// asserts on it.
+    #[must_use]
+    pub fn locked<C: Cluster + ?Sized>(&self, c: &C, charges: &Charges) -> Vec<Locked> {
+        self.read.set(true);
+        let records: BTreeSet<SubstateKey> = charges
+            .records(c)
+            .into_iter()
+            .chain(self.owed.iter().copied())
+            .collect();
+        records
+            .into_iter()
+            .filter_map(|record| locked_at(c, record))
+            .collect()
     }
 
     /// Whether what the world holds now, plus what `burned` accounts for,
@@ -122,6 +229,9 @@ impl World {
     /// reading it once says nothing about how many times value came
     /// back.
     ///
+    /// Returns what [`locked`](Self::locked) reports at the settled
+    /// instant.
+    ///
     /// # Panics
     ///
     /// As [`assert_settled`](Self::assert_settled).
@@ -131,21 +241,48 @@ impl World {
         charges: &Charges,
         budget: Budget,
         context: &str,
-    ) {
+    ) -> Vec<Locked> {
         let _ = c.run_until(budget, |c| self.settles(c, charges.burned(c)));
         let tail = c.now() + SETTLED_TAIL;
         let _ = c.run_until(budget, |c| c.now() >= tail);
-        self.assert_settled(c, charges.burned(c), context);
+        let locked = self.assert_settled(c, charges, context);
         charges.assert_each_fits_a_full_block(c);
+        locked
     }
 
-    /// Assert [`settles`](Self::settles), naming both sides.
+    /// Assert [`settles`](Self::settles) against what `charges` burned,
+    /// naming both sides, and report what stands locked.
     ///
     /// # Panics
     ///
     /// Panics if the world grew — value from nowhere — or shrank by more
     /// than the burn — value stranded.
-    pub fn assert_settled<C: Cluster + ?Sized>(&self, c: &C, burned: u128, context: &str) {
+    pub fn assert_settled<C: Cluster + ?Sized>(
+        &self,
+        c: &C,
+        charges: &Charges,
+        context: &str,
+    ) -> Vec<Locked> {
+        let burned = charges.burned(c);
+        // Counting a standing record as value the world holds is what
+        // keeps the sum honest while a crossing is in flight, and it is
+        // also what a strand would hide: the value is there, so the two
+        // sides balance whether or not anything can still reach it. A
+        // record inside its delivery window is in flight and says
+        // nothing; one past it can never be claimed, because the only
+        // writer of the claim cell is a delivery member and admission
+        // refuses one there.
+        //
+        // A tripwire rather than a demonstration: no scenario yet keeps a
+        // shard from its delivery for the width of that window, so this
+        // has never fired. It is what would catch the day one does.
+        let stranded = self.stranded(c);
+        assert!(
+            stranded.is_empty(),
+            "{context}: the world balances with {} crossing(s) past the close of their \
+             delivery window that nothing can claim — {stranded:?}",
+            stranded.len(),
+        );
         let after = self.held(c);
         assert_eq!(
             after + burned,
@@ -159,6 +296,13 @@ impl World {
                 "value was stranded"
             },
         );
+        let locked = self.locked(c, charges);
+        let holding: u128 = locked.iter().map(|lock| lock.amount).sum();
+        println!(
+            "{context}: {} locked record(s) holding {holding}",
+            locked.len()
+        );
+        locked
     }
 }
 
@@ -204,6 +348,25 @@ impl Charges {
         let hash = self.record(&tx);
         c.submit(tx);
         hash
+    }
+
+    /// The record cell of every crossing the recorded transactions
+    /// derive, skipping a transaction that does not derive here.
+    #[must_use]
+    pub fn records<C: Cluster + ?Sized>(&self, c: &C) -> Vec<SubstateKey> {
+        let derivation = c.derivation();
+        self.owed
+            .values()
+            .filter_map(|tx| tx.try_derived(derivation.as_ref()).ok())
+            .flat_map(|derived| crossing_records(&derived.legs))
+            .collect()
+    }
+
+    /// The envelope recorded under `hash`, for a scenario that has to
+    /// offer the same signed transaction again.
+    #[must_use]
+    pub fn recorded(&self, hash: TxHash) -> Option<&Arc<Transaction>> {
+        self.owed.get(&hash)
     }
 
     /// How many of the recorded transactions have been charged.
@@ -294,4 +457,126 @@ impl Charges {
 /// depth no chain ever existed at answers nothing, so asking is inert.
 fn covering_chains(payer: Address) -> impl Iterator<Item = ShardId> {
     (0..=MAX_SEARCHED_DEPTH).map(move |depth| ShardTrie::uniform(depth).shard_for_prefix(payer))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use hyperscale_types::{
+        BeaconState, BlockHeight, Derivation, StateRoot, TxsInFlight, WeightedTimestamp,
+    };
+
+    use super::*;
+    use crate::support::query::RanAs;
+
+    /// A cluster serving nothing: every observation answers absent, and
+    /// nothing a conservation read reaches drives it.
+    struct Nowhere;
+
+    impl Cluster for Nowhere {
+        fn submit(&mut self, _: Arc<Transaction>) {
+            unreachable!()
+        }
+
+        fn submit_to(&mut self, _: ShardId, _: Arc<Transaction>) {
+            unreachable!()
+        }
+
+        fn derivation(&self) -> Arc<dyn Derivation> {
+            unreachable!()
+        }
+
+        fn run_until(&mut self, _: Budget, _: impl Fn(&Self) -> bool) -> bool {
+            unreachable!()
+        }
+
+        fn now(&self) -> Duration {
+            unreachable!()
+        }
+
+        fn committed_height(&self, _: ShardId) -> Option<BlockHeight> {
+            None
+        }
+
+        fn committed_state_root(&self, _: ShardId) -> Option<StateRoot> {
+            None
+        }
+
+        fn serves_shard(&self, _: ShardId) -> bool {
+            false
+        }
+
+        fn beacon_state(&self) -> Option<Arc<BeaconState>> {
+            None
+        }
+
+        fn chain_origin_anchor(&self, _: ShardId) -> Option<WeightedTimestamp> {
+            None
+        }
+
+        fn committed_txs_in_flight(&self, _: ShardId) -> Option<TxsInFlight> {
+            None
+        }
+
+        fn tx_status(&self, _: TxHash) -> Option<TransactionStatus> {
+            None
+        }
+
+        fn ran(&self, _: ShardId, _: TxHash) -> Vec<RanAs> {
+            Vec::new()
+        }
+
+        fn named_unsettled(&self, _: ShardId, _: TxHash) -> Vec<(BlockHeight, ShardId)> {
+            Vec::new()
+        }
+
+        fn reads_record(&self, _: ShardId, _: SubstateKey) -> bool {
+            false
+        }
+
+        fn declined(&self, _: ShardId, _: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
+            Vec::new()
+        }
+
+        fn chain_fate(
+            &self,
+            _: ShardId,
+            _: TxHash,
+        ) -> (
+            Option<BlockHeight>,
+            Option<(BlockHeight, TransactionDecision)>,
+        ) {
+            (None, None)
+        }
+    }
+
+    /// A world as [`World::open`] leaves it: sampled, and not yet read.
+    fn unread_world() -> World {
+        World {
+            resource: *PROTOCOL_RESOURCE,
+            holders: Vec::new(),
+            cells: Vec::new(),
+            owed: Vec::new(),
+            before: 1,
+            read: Cell::new(false),
+        }
+    }
+
+    #[test]
+    fn a_world_opened_and_never_read_panics() {
+        let dropped = catch_unwind(AssertUnwindSafe(|| drop(unread_world())));
+        let message = dropped.expect_err("an unread world must refuse to drop");
+        let message = message
+            .downcast_ref::<String>()
+            .expect("the refusal is a formatted message");
+        assert!(
+            message.contains("a conservation world was opened and never read"),
+            "{message}",
+        );
+
+        let read = unread_world();
+        assert_eq!(read.held(&Nowhere), 0);
+        drop(read);
+    }
 }

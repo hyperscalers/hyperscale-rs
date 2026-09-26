@@ -8,15 +8,18 @@
 
 use std::collections::BTreeSet;
 
+use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool,
-    StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
+    Address, BlockHash, BlockHeight, ConsensusPublicKey, Deadline, Epoch,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId,
+    ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
+    WeightedTimestamp, Window, sweep_admits_block,
 };
+use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms};
 
 use super::{Budget, Cluster};
 
@@ -131,6 +134,129 @@ pub(crate) fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
         })
 }
 
+/// What a crossing record standing at `cell` still owes, in `resource`.
+///
+/// Zero where the cell holds nothing, holds something that is not a
+/// record, or holds one denominated in another resource — and zero once
+/// the consumer's claim cell is there, whatever the record still says.
+/// A record is value the producing shard holds for a crossing its
+/// consumer has **not** claimed; past the claim the value is in the
+/// recipient's vault and the leaf is a receipt awaiting deletion. The
+/// two overlap for as long as the retirement takes to be composed, and
+/// counting both would find a payment twice.
+pub(crate) fn owed_at<C: Cluster + ?Sized>(
+    c: &C,
+    cell: SubstateKey,
+    resource: ResourceAddr,
+) -> u128 {
+    let shard = owning_shard(c, cell.owner);
+    c.substate(shard, cell.owner, cell.local.0)
+        .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+        .filter(|record| record.resource == resource)
+        .filter(|record| {
+            let claim = CrossingId::of_record(cell.owner, record)
+                .answer_key(&ProtocolHasher, Answered::Taken);
+            c.substate(owning_shard(c, claim.owner), claim.owner, claim.local.0)
+                .is_none()
+        })
+        .map_or(0, |record| record.amount)
+}
+
+/// What a crossing record standing at `cell` owes that nothing can
+/// claim any more, in `resource`.
+///
+/// [`owed_at`] measured against the close of the window the record's own
+/// kind is decided in. Inside it the value is in flight; past it no
+/// action of any shard can move it again, so a non-zero answer is value
+/// stranded.
+///
+/// The two kinds close for different reasons and the arms are kept
+/// apart:
+///
+/// - an **owed** record is claimed by a delivery, and nothing closes
+///   that: the crossing is its consumer's whenever it runs, so the value
+///   is in flight for as long as the record stands and this arm never
+///   reports it stranded;
+/// - an **escrowed** one is taken by a core or credited back to the cell
+///   it names, and past [`Window::LegEntry`] the leg entry that composes
+///   either is gone — which is the last road that needs nothing of the
+///   consumer.
+///
+/// **The escrowed arm is a net rather than a proof, and says so.** Every
+/// crossing verdict is a presence, and a presence answers at whatever
+/// anchor it was taken: the record stands in the producer's `held`,
+/// which no clock prunes, so a consumer's decline arriving later still
+/// settles it. What the window bounds is how long the producer can
+/// settle without the consumer speaking at all. So a record still
+/// standing past it is one whose consumer has not been heard from — cut
+/// off, or never handed the crossing — and reporting it is how a
+/// scenario notices; a scenario whose cut later lifts must drive to
+/// settlement rather than read this at an instant.
+pub(crate) fn unclaimable_at<C: Cluster + ?Sized>(
+    c: &C,
+    cell: SubstateKey,
+    resource: ResourceAddr,
+) -> u128 {
+    let shard = owning_shard(c, cell.owner);
+    let closed = c
+        .substate(shard, cell.owner, cell.local.0)
+        .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+        .is_some_and(|record| {
+            let deadline = Deadline::of(WeightedTimestamp::from_millis(record.validity_end_ms));
+            match record.terms {
+                Terms::Owed => false,
+                Terms::Escrowed { .. } => Window::LegEntry.of(deadline).end <= clock(c),
+            }
+        });
+    if closed {
+        owed_at(c, cell, resource)
+    } else {
+        0
+    }
+}
+
+/// A crossing record standing with no answer: value the protocol holds
+/// locked, listed and counted, until a verdict releases it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locked {
+    /// The record cell.
+    pub record: SubstateKey,
+    /// The transaction that issued the crossing.
+    pub tx: TxHash,
+    /// Which kind of crossing the record is.
+    pub kind: Kind,
+    /// What the record holds.
+    pub resource: ResourceAddr,
+    /// How much of it.
+    pub amount: u128,
+}
+
+/// The record standing at `cell` that nothing has answered: an escrowed
+/// or owed record whose claim key and decline key are both absent.
+/// `None` for an absent key or a record either answer stands beside —
+/// a record in flight at the instant of the read looks
+/// the same, so this reports and asserts nothing.
+#[must_use]
+pub(crate) fn locked_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> Option<Locked> {
+    let shard = owning_shard(c, cell.owner);
+    let record = CrossingCell::from_bytes(&c.substate(shard, cell.owner, cell.local.0)?)?;
+    let kind = record.terms.kind();
+    let id = CrossingId::of_record(cell.owner, &record);
+    let claim = id.answer_key(&ProtocolHasher, Answered::Taken);
+    let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+    let answered = [claim, decline].into_iter().any(|key| {
+        c.substate(owning_shard(c, key.owner), key.owner, key.local.0)
+            .is_some()
+    });
+    (!answered).then_some(Locked {
+        record: cell,
+        tx: record.tx,
+        kind,
+        resource: record.resource,
+        amount: record.amount,
+    })
+}
+
 /// The live shard whose prefix `owner` falls under.
 ///
 /// The beacon's live leaf partition is the authority: a split's parent
@@ -207,6 +333,68 @@ pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHe
     named
 }
 
+/// Whether `shard`'s chain has carried a held reading of `key`: a state
+/// claim, in any committed block, holding the cell's value. A crossing
+/// record reaches its consumer this way, pushed or read.
+#[must_use]
+pub fn reads_record(store: &impl ShardChainReader, key: SubstateKey) -> bool {
+    let tip = store.committed_height();
+    let mut height = BlockHeight::new(1);
+    while height <= tip {
+        if let Some(certified) = store.get_block(height)
+            && certified
+                .block()
+                .state_claims()
+                .iter()
+                .any(|claim| claim.held(key).is_some())
+        {
+            return true;
+        }
+        height = height.next();
+    }
+    false
+}
+
+/// Walk `store`'s committed chain for every crossing refusal naming
+/// `tx`: the height each committed at and the record it refuses.
+///
+/// Read off the `Never` cells this shard's own finalizations wrote,
+/// which is where a refusal is: the consuming member's refusal receipt,
+/// riding the finalization that refused it. So a scenario asking whether
+/// this shard refused a crossing asks the chain rather than the state,
+/// and gets the height it happened at with the answer.
+#[must_use]
+pub fn declines_naming(
+    store: &impl ShardChainReader,
+    tx: TxHash,
+) -> Vec<(BlockHeight, SubstateKey)> {
+    let tip = store.committed_height();
+    let mut named = Vec::new();
+    let mut height = BlockHeight::new(1);
+    while height <= tip {
+        if let Some(certified) = store.get_block(height) {
+            for finalization in certified.block().certificates().iter() {
+                for receipt in finalization.as_unverified().receipts() {
+                    let Some(writes) = receipt.consensus.writes() else {
+                        continue;
+                    };
+                    named.extend(writes.cells.iter().filter_map(|(key, value)| {
+                        let CrossingLeaf::Answer { id, answer } =
+                            CrossingLeaf::read(&ProtocolHasher, *key, value.as_ref()?)?
+                        else {
+                            return None;
+                        };
+                        (answer.answered == Answered::Never && answer.tx == tx)
+                            .then(|| (height, id.record_key(&ProtocolHasher)))
+                    }));
+                }
+            }
+        }
+        height = height.next();
+    }
+    named
+}
+
 /// One thing a shard's own certificate said it ran of a transaction.
 ///
 /// Read off the local execution certificate's outcome, so it is the
@@ -225,8 +413,6 @@ pub struct RanAs {
     /// member this shard composed for itself — a reclaim or a
     /// retirement.
     pub(crate) reaches_beyond: bool,
-    /// The shards this execution's crossings were issued to.
-    pub(crate) crossing_targets: Vec<ShardId>,
 }
 
 impl RanAs {
@@ -262,7 +448,6 @@ pub fn chain_membership(store: &impl ShardChainReader, tx: TxHash) -> Vec<RanAs>
                             awaited: outcome.counterparts().to_vec(),
                             decides: outcome.decides(),
                             reaches_beyond: outcome.reaches_beyond(),
-                            crossing_targets: outcome.crossing_targets().to_vec(),
                         }),
                 );
             }
@@ -429,7 +614,7 @@ pub(crate) fn merge_keeper_count<C: Cluster>(c: &C, parent: ShardId) -> Option<u
         .and_then(|state| match state.pending_reshapes.get(&parent) {
             Some(PendingReshape::Merge {
                 keepers,
-                admitted_at: Some(_),
+                admitted: Some(_),
                 ..
             }) => Some(keepers.len()),
             _ => None,

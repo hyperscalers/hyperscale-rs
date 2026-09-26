@@ -15,9 +15,9 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    Anchor, BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal,
-    ShardId, SubstateKey, TerminalEvidence, TopologySchedule, TransactionStatus, TxHash,
-    ValidatorId, Verified,
+    Anchor, BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, ShardId, SubstateKey,
+    TerminalEvidence, TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
+    WeightedTimestamp,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -29,7 +29,7 @@ use crate::shard::commit::{
     QcOnlyPending, make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
-use crate::shard::cross_shard::{CommittedTxBinding, SettledTxsBinding, StateProofRelayBinding};
+use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -78,6 +78,7 @@ where
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. }
+            | Action::PushCrossingReadings { .. }
             | Action::BroadcastBlockHeader { .. }
             | Action::SignAndBroadcastBlockVote { .. }
             | Action::SignAndBroadcastTimeout { .. }
@@ -201,12 +202,14 @@ where
                 certified,
                 source,
                 witness,
+                committee_anchor,
             } => {
                 self.accept_block_commit(PendingCommit {
                     certified,
                     source,
                     committed_notified: false, // set by accumulate
                     witness,
+                    committee_anchor,
                 });
             }
             Action::CommitBlockByQcOnly {
@@ -215,8 +218,10 @@ where
                 parent_block_height,
                 parent_sweep_frontier,
                 creations,
+                frontier,
                 source,
                 witness,
+                committee_anchor,
             } => {
                 self.accept_qc_only_commit(QcOnlyCommit {
                     certified,
@@ -224,8 +229,10 @@ where
                     parent_block_height,
                     parent_sweep_frontier,
                     creations,
+                    frontier,
                     source,
                     witness,
+                    committee_anchor,
                 });
             }
             Action::AttachCertifiedUncommitted { certified } => {
@@ -321,8 +328,7 @@ where
 
     fn handle_restore_committed_state(&self) {
         let storage = &self.io.storage;
-        let height = storage.committed_height();
-        let hash = storage.committed_hash();
+        let (height, hash) = storage.committed_head();
         let qc = storage.latest_qc();
         push_protocol_event(
             self.event_sender(),
@@ -390,8 +396,10 @@ where
             parent_block_height,
             parent_sweep_frontier,
             creations,
+            frontier,
             source,
             witness,
+            committee_anchor,
         } = commit;
         let block_hash = certified.block().hash();
         let height = certified.block().height();
@@ -415,9 +423,11 @@ where
             parent_block_height,
             parent_sweep_frontier,
             creations,
+            frontier,
             source,
             kind,
             witness,
+            committee_anchor,
         };
         if let Some(to_process) = self.io.block_commit.try_acquire_qc_only_slot(pending) {
             self.process_qc_only(to_process);
@@ -444,6 +454,7 @@ where
                         source: pending.source,
                         committed_notified: false,
                         witness: pending.witness,
+                        committee_anchor: pending.committee_anchor,
                     });
                     match self.io.block_commit.release_qc_only_slot() {
                         Some(next) => pending = next,
@@ -480,6 +491,7 @@ where
                     certified,
                     source,
                     witness,
+                    committee_anchor,
                     ..
                 } = pending;
                 match result {
@@ -490,6 +502,7 @@ where
                             certified,
                             source,
                             witness,
+                            committee_anchor,
                         },
                     ),
                     Err(div) => push_shard_input(
@@ -511,12 +524,14 @@ where
         certified: Arc<Verified<CertifiedBlock>>,
         source: CommitSource,
         witness: BeaconWitnessCommit,
+        committee_anchor: WeightedTimestamp,
     ) {
         self.accept_block_commit(PendingCommit {
             certified,
             source,
             committed_notified: false,
             witness,
+            committee_anchor,
         });
         if let Some(next) = self.io.block_commit.release_qc_only_slot() {
             self.process_qc_only(next);
@@ -542,6 +557,7 @@ where
             AccumulateDecision::Accepted {
                 height,
                 handle: certified,
+                committee_anchor,
                 notify_now,
             } => {
                 debug!(height = height.inner(), "Block committed");
@@ -557,7 +573,10 @@ where
                     .pending_chain
                     .attach_certified_block(block_hash, Arc::clone(&certified));
                 if notify_now {
-                    self.dispatch_event(ProtocolEvent::BlockCommitted { certified });
+                    self.dispatch_event(ProtocolEvent::BlockCommitted {
+                        certified,
+                        committee_anchor,
+                    });
                 }
             }
         }
@@ -602,30 +621,26 @@ where
                 preferred,
                 class,
             } => self.request_fetch(ids, shard, preferred, class),
-            FetchRequest::CommittedTxs {
-                predecessor,
-                tx_hashes,
+            FetchRequest::PrecutProofs {
+                terminal,
+                keys,
                 preferred,
                 class,
             } => {
-                let wanted: BTreeSet<(PredecessorTerminal, TxHash)> = tx_hashes
-                    .into_iter()
-                    .map(|tx_hash| (predecessor, tx_hash))
-                    .collect();
-                // The scan re-derives the whole wanted set for this
-                // predecessor each pass, so anything the fetch still
-                // holds under it and the scan no longer names is an
-                // answer nobody is waiting for — a transaction that
-                // expired out of the pool, or the rule retiring as the
-                // chain outlives its origin. Nothing else retires these
-                // ids: a terminated committee that never answers would
-                // pin them for good.
-                self.abandon_unwanted::<CommittedTxBinding>(&wanted, |id| {
-                    id.0.shard == predecessor.shard
-                });
-                self.drive_fetch::<CommittedTxBinding>(FetchInput::Request {
+                let wanted: BTreeSet<(Anchor, SubstateKey)> =
+                    keys.into_iter().map(|key| (terminal, key)).collect();
+                // The scan re-derives the whole wanted set under this
+                // terminal each pass, so anything the fetch still holds
+                // under it and the scan no longer names is an answer
+                // nobody is waiting for — a transaction that expired out
+                // of the pool, or the rule retiring as the chain outlives
+                // its origin. Nothing else retires these ids: a
+                // terminated committee that never answers would pin them
+                // for good.
+                self.abandon_unwanted::<StateProofBinding>(&wanted, |id| id.0 == terminal);
+                self.drive_fetch::<StateProofBinding>(FetchInput::Request {
                     ids: wanted.into_iter().collect(),
-                    shard: predecessor.shard,
+                    shard: terminal.shard,
                     preferred,
                     class,
                 });
@@ -654,31 +669,6 @@ where
                         class,
                     });
                 }
-            }
-            FetchRequest::RelayedStateProof {
-                anchor,
-                keys,
-                shard,
-                preferred,
-                class,
-            } => {
-                let wanted: BTreeSet<(Anchor, SubstateKey)> =
-                    keys.into_iter().map(|key| (anchor, key)).collect();
-                // A deferral names what every block deferred at this
-                // anchor is waiting on, not what one of them wants, so a
-                // cell the fetch still holds under it and the ask no
-                // longer names is one nobody is waiting on — the block
-                // that claimed it was discarded, or this validator's own
-                // probe proved the cell first. Nothing else retires
-                // these ids: a committee that never holds the proof
-                // would pin them for good.
-                self.abandon_unwanted::<StateProofRelayBinding>(&wanted, |id| id.0 == anchor);
-                self.drive_fetch::<StateProofRelayBinding>(FetchInput::Request {
-                    ids: wanted.into_iter().collect(),
-                    shard,
-                    preferred,
-                    class,
-                });
             }
         }
     }

@@ -23,25 +23,21 @@
 use std::collections::HashSet;
 
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Deadline, FEE_HOLD_WINDOW, FinalizationHash,
-    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp, Window,
+    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Engagement, FEE_HOLD_WINDOW, FinalizationHash,
+    PrincipalAddr, ProvisionHash, RETENTION_HORIZON, SubstateKey, TxHash, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
+use super::crossings::record_arrivals;
 
 /// One rebuild of the committed-artifact window, and whether it covers the
 /// whole of it.
 ///
-/// The three maps carry their own deadlines because the tiers differ: a
-/// transaction's is the close of the delivery window its signed
-/// `end_timestamp_exclusive` opens, a resolution's comes off the
-/// resolving certificate, and a provision batch's is keyed to the block
-/// that committed it.
+/// The maps carry their own deadlines because the tiers differ: a
+/// resolution's and a finalization's come off the resolving certificate,
+/// and a provision batch's is keyed to the block that committed it.
 #[derive(Debug, Clone, Default)]
 pub struct DedupWindow {
-    /// `(tx_hash, close of the delivery window)` for every transaction
-    /// the window's blocks committed.
-    pub committed: Vec<(TxHash, WeightedTimestamp)>,
     /// `(tx_hash, deadline)` for every transaction a committed
     /// finalization in the window reached a verdict for.
     pub resolved: Vec<(TxHash, WeightedTimestamp)>,
@@ -57,6 +53,19 @@ pub struct DedupWindow {
     /// *this certificate*, which is the only thing that refuses one whose
     /// members reach no verdict at all.
     pub finalizations: Vec<(FinalizationHash, WeightedTimestamp)>,
+    /// `(engagement, deadline)` for every entry the window's blocks
+    /// committed, each at its own block's anchor plus
+    /// [`RETENTION_HORIZON`] — the clock the live commit stamps with, so
+    /// a restart and a snap-synced joiner seed the tier the live path
+    /// built. Read off the block's own list, which a stored sealed block
+    /// keeps, so no provision body is read.
+    pub engagements: Vec<(Engagement, WeightedTimestamp)>,
+    /// `((record, issuer), height, deadline)` for every record a
+    /// committed claim in the window read live, at the height of the
+    /// block that carried the claim and that block's anchor plus
+    /// [`RETENTION_HORIZON`]: the arrivals tier's seed, on the clock the
+    /// live commit stamps with.
+    pub arrivals: Vec<((SubstateKey, TxHash), BlockHeight, WeightedTimestamp)>,
     /// The oldest block anchor the walk folded, or `None` when it folded
     /// nothing.
     ///
@@ -78,7 +87,7 @@ pub struct DedupWindow {
     ///
     /// Folded over a deeper span than the tiers above
     /// ([`FEE_HOLD_WINDOW`]), because a hold outlives a transaction's
-    /// delivery window. Held as what a payer shard's ledger takes rather
+    /// validity range. Held as what a payer shard's ledger takes rather
     /// than as a dedup tier: nothing here refuses a second inclusion.
     pub fee_holds: Vec<FeeHold>,
     /// Whether the fee-hold fold reached its own floor or the chain's
@@ -138,10 +147,13 @@ impl DedupWindow {
         let fee_floor = committed_ts.minus(FEE_HOLD_WINDOW);
         let mut window = Self::default();
         let mut height = committed_height;
-        // One descent, each tier stopping at its own floor. The fee tier
-        // reaches deeper, so the dedup tiers pin their coverage on the way
-        // past rather than ending the walk.
+        // One descent, each tier stopping at its own floor, and the walk
+        // ending where both have. The fee tier reaches deeper — a hold
+        // ends one settlement window past its transaction's, where a
+        // committed transaction is held one horizon past the block that
+        // carried it — so neither floor alone can end the descent.
         let mut dedup_done = false;
+        let mut fee_done = false;
         // What a finalization already released, gathered descending — a
         // block's certificates are read before its transactions, and a
         // finalization always sits at or above the block that committed
@@ -151,11 +163,11 @@ impl DedupWindow {
         loop {
             if height < origin.genesis_height {
                 // The bottom of this chain. Nothing beneath it was ever
-                // committed *here*, and for a reshape successor what its
-                // predecessor committed beneath it is refused by a
-                // different rule — a transaction whose validity window
-                // opened before the chain did cannot be admitted at all,
-                // so there is nothing down there for this window to hold.
+                // committed *here*: a predecessor's finalizations and
+                // provisions reached their own chain, and every one of its
+                // transactions is answered by the markers the precut rule
+                // reads, so there is nothing down there for this window
+                // to hold.
                 window.reached_origin = true;
                 window.fee_holds_whole = true;
                 return window;
@@ -167,22 +179,30 @@ impl DedupWindow {
             };
             let block = certified.block();
             let anchor = block.header().parent_qc().weighted_timestamp();
-            if anchor < fee_floor {
-                // Below every floor: nothing this walk seeds reaches here.
+            if !fee_done && anchor < fee_floor {
+                // Below the fee floor: every hold this walk seeds is
+                // folded, and the descent continues for the dedup tiers
+                // alone.
                 window.fee_holds_whole = true;
-                return window;
+                fee_done = true;
             }
             if !dedup_done && anchor < dedup_floor {
                 // Below the dedup floor: everything those tiers have to
                 // cover is already folded, and this block is the proof of
-                // it. The descent continues for the fee tier alone.
+                // it.
                 window.covered_from = Some(anchor);
                 dedup_done = true;
+            }
+            if dedup_done && fee_done {
+                // Below every floor: nothing this walk seeds reaches here.
+                return window;
             }
             if !dedup_done {
                 window.fold_block(block, anchor);
             }
-            window.fold_fee_holds(block, committed_ts, &mut released);
+            if !fee_done {
+                window.fold_fee_holds(block, committed_ts, &mut released);
+            }
 
             let Some(previous) = height.prev() else {
                 // Height zero: there is no block beneath it anywhere.
@@ -198,13 +218,9 @@ impl DedupWindow {
     /// now reaches its anchor.
     ///
     /// `anchor` is the block's own `parent_qc` weighted timestamp, which
-    /// the provision tier keys its deadline on.
+    /// the provision and engagement tiers key their deadlines on.
     fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
-        for tx in block.transactions().iter() {
-            let deadline = Window::Delivery.of(Deadline::of_transaction(tx)).end;
-            self.committed.push((tx.hash(), deadline));
-        }
         for finalization in block.certificates().iter() {
             let deadline = finalization.local_ec().deadline();
             self.finalizations
@@ -217,10 +233,22 @@ impl DedupWindow {
                 self.resolved.push((tx_hash, deadline));
             }
         }
-        let provision_deadline = anchor.plus(RETENTION_HORIZON);
+        let anchored_deadline = anchor.plus(RETENTION_HORIZON);
         for hash in block.provision_hashes() {
-            self.provisions.push((hash, provision_deadline));
+            self.provisions.push((hash, anchored_deadline));
         }
+        self.engagements.extend(
+            block
+                .engagements()
+                .iter()
+                .map(|engagement| (*engagement, anchored_deadline)),
+        );
+        let height = block.height();
+        self.arrivals.extend(
+            record_arrivals(block.state_claims())
+                .into_iter()
+                .map(|arrival| (arrival, height, anchored_deadline)),
+        );
     }
 
     /// Fold one committed block's fee reservations in: what its

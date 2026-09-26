@@ -13,7 +13,7 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
-use hyperscale_engine::legs::{Classified, Licence, Member, PlanDefect, Runs, Side};
+use hyperscale_engine::legs::{Classified, Member, PlanDefect, Runs, Unclaimable};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
@@ -22,20 +22,21 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
-    Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
+    Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore, crossing_settlements,
 };
-use hyperscale_transactions::{Ceilings, Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
 use hyperscale_types::{
-    BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline, DeclaredRange,
+    Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
-    GlobalReceipt, Hash, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
-    ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
-    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, Window,
-    absorb_committed_cells, compute_merkle_root,
+    GlobalReceipt, Hash, Inclusion, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof, NetworkId,
+    PriceTable, PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateClaim,
+    StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
+    WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, CrossingCell, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree,
-    PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
+    AbiParam, Answered, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent,
+    IntentHeader, IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Value,
+    issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
@@ -187,6 +188,8 @@ impl VersionedStore for MapDb {
     fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
         None
     }
+
+    fn hold_retention_at(&self, _height: BlockHeight) {}
 }
 
 /// The genesis package set this binary runs on.
@@ -681,6 +684,32 @@ fn settled_on(writes: &StateWrites, state: &impl Substates) -> SettledWrites {
         .expect("the debit fits")
 }
 
+/// The arrivals `consumer` takes, read off the record cells the
+/// producer's `writes` hold, as a consumer's arrival index reads the
+/// proven record.
+fn arrivals_written(
+    classified: &Classified,
+    writes: &StateWrites,
+    consumer: ShardId,
+) -> Vec<EscrowedValue> {
+    classified
+        .edges()
+        .iter()
+        .filter(|edge| edge.to.contains(&consumer))
+        .filter_map(|edge| {
+            let record = edge.crossing.id.record_key(&ProtocolHasher);
+            let cell = CrossingCell::from_bytes(writes.cells.get(&record)?.as_deref()?)?;
+            Some(EscrowedValue {
+                node: edge.producer,
+                output: edge.output,
+                resource: cell.resource,
+                amount: cell.amount,
+                record,
+            })
+        })
+        .collect()
+}
+
 fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
     eprintln!(
         "SETTLEDBG cells={:?} movements={:?} accounts={:?}",
@@ -828,7 +857,11 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
         if let Some(writes) = e.consensus.writes() {
             store.apply(writes);
         }
-        if let Some(writes) = e.fee_receipt.as_ref().and_then(ConsensusReceipt::writes) {
+        if let Some(writes) = e
+            .refusal_receipt
+            .as_ref()
+            .and_then(ConsensusReceipt::writes)
+        {
             store.apply(writes);
         }
     }
@@ -884,7 +917,7 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
     // Settle both, in commit order, and the debit is still there.
     let mut db = MapDb::genesis(&world_accounts());
     let charge = executed[0]
-        .fee_receipt
+        .refusal_receipt
         .as_ref()
         .and_then(|receipt| receipt.writes())
         .expect("a charged failure settles its price");
@@ -1097,9 +1130,9 @@ fn a_missed_edge_bound_charges_its_payer_the_price() {
     let Some(ConsensusReceipt::Succeeded {
         writes: database_updates,
         ..
-    }) = executed[0].fee_receipt.as_ref()
+    }) = executed[0].refusal_receipt.as_ref()
     else {
-        panic!("a charged abort settles a fee receipt");
+        panic!("a charged abort settles a refusal receipt");
     };
     assert_eq!(
         vault_cell(&settled(database_updates, &accounts), payer),
@@ -1155,6 +1188,26 @@ fn far() -> PrincipalAddr {
     PrincipalAddr::new(body)
 }
 
+/// The record keys of the crossings `local` issues, in edge order: every
+/// one, or those of one `kind`.
+/// `records`, each licensed by a verdict naming `tx`, which issued them.
+fn issued_by(records: Vec<SubstateKey>, tx: TxHash) -> Vec<(SubstateKey, Unclaimable)> {
+    records
+        .into_iter()
+        .map(|key| (key, Unclaimable::IssuedBy { tx }))
+        .collect()
+}
+
+fn issued(classified: &Classified, local: ShardId, kind: Option<Kind>) -> Vec<SubstateKey> {
+    classified
+        .crossings()
+        .filter(|(edge, _)| {
+            edge.from == local && kind.is_none_or(|kind| edge.crossing.kind == kind)
+        })
+        .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
+        .collect()
+}
+
 /// Execute one batch as `local_shard` under a two-leaf trie.
 fn execute_on_shard(
     executor: &Executor,
@@ -1193,8 +1246,9 @@ fn hash_of(executed: &ExecutedTx) -> Hash {
     *receipt_hash.as_raw()
 }
 
-/// A transfer's two legs emit from accounts on different shards. Each
-/// shard's receipt keeps only the events its own instances emitted,
+/// A transfer's withdrawal emits from an account on another shard than
+/// its recipient. Each shard's receipt keeps only the events its own
+/// instances emitted,
 /// while the receipt hash stays identical under whole locality — this
 /// batch has no abortable member, so the writes root covers the full
 /// fold on both sides. On the abortable path the roots are per shard by
@@ -1218,12 +1272,127 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
     let sender_side = execute_on_shard(&executor, near_shard, std::slice::from_ref(&tx));
     let recipient_side = execute_on_shard(&executor, far_shard, &[tx]);
 
+    // The deposit is the kernel's and emits nothing, so the recipient's
+    // shard keeps no event: the withdrawal's is not its emitter's to hold.
     assert_eq!(events_of(&sender_side[0]), vec![(alice().address(), 0)]);
-    assert_eq!(events_of(&recipient_side[0]), vec![(far().address(), 1)]);
+    assert_eq!(events_of(&recipient_side[0]), vec![]);
     assert_eq!(
         hash_of(&sender_side[0]),
         hash_of(&recipient_side[0]),
         "under whole locality the hash covers the full fold, so it cannot differ by shard",
+    );
+}
+
+/// A transfer whose fee payer sits on the recipient's shard never leaves
+/// that shard only delivering: the payer's home bears the verdict, so it
+/// commits as the core and the fee burns there, once. The sender's shard
+/// runs the withdrawal and pays the payment alone, and the crossing into
+/// the core is escrowed: the core takes it and credits the recipient.
+#[test]
+fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
+    let graph = client()
+        .transfer_graph(alice(), far(), 100)
+        .expect("an account answers a transfer");
+    let gas_limits = default_gas_limits(graph.nodes.len());
+    let envelope = signing::wrap(
+        &IntentTree::of_one(Intent::leaf(HEADER, alice(), graph)),
+        signing::Terms {
+            fee_payer: far(),
+            max_fee: TRANSFER_FEE,
+            gas_limits: gas_limits
+                .try_into()
+                .expect("one ceiling per node, under the node cap"),
+            priority_bp: 0,
+            message: Bytes::empty(),
+        },
+    )
+    .expect("a transfer fits the tree cap");
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
+        signing::sign(envelope, &key, &ProtocolHasher).expect("a transfer signs"),
+    )));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    assert_eq!(tx.fee_payer(), far().address());
+
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
+    assert!(classified.decomposed());
+    assert_eq!(
+        classified.core(),
+        &BTreeSet::from([far_shard]),
+        "the payer's home is the core"
+    );
+    assert!(classified.commits_at(near_shard) && classified.commits_at(far_shard));
+    let edge = classified.edges()[0].clone();
+    assert_eq!(
+        edge.crossing.kind,
+        Kind::Escrowed,
+        "a consumer on the core is escrowed, never owed",
+    );
+
+    let price = price_of(&executor, &tx);
+    let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
+        let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+        let ctx = TickBatchContext {
+            local_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Shape(Member::of(
+                classified.clone(),
+                local_shard,
+                BTreeSet::from([near_shard, far_shard]),
+            )),
+            arrivals,
+        };
+        let executed = executor
+            .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0);
+        let ConsensusReceipt::Succeeded { writes, .. } = &executed.consensus else {
+            panic!(
+                "{local_shard:?}'s member succeeds: {:?} {:?}",
+                executed.consensus, executed.metadata
+            );
+        };
+        (
+            settled(writes, &[(alice(), 1_000), (far(), 50)]),
+            arrivals_written(&classified, writes, far_shard),
+        )
+    };
+
+    let (sender, escrowed) = run(near_shard, &[]);
+    assert_eq!(
+        vault_cell(&sender, alice()),
+        Some(encode_amount(1_000 - 100).to_vec()),
+        "the sender's shard pays the payment and no fee",
+    );
+    assert_eq!(
+        vault_cell(&sender, far()),
+        None,
+        "and burns nothing of the payer's"
+    );
+
+    let (core, _) = run(far_shard, &escrowed);
+    assert_eq!(
+        vault_cell(&core, far()),
+        Some(encode_amount(50 + 100 - price).to_vec()),
+        "the core takes the payment and burns the fee from the payer once",
+    );
+    assert_eq!(
+        vault_cell(&core, alice()),
+        None,
+        "and moves nothing of the sender's"
     );
 }
 
@@ -1250,8 +1419,9 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     assert_eq!(edge.from, near_shard);
     assert_eq!(edge.to, BTreeSet::from([far_shard]));
 
+    let validity_end = tx.validity_range().end_timestamp_exclusive;
     let sender = divided
-        .plan(&[], near_shard, Side::Issuing)
+        .plan(&[], near_shard, validity_end)
         .expect("the sender's legs take no arrival");
     assert!(!sender.legs.is_whole());
     assert!(
@@ -1260,38 +1430,23 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     );
     assert!(sender.judges.covers(alice()) && !sender.judges.covers(far()));
 
-    let arrived = EscrowedValue {
-        node: edge.producer,
-        output: edge.output,
-        resource: *PROTOCOL_RESOURCE,
-        amount: 100,
-        record: edge.record.key(),
-    };
-    let recipient = divided
-        .plan(std::slice::from_ref(&arrived), far_shard, Side::Delivering)
-        .expect("the recipient's leg has its arrival");
-    assert!(recipient.legs.arrival(edge.producer, edge.output).is_some());
-    assert!(
-        recipient
-            .legs
-            .departure(edge.producer, edge.output)
-            .is_none()
-    );
-    assert!(recipient.judges.covers(far()) && !recipient.judges.covers(alice()));
-
+    // The deposit is the recipient's shard's commit fold, off the
+    // record's reading: that shard runs no member of the transfer.
+    assert!(!divided.commits_at(far_shard));
     assert!(matches!(
-        divided.plan(&[], far_shard, Side::Delivering),
-        Err(PlanDefect::MissingArrival { .. }),
+        divided.plan(&[], far_shard, validity_end),
+        Err(PlanDefect::NotAParticipant),
     ));
 }
 
 /// A shard's share under a classification is the shares of the owners it
-/// holds, the terms of the nodes its members run, and what every shard
-/// bears. Over the shards of a trie the shares sum to the whole in
-/// footprint, past it in compute by what every shard repeats, and each
-/// carries the whole retention.
+/// holds, the terms of the nodes its member runs, and what every shard
+/// bears. A divided transfer is committed by the payer's shard alone: it
+/// runs the withdraw beside its verification and carries the whole
+/// retention, and the recipient's vault, which the recipient's fold
+/// credits, is outside its footprint.
 #[test]
-fn local_shares_sum_to_the_whole_across_a_trie() {
+fn local_shares_cover_what_the_committing_shard_runs() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
@@ -1306,30 +1461,22 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
     let whole = tx.work();
 
     let divided = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
-    let mine = divided.local_work(&tx, near_shard);
-    let theirs = divided.local_work(&tx, far_shard);
-
-    // Both shards verify the signatures and write the committed cell, so
-    // compute and writes sum past the whole by exactly one verification
-    // and one marker; footprint sums exactly, since a cell is excluded
-    // where it lives.
-    let verification = attestation_work(&tx.body().signatures).compute;
-    assert_eq!(mine.compute + theirs.compute, whole.compute + verification);
-    assert_eq!(mine.footprint + theirs.footprint, whole.footprint);
-    assert_eq!(mine.retention, whole.retention);
-    assert_eq!(theirs.retention, whole.retention);
-    // A node each, and a verification each: the withdrawal the payer's
-    // shard runs and the deposit the recipient's are the whole of it,
-    // since the sign-in that used to sit beside the withdrawal is the
-    // signature the intent already carries.
-    assert_eq!(
-        mine.compute, theirs.compute,
-        "one node and one verification on each side"
-    );
     assert!(
-        theirs.compute > verification,
-        "the recipient's shard runs the deposit beside its verification"
+        !divided.commits_at(far_shard),
+        "the recipient's shard commits nothing"
     );
+    let mine = divided.local_work(&tx, near_shard);
+    let verification = attestation_work(&tx.body().signatures).compute;
+    assert!(
+        mine.compute > verification,
+        "the payer's shard runs the withdraw beside its verification"
+    );
+    assert!(mine.compute < whole.compute + verification);
+    assert!(
+        mine.footprint < whole.footprint,
+        "the recipient's vault is the recipient's fold's"
+    );
+    assert_eq!(mine.retention, whole.retention);
 
     let one = ShardTrie::from_leaves([ShardId::ROOT]);
     assert_eq!(
@@ -1352,10 +1499,9 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
     let artifact = artifacts[0].read_bytes;
     assert!(artifact > 0, "the fixture publishes the account's artifact");
     assert!(
-        mine.read_bytes >= artifact && theirs.read_bytes >= artifact,
-        "each end reserves the artifact it instantiates: {} and {} against {artifact}",
+        mine.read_bytes >= artifact,
+        "the payer's shard reserves the artifact it instantiates: {} against {artifact}",
         mine.read_bytes,
-        theirs.read_bytes,
     );
 
     // And a classification that read no placement bears the whole
@@ -1373,12 +1519,11 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
 }
 
 /// A transfer executed divided, end to end through the engine: the
-/// sender's shard runs the sign-in and the withdraw, escrows the value
-/// into the record cell the plan filed, and attests exactly that; the
-/// recipient's shard runs the deposit against the attested arrival and
-/// escrows nothing. Neither side runs the other's leg.
+/// sender's shard runs the withdraw and escrows the value into the record
+/// cell the plan filed, which is what the recipient reads. The recipient's shard
+/// runs nothing: its fold credits the deposit off the record.
 #[test]
-fn a_transfer_executes_divided_on_both_shards() {
+fn a_transfer_executes_divided_on_the_payers_shard() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
@@ -1409,7 +1554,6 @@ fn a_transfer_executes_divided_on_both_shards() {
             runs: Runs::Shape(Member::of(
                 classified.clone(),
                 local_shard,
-                classified.first_side_at(local_shard),
                 BTreeSet::from([near_shard, far_shard]),
             )),
             arrivals,
@@ -1425,19 +1569,31 @@ fn a_transfer_executes_divided_on_both_shards() {
         panic!("the sender's legs must succeed: {:?}", sender.metadata);
     };
     assert_eq!(
-        sender.escrowed,
+        arrivals_written(&classified, writes, far_shard),
         vec![EscrowedValue {
             node: edge.producer,
             output: edge.output,
             resource: *PROTOCOL_RESOURCE,
             amount: 100,
-            record: edge.record.key(),
+            record: edge.crossing.id.record_key(&ProtocolHasher),
         }],
-        "the withdraw's value left into the record cell the plan filed",
+        "the withdraw's value left into the record cell the plan filed, and the recipient reads it there",
     );
-    assert!(
-        writes.cells.contains_key(&edge.record.key()),
-        "the record cell is among the sender's writes"
+    let record = writes
+        .cells
+        .get(&edge.crossing.id.record_key(&ProtocolHasher))
+        .and_then(|value| CrossingCell::from_bytes(value.as_deref()?))
+        .expect("the record cell is among the sender's writes");
+    assert_eq!(
+        record.validity_end_ms,
+        tx.validity_range().end_timestamp_exclusive.as_millis(),
+        "the record states the transaction's own validity end"
+    );
+    assert_ne!(record.validity_end_ms, 0, "and never nothing");
+    assert_eq!(
+        CrossingId::of_record(edge.crossing.id.producer, &record),
+        edge.crossing.id,
+        "the record rebuilds the crossing the plan filed"
     );
     assert!(
         !writes
@@ -1447,34 +1603,25 @@ fn a_transfer_executes_divided_on_both_shards() {
         "the sender ran no leg of the recipient's"
     );
 
-    let recipient = run(far_shard, &sender.escrowed);
-    let ConsensusReceipt::Succeeded { writes, .. } = &recipient.consensus else {
-        panic!("the recipient's leg must succeed: {:?}", recipient.metadata);
-    };
-    assert!(recipient.escrowed.is_empty(), "a deposit hands nothing on");
-    assert!(
-        writes
-            .movements
-            .keys()
-            .any(|key| key.owner == far().address()),
-        "the deposit credited the recipient"
-    );
-    assert!(
-        !writes
-            .movements
-            .keys()
-            .any(|key| key.owner == alice().address()),
-        "the recipient ran no leg of the sender's"
+    let recipient = run(far_shard, &arrivals_written(&classified, writes, far_shard));
+    assert_eq!(
+        recipient.consensus,
+        ConsensusReceipt::Failed,
+        "the recipient's shard has no plan: nothing it runs takes the crossing",
     );
 }
 
-/// A refused transfer's escrow comes back. The sender's shard runs the
-/// reclaim — no node, no nullifier, a declaration of its own over the
-/// record, the claim and the origin — and the vault is back at its
-/// pre-escrow balance exactly, read off the cell; the record goes with
-/// it, since the value it held is back where it left.
+/// A transfer's crossing is the recipient's, so nothing takes it back:
+/// the record is none of the sender's to settle, and a settlement asked
+/// to take it back is refused before the kernel runs.
+///
+/// The classification names it neither way round. What the sender's
+/// shard may settle under the transaction's own name excludes every
+/// delivering record, so the licence this case hands in is one no
+/// composer reaches — and the refusal is what keeps a hand-built one
+/// from crediting value the recipient may still claim.
 #[test]
-fn a_reclaim_restores_the_senders_vault_exactly() {
+fn a_delivered_crossing_is_no_ones_to_take_back() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
@@ -1515,7 +1662,6 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         Runs::Shape(Member::of(
             classified.clone(),
             near_shard,
-            Side::Issuing,
             std::iter::once(near_shard)
                 .chain(edge.to.iter().copied())
                 .collect(),
@@ -1531,44 +1677,79 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         "the escrow debited the vault"
     );
 
-    let reclaimed = run(
+    assert!(
+        issued(&classified, near_shard, Some(Kind::Escrowed)).is_empty(),
+        "the sender settles none of it under the transaction's own name",
+    );
+
+    let asked = run(
         &store,
-        Runs::Settle {
+        Runs::Reclaim {
             member: Member::whole(near_shard),
-            records: classified.records_issued(near_shard),
-            on: Licence::Unclaimed,
+            records: issued_by(issued(&classified, near_shard, None), tx.hash()),
             charged: true,
         },
     );
-    let ConsensusReceipt::Succeeded { writes, .. } = &reclaimed.consensus else {
-        panic!("the reclaim must succeed: {:?}", reclaimed.metadata);
-    };
-    assert!(reclaimed.escrowed.is_empty(), "a reclaim issues nothing");
-    assert!(
-        reclaimed.fee_receipt.is_none(),
-        "the leg's own certificate settled the price; the reclaim owes none"
+    assert_eq!(
+        asked.consensus,
+        ConsensusReceipt::Failed,
+        "the one record it named is left standing, so the member settles nothing",
     );
-    store.apply(writes);
     assert_eq!(
         store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
-        Some(encode_amount(1_000).to_vec()),
-        "and the reclaim restores it exactly"
+        Some(encode_amount(900).to_vec()),
+        "the vault stays debited: the crossing is the recipient's"
     );
     assert!(
-        store.cell(edge.record.key()).is_none(),
-        "the record goes with the value it held"
+        store
+            .cell(edge.crossing.id.record_key(&ProtocolHasher))
+            .is_some(),
+        "and the record stands, holding the value for whoever claims it"
     );
 }
 
-/// Once the recipient's claim is on record, the sender's shard retires
-/// the record it held for it: no node, no fee, nothing moved, and the
-/// record deleted. A second retirement finds nothing and is refused
-/// before the kernel runs.
+/// The claim a block of the producer's shard carries once the
+/// consumer's `Taken` for `id` is read present at some anchor of the
+/// consumer's, named for the crossing: what licenses the fold to remove
+/// the record.
+fn taken_read_present(id: CrossingId, consumer: ShardId) -> StateClaim {
+    let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+    StateClaim::new(
+        Anchor {
+            shard: consumer,
+            height: BlockHeight::new(5),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(5_000),
+        },
+        [(taken, Inclusion::Present([7; 32]))],
+        MerkleInclusionProof::dummy(),
+    )
+    .naming([(taken, id)])
+}
+
+/// Apply to `store` what the commit fold removes for `claims`, and
+/// return what it removed.
+fn fold_settlements(store: &mut MapDb, claims: &[StateClaim]) -> Vec<SubstateKey> {
+    let removed = crossing_settlements(claims, &SettledWrites::default(), store);
+    let mut writes = StateWrites::default();
+    for key in &removed {
+        writes.cells.insert(*key, None);
+    }
+    store.apply(&writes);
+    removed
+}
+
+/// Once the recipient's claim is on record, the sender's shard removes
+/// the record it held for it in its commit fold: the block carries the
+/// consumer's `Taken` read present, named for the crossing, and that
+/// reading is the whole licence. No node, no fee, nothing moved, and a
+/// later block with the same reading finds nothing left to remove.
 #[test]
-fn a_retirement_deletes_the_record_and_moves_nothing() {
+fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
+    let far_shard = trie.shard_for_prefix(far());
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
@@ -1577,228 +1758,206 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
     let edge = classified.edges()[0].clone();
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
-    let run = |store: &MapDb, runs: Runs| {
-        let ctx = TickBatchContext {
-            local_shard: near_shard,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(1_000),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-        };
-        let input = TickTxInput {
-            prices: PriceTable::GENESIS,
-            tx_hash: tx.hash(),
-            transaction: Some(&tx),
-            provisions: &[],
-            clock: WeightedTimestamp::from_millis(1_000),
-            runs,
-            arrivals: &[],
-        };
-        executor
-            .execute_tick_batch(&ctx, store, &[input])
-            .expect("the harness engine holds every package it runs")
-            .remove(0)
+    let ctx = TickBatchContext {
+        local_shard: near_shard,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
     };
-
-    let sent = run(
-        &store,
-        Runs::Shape(Member::of(
-            classified.clone(),
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash: tx.hash(),
+        transaction: Some(&tx),
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(1_000),
+        runs: Runs::Shape(Member::of(
+            classified,
             near_shard,
-            Side::Issuing,
             std::iter::once(near_shard)
                 .chain(edge.to.iter().copied())
                 .collect(),
         )),
-    );
+        arrivals: &[],
+    };
+    let sent = executor
+        .execute_tick_batch(&ctx, &store, &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0);
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
         panic!("the sender's legs must succeed: {:?}", sent.metadata);
     };
     store.apply(writes);
-    assert!(
-        store.cell(edge.record.key()).is_some(),
-        "the record is written"
-    );
+    let record = edge.crossing.id.record_key(&ProtocolHasher);
+    assert!(store.cell(record).is_some(), "the record is written");
 
-    let retired = run(
-        &store,
-        Runs::Settle {
-            member: Member::whole(near_shard),
-            records: classified.records_issued(near_shard),
-            on: Licence::Claimed,
-            charged: true,
-        },
+    let claim = taken_read_present(edge.crossing.id, far_shard);
+    assert_eq!(
+        fold_settlements(&mut store, std::slice::from_ref(&claim)),
+        vec![record],
+        "the Taken read present licenses removing the record and nothing else",
     );
-    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
-        panic!("the retirement must succeed: {:?}", retired.metadata);
-    };
-    assert!(retired.escrowed.is_empty(), "a retirement issues nothing");
-    assert!(retired.fee_receipt.is_none(), "and charges nothing");
-    store.apply(writes);
     assert!(
-        store.cell(edge.record.key()).is_none(),
-        "the record is gone"
+        store.cell(record).is_none(),
+        "the record is removed where it is retired; its consumer reads it gone at an \
+         anchor at or above its read frontier"
     );
     assert_eq!(
         store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(900).to_vec()),
         "and the value stays where the claim took it"
     );
-
-    let again = run(
-        &store,
-        Runs::Settle {
-            member: Member::whole(near_shard),
-            records: classified.records_issued(near_shard),
-            on: Licence::Claimed,
-            charged: true,
-        },
-    );
     assert!(
-        matches!(again.consensus, ConsensusReceipt::Failed),
-        "a second retirement finds no record and is refused: {:?}",
-        again.metadata
+        fold_settlements(&mut store, &[claim]).is_empty(),
+        "a second block carrying the reading has nothing left to remove",
     );
 }
 
-/// A record a shard inherited with a prefix decides itself, against the
-/// claim cell the record names: absent, the value goes back to the cell
-/// it left; present, the record is deleted and nothing moves.
-///
-/// The member runs with no body at all, which is the point — a merge
-/// successor's store arrives as a prefix of leaves and its ledger begins
-/// empty, so the leaf is the whole of what a reclaim has to work from.
-#[test]
-#[allow(clippy::too_many_lines)] // one member over one fixture, in both its states
-fn an_inherited_record_decides_itself_against_its_claim() {
+/// A store holding the record an outbound leg wrote, and the pieces a
+/// settlement of it needs — what a reshape successor inherits: leaves,
+/// and no ledger to read them beside.
+struct Inherited {
+    executor: Executor,
+    trie: ShardTrie,
+    shard: ShardId,
+    store: MapDb,
+    record: SubstateKey,
+    crossing: CrossingId,
+    tx: TxHash,
+}
+
+/// Run the sending half over a fresh store, so the record stands with
+/// the value behind it.
+fn inherited_record() -> Inherited {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
-    let near_shard = trie.shard_for_prefix(alice());
+    let shard = trie.shard_for_prefix(alice());
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     let edge = classified.edges()[0].clone();
-
-    // The sending half, which writes the record the successor inherits.
-    let issued = |store: &MapDb| {
-        let ctx = TickBatchContext {
-            local_shard: near_shard,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(1_000),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-        };
-        let input = TickTxInput {
-            prices: PriceTable::GENESIS,
-            tx_hash: tx.hash(),
-            transaction: Some(&tx),
-            provisions: &[],
-            clock: WeightedTimestamp::from_millis(1_000),
-            runs: Runs::Shape(Member::of(
-                classified.clone(),
-                near_shard,
-                Side::Issuing,
-                std::iter::once(near_shard)
-                    .chain(edge.to.iter().copied())
-                    .collect(),
-            )),
-            arrivals: &[],
-        };
-        executor
-            .execute_tick_batch(&ctx, store, &[input])
-            .expect("the harness engine holds every package it runs")
-            .remove(0)
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let ctx = TickBatchContext {
+        local_shard: shard,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
     };
-
-    // The housekeeping half: no body, and a clock inside the window an
-    // absent claim answers in.
-    let settle = |store: &MapDb, at: u64| {
-        let ctx = TickBatchContext {
-            local_shard: near_shard,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(at),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-        };
-        let input = TickTxInput {
-            prices: PriceTable::GENESIS,
-            tx_hash: TxHash::from(Hash::from_bytes(b"housekeeping")),
-            transaction: None,
-            provisions: &[],
-            clock: WeightedTimestamp::from_millis(at),
-            runs: Runs::Settle {
-                member: Member::whole(near_shard),
-                records: vec![edge.record.key()],
-                on: Licence::OwnLeaf,
-                charged: true,
-            },
-            arrivals: &[],
-        };
-        executor
-            .execute_tick_batch(&ctx, store, &[input])
-            .expect("the harness engine holds every package it runs")
-            .remove(0)
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash: tx.hash(),
+        transaction: Some(&tx),
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(1_000),
+        runs: Runs::Shape(Member::of(
+            classified,
+            shard,
+            std::iter::once(shard)
+                .chain(edge.to.iter().copied())
+                .collect(),
+        )),
+        arrivals: &[],
     };
-
-    let mut unclaimed = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
-    let sent = issued(&unclaimed);
+    let sent = executor
+        .execute_tick_batch(&ctx, &store, &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0);
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
         panic!("the sender's legs must succeed: {:?}", sent.metadata);
     };
-    unclaimed.apply(writes);
-    let record = CrossingCell::from_bytes(
-        &Substates::cell(&unclaimed, edge.record.key()).expect("the record is written"),
-    )
-    .expect("a record decodes");
-    // The engine reads the claim cell alone; that the reading is taken
-    // inside the lapse, where an absence means something, is admission's
-    // business, and this clock sits inside it.
-    let inside = record.expiry_ms - 1;
-    assert!(
-        Window::Lapse
-            .of(Deadline::from_expiry(record.expiry_ms))
-            .contains(&WeightedTimestamp::from_millis(inside))
-    );
+    store.apply(writes);
+    Inherited {
+        executor,
+        trie,
+        shard,
+        store,
+        record: edge.crossing.id.record_key(&ProtocolHasher),
+        crossing: edge.crossing.id,
+        tx: tx.hash(),
+    }
+}
 
-    // A store where the claim is present is the same store plus that one
-    // cell, so the two runs differ in nothing else.
-    let mut claimed = MapDb(unclaimed.0.clone());
-    claimed.0.insert(record.consumer_claim, vec![0xAA]);
-
-    let taken_back = settle(&unclaimed, inside);
-    let ConsensusReceipt::Succeeded { writes, .. } = &taken_back.consensus else {
-        panic!("the reclaim must succeed: {:?}", taken_back.metadata);
+/// Take the inherited record back, with no body and no clock that
+/// matters: the record is the whole of the member's input.
+fn reclaim_inherited(held: &Inherited) -> ExecutedTx {
+    let ctx = TickBatchContext {
+        local_shard: held.shard,
+        shard_trie: &held.trie,
+        tick_ts: WeightedTimestamp::from_millis(2_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
     };
-    assert!(
-        taken_back.fee_receipt.is_none(),
-        "the chain that issued the crossing settled the price before it ended"
-    );
-    unclaimed.apply(writes);
-    assert_eq!(
-        Substates::cell(&unclaimed, vault_key(alice(), *PROTOCOL_RESOURCE)),
-        Some(encode_amount(1_000).to_vec()),
-        "an unclaimed crossing returns to the cell it left"
-    );
-    assert!(
-        Substates::cell(&unclaimed, edge.record.key()).is_none(),
-        "and the record goes with it"
-    );
-
-    let retired = settle(&claimed, inside);
-    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
-        panic!("the retirement must succeed: {:?}", retired.metadata);
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash: TxHash::from(Hash::from_bytes(b"housekeeping")),
+        transaction: None,
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(2_000),
+        runs: Runs::Reclaim {
+            member: Member::whole(held.shard),
+            records: issued_by(vec![held.record], held.tx),
+            charged: true,
+        },
+        arrivals: &[],
     };
-    claimed.apply(writes);
+    held.executor
+        .execute_tick_batch(&ctx, &held.store, &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0)
+}
+
+/// A record a shard inherited with a prefix is removed in the commit
+/// fold where its consumer claimed: the block carries the consumer's
+/// `Taken` read present, named for the crossing, and the value stays
+/// where the claim took it.
+///
+/// No member runs at all, which is the point — a merge successor's
+/// store arrives as a prefix of leaves and its ledger begins empty, so
+/// the leaf and the reading are the whole of what the removal works
+/// from. The licence is a presence its own chain committed.
+#[test]
+fn an_inherited_record_is_retired_in_the_fold_where_its_consumer_claimed() {
+    let mut held = inherited_record();
+    let consumer = held.trie.shard_for_prefix(far());
+    let claim = taken_read_present(held.crossing, consumer);
+    assert_eq!(
+        fold_settlements(&mut held.store, &[claim]),
+        vec![held.record]
+    );
     assert!(
-        Substates::cell(&claimed, edge.record.key()).is_none(),
-        "a claimed crossing's record is deleted"
+        Substates::cell(&held.store, held.record).is_none(),
+        "a claimed crossing's record is removed"
     );
     assert_eq!(
-        Substates::cell(&claimed, vault_key(alice(), *PROTOCOL_RESOURCE)),
+        Substates::cell(&held.store, vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(900).to_vec()),
         "and the value stays where the claim took it"
+    );
+}
+
+/// The same record under the licence that credits back, which this
+/// crossing has no recourse for: an outbound leg consumes it, so it
+/// names nobody to take it back and the record is left standing.
+#[test]
+fn an_inherited_record_with_no_recourse_is_left_standing() {
+    let held = inherited_record();
+    let standing = reclaim_inherited(&held);
+    assert_eq!(
+        standing.consensus,
+        ConsensusReceipt::Failed,
+        "the one record it named is left standing, so the member settles nothing",
+    );
+    assert_eq!(
+        Substates::cell(&held.store, vault_key(alice(), *PROTOCOL_RESOURCE)),
+        Some(encode_amount(900).to_vec()),
+        "an unclaimed crossing an outbound leg consumes goes back nowhere"
+    );
+    assert!(
+        Substates::cell(&held.store, held.record).is_some(),
+        "and the record stands, holding it for whoever claims it"
     );
 }
 
@@ -1834,11 +1993,16 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            runs: Runs::Settle {
+            runs: Runs::Reclaim {
                 member: Member::whole(near_shard),
-                records: Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie)
-                    .records_issued(near_shard),
-                on: Licence::Unclaimed,
+                records: issued_by(
+                    issued(
+                        &Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie),
+                        near_shard,
+                        None,
+                    ),
+                    tx.hash(),
+                ),
                 charged,
             },
             arrivals: &[],
@@ -1856,7 +2020,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
         owed.metadata
     );
     let charge = owed
-        .fee_receipt
+        .refusal_receipt
         .as_ref()
         .and_then(ConsensusReceipt::writes)
         .expect("the refusal settles the price apart");
@@ -1873,7 +2037,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
         "the same refusal for a leg that ran"
     );
     assert!(
-        paid.fee_receipt.is_none(),
+        paid.refusal_receipt.is_none(),
         "owes nothing more: its own certificate settled the price"
     );
 }
@@ -1911,7 +2075,6 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             runs: Runs::Shape(Member::of(
                 Classified::whole(),
                 local_shard,
-                Side::Issuing,
                 BTreeSet::from([near_shard, far_shard]),
             )),
             arrivals: &[],
@@ -1923,8 +2086,10 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
     };
     let (sender_side, recipient_side) = (run(near_shard), run(far_shard));
 
+    // The deposit is the kernel's and emits nothing, so the recipient's
+    // root covers no event.
     assert_eq!(events_of(&sender_side), vec![(alice().address(), 0)]);
-    assert_eq!(events_of(&recipient_side), vec![(far().address(), 1)]);
+    assert_eq!(events_of(&recipient_side), vec![]);
     for side in [&sender_side, &recipient_side] {
         let ConsensusReceipt::Succeeded {
             receipt_hash,
@@ -2083,7 +2248,7 @@ fn package_cell(writes: &StateWrites, artifact: &[u8]) -> Option<Vec<u8>> {
 fn a_publish_writes_the_artifact_under_its_own_address() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
-    let artifact = published_account_artifact();
+    let artifact = published_artifact();
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
         7,
         artifact.clone(),
@@ -2141,7 +2306,7 @@ fn a_publish_writes_the_artifact_under_its_own_address() {
 fn a_publish_charges_no_more_than_the_ceiling_it_signed() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
-    let artifact = published_account_artifact();
+    let artifact = published_artifact();
 
     // The ceiling is derived from the price rather than pinned, so this
     // keeps saying the same thing as the table moves under it.
@@ -2201,15 +2366,9 @@ fn the_stdlib_artifact_carries_resolvable_bindings() {
     );
     assert_eq!(
         metadata.methods["deposit"].abi,
-        vec![
-            AbiParam::Handle { clause: 0, site: 0 },
-            AbiParam::Handle { clause: 1, site: 0 },
-            AbiParam::Handle { clause: 2, site: 0 },
-            AbiParam::Bucket(0),
-        ],
-        "one handle per cell the deposit may reach — the flag it reads, the \
-         vault, and the quarantine beside it — each naming the clause that \
-         declared it rather than a position"
+        vec![AbiParam::Handle { clause: 0, site: 0 }, AbiParam::Bucket(0),],
+        "one handle for the one cell a deposit reaches, naming the clause \
+         that declared it rather than a position"
     );
 }
 
@@ -2338,7 +2497,7 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
     // A package the world has never seen: the stdlib artifact with its
     // metadata attached a second time under a different publisher would
     // be the same bytes, so vary the metadata to vary the address.
-    let mut metadata = published_metadata();
+    let mut metadata = staking::metadata();
     naming(&mut metadata, "republished");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -2371,25 +2530,16 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
     );
 }
 
-/// Wait out the compile worker; the bound is a harness valve, not a
-/// verdict — consensus never reads a clock here.
-/// The stdlib account's metadata as a *publisher* could submit it.
-///
-/// These tests publish through the ordinary transaction path, and that
-/// path refuses a claim to totality — the mark is the protocol's, granted
-/// to what genesis seeds. The account declares one total method, so the
-/// fixture drops the claim rather than the tests asserting a publish the
-/// gate does not allow.
-fn published_account_artifact() -> Vec<u8> {
-    attach_metadata(STAKING_MODULE, &published_metadata()).expect("attaches")
-}
-
-/// The metadata a publisher's artifact carries.
+/// The staking package's artifact, as a publisher submits it.
 ///
 /// The staking package rather than the account's: a published package
 /// serves instances, and the gate holds one to declaring the seal its
 /// components come up through — which the account, serving principals,
 /// has no reason to carry.
+fn published_artifact() -> Vec<u8> {
+    attach_metadata(STAKING_MODULE, &staking::metadata()).expect("attaches")
+}
+
 /// Vary `metadata`, and so the address of any artifact carrying it, by
 /// naming one more event.
 ///
@@ -2413,16 +2563,8 @@ fn naming(metadata: &mut PackageMetadata, event: &str) {
     metadata.events.push(named);
 }
 
-fn published_metadata() -> PackageMetadata {
-    let mut metadata = staking::metadata();
-    for signature in metadata.methods.values_mut() {
-        if signature.totality == Totality::Total {
-            signature.totality = Totality::Infallible;
-        }
-    }
-    metadata
-}
-
+/// Wait out the compile worker; the bound is a harness valve, not a
+/// verdict — consensus never reads a clock here.
 fn await_code_runnable(executor: &Executor, package: PackageHash) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while executor.package_standing(package) != Availability::Runnable {
@@ -2439,7 +2581,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
 
-    let mut metadata = published_metadata();
+    let mut metadata = staking::metadata();
     naming(&mut metadata, "compiled");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -2473,7 +2615,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
 fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     let executor = executor(ExecutionMode::Serial);
 
-    let mut metadata = published_metadata();
+    let mut metadata = staking::metadata();
     naming(&mut metadata, "reseeded");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -2511,7 +2653,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
     let executor = executor(ExecutionMode::Serial);
     let cache = executor.packages();
 
-    let mut metadata = published_metadata();
+    let mut metadata = staking::metadata();
     naming(&mut metadata, "smuggled");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -3147,7 +3289,7 @@ fn a_node_reaching_for_another_partys_authority_never_previews() {
 #[test]
 fn a_preview_prices_a_publish_through_the_table() {
     let payer = fee_payer(7);
-    let artifact = published_account_artifact();
+    let artifact = published_artifact();
     let executor = executor(ExecutionMode::Serial);
     let tx = signed_publish(7, artifact.clone());
     let report = preview_on(
@@ -3228,11 +3370,6 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // own package declares.
     let mut metadata = staking::metadata();
     naming(&mut metadata, "instantiable");
-    for signature in metadata.methods.values_mut() {
-        if signature.totality == Totality::Total {
-            signature.totality = Totality::Infallible;
-        }
-    }
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
@@ -3362,7 +3499,11 @@ fn a_resubmit_at_a_higher_ceiling_runs_the_declaration_once() {
             if let Some(writes) = e.consensus.writes() {
                 store.apply(writes);
             }
-            if let Some(writes) = e.fee_receipt.as_ref().and_then(ConsensusReceipt::writes) {
+            if let Some(writes) = e
+                .refusal_receipt
+                .as_ref()
+                .and_then(ConsensusReceipt::writes)
+            {
                 store.apply(writes);
             }
         }

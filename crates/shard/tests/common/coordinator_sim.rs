@@ -29,11 +29,15 @@ use std::time::Duration;
 use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Capped;
-use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
+use hyperscale_shard::action_handlers::{build_proposal, committing_shards, verify_and_build_qc};
+use hyperscale_shard::local_crossings::{
+    disagreeing_parent_reading, misstated_unclaimed, parent_claims,
+};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
-    ChainEntry, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
-    ShardChainWriter, SubstateStore, TerminalWindow, sweep_for_block,
+    ChainEntry, ChainWrites, MemberIndex, ParentAnchor, PendingChain, RecoveredState,
+    SafeVoteRegisterStore, ShardChainWriter, SubstateStore, TerminalWindow,
+    colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -41,15 +45,16 @@ use hyperscale_types::{
     AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
     Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
     CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey,
-    ConsensusReceipt, Epoch, Finalization, Hash, HborSigned, LocalReceiptRoot, LocalTimestamp,
-    NetworkDefinition, ProposerTimestamp, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
-    QuorumCertificate, ReadySignal, RootMismatch, Round, ShardId, ShardLoad, ShardVoteEquivocation,
-    ShardWitnessPayload, Signer, SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError,
-    StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight,
-    ValidatorId, Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
+    ConsensusReceipt, Epoch, Finalization, FrontierInputs, Hash, HborSigned, LocalReceiptRoot,
+    LocalTimestamp, NetworkDefinition, ProposerTimestamp, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
+    QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round, ShardId, ShardLoad,
+    ShardVoteEquivocation, ShardWitnessPayload, Signer, SignerBitfield, StateRoot,
+    StateRootContext, StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext,
+    TxHash, TxRootVerifyError, TxsInFlight, ValidatorId, Verifiable, VerificationKind, Verified,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign,
+    signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -874,6 +879,7 @@ impl ShardCoordinatorSim {
             vec![],
             vec![],
             vec![],
+            vec![],
         )
     }
 
@@ -1105,17 +1111,21 @@ impl ShardCoordinatorSim {
                 expected_root: ready.expected_root,
                 expected_local_receipt_root: ready.expected_local_receipt_root,
                 finalizations: ready.finalizations,
-                block_tx_hashes: ready.block_tx_hashes,
                 creations: ready.creations,
                 block_height: ready.block_height,
                 claimed_split_child_roots: ready.claimed_split_child_roots,
                 split_child_roots_required: ready.split_child_roots_required,
-                terminal_roots_required: ready.terminal_roots_required,
-                claimed_terminal_roots: ready.claimed_terminal_roots,
+                terminal_settled_txs_required: ready.terminal_settled_txs_required,
+                claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
                 settled_txs_window_floor: ready.settled_txs_window_floor,
                 parent_sweep_frontier: ready.parent_sweep_frontier,
                 claimed_sweep_frontier: ready.claimed_sweep_frontier,
+                frontier: ready.frontier,
+                members: ready.members,
+                fence: ready.fence,
+                state_claims: ready.state_claims,
+                abandonment_records: ready.abandonment_records,
             });
         }
         if self.coordinators[to_idx].take_ready_proposal() {
@@ -1199,6 +1209,7 @@ impl ShardCoordinatorSim {
                 block_hash,
                 &qc,
                 &[],
+                vec![],
                 vec![],
                 vec![],
                 vec![],
@@ -1418,6 +1429,7 @@ impl ShardCoordinatorSim {
             // bucket below.
             Action::BuildProposal {
                 shard_id,
+                chain_origin,
                 proposer,
                 height,
                 round,
@@ -1447,9 +1459,14 @@ impl ShardCoordinatorSim {
                 parent_committee_anchor_epoch,
                 committee_anchor_epoch,
                 carry_split_child_roots,
-                carry_terminal_roots,
+                carry_terminal_settled_txs,
                 settled_txs_window_floor,
                 classification_topology_snapshot: classification_topology,
+                frontier,
+                fence: _,
+                parent_anchor,
+                local_crossings,
+                manifest,
             } => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
                 // whose QC round sits below the honest lock, so honest
@@ -1524,9 +1541,22 @@ impl ShardCoordinatorSim {
                     };
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
-                let terminal_roots = carry_terminal_roots.then(|| {
+                let mut state_claims = state_claims;
+                state_claims.extend(parent_claims(
+                    &local_crossings,
+                    parent_anchor,
+                    &view.snapshot(),
+                ));
+                state_claims.sort_unstable();
+                let frontier = FrontierInputs::for_block(
+                    &state_claims,
+                    frontier.windows,
+                    frontier.anchor,
+                    frontier.local,
+                );
+                let terminal_settled_txs = carry_terminal_settled_txs.then(|| {
                     self.pending_chains[emitter_idx]
-                        .terminal_roots_in_window(
+                        .terminal_settled_txs_root(
                             &TerminalWindow {
                                 local_shard: shard_id,
                                 parent_block_hash,
@@ -1535,7 +1565,6 @@ impl ShardCoordinatorSim {
                                 settled_window_floor: settled_txs_window_floor,
                             },
                             &finalizations,
-                            transactions.iter().map(|tx| tx.hash()).collect(),
                         )
                         .expect("the sim's stores hold every height in the window")
                 });
@@ -1553,6 +1582,7 @@ impl ShardCoordinatorSim {
                     &Capped::new(transactions).expect("a selection written out in a test"),
                     Capped::new(finalizations.clone()).expect("a list written out in a test"),
                     shard_id,
+                    chain_origin,
                     &classification_topology,
                     Capped::new(provisions.clone()).expect("a list written out in a test"),
                     Capped::new(abandonment_records).expect("a list written out in a test"),
@@ -1581,7 +1611,9 @@ impl ShardCoordinatorSim {
                     parent_committee_anchor_epoch,
                     committee_anchor_epoch,
                     carry_split_child_roots,
-                    terminal_roots,
+                    terminal_settled_txs,
+                    &frontier,
+                    &manifest,
                 );
                 let block_hash = result.block_hash;
                 let bytes_delta = result.jmt_snapshot.bytes_delta;
@@ -1594,12 +1626,6 @@ impl ShardCoordinatorSim {
                         parent_block_hash,
                         height,
                         settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
-                        committed_txs: result
-                            .block
-                            .transactions()
-                            .iter()
-                            .map(|tx| tx.hash())
-                            .collect(),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
                         certified_uncommitted: None,
@@ -1674,10 +1700,8 @@ impl ShardCoordinatorSim {
                 expected_root,
                 transactions,
                 validity_anchor,
-                late_deliveries,
             } => {
                 let tx_ctx = TransactionRootContext {
-                    late_deliveries: &late_deliveries,
                     transactions: &transactions,
                     validity_anchor,
                 };
@@ -1727,14 +1751,14 @@ impl ShardCoordinatorSim {
                 block_hash,
                 expected,
                 transactions,
-                certificates,
                 topology_snapshot,
             } => {
+                let committing = committing_shards(&topology_snapshot);
                 let ptx_ctx = ProvisionTxRootsContext {
                     local_shard: self.shard,
                     topology_snapshot: &topology_snapshot,
                     transactions: &transactions,
-                    certificates: &certificates,
+                    committing: &committing,
                 };
                 let result = expected.verify(&ptx_ctx);
                 self.loopback_q.push_back(Envelope {
@@ -1824,17 +1848,21 @@ impl ShardCoordinatorSim {
                 expected_root,
                 expected_local_receipt_root,
                 finalizations,
-                block_tx_hashes,
                 creations,
                 block_height,
                 claimed_split_child_roots,
                 split_child_roots_required,
-                terminal_roots_required,
-                claimed_terminal_roots,
+                terminal_settled_txs_required,
+                claimed_terminal_settled_txs,
                 parent_weighted_timestamp,
                 settled_txs_window_floor,
                 parent_sweep_frontier,
                 claimed_sweep_frontier,
+                frontier,
+                members,
+                fence: _,
+                state_claims,
+                abandonment_records,
             } => {
                 // Mirrors the production handler: receipt-root
                 // pre-flight first, then JMT prep on success.
@@ -1855,9 +1883,9 @@ impl ShardCoordinatorSim {
                 if !receipt_ok {
                     return;
                 }
-                let computed_terminal_roots = terminal_roots_required.then(|| {
+                let computed_terminal_settled_txs = terminal_settled_txs_required.then(|| {
                     self.pending_chains[emitter_idx]
-                        .terminal_roots_in_window(
+                        .terminal_settled_txs_root(
                             &TerminalWindow {
                                 local_shard: self.shard,
                                 parent_block_hash,
@@ -1866,7 +1894,6 @@ impl ShardCoordinatorSim {
                                 settled_window_floor: settled_txs_window_floor,
                             },
                             &finalizations,
-                            block_tx_hashes.clone(),
                         )
                         .expect("the sim's stores hold every height in the window")
                 });
@@ -1881,6 +1908,38 @@ impl ShardCoordinatorSim {
                     computed_sweep_frontier, claimed_sweep_frontier,
                     "the sim's proposer and verifier walk the same interval",
                 );
+                assert!(
+                    colliding_committed_cell(&creations, &view.snapshot()).is_none(),
+                    "the sim's proposer defers a transaction whose committed cell collides",
+                );
+                assert!(
+                    colliding_member_row(
+                        members.shard,
+                        members.transactions.iter().map(|(tx, _)| *tx),
+                        &view.snapshot(),
+                    )
+                    .is_none(),
+                    "the sim's proposer defers a transaction whose member row collides",
+                );
+                assert!(
+                    disagreeing_parent_reading(&state_claims, self.shard, &view.snapshot())
+                        .is_none(),
+                    "the sim's proposer reads its parent as its verifiers do",
+                );
+                assert!(
+                    misstated_unclaimed(&abandonment_records, &view.snapshot()).is_none(),
+                    "the sim's proposer names only the crossings its parent holds",
+                );
+                // The coordinator's rows are the state's own: at a parent
+                // that is its committed tip, the two read one family.
+                let coordinator = &self.coordinators[emitter_idx];
+                if coordinator.committed_hash() == parent_block_hash {
+                    assert_eq!(
+                        coordinator.member_rows(),
+                        &MemberIndex::load(&view.snapshot(), self.shard),
+                        "the coordinator's tick membership drifted from state",
+                    );
+                }
                 let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                     ParentAnchor {
                         state_root: parent_state_root,
@@ -1890,17 +1949,22 @@ impl ShardCoordinatorSim {
                         base_reads: None,
                     },
                     &finalizations,
-                    &creations,
-                    &removals,
+                    ChainWrites {
+                        creations: &creations_of(&creations),
+                        removals: &removals,
+                        frontier: &frontier,
+                        state_claims: &state_claims,
+                        members: &members,
+                    },
                     block_height,
                 );
                 let verify_result = expected_root.verify(&StateRootContext {
                     computed_root: &computed_root,
                     claimed_split_child_roots,
                     split_child_roots_required,
-                    claimed_terminal_roots,
-                    computed_terminal_roots,
-                    terminal_roots_required,
+                    claimed_terminal_settled_txs,
+                    computed_terminal_settled_txs,
+                    terminal_settled_txs_required,
                 });
                 let bytes_delta = jmt_snapshot.bytes_delta;
                 if verify_result.is_ok() {
@@ -1910,7 +1974,6 @@ impl ShardCoordinatorSim {
                             parent_block_hash,
                             height: block_height,
                             settled_txs: local_settled_tx_hashes(&finalizations, self.shard),
-                            committed_txs: block_tx_hashes,
                             jmt_snapshot,
                             certified_block: None,
                             certified_uncommitted: None,
@@ -1968,6 +2031,7 @@ impl ShardCoordinatorSim {
                 certified,
                 source: _,
                 witness,
+                committee_anchor: _,
             }
             | Action::CommitBlockByQcOnly {
                 certified,
@@ -1975,8 +2039,10 @@ impl ShardCoordinatorSim {
                 parent_block_height: _,
                 parent_sweep_frontier: _,
                 creations: _,
+                frontier: _,
                 source: _,
                 witness,
+                committee_anchor: _,
             } => {
                 let block = certified.block();
                 self.commits[emitter_idx].push(CapturedCommit {

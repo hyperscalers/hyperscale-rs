@@ -23,12 +23,12 @@ use hyperscale_types::{
     MAX_STATE_ENTRIES_PER_TX, MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing,
     TimestampRange, TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
-use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
+use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, vault_cell};
 use hyperscale_vm_effects::{
-    Admitted, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, Intent, IntentHeader,
-    IntentRecord, IntentTree, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, Value,
-    admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes, effect_units,
-    legs_of, package_hash, package_key as canonical_package_key, principal_address,
+    Admitted, CROSSING_ANSWER_CELL_BYTES, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingId,
+    Intent, IntentHeader, IntentRecord, IntentTree, MARKER_CELL_BYTES, ManifestHash, NodeCall,
+    PackageHash, Value, admit_tree, auth_cell_admits, child_key, decode_tree as decode_tree_bytes,
+    effect_units, legs_of, package_hash, package_key as canonical_package_key, principal_address,
     protocol_resource,
 };
 use hyperscale_vm_fixtures::lottery;
@@ -42,8 +42,7 @@ use hyperscale_vm_types::{
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 use crate::records::{
-    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, record_cell,
-    sweepable_cell,
+    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, sweepable_cell,
 };
 
 /// The accounts a transaction's intents act as: the owners of each
@@ -77,10 +76,11 @@ fn intent_accounts(admitted: &Admitted) -> Vec<Address> {
 pub fn crossing_records(legs: &[LegShape]) -> Vec<SubstateKey> {
     let mut records: Vec<((u32, u32), SubstateKey)> = legs
         .iter()
-        .flat_map(|consumer| &consumer.edges)
-        .filter_map(|edge| {
+        .flat_map(|consumer| consumer.edges.iter().map(move |edge| (consumer, edge)))
+        .filter_map(|(consumer, edge)| {
             let producer = legs.get(edge.source as usize)?;
-            let record = CrossingSite::record_of(&ProtocolHasher, producer, edge.output).key();
+            let record = CrossingId::of_edge(producer, consumer.target, edge.output)
+                .record_key(&ProtocolHasher);
             Some(((edge.source, edge.output), record))
         })
         .collect();
@@ -228,17 +228,20 @@ pub fn declared_vector(
                     ..DeclaredWork::ZERO
                 },
             );
+            // A consumer's answer is one family whatever the crossing's
+            // terms, and it carries the record it answers for — which is
+            // what makes it wider than a marker.
             add(
                 consumer.target,
                 DeclaredWork {
-                    write_bytes: written_leaf(u64::from(MARKER_CELL_BYTES)),
+                    write_bytes: written_leaf(u64::from(CROSSING_ANSWER_CELL_BYTES)),
                     footprint: point_write,
                     ..DeclaredWork::ZERO
                 },
             );
             retained = retained
                 .saturating_add(u64::from(CROSSING_CELL_BYTES))
-                .saturating_add(u64::from(MARKER_CELL_BYTES));
+                .saturating_add(u64::from(CROSSING_ANSWER_CELL_BYTES));
         }
     }
 
@@ -535,13 +538,8 @@ pub static PROTOCOL_RESOURCE: LazyLock<ResourceAddr> =
 /// The vault cell for `resource` under `owner` — the same child key the
 /// stdlib account metadata's effect clauses compute.
 #[must_use]
-pub fn vault_key(owner: impl Into<Address>, resource: impl Into<Address>) -> SubstateKey {
-    child_key(
-        &ProtocolHasher,
-        owner,
-        VAULT,
-        &[Value::Address(resource.into()).canonical_bytes()],
-    )
+pub fn vault_key(owner: impl Into<Address>, resource: ResourceAddr) -> SubstateKey {
+    vault_cell(&ProtocolHasher, owner, resource)
 }
 
 /// The stored-authority cell under `owner` — what `securify` writes,
@@ -1208,10 +1206,6 @@ impl ProtocolStatics for BridgeStatics {
         sweepable_cell(Address::from_bytes(owner).ok()?, local, value)
     }
 
-    fn record_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
-        Address::from_bytes(owner).is_ok_and(|owner| record_cell(owner, local, value))
-    }
-
     fn rule_admits(
         &self,
         auth_cell: Option<&[u8]>,
@@ -1239,10 +1233,10 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg, GraphNode,
-        Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash, ManifestGraph, Member,
-        MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket, StoredRule, ValueRef,
-        child_key, never, nullifier_expiry_ms, nullifier_key, package_slot,
+        Answered, Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg,
+        GraphNode, Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash,
+        ManifestGraph, Member, MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket,
+        StoredRule, ValueRef, child_key, never, nullifier_expiry_ms, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::wrap_publish;
     use hyperscale_vm_stdlib::account;
@@ -1255,6 +1249,32 @@ mod tests {
 
     const RES_X: ResourceAddr = ResourceAddr::new([0xE1; 31]);
     const RES_Y: ResourceAddr = ResourceAddr::new([0xE2; 31]);
+
+    /// An owed crossing's credit lands in the consumer's own vault for
+    /// the record's resource: the cell a deposit to that consumer
+    /// credits, whoever produced the record.
+    #[test]
+    fn an_owed_credit_lands_in_the_consumers_vault() {
+        for (seed, resource) in [(0x11, RES_X), (0x42, RES_Y), (0x9F, *PROTOCOL_RESOURCE)] {
+            let consumer = Address::new([seed; 31], AddressClass::Component);
+            let id = CrossingId {
+                producer: Address::new([seed ^ 0xFF; 31], AddressClass::Component),
+                consumer,
+                intent: IntentHash(Hash32([seed; 32])),
+                local: u32::from(seed),
+                output: 1,
+            };
+            assert_eq!(
+                id.owed_credit(&ProtocolHasher, resource),
+                vault_key(consumer, resource)
+            );
+            assert_eq!(
+                id.owed_credit(&ProtocolHasher, resource).owner,
+                id.answer_key(&ProtocolHasher, Answered::Taken).owner,
+                "the credit and the answer that guards it sit under one owner",
+            );
+        }
+    }
 
     fn key(seed: u8) -> Ed25519PrivateKey {
         Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap()
@@ -1511,7 +1531,7 @@ mod tests {
             "the record sits under the producer beside its own declaration"
         );
         assert!(
-            consumer.write_bytes >= u64::from(MARKER_CELL_BYTES)
+            consumer.write_bytes >= u64::from(CROSSING_ANSWER_CELL_BYTES)
                 && consumer.footprint >= point_write,
             "the claim sits under the consumer"
         );
@@ -1653,7 +1673,9 @@ mod tests {
         assert_eq!(one.legs[0].intent, first.root.hash(&ProtocolHasher));
 
         let record_of = |derived: &Derived, node: usize| {
-            CrossingSite::record_of(&ProtocolHasher, &derived.legs[node], 0).key()
+            // The consumer is not in a record's key.
+            let producer = &derived.legs[node];
+            CrossingId::of_edge(producer, producer.target, 0).record_key(&ProtocolHasher)
         };
         assert_eq!(
             record_of(&one, 1),
@@ -1749,7 +1771,7 @@ mod tests {
         assert_eq!(
             twice.work.retention - derived.work.retention,
             moving
-                + u64::from(CROSSING_CELL_BYTES + MARKER_CELL_BYTES)
+                + u64::from(CROSSING_CELL_BYTES + CROSSING_ANSWER_CELL_BYTES)
                 + (wider_bytes - envelope_bytes),
             "the second pair adds its own event bound, the cells its edge keeps, and its own envelope"
         );
@@ -1960,15 +1982,9 @@ mod tests {
         )));
         let rule_cell =
             DeclaredKey::substate(composer_addr().address(), auth_key(composer_addr()).local.0);
-        let refused = child_key(
-            &ProtocolHasher,
-            bob_addr(),
-            package_slot(0),
-            &[Value::Address(RES_X.address()).canonical_bytes()],
-        );
-        let landing = DeclaredKey::substate(bob_addr().address(), refused.local.0);
-        let mut reads = vec![rule_cell, landing];
-        reads.sort_unstable();
+        // The sender's rule cell and nothing else: a credit has one
+        // destination, so the recipient's side reads no leaf to pick it.
+        let reads = vec![rule_cell];
         assert_eq!(derived.routing.read_keys, reads);
         // The root's nullifier is a creation, so its absence is
         // provisioned to every participant beside what the calls read.
@@ -1979,16 +1995,19 @@ mod tests {
             root_hash,
             nullifier_expiry_ms(&tree.root.header),
         );
-        let mut provisioned = reads.clone();
+        let mut provisioned = reads;
         provisioned.push(DeclaredKey::substate(
             composer_addr().address(),
             root_nullifier.local.0,
         ));
         provisioned.sort_unstable();
         assert_eq!(derived.routing.provision_keys, provisioned);
-        let mut provisioning = vec![composer_addr().address(), bob_addr().address()];
-        provisioning.sort_unstable();
-        assert_eq!(derived.routing.provision_prefixes, provisioning);
+        // The sender's prefix alone: the recipient's side reads nothing,
+        // so nothing of Bob's has to be provisioned to run the credit.
+        assert_eq!(
+            derived.routing.provision_prefixes,
+            vec![composer_addr().address()]
+        );
         assert_eq!(derived.attestations.len(), 1, "the root's alone");
         let mut owners = vec![composer_addr(), bob_addr()];
         owners.sort_unstable();

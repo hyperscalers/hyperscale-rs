@@ -13,13 +13,13 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, SubstateStore,
-    Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
-    key_under_prefix, prefix_low_key,
+    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, MemberIndex,
+    SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
+    key_under_prefix, load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, ShardId, StateRoot, SubstateKey,
-    SubstateLeaf, shard_prefix_path,
+    Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, FrontierInputs, ReadFrontier,
+    ShardId, StateRoot, SubstateKey, SubstateLeaf,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -97,15 +97,21 @@ impl Substates for SimBoundary {
 impl BoundaryStore for SimShardStorage {
     type Boundary = SimBoundary;
 
-    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
-        let prefix = shard_prefix_path(shard);
+    fn crossing_rows(&self, under: &NibblePath) -> Vec<SubstateKey> {
         read_or_recover(&self.state)
-            .current_state
-            .range(prefix_low_key(&prefix)..)
-            .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
-            .filter(|(key, value)| is_record_cell(**key, value))
-            .map(|(key, value)| (*key, value.to_vec()))
+            .crossing_index
+            .range(prefix_low_key(under)..)
+            .take_while(|key| key_under_prefix(&key.to_bytes(), under))
+            .copied()
             .collect()
+    }
+
+    fn read_frontier(&self, shard: ShardId) -> ReadFrontier {
+        load_read_frontier(self, shard)
+    }
+
+    fn member_index(&self, shard: ShardId) -> MemberIndex {
+        MemberIndex::load(self, shard)
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
@@ -215,7 +221,11 @@ impl BoundaryStore for SimShardStorage {
                 entry,
                 package,
                 sweep,
+                crossing,
             } = LeafRows::of(leaf.key, &leaf.value);
+            if crossing {
+                state.crossing_index.insert(leaf.key);
+            }
             if let Some((entry_key, value)) = entry {
                 state.current_entries.insert(entry_key, Arc::from(value));
             }
@@ -276,6 +286,7 @@ impl BoundaryStore for SimShardStorage {
         &self,
         block: &Block,
         creations: &[(SubstateKey, Vec<u8>)],
+        frontier: &FrontierInputs,
     ) -> Result<StateRoot, String> {
         let height = block.height();
         let prefix = read_or_recover(&self.state).tree_store.root_path();
@@ -284,7 +295,8 @@ impl BoundaryStore for SimShardStorage {
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let filtered = followed_block_writes(self, &self.snapshot(), block, creations, &prefix);
+        let filtered =
+            followed_block_writes(self, &self.snapshot(), block, creations, frontier, &prefix);
         let mut state = write_or_recover(&self.state);
         if height <= state.current_block_height {
             return Err(format!(
@@ -320,9 +332,14 @@ mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
-        test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
-        test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
-        test_import_gate_reads_the_trie,
+        test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_presence_below_the_deleting_absence_is_refused,
+        test_an_owed_credit_composes_with_a_receipt_on_its_vault,
+        test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
+        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
+        test_crossing_index_equals_the_leaves, test_followed_halves_fold_the_settlements,
+        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
+        test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key, committed_tx_cells};
     use hyperscale_types::test_utils::{
@@ -330,9 +347,9 @@ mod tests {
     };
     use hyperscale_types::{
         AddressClass, Block, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusReceipt,
-        GlobalReceiptHash, Hash, SettledWrites, ShardId, SplitChildRoots, StateWrites,
-        StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash, Verifiable,
-        WitnessSources, shard_prefix_path,
+        FrontierInputs, GlobalReceiptHash, Hash, SettledWrites, ShardId, SplitChildRoots,
+        StateWrites, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash,
+        Verifiable, WitnessSources, shard_prefix_path,
     };
 
     use super::*;
@@ -441,14 +458,90 @@ mod tests {
         test_boundary_import_roundtrip(&storage, &fresh);
     }
 
-    /// A store answers for the escrow records its state holds, and
-    /// answers the same whether it is running or resumed.
+    /// The crossing index equals the leaves across commits, deletes and
+    /// an import.
     #[test]
-    fn escrow_records_are_read_off_the_state() {
+    fn the_crossing_index_equals_the_leaves() {
+        test_crossing_index_equals_the_leaves(
+            &SimShardStorage::default(),
+            &SimShardStorage::default(),
+        );
+    }
+
+    /// A store answers for the read frontier its state holds, the same
+    /// whether it is running or resumed.
+    #[test]
+    fn the_read_frontier_is_read_off_the_state() {
         let storage = SimShardStorage::default();
-        test_escrow_records_are_read_off_the_state(&storage, |shard| {
+        test_the_read_frontier_is_read_off_the_state(&storage, |shard| {
             storage.load_recovered_state(shard)
         });
+    }
+
+    /// A split follower on each half rebuilds the parent's raise from
+    /// the copy on its half, and the halves recompose the parent's root.
+    #[test]
+    fn followed_halves_hold_the_read_frontier() {
+        let (left, right) = ShardId::ROOT.children();
+        test_followed_halves_hold_the_read_frontier(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A split follower on each half folds the settlements landing on
+    /// its half, and the halves recompose the parent's root.
+    #[test]
+    fn followed_halves_fold_the_settlements() {
+        let (left, right) = ShardId::ROOT.children();
+        test_followed_halves_fold_the_settlements(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A committed marker refuses its transaction after a restart, after
+    /// a snap sync, and through a pending ancestor alone.
+    #[test]
+    fn a_committed_marker_refuses_its_transaction_on_every_view() {
+        test_a_committed_marker_refuses_its_transaction_on_every_view(
+            &SimShardStorage::default(),
+            &SimShardStorage::default(),
+            &SimShardStorage::default(),
+        );
+    }
+
+    /// A block crediting an owed crossing lands one root committed,
+    /// followed whole and followed in halves.
+    #[test]
+    fn an_owed_credit_lands_one_root_on_every_path() {
+        let (left, right) = ShardId::ROOT.children();
+        test_an_owed_credit_lands_one_root_on_every_path(
+            &SimShardStorage::default(),
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// An owed credit composes with a receipt's movement on its vault.
+    #[test]
+    fn an_owed_credit_composes_with_a_receipt_on_its_vault() {
+        test_an_owed_credit_composes_with_a_receipt_on_its_vault(&SimShardStorage::default());
+    }
+
+    /// The frontier a credit and its deletion leave refuses a presence
+    /// below the deleting absence, whole and on the consumer's half.
+    #[test]
+    fn a_presence_below_the_deleting_absence_is_refused() {
+        let (left, right) = ShardId::ROOT.children();
+        test_a_presence_below_the_deleting_absence_is_refused(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
     }
 
     #[test]
@@ -511,8 +604,12 @@ mod tests {
             let left_before = left_store.state_root();
             let right_before = right_store.state_root();
             let block = block_settling(height, receipts.to_vec());
-            let left_after = left_store.follow_block_writes(&block, &[]).unwrap();
-            let right_after = right_store.follow_block_writes(&block, &[]).unwrap();
+            let left_after = left_store
+                .follow_block_writes(&block, &[], &FrontierInputs::still(ShardId::ROOT))
+                .unwrap();
+            let right_after = right_store
+                .follow_block_writes(&block, &[], &FrontierInputs::still(ShardId::ROOT))
+                .unwrap();
 
             // Exactly the routed side's root moves; the other side's
             // follow is a no-op.
@@ -583,6 +680,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -610,8 +708,12 @@ mod tests {
         let creations = committed_tx_cells(ShardId::ROOT, std::iter::once(&tx));
         let carrying = followed_block(1, SweepFrontier::ZERO, vec![tx], Vec::new());
         let other_before = other.state_root();
-        routed.follow_block_writes(&carrying, &creations).unwrap();
-        other.follow_block_writes(&carrying, &creations).unwrap();
+        routed
+            .follow_block_writes(&carrying, &creations, &FrontierInputs::still(ShardId::ROOT))
+            .unwrap();
+        other
+            .follow_block_writes(&carrying, &creations, &FrontierInputs::still(ShardId::ROOT))
+            .unwrap();
         assert!(
             routed.cell(cell).is_some(),
             "the committed cell lands on its half"
@@ -651,6 +753,7 @@ mod tests {
             .follow_block_writes(
                 &followed_block(1, SweepFrontier::ZERO, Vec::new(), vec![receipt]),
                 &[],
+                &FrontierInputs::still(ShardId::ROOT),
             )
             .unwrap();
         assert!(store.cell(sweepable).is_some());
@@ -658,7 +761,11 @@ mod tests {
         let bucket = SweepFrontier::of_leaf(sweepable).bucket();
         let short = SweepFrontier::start_of(bucket);
         store
-            .follow_block_writes(&followed_block(2, short, Vec::new(), Vec::new()), &[])
+            .follow_block_writes(
+                &followed_block(2, short, Vec::new(), Vec::new()),
+                &[],
+                &FrontierInputs::still(ShardId::ROOT),
+            )
             .unwrap();
         assert!(
             store.cell(sweepable).is_some(),
@@ -667,7 +774,11 @@ mod tests {
 
         let past = SweepFrontier::start_of(SweepBucket(bucket.0 + 1));
         store
-            .follow_block_writes(&followed_block(3, past, Vec::new(), Vec::new()), &[])
+            .follow_block_writes(
+                &followed_block(3, past, Vec::new(), Vec::new()),
+                &[],
+                &FrontierInputs::still(ShardId::ROOT),
+            )
             .unwrap();
         assert!(
             store.cell(sweepable).is_none(),
@@ -682,7 +793,13 @@ mod tests {
         let store = SimShardStorage::new(shard_prefix_path(child_of(1)));
         let (_, receipt) = follow_receipt(1);
         let block = block_settling(BlockHeight::new(5), vec![receipt]);
-        store.follow_block_writes(&block, &[]).unwrap();
-        assert!(store.follow_block_writes(&block, &[]).is_err());
+        store
+            .follow_block_writes(&block, &[], &FrontierInputs::still(ShardId::ROOT))
+            .unwrap();
+        assert!(
+            store
+                .follow_block_writes(&block, &[], &FrontierInputs::still(ShardId::ROOT))
+                .is_err()
+        );
     }
 }

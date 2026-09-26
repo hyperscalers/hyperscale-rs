@@ -303,7 +303,7 @@ const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
         terminal_epoch: None,
         handoff_complete: None,
         terminal_delivered: false,
-        terminal_roots: None,
+        terminal_settled_txs: None,
         reshape_admitted_epoch: None,
     }
 }
@@ -362,13 +362,13 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
     let halves = BTreeMap::from([(left, left_half.to_vec()), (right, right_half.to_vec())]);
     let Some(PendingReshape::Split {
         scheduled,
-        admitted_at,
+        admitted,
         ..
     }) = state.pending_reshapes.get_mut(&target)
     else {
         unreachable!("pending split read above");
     };
-    let admitted_at = *admitted_at;
+    let admitted_at = admitted.at;
     *scheduled = Some(ScheduledSplit { terminal, halves });
 
     // The parent's chain terminates at `terminal`'s cut and the children
@@ -493,7 +493,7 @@ pub(super) fn schedule_ready_merges(state: &mut BeaconState) {
             matches!(
                 r,
                 PendingReshape::Merge {
-                    admitted_at: Some(_),
+                    admitted: Some(_),
                     scheduled_terminal: None,
                     ..
                 }
@@ -548,13 +548,13 @@ fn try_schedule_merge(state: &mut BeaconState, parent: ShardId) {
 
     let Some(PendingReshape::Merge {
         scheduled_terminal,
-        admitted_at,
+        admitted,
         ..
     }) = state.pending_reshapes.get_mut(&parent)
     else {
         unreachable!("pending merge read above");
     };
-    let admitted_at = *admitted_at;
+    let admitted_at = admitted.map(|admission| admission.at);
     *scheduled_terminal = Some(terminal);
 
     // Both children terminate on the same cut. The mark keeps each
@@ -701,7 +701,7 @@ mod tests {
         apply_next_epoch, apply_witness_chunk, empty_state, net, single_pool_state,
         validator_record,
     };
-    use crate::state::witness::{apply_shard_payload, prune_stale_reshapes};
+    use crate::state::witness::{apply_shard_payload, defer_reshape_ttls, prune_stale_reshapes};
 
     /// `single_pool_state(4)` — four ready members on `leaf(1, 0)`,
     /// promoted into the active slot too — plus `pooled` free
@@ -977,7 +977,7 @@ mod tests {
                 terminal_epoch: None,
                 handoff_complete: None,
                 terminal_delivered: false,
-                terminal_roots: None,
+                terminal_settled_txs: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -1017,6 +1017,113 @@ mod tests {
             state.live_settled_window_floors().get(&p),
             Some(&floor),
             "the boundary stamp keeps projecting the floor through the coast",
+        );
+    }
+
+    /// The floor is the admission epoch however many Skip folds follow
+    /// it: a stall moves the readiness deadline, and the settled window
+    /// keeps reaching back to the fold the counterpart fences armed at.
+    #[test]
+    fn the_settled_floor_ignores_skip_epochs() {
+        use hyperscale_types::RETENTION_HORIZON;
+
+        const EPOCH_MS: u64 = 400_000;
+        let floor_of = |admitted: Epoch| {
+            WeightedTimestamp::from_millis(
+                admitted.inner() * EPOCH_MS - RETENTION_HORIZON.as_secs() * 1000,
+            )
+        };
+        // The fold's Skip arm: the epoch advances and the deadlines move.
+        let skip = |state: &mut BeaconState| {
+            state.current_epoch = state.current_epoch.next();
+            defer_reshape_ttls(state);
+        };
+
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        let mut state = grow_state(4);
+        state.chain_config.epoch_duration_ms = EPOCH_MS;
+        state.boundaries.insert(
+            p,
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::ZERO,
+                height: BlockHeight::new(10),
+                weighted_timestamp: WeightedTimestamp::ZERO,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
+                cumulative_fees: 0,
+                used: DeclaredWork::ZERO,
+                blocks: 0,
+                substate_bytes: 0,
+                last_live_epoch: Epoch::new(5),
+                consecutive_misses: 0,
+                terminal_epoch: None,
+                handoff_complete: None,
+                terminal_delivered: false,
+                terminal_settled_txs: None,
+                reshape_admitted_epoch: None,
+            },
+        );
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
+        );
+        let admitted = state.current_epoch;
+        skip(&mut state);
+        skip(&mut state);
+        assert_eq!(
+            state.live_settled_window_floors().get(&p),
+            Some(&floor_of(admitted)),
+            "the pending record floors on the admission, two skips later",
+        );
+
+        let left_observer = observer_for(&state, p, left);
+        mark_ready(&mut state, p, left_observer);
+        let right_observer = observer_for(&state, p, right);
+        mark_ready(&mut state, p, right_observer);
+        schedule_ready_splits(&mut state);
+        assert!(
+            state.pending_reshapes[&p].scheduled_terminal().is_some(),
+            "the gate schedules the cut",
+        );
+        assert_eq!(
+            state.live_settled_window_floors().get(&p),
+            Some(&floor_of(admitted)),
+            "the scheduled record floors on the admission",
+        );
+
+        assert!(advance_to_scheduled_cut(&mut state));
+        apply_scheduled_splits(&mut state);
+        assert!(state.pending_reshapes.is_empty());
+        assert_eq!(state.boundaries[&p].reshape_admitted_epoch, Some(admitted));
+        assert_eq!(
+            state.live_settled_window_floors().get(&p),
+            Some(&floor_of(admitted)),
+            "the boundary stamp floors on the admission",
+        );
+
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        state.chain_config.epoch_duration_ms = EPOCH_MS;
+        let merge = merge_assertion(parent);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+        let paired = state.current_epoch;
+        skip(&mut state);
+        skip(&mut state);
+        let floors = state.live_settled_window_floors();
+        assert_eq!(
+            (floors.get(&left), floors.get(&right)),
+            (Some(&floor_of(paired)), Some(&floor_of(paired))),
+            "both children floor on the pairing, two skips later",
         );
     }
 
@@ -1351,7 +1458,7 @@ mod tests {
                     terminal_epoch: None,
                     handoff_complete: None,
                     terminal_delivered: false,
-                    terminal_roots: None,
+                    terminal_settled_txs: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -1399,24 +1506,22 @@ mod tests {
         // The first half waits: no keepers, no readiness clock.
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         let Some(PendingReshape::Merge {
-            keepers,
-            admitted_at,
-            ..
+            keepers, admitted, ..
         }) = state.pending_reshapes.get(&parent)
         else {
             panic!("merge half not recorded");
         };
         assert!(keepers.is_empty());
-        assert!(admitted_at.is_none());
+        assert!(admitted.is_none());
 
         // The sibling pairs it: keepers drawn on the spot.
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
-        let Some(PendingReshape::Merge { admitted_at, .. }) = state.pending_reshapes.get(&parent)
+        let Some(PendingReshape::Merge { admitted, .. }) = state.pending_reshapes.get(&parent)
         else {
             unreachable!()
         };
-        assert_eq!(*admitted_at, Some(Epoch::new(5)));
+        assert_eq!(admitted.map(|admission| admission.at), Some(Epoch::new(5)));
         assert_eq!(keepers.len(), 4);
         let from_left = keepers.values().filter(|s| s.child == left).count();
         let from_right = keepers.values().filter(|s| s.child == right).count();
@@ -1930,7 +2035,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         }
     }

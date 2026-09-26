@@ -13,8 +13,8 @@
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    Address, BeaconWitnessEvent, ConsensusReceipt, EscrowedValue, Event, ExecutionMetadata,
-    GlobalReceiptHash, ShardId, ShardTrie, StateWrites, TxHash,
+    Address, BeaconWitnessEvent, ConsensusReceipt, Event, ExecutionMetadata, GlobalReceiptHash,
+    ShardId, ShardTrie, StateWrites, TxHash,
 };
 
 use crate::output::ExecutedTx;
@@ -56,8 +56,6 @@ enum CachedOutputBody {
         /// question — and the same answer — as which shard keeps the
         /// event it was read from.
         witnesses: Vec<(Address, BeaconWitnessEvent)>,
-        /// What the execution escrowed out, per departing edge.
-        escrowed: Vec<EscrowedValue>,
     },
 }
 
@@ -73,7 +71,6 @@ impl CachedOutput {
         metadata: ExecutionMetadata,
         events: Vec<Event>,
         witnesses: Vec<(Address, BeaconWitnessEvent)>,
-        escrowed: Vec<EscrowedValue>,
     ) -> Self {
         Self {
             metadata,
@@ -82,7 +79,6 @@ impl CachedOutput {
                 events,
                 receipt_hash,
                 witnesses,
-                escrowed,
             },
         }
     }
@@ -125,7 +121,6 @@ pub fn project_to_shard(
             events,
             receipt_hash,
             witnesses,
-            escrowed,
         } => {
             let owned = owned_by(local_shard, shard_trie);
             let writes = filter_writes_for_shard(raw_writes, owned);
@@ -156,9 +151,7 @@ pub fn project_to_shard(
                     .expect("a list under the cap its source already met"),
                 events: Capped::new(events).expect("a list under the cap its source already met"),
             };
-            let mut executed = ExecutedTx::new(tx_hash, consensus, cached.metadata.clone());
-            executed.escrowed.clone_from(escrowed);
-            executed
+            ExecutedTx::new(tx_hash, consensus, cached.metadata.clone())
         }
     }
 }

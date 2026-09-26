@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_engine::TickEnvironment;
+use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     Anchor, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
@@ -20,7 +21,7 @@ use hyperscale_types::{
     QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
     Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StoredReceipt, SubstateKey, TickId, Timeout,
+    SpcProposalObjectVerifyError, SpcView, StateClaim, StoredReceipt, SubstateKey, TickId, Timeout,
     Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, Verifiable, VerificationKind,
     Verified, WeightedTimestamp,
 };
@@ -38,11 +39,12 @@ pub struct TickBatchOutcome {
     /// Per-member outcomes extracted on the handler thread for vote
     /// signing.
     pub tx_outcomes: Vec<TxOutcome>,
-    /// Fee receipts built beside the execution receipts, for the
-    /// transactions this shard pays for and a counterpart can still
-    /// refuse. Held in reserve: an abort settles one of these in place of
-    /// the discarded execution receipt.
-    pub fee_receipts: Vec<StoredReceipt>,
+    /// Refusal receipts built beside the execution receipts: the charge
+    /// of a transaction this shard pays for, and the `Never` answers of
+    /// a consumer that was or can still be refused. Held in reserve: a
+    /// refusal settles one of these in place of the discarded execution
+    /// receipt.
+    pub refusal_receipts: Vec<StoredReceipt>,
 }
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -219,6 +221,11 @@ pub enum ProtocolEvent {
         /// verification rides the parallel pipeline path (see the doc
         /// on [`Verified<Block>`](hyperscale_types::Verified)).
         certified: Arc<Verified<CertifiedBlock>>,
+        /// The block's committee anchor — its parent's own anchor, the
+        /// window its content is classified under. Carried from the
+        /// shard's commit, because a buffered run commits in one step and
+        /// a scalar read at fan-out names only the run's last block.
+        committee_anchor: WeightedTimestamp,
     },
 
     /// A block has been durably persisted to `RocksDB`.
@@ -411,6 +418,17 @@ pub enum ProtocolEvent {
         provisions: Arc<Provisions>,
     },
 
+    /// A producer's pushed record readings, past ingress: routed to a
+    /// hosted shard, all at one anchor, signed by a member of the
+    /// committee that proposed the anchor's block, and each claim
+    /// well-formed and proving its readings. What remains is the
+    /// execution coordinator's to place: offered where the anchor is
+    /// commit-proven, parked until it is, dropped where it disagrees.
+    CrossingReadingsReceived {
+        /// The claims, every one at the same anchor.
+        claims: Vec<StateClaim>,
+    },
+
     /// Received provisions whose merkle proof predicate already holds —
     /// produced only by the local-dispatch fast path when a colocated
     /// source-shard vnode emits a notification carrying
@@ -434,9 +452,9 @@ pub enum ProtocolEvent {
         /// Verified provisions on success; the raw bundle paired with
         /// its error on failure.
         result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
-        /// The certified header whose `state_root` the merkle proof was
+        /// The source anchor whose `state_root` the merkle proof was
         /// checked against.
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        anchor: Anchor,
     },
 
     /// A provisions has been verified — ready for downstream consumption.
@@ -743,8 +761,9 @@ pub enum ProtocolEvent {
 
     /// A state proof fetched against a commit-proven remote header
     /// verified: it reconstructs the anchor's root and claims every key
-    /// asked. The execution coordinator keeps the bytes to offer in a
-    /// block it proposes; nothing reads an answer off a fetch, since
+    /// asked, and every value served beside it hashes to the presence
+    /// it proves. The execution coordinator keeps the bytes to offer in
+    /// a block it proposes; nothing reads an answer off a fetch, since
     /// the answer is the chain's once a block carries the proof.
     FetchedStateProofVerified {
         /// The state the proof was checked against.
@@ -753,6 +772,9 @@ pub enum ProtocolEvent {
         keys: Vec<SubstateKey>,
         /// The proof as fetched.
         proof: MerkleInclusionProof,
+        /// The record values the server proved present, each held to
+        /// the proof.
+        values: Vec<ServedValue>,
     },
 
     /// A settled-set fetch verified a past-terminal shard's complete
@@ -767,21 +789,6 @@ pub enum ProtocolEvent {
         /// The terminated shard's terminal weighted timestamp — bounds
         /// the fence's retention cutoff.
         terminal_wt: WeightedTimestamp,
-    },
-
-    /// A predecessor's committee answered which of the queried
-    /// transactions it committed before terminating. Every `absent`
-    /// answer here arrives already checked against that predecessor's
-    /// `committed_txs_root`; a `committed` answer needs no proof, since
-    /// it leaves the successor's standing refusal in place.
-    ///
-    /// `ShardCoordinator` records them and re-drives any vote that
-    /// deferred for want of one.
-    PrecutResolutionsReceived {
-        /// The terminated chain that answered.
-        predecessor: ShardId,
-        /// One `(transaction, absent)` pair per answered query.
-        answers: Vec<(TxHash, bool)>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

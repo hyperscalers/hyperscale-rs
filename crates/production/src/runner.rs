@@ -886,7 +886,11 @@ impl ProductionRunner {
             // on a pinned thread, so consensus may fire immediately.
             let genesis_commit_output = host.step(HostEvent::protocol(
                 shard,
-                ProtocolEvent::BlockCommitted { certified },
+                ProtocolEvent::BlockCommitted {
+                    // A genesis block anchors its own committee.
+                    committee_anchor: certified.block().header().parent_qc().weighted_timestamp(),
+                    certified,
+                },
             ));
             timer_ops.extend(genesis_commit_output.timer_ops);
             host.flush_all_batches();
@@ -1816,7 +1820,7 @@ mod tests {
             terminal_epoch: terminal.map(Epoch::new),
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         }
     }

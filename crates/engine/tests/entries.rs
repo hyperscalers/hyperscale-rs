@@ -19,10 +19,10 @@ use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates}
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, MAX_INTENT_VALIDITY_RANGE,
-    NetworkId, PriceTable, PrincipalAddr, ProtocolHasher, ProvisionalHolds, ResourceAddr,
-    SettledWrites, ShardId, ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified,
-    WeightedTimestamp,
+    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, FrontierInputs,
+    MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProtocolHasher,
+    ProvisionalHolds, ResourceAddr, SettledWrites, ShardId, ShardTrie, StoredReceipt,
+    TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::holdings_collection;
 use hyperscale_vm_stdlib::account;
@@ -168,18 +168,22 @@ fn run_tick(
         .expect("the harness engine holds every package it runs");
 
     let before = storage.state_root();
-    // Execution and fee receipts both, as the tick stores them: a failed
+    // Execution and refusal receipts both, as the tick stores them: a failed
     // attempt applies nothing itself but its charge still settles.
     let mut receipts: Vec<StoredReceipt> = Vec::new();
     for tx in &executed {
         let mut tx = tx.clone();
-        if let Some(fee) = tx.fee_receipt.take() {
+        if let Some(fee) = tx.refusal_receipt.take() {
             receipts.push(StoredReceipt::synced(tx.tx_hash, Arc::new(fee)));
         }
         receipts.push(StoredReceipt::from(tx));
     }
     let after = storage
-        .follow_block_writes(&block_settling(BlockHeight::new(height), receipts), &[])
+        .follow_block_writes(
+            &block_settling(BlockHeight::new(height), receipts),
+            &[],
+            &FrontierInputs::still(ShardId::ROOT),
+        )
         .expect("committed receipts apply");
     assert_ne!(before, after, "a settling tick moves the state root");
     executed

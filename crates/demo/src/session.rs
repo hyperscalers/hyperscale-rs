@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_effects_bridge::account_address;
+use hyperscale_effects_bridge::{ProtocolHasher, account_address};
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
@@ -12,9 +12,10 @@ use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
     NetworkId, PrincipalAddr, Provisions, ReshapeThresholds, ShardId, SharedCertificates,
-    TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
-    Verifiable, WeightedTimestamp,
+    StateClaim, TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    ValidatorId, Verifiable, WeightedTimestamp,
 };
+use hyperscale_vm_effects::{CrossingLeaf, Terms as RecordTerms};
 
 use crate::event::{HostRole, ObserverSeat, ShardPath, TraceEvent};
 
@@ -180,7 +181,8 @@ fn resolve_status(answers: &[TransactionStatus]) -> Option<Reported> {
 }
 
 /// Derive the settlement events a block attests to: the state it took
-/// delivery of and the finalizations it committed.
+/// delivery of, the owed crossings its fold credited, and the
+/// finalizations it committed.
 ///
 /// A bundle reaches a block only once this committee has checked its
 /// merkle multiproof against the source's QC-attested state root, and a
@@ -199,6 +201,7 @@ fn settlement_events(
     shard: ShardId,
     height: BlockHeight,
     provisions: &[Arc<Verifiable<Provisions>>],
+    state_claims: &[StateClaim],
     certificates: &SharedCertificates,
 ) {
     for bundle in provisions {
@@ -212,6 +215,32 @@ fn settlement_events(
         if !delivered.is_empty() {
             events.push(TraceEvent::provisions_verified(
                 wt, bundle, shard, height, delivered,
+            ));
+        }
+    }
+    // A named, valued reading of an owed record is what the fold credits
+    // its consumer off.
+    for claim in state_claims {
+        let credited: Vec<TxHash> = claim
+            .crossings
+            .iter()
+            .filter(|(key, id)| *key == id.record_key(&ProtocolHasher))
+            .filter_map(|(key, _)| {
+                match CrossingLeaf::read(&ProtocolHasher, *key, claim.held(*key)?)? {
+                    CrossingLeaf::Record { cell, .. } if cell.terms == RecordTerms::Owed => {
+                        Some(cell.tx)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        if !credited.is_empty() {
+            events.push(TraceEvent::crossing_credited(
+                wt,
+                &claim.anchor,
+                shard,
+                height,
+                credited,
             ));
         }
     }
@@ -811,6 +840,7 @@ impl Session {
                     shard,
                     header.height(),
                     &storage.provisions_at(header.height()),
+                    block.state_claims(),
                     block.certificates(),
                 );
                 watermarks.push((shard, BlockHeight::new(height)));

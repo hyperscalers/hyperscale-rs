@@ -16,10 +16,9 @@ const TX_OUTCOME_LEAF_TAG: &[u8] = b"hyperscale.tx_outcome_leaf.v1";
 /// The vote signature covers only the receipt root, and decoding
 /// recomputes that root from the outcomes, so every field of the
 /// outcome has to sit under the leaf or it is an aggregator's to forge:
-/// the verdict, the attested and reserved work, any settled fee receipt,
-/// the shards the settlement waits on, what the execution escrowed and
-/// where those crossings land, and what the outcome says of its own
-/// role. The encoding admits one reading of all of them, so nothing is
+/// the verdict, the attested and reserved work, any settled refusal
+/// receipt, the shards the settlement waits on, and what the outcome
+/// says of its own role. The encoding admits one reading of all of them, so nothing is
 /// packed by hand.
 ///
 /// # Panics
@@ -95,10 +94,8 @@ mod reservation_tests {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_vm_types::{Address, AddressClass, LocalKey, SubstateKey};
-
     use super::*;
-    use crate::{ExecutionOutcome, GlobalReceiptHash, Role, ShardId, TxHash};
+    use crate::{ExecutionOutcome, GlobalReceiptHash, Role, TxHash};
 
     /// Whether an outcome decides its transaction is under the signed
     /// leaf: a leg's success and a core's are otherwise identical bytes.
@@ -145,69 +142,14 @@ mod tests {
         TxHash::from(Hash::from_bytes(b"leaf-tx"))
     }
 
-    fn escrowed(node: u32) -> SubstateKey {
-        SubstateKey {
-            owner: Address::new([0xC1; 31], AddressClass::Component),
-            local: LocalKey([u8::try_from(node).expect("a test node fits a byte"); 16]),
-        }
-    }
-
-    fn base() -> TxOutcome {
-        TxOutcome::new(tx_hash(), ExecutionOutcome::Aborted)
-    }
-
-    /// The list region is one byte string whatever the split between
-    /// its three lists, so the counts have to be what fixes the reading:
-    /// three escrowed entries and twenty-six shards are the same 312
-    /// bytes of region, and the leaves differ.
-    #[test]
-    fn two_list_splits_of_equal_length_give_different_leaves() {
-        let escrowing = base().escrowing((0..3).map(escrowed));
-        let crossing = base().crossing_to((0..12).map(|path| ShardId::leaf(4, path)));
-        assert_eq!(
-            escrowing.escrowed().len() * 48,
-            crossing.crossing_targets().len() * 12,
-            "the two regions have to be the same length, or this proves nothing"
-        );
-        assert_ne!(tx_outcome_leaf(&escrowing), tx_outcome_leaf(&crossing));
-
-        // And the same shards awaited rather than crossed to is a third
-        // reading of the same bytes.
-        let awaiting = base().awaiting((0..12).map(|path| ShardId::leaf(4, path)));
-        assert_ne!(tx_outcome_leaf(&awaiting), tx_outcome_leaf(&crossing));
-    }
-
-    /// The cells an execution escrowed are under the leaf: an aggregator
-    /// restating which of them left fails the root recompute.
-    #[test]
-    fn leaf_covers_which_cells_were_escrowed() {
-        let one = base().escrowing([escrowed(1)]);
-        let moved = base().escrowing([escrowed(2)]);
-        let both = base().escrowing([escrowed(1), escrowed(2)]);
-        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&moved));
-        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&both));
-        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&base()));
-    }
-
-    /// One form: the builder sorts on the whole entry and keeps one per
-    /// edge, so two callers offering the same set in different orders
-    /// build the same outcome.
-    #[test]
-    fn escrowed_entries_take_one_form() {
-        let forward = base().escrowing([escrowed(1), escrowed(2)]);
-        let backward = base().escrowing([escrowed(2), escrowed(1), escrowed(2)]);
-        assert_eq!(forward, backward);
-        assert_eq!(forward.escrowed().len(), 2);
-    }
-
     /// What a transaction was charged is folded into the leaf on the
-    /// outcomes that settle a fee receipt too, so a forged charge fails
-    /// the receipt-root recompute every EC decode runs.
+    /// outcomes that settle a refusal receipt too, so a forged charge
+    /// fails the receipt-root recompute every EC decode runs.
     #[test]
-    fn leaf_covers_the_charge_on_a_fee_settling_outcome() {
-        let fee = GlobalReceiptHash::from_raw(Hash::from_bytes(b"fee"));
+    fn leaf_covers_the_charge_on_a_refusal_settling_outcome() {
+        let refusal = GlobalReceiptHash::from_raw(Hash::from_bytes(b"refusal"));
         let outcome = |charged| {
-            TxOutcome::with_fee(tx_hash(), ExecutionOutcome::Failed, fee).reserving(charged)
+            TxOutcome::with_refusal(tx_hash(), ExecutionOutcome::Failed, refusal).reserving(charged)
         };
         assert_ne!(
             tx_outcome_leaf(&outcome(7)),

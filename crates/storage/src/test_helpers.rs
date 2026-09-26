@@ -10,36 +10,41 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_hbor::{Bytes, Capped, from_slice};
-use hyperscale_jmt::{KEY_BYTES, TreeReader};
+use hyperscale_jmt::{KEY_BYTES, NibblePath, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    stub_record_cell, stub_sweepable_cell, test_transaction,
+    proven_claim, stub_sweepable_cell, test_key, test_transaction,
 };
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
+    AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
     BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
-    CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, Event,
+    CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, EpochWindows, Event,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel, MerkleInclusionProof, PcQc2,
-    PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher,
-    ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness,
-    RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor,
-    ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
-    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
-    UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Inclusion, LocalKey, LogLevel,
+    MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable,
+    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
+    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence,
+    ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites,
+    ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots,
+    Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StoredReceipt, SubstateKey,
+    SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
+    TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
+    Verified, VotePosition, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
+    compute_merkle_root, encode_amount, entry_leaf_key, read_amount, shard_prefix_path,
 };
+use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
+use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BOUNDARY_RETAIN, BoundaryStore, GenesisCommit, ImportCursor, ImportProgress,
-    JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState, SafeVoteRegisterStore,
-    ShardChainReader, ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore,
-    WitnessSeed, committed_tx_cell_key, committed_tx_cells, holds_state, sweep_for_block,
+    Anchored, BOUNDARY_RETAIN, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit, ImportCursor,
+    ImportProgress, JmtSnapshot, MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain,
+    RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
+    Substates, SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell, committed_here,
+    committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -279,6 +284,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
+        tick_manifest: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -522,6 +528,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -533,6 +540,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
                 provisions,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             }
         }
@@ -541,8 +549,10 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             transactions,
             certificates,
             provision_hashes,
+            engagements,
             abandonment_records,
             state_claims,
+            tick_manifest,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -552,8 +562,10 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
+                engagements,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             }
         }
@@ -569,6 +581,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             certificates,
             provisions,
             state_claims,
+            tick_manifest,
             witness_sources,
             ..
         } => Block::Live {
@@ -578,6 +591,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             provisions,
             abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
+            tick_manifest,
             witness_sources,
         },
         Block::Sealed {
@@ -585,7 +599,9 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             transactions,
             certificates,
             provision_hashes,
+            engagements,
             state_claims,
+            tick_manifest,
             witness_sources,
             ..
         } => Block::Sealed {
@@ -593,8 +609,10 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             transactions,
             certificates,
             provision_hashes,
+            engagements,
             abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
+            tick_manifest,
             witness_sources,
         },
     }
@@ -631,8 +649,13 @@ pub fn commit_settled_at<S: TestStore>(
             base_reads: None,
         },
         &block.certificates()[..],
-        creations,
-        removals,
+        ChainWrites {
+            creations,
+            removals,
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
         block.height(),
     );
     commit(SyncHint::FlushNow, certified, witness)
@@ -808,6 +831,7 @@ pub fn commit_block_with_witnesses(
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
+        tick_manifest: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -864,6 +888,7 @@ pub fn commit_block_with_witness_window(
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
+        tick_manifest: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -936,8 +961,9 @@ pub fn pin_snap_sync_replica(
         height: anchor_height,
         weighted_timestamp: WeightedTimestamp::from_millis(anchor_height.inner()),
         witness_base: BeaconWitnessLeafCount::ZERO,
-        terminal_roots: None,
+        terminal_settled_txs: None,
         handoff_complete: None,
+        terminal_epoch: None,
     }
 }
 
@@ -963,8 +989,8 @@ pub fn test_witness_payload_range_reads(storage: &(impl ShardChainReader + TestS
     assert!(storage.get_beacon_witness_payload_range(7, 9).is_empty());
 }
 
-/// Shared EC roundtrip test: commit a block carrying an EC, then read it
-/// back by `tick_id`.
+/// Shared EC roundtrip test: commit a block carrying a finalization, then
+/// read its certificate back by the transaction it attests.
 ///
 /// # Panics
 ///
@@ -972,38 +998,49 @@ pub fn test_witness_payload_range_reads(storage: &(impl ShardChainReader + TestS
 pub fn test_ec_storage_roundtrip(storage: &(impl ShardChainReader + TestStore)) {
     let ec = make_test_execution_certificate(1, BlockHeight::new(10));
     let tick_id = *ec.tick_id();
+    let tx = attested_by(&ec);
 
-    // Initially absent.
-    assert!(storage.get_execution_certificate(&tick_id).is_none());
+    // Absent until the finalization commits.
+    assert!(storage.get_execution_certificates_for_txs(&[tx]).is_empty());
 
     commit_empty_blocks_below(storage, BlockHeight::new(10));
     let block = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec)]);
     let certified = make_test_certified(block);
     commit_settled_at(storage, &certified, &[], &[], &empty_witness());
 
-    let direct = storage
-        .get_execution_certificate(&tick_id)
-        .expect("EC must be retrievable by tick_id");
-    assert_eq!(direct.tick_id(), &tick_id);
-    assert_eq!(direct.block_height(), BlockHeight::new(10));
+    let served = storage.get_execution_certificates_for_txs(&[tx]);
+    assert_eq!(
+        served.len(),
+        1,
+        "the certificate is served by the transaction it attests"
+    );
+    assert_eq!(served[0].tick_id(), &tick_id);
+    assert_eq!(served[0].block_height(), BlockHeight::new(10));
 }
 
-/// Shared EC batch test: commit two ECs at one height plus one at another,
-/// confirm batch read returns hits and skips misses.
+/// The one transaction a [`make_test_execution_certificate`] attests.
+fn attested_by(ec: &ExecutionCertificate) -> TxHash {
+    ec.tx_outcomes()
+        .iter()
+        .next()
+        .expect("a test certificate attests one outcome")
+        .tx_hash()
+}
+
+/// Shared EC batch test: commit finalizations at two heights, then ask by
+/// transaction: every transaction certified here is answered by its own
+/// certificate, and one never certified here is skipped.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
 pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + TestStore)) {
     let ec1 = make_test_execution_certificate(1, BlockHeight::new(10));
-    let ec2 = make_test_execution_certificate(2, BlockHeight::new(10));
-    let ec3 = make_test_execution_certificate(3, BlockHeight::new(20));
+    let ec2 = make_test_execution_certificate(2, BlockHeight::new(20));
+    let never = attested_by(&make_test_execution_certificate(3, BlockHeight::new(30)));
 
     commit_empty_blocks_below(storage, BlockHeight::new(10));
-    let block10 = make_test_block_with_ecs(
-        BlockHeight::new(10),
-        vec![Arc::new(ec1.clone()), Arc::new(ec2.clone())],
-    );
+    let block10 = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec1.clone())]);
     commit_settled_at(
         storage,
         &make_test_certified(block10),
@@ -1016,7 +1053,7 @@ pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + TestStore)) {
         let certified = make_test_certified(make_test_block(BlockHeight::new(h)));
         commit_settled_at(storage, &certified, &[], &[], &empty_witness());
     }
-    let block20 = make_test_block_with_ecs(BlockHeight::new(20), vec![Arc::new(ec3.clone())]);
+    let block20 = make_test_block_with_ecs(BlockHeight::new(20), vec![Arc::new(ec2.clone())]);
     commit_settled_at(
         storage,
         &make_test_certified(block20),
@@ -1025,14 +1062,72 @@ pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + TestStore)) {
         &empty_witness(),
     );
 
-    let known = [*ec1.tick_id(), *ec2.tick_id(), *ec3.tick_id()];
-    let batch = storage.get_execution_certificates_batch(&known);
-    assert_eq!(batch.len(), 3);
+    let served: BTreeSet<TickId> = storage
+        .get_execution_certificates_for_txs(&[attested_by(&ec1), attested_by(&ec2), never])
+        .iter()
+        .map(|cert| *cert.tick_id())
+        .collect();
+    assert_eq!(served, BTreeSet::from([*ec1.tick_id(), *ec2.tick_id()]));
 
-    let missing_tick_id = TickId::new(known[0].shard_id(), BlockHeight::new(999));
-    let partial = storage.get_execution_certificates_batch(&[*ec3.tick_id(), missing_tick_id]);
+    let partial = storage.get_execution_certificates_for_txs(&[attested_by(&ec2), never]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].tick_id(), ec3.tick_id());
+    assert_eq!(partial[0].tick_id(), ec2.tick_id());
+}
+
+/// Shared test: a finalization whose tick names another shard is stored
+/// with the block and indexed for no transaction.
+///
+/// The by-transaction read answers what this shard attested, and a
+/// counterpart's certificate answers a question nobody asks this shard.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_foreign_ticks_finalization_is_stored_and_not_indexed(
+    storage: &(impl ShardChainReader + TestStore),
+) {
+    let tx = TxHash::from(Hash::from_bytes(&[9u8; 32]));
+    let outcomes = vec![TxOutcome::new(
+        tx,
+        ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[98u8; 32])),
+        },
+    )];
+    let foreign = ExecutionCertificate::new(
+        TickId::new(ShardId::leaf(1, 1), BlockHeight::new(3)),
+        WeightedTimestamp::from_millis(4),
+        compute_global_receipt_root(&outcomes),
+        Capped::new(outcomes).expect("a list written out in a test"),
+        AggregateSignature::new([0u8; 96]),
+        SignerBitfield::new(4),
+    );
+    let finalization: Verifiable<Finalization> = Finalization::new(
+        *foreign.tick_id(),
+        TickHalf::Legs,
+        &Capped::from_array([Arc::new(foreign)]),
+        Capped::from_array([]),
+    )
+    .into();
+    let id = finalization.receipt_hash();
+
+    let block = push_certificate(make_test_block(BlockHeight::new(1)), Arc::new(finalization));
+    commit_settled_at(
+        storage,
+        &make_test_certified(block),
+        &[],
+        &[],
+        &empty_witness(),
+    );
+
+    assert_eq!(
+        storage.get_certificates_batch(&[id]).len(),
+        1,
+        "the finalization is stored with its block",
+    );
+    assert!(
+        storage.get_execution_certificates_for_txs(&[tx]).is_empty(),
+        "and answers for no transaction here",
+    );
 }
 
 /// One substate commit for `seed`: the cell [`make_settled_writes`]
@@ -1324,8 +1419,13 @@ where
             base_reads: None,
         },
         &block_one.certificates()[..],
-        &[],
-        &[],
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
         one,
     );
 
@@ -1344,8 +1444,13 @@ where
             base_reads: None,
         },
         &block_two.certificates()[..],
-        &[],
-        &[],
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
         two,
     );
 
@@ -1495,86 +1600,181 @@ where
     );
 }
 
-/// Shared serve → import round trip: leaves enumerated and resolved
-/// from `serving`'s pinned boundary rebuild an identical store in
-/// `fresh`, with the raw substates readable and a second import
-/// rejected.
+/// The crossing `producer` issues to `consumer`, both owners seeded as
+/// [`state_key`] seeds them: a seed under `0x80` sits in the left half.
+const fn fixture_crossing(producer: u8, consumer: u8) -> CrossingId {
+    CrossingId {
+        producer: state_key(producer, 0).owner,
+        consumer: state_key(consumer, 0).owner,
+        intent: IntentHash(Hash32([producer; 32])),
+        local: 0,
+        output: 0,
+    }
+}
+
+/// A record leaf of the crossing `producer` issues, at its derived key.
+///
+/// # Panics
+///
+/// Never: a crossing cell is narrower than a leaf's cap.
+#[must_use]
+pub fn crossing_record_leaf(producer: u8) -> SubstateLeaf {
+    let id = fixture_crossing(producer, producer ^ 0x80);
+    SubstateLeaf {
+        key: id.record_key(&ProtocolHasher),
+        value: Bytes::new(
+            id.cell(
+                VmTxHash(Hash32([0xC0; 32])),
+                ResourceAddr::new([0xE0; 31]),
+                500,
+                1_000,
+                Terms::Owed,
+            )
+            .to_bytes(),
+        )
+        .expect("a crossing cell fits a leaf"),
+    }
+}
+
+/// The crossing index equals the leaves.
+///
+/// After a commit that writes a record and an answer, one that deletes
+/// each, and an import of the store's leaves into `fresh`, the rows
+/// under each half are exactly the keys among those written that
+/// `CrossingLeaf::read` classifies.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-/// Shared boundary test: a store answers for the escrow records its
-/// committed state holds, and for nothing else.
-///
-/// Read off the state rather than an index, which is why it does not
-/// matter how the cells arrived — a commit here, an import at a reshape
-/// successor's adoption — nor how the store was reached. `recovered`
-/// answers as a restart does, and answers with the same set: a node
-/// resuming a store owes exactly what a node that never stopped owes,
-/// or the two compose different ticks.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-pub fn test_escrow_records_are_read_off_the_state<S>(
-    storage: &S,
-    recovered: impl Fn(ShardId) -> RecoveredState,
-) where
+pub fn test_crossing_index_equals_the_leaves<S>(storage: &S, fresh: &S)
+where
     S: BoundaryStore + TestStore,
 {
-    let owed = |shard: ShardId| {
-        let scanned = storage.escrow_records(shard);
-        assert_eq!(
-            recovered(shard).escrow_records,
-            scanned,
-            "a resumed store owes what a running one does",
-        );
-        scanned
-    };
     install_stub_protocol_statics();
-    // The left half of the keyspace. `state_key` fills all thirty-one
-    // body bytes with its owner seed, so a seed under 0x80 sits here and
-    // one at or above it sits in the sibling.
-    let shard = ShardId::leaf(1, 0);
-    let commit = |writes: &SettledWrites| {
-        commit_writes(storage, writes);
+    let mut written: BTreeSet<SubstateKey> = BTreeSet::new();
+    let halves = [
+        shard_prefix_path(ShardId::leaf(1, 0)),
+        shard_prefix_path(ShardId::leaf(1, 1)),
+    ];
+    let holds = |store: &S, written: &BTreeSet<SubstateKey>| {
+        for half in &halves {
+            let leaves: Vec<SubstateKey> = written
+                .iter()
+                .filter(|key| key_under_prefix(&key.to_bytes(), half))
+                .filter(|key| {
+                    store.cell(**key).is_some_and(|value| {
+                        CrossingLeaf::read(&ProtocolHasher, **key, &value).is_some()
+                    })
+                })
+                .copied()
+                .collect();
+            assert_eq!(store.crossing_rows(half), leaves, "rows under {half:?}");
+        }
     };
-    assert!(
-        owed(shard).is_empty(),
-        "a store holding nothing owes nothing",
-    );
+    let commit = |written: &mut BTreeSet<SubstateKey>,
+                  cells: Vec<(SubstateKey, Option<Vec<u8>>)>| {
+        written.extend(cells.iter().map(|(key, _)| *key));
+        commit_writes(
+            storage,
+            &SettledWrites::from_absolutes(cells.into_iter().collect()),
+        );
+    };
 
-    commit(&make_settled_writes(1, 1, vec![9, 9, 9]));
-    assert!(
-        owed(shard).is_empty(),
-        "an ordinary cell is not a record, wherever it sits",
+    holds(storage, &BTreeSet::new());
+    let ordinary = state_key(1, 1);
+    let (left, right) = (crossing_record_leaf(2), crossing_record_leaf(0x82));
+    let answered = fixture_crossing(0x84, 3);
+    let answer = answered.answer_key(&ProtocolHasher, Answered::Taken);
+    let answer_value = answered
+        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken, 1_000)
+        .to_bytes();
+    commit(
+        &mut written,
+        vec![
+            (ordinary, Some(vec![9, 9, 9])),
+            (left.key, Some(left.value.to_vec())),
+            (right.key, Some(right.value.to_vec())),
+            (answer, Some(answer_value)),
+        ],
     );
-
-    let record = state_key(2, 2);
-    let sibling = state_key(0x82, 2);
-    commit(&SettledWrites::from_absolutes(BTreeMap::from([
-        (record, Some(stub_record_cell(7))),
-        (sibling, Some(stub_record_cell(8))),
-    ])));
+    holds(storage, &written);
     assert_eq!(
-        owed(shard),
-        vec![(record, stub_record_cell(7))],
-        "a record reads back with the bytes a reclaim composes from, and a \
-         record under the sibling's prefix is not this shard's to owe",
-    );
-    assert_eq!(
-        owed(ShardId::leaf(1, 1)),
-        vec![(sibling, stub_record_cell(8))],
-        "and the sibling's own scan answers with its own",
+        storage.crossing_rows(&NibblePath::empty()).len(),
+        3,
+        "a record under each half and an answer, and no ordinary cell",
     );
 
-    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
-        record, None,
-    )])));
-    assert!(
-        owed(shard).is_empty(),
-        "a record taken back is no longer owed",
+    commit(&mut written, vec![(left.key, None), (answer, None)]);
+    holds(storage, &written);
+    assert_eq!(
+        storage.crossing_rows(&NibblePath::empty()),
+        vec![right.key],
+        "a record and an answer removed leave their rows",
     );
+
+    commit(&mut written, vec![(left.key, Some(left.value.to_vec()))]);
+    storage.pin_boundary(BlockHeight::new(3)).unwrap();
+    let boundary = storage.open_boundary(BlockHeight::new(3)).expect("pinned");
+    let root_key = boundary.get_root_key(3).expect("root resolves");
+    let chunk = Jmt::collect_range(
+        &boundary,
+        &root_key,
+        &[0u8; KEY_BYTES],
+        &[0xFF; KEY_BYTES],
+        1_000,
+    )
+    .unwrap();
+    let leaves: Vec<SubstateLeaf> = chunk
+        .leaves
+        .iter()
+        .map(|(leaf_key, _)| {
+            let key =
+                SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address");
+            SubstateLeaf {
+                key,
+                value: Bytes::new(boundary.cell(key).expect("resolves"))
+                    .expect("a list written out in a test"),
+            }
+        })
+        .collect();
+    import_boundary_state(fresh, BlockHeight::new(3), &leaves, WitnessSeed::default()).unwrap();
+    holds(fresh, &written);
+    assert_eq!(
+        fresh.crossing_rows(&NibblePath::empty()),
+        storage.crossing_rows(&NibblePath::empty()),
+        "an imported store indexes what the committing one does",
+    );
+}
+
+/// Every leaf `serving` holds at `height`, pinned there, as a snap-sync
+/// import receives them.
+fn boundary_leaves<S: BoundaryStore>(serving: &S, height: BlockHeight) -> Vec<SubstateLeaf> {
+    serving.pin_boundary(height).unwrap();
+    let boundary = serving.open_boundary(height).expect("pinned");
+    let root_key = boundary
+        .get_root_key(height.inner())
+        .expect("root resolves");
+    let chunk = Jmt::collect_range(
+        &boundary,
+        &root_key,
+        &[0u8; KEY_BYTES],
+        &[0xFF; KEY_BYTES],
+        1_000,
+    )
+    .unwrap();
+    chunk
+        .leaves
+        .iter()
+        .map(|(leaf_key, _)| {
+            let key =
+                SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address");
+            let value = boundary.cell(key).expect("resolves");
+            SubstateLeaf {
+                key,
+                value: Bytes::new(value).expect("a list written out in a test"),
+            }
+        })
+        .collect()
 }
 
 /// Shared serve → import round trip: leaves enumerated and resolved
@@ -1599,34 +1799,7 @@ where
         &make_settled_entries(7, &[(5, Some(vec![5])), (10, Some(vec![10]))]),
     );
     let source_root = serving.state_root();
-    serving.pin_boundary(BlockHeight::new(6)).unwrap();
-
-    let boundary = serving.open_boundary(BlockHeight::new(6)).expect("pinned");
-    let root_key = boundary.get_root_key(6).expect("root resolves");
-    let chunk = Jmt::collect_range(
-        &boundary,
-        &root_key,
-        &[0u8; KEY_BYTES],
-        &[0xFF; KEY_BYTES],
-        1_000,
-    )
-    .unwrap();
-    let leaves: Vec<SubstateLeaf> = chunk
-        .leaves
-        .iter()
-        .map(|(leaf_key, _)| {
-            let value = boundary
-                .cell(
-                    SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address"),
-                )
-                .expect("resolves");
-            SubstateLeaf {
-                key: SubstateKey::from_bytes(*leaf_key)
-                    .expect("a stored leaf key names an address"),
-                value: Bytes::new(value).expect("a list written out in a test"),
-            }
-        })
-        .collect();
+    let leaves = boundary_leaves(serving, BlockHeight::new(6));
     assert_eq!(leaves.len(), 7);
     let probe = leaves
         .iter()
@@ -1692,14 +1865,16 @@ fn execution_certificate_over(
     )
 }
 
-/// Shared coverage test for the tick slot: a store keeps the widest copy
-/// of a tick it has seen, and answers a by-transaction lookup only for
-/// what that copy carries.
+/// Shared coverage test for a tick's copies: every finalization of the
+/// tick that carries a transaction answers for it, and no served
+/// certificate covers none of the asked transactions.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + TestStore)) {
+pub fn test_every_copy_of_a_tick_answers_for_what_it_carries(
+    storage: &(impl ShardChainReader + TestStore),
+) {
     let txs: Vec<TxHash> = (1u8..=3)
         .map(|seed| TxHash::from(Hash::from_bytes(&[seed; 32])))
         .collect();
@@ -1724,8 +1899,10 @@ pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + T
     assert_eq!(served.len(), 1, "the transaction its copy carries");
     assert!(served[0].covers(&txs[0]));
 
-    // A disjoint leg does not take the slot from it — the transaction
-    // only that leg covered is served from its own shard instead.
+    // A disjoint leg is a second answer, not a narrower one: the two
+    // halves of one tick each carry what the other does not, and nobody
+    // else holds a shard's own tick. Each answers for its own
+    // transaction and neither for the other's.
     let second = make_test_block_with_ecs(BlockHeight::new(2), vec![Arc::new(leg(txs[1]))]);
     commit_settled_at(
         storage,
@@ -1734,36 +1911,67 @@ pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + T
         &[],
         &empty_witness(),
     );
-    assert!(
-        storage.get_execution_certificates_for_txs(&[txs[0]])[0].covers(&txs[0]),
-        "the copy already held keeps the slot",
-    );
-    assert!(
-        storage
-            .get_execution_certificates_for_txs(&[txs[1]])
-            .is_empty(),
-        "and nothing points at a copy that lost",
-    );
+    for tx in &txs[..2] {
+        let served = storage.get_execution_certificates_for_txs(from_ref(tx));
+        assert_eq!(served.len(), 1, "one copy carries it");
+        assert!(served[0].covers(tx), "and that copy answers for it");
+    }
 
-    // The complete copy carries everything the slot held and more, so it
-    // takes it, and the index reaches every transaction of the tick.
-    let third = make_test_block_with_ecs(BlockHeight::new(3), vec![Arc::new(complete.clone())]);
+    // The same finalization committed again is the same finalization,
+    // and adds nothing.
+    let repeat = make_test_block_with_ecs(BlockHeight::new(3), vec![Arc::new(leg(txs[0]))]);
     commit_settled_at(
         storage,
-        &make_test_certified(third),
+        &make_test_certified(repeat),
         &[],
         &[],
         &empty_witness(),
     );
-    for tx in &txs {
-        let served = storage.get_execution_certificates_for_txs(from_ref(tx));
-        assert_eq!(served.len(), 1);
-        assert!(served[0].covers(tx), "the complete copy answers for it");
-    }
     assert_eq!(
-        storage.get_execution_certificates_for_txs(&txs).len(),
+        storage.get_execution_certificates_for_txs(&[txs[0]]).len(),
+        1
+    );
+
+    // A finalization carrying the whole tick answers for every
+    // transaction of it, beside the halves that still answer for theirs;
+    // nothing served covers none of what was asked.
+    let fourth = make_test_block_with_ecs(BlockHeight::new(4), vec![Arc::new(complete.clone())]);
+    commit_settled_at(
+        storage,
+        &make_test_certified(fourth),
+        &[],
+        &[],
+        &empty_witness(),
+    );
+    let served = storage.get_execution_certificates_for_txs(&txs);
+    for tx in &txs {
+        assert!(
+            served.iter().any(|cert| cert.covers(tx)),
+            "every transaction of the tick is answered",
+        );
+    }
+    assert!(
+        served
+            .iter()
+            .all(|cert| txs.iter().any(|tx| cert.covers(tx))),
+        "and nothing served covers none of the asked transactions",
+    );
+    let only_whole = storage.get_execution_certificates_for_txs(from_ref(&txs[2]));
+    assert_eq!(
+        only_whole.len(),
         1,
-        "transactions of one tick resolve to one certificate",
+        "a transaction only the whole tick carries"
+    );
+    assert!(
+        only_whole[0].is_complete(),
+        "is answered by the complete copy",
+    );
+    assert!(
+        storage
+            .get_execution_certificates_for_txs(from_ref(&txs[1]))
+            .iter()
+            .all(|cert| cert.covers(&txs[1])),
+        "and the half that never carried it does not answer for it",
     );
 }
 
@@ -1925,6 +2133,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -1949,10 +2158,739 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             provisions,
             abandonment_records,
             state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
     }
+}
+
+/// Attach `claims` to a live block, preserving everything else.
+///
+/// # Panics
+///
+/// If `claims` is past the cap a block carries.
+#[must_use]
+pub fn with_state_claims(block: Block, claims: Vec<StateClaim>) -> Block {
+    match block {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources,
+        },
+        sealed @ Block::Sealed { .. } => sealed,
+    }
+}
+
+/// The grid the frontier fixtures read marks on: wide enough that every
+/// anchor they name falls in epoch zero and no entry ages out.
+const FRONTIER_WINDOW_MS: u64 = 1_000_000;
+
+/// A block at `height` carrying one claim of `producer` at its height
+/// `read_at`, over one absent key under `producer`'s prefix, and the
+/// frontier inputs the block's shard reads off it.
+fn block_reading(height: u64, producer: ShardId, read_at: u64) -> (Block, FrontierInputs) {
+    let asked = test_key(0xD0);
+    let block = with_state_claims(
+        make_test_block(BlockHeight::new(height)),
+        vec![proven_claim(producer, read_at, &[], &[asked])],
+    );
+    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+    (block, inputs)
+}
+
+/// The table one reading of `producer` at `read_at` leaves, on the
+/// fixtures' grid.
+fn frontier_of(producer: ShardId, read_at: u64) -> ReadFrontier {
+    ReadFrontier::from_entries([(
+        producer,
+        ReadMark {
+            epoch: Epoch::new(0),
+            height: BlockHeight::new(read_at),
+        },
+    )])
+}
+
+/// Commit `block` at the store's tip through the one commit path, with
+/// `frontier` as what its claims do to the read frontier and its own
+/// certificates as what it settles. Returns the root the commit
+/// prepared beside the one it flushed.
+fn commit_raising<S: TestStore>(
+    storage: &S,
+    block: Block,
+    frontier: &FrontierInputs,
+) -> (StateRoot, StateRoot) {
+    let storage = Arc::new(storage.clone());
+    let claims: Vec<StateClaim> = block.state_claims().to_vec();
+    let (prepared, _, commit) = storage.prepare_block_commit(
+        ParentAnchor {
+            state_root: storage.state_root(),
+            height: storage.jmt_height(),
+            state: &storage.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &block.certificates()[..],
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier,
+            state_claims: &claims,
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
+        block.height(),
+    );
+    let committed = commit(
+        SyncHint::FlushNow,
+        &make_test_certified(block),
+        &empty_witness(),
+    );
+    (prepared, committed)
+}
+
+/// Shared: the read frontier is state, written by the one commit path.
+///
+/// A block carrying a claim raises its producer's entry under the root
+/// it prepares and commits; the same reading again moves nothing; the
+/// store answers for the table through `read_frontier`, and a store
+/// resumed from the same state answers the same, so a restart seeds the
+/// coordinator's copy from what the chain wrote. Both children read the
+/// table too: the left one where it stands, the right one from its copy.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_the_read_frontier_is_read_off_the_state<S>(
+    storage: &S,
+    recovered: impl Fn(ShardId) -> RecoveredState,
+) where
+    S: BoundaryStore + TestStore,
+{
+    let local = ShardId::ROOT;
+    let producer = ShardId::leaf(2, 3);
+    let table = |shard: ShardId| {
+        let held = storage.read_frontier(shard);
+        assert_eq!(
+            recovered(shard).read_frontier,
+            held,
+            "a resumed store holds the table a running one does",
+        );
+        held
+    };
+    assert!(table(local).is_empty(), "a fresh store has read nothing");
+
+    let (block, inputs) = block_reading(1, producer, 7);
+    let parent_root = storage.state_root();
+    let (prepared, committed) = commit_raising(storage, block, &inputs);
+    assert_ne!(prepared, parent_root, "a raise moves the root");
+    assert_eq!(committed, prepared, "the commit lands the root it prepared");
+    let expected = frontier_of(producer, 7);
+    assert_eq!(table(local), expected, "the store answers for the raise");
+    let (left, right) = local.children();
+    assert_eq!(table(left), expected, "the left child inherits the table");
+    assert_eq!(table(right), expected, "and the right child reads its copy");
+
+    let (again, inputs) = block_reading(2, producer, 7);
+    let (prepared, committed) = commit_raising(storage, again, &inputs);
+    assert_eq!(
+        prepared, committed,
+        "a block raising nothing prepares its parent's root"
+    );
+    assert_eq!(committed, storage.state_root());
+    assert_eq!(table(local), expected, "and leaves the table as it was");
+
+    let (higher, inputs) = block_reading(3, producer, 9);
+    let before = storage.state_root();
+    let (_, committed) = commit_raising(storage, higher, &inputs);
+    assert_ne!(committed, before, "a higher reading moves the root again");
+    assert_eq!(table(local), frontier_of(producer, 9));
+}
+
+/// A crossing whose producer sits on the left half of the root's
+/// keyspace and whose consumer sits on the right, so its record and its
+/// answers land on different children of a root split.
+const fn straddling_crossing(seed: u8) -> CrossingId {
+    CrossingId {
+        producer: Address::new([seed & 0x7F; 31], AddressClass::Component),
+        consumer: Address::new([seed | 0x80; 31], AddressClass::Component),
+        intent: IntentHash(Hash32([seed; 32])),
+        local: 0,
+        output: 0,
+    }
+}
+
+/// Two crossings the settling fixtures read: one whose record stands
+/// and whose consumer's `Taken` a claim reads present, and one whose
+/// `Taken` stands and whose record a claim reads absent.
+struct Settling {
+    retired: CrossingId,
+    answered: CrossingId,
+}
+
+impl Settling {
+    const fn new() -> Self {
+        Self {
+            retired: straddling_crossing(0x21),
+            answered: straddling_crossing(0x22),
+        }
+    }
+
+    /// The record of the crossing being retired.
+    fn record(&self) -> SubstateKey {
+        self.retired.record_key(&ProtocolHasher)
+    }
+
+    /// The `Taken` of the crossing whose record is gone.
+    fn taken(&self) -> SubstateKey {
+        self.answered.answer_key(&ProtocolHasher, Answered::Taken)
+    }
+
+    /// The two cells as state holds them before the settling block.
+    fn standing(&self) -> BTreeMap<SubstateKey, Option<Vec<u8>>> {
+        BTreeMap::from([
+            (
+                self.record(),
+                Some(
+                    self.retired
+                        .cell(
+                            VmTxHash(Hash32([0xC0; 32])),
+                            ResourceAddr::new([0xE0; 31]),
+                            500,
+                            1_000,
+                            Terms::Owed,
+                        )
+                        .to_bytes(),
+                ),
+            ),
+            (
+                self.taken(),
+                Some(
+                    self.answered
+                        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken, 1_000)
+                        .to_bytes(),
+                ),
+            ),
+        ])
+    }
+
+    /// A block at `height` carrying the claim that settles both: the
+    /// retired crossing's `Taken` read present and the answered
+    /// crossing's record read absent, each naming its crossing.
+    fn block(&self, height: u64) -> (Block, FrontierInputs) {
+        let taken = self.retired.answer_key(&ProtocolHasher, Answered::Taken);
+        let record = self.answered.record_key(&ProtocolHasher);
+        let claim = StateClaim::new(
+            Anchor {
+                shard: ShardId::leaf(2, 3),
+                height: BlockHeight::new(7),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(7_000),
+            },
+            [
+                (taken, Inclusion::Present([7; 32])),
+                (record, Inclusion::Absent),
+            ],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(taken, self.retired), (record, self.answered)]);
+        let block = with_state_claims(make_test_block(BlockHeight::new(height)), vec![claim]);
+        let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+        (block, inputs)
+    }
+}
+
+/// Shared: a block's claims settle crossings in its commit fold.
+///
+/// A record whose consumer's `Taken` a claim reads present is removed,
+/// and an answer whose record a claim reads absent is removed, under
+/// the root the one commit path prepares and commits; the same block
+/// again, with nothing left to remove, prepares its parent's root.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_settling_claim_folds_its_removals<S: TestStore>(storage: &S) {
+    let settling = Settling::new();
+    commit_writes(storage, &SettledWrites::from_absolutes(settling.standing()));
+    assert!(storage.cell(settling.record()).is_some());
+    assert!(storage.cell(settling.taken()).is_some());
+
+    let (block, inputs) = settling.block(2);
+    let parent_root = storage.state_root();
+    let (prepared, committed) = commit_raising(storage, block, &inputs);
+    assert_ne!(prepared, parent_root, "a settlement moves the root");
+    assert_eq!(committed, prepared);
+    assert!(
+        storage.cell(settling.record()).is_none(),
+        "the Taken read present retires the record",
+    );
+    assert!(
+        storage.cell(settling.taken()).is_none(),
+        "and the record read absent deletes the answer",
+    );
+
+    let (again, inputs) = settling.block(3);
+    let before = storage.state_root();
+    let (prepared, committed) = commit_raising(storage, again, &inputs);
+    assert_eq!(
+        prepared, before,
+        "nothing left to remove prepares the parent's root"
+    );
+    assert_eq!(committed, before);
+}
+
+/// Shared: a split follower on each half folds the settlements of the
+/// parent's block that land on its half, and the halves recompose the
+/// parent's root.
+///
+/// The record sits on the left half and the answer on the right, so
+/// one block settles crossings whose ends are in different children:
+/// each follower removes the key it holds, reads the other absent and
+/// writes nothing for it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_followed_halves_fold_the_settlements<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let settling = Settling::new();
+    let mut writes = StateWrites::default();
+    for (key, value) in settling.standing() {
+        writes.cells.insert(key, value);
+    }
+    let receipt = StoredReceipt::synced(
+        TxHash::from(Hash::from_bytes(b"standing")),
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let standing = block_settling(BlockHeight::new(1), vec![receipt]);
+    commit_writes(parent, &SettledWrites::from_absolutes(settling.standing()));
+    let still = FrontierInputs::still(ShardId::ROOT);
+    left.follow_block_writes(&standing, &[], &still).unwrap();
+    right.follow_block_writes(&standing, &[], &still).unwrap();
+    assert!(
+        left.cell(settling.record()).is_some(),
+        "the record is on the left"
+    );
+    assert!(
+        right.cell(settling.taken()).is_some(),
+        "the answer on the right"
+    );
+    let under = |store: &S, key: SubstateKey| {
+        store
+            .crossing_rows(&NibblePath::empty())
+            .into_iter()
+            .filter(|row| *row == key)
+            .count()
+    };
+    assert_eq!(
+        (
+            under(left, settling.record()),
+            under(right, settling.taken())
+        ),
+        (1, 1),
+        "a followed block indexes what a committed one does",
+    );
+    assert_eq!(
+        (
+            under(parent, settling.record()),
+            under(parent, settling.taken())
+        ),
+        (1, 1),
+    );
+
+    let (block, inputs) = settling.block(2);
+    let (_, parent_root) = commit_raising(parent, block.clone(), &inputs);
+    let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
+    let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert!(
+        left.cell(settling.record()).is_none(),
+        "the left half retires the record"
+    );
+    assert!(
+        right.cell(settling.taken()).is_none(),
+        "the right half deletes the answer"
+    );
+    assert_eq!(
+        (
+            under(left, settling.record()),
+            under(right, settling.taken())
+        ),
+        (0, 0),
+        "and drops the rows the fold removed",
+    );
+    assert!(
+        SplitChildRoots {
+            left: left_root,
+            right: right_root,
+        }
+        .composes_to(parent_root),
+        "the followed halves recompose the parent's root",
+    );
+}
+
+/// One owed crossing of `straddling_crossing`'s: its record on the left
+/// half of the root split, and the consumer's vault and `Taken` on the
+/// right, where the consumer's fold credits it.
+struct Owed {
+    id: CrossingId,
+}
+
+impl Owed {
+    const RESOURCE: ResourceAddr = ResourceAddr::new([0xE3; 31]);
+    const AMOUNT: u128 = 250;
+
+    /// The producer's shard, which owns the record's prefix.
+    const PRODUCER: ShardId = ShardId::leaf(1, 0);
+
+    const fn new(seed: u8) -> Self {
+        Self {
+            id: straddling_crossing(seed),
+        }
+    }
+
+    fn record(&self) -> SubstateKey {
+        self.id.record_key(&ProtocolHasher)
+    }
+
+    fn taken(&self) -> SubstateKey {
+        self.id.answer_key(&ProtocolHasher, Answered::Taken)
+    }
+
+    /// The consumer's vault for the crossing's resource: where the
+    /// credit lands.
+    fn vault(&self) -> SubstateKey {
+        self.id.owed_credit(&ProtocolHasher, Self::RESOURCE)
+    }
+
+    /// The record's value, as the producer's state holds it.
+    fn held(&self) -> Stated {
+        let cell = self.id.cell(
+            VmTxHash(Hash32([0xC2; 32])),
+            Self::RESOURCE,
+            Self::AMOUNT,
+            1_000,
+            Terms::Owed,
+        );
+        Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits"))
+    }
+
+    /// A claim at the producer's height `read_at` reading the record as
+    /// `stated`, naming its crossing.
+    fn claim(&self, read_at: u64, stated: Stated) -> StateClaim {
+        StateClaim::new(
+            Anchor {
+                shard: Self::PRODUCER,
+                height: BlockHeight::new(read_at),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(read_at * 1_000),
+            },
+            [(self.record(), stated)],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(self.record(), self.id)])
+    }
+
+    /// The fence a later block's presence of the record at `read_at`
+    /// meets, built as the voter builds it.
+    fn presence_at(&self, read_at: u64) -> ReadFence {
+        let anchor = self.claim(read_at, self.held()).anchor;
+        ReadFence {
+            presences: vec![Reading {
+                key: self.record(),
+                shard: anchor.shard,
+                mark: ReadMark::of(&anchor, EpochWindows::new(FRONTIER_WINDOW_MS)),
+            }],
+            absences: Vec::new(),
+            deletions: Vec::new(),
+        }
+    }
+}
+
+/// A block at `height` carrying `claims` and settling one receipt of
+/// `writes` where one is given, and the frontier inputs its shard reads
+/// off it.
+fn owed_block(
+    height: u64,
+    claims: Vec<StateClaim>,
+    writes: Option<StateWrites>,
+) -> (Block, FrontierInputs) {
+    let height = BlockHeight::new(height);
+    let base = writes.map_or_else(
+        || make_test_block(height),
+        |writes| push_certificate(make_test_block(height), settling(height, writes)),
+    );
+    let block = with_state_claims(base, claims);
+    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+    (block, inputs)
+}
+
+/// Writes moving `vault` by `movement` and nothing else.
+fn moving(vault: SubstateKey, movement: Movement) -> StateWrites {
+    let mut writes = StateWrites::default();
+    writes.movements.insert(vault, movement);
+    writes
+}
+
+/// What `store` holds at `key` as an amount, absent as zero.
+fn amount_at<S: SubstateStore>(store: &S, key: SubstateKey) -> u128 {
+    store
+        .cell(key)
+        .map_or(0, |bytes| read_amount(&bytes).expect("an amount cell"))
+}
+
+/// Shared: a block crediting an owed crossing lands one root on every
+/// path.
+///
+/// Build, the vote's verification and a QC-only replica all prepare the
+/// block through `parent`'s commit path; a follower holding the whole
+/// keyspace and the two halves of a split follow it. The whole follower
+/// lands the parent's root, the halves recompose it, and the credit and
+/// `Taken` land on the consumer's half alone.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_owed_credit_lands_one_root_on_every_path<S>(
+    parent: &S,
+    whole: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore,
+{
+    let owed = Owed::new(0x31);
+    let (block, inputs) = owed_block(1, vec![owed.claim(7, owed.held())], None);
+
+    let before = parent.state_root();
+    let (prepared, committed) = commit_raising(parent, block.clone(), &inputs);
+    assert_ne!(prepared, before, "the credit moves the root");
+    assert_eq!(committed, prepared);
+    assert_eq!(amount_at(parent, owed.vault()), Owed::AMOUNT);
+    assert!(
+        parent.cell(owed.taken()).is_some(),
+        "the credit writes Taken"
+    );
+
+    let whole_root = whole.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert_eq!(
+        whole_root, committed,
+        "a follower holding the consumer's prefix lands the committed root",
+    );
+    let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
+    let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert_eq!(amount_at(right, owed.vault()), Owed::AMOUNT);
+    assert!(right.cell(owed.taken()).is_some());
+    assert_eq!(
+        (amount_at(left, owed.vault()), left.cell(owed.taken())),
+        (0, None),
+        "nothing of the credit lands on the producer's half",
+    );
+    assert!(
+        SplitChildRoots {
+            left: left_root,
+            right: right_root,
+        }
+        .composes_to(committed),
+        "the followed halves recompose the committed root",
+    );
+}
+
+/// Shared: an owed credit composes with a receipt's movement on the
+/// same vault.
+///
+/// A receipt settled in the block that credits a crossing moves the
+/// consumer's vault from the parent's balance, and the credit folds
+/// after it: a debit and the credit settle to their net, and a second
+/// block's receipt credit and a second crossing's credit both land.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_owed_credit_composes_with_a_receipt_on_its_vault<S: TestStore>(storage: &S) {
+    const SEED: u128 = 1_000;
+    let first = Owed::new(0x33);
+    let second = Owed {
+        id: CrossingId {
+            local: 1,
+            ..first.id
+        },
+    };
+    assert_eq!(first.vault(), second.vault(), "one consumer, one vault");
+    let vault = first.vault();
+    commit_writes(
+        storage,
+        &SettledWrites::from_absolutes(BTreeMap::from([(
+            vault,
+            Some(encode_amount(SEED).to_vec()),
+        )])),
+    );
+
+    let debit = moving(
+        vault,
+        Movement {
+            resource: Owed::RESOURCE,
+            credit: 0,
+            debit: 30,
+            unjudged_debit: 0,
+        },
+    );
+    let (block, inputs) = owed_block(2, vec![first.claim(7, first.held())], Some(debit));
+    commit_raising(storage, block, &inputs);
+    assert_eq!(
+        amount_at(storage, vault),
+        SEED - 30 + Owed::AMOUNT,
+        "the debit and the credit settle to their net",
+    );
+
+    let credit = moving(
+        vault,
+        Movement {
+            resource: Owed::RESOURCE,
+            credit: 10,
+            debit: 0,
+            unjudged_debit: 0,
+        },
+    );
+    let (block, inputs) = owed_block(3, vec![second.claim(8, second.held())], Some(credit));
+    commit_raising(storage, block, &inputs);
+    assert_eq!(
+        amount_at(storage, vault),
+        SEED - 30 + Owed::AMOUNT + 10 + Owed::AMOUNT,
+        "a receipt credit and a second crossing's credit both land",
+    );
+}
+
+/// Shared: once the fold deletes a crossing's `Taken` on its record's
+/// absence, no presence of the record read below that absence is
+/// admissible, on the consumer's store or on the split half holding it.
+///
+/// Block 1 credits on a reading at 7 and block 2 deletes `Taken` on the
+/// record read absent at 9. The frontier each store holds refuses a
+/// presence at 7 and at 8, passes one at 10, and the vault holds one
+/// credit.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_presence_below_the_deleting_absence_is_refused<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let owed = Owed::new(0x35);
+    let blocks = [
+        owed_block(1, vec![owed.claim(7, owed.held())], None),
+        owed_block(
+            2,
+            vec![owed.claim(9, Stated::from(Inclusion::Absent))],
+            None,
+        ),
+    ];
+    for (block, inputs) in &blocks {
+        commit_raising(parent, block.clone(), inputs);
+        left.follow_block_writes(block, &[], inputs).unwrap();
+        right.follow_block_writes(block, &[], inputs).unwrap();
+    }
+    assert!(
+        parent.cell(owed.taken()).is_none(),
+        "the absence deleted Taken"
+    );
+    assert!(right.cell(owed.taken()).is_none());
+
+    let (_, consumer_half) = ShardId::ROOT.children();
+    for (name, frontier) in [
+        ("the consumer's store", parent.read_frontier(ShardId::ROOT)),
+        (
+            "the half holding the consumer",
+            right.read_frontier(consumer_half),
+        ),
+    ] {
+        for below in [7, 8] {
+            assert!(
+                owed.presence_at(below).check(&frontier).is_err(),
+                "{name} refuses a presence at {below}, below the absence at 9",
+            );
+        }
+        assert_eq!(
+            owed.presence_at(10).check(&frontier),
+            Ok(()),
+            "{name} passes a presence above the absence",
+        );
+    }
+    assert_eq!(
+        amount_at(parent, owed.vault()),
+        Owed::AMOUNT,
+        "credited once"
+    );
+    assert_eq!(amount_at(right, owed.vault()), Owed::AMOUNT);
+}
+
+/// Shared: a split observer following the parent's blocks into one half
+/// rebuilds the parent's raise from the copy on that half alone.
+///
+/// `parent` holds the whole keyspace and commits a block carrying a
+/// claim through the one commit path; `left` and `right` hold one half
+/// each and follow the same block. Each half's root moves, the two
+/// recompose the parent's, and each child reads the table the parent
+/// wrote from its own half.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_followed_halves_hold_the_read_frontier<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let producer = ShardId::leaf(2, 3);
+    let (block, inputs) = block_reading(1, producer, 7);
+    let (_, parent_root) = commit_raising(parent, block.clone(), &inputs);
+
+    let left_before = left.state_root();
+    let right_before = right.state_root();
+    let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
+    let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert_ne!(left_root, left_before, "the left half holds the table");
+    assert_ne!(right_root, right_before, "and the right half its copy");
+    assert!(
+        SplitChildRoots {
+            left: left_root,
+            right: right_root,
+        }
+        .composes_to(parent_root),
+        "the followed halves recompose the parent's root",
+    );
+
+    let expected = frontier_of(producer, 7);
+    let (left_child, right_child) = ShardId::ROOT.children();
+    assert_eq!(
+        left.read_frontier(left_child),
+        expected,
+        "the left child reads the table off its half",
+    );
+    assert_eq!(
+        right.read_frontier(right_child),
+        expected,
+        "and the right child off its own",
+    );
 }
 
 /// Shared prepare-path test: a block that carries a transaction and no
@@ -1997,8 +2935,13 @@ where
             base_reads: None,
         },
         &[],
-        &creations,
-        &[],
+        ChainWrites {
+            creations: &creations,
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
         BlockHeight::new(1),
     );
     let certified = make_test_certified(block);
@@ -2012,6 +2955,112 @@ where
         ),
         "the prepared commit serves the committed cell under its root",
     );
+}
+
+/// Shared: a transaction's committed marker refuses its re-inclusion
+/// through every view a voter reads, whatever the voter remembers.
+///
+/// The voter's rule reads the anchored view and nothing node-local, so
+/// a replica that restarted with nothing folded, one whose store begins
+/// at a snap-sync boundary, and one that has persisted nothing past a
+/// pending ancestor carrying the transaction all refuse it as a live
+/// replica does.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
+    serving: &S,
+    fresh: &S,
+    unpersisted: &S,
+) where
+    S: BoundaryStore + TestStore + VersionedStore + TreeReader + ShardChainReader + Sync + 'static,
+{
+    let tx = test_transaction(1);
+    let block = with_transactions(
+        make_test_block(BlockHeight::new(1)),
+        vec![Arc::new(Verifiable::from(tx.clone()))],
+    );
+    let creations = committed_tx_cells(ShardId::ROOT, [&tx]);
+    let rows = committed_here(ShardId::ROOT, WeightedTimestamp::ZERO, [&tx]);
+    let marker = rows[0].key;
+    let chain_over = |store: &S| {
+        Arc::new(PendingChain::new(
+            Arc::new(store.clone()),
+            ChainOrigin::ROOT,
+        ))
+    };
+
+    commit_settled_at(
+        serving,
+        &make_test_certified(block.clone()),
+        &creations,
+        &[],
+        &empty_witness(),
+    );
+    let restarted = chain_over(serving);
+    assert_eq!(
+        colliding_committed_cell(&rows, &restarted.view_at_committed_tip().snapshot()),
+        Some(marker),
+        "a restarted replica reads the marker off its store",
+    );
+
+    let leaves = boundary_leaves(serving, BlockHeight::new(1));
+    import_boundary_state(fresh, BlockHeight::new(1), &leaves, WitnessSeed::default()).unwrap();
+    let synced = chain_over(fresh);
+    assert_eq!(
+        colliding_committed_cell(&rows, &synced.view_at_committed_tip().snapshot()),
+        Some(marker),
+        "a snap-synced replica reads the marker off the imported state",
+    );
+
+    let pending = chain_over(unpersisted);
+    assert_eq!(
+        colliding_committed_cell(&rows, &pending.view_at_committed_tip().snapshot()),
+        None,
+        "nothing is committed yet",
+    );
+    let base = Arc::new(unpersisted.clone());
+    let (_, jmt_snapshot, _) = base.prepare_block_commit(
+        ParentAnchor {
+            state_root: base.state_root(),
+            height: BlockHeight::GENESIS,
+            state: &base.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &[],
+        ChainWrites {
+            creations: &creations,
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
+        BlockHeight::new(1),
+    );
+    pending.insert(
+        block.hash(),
+        ChainEntry {
+            parent_block_hash: block.header().parent_block_hash(),
+            height: BlockHeight::new(1),
+            settled_txs: Vec::new(),
+            jmt_snapshot,
+            certified_block: None,
+            certified_uncommitted: None,
+        },
+    );
+    assert_eq!(
+        colliding_committed_cell(
+            &rows,
+            &pending
+                .view_at(block.hash(), BlockHeight::new(1))
+                .snapshot()
+        ),
+        Some(marker),
+        "a pending ancestor's marker is read through the overlay",
+    );
+    assert_eq!(unpersisted.jmt_height(), BlockHeight::GENESIS);
 }
 
 /// A prepared commit whose height the tree already reached refuses when
@@ -2040,8 +3089,13 @@ where
                 base_reads: None,
             },
             &[],
-            &[],
-            &[],
+            ChainWrites {
+                creations: &[],
+                removals: &[],
+                frontier: &FrontierInputs::still(ShardId::ROOT),
+                state_claims: &[],
+                members: &MemberInputs::still(ShardId::ROOT),
+            },
             BlockHeight::new(1),
         );
         commit(
@@ -2093,8 +3147,13 @@ where
             base_reads: None,
         },
         &[],
-        &creations,
-        &[],
+        ChainWrites {
+            creations: &creations,
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
         BlockHeight::new(1),
     );
 
@@ -2480,7 +3539,7 @@ fn assert_replayed_window(storage: &(impl ShardChainReader + TestStore)) {
         "carrying the clock of the block below it, so the first block replayed keeps the carry",
     );
     assert_eq!(
-        window.compose_from,
+        window.dispatch_from,
         BlockHeight::new(2),
         "with nothing retired, composition starts where the fold does",
     );
@@ -2531,7 +3590,7 @@ fn assert_compose_floor_follows_retention(storage: &impl ShardChainReader) {
         "the fold's reach is what is owed an outcome, whatever the store retired",
     );
     assert_eq!(
-        retired.compose_from,
+        retired.dispatch_from,
         BlockHeight::new(3),
         "and composition starts at the first height whose baseline is readable",
     );
@@ -2565,6 +3624,7 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
                 committee_anchor: WeightedTimestamp::from_millis(100),
             },
             reach: stranded.routing().all_routes(),
+            escrowed: Capped::empty(),
         }],
     );
 
@@ -2860,8 +3920,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
 pub fn test_a_fresh_store_holds_nothing<S: TestStore + ShardChainReader>(storage: &S) {
     assert_eq!(storage.jmt_height(), BlockHeight::GENESIS);
     assert_eq!(storage.state_root(), StateRoot::ZERO);
-    assert_eq!(storage.committed_height(), BlockHeight::GENESIS);
-    assert!(storage.committed_hash().is_none());
+    assert_eq!(storage.committed_head(), (BlockHeight::GENESIS, None));
     assert!(storage.latest_qc().is_none());
     assert!(storage.get_block(BlockHeight::new(999)).is_none());
     assert!(

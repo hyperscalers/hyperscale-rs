@@ -128,6 +128,7 @@ pub trait FaultableCluster: Cluster {
     fn heal_all(&mut self);
 
     /// Read a cluster-wide metric counter (e.g. `("fetch_items_sent",
-    /// Some("transaction"))`), summed across hosts.
+    /// Some("transaction"))`), summed across hosts. An unlabelled read of
+    /// a labelled counter is the sum over its labels.
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64;
 }

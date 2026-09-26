@@ -12,10 +12,11 @@
 use hyperscale_jmt::{Key, NibblePath, TreeReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-    ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
+    FrontierInputs, ReadFrontier, ShardId, ShardWitnessPayload, StateRoot, SubstateKey,
+    SubstateLeaf,
 };
 
-use crate::Substates;
+use crate::{MemberIndex, Substates};
 
 /// The default number of boundary pins a backend retains before
 /// evicting the oldest.
@@ -403,6 +404,7 @@ pub trait BoundaryStore {
         &self,
         block: &Block,
         creations: &[(SubstateKey, Vec<u8>)],
+        frontier: &FrontierInputs,
     ) -> Result<StateRoot, String>;
 
     /// Install a reshape successor's derived `genesis` as this store's
@@ -426,23 +428,23 @@ pub trait BoundaryStore {
     /// store's version line doesn't carry it.
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64>;
 
-    /// Every escrow record `shard`'s slice of the committed state holds,
-    /// with its bytes.
+    /// The persisted crossing index's rows under `under`: the keys of the
+    /// committed crossing records and answers there, ascending.
     ///
-    /// Derived on demand rather than indexed, because the state is the
-    /// authority and the one caller asks once: a reshape successor whose
-    /// adoption just filled its trie, and whose ledger begins empty
-    /// while the value its predecessors escrowed rides the prefix in.
-    /// Nothing else names those records — the entry that would is the
-    /// predecessor's ledger's, a fold over a chain the successor never
-    /// replays, and the cell is outside every sweep's reach.
-    ///
-    /// Bounded by the shard's own prefix rather than run over the store:
-    /// a split child's store is a clone of its parent's and holds the
-    /// sibling's leaves too, and an obligation the sibling owns is not
-    /// this seat's to take. The keyspace is owner-major, so the prefix is
-    /// a contiguous run and the scan is that run and nothing else.
-    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)>;
+    /// Persisted rows only; an unpersisted ancestor's writes are the
+    /// overlay's to add.
+    fn crossing_rows(&self, under: &NibblePath) -> Vec<SubstateKey>;
+
+    /// The read frontier `shard`'s slice of the committed state holds:
+    /// [`load_read_frontier`](crate::load_read_frontier) over the store,
+    /// read the same way however the store was reached, since the table
+    /// is state and the state is what every seat imports.
+    fn read_frontier(&self, shard: ShardId) -> ReadFrontier;
+
+    /// The tick membership `shard`'s slice of the committed state holds:
+    /// [`MemberIndex::load`](crate::MemberIndex::load) over the store,
+    /// read the same way however the store was reached.
+    fn member_index(&self, shard: ShardId) -> MemberIndex;
 }
 
 #[cfg(test)]

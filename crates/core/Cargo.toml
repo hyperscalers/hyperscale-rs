@@ -11,6 +11,7 @@ hyperscale-engine.workspace = true
 hyperscale-network.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
+hyperscale-vm-effects.workspace = true
 strum.workspace = true
 
 [lints]

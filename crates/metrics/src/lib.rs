@@ -255,6 +255,34 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// is put again at a newer header.
     fn record_reclaim_probe_pending(&self) {}
 
+    /// The bytes a committed block's state claims weigh between them,
+    /// proofs included, against the section's budget.
+    fn record_state_claims_weight(&self, bytes: usize) {}
+
+    /// A consumer asking a producer's chain for a crossing record it
+    /// waits on: the fallback read a push did not make unnecessary.
+    fn record_record_ask(&self) {}
+
+    /// A crossing question asked past its transaction's deadline, where
+    /// a push did not answer it: by the record's producer (`"producer"`)
+    /// or by the answer's consumer (`"consumer"`).
+    fn record_crossing_fallback_ask(&self, asker: &str) {
+        let _ = asker;
+    }
+
+    /// A fenced claim, one carrying a record presence (`"record"`) or a
+    /// deleting absence (`"removed"`), either carried by a committed
+    /// block or dropped from what a validator held to offer because the
+    /// block raised its producer's read frontier above it.
+    fn record_fenced_claim(&self, reading: &str, carried: bool) {
+        let _ = (reading, carried);
+    }
+
+    /// A pushed crossing reading dropped on the consumer's side, by the
+    /// check that dropped it: at ingress, at the anchor, or at the
+    /// park. Each drop is one the fallback read has to make up.
+    fn record_crossing_push_dropped(&self, reason: &str) {}
+
     /// A fetch response the requester's own check refused, by fetch kind
     /// and the check that refused it.
     ///
@@ -762,6 +790,37 @@ pub fn record_reclaim_admitted(from_leaf: bool) {
 #[inline]
 pub fn record_reclaim_probe_pending() {
     recorder().record_reclaim_probe_pending();
+}
+
+/// Record the bytes a committed block's state claims weigh.
+#[inline]
+pub fn record_state_claims_weight(bytes: usize) {
+    recorder().record_state_claims_weight(bytes);
+}
+
+/// Record a consumer's ask for a crossing record.
+#[inline]
+pub fn record_record_ask() {
+    recorder().record_record_ask();
+}
+
+/// Record a crossing question asked past its deadline, by `asker`.
+#[inline]
+pub fn record_crossing_fallback_ask(asker: &str) {
+    recorder().record_crossing_fallback_ask(asker);
+}
+
+/// Record a fenced claim carried by a block or refused by the read
+/// frontier, by what it read.
+#[inline]
+pub fn record_fenced_claim(reading: &str, carried: bool) {
+    recorder().record_fenced_claim(reading, carried);
+}
+
+/// Record a pushed crossing reading dropped by the consumer, by reason.
+#[inline]
+pub fn record_crossing_push_dropped(reason: &str) {
+    recorder().record_crossing_push_dropped(reason);
 }
 
 /// Record a fetch response refused by the requester's own check.

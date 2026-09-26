@@ -17,10 +17,7 @@
 //! variants retain `(source_shard, block_height)` because that scope IS
 //! the fetch key (no id-set to enumerate).
 
-use hyperscale_types::{
-    Anchor, MessageClass, PredecessorTerminal, ShardId, SubstateKey, TerminalEvidence, TxHash,
-    ValidatorId,
-};
+use hyperscale_types::{Anchor, MessageClass, ShardId, SubstateKey, TerminalEvidence, ValidatorId};
 
 use crate::FetchIds;
 
@@ -63,50 +60,25 @@ pub enum FetchRequest {
         /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
     },
-    /// Committed-transaction membership query against a chain this one
-    /// succeeds. Routing shard is `predecessor.shard`, whose committee
-    /// still answers while any retained window carries it. `preferred`
-    /// is `None`: every member of the terminal committee holds the same
-    /// answer, so health-weighted rotation is what moves off a peer that
-    /// serves `not_found` or an unusable proof.
+    /// A split's right child asking its parent's terminal state which
+    /// committed markers it holds. Routing shard is `terminal.shard`,
+    /// whose committee still answers while any retained window carries
+    /// it. `preferred` is `None`: every member of the terminal committee
+    /// holds the same state, so health-weighted rotation is what moves
+    /// off a peer that serves `not_found` or an unusable proof.
     ///
-    /// The predecessor rides whole rather than as a shard id. Its
-    /// terminal names the window the server reconstructs, and its
-    /// `committed_txs_root` is what an absence proof is checked against
-    /// before any answer reaches the coordinator.
-    CommittedTxs {
-        /// The chain being queried and the terminal to resolve against.
-        predecessor: PredecessorTerminal,
-        /// Transactions whose membership in that chain's committed set
-        /// is outstanding.
-        tx_hashes: Vec<TxHash>,
-        /// Always `None` for this variant; see variant-level doc.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
-    /// A state proof this shard's own committee relays, for a cell a
-    /// block claims that this validator has not proven for itself.
-    ///
-    /// Routing shard is the local one: what is wanted is not a
-    /// counterpart's state but a peer's copy of a proof of it. Every
-    /// member probes, so most hold the bytes already, and the proposer
-    /// of the block making the claim certainly does. `preferred` is
-    /// `None` for that reason — any member that probed the anchor
-    /// answers, and health-weighted rotation is what moves off one that
-    /// did not.
-    ///
-    /// Distinct from [`Self::StateProof`] rather than a routing flag on
-    /// it, because a fetch is keyed by its ids: the two ask different
-    /// committees the same `(anchor, key)`, and one slot would hold
-    /// whichever asked first and never rotate to the other.
-    RelayedStateProof {
-        /// The commit-proven state the proof reconstructs.
-        anchor: Anchor,
-        /// The keys whose presence or absence under it is wanted.
+    /// Carries the whole wanted set, re-derived on every scan. The node
+    /// diffs it against what the state-proof fetch holds under this
+    /// terminal, so a key that drops out of the set here — its
+    /// transaction gone from the pool, or the rule retiring as the chain
+    /// outlives its origin — is what releases its slot. An empty set is
+    /// how the last one retires.
+    PrecutProofs {
+        /// The parent's terminal, whose state root every proof is
+        /// checked against.
+        terminal: Anchor,
+        /// The marker keys still owed an answer.
         keys: Vec<SubstateKey>,
-        /// Always the local shard for this variant.
-        shard: ShardId,
         /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.

@@ -162,6 +162,20 @@ impl ProvenAnchors {
             .expect("proven anchors lock poisoned")
             .retain(|_, anchor| anchor.ts >= floor);
     }
+
+    /// Forget every anchor `fenced` names: a height a shard's recovery
+    /// has fenced is one no block admits a claim at, so a composer
+    /// offering a claim there would offer what every voter refuses.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::record`].
+    pub fn forget_fenced(&self, fenced: impl Fn(ShardId, BlockHeight) -> bool) {
+        self.by_height
+            .write()
+            .expect("proven anchors lock poisoned")
+            .retain(|_, anchor| !fenced(anchor.shard, anchor.height));
+    }
 }
 
 #[cfg(test)]
@@ -271,5 +285,23 @@ mod tests {
         assert_eq!(anchors.at(shard, BlockHeight::new(1)), None);
         assert!(anchors.at(shard, BlockHeight::new(2)).is_some());
         assert_eq!(anchors.len(), 1);
+    }
+
+    #[test]
+    fn a_fenced_anchor_is_forgotten_and_the_rest_stand() {
+        let anchors = ProvenAnchors::new();
+        let shard = ShardId::leaf(1, 0);
+        for height in [8, 9, 10] {
+            anchors.record(Anchor {
+                shard,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(height * 1_000),
+            });
+        }
+        anchors.forget_fenced(|s, height| s == shard && height >= BlockHeight::new(9));
+        assert!(anchors.at(shard, BlockHeight::new(8)).is_some());
+        assert!(anchors.at(shard, BlockHeight::new(9)).is_none());
+        assert!(anchors.at(shard, BlockHeight::new(10)).is_none());
     }
 }

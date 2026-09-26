@@ -3,6 +3,8 @@
 //! - [`block`]: [`Block`] (the Live/Sealed enum).
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
 //! - [`certified_header`]: [`CertifiedBlockHeader`] cross-shard trust attestation.
+//! - [`engagement`]: [`Engagement`](engagement::Engagement), a transaction
+//!   a block's provisions name, which the committed engagement tier folds.
 //! - [`evidence`]: [`ShardVoteEquivocation`] self-proving double-vote evidence.
 //! - [`demands`]: what a block [`Demands`](demands::Demands) be checked
 //!   before a vote, and how one [`CheckOutcome`](demands::CheckOutcome) ends.
@@ -15,11 +17,15 @@
 //!   emission by.
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
+//! - [`read_frontier`]: [`ReadFrontier`](read_frontier::ReadFrontier), how far
+//!   along each producer this shard has read, committed as state.
 //! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
 //! - [`storage_commit`]: type-erased [`PreparedCommit`](storage_commit::PreparedCommit)
 //!   closure, [`SyncHint`](storage_commit::SyncHint), and
 //!   [`BeaconWitnessCommit`](storage_commit::BeaconWitnessCommit) payload
 //!   threaded through shard block commits.
+//! - [`tick_manifest`]: [`TickLine`](tick_manifest::TickLine), what a
+//!   block's tick holds and what it lets go, named by the proposer.
 //! - [`timeout`]: [`Timeout`] view-change share that drives the pacemaker.
 //! - [`vote`]: [`BlockVote`] shard consensus vote.
 //! - [`vote_registers`]: snapshot type for the two monotone safe-vote
@@ -37,6 +43,7 @@ pub mod chain_origin;
 pub mod commit_proof;
 pub mod counterpart_mirror;
 pub mod demands;
+pub mod engagement;
 pub mod evidence;
 pub mod fork_fence;
 pub mod header;
@@ -45,13 +52,14 @@ pub mod limits;
 pub mod load;
 pub mod manifest;
 pub mod proven_anchors;
-pub mod proven_cells;
 pub mod quorum_certificate;
+pub mod read_frontier;
 pub mod reshape;
 pub mod roots;
 pub mod state_claim;
 pub mod storage_commit;
 pub mod sweep;
+pub mod tick_manifest;
 pub mod timeout;
 pub mod vote;
 pub mod vote_registers;

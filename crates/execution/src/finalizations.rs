@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use hyperscale_types::{
-    BloomFilter, DEFAULT_FPR, Finalization, FinalizationHash, TickId, TxHash, Verifiable,
+    BloomFilter, DEFAULT_FPR, Finalization, FinalizationHash, TickHalf, TickId, TxHash, Verifiable,
 };
 
 /// A tracked finalization's place in the store: its tick, which orders it
@@ -128,6 +128,23 @@ impl FinalizationStore {
             if inner.by_tx.get(&tx_hash) == Some(&slot) {
                 inner.by_tx.remove(&tx_hash);
             }
+        }
+    }
+
+    /// Remove `tick_id`'s `half`, if held.
+    pub(crate) fn remove_half(&self, tick_id: &TickId, half: TickHalf) {
+        let hashes: Vec<FinalizationHash> = self
+            .inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finalizations
+            .range((*tick_id, FinalizationHash::ZERO)..)
+            .take_while(|((tick, _), _)| tick == tick_id)
+            .filter(|(_, fw)| fw.half() == half)
+            .map(|((_, hash), _)| *hash)
+            .collect();
+        for hash in hashes {
+            self.remove(&hash);
         }
     }
 

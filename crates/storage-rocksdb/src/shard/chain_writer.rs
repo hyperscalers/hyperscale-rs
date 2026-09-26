@@ -6,11 +6,12 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, settled_writes_at,
+    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, crossing_settlements,
+    member_writes, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
-    StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
+    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 use rocksdb::WriteBatch;
 
@@ -25,24 +26,44 @@ impl ShardChainWriter for RocksDbShardStorage {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
-        creations: &[(SubstateKey, Vec<u8>)],
-        removals: &[SubstateKey],
+        chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
+        let ChainWrites {
+            creations,
+            removals,
+            frontier,
+            state_claims,
+            members,
+        } = chain;
         // Everything the ticks carried, for storage; only what they
         // decided reaches state.
         let receipts: Vec<&StoredReceipt> = finalizations
             .iter()
             .flat_map(|fw| fw.receipts().iter())
             .collect();
+        // The chain's own protocol families: the read frontier and tick
+        // membership, each read off the parent state it advances.
+        let mut frontier = read_frontier_writes(parent.state, frontier);
+        frontier.extend(member_writes(parent.state, members));
+        // What the claims settle against the parent state, read once
+        // for the no-op test below; the fold reads it again beside the
+        // receipts, whose writes it defers to.
+        let settled = crossing_settlements(state_claims, &SettledWrites::default(), parent.state);
         // Nothing to write → state root is unchanged. Build a no-op
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet (e.g.,
         // proposer just exited sync and BlockPersisted hasn't fired).
-        // A block's sweep and its committed cells are writes like any
-        // other, so a block that removes or creates something is not one
-        // of these however few receipts it carries.
-        if receipts.is_empty() && creations.is_empty() && removals.is_empty() {
+        // A block's sweep, its committed cells and its read frontier are
+        // writes like any other, so a block that removes, creates or
+        // raises something is not one of these however few receipts it
+        // carries.
+        if receipts.is_empty()
+            && creations.is_empty()
+            && removals.is_empty()
+            && frontier.is_empty()
+            && settled.is_empty()
+        {
             let jmt_snapshot = Arc::new(noop_jmt_snapshot(
                 &SnapshotTreeStore::new(&self.db, self.root_path.clone()),
                 parent.pending,
@@ -79,6 +100,8 @@ impl ShardChainWriter for RocksDbShardStorage {
             parent.height,
             creations,
             removals,
+            frontier,
+            state_claims,
         );
 
         let (computed_root, collected) = if parent.pending.is_empty() {
@@ -169,10 +192,9 @@ fn build_prepared_commit(
             );
             storage.append_beacon_witnesses_to_batch(&mut write_batch, witness);
 
-            // The block's execution certificates and its sweep-index
-            // delta append inside `try_apply_prepared_commit`, which
-            // holds `commit_lock` across the reads their writes depend
-            // on.
+            // The block's sweep-index delta appends inside
+            // `try_apply_prepared_commit`, which holds `commit_lock`
+            // across the reads its write depends on.
             let applied = storage.try_apply_prepared_commit(
                 write_batch,
                 &sweep_rows,

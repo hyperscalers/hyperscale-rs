@@ -44,24 +44,30 @@ pub use shard::boundary::{
     Vintage, WitnessSeed, adopt_plan, holds_state,
 };
 pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
-pub use shard::chain_writer::{ParentAnchor, ShardChainWriter};
+pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
+pub use shard::crossings::{crossing_settlements, live_record, record_arrivals};
 pub use shard::dedup_window::{DedupWindow, FeeHold};
-pub use shard::derived::{LeafRows, index_leaf};
+pub use shard::derived::{Indexed, LeafRows, RowChange, index_leaf};
 pub use shard::genesis::GenesisCommit;
+pub use shard::members::{
+    MemberIndex, MemberInputs, MemberRow, RowState, SettledHalf, TickRow, colliding_member_row,
+    member_order, member_writes, without_colliding_member_rows,
+};
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
     BaseReadCache, ChainEntry, PendingChain, SubstateView, TerminalWindow,
 };
+pub use shard::read_frontier::{load_read_frontier, read_frontier_writes, with_frontier};
 pub use shard::recovered_state::{RECENT_HEADER_REPLAY, RecoveredState, recent_headers};
 pub use shard::retention::{Retired, retire_dated};
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
-    SweepIndex, SweepRow, SweepRows, committed_tx_cell_key, committed_tx_cells,
-    followed_block_writes, is_record_cell, merge_sweep_overlay, sweep_for_block, sweep_through,
-    sweepable_expiry, with_sweep,
+    CommittedHere, SweepIndex, SweepRow, SweepRows, colliding_committed_cell, committed_here,
+    committed_tx_cell_key, committed_tx_cells, creations_of, followed_block_writes,
+    merge_sweep_overlay, sweep_for_block, sweep_through, sweepable_expiry, with_sweep,
+    without_colliding_committed_cells,
 };
-pub use shard::tick_certs::{covers_strictly_more, widest_tick_copies};
 pub use shard::tick_chain::{
     ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,
 };

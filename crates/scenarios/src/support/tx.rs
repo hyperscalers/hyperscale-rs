@@ -27,7 +27,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Composed, Constraint, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree, ManifestGraph,
-    ResourceKind, SignedIntent, SlotId, Totality, Value, child_key, issued_resource, package_hash,
+    ResourceKind, SignedIntent, SlotId, Value, child_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{
@@ -239,12 +239,12 @@ pub struct HaltStraddlerSetup {
     /// Genesis accounts: the stable-band ballast plus every probe leg's
     /// payer and recipient.
     pub accounts: Vec<(PrincipalAddr, u128)>,
-    /// Probe transfers in submission order, [`HALT_STRADDLER_BATCH`] per
-    /// batch: `(payer key, payer account, recipient account)`.
-    pub straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
-    /// Transfers submitted after the recovery record clears, one per
+    /// Probe payments in submission order, [`HALT_STRADDLER_BATCH`] per
+    /// batch.
+    pub straddlers: Vec<PaymentLeg>,
+    /// Payments submitted after the recovery record clears, one per
     /// direction — the recovered shard's cross-shard rail must serve both.
-    pub(crate) post_recovery: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+    pub(crate) post_recovery: Vec<PaymentLeg>,
 }
 
 /// Ballast accounts per child of the root split, for the halt-recovery
@@ -291,7 +291,7 @@ pub fn halt_straddler_setup() -> HaltStraddlerSetup {
     ballast(surviving, 2, HALT_RECOVERY_BULK, &mut accounts);
 
     let mut taken = Vec::new();
-    let mut leg = |from, to| transfer_leg(from, to, 2, &mut taken, &mut accounts);
+    let mut leg = |from, to| payment_leg(from, to, 2, &mut taken, &mut accounts);
 
     let mut straddlers = Vec::new();
     for _ in 0..3 {
@@ -320,9 +320,9 @@ pub struct MergeStraddlerSetup {
     /// and the merging pair left under it, plus the straddler payers in
     /// the survivor and their recipients in the merging left child.
     pub accounts: Vec<(PrincipalAddr, u128)>,
-    /// Straddler transfers: `(payer key, payer account in the survivor,
-    /// recipient in the merging left child)`.
-    pub(crate) straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+    /// Straddler payments: payers in the survivor, recipients in the
+    /// merging left child.
+    pub(crate) straddlers: Vec<PaymentLeg>,
 }
 
 /// The genesis funding and straddler transfers for the split-straddler scenario.
@@ -334,9 +334,9 @@ pub struct SplitStraddlerSetup {
     /// crosses the voted-down threshold, plus the straddler payers in the
     /// survivor and their recipients in the splitter.
     pub accounts: Vec<(PrincipalAddr, u128)>,
-    /// Straddler transfers: `(payer key, payer account in survivor, recipient in
-    /// splitter)`.
-    pub(crate) straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+    /// Straddler payments: payers in the survivor, recipients in the
+    /// splitter.
+    pub(crate) straddlers: Vec<PaymentLeg>,
 }
 
 /// Push `count` ballast accounts routing to `shard` under a
@@ -557,7 +557,7 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
     let mut taken = Vec::new();
     let straddlers = (0..STRADDLER_COUNT)
         .map(|_| {
-            transfer_leg(
+            payment_leg(
                 STRADDLER_SURVIVOR,
                 STRADDLER_SPLITTER,
                 2,
@@ -585,7 +585,7 @@ pub fn split_issuer_straddler_setup() -> SplitStraddlerSetup {
     let mut taken = Vec::new();
     let straddlers = (0..STRADDLER_COUNT)
         .map(|_| {
-            transfer_leg(
+            payment_leg(
                 STRADDLER_SPLITTER,
                 STRADDLER_SURVIVOR,
                 2,
@@ -630,18 +630,22 @@ fn merge_survivor_ballast(packages: &GenesisPackages, accounts: &mut Vec<(Princi
 /// tick names the shard that terminates at the merge.
 #[must_use]
 pub fn merge_straddler_setup() -> MergeStraddlerSetup {
+    merge_setup(&mut Vec::new())
+}
+
+/// The merge-straddler genesis, grinding its accounts past `taken`.
+fn merge_setup(taken: &mut Vec<u8>) -> MergeStraddlerSetup {
     let num_shards = 4;
     let mut accounts = Vec::new();
     merge_survivor_ballast(&GenesisPackages::protocol(), &mut accounts);
 
-    let mut taken = Vec::new();
     let straddlers = (0..MERGE_STRADDLER_COUNT)
         .map(|_| {
-            transfer_leg(
+            payment_leg(
                 MERGE_STRADDLER_SURVIVOR,
                 MERGE_STRADDLER_LEFT,
                 num_shards,
-                &mut taken,
+                taken,
                 &mut accounts,
             )
         })
@@ -649,6 +653,36 @@ pub fn merge_straddler_setup() -> MergeStraddlerSetup {
     MergeStraddlerSetup {
         accounts,
         straddlers,
+    }
+}
+
+/// The merge-straddler genesis and one more transfer, whose payer sits on
+/// one merging child and whose recipient on the other: a crossing the
+/// merge converges onto one shard.
+pub struct MergeConvergenceSetup {
+    /// Genesis accounts: the merge-straddler set and the transfer's two.
+    pub accounts: Vec<(PrincipalAddr, u128)>,
+    /// The payer's key, the payer on [`MERGE_STRADDLER_LEFT`] and the
+    /// recipient on [`MERGE_STRADDLER_RIGHT`].
+    pub(crate) converging: (Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
+}
+
+/// Build the merge-convergence genesis: [`merge_straddler_setup`]'s,
+/// with one funded transfer across the merging pair.
+#[must_use]
+pub fn merge_convergence_setup() -> MergeConvergenceSetup {
+    let mut taken = Vec::new();
+    let MergeStraddlerSetup { mut accounts, .. } = merge_setup(&mut taken);
+    let converging = transfer_leg(
+        MERGE_STRADDLER_LEFT,
+        MERGE_STRADDLER_RIGHT,
+        4,
+        &mut taken,
+        &mut accounts,
+    );
+    MergeConvergenceSetup {
+        accounts,
+        converging,
     }
 }
 
@@ -874,9 +908,21 @@ pub fn livelock_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// the payment itself.
 #[must_use]
 pub fn build_probe_transfer_tx(validity: TimestampRange) -> Transaction {
-    let (payer, from) = sender(0);
+    build_probe_transfer_tx_from(0, validity)
+}
+
+/// A probe paid by `sender(index)`, which is where it commits: `0`
+/// routes to the right half of a two-way split and [`LEFT_PROBE_SENDER`]
+/// to the left.
+#[must_use]
+pub fn build_probe_transfer_tx_from(index: u8, validity: TimestampRange) -> Transaction {
+    let (payer, from) = sender(index);
     build_transfer_tx(&payer, from, recipient(0), PROBE_PAYMENT, validity)
 }
+
+/// The probe sender whose account routes to the left half of a two-way
+/// split. [`probe_train_genesis_accounts`] funds it for one probe.
+pub const LEFT_PROBE_SENDER: u8 = 1;
 
 /// What [`build_probe_transfer_tx`] moves: enough to be a real credit,
 /// far under the sender's genesis funding so a scenario can submit
@@ -894,7 +940,11 @@ pub(crate) const PROBE_PAYMENT: u128 = 100;
 #[must_use]
 pub fn probe_train_genesis_accounts(count: u32) -> Vec<(PrincipalAddr, u128)> {
     let funded = u128::from(count) * (MAX_FEE + PROBE_PAYMENT) * 2;
-    vec![(sender(0).1, funded), (recipient(0), 10)]
+    vec![
+        (sender(0).1, funded),
+        (sender(LEFT_PROBE_SENDER).1, (MAX_FEE + PROBE_PAYMENT) * 2),
+        (recipient(0), 10),
+    ]
 }
 
 /// `count` accounts routing to `shard` under a `num_shards`-wide trie,
@@ -1035,6 +1085,52 @@ pub(crate) fn ml_dsa_account_routing_to(
 #[must_use]
 pub(crate) fn account_shard(address: impl Into<Address>, num_shards: u64) -> ShardId {
     ShardTrie::uniform_from_count(num_shards).shard_for_prefix(address)
+}
+
+/// A straddler leg both of whose ends sign: `(payer key, payer, recipient
+/// key, recipient)`. The recipient's key is what lets it sign the payment
+/// as a request, so the transaction acts as it and runs whole.
+pub type PaymentLeg = (
+    Ed25519PrivateKey,
+    PrincipalAddr,
+    Ed25519PrivateKey,
+    PrincipalAddr,
+);
+
+/// The payment `leg` makes of `amount`, standing for `validity`: the
+/// recipient's signed request for it, composed by the payer.
+///
+/// The transaction acts as the recipient, so it runs whole and both
+/// shards commit it.
+#[must_use]
+pub fn build_leg_payment_tx(
+    (payer_key, payer, recipient_key, recipient): &PaymentLeg,
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    build_composed_tx(
+        payer_key,
+        *payer,
+        recipient_key,
+        &payment_request_for(*recipient, amount, validity),
+        amount,
+        validity,
+    )
+}
+
+/// [`transfer_leg`], keeping the recipient's key.
+fn payment_leg(
+    from_shard: ShardId,
+    to_shard: ShardId,
+    num_shards: u64,
+    taken: &mut Vec<u8>,
+    accounts: &mut Vec<(PrincipalAddr, u128)>,
+) -> PaymentLeg {
+    let (payer_key, payer) = account_routing_to_n(from_shard, num_shards, taken);
+    let (recipient_key, recipient) = account_routing_to_n(to_shard, num_shards, taken);
+    accounts.push((payer, 10_000));
+    accounts.push((recipient, 10));
+    (payer_key, payer, recipient_key, recipient)
 }
 
 /// Grind a straddler leg: a payer in `from_shard` and a recipient in
@@ -1843,13 +1939,6 @@ pub(crate) fn storm_artifact(nonce: u16) -> Vec<u8> {
         })
         .expect("a name the package does not already hold");
     metadata.events.push(named);
-    // The mark is granted to protocol code seeded at genesis, and this
-    // artifact publishes through the ordinary path.
-    for signature in metadata.methods.values_mut() {
-        if signature.totality == Totality::Total {
-            signature.totality = Totality::Infallible;
-        }
-    }
     attach_metadata(STAKING_MODULE, &metadata).expect("storm metadata attaches")
 }
 

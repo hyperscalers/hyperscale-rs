@@ -37,11 +37,11 @@ mod topology;
 mod transaction;
 
 pub use beacon::{
-    BEACON_SIGNER_COUNT, BeaconBlock, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
-    BeaconProposal, BeaconProposalEquivocationMismatch, BeaconProposalVerifyContext,
-    BeaconProposalVerifyError, BeaconState, BeaconWitnessEvent, CandidateBeaconBlock,
-    CandidateBeaconBlockVerifyError, CandidateVerifyContext, CertifiedBeaconBlock,
-    CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
+    Admission, BEACON_SIGNER_COUNT, BeaconBlock, BeaconCert, BeaconChainConfig,
+    BeaconGenesisConfig, BeaconProposal, BeaconProposalEquivocationMismatch,
+    BeaconProposalVerifyContext, BeaconProposalVerifyError, BeaconState, BeaconWitnessEvent,
+    CandidateBeaconBlock, CandidateBeaconBlockVerifyError, CandidateVerifyContext,
+    CertifiedBeaconBlock, CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
     CertifiedBeaconBlockVerifyError, CohortSeat, CommitteeTransition, CompletedRecovery,
     EMISSION_PARTICIPATION_WEIGHT, EMISSION_STORAGE_WEIGHT, EMISSION_WORK_WEIGHT,
     EMISSIONS_PER_EPOCH, EPOCHS_PER_YEAR, GenesisPool, GenesisValidator, HALT_THRESHOLD_EPOCHS,
@@ -77,6 +77,7 @@ pub use beacon::{
 };
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
 pub use crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
+pub use execution::arrival::EscrowedValue;
 pub use execution::computation::{tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError, Spoken,
@@ -86,7 +87,7 @@ pub use execution::finalization::{
     MAX_EXECUTION_CERTIFICATES_PER_TICK, ReceiptValidationError, Settles, TickHalf,
     refused_transactions, settles,
 };
-pub use execution::outcome::{EscrowedValue, ExecutionOutcome, Role, TxOutcome};
+pub use execution::outcome::{ExecutionOutcome, Role, TxOutcome};
 pub use execution::receipt_tree::{
     compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
 };
@@ -102,11 +103,11 @@ pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, AccountSigner, Address, AddressClass, BASIS_POINTS, CallTarget,
     CollectionId, ComponentAddr, Compose, DeclaredWork, EntryKey, EntryLeaf, FiveWay,
-    InvalidAddress, LEAF_KEY_BYTES, LocalKey, MAX_CELL_VALUE_LEN, MAX_GAS_LIMIT, Mode, ModeKind,
-    Movement, NativeAddr, NotCallable, OverDebit, PackageAddr, Presence, PriceBounds, PriceTable,
-    PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES, SWEEP_BUCKET_SHIFT, SchemeId, SettledCells,
-    SettledEntries, SettledWrites, StateWrites, SubstateKey, SweepBucket, Utilization, amount_cell,
-    compatible, encode_amount, entry_leaf_key, read_amount,
+    InvalidAddress, LEAF_KEY_BYTES, LegRole, LocalKey, MAX_CELL_VALUE_LEN, MAX_GAS_LIMIT, Mode,
+    ModeKind, Movement, NativeAddr, NotCallable, OverDebit, PackageAddr, Presence, PriceBounds,
+    PriceTable, PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES, SWEEP_BUCKET_SHIFT, SchemeId,
+    SettledCells, SettledEntries, SettledWrites, StateWrites, SubstateKey, SweepBucket,
+    Utilization, amount_cell, compatible, encode_amount, entry_leaf_key, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
@@ -116,9 +117,10 @@ pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
     AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
-    CommittedTxsRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
+    EngagementRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
-    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
+    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TickManifestRoot, TransactionRoot,
+    TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex,
@@ -146,17 +148,19 @@ pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
 pub use shard::abandonment::{
-    AbandonmentRecord, AbortCharge, CommitWindow, CommittedAt, Resolutions, UnsettledTx,
+    AbandonmentRecord, AbortCharge, CommitWindow, CommittedAt, Resolutions, UnclaimedCrossing,
+    UnsettledTx,
 };
 pub use shard::anchor::Anchor;
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
-pub use shard::chain_origin::{ChainOrigin, PredecessorTerminal};
+pub use shard::chain_origin::ChainOrigin;
 pub use shard::commit_proof::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
 };
 pub use shard::counterpart_mirror::CounterpartMirror;
 pub use shard::demands::{CheckOutcome, DeferOn, Demands, VerificationKind};
+pub use shard::engagement::{Engagement, Engagements};
 pub use shard::evidence::{
     ShardForkProof, ShardForkProofVerifyError, ShardVoteEquivocation, ShardVoteEquivocationContext,
     ShardVoteEquivocationVerifyError, verify_shard_vote_equivocation,
@@ -168,36 +172,44 @@ pub use shard::header::{
 };
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
-    ABANDONMENT_RECORD_BYTES, BLOCK_CAPS, MAX_BLOCK_COMPUTE, MAX_BLOCK_FOOTPRINT,
-    MAX_BLOCK_READ_BYTES, MAX_BLOCK_RETENTION_BYTES, MAX_BLOCK_WRITE_BYTES, MAX_CELLS_PER_QUERY,
-    MAX_CELLS_RESPONSE_BYTES, MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
+    ABANDONMENT_RECORD_BYTES, BLOCK_CAPS, ESCROWED_RECORD_BYTES, MAX_BLOCK_COMPUTE,
+    MAX_BLOCK_FOOTPRINT, MAX_BLOCK_READ_BYTES, MAX_BLOCK_RETENTION_BYTES, MAX_BLOCK_WRITE_BYTES,
+    MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
+    MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
+    MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
-    TX_CAPS, UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction, drain_admits_block,
-    evidence_admits_block, sweep_admits_block,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES, MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES,
+    MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS,
+    MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
+    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TICK_HOLD_BYTES,
+    TICK_LINE_BYTES, TICK_REACH_BYTES, TX_CAPS, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES,
+    budget_admits_block, caps_admit_transaction, drain_admits_block, evidence_admits_block,
+    state_claims_admit_block, sweep_admits_block, tick_manifest_admits_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad};
 pub use shard::manifest::{BlockManifest, BlockMetadata};
 pub use shard::proven_anchors::ProvenAnchors;
-pub use shard::proven_cells::ProvenCells;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
+pub use shard::read_frontier::{
+    FrontierInputs, FrontierRefusal, ReadFence, ReadFrontier, ReadMark, Reading, Refused,
+};
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
-    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CommittedTxAbsence, LeafRoot,
+    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CommittingShards, LeafRoot,
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    REVEAL_CHAIN_DOMAIN_TAG, RootMismatch, SplitChildRoots, StateRootContext, StateRootVerifyError,
-    TerminalRoots, TransactionRootContext, TxRootVerifyError, commit_witness_window,
-    committed_crossings, committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves,
-    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
-    ready_leaf_payload, settled_txs_root_from_hashes,
+    REVEAL_CHAIN_DOMAIN_TAG, RootMismatch, SetRoot, SplitChildRoots, StateRootContext,
+    StateRootVerifyError, TransactionRootContext, TxRootVerifyError, commit_witness_window,
+    derive_leaves, derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
+    settled_txs_root_from_hashes,
 };
-pub use shard::state_claim::StateClaim;
+pub use shard::state_claim::{StateClaim, Stated};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
+pub use shard::tick_manifest::{
+    DiscardCause, Holds, Joins, Reach, Settlement, TickLine, TickManifest,
+};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
@@ -208,33 +220,37 @@ pub use shard::{
 };
 pub use signing::{
     BeaconRevealMessage, BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage,
-    ExecutionCertificatesSenderMessage, ExecutionVoteMessage, NetworkId, PcRound, PcScope,
-    PcVoteMessage, ProvisionsSenderMessage, RatifyVoteMessage, ShardRevealMessage,
-    SpcEmptyViewMessage, SpcRelayKind, SpcRelayMessage, VALIDATOR_BIND_NONCE_LEN,
-    ValidatorAddressMessage, ValidatorBindMessage, ValidatorPossessionProofMessage,
-    beacon_reveal_sign, beacon_reveal_verify, shard_reveal_sign, shard_reveal_verify, signed_bytes,
-    validator_possession_proof_sign, validator_possession_proof_verify, vrf_output_from_proof,
+    CrossingReadingsSenderMessage, ExecutionCertificatesSenderMessage, ExecutionVoteMessage,
+    NetworkId, PcRound, PcScope, PcVoteMessage, ProvisionsSenderMessage, RatifyVoteMessage,
+    ShardRevealMessage, SpcEmptyViewMessage, SpcRelayKind, SpcRelayMessage,
+    VALIDATOR_BIND_NONCE_LEN, ValidatorAddressMessage, ValidatorBindMessage,
+    ValidatorPossessionProofMessage, beacon_reveal_sign, beacon_reveal_verify, shard_reveal_sign,
+    shard_reveal_verify, signed_bytes, validator_possession_proof_sign,
+    validator_possession_proof_verify, vrf_output_from_proof,
 };
 pub use state_holds::ProvisionalHolds;
-pub use time::deadline::{CLAIM_WINDOW, Deadline, Probed, TRANSACTION_EVIDENCE_HORIZON, Window};
+pub use time::deadline::{
+    CLAIM_WINDOW, Deadline, Probed, TRANSACTION_EVIDENCE_HORIZON, Window, admissible_until,
+};
 pub use time::epoch_windows::EpochWindows;
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_INTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
-    CLAIM_VISIBILITY_LAG, DEDUP_WINDOW, EPOCH_DURATION, FEE_HOLD_WINDOW, HALT_HARVEST_WAIT,
-    MAX_FINALIZATION_DELAY, PROGRESS_WAIT_MULTIPLIER, RATIFY_ROUND_TIMEOUT,
-    REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_DELAY_MULTIPLIER,
-    VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, VIEW_CHANGE_TIMEOUT_MIN,
+    DEDUP_WINDOW, EPOCH_DURATION, FEE_HOLD_WINDOW, HALT_HARVEST_WAIT, MAX_FINALIZATION_DELAY,
+    PROGRESS_WAIT_MULTIPLIER, RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION, RETENTION_HORIZON,
+    SKIP_TIMEOUT, VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT,
+    VIEW_CHANGE_TIMEOUT_MAX, VIEW_CHANGE_TIMEOUT_MIN,
 };
-pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
+pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
     RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{
-    SettledSetVerdict, SettledTxSet, TerminalEvidence, TxClaim, settled_set_verdict,
+    Evidence, SettledSetVerdict, SettledTxSet, TerminalEvidence, TxClaim, partner_evidence,
+    settled_set_verdict,
 };
 pub use topology::shard_prefix::shard_prefix_path;
 pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};

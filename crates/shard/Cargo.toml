@@ -13,11 +13,16 @@ hyperscale-metrics.workspace = true
 hyperscale-network.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
+# The record cell a block's declines carry, whose terms say whether a
+# crossing may be refused at all.
+hyperscale-vm-effects.workspace = true
+hyperscale-vm-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-crypto-bls.workspace = true
+hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true

@@ -33,14 +33,14 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::network::request::{
-    GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
+    BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
 };
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, PredecessorTerminal, QuorumCertificate,
-    ReadySignal, ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot,
-    ValidatorId, WeightedTimestamp, ready_signal_window, shard_prefix_path,
+    Anchor, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin,
+    CommitProof, MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal,
+    ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot, ValidatorId,
+    WeightedTimestamp, ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -303,8 +303,8 @@ pub struct DerivedGenesis {
     pub origin: ChainOrigin,
     /// The parent terminal this child succeeds, carried off the same
     /// header the genesis derives from. `None` when that header carries
-    /// no committed-transaction commitment.
-    pub predecessor: Option<PredecessorTerminal>,
+    /// no terminal settled root.
+    pub predecessor: Option<Anchor>,
 }
 
 /// Derive `child`'s genesis from the parent's terminal header.
@@ -320,7 +320,7 @@ fn derive_child_genesis(
     Some(DerivedGenesis {
         block,
         origin,
-        predecessor: terminal.as_predecessor_terminal(),
+        predecessor: terminal.as_terminal_anchor(),
     })
 }
 
@@ -503,7 +503,7 @@ impl ObserverTail {
             return None;
         }
         self.in_flight = true;
-        Some(GetBlockRequest::new(self.next, self.next))
+        Some(GetBlockRequest::new(self.next, BlockIntent::Execute))
     }
 
     /// The next certified-header fetch from `source`, for a recognizing
@@ -984,6 +984,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1018,8 +1019,9 @@ mod tests {
             height: BlockHeight::new(1),
             weighted_timestamp: WeightedTimestamp::from_millis(4_000),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         };
         // The terminal's own parent QC sits at the cut exactly — the
         // boundary instant counts as not yet crossed.

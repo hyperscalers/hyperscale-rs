@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
-use hyperscale_execution::{crossing_requests, provision_request};
+use hyperscale_execution::provision_request;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_provisions::build_provisions;
 use hyperscale_storage::{PendingChain, ShardStorage};
@@ -35,9 +35,10 @@ pub fn serve_provision_request<S: ShardStorage>(
     shard_trie: &ShardTrie,
     req: &GetProvisionsRequest,
 ) -> GetProvisionResponse {
-    let Some(certified) = pending_chain.certified_block(req.block_height) else {
+    let height = req.height;
+    let Some(certified) = pending_chain.certified_block(height) else {
         warn!(
-            block_height = req.block_height.inner(),
+            block_height = height.inner(),
             "Provision request: block not found"
         );
         return GetProvisionResponse { provisions: None };
@@ -58,22 +59,12 @@ pub fn serve_provision_request<S: ShardStorage>(
         request.targets = vec![req.target_shard];
         requests.push(request);
     }
-    // The crossings the block's certificates commit, after its
-    // transactions — the order the block's roots bucket them in.
-    for mut request in crossing_requests(block.certificates(), local_shard) {
-        if !request.targets.contains(&req.target_shard) {
-            continue;
-        }
-        request.targets = vec![req.target_shard];
-        requests.push(request);
-    }
-
     let view = pending_chain.view_at_committed_tip();
     let provisions = build_provisions(
         &view,
         local_shard,
         req.target_shard,
-        req.block_height,
+        height,
         block.header().parent_qc().weighted_timestamp(),
         &requests,
     );

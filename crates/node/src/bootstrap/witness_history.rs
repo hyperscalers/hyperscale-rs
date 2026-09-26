@@ -221,11 +221,11 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_storage::test_helpers::{commit_block_with_witnesses, stake_deposit};
-    use hyperscale_storage::{PendingChain, RecoveredState};
+    use hyperscale_storage::{MemberIndex, PendingChain, RecoveredState};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, ChainOrigin, ShardWitnessPayload,
-        StateRoot, WeightedTimestamp,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, ChainOrigin, ReadFrontier, ShardId,
+        ShardWitnessPayload, StateRoot, WeightedTimestamp,
     };
 
     use super::*;
@@ -244,8 +244,9 @@ mod tests {
             height: BlockHeight::new(HEIGHT),
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         };
         (
             PendingChain::new(Arc::new(storage), ChainOrigin::ROOT),
@@ -286,8 +287,15 @@ mod tests {
             .iter()
             .map(ShardWitnessPayload::leaf_hash)
             .collect();
-        let recovered =
-            RecoveredState::from_snap_synced_boundary(&anchor, &header, qc.clone(), hashes, 0);
+        let recovered = RecoveredState::from_snap_synced_boundary(
+            &anchor,
+            &header,
+            qc.clone(),
+            hashes,
+            0,
+            ReadFrontier::default(),
+            MemberIndex::empty(ShardId::ROOT),
+        );
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
@@ -335,8 +343,9 @@ mod tests {
             height: BlockHeight::new(HEIGHT),
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         };
         let peer = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
 
@@ -352,7 +361,15 @@ mod tests {
             .iter()
             .map(ShardWitnessPayload::leaf_hash)
             .collect();
-        let recovered = RecoveredState::from_snap_synced_boundary(&anchor, &header, qc, hashes, 0);
+        let recovered = RecoveredState::from_snap_synced_boundary(
+            &anchor,
+            &header,
+            qc,
+            hashes,
+            0,
+            ReadFrontier::default(),
+            MemberIndex::empty(ShardId::ROOT),
+        );
         assert_eq!(
             recovered.beacon_witness_start,
             BeaconWitnessLeafCount::new(3)

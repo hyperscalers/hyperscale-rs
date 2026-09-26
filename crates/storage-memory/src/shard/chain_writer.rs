@@ -1,6 +1,5 @@
 //! `ShardChainWriter` implementation for `SimShardStorage`.
 
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
@@ -8,39 +7,58 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, covers_strictly_more,
-    holds_this_block_at, settled_writes_at, widest_tick_copies,
+    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, crossing_settlements,
+    holds_this_block_at, member_writes, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
-    SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
+    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
-use super::state::{ConsensusState, apply_writes};
+use super::state::apply_writes;
 
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
-        creations: &[(SubstateKey, Vec<u8>)],
-        removals: &[SubstateKey],
+        chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
+        let ChainWrites {
+            creations,
+            removals,
+            frontier,
+            state_claims,
+            members,
+        } = chain;
         // Everything the ticks carried, for storage; only what they
         // decided reaches state.
         let receipts: Vec<StoredReceipt> = finalizations
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
+        // The chain's own protocol families: the read frontier and tick
+        // membership, each read off the parent state it advances.
+        let mut frontier = read_frontier_writes(parent.state, frontier);
+        frontier.extend(member_writes(parent.state, members));
+        // What the claims settle against the parent state, read once
+        // for the no-op test below; the fold reads it again beside the
+        // receipts, whose writes it defers to.
+        let settled = crossing_settlements(state_claims, &SettledWrites::default(), parent.state);
         // Nothing to write → state root is unchanged. Build a no-op
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet. A block's
-        // sweep and its committed cells are writes like any other, so a
-        // block that removes or creates something is not one of these
-        // however few receipts it carries.
-        if receipts.is_empty() && creations.is_empty() && removals.is_empty() {
+        // sweep, its committed cells and its read frontier are writes
+        // like any other, so a block that removes, creates or raises
+        // something is not one of these however few receipts it carries.
+        if receipts.is_empty()
+            && creations.is_empty()
+            && removals.is_empty()
+            && frontier.is_empty()
+            && settled.is_empty()
+        {
             let s = read_or_recover(&self.state);
             let snapshot = Arc::new(noop_jmt_snapshot(
                 &s.tree_store,
@@ -79,6 +97,8 @@ impl ShardChainWriter for SimShardStorage {
             parent.height,
             creations,
             removals,
+            frontier,
+            state_claims,
         );
 
         let (result_root, collected) = if parent.pending.is_empty() {
@@ -178,17 +198,28 @@ fn build_prepared_commit(
                 c.transactions.insert(tx.hash(), (***tx).clone());
             }
             c.blocks.insert(block.height(), unwrapped);
+            let local_shard = block.header().shard_id();
             for fw in block.certificates().iter() {
-                let tick_id = *fw.tick_id();
-                c.certificates.insert(fw.receipt_hash(), fw.attestation());
-                c.finalizations_by_height
-                    .entry(tick_id.block_height())
-                    .or_default()
-                    .push(tick_id);
+                let hash = fw.receipt_hash();
+                c.certificates.insert(hash, fw.attestation());
+                // Only a finalization of this shard's own tick is indexed,
+                // and only for its local certificate: a counterpart's
+                // certificate riding inside it answers a question nobody
+                // asks this shard, and an asker served its own
+                // certificate back refuses it as unsolicited and asks
+                // again.
+                if fw.tick_id().shard_id() != local_shard {
+                    continue;
+                }
+                c.tx_finalizations.extend(
+                    fw.local_ec()
+                        .tx_outcomes()
+                        .iter()
+                        .map(|outcome| (outcome.tx_hash(), hash)),
+                );
             }
             c.record_provisions(block, floor);
             c.insert_receipts(&receipts);
-            record_execution_certs(&mut c, block);
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
@@ -216,51 +247,6 @@ impl SimShardStorage {
         for (offset, payload) in witness.leaves.iter().enumerate() {
             c.beacon_witnesses
                 .insert(start + offset as u64, payload.clone());
-        }
-    }
-}
-
-/// Fold a block's execution certificates into the consensus map, keeping
-/// the widest copy of each tick and indexing the transactions that copy
-/// attests.
-///
-/// Only an accepted copy of this shard's own certificate is indexed. A
-/// settled cross-shard transaction lands here under both sides'
-/// certificates, and the index answers "what did THIS shard attest for
-/// the transaction" — the question a counterpart's fallback fetch asks
-/// this shard. A remote copy in there serves the requester its own
-/// certificate back, which it rightly refuses as unsolicited, and the
-/// fetch loops forever.
-///
-/// Every one of this shard's is indexed, not the newest: the verdict and
-/// whatever settles what it left both name the transaction, and only the
-/// asker can tell which answers the question its tick waits on.
-fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
-    let local_shard = block
-        .certificates()
-        .first()
-        .map(|finalization| finalization.tick_id().shard_id());
-    for cert in widest_tick_copies(block).into_values() {
-        match consensus.execution_certs.entry(*cert.tick_id()) {
-            Entry::Occupied(mut held) => {
-                if !covers_strictly_more(cert, held.get()) {
-                    continue;
-                }
-                held.insert(cert.clone());
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(cert.clone());
-            }
-        }
-        if Some(cert.tick_id().shard_id()) != local_shard {
-            continue;
-        }
-        for outcome in cert.tx_outcomes() {
-            consensus
-                .tx_cert_index
-                .entry(outcome.tx_hash())
-                .or_default()
-                .insert(*cert.tick_id());
         }
     }
 }

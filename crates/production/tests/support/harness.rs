@@ -24,14 +24,16 @@ use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageFactory,
 };
-use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership, records_naming};
+use hyperscale_scenarios::query::{
+    RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
+};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, ShardId, StateRoot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
-    WeightedTimestamp, shard_prefix_path,
+    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    ValidatorId, WeightedTimestamp, shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
@@ -358,6 +360,27 @@ impl Harness {
         })
     }
 
+    /// The committed value of `key` on `shard`, read off the furthest-along
+    /// live store any host holds for it, at that store's own JMT height.
+    /// The greatest height rather than the first host: a reseated or
+    /// merged host holds a frozen predecessor under the same id, and only
+    /// the live copy has committed past the cut. `None` when no host
+    /// serves `shard`, the height is unavailable, or the cell is absent.
+    pub fn substate(&self, shard: ShardId, key: SubstateKey) -> Option<Vec<u8>> {
+        let store = self
+            .hosts
+            .iter()
+            .filter_map(|h| {
+                h.stores
+                    .lock()
+                    .expect("store registry")
+                    .get(&shard)
+                    .and_then(Weak::upgrade)
+            })
+            .max_by_key(|store| store.jmt_height())?;
+        store.get_substate_at_height(key, store.jmt_height())?
+    }
+
     /// A live handle to host `host`'s `RocksDbShardStorage` for `shard`, or
     /// `None` if that host does not currently hold one there.
     fn host_store(&self, host: usize, shard: ShardId) -> Option<Arc<RocksDbShardStorage>> {
@@ -401,6 +424,22 @@ impl Harness {
     pub fn named_unsettled(&self, shard: ShardId, hash: TxHash) -> Vec<(BlockHeight, ShardId)> {
         self.store_for(shard)
             .map_or_else(Vec::new, |store| records_naming(store.as_ref(), hash))
+    }
+
+    /// [`reads_record`] over the live store — whether `shard`'s chain has
+    /// carried a held reading of `key`. False if no host serves `shard`.
+    #[must_use]
+    pub fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool {
+        self.store_for(shard)
+            .is_some_and(|store| reads_record(store.as_ref(), key))
+    }
+
+    /// [`declines_naming`] over the live store — every crossing on
+    /// `shard`'s chain that it refused for `hash`.
+    #[must_use]
+    pub fn declined(&self, shard: ShardId, hash: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
+        self.store_for(shard)
+            .map_or_else(Vec::new, |store| declines_naming(store.as_ref(), hash))
     }
 
     /// [`chain_fate`] over the live store the runner writes to — the shared

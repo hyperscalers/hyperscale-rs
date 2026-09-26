@@ -1,5 +1,6 @@
 //! `SubstateStore` implementation for `RocksDbShardStorage`.
 
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use hex::encode as hex_encode;
@@ -16,7 +17,6 @@ use rocksdb::{WriteBatch, WriteOptions};
 
 use super::column_families::{PackageArtifactsCf, StateCf, SweepIndexCf};
 use super::core::{RocksDbShardStorage, fold_sweep_rows};
-use super::execution_certs::append_block_certs_to_batch;
 use super::metadata::read_jmt_metadata;
 use super::retention::retention_floor;
 use super::snapshot::RocksDbSnapshot;
@@ -116,6 +116,10 @@ impl VersionedStore for RocksDbShardStorage {
         self.substate_bytes_at_version(height.inner())
     }
 
+    fn hold_retention_at(&self, height: BlockHeight) {
+        self.retention_hold.store(height.inner(), Ordering::Relaxed);
+    }
+
     fn retention_floor(&self) -> u64 {
         Self::retention_floor(self)
     }
@@ -187,15 +191,10 @@ impl RocksDbShardStorage {
 
         self.append_jmt_to_batch(&mut write_batch, jmt_snapshot, new_version);
 
-        // Certificates append here rather than at prepare time: choosing
-        // which copy of a tick to keep reads the stored copy, and that
-        // read has to sit under `commit_lock` with the write it decides.
-        append_block_certs_to_batch(self, &mut write_batch, block);
-
         // The sweep index is a total over what has committed, so its
-        // fold reads the persisted rows and belongs here for the same
-        // reason: a batch prepared over unpersisted ancestors has not
-        // seen what they moved.
+        // fold reads the persisted rows and belongs here, under
+        // `commit_lock` with the write it decides: a batch prepared over
+        // unpersisted ancestors has not seen what they moved.
         fold_sweep_rows(&self.db, &mut write_batch, &self.cf(), sweep_rows);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.

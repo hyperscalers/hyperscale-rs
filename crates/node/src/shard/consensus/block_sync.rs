@@ -28,9 +28,10 @@ use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash,
-    Inventory, LocalReceiptRoot, ProvisionHash, ProvisionsRoot, RehydrateError, StateClaimsRoot,
-    StoredReceipt, TransactionRoot, Verifiable, Verified,
+    AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock,
+    EngagementRoot, Hash, Inventory, LeafRoot, LocalReceiptRoot, ProvisionHash, ProvisionsRoot,
+    RehydrateError, SetRoot, StateClaimsRoot, StoredReceipt, TickManifestRoot, TransactionRoot,
+    Verifiable, Verified,
 };
 
 use crate::event::classify_fetch_error;
@@ -220,16 +221,16 @@ where
         }
     }
 
-    /// Dispatch a single-height block fetch. Reads the current sync
-    /// target and `force_full` flag from the FSM at dispatch time.
+    /// Dispatch a single-height block fetch. This node syncs to
+    /// execute, so every fetch states that intent; the `force_full`
+    /// flag comes from the FSM at dispatch time.
     fn dispatch_block_sync_fetch(
         &self,
         height: BlockHeight,
         inventory_cache: &mut Option<Inventory>,
     ) {
-        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 
-        let target_height = self.io.consensus.block_sync.target(&()).unwrap_or(height);
         let force_full = self.io.consensus.block_sync.force_full(height);
 
         // Heights flagged `force_full` were rehydration misses last time —
@@ -247,7 +248,7 @@ where
         self.process.network.request(
             self.shard,
             None,
-            GetBlockRequest::new(height, target_height).with_inventory(inventory),
+            GetBlockRequest::new(height, BlockIntent::Execute).with_inventory(inventory),
             None,
             Box::new(move |result: Result<GetBlockResponse, _>| {
                 match result {
@@ -396,10 +397,11 @@ fn cache_sensitive_validation_failure(reason: &str) -> bool {
 /// derives the `Live` list by hashing the same bodies the root is computed
 /// over. One expression therefore binds both variants.
 ///
-/// The abandonment records are the one body list no hash in the
-/// manifest binds — they ride inline rather than by reference — so this is
-/// the only place a serving peer's copy is held to the header the committee
-/// actually signed.
+/// The abandonment records and a sealed block's engagements are the body
+/// lists no hash in the manifest binds — they ride inline rather than by
+/// reference — so this is the only place a serving peer's copy is held to
+/// the header the committee actually signed. A live block's engagements
+/// are derived from its provision bodies, which the provisions root binds.
 ///
 /// On `Err`, the returned `&'static str` is suitable for both the
 /// metrics label and the warn message.
@@ -430,6 +432,14 @@ fn validate_synced_block(
         != header.state_claims_root()
     {
         return Err("state_claims_root_mismatch");
+    }
+
+    if EngagementRoot::over(certified.block().engagements().iter()) != header.engagement_root() {
+        return Err("engagement_root_mismatch");
+    }
+
+    if TickManifestRoot::over(certified.block().tick_manifest()) != header.tick_manifest_root() {
+        return Err("tick_manifest_root_mismatch");
     }
 
     if Verified::<TransactionRoot>::compute(certified.block().transactions()).into_inner()
@@ -489,10 +499,10 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts,
         BlockHeight, CertificateRoot, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline,
-        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield,
-        TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable,
-        WeightedTimestamp, WitnessSources,
+        Engagement, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash,
+        GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round, ShardId,
+        SignerBitfield, TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, UnsettledTx,
+        Verifiable, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -619,6 +629,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -635,6 +646,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -655,6 +667,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -679,6 +692,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -712,12 +726,14 @@ mod tests {
     }
 
     /// A block's state claims are the one body list beside the records
-    /// that a manifest holds by value, and every replica folds them at
-    /// commit; a serving peer that drops or forges them hands back a
-    /// block whose answers are not the chain's.
+    /// that a manifest holds by value, and every replica checks and
+    /// folds them at commit; a serving peer that drops or forges them,
+    /// proof included, hands back a block whose answers are not the
+    /// chain's. The sealed form carries the same claims under the same
+    /// root.
     #[test]
     fn validate_binds_state_claims_in_both_directions() {
-        use hyperscale_types::{Anchor, Inclusion, StateClaim, StateRoot};
+        use hyperscale_types::{Anchor, Inclusion, MerkleInclusionProof, StateClaim, StateRoot};
         let bundles = vec![StateClaim::new(
             Anchor {
                 shard: ShardId::leaf(1, 0),
@@ -726,6 +742,7 @@ mod tests {
                 ts: WeightedTimestamp::from_millis(3_000),
             },
             [(stub_abort_charge(1).vault, Inclusion::Absent)],
+            MerkleInclusionProof::new(b"proof".to_vec()),
         )];
         let root = Verified::<StateClaimsRoot>::compute(&bundles).into_inner();
         let live = |state_claims: Vec<StateClaim>| Block::Live {
@@ -745,6 +762,7 @@ mod tests {
             state_claims: Arc::new(
                 Capped::new(state_claims).expect("a rebuilt block keeps the caps its source met"),
             ),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -755,11 +773,27 @@ mod tests {
             "state_claims_root_mismatch"
         );
 
+        let mut forged = bundles.clone();
+        forged[0].proof = MerkleInclusionProof::new(b"other".to_vec());
+        let forged = live(forged);
+        let qc = qc_for(&forged);
+        assert_eq!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(forged, qc)).unwrap_err(),
+            "state_claims_root_mismatch",
+            "a proof altered in flight fails the root"
+        );
+
         let carried = live(bundles);
         let qc = qc_for(&carried);
+        let sealed = carried.clone().into_sealed();
         assert!(
-            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc)).is_ok(),
-            "the proofs the header commits are the ones it accepts"
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc.clone()))
+                .is_ok(),
+            "the claims the header commits are the ones it accepts"
+        );
+        assert!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(sealed, qc)).is_ok(),
+            "and the sealed form recomputes the same root"
         );
     }
 
@@ -778,6 +812,7 @@ mod tests {
                     committee_anchor: WeightedTimestamp::from_millis(500),
                 },
                 reach: Capped::empty(),
+                escrowed: Capped::empty(),
             }],
         )
     }
@@ -796,6 +831,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::from_array([boundary_record()])),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -824,6 +860,7 @@ mod tests {
                     .expect("a rebuilt block keeps the caps its source met"),
             ),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -853,6 +890,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -879,6 +917,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -906,6 +945,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -929,6 +969,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -965,8 +1006,10 @@ mod tests {
                 Capped::new(provision_hashes)
                     .expect("a rebuilt block keeps the caps its source met"),
             ),
+            engagements: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -986,6 +1029,57 @@ mod tests {
         );
     }
 
+    /// A `Sealed` block keeps the engagements its dropped bodies named,
+    /// and no manifest hash binds that inline list: the header's root is
+    /// the only thing holding a serving peer's copy to what the committee
+    /// signed. A stripped or altered list fails; the committed one passes.
+    #[test]
+    fn a_synced_block_whose_list_misses_its_root_is_refused() {
+        let entry = |seed: u8| Engagement {
+            source: ShardId::leaf(1, 1),
+            tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
+            source_height: BlockHeight::new(3),
+        };
+        let committed = vec![entry(1), entry(2)];
+        let root = EngagementRoot::over(&committed);
+        let sealed = |engagements: Vec<Engagement>| Block::Sealed {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: HEIGHT,
+                parent_block_hash: BlockHash::ZERO,
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                timestamp: ProposerTimestamp::from_millis(1_000),
+                provision_tx_roots: Capped::default(),
+                engagement_root: root,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provision_hashes: Arc::new(Capped::empty()),
+            engagements: Arc::new(Capped::new(engagements).expect("a list written out in a test")),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+
+        for served in [Vec::new(), vec![entry(1)], vec![entry(1), entry(3)]] {
+            let block = sealed(served);
+            let qc = qc_for(&block);
+            assert_eq!(
+                validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(block, qc))
+                    .unwrap_err(),
+                "engagement_root_mismatch"
+            );
+        }
+
+        let carried = sealed(committed);
+        let qc = qc_for(&carried);
+        assert!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc)).is_ok(),
+            "the list the header commits is the one it accepts"
+        );
+    }
+
     #[test]
     fn validate_rejects_certificate_root_mismatch() {
         let (fw, lrr, _cr) = make_tick(true);
@@ -1002,6 +1096,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1061,6 +1156,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1091,6 +1187,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1147,6 +1244,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);

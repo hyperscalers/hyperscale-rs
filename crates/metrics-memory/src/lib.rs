@@ -54,11 +54,29 @@ impl MemoryRecorder {
         Self::default()
     }
 
-    /// Read a counter value. Returns 0 if the metric has not been recorded.
+    /// Read a counter value. An unlabelled read of a labelled counter is
+    /// the sum over its labels, the reading a `CounterVec` gives with no
+    /// selector. Returns 0 if nothing has been recorded under `name`.
     #[must_use]
     pub fn counter(&self, name: &'static str, label: Option<&str>) -> u64 {
-        let key = (name, label.map(str::to_owned));
-        self.inner.lock().counters.get(&key).copied().unwrap_or(0)
+        let inner = self.inner.lock();
+        label.map_or_else(
+            || {
+                inner
+                    .counters
+                    .range((name, None)..)
+                    .take_while(|((entry, _), _)| *entry == name)
+                    .map(|(_, count)| count)
+                    .sum()
+            },
+            |label| {
+                inner
+                    .counters
+                    .get(&(name, Some(label.to_owned())))
+                    .copied()
+                    .unwrap_or(0)
+            },
+        )
     }
 
     /// Read a gauge value. Returns 0.0 if the metric has not been recorded.
@@ -276,6 +294,32 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("reclaim_probes_pending", None, 1);
     }
 
+    fn record_state_claims_weight(&self, bytes: usize) {
+        self.observe("state_claims_weight", None, bytes as f64);
+    }
+
+    fn record_record_ask(&self) {
+        self.inc("record_asks", None, 1);
+    }
+
+    fn record_crossing_fallback_ask(&self, asker: &str) {
+        self.inc("crossing_fallback_asks", Some(asker), 1);
+    }
+
+    fn record_fenced_claim(&self, reading: &str, carried: bool) {
+        let name = if carried {
+            "fenced_claims_carried"
+        } else {
+            "fenced_claims_refused"
+        };
+        self.inc(name, Some(reading), 1);
+    }
+
+    fn record_crossing_push_dropped(&self, reason: &str) {
+        self.inc("crossing_pushes_dropped", None, 1);
+        self.inc("crossing_pushes_dropped", Some(reason), 1);
+    }
+
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {
         self.inc("fetch_responses_refused", Some(kind), 1);
         self.inc(
@@ -420,6 +464,15 @@ mod tests {
         r.record_fetch_started("provision");
         assert_eq!(r.counter("fetch_started", Some("transaction")), 2);
         assert_eq!(r.counter("fetch_started", Some("provision")), 1);
+    }
+
+    #[test]
+    fn an_unlabelled_read_sums_a_labelled_counter() {
+        let r = MemoryRecorder::new();
+        r.record_reclaim_admitted(true);
+        r.record_reclaim_admitted(false);
+        assert_eq!(r.counter("reclaims_admitted", None), 2);
+        assert_eq!(r.counter("reclaims_admitted", Some("leaf")), 1);
     }
 
     #[test]

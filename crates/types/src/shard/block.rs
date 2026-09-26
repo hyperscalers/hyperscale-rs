@@ -6,6 +6,7 @@
 //! verified) and every internal commitment root the block declares has
 //! been checked against the inline data.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor};
@@ -13,10 +14,10 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
-    ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    Engagement, Engagements, Finalization, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
-    StateRoot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    StateRoot, TickManifest, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
     WeightedTimestamp, WitnessSources,
 };
 
@@ -109,7 +110,9 @@ pub fn fees_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) ->
 ///
 /// The header's `provision_root` commits to the original provision set, so
 /// `Sealed` is self-consistent — a `Live` block matches its `Sealed` form
-/// modulo the provision payload.
+/// modulo the provision payload. A `Sealed` block keeps the engagements
+/// those bodies named, which the header's `engagement_root` binds: the
+/// engagement tier is folded from them wherever the bodies are gone.
 #[derive(Debug, Clone, Hbor)]
 pub enum Block {
     /// Block within its cross-shard execution window — carries provisions.
@@ -127,10 +130,15 @@ pub enum Block {
         /// Committed via the header's `abandonment_root`.
         abandonment_records: Arc<Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>>,
         /// What this block commits about counterparts' chains: cells
-        /// their commit-proven state holds, proved against their
-        /// headers. Committed via the header's `state_claims_root` and
-        /// folded by every replica at commit.
+        /// their commit-proven state holds, each claim carrying the
+        /// proof of its readings under its anchor's root. Committed via
+        /// the header's `state_claims_root`, checked from the block at
+        /// admission and folded by every replica at commit.
         state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
+        /// What the block's tick holds and what it lets go, named by the
+        /// proposer and checked line by line against committed content.
+        /// Committed via the header's `tick_manifest_root`.
+        tick_manifest: Arc<TickManifest>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -152,16 +160,27 @@ pub enum Block {
         /// Content hashes of the provisions the block consumed while
         /// `Live`. Empty iff the block consumed no provisions.
         provision_hashes: Arc<Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>>,
+        /// The transactions the dropped provisions named, by the shard
+        /// and height that sent them, ascending. Committed via the
+        /// header's `engagement_root`, which a `Live` block's bodies
+        /// derive.
+        engagements: Arc<Engagements>,
         /// What departed shards left unresolved of this chain's business.
         ///
         /// Retained through sealing, unlike provisions: a verdict is
         /// composed on this evidence however long after the terminal it
         /// came from, which is the whole reason it is written down.
         abandonment_records: Arc<Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>>,
-        /// Proofs of counterparts' cells, retained through sealing like
-        /// the records: a replay of any depth re-folds its answers off
-        /// the block it reads, and the root binds at every stage.
+        /// Claims about counterparts' cells, retained through sealing
+        /// with their proofs, like the records: a replay of any depth
+        /// re-folds its answers off the block it reads, the root binds
+        /// at every stage, and no stage has a claim form without its
+        /// proof.
         state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
+        /// The tick manifest, retained through sealing: a replica that
+        /// syncs the block sealed seats the same ticks as one that syncs
+        /// it live.
+        tick_manifest: Arc<TickManifest>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -236,6 +255,7 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -263,6 +283,7 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -293,6 +314,7 @@ impl Block {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -440,6 +462,14 @@ impl Block {
         }
     }
 
+    /// The block's tick manifest, regardless of variant.
+    #[must_use]
+    pub fn tick_manifest(&self) -> &TickManifest {
+        match self {
+            Self::Live { tick_manifest, .. } | Self::Sealed { tick_manifest, .. } => tick_manifest,
+        }
+    }
+
     /// Every transaction the block's finalizations resolve without
     /// deciding: a delivery's or a leg's, checked against the lapse
     /// where the body says this shard delivers for it.
@@ -453,35 +483,12 @@ impl Block {
             .collect()
     }
 
-    /// Every transaction the block's finalizations decide with success
-    /// by its own execution, for a member that awaits nobody — the only
-    /// successes the deadline bounds. One with a sibling to stay atomic
-    /// with settles on the sibling's clock, however late; a member
-    /// settling what an execution left is past the deadline by
-    /// construction.
-    #[must_use]
-    pub fn successes_decided_alone(&self) -> Vec<TxHash> {
-        self.certificates()
-            .iter()
-            .flat_map(|fw| fw.local_ec().tx_outcomes().iter())
-            .filter(|outcome| {
-                outcome.decides()
-                    && outcome.executes()
-                    && outcome.counterparts().is_empty()
-                    && matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. })
-            })
-            .map(TxOutcome::tx_hash)
-            .collect()
-    }
-
     /// Whether the block carries anything the resolutions check reads:
     /// a record's figures, or a finalization resolving a name it does
-    /// not decide, or one it decides with success alone.
+    /// not decide.
     #[must_use]
     pub(crate) fn resolves_anything(&self) -> bool {
-        !self.abandonment_records().is_empty()
-            || !self.undecided_names().is_empty()
-            || !self.successes_decided_alone().is_empty()
+        !self.abandonment_records().is_empty() || !self.undecided_names().is_empty()
     }
 
     /// The checks this block demands before a vote.
@@ -524,6 +531,21 @@ impl Block {
         }
     }
 
+    /// The engagements the block's provisions name, regardless of
+    /// variant: derived from the bodies on `Live`, read from the kept
+    /// list on `Sealed`. The two agree on the same block by
+    /// construction, as [`Self::provision_hashes`] does: `into_sealed`
+    /// derives the list before dropping the bodies.
+    #[must_use]
+    pub fn engagements(&self) -> Cow<'_, [Engagement]> {
+        match self {
+            Self::Live { provisions, .. } => {
+                Cow::Owned(Engagement::of_provisions(provisions).into_iter().collect())
+            }
+            Self::Sealed { engagements, .. } => Cow::Borrowed(engagements),
+        }
+    }
+
     /// Content hashes of the block's provisions, regardless of variant.
     /// Computed inline from `provisions` on `Live`; read from the carried
     /// list on `Sealed`. The two paths agree on the same block by
@@ -562,10 +584,19 @@ impl Block {
         matches!(self, Self::Live { .. })
     }
 
-    /// Convert to `Sealed` by dropping provision bodies and retaining only
-    /// their hashes. Identity on an already-sealed block. This is the
-    /// canonical persisted shape; sync-serving glue re-attaches provision
-    /// bodies (via `into_live`) when the requester needs them.
+    /// Convert to `Sealed` by dropping provision bodies and retaining
+    /// their hashes and the engagements they named. Identity on an
+    /// already-sealed block. This is the canonical persisted shape;
+    /// sync-serving glue re-attaches provision bodies (via `into_live`)
+    /// when the requester needs them.
+    ///
+    /// # Panics
+    ///
+    /// If the bodies name more than [`MAX_ENGAGEMENTS_PER_BLOCK`]
+    /// transactions, which the provisions section refuses of any block
+    /// a chain commits.
+    ///
+    /// [`MAX_ENGAGEMENTS_PER_BLOCK`]: crate::MAX_ENGAGEMENTS_PER_BLOCK
     #[must_use]
     pub fn into_sealed(self) -> Self {
         match self {
@@ -576,18 +607,24 @@ impl Block {
                 provisions,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             } => {
                 // One hash per body, so the list keeps the cap the
                 // provisions field already met.
                 let hashes = provisions.map(|p| p.hash());
+                let engagements =
+                    Capped::new(Engagement::of_provisions(&provisions).into_iter().collect())
+                        .expect("the provisions section caps what a block's provisions name");
                 Self::Sealed {
                     header,
                     transactions,
                     certificates,
                     provision_hashes: Arc::new(hashes),
+                    engagements: Arc::new(engagements),
                     abandonment_records,
                     state_claims,
+                    tick_manifest,
                     witness_sources,
                 }
             }
@@ -597,7 +634,8 @@ impl Block {
 
     /// Attach provisions, promoting `Sealed` → `Live`. Used by sync-serving
     /// to upgrade a persisted block when the requester is still inside the
-    /// cross-shard execution window.
+    /// cross-shard execution window. The kept engagements go: the bodies
+    /// derive them.
     ///
     /// # Panics
     ///
@@ -612,6 +650,7 @@ impl Block {
                 certificates,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
                 ..
             } => Self::Live {
@@ -621,6 +660,7 @@ impl Block {
                 provisions,
                 abandonment_records,
                 state_claims,
+                tick_manifest,
                 witness_sources,
             },
             Self::Live { .. } => {

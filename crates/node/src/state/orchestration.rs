@@ -14,41 +14,32 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    Anchor, CertifiedBlock, CertifiedBlockHeader, Verified, derive_block_transactions,
+    Anchor, CertifiedBlock, CertifiedBlockHeader, Verified, WeightedTimestamp,
+    derive_block_transactions,
 };
 
 use super::NodeStateMachine;
 
 impl NodeStateMachine {
-    /// Block committed — notify all subsystems in commit order.
+    /// Block committed: fold it into execution and notify every
+    /// subsystem the live commit stream feeds.
     ///
-    /// The fanout sequence has load-bearing dependencies; reordering silently
-    /// breaks invariants the downstream coordinators rely on:
+    /// Transactions are derived first, and the block's snapshot is marked
+    /// a usable parent before anything can emit a child verification.
+    /// The fork fence clears before any coordinator reads it. The mempool
+    /// marks the block committed before it hears the fold's resolutions,
+    /// and engagement evidence lands before the proposal latch, which
+    /// [`settle_tip`](super::participation::ShardParticipation::settle_tip)
+    /// runs last.
     ///
-    /// 1. `shard.on_block_committed_verification` marks the block's JMT snapshot
-    ///    as a usable parent so pending child state-root verifications unblock.
-    /// 2. `mempool.on_block_committed` drives `block.transactions` Pending →
-    ///    Committed and `block.certificates` to their terminal state. Reads the
-    ///    shard coordinator's `tx_retention` (populated synchronously in
-    ///    `record_block_committed`) for tombstone retention.
-    /// 3. `remote_headers.on_block_committed` updates liveness + cross-shard
-    ///    timeouts. The schedule (not head) so the probe terminal-clamps a
-    ///    drained reshape shard to the committee still serving it.
-    /// 4. `provisions.on_block_committed` prunes + schedules fallback timeouts.
-    /// 5. `outbound_provisions.on_block_committed` evicts on the consensus-
-    ///    authenticated weighted timestamp so every validator evicts identically.
-    /// 6. `beacon.on_local_block_committed` advances the committee anchor; the
-    ///    local commit stream is the beacon's only source view of its own shard,
-    ///    so `on_verified_source_header` feeds each certified header in.
-    /// 7. `apply_block_to_execution` runs tick cleanup + dispatch + vote
-    ///    emission last, after mempool's terminal-state transitions.
-    ///
-    /// Finally the terminal-chain sweep and a proposal-retry latch
-    /// (in-flight counts changed) for the post-dispatch hook to turn into one
-    /// `try_event_driven_proposal`.
+    /// The restart's replay folds through the same execution entry and
+    /// the same two hand-offs, and feeds none of the hooks between: each
+    /// of them reads the tip it is handed rather than the run behind it,
+    /// so it heals from the head on the next live commit.
     pub(super) fn on_block_committed(
         &mut self,
         certified: &Verified<CertifiedBlock>,
+        committee_anchor: WeightedTimestamp,
     ) -> Vec<Action> {
         let Some(s) = self.shard.as_mut() else {
             return Vec::new();
@@ -60,34 +51,46 @@ impl NodeStateMachine {
         s.shard_coordinator
             .on_block_committed_verification(block_hash);
 
+        // The node's one fork fence clears here, before any coordinator
+        // reads it for this commit, once the attested recovery for a
+        // fenced shard completes; a later re-fork can then re-engage.
+        let cleared = s.fork_fence.clear_completed(
+            self.beacon_coordinator
+                .topology_schedule()
+                .head()
+                .completed_recoveries(),
+        );
+
         actions.extend(s.mempool_coordinator.on_block_committed(
             self.beacon_coordinator.current_topology_snapshot(),
             certified,
         ));
-        // What the block's finalizations settle about the transactions
-        // they name is the execution ledger's reading — a name that
-        // decides nothing is a leg finalizing here, a deciding success
-        // on a leg entry is the reclaim — taken before the same block
-        // releases the entries below.
-        let resolutions = s
-            .execution_coordinator
-            .resolutions_of(certified.block().certificates());
-        actions.extend(s.mempool_coordinator.on_resolutions(&resolutions));
-        // Committed bundles are engagement evidence: promote any parked
-        // cross-shard transaction whose payer bundle just committed.
-        // Covers the case where another proposer paired the bundle
-        // before this node's provisions pipeline verified it.
-        for bundle in certified.block().provisions() {
+        // Committed engagements are engagement evidence: promote any
+        // parked cross-shard transaction whose payer bundle just
+        // committed. Covers the case where another proposer paired the
+        // bundle before this node's provisions pipeline verified it, and
+        // reads the list the engagement tier folds, so a block that
+        // arrives sealed promotes what a live one does.
+        let trie = self
+            .beacon_coordinator
+            .current_topology_snapshot()
+            .shard_trie()
+            .clone();
+        let engagements = certified.block().engagements();
+        // Ascending, so each source's entries are one run.
+        for run in engagements.chunk_by(|a, b| a.source == b.source) {
             s.mempool_coordinator.on_engagement_evidence(
-                bundle.source_shard(),
-                bundle.transactions().iter().map(|entry| entry.tx_hash),
+                &trie,
+                run[0].source,
+                run.iter().map(|engagement| engagement.tx_hash),
             );
         }
 
-        actions.extend(
-            s.remote_headers_coordinator
-                .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
-        );
+        actions.extend(s.remote_headers_coordinator.on_block_committed(
+            self.beacon_coordinator.topology_schedule(),
+            certified,
+            &cleared,
+        ));
 
         actions.extend(
             s.provisions_coordinator
@@ -113,45 +116,13 @@ impl NodeStateMachine {
                 .on_verified_source_header(&certified_header),
         );
 
-        actions.extend(
-            s.apply_block_to_execution(self.beacon_coordinator.topology_schedule(), certified),
+        let effects = s.execution_coordinator.commit_block(
+            self.beacon_coordinator.topology_schedule(),
+            certified,
+            committee_anchor,
         );
-
-        // The first coast commit quiesces the chain's content: finalization is a
-        // finalization in a later block, and no later content block will
-        // exist, so every still-in-flight transaction is permanently undecidable
-        // here. Drive them to their terminal abort and drop the execution state
-        // that was waiting on them — once. Keyed on quiescence, not dissolution:
-        // the committee keeps coasting and serving past this point, but its
-        // terminal block is the last that can decide a transaction. Runs after
-        // the fan-out above so a final cert-carrying block terminalizes its
-        // transactions through the normal path first.
-        if !s.terminal_chain_swept
-            && s.shard_coordinator
-                .quiescent(self.beacon_coordinator.topology_schedule())
-        {
-            s.terminal_chain_swept = true;
-            actions.extend(s.mempool_coordinator.abort_in_flight());
-            actions.extend(s.execution_coordinator.abort_pending_ticks());
-        }
-
-        // Settlement order is judged over the execution fold, and only a
-        // commit moves it — a member settles when a block carries the
-        // half that settles it. Mirror the fold's answer into shard
-        // consensus, where the proposer's selection and the vote path
-        // both read it, so the two run one rule.
-        s.shard_coordinator
-            .set_owed_determined(s.execution_coordinator.owed_determined_ticks());
-
-        s.shard_coordinator.queue_ready_proposal();
-
-        // The fork-proof dedup fence clears once the attested recovery for
-        // its shard completes — the coordinators self-clear their own
-        // fences on the same edge, so a later re-fork can re-engage.
-        if !s.fork_fence.is_empty() {
-            let head = self.beacon_coordinator.topology_schedule().head();
-            s.fork_fence.clear_completed(head.completed_recoveries());
-        }
+        actions.extend(s.apply_commit_effects(effects));
+        actions.extend(s.settle_tip(self.beacon_coordinator.topology_schedule()));
 
         actions
     }
@@ -206,7 +177,7 @@ impl NodeStateMachine {
             .on_committed_remote_header(topology_schedule, certified_header);
         actions.extend(
             s.execution_coordinator
-                .on_committed_remote_header(topology_schedule, certified_header.shard_id()),
+                .on_committed_remote_header(topology_schedule, Anchor::of(certified_header)),
         );
         actions
     }

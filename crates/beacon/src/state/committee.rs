@@ -592,8 +592,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_types::{
-        BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight,
-        DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR,
+        Admission, BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash,
+        BlockHeight, DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR,
         PendingReshape, Randomness, RecoveryCause, ShardBoundary, ShardCommittee, ShardId,
         ShardWitnessPayload, Stake, StakePool, StakePoolId, StateRoot, TransitionCause,
         ValidatorId, ValidatorStatus, WeightedTimestamp,
@@ -818,7 +818,7 @@ mod tests {
             splitting,
             PendingReshape::Split {
                 last_asserted: Epoch::GENESIS,
-                admitted_at: Epoch::GENESIS,
+                admitted: Admission::new(Epoch::GENESIS),
                 cohort: BTreeMap::new(),
                 cohort_seed: state.randomness,
                 scheduled: None,
@@ -1426,7 +1426,7 @@ mod tests {
             splitting,
             PendingReshape::Split {
                 last_asserted: Epoch::new(shuffle_interval()),
-                admitted_at: Epoch::new(shuffle_interval()),
+                admitted: Admission::new(Epoch::new(shuffle_interval())),
                 cohort: BTreeMap::new(),
                 cohort_seed: state.randomness,
                 scheduled: None,
@@ -1905,7 +1905,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         }
     }
@@ -1933,7 +1933,7 @@ mod tests {
             terminal_epoch: None,
             handoff_complete: None,
             terminal_delivered: false,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             reshape_admitted_epoch: None,
         }
     }

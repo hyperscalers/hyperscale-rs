@@ -24,13 +24,14 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{
-    ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore, sweep_for_block,
+    ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage, SubstateStore,
+    sweep_for_block,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
-    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SubstateKey,
-    SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
-    local_settled_tx_hashes,
+    EpochWindows, Finalization, FrontierInputs, LocalTimestamp, PreparedCommit, ShardId, StateRoot,
+    SubstateKey, SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp,
+    absorb_committed_cells, local_settled_tx_hashes,
 };
 use tracing::debug;
 
@@ -76,10 +77,17 @@ pub struct QcOnlyCommit {
     pub(crate) parent_sweep_frontier: SweepFrontier,
     /// The committed cells the block writes, derived under its window.
     pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
+    /// What the block's claims do to the read frontier.
+    pub(crate) frontier: FrontierInputs,
     /// How this node learned the certifying QC.
     pub(crate) source: CommitSource,
     /// Beacon-witness leaves to fold into the commit.
     pub(crate) witness: BeaconWitnessCommit,
+    /// The committed block's committee anchor — its parent's own
+    /// anchor — which classifies its content downstream. Carried from the
+    /// commit rather than read at fan-out, because a buffered run commits
+    /// in one step and a scalar read afterwards names only its last block.
+    pub(crate) committee_anchor: WeightedTimestamp,
 }
 
 /// A QC-only commit waiting on the single in-flight slot. Every
@@ -106,6 +114,9 @@ pub struct QcOnlyPending {
     /// under the block's own window. Unused when
     /// `kind == AlreadyPrepared`.
     pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
+    /// What the block's claims do to the read frontier. Unused when
+    /// `kind == AlreadyPrepared`.
+    pub(crate) frontier: FrontierInputs,
     /// How this node learned the certifying QC.
     pub(crate) source: CommitSource,
     /// Whether this entry needs the pool to run JMT prep or can
@@ -116,6 +127,11 @@ pub struct QcOnlyPending {
     /// `PendingCommit` queued for `flush` has the same data the
     /// original `Action::CommitBlockByQcOnly` supplied.
     pub(crate) witness: BeaconWitnessCommit,
+    /// The committed block's committee anchor — its parent's own
+    /// anchor — which classifies its content downstream. Carried from the
+    /// commit rather than read at fan-out, because a buffered run commits
+    /// in one step and a scalar read afterwards names only its last block.
+    pub(crate) committee_anchor: WeightedTimestamp,
 }
 
 /// Outcome of [`BlockCommitCoordinator::decide_qc_only`]. The shard runs
@@ -220,8 +236,13 @@ where
             base_reads: None,
         },
         &finalizations,
-        creations,
-        &removals,
+        ChainWrites {
+            creations,
+            removals: &removals,
+            frontier: &pending.frontier,
+            state_claims: block.state_claims(),
+            members: &MemberInputs::of(block),
+        },
         height,
     );
 
@@ -254,14 +275,12 @@ where
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref), derivation);
     let parent_block_hash = block.header().parent_block_hash();
     let settled_txs = local_settled_tx_hashes(finalizations.iter(), block.header().shard_id());
-    let committed_txs = block.transactions().iter().map(|tx| tx.hash()).collect();
     pending_chain.insert(
         block_hash,
         ChainEntry {
             parent_block_hash,
             height,
             settled_txs,
-            committed_txs,
             jmt_snapshot,
             certified_block: None,
             certified_uncommitted: None,
@@ -306,7 +325,6 @@ where
             prepared,
             jmt_snapshot,
             settled_txs,
-            committed_txs,
         } = prep;
         pending_chain.insert(
             block_hash,
@@ -314,7 +332,6 @@ where
                 parent_block_hash,
                 height: block_height,
                 settled_txs,
-                committed_txs,
                 jmt_snapshot,
                 certified_block: None,
                 certified_uncommitted: None,
@@ -347,6 +364,11 @@ pub struct PendingCommit {
     /// Sourced from the `Action::CommitBlock` / `Action::CommitBlockByQcOnly`
     /// payload the shard coordinator emits at commit time.
     pub(crate) witness: BeaconWitnessCommit,
+    /// The committed block's committee anchor — its parent's own
+    /// anchor — which classifies its content downstream. Carried from the
+    /// commit rather than read at fan-out, because a buffered run commits
+    /// in one step and a scalar read afterwards names only its last block.
+    pub(crate) committee_anchor: WeightedTimestamp,
 }
 
 /// Outcome of accumulating a single commit.
@@ -363,6 +385,8 @@ pub enum AccumulateDecision {
         /// handlers, then — if `notify_now` — forwards the same handle
         /// to `BlockCommitted`.
         handle: NotifyHandle,
+        /// The accepted block's committee anchor, for its `BlockCommitted`.
+        committee_anchor: WeightedTimestamp,
         /// True if the `io_loop` should fire `BlockCommitted` immediately.
         /// False under persistence backpressure: the flush closure fires
         /// the event after the disk write completes instead.
@@ -691,12 +715,14 @@ impl BlockCommitCoordinator {
         }
 
         let handle = Arc::clone(&commit.certified);
+        let committee_anchor = commit.committee_anchor;
         commit.committed_notified = notify_now;
         self.pending.push(commit);
 
         AccumulateDecision::Accepted {
             height,
             handle,
+            committee_anchor,
             notify_now,
         }
     }
@@ -756,6 +782,7 @@ impl BlockCommitCoordinator {
                     self.shard,
                     ProtocolEvent::BlockCommitted {
                         certified: commit.certified,
+                        committee_anchor: commit.committee_anchor,
                     },
                 );
             }
@@ -924,11 +951,13 @@ impl BlockCommitCoordinator {
             for (i, _) in heights.iter().enumerate() {
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
-                    let certified = commit.certified;
                     push_protocol_event(
                         &event_tx,
                         shard,
-                        ProtocolEvent::BlockCommitted { certified },
+                        ProtocolEvent::BlockCommitted {
+                            certified: commit.certified,
+                            committee_anchor: commit.committee_anchor,
+                        },
                     );
                 }
             }
@@ -1043,6 +1072,7 @@ mod tests {
             source,
             committed_notified: false,
             witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            committee_anchor: WeightedTimestamp::ZERO,
         };
         let prepared = make_mock_prepared(sink, height.inner());
         (pending, prepared)
@@ -1762,6 +1792,7 @@ mod tests {
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();
@@ -1777,6 +1808,7 @@ mod tests {
             source: CommitSource::Sync,
             committed_notified: false,
             witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            committee_anchor: WeightedTimestamp::ZERO,
         };
         let prepared = make_mock_prepared(sink, height);
         (pending, prepared, hash)

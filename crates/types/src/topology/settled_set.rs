@@ -110,6 +110,62 @@ pub enum TxClaim {
     Abandoned,
 }
 
+/// What a partner shard's evidence says at a judging anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// The shard is live, and `terminating` where it is scheduled to
+    /// leave.
+    Live {
+        /// Whether an admitted reshape or a coast takes it out.
+        terminating: bool,
+    },
+    /// It has departed and its settled set can still be read.
+    Readable,
+    /// It has departed and its settled set can never be read: evicted
+    /// from every retained window, its boundary record swept, or its
+    /// handoff stamped and aged past the evidence window.
+    Unreadable,
+    /// The judging anchor's window has not folded yet.
+    Unknown,
+}
+
+/// What `shard`'s evidence says at `anchored_wt`.
+///
+/// Read off the anchored snapshot, where the beacon's handoff-complete
+/// stamp lands: the one reading behind the settled-set fence and every
+/// licence that turns on a partner no longer being able to answer.
+#[must_use]
+pub fn partner_evidence(
+    topology_schedule: &TopologySchedule,
+    shard: ShardId,
+    anchored_wt: WeightedTimestamp,
+) -> Evidence {
+    let Some((_, past_terminal)) = topology_schedule.at_for_shard(shard, anchored_wt) else {
+        return Evidence::Unreadable;
+    };
+    if !past_terminal {
+        return Evidence::Live {
+            terminating: topology_schedule.termination_scheduled(shard, anchored_wt),
+        };
+    }
+    match topology_schedule.lookup(anchored_wt) {
+        WindowLookup::Window(window) => match window.boundary(shard) {
+            None => Evidence::Unreadable,
+            Some(anchor)
+                if anchor.handoff_complete.is_some_and(|done| {
+                    anchored_wt > topology_schedule.windows().handoff_evidence_expiry(done)
+                }) =>
+            {
+                Evidence::Unreadable
+            }
+            Some(_) => Evidence::Readable,
+        },
+        WindowLookup::NotYetCommitted => Evidence::Unknown,
+        // Below the schedule floor nothing about the window is readable.
+        WindowLookup::Evicted => Evidence::Unreadable,
+    }
+}
+
 /// Resolve a finalization's per-transaction claims against the known
 /// settled sets at `anchored_wt`.
 ///
@@ -151,59 +207,34 @@ where
         }
         let settlement = matches!(claim, TxClaim::Settled);
 
-        // Evicted from every retained window — terminated so long ago its
-        // settled set can never be acquired. Both claims need the set. A
-        // settlement is categorically unreachable without the partner's
-        // coverage. And an abandonment turns on the partner *not* having
-        // settled, which a set nobody can read cannot establish: a
-        // certificate of this shard's covering the transaction is enough
-        // for the partner to have settled against, and whether one exists
-        // is not something a replica can answer about itself — a restart
-        // loses the tick that produced it while the certificate itself
-        // outlives the restart.
-        let Some((_, past_terminal)) = topology_schedule.at_for_shard(shard, anchored_wt) else {
-            return SettledSetVerdict::Reject;
-        };
-        if !past_terminal {
-            // `shard` is live now, but if it is scheduled to terminate it may
-            // leave the trie before it resolves this transaction — and once it
-            // does, only its settled set is authoritative. Deciding on
-            // coverage alone would then risk applying a transaction the
-            // terminating side never settled (it can produce its outcome yet
-            // still fail to receive ours before its terminal block), or
-            // abandoning one it did. Defer to its settled set, exactly as for
-            // an already-terminated shard.
-            if topology_schedule.termination_scheduled(shard, anchored_wt) {
-                defer = true;
+        match partner_evidence(topology_schedule, shard, anchored_wt) {
+            // Gone for good. Both claims need the set: a settlement is
+            // unreachable without the partner's coverage, and an
+            // abandonment turns on the partner *not* having settled,
+            // which a set nobody can read cannot establish — a
+            // certificate of this shard's covering the transaction is
+            // enough for the partner to have settled against, and
+            // whether one exists is not something a replica can answer
+            // about itself.
+            Evidence::Unreadable => return SettledSetVerdict::Reject,
+            // `shard` is live now, but if it is scheduled to terminate it
+            // may leave the trie before it resolves this transaction — and
+            // once it does, only its settled set is authoritative. Deciding
+            // on coverage alone would then risk applying a transaction the
+            // terminating side never settled, or abandoning one it did.
+            // Defer to its settled set, exactly as for an already
+            // terminated shard.
+            Evidence::Live { terminating } => {
+                defer |= terminating;
+                continue;
             }
-            continue;
-        }
-        // The evidence window, read off the judging anchor's own snapshot,
-        // where the beacon's handoff-complete stamp lands. An anchor
-        // before the stamp reads an open window; one after it reads the
-        // expiry the stamp fixes; one where the boundary record is gone
-        // reads a window the beacon already closed and swept.
-        match topology_schedule.lookup(anchored_wt) {
-            WindowLookup::Window(window) => match window.boundary(shard) {
-                None => return SettledSetVerdict::Reject,
-                Some(anchor)
-                    if anchor.handoff_complete.is_some_and(|done| {
-                        anchored_wt > topology_schedule.windows().handoff_evidence_expiry(done)
-                    }) =>
-                {
-                    return SettledSetVerdict::Reject;
-                }
-                Some(_) => {}
-            },
             // The judging anchor's window hasn't folded yet — transient
             // lag, the same hold the missing set takes below.
-            WindowLookup::NotYetCommitted => {
+            Evidence::Unknown => {
                 defer = true;
                 continue;
             }
-            // Below the schedule floor nothing about the window is
-            // readable, which rejects for the same reason eviction does.
-            WindowLookup::Evicted => return SettledSetVerdict::Reject,
+            Evidence::Readable => {}
         }
         match settled_sets.get(&shard) {
             // The partner's verdict, read the way the claim needs it: a
@@ -273,8 +304,9 @@ mod tests {
                         height: BlockHeight::new(9),
                         weighted_timestamp: wt(CUT_MS),
                         witness_base: BeaconWitnessLeafCount::ZERO,
-                        terminal_roots: None,
+                        terminal_settled_txs: None,
                         handoff_complete: *handoff_complete,
+                        terminal_epoch: None,
                     },
                 )
             })

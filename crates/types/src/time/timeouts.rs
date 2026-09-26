@@ -19,9 +19,9 @@
 
 use std::time::Duration;
 
-use hyperscale_vm_types::{ARTIFACT_GRACE_MS, COMMITTED_GRACE_MS, CROSSING_GRACE_MS};
+use hyperscale_vm_types::{ARTIFACT_GRACE_MS, COMMITTED_GRACE_MS};
 
-use crate::{CLAIM_WINDOW, MAX_VALIDITY_RANGE, TERMINAL_EVIDENCE_EPOCHS};
+use crate::MAX_VALIDITY_RANGE;
 
 /// The longest a cross-shard transaction may take to finalize, past the
 /// last block that could have included it.
@@ -75,17 +75,20 @@ pub const RETENTION_HORIZON: Duration =
 /// How far back a chain is folded to rebuild the committed-artifact
 /// dedup window.
 ///
-/// The widest of the index's tiers. A transaction is held to the close of
-/// its delivery window — one [`MAX_VALIDITY_RANGE`] past a validity end
-/// that may itself sit a whole range past the block that committed it —
-/// so an entry still live can come from a block two ranges back. The
-/// resolution and provision tiers are keyed at most
-/// [`RETENTION_HORIZON`] past their own block, which this covers.
-pub const DEDUP_WINDOW: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
+/// One figure for every tier, and they are one figure rather than three
+/// that happen to agree. A verdict is held to its transaction's deadline
+/// ([`admissible_until`](crate::admissible_until)), which sits at most
+/// this far past the block at anchor `A` that carried the transaction: a
+/// validity range to the end, a finalization delay past that. The
+/// provision tier keys `A + RETENTION_HORIZON` outright, and a
+/// finalization's deadline is its transaction's. So the walk's depth and
+/// the entries it keeps move together. A committed transaction is not a
+/// tier: its marker in the chain's own state answers for it.
+pub const DEDUP_WINDOW: Duration = RETENTION_HORIZON;
 
 const _: () = assert!(
-    DEDUP_WINDOW.as_secs() >= RETENTION_HORIZON.as_secs(),
-    "the dedup walk covers every tier of the index it rebuilds",
+    DEDUP_WINDOW.as_secs() == RETENTION_HORIZON.as_secs(),
+    "the dedup walk is exactly as deep as the tiers it rebuilds",
 );
 
 /// How far back a chain is folded to rebuild the fee reservations the
@@ -98,11 +101,10 @@ const _: () = assert!(
 /// that. So a hold still engaged can come from a block that far back, and
 /// the walk has to reach it or the ledger it seeds under-counts.
 ///
-/// Deeper than [`DEDUP_WINDOW`] by exactly [`MAX_FINALIZATION_DELAY`],
-/// which is the term the dedup tiers' arithmetic does not carry: their
-/// deepest entry is a delivery window past a validity end, where this one
-/// is a settlement window past it. The two walks share a descent and each
-/// tier stops at its own floor.
+/// Deeper than [`DEDUP_WINDOW`], whose deepest entry stands to its
+/// transaction's own deadline where a hold ends one settlement window
+/// past it. The two walks share a descent and each tier stops at its own
+/// floor, so this is the figure the descent is floored at.
 pub const FEE_HOLD_WINDOW: Duration =
     Duration::from_secs(RETENTION_HORIZON.as_secs() + MAX_VALIDITY_RANGE.as_secs());
 
@@ -133,19 +135,6 @@ const _: () = assert!(
     "a committed cell lives to the close of the window its absence answers in",
 );
 
-/// The exception is the crossing, whose cells are swept where the claim
-/// window closes: swept earlier and the proof would license a reclaim of
-/// state already gone, retained later and it is state nobody can retire.
-/// And the claim window is the terminal evidence span, so a record a
-/// successor inherits across a cut stays decidable for as long as any
-/// other reshape evidence is readable — which is the whole reason this
-/// family is not on the default.
-const _: () = assert!(
-    (MAX_FINALIZATION_DELAY.as_secs() + CLAIM_WINDOW.as_secs()) * 1_000 == CROSSING_GRACE_MS
-        && EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS * 1_000 == CROSSING_GRACE_MS,
-    "a crossing's grace is the deadline plus the claim window, sized at the reshape span",
-);
-
 /// The horizon must not outlive the epoch that produced what it retains.
 ///
 /// A reshape's cut is scheduled one window ahead, so a successor
@@ -154,6 +143,20 @@ const _: () = assert!(
 /// reshape spans, and the successor has to fetch below what it already
 /// walks. Half an epoch is the working margin, not the hard bound.
 const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
+
+/// A transaction predates at most one cut on its lineage.
+///
+/// Cuts on one lineage fall on epoch boundaries at least an epoch apart,
+/// so a transaction still admissible after a cut opened after the one
+/// before it: a successor judges it by its parent's markers alone, never
+/// a grandparent's. The figure is the validity range because the precut
+/// question is only asked at anchors below the range's end. Implied by
+/// the assertion above, and stated because it is the premise the precut
+/// rule reads.
+const _: () = assert!(
+    MAX_VALIDITY_RANGE.as_secs() < EPOCH_DURATION.as_secs(),
+    "a transaction predates at most one cut",
+);
 
 /// A skipped epoch and its recovery must not expire the transactions a
 /// shard is holding. `SKIP_TIMEOUT` bounds the wait before the pool
@@ -218,30 +221,6 @@ pub const PROGRESS_WAIT_MULTIPLIER: u32 = 3;
 /// cleanup interval, which is the retained member's local knob and not
 /// something the waiting member can read.
 pub const HALT_HARVEST_WAIT: Duration = Duration::from_secs(10);
-
-/// How long past a counterpart's claiming vote its claim cell becomes
-/// readable in that counterpart's committed state.
-///
-/// The vote anchor a certificate speaks at is where the counterpart's
-/// execution ran, and the cell it writes lands where the tick casting
-/// that vote commits — a few of that shard's blocks later. A probe
-/// before then is certain to miss, and costs more than the fetch it
-/// wastes: a claim is held to each voter's own reading, so members
-/// polling on their own fetch latencies hold readings at different
-/// heights and a block claiming one sends the rest to fetch it again.
-/// Measured from the anchor the certificate names, which every member
-/// reads the same, so they ask one question at one height.
-///
-/// Sized well above a handful of block intervals and far under the
-/// windows a reading answers in, which run to minutes. A counterpart
-/// slower than this is asked again at a newer header, as before; one
-/// faster is retired a moment later than it might have been.
-pub const CLAIM_VISIBILITY_LAG: Duration = Duration::from_secs(1);
-
-const _: () = assert!(
-    CLAIM_VISIBILITY_LAG.as_secs() * 20 < MAX_VALIDITY_RANGE.as_secs(),
-    "the wait before a claim is asked about is a rounding error against the window it answers in",
-);
 
 /// Beacon-chain epoch length, measured against committed beacon-slot
 /// `weighted_timestamp`.

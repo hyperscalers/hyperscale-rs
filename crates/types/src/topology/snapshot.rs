@@ -14,7 +14,7 @@ use hyperscale_vm_types::PriceTable;
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
     DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, SeedRing,
-    ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction, ValidatorId,
+    SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
     ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
@@ -56,21 +56,26 @@ pub struct ShardAnchor {
     /// header's `beacon_witness_root`. Serving shards retain persisted
     /// witness payloads down to this index.
     pub witness_base: BeaconWitnessLeafCount,
-    /// The terminated shard's beacon-attested [`TerminalRoots`], set only
-    /// on a terminal boundary record and `None` for a live shard's anchor.
+    /// The terminated shard's beacon-attested settled-transaction root,
+    /// set only on a terminal boundary record and `None` for a live
+    /// shard's anchor.
     ///
-    /// A surviving counterpart reads the settled half to resolve
-    /// split-straddling ticks; a reshape successor reads the committed
-    /// half to tell a replay of something the predecessor committed from a
-    /// first inclusion it never made. Both also take them off the terminal
-    /// header directly — this is the durable copy a restart, or a
-    /// validator seated after the flip, recovers them from.
-    pub terminal_roots: Option<TerminalRoots>,
+    /// A surviving counterpart reads it to resolve split-straddling
+    /// ticks, and also takes it off the terminal header directly — this
+    /// is the durable copy a restart, or a validator seated after the
+    /// flip, recovers it from.
+    pub terminal_settled_txs: Option<SettledTxsRoot>,
     /// The epoch the beacon fold first observed this terminal shard's
     /// reshape successors live. The terminal-evidence window counts from
     /// here; `None` while the handoff is pending (an open window), and
     /// always `None` for a live shard's anchor.
     pub handoff_complete: Option<Epoch>,
+    /// The epoch whose cut this shard's chain terminates at, once a
+    /// reshape scheduled it; `None` for a live shard. The end of that
+    /// epoch's window is the shard's terminal cut, so a window carrying
+    /// the record answers where the departed chain ended without walking
+    /// the schedule.
+    pub terminal_epoch: Option<Epoch>,
 }
 
 /// One reshape cohort seat as the topology projects it.
@@ -945,6 +950,14 @@ impl TopologySnapshot {
         self.boundaries.get(&shard).copied()
     }
 
+    /// Every shard's beacon-attested boundary anchor this snapshot
+    /// carries.
+    pub fn boundaries(&self) -> impl Iterator<Item = (ShardId, ShardAnchor)> + '_ {
+        self.boundaries
+            .iter()
+            .map(|(&shard, &anchor)| (shard, anchor))
+    }
+
     /// Whether the beacon fold has observed `shard` cross a boundary past its
     /// seeded genesis — it is producing on its own chain, not merely seeded.
     /// `false` for a freshly seeded reshape successor until its first crossing
@@ -1554,8 +1567,9 @@ mod tests {
             height: BlockHeight::new(42),
             weighted_timestamp: WeightedTimestamp::from_millis(42),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            terminal_roots: None,
+            terminal_settled_txs: None,
             handoff_complete: None,
+            terminal_epoch: None,
         };
         let mut boundaries = HashMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);
