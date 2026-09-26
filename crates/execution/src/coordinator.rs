@@ -50,6 +50,7 @@ use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Member, Runs, Unclaimable, never_answer};
+use hyperscale_engine::tick_select::{ProvisionalCells, Requirement, requirements_of};
 use hyperscale_engine::{
     CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
@@ -89,8 +90,7 @@ use crate::lookups::{
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
 use crate::parked_claims::ParkedClaims;
-use crate::provisional::ProvisionalCells;
-use crate::provisioning::{ProvisioningTracker, Requirement, WantedRecord, requirements_of};
+use crate::provisioning::{ProvisioningTracker, WantedRecord};
 use crate::tick_state::{Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::vote_tracker::VoteTracker;

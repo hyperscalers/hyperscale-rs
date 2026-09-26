@@ -36,6 +36,7 @@ pub mod genesis;
 pub mod legs;
 /// Shard assignment and write filtering for `StateWrites`.
 pub mod sharding;
+pub mod tick_select;
 
 pub use backend::Availability;
 pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};

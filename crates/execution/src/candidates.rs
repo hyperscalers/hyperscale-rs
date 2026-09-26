@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs};
+use hyperscale_engine::tick_select::ProvisionalCells;
 use hyperscale_types::{
     EscrowedValue, Joins, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
 
-use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
 use crate::tick_state::Membership;
 

@@ -17,41 +17,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, Member, live_record};
+use hyperscale_engine::legs::live_record;
+use hyperscale_engine::tick_select::Requirement;
 use hyperscale_types::{
     MAX_FINALIZATION_DELAY, Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry,
     SubstateKey, TxHash, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{CrossingCell, Kind};
-use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
-
-/// One thing a cross-shard member waits for before it can run.
-///
-/// The kind is part of the key, because a shard can owe both and an
-/// arrival of one must not read as an answer to the other. What a member
-/// files is its execution scope minus itself: a member running only its
-/// own legs files no [`CommittedState`](Self::CommittedState) at all, a
-/// core member files one per other core shard, and any member consuming
-/// a value edge its own shard does not produce files the
-/// [`Crossing`](Self::Crossing) for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Requirement {
-    /// A counterpart's committed state for the transaction, carried by a
-    /// bundle from that shard.
-    CommittedState(ShardId),
-    /// A crossing's record cell, read live by a committed state claim
-    /// naming the transaction as its issuer.
-    ///
-    /// The key alone: the record sits under the producer's prefix, and
-    /// admission holds the claim's anchor to the shard that owned that
-    /// prefix at the anchor's own clock, so whoever wrote it, a claim
-    /// that admits speaks for the one root the record means anything
-    /// under. The same claim is what the arrival is read from.
-    Crossing {
-        /// The record cell.
-        key: SubstateKey,
-    },
-}
+use hyperscale_vm_effects::CrossingCell;
 
 /// A crossing record a consumer here waits on and has no arrival for:
 /// what the fallback read asks a producer's chain for.
@@ -68,74 +40,6 @@ pub struct WantedRecord {
     /// `None` where only the producer's certificate arms it. The
     /// certificate arms either sooner.
     pub arms_at: Option<WeightedTimestamp>,
-}
-
-/// What `member`, a divided member of a transaction with these `legs`,
-/// files before it can run: its execution scope minus itself, and the
-/// crossings the legs it runs consume.
-#[must_use]
-pub fn requirements_of(member: &Member, legs: &[LegShape]) -> BTreeSet<Requirement> {
-    divided_requirements(legs, member.classified(), member.local())
-}
-
-/// What a divided member of a transaction files: its execution scope
-/// minus itself, and the crossings the legs it runs consume.
-///
-/// A member running only its own legs is in no core set and files no
-/// committed state at all; a core member files one per other core shard;
-/// and either files a crossing for every escrowed value edge landing on
-/// it from a node it does not run. Nothing else — the engagement exchange a whole
-/// shape files is not here, since a divided member's inbound escrow is
-/// its engagement and the crossing bundle it consumes is its
-/// counterpart's commitment.
-#[must_use]
-pub fn divided_requirements(
-    legs: &[LegShape],
-    classified: &Classified,
-    local: ShardId,
-) -> BTreeSet<Requirement> {
-    let mut requirements: BTreeSet<Requirement> = BTreeSet::new();
-    let core = classified.core();
-
-    if core.contains(&local) {
-        requirements.extend(
-            core.iter()
-                .filter(|&&shard| shard != local)
-                .map(|&shard| Requirement::CommittedState(shard)),
-        );
-    }
-    // Every member admits the whole manifest, and admission resolves a
-    // component call against the target's own record — a declared read
-    // of its leaf, provisioned by the shard holding it. So a member waits
-    // for the commit-time bundle of every remote shard holding a
-    // component the transaction calls, which is where the records it
-    // cannot read itself arrive. A principal has no record to read, so a
-    // transaction reaching only accounts waits on nobody here, and a
-    // shard that only takes delivery commits nothing and sends no bundle.
-    if let Some(trie) = classified.placement() {
-        requirements.extend(
-            legs.iter()
-                .filter(|leg| leg.target.class() == AddressClass::Component)
-                .map(|leg| trie.shard_for_prefix(leg.target))
-                .filter(|&shard| shard != local && classified.commits_at(shard))
-                .map(Requirement::CommittedState),
-        );
-    }
-    // A member waits only on the escrowed arrivals feeding its core
-    // share: an owed crossing is credited by the consumer's commit fold,
-    // and an inbound leg consumes nothing that crosses, so a member on
-    // the far side of a core waits on nothing at all — which is what
-    // lets the core's arrival exist in the first place.
-    requirements.extend(
-        classified
-            .edges()
-            .iter()
-            .filter(|edge| edge.to.contains(&local) && edge.crossing.kind == Kind::Escrowed)
-            .map(|edge| Requirement::Crossing {
-                key: edge.crossing.id.record_key(&ProtocolHasher),
-            }),
-    );
-    requirements
 }
 
 /// The environment a source block's bundle carries for the transactions
@@ -539,12 +443,15 @@ impl ProvisioningTracker {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_engine::legs::Classified;
+    use hyperscale_engine::tick_select::divided_requirements;
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         BlockHeight, Hash, MAX_STATE_ENTRIES_PER_TX, MerkleInclusionProof, ProvisionEntry,
         ShardTrie,
     };
+    use hyperscale_vm_types::{LegShape, ProtocolHasher};
 
     use super::*;
     use crate::fixtures;

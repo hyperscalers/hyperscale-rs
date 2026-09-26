@@ -264,7 +264,9 @@ mod tests {
     /// finalization delay later on the clock alone.
     #[test]
     fn a_pure_legs_consumer_arms_on_the_finalization_delay() {
-        use crate::provisioning::{ProvisioningTracker, Requirement};
+        use hyperscale_engine::tick_select::Requirement;
+
+        use crate::provisioning::ProvisioningTracker;
 
         let filed = WeightedTimestamp::from_millis(7_000);
         let mut provisioning = ProvisioningTracker::new();
