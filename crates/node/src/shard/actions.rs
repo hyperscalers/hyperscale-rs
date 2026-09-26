@@ -17,6 +17,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
     Anchor, BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, ShardId, SubstateKey,
     TerminalEvidence, TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
+    WeightedTimestamp,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -201,12 +202,14 @@ where
                 certified,
                 source,
                 witness,
+                committee_anchor,
             } => {
                 self.accept_block_commit(PendingCommit {
                     certified,
                     source,
                     committed_notified: false, // set by accumulate
                     witness,
+                    committee_anchor,
                 });
             }
             Action::CommitBlockByQcOnly {
@@ -218,6 +221,7 @@ where
                 frontier,
                 source,
                 witness,
+                committee_anchor,
             } => {
                 self.accept_qc_only_commit(QcOnlyCommit {
                     certified,
@@ -228,6 +232,7 @@ where
                     frontier,
                     source,
                     witness,
+                    committee_anchor,
                 });
             }
             Action::AttachCertifiedUncommitted { certified } => {
@@ -394,6 +399,7 @@ where
             frontier,
             source,
             witness,
+            committee_anchor,
         } = commit;
         let block_hash = certified.block().hash();
         let height = certified.block().height();
@@ -421,6 +427,7 @@ where
             source,
             kind,
             witness,
+            committee_anchor,
         };
         if let Some(to_process) = self.io.block_commit.try_acquire_qc_only_slot(pending) {
             self.process_qc_only(to_process);
@@ -447,6 +454,7 @@ where
                         source: pending.source,
                         committed_notified: false,
                         witness: pending.witness,
+                        committee_anchor: pending.committee_anchor,
                     });
                     match self.io.block_commit.release_qc_only_slot() {
                         Some(next) => pending = next,
@@ -483,6 +491,7 @@ where
                     certified,
                     source,
                     witness,
+                    committee_anchor,
                     ..
                 } = pending;
                 match result {
@@ -493,6 +502,7 @@ where
                             certified,
                             source,
                             witness,
+                            committee_anchor,
                         },
                     ),
                     Err(div) => push_shard_input(
@@ -514,12 +524,14 @@ where
         certified: Arc<Verified<CertifiedBlock>>,
         source: CommitSource,
         witness: BeaconWitnessCommit,
+        committee_anchor: WeightedTimestamp,
     ) {
         self.accept_block_commit(PendingCommit {
             certified,
             source,
             committed_notified: false,
             witness,
+            committee_anchor,
         });
         if let Some(next) = self.io.block_commit.release_qc_only_slot() {
             self.process_qc_only(next);
@@ -545,6 +557,7 @@ where
             AccumulateDecision::Accepted {
                 height,
                 handle: certified,
+                committee_anchor,
                 notify_now,
             } => {
                 debug!(height = height.inner(), "Block committed");
@@ -560,7 +573,10 @@ where
                     .pending_chain
                     .attach_certified_block(block_hash, Arc::clone(&certified));
                 if notify_now {
-                    self.dispatch_event(ProtocolEvent::BlockCommitted { certified });
+                    self.dispatch_event(ProtocolEvent::BlockCommitted {
+                        certified,
+                        committee_anchor,
+                    });
                 }
             }
         }

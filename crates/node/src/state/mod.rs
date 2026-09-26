@@ -333,7 +333,10 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ── Cross-coordinator orchestration (drives the beacon too) ────
-            ProtocolEvent::BlockCommitted { certified } => self.on_block_committed(&certified),
+            ProtocolEvent::BlockCommitted {
+                certified,
+                committee_anchor,
+            } => self.on_block_committed(&certified, committee_anchor),
             ProtocolEvent::RemoteHeaderAdmitted { certified_header } => {
                 self.on_remote_header_admitted(&certified_header)
             }

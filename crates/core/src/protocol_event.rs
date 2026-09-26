@@ -221,6 +221,11 @@ pub enum ProtocolEvent {
         /// verification rides the parallel pipeline path (see the doc
         /// on [`Verified<Block>`](hyperscale_types::Verified)).
         certified: Arc<Verified<CertifiedBlock>>,
+        /// The block's committee anchor — its parent's own anchor, the
+        /// window its content is classified under. Carried from the
+        /// shard's commit, because a buffered run commits in one step and
+        /// a scalar read at fan-out names only the run's last block.
+        committee_anchor: WeightedTimestamp,
     },
 
     /// A block has been durably persisted to `RocksDB`.

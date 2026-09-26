@@ -503,7 +503,14 @@ impl SimulationRunner {
         self.schedule_event(
             host,
             self.now,
-            HostEvent::protocol(shard, ProtocolEvent::BlockCommitted { certified }),
+            HostEvent::protocol(
+                shard,
+                ProtocolEvent::BlockCommitted {
+                    // A genesis block anchors its own committee.
+                    committee_anchor: certified.block().header().parent_qc().weighted_timestamp(),
+                    certified,
+                },
+            ),
         );
         for &validator in validators {
             self.hosts[host as usize].drop_pooled_vnode(validator);

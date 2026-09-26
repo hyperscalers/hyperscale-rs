@@ -1202,6 +1202,11 @@ pub enum Action {
         /// accumulator-start index, and the resulting
         /// `leaf_count_at_block_end` stamped into the block's metadata.
         witness: BeaconWitnessCommit,
+        /// The committed block's committee anchor — its parent's own
+        /// anchor — which classifies its content downstream. Carried from the
+        /// commit rather than read at fan-out, because a buffered run commits
+        /// in one step and a scalar read afterwards names only its last block.
+        committee_anchor: WeightedTimestamp,
     },
 
     /// Commit a block trusted via QC only — no cached `PreparedCommit` exists
@@ -1240,6 +1245,11 @@ pub enum Action {
         /// Beacon-witness leaves to persist alongside the block in the
         /// same atomic write — see [`Self::CommitBlock`].
         witness: BeaconWitnessCommit,
+        /// The committed block's committee anchor — its parent's own
+        /// anchor — which classifies its content downstream. Carried from the
+        /// commit rather than read at fan-out, because a buffered run commits
+        /// in one step and a scalar read afterwards names only its last block.
+        committee_anchor: WeightedTimestamp,
     },
 
     /// Attach a certified-but-not-yet-committed block to the pending

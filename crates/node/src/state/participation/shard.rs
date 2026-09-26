@@ -63,7 +63,7 @@ use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, ShardForkProof,
-    TopologySchedule, Verifiable, Verified, drain_admits_block,
+    TopologySchedule, Verifiable, Verified, WeightedTimestamp, drain_admits_block,
 };
 
 use super::ShardParticipation;
@@ -416,6 +416,7 @@ impl ShardParticipation {
         &mut self,
         sched: &TopologySchedule,
         certified: &CertifiedBlock,
+        committee_anchor: WeightedTimestamp,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -426,10 +427,11 @@ impl ShardParticipation {
         self.execution_coordinator
             .cleanup_committed_finalizations(certified.block().certificates());
 
-        actions.extend(
-            self.execution_coordinator
-                .on_block_committed(sched, certified),
-        );
+        actions.extend(self.execution_coordinator.on_block_committed(
+            sched,
+            certified,
+            committee_anchor,
+        ));
 
         // Round voting: scan all incomplete ticks and emit votes for
         // complete ones. Single path to execution voting — abort intents
@@ -747,7 +749,13 @@ mod tests {
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(certify(
             block, /* weighted_timestamp_ms */ 1_000,
         )));
-        let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
+        let _ = node.handle(
+            past_deadline,
+            ProtocolEvent::BlockCommitted {
+                certified,
+                committee_anchor: WeightedTimestamp::ZERO,
+            },
+        );
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             1,
@@ -770,7 +778,13 @@ mod tests {
             block,
             past_deadline_ms,
         )));
-        let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
+        let _ = node.handle(
+            past_deadline,
+            ProtocolEvent::BlockCommitted {
+                certified,
+                committee_anchor: WeightedTimestamp::ZERO,
+            },
+        );
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             0,
@@ -875,7 +889,10 @@ mod tests {
         )));
         let _ = node.handle(
             LocalTimestamp::ZERO,
-            ProtocolEvent::BlockCommitted { certified },
+            ProtocolEvent::BlockCommitted {
+                certified,
+                committee_anchor: WeightedTimestamp::ZERO,
+            },
         );
 
         assert_eq!(

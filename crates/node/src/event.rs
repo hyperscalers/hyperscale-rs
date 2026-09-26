@@ -24,7 +24,7 @@ use hyperscale_types::{
     Address, BeaconWitnessCommit, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
     Hash, HeaderFetchCount, ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash,
-    ValidatorId, Verifiable, Verified,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -411,6 +411,11 @@ pub enum ShardScopedInput {
         /// shard handed the prep slot; rides back through this event so
         /// the resulting `PendingCommit` can be persisted atomically.
         witness: BeaconWitnessCommit,
+        /// The committed block's committee anchor — its parent's own
+        /// anchor — which classifies its content downstream. Carried from the
+        /// commit rather than read at fan-out, because a buffered run commits
+        /// in one step and a scalar read afterwards names only its last block.
+        committee_anchor: WeightedTimestamp,
     },
 
     /// JMT prep for a QC-only commit computed a state root that doesn't

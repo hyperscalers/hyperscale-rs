@@ -324,7 +324,12 @@ impl ExecutionSim {
             .push(Verified::<CertifiedBlock>::from_persisted(
                 certified.clone(),
             ));
-        let actions = self.coord.on_block_committed(&self.topology, &certified);
+        // The fixture's blocks all extend the genesis QC, so each one's
+        // committee anchor is its own.
+        let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
+        let actions = self
+            .coord
+            .on_block_committed(&self.topology, &certified, committee_anchor);
         self.absorb(actions);
         // Persistence follows the commit, which is when the chain evicts
         // the folds it believes the base now covers.
@@ -384,7 +389,12 @@ impl ExecutionSim {
             .push(Verified::<CertifiedBlock>::from_persisted(
                 certified.clone(),
             ));
-        let actions = self.coord.on_block_committed(&self.topology, &certified);
+        // The fixture's blocks all extend the genesis QC, so each one's
+        // committee anchor is its own.
+        let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
+        let actions = self
+            .coord
+            .on_block_committed(&self.topology, &certified, committee_anchor);
         self.absorb(actions);
         self.chain.prune_persisted(self.height);
         self.release_due();

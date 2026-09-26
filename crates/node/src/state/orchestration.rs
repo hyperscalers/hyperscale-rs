@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    Anchor, CertifiedBlock, CertifiedBlockHeader, Verified, derive_block_transactions,
+    Anchor, CertifiedBlock, CertifiedBlockHeader, Verified, WeightedTimestamp,
+    derive_block_transactions,
 };
 
 use super::NodeStateMachine;
@@ -47,6 +48,7 @@ impl NodeStateMachine {
     pub(super) fn on_block_committed(
         &mut self,
         certified: &Verified<CertifiedBlock>,
+        committee_anchor: WeightedTimestamp,
     ) -> Vec<Action> {
         let Some(s) = self.shard.as_mut() else {
             return Vec::new();
@@ -132,9 +134,11 @@ impl NodeStateMachine {
                 .on_verified_source_header(&certified_header),
         );
 
-        actions.extend(
-            s.apply_block_to_execution(self.beacon_coordinator.topology_schedule(), certified),
-        );
+        actions.extend(s.apply_block_to_execution(
+            self.beacon_coordinator.topology_schedule(),
+            certified,
+            committee_anchor,
+        ));
 
         // The first coast commit quiesces the chain's content: finalization is a
         // finalization in a later block, and no later content block will

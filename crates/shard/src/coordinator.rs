@@ -277,6 +277,7 @@ enum RetainedTip {
 }
 
 /// One transaction's contribution to its payer's fee demand.
+#[derive(Clone)]
 struct PayerFee {
     /// The payer's fee vault.
     vault: SubstateKey,
@@ -399,12 +400,13 @@ pub struct ShardCoordinator {
     /// The figures an abandonment record must restate for every
     /// committed transaction a record may still name — what the vote
     /// fence checks a record's entries against.
-    /// Fee-reservation verifications whose balance-read anchor the local
-    /// commit pipeline hasn't materialized yet: block hash → (demands,
-    /// anchor). The anchor is ancestry-proven, so the commit that
-    /// materializes it is coming; `record_block_committed` dispatches
-    /// these as it lands.
-    deferred_reservation_checks: HashMap<BlockHash, (Vec<FeeDemand>, BlockHeight)>,
+    /// Fee-reservation verifications whose balance-read height the local
+    /// commit pipeline hasn't materialized yet: block hash → (the block's
+    /// local payer fees, the read height). The height is ancestry-proven,
+    /// so the commit that materializes it is coming, and
+    /// `record_block_committed` sums the demand and dispatches as it
+    /// lands, with the holds read at that height.
+    deferred_reservation_checks: HashMap<BlockHash, (Vec<PayerFee>, BlockHeight)>,
     /// Rounds of recently committed blocks by height — the committed
     /// half of the ancestry walk in
     /// [`Self::ancestry_committed_height`], covering ancestors already
@@ -729,7 +731,10 @@ impl ShardCoordinator {
             // Seeded from the same descent the dedup index takes: an
             // empty ledger under-counts held demand for every payer
             // whose transactions committed before this process did.
-            fee_ledger: FeeReservationLedger::seeded(&recovered.dedup.fee_holds),
+            fee_ledger: FeeReservationLedger::seeded(
+                &recovered.dedup.fee_holds,
+                recovered.committed_height,
+            ),
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
@@ -863,10 +868,11 @@ impl ShardCoordinator {
     /// consecutive heights to QC verification in parallel, so the parent is
     /// usually still in flight rather than applied. Falls back to the block's
     /// own anchor when no route holds the parent at all — the first block of
-    /// a sync window, or one whose parent sits below retention. That names
-    /// the same committee except when the block is an epoch's first, and it
-    /// is self-healing: the next arrival resolves exactly once its parent
-    /// lands.
+    /// a sync window, or a canonical child extending a sibling of the block
+    /// this node applied, whose verification is how the orphan is found.
+    /// That names the same committee except when the block is an epoch's
+    /// first, and it is self-healing: the next arrival resolves exactly once
+    /// its parent lands.
     fn synced_committee_anchor_wt(&self, header: &BlockHeader) -> WeightedTimestamp {
         let parent = header.parent_block_hash();
         self.block_anchor(parent)
@@ -2586,7 +2592,15 @@ impl ShardCoordinator {
                         attested_by: None,
                     }),
                 );
-                self.fee_demands(&payer_seeds, parent_block_hash)
+                // Read at the height the build reads the balance at, or at
+                // the tip where that height has left the release ring; a
+                // voter that cannot read it withholds anyway.
+                let read_height = self.ancestry_committed_height(&parent_qc);
+                self.fee_demands(&payer_seeds, parent_block_hash, read_height)
+                    .or_else(|| {
+                        self.fee_demands(&payer_seeds, parent_block_hash, self.committed_height)
+                    })
+                    .unwrap_or_default()
             }
             ProposalKind::Fallback | ProposalKind::Sync => Vec::new(),
         };
@@ -3660,17 +3674,43 @@ impl ShardCoordinator {
                     attested_by: Some(tx.attested_by().to_vec()),
                 }),
             );
-            let fee_demands = self.fee_demands(&block_fees, block.header().parent_block_hash());
             let fee_read_height = self.ancestry_committed_height(block.header().parent_qc());
             let fee_read_ready = fee_read_height <= self.committed_height;
-            if !fee_read_ready && !fee_demands.is_empty() {
-                // The anchor's commit is proven but hasn't landed in the
-                // local pipeline yet; hold the demands and dispatch from
-                // `record_block_committed` when it does.
-                self.deferred_reservation_checks
-                    .entry(block_hash)
-                    .or_insert_with(|| (fee_demands.clone(), fee_read_height));
-            }
+            let fee_demands = if fee_read_ready {
+                // Holds read at the height the balance is read at, so
+                // voters at different tips sum one demand. A height below
+                // the release ring is one this node cannot answer for.
+                let Some(demands) = self.fee_demands(
+                    &block_fees,
+                    block.header().parent_block_hash(),
+                    fee_read_height,
+                ) else {
+                    trace!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        read_height = fee_read_height.inner(),
+                        "Fee holds at the read height are no longer held — withholding the vote"
+                    );
+                    return vec![];
+                };
+                demands
+            } else {
+                // The read height's commit is proven but hasn't landed in
+                // the local pipeline yet; hold the fees and sum the demand
+                // from `record_block_committed` when it does. Summed now,
+                // only to mark the check outstanding.
+                if !block_fees.is_empty() {
+                    self.deferred_reservation_checks
+                        .entry(block_hash)
+                        .or_insert_with(|| (block_fees.clone(), fee_read_height));
+                }
+                self.fee_demands(
+                    &block_fees,
+                    block.header().parent_block_hash(),
+                    self.committed_height,
+                )
+                .unwrap_or_default()
+            };
             let verification_actions = self.verification.initiate_block_verifications(
                 committee,
                 topology_schedule,
@@ -3725,7 +3765,12 @@ impl ShardCoordinator {
     /// the sum can sit under what is really in flight; a fee settled past
     /// the vault takes what is there rather than refusing, because no
     /// engine judged that charge against a balance.
-    fn fee_demands(&self, fees: &[PayerFee], parent_block_hash: BlockHash) -> Vec<FeeDemand> {
+    fn fee_demands(
+        &self,
+        fees: &[PayerFee],
+        parent_block_hash: BlockHash,
+        read_height: BlockHeight,
+    ) -> Option<Vec<FeeDemand>> {
         let mut demands: BTreeMap<SubstateKey, FeeDemand> = BTreeMap::new();
         for fee in fees {
             let entry = demands.entry(fee.vault).or_insert_with(|| FeeDemand {
@@ -3738,7 +3783,7 @@ impl ShardCoordinator {
             entry.attesting_sets.extend(fee.attested_by.clone());
         }
         if demands.is_empty() {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let mut cursor = parent_block_hash;
         while let Some(pending) = self.pending_blocks.get(cursor) {
@@ -3756,11 +3801,12 @@ impl ShardCoordinator {
             cursor = pending.header().parent_block_hash();
         }
         for demand in demands.values_mut() {
-            demand.demand = demand
-                .demand
-                .saturating_add(self.fee_ledger.held_for(demand.vault.owner));
+            let held = self
+                .fee_ledger
+                .held_for_at(demand.vault.owner, read_height)?;
+            demand.demand = demand.demand.saturating_add(held);
         }
-        demands.into_values().collect()
+        Some(demands.into_values().collect())
     }
 
     /// The highest height a block's own ancestry proves committed,
@@ -5051,7 +5097,7 @@ impl ShardCoordinator {
             |pending| pending.manifest().clone(),
         );
         self.register_dedup_artifacts(block, &manifest);
-        self.register_fee_holds(topology_schedule, block, commit_ts);
+        self.register_fee_holds(block);
 
         // Derive this block's beacon-witness leaves from the same
         // canonical sources the proposer used (receipts from finalized
@@ -5192,24 +5238,25 @@ impl ShardCoordinator {
             .register_committed_engagements(&block.engagements(), anchor);
     }
 
-    /// Commit-time fee-ledger bookkeeping: engage reservations for the
-    /// block's local payers, release those its finalizations resolve,
-    /// and prune holds whose deadlines passed — the cover for
-    /// resolution paths that never produce a certificate (a reshape
-    /// terminal's abort by omission).
-    fn register_fee_holds(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block: &Block,
-        commit_ts: WeightedTimestamp,
-    ) {
-        let trie = topology_schedule.head().shard_trie();
-        let local_shard = self.local_shard;
+    /// Commit-time fee-ledger bookkeeping: engage the block's
+    /// reservations, whoever pays them, release those its finalizations
+    /// resolve, and prune holds whose deadlines passed at the block's own
+    /// anchor — the cover for resolution paths that never produce a
+    /// certificate (a reshape terminal's abort by omission). Which payers
+    /// this shard answers for is asked where a demand is summed, of the
+    /// judged block's committee.
+    fn register_fee_holds(&mut self, block: &Block) {
+        let height = block.height();
         self.fee_ledger.register_committed(block.transactions());
-        self.fee_ledger.release_finalized(block.certificates());
         self.fee_ledger
-            .retain_payers(|payer| trie.shard_for_prefix(payer) == local_shard);
-        self.fee_ledger.prune(commit_ts);
+            .release_finalized(block.certificates(), height);
+        self.fee_ledger
+            .prune(block.header().parent_qc().weighted_timestamp(), height);
+        self.fee_ledger.retire_below(BlockHeight::new(
+            height
+                .inner()
+                .saturating_sub(COMMITTED_ROUNDS_HORIZON as u64),
+        ));
     }
 
     /// Dispatch fee-reservation verifications whose ancestry-proven
@@ -5221,21 +5268,31 @@ impl ShardCoordinator {
         height: BlockHeight,
         actions: &mut Vec<Action>,
     ) {
-        let pending_blocks = &self.pending_blocks;
-        self.deferred_reservation_checks
-            .retain(|deferred_hash, (demands, anchor)| {
-                if *anchor > height {
-                    return true;
-                }
-                if pending_blocks.get(*deferred_hash).is_some() {
-                    actions.push(Action::VerifyReservations {
-                        block_hash: *deferred_hash,
-                        demands: std::mem::take(demands),
-                        read_height: *anchor,
-                    });
-                }
-                false
-            });
+        for (block_hash, (fees, read_height)) in
+            std::mem::take(&mut self.deferred_reservation_checks)
+        {
+            if read_height > height {
+                self.deferred_reservation_checks
+                    .insert(block_hash, (fees, read_height));
+                continue;
+            }
+            let Some(parent) = self
+                .pending_blocks
+                .get(block_hash)
+                .map(|pending| pending.header().parent_block_hash())
+            else {
+                continue;
+            };
+            // Summed now, with the holds read at the height the balance
+            // is read at, as a voter already at that height sums it.
+            if let Some(demands) = self.fee_demands(&fees, parent, read_height) {
+                actions.push(Action::VerifyReservations {
+                    block_hash,
+                    demands,
+                    read_height,
+                });
+            }
+        }
     }
 
     /// Drive the commit chain: commit the given block, then any buffered
@@ -5353,11 +5410,16 @@ impl ShardCoordinator {
         self.record_leader_activity();
 
         let proposer = certified.block().header().proposer();
+        // The committed block's committee anchor, which the commit just
+        // moved into place: the event carries it so each block of a
+        // buffered run is classified under its own.
+        let committee_anchor = self.committed_committee_anchor_wt;
         actions.push(if state_root_verified {
             Action::CommitBlock {
                 certified: Arc::clone(certified),
                 source,
                 witness,
+                committee_anchor,
             }
         } else {
             Action::CommitBlockByQcOnly {
@@ -5369,6 +5431,7 @@ impl ShardCoordinator {
                 frontier: FrontierInputs::of_block(certified.block(), topology_schedule.windows()),
                 source,
                 witness,
+                committee_anchor,
             }
         });
 
@@ -7756,6 +7819,55 @@ mod tests {
                 "transaction {seed}"
             );
         }
+    }
+
+    /// A buffered run commits in one step, and each block's commit carries
+    /// its own committee anchor: K's is its parent's anchor, in the window
+    /// before the cut, and K+1's is K's own. A scalar read after the run
+    /// would name K+1's for both.
+    #[test]
+    fn a_batched_commit_classifies_each_block_under_its_own_anchor() {
+        let (mut state, schedule) = make_test_state();
+        let from = BlockHash::from_raw(Hash::from_bytes(b"batched tip"));
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = from;
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(500);
+        let k = block_chained_on(BlockHeight::new(1), from, 1_500);
+        let k1 = block_chained_on(BlockHeight::new(2), k.hash(), 1_700);
+        let certified = |block: &Block| {
+            let qc = make_test_qc(block.hash(), block.height());
+            Arc::new(Verified::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(block.clone(), qc),
+            ))
+        };
+        let anchors = |actions: &[Action]| -> Vec<WeightedTimestamp> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::CommitBlock {
+                        committee_anchor, ..
+                    }
+                    | Action::CommitBlockByQcOnly {
+                        committee_anchor, ..
+                    } => Some(*committee_anchor),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let early =
+            state.on_block_ready_to_commit(&schedule, certified(&k1), CommitSource::Aggregator);
+        assert!(anchors(&early).is_empty(), "K+1 waits for K");
+        let run =
+            state.on_block_ready_to_commit(&schedule, certified(&k), CommitSource::Aggregator);
+        assert_eq!(
+            anchors(&run),
+            vec![
+                WeightedTimestamp::from_millis(500),
+                WeightedTimestamp::from_millis(1_500)
+            ],
+        );
+        assert_eq!(state.committed_height, BlockHeight::new(2));
     }
 
     /// The proposer's pre-filter and a voter's committed arm read one

@@ -993,7 +993,18 @@ impl SimulationRunner {
             self.schedule_event(
                 host_index,
                 self.now,
-                HostEvent::protocol(shard, ProtocolEvent::BlockCommitted { certified }),
+                HostEvent::protocol(
+                    shard,
+                    ProtocolEvent::BlockCommitted {
+                        // A genesis block anchors its own committee.
+                        committee_anchor: certified
+                            .block()
+                            .header()
+                            .parent_qc()
+                            .weighted_timestamp(),
+                        certified,
+                    },
+                ),
             );
         }
 

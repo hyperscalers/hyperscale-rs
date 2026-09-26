@@ -83,6 +83,11 @@ pub struct QcOnlyCommit {
     pub(crate) source: CommitSource,
     /// Beacon-witness leaves to fold into the commit.
     pub(crate) witness: BeaconWitnessCommit,
+    /// The committed block's committee anchor — its parent's own
+    /// anchor — which classifies its content downstream. Carried from the
+    /// commit rather than read at fan-out, because a buffered run commits
+    /// in one step and a scalar read afterwards names only its last block.
+    pub(crate) committee_anchor: WeightedTimestamp,
 }
 
 /// A QC-only commit waiting on the single in-flight slot. Every
@@ -122,6 +127,11 @@ pub struct QcOnlyPending {
     /// `PendingCommit` queued for `flush` has the same data the
     /// original `Action::CommitBlockByQcOnly` supplied.
     pub(crate) witness: BeaconWitnessCommit,
+    /// The committed block's committee anchor — its parent's own
+    /// anchor — which classifies its content downstream. Carried from the
+    /// commit rather than read at fan-out, because a buffered run commits
+    /// in one step and a scalar read afterwards names only its last block.
+    pub(crate) committee_anchor: WeightedTimestamp,
 }
 
 /// Outcome of [`BlockCommitCoordinator::decide_qc_only`]. The shard runs
@@ -353,6 +363,11 @@ pub struct PendingCommit {
     /// Sourced from the `Action::CommitBlock` / `Action::CommitBlockByQcOnly`
     /// payload the shard coordinator emits at commit time.
     pub(crate) witness: BeaconWitnessCommit,
+    /// The committed block's committee anchor — its parent's own
+    /// anchor — which classifies its content downstream. Carried from the
+    /// commit rather than read at fan-out, because a buffered run commits
+    /// in one step and a scalar read afterwards names only its last block.
+    pub(crate) committee_anchor: WeightedTimestamp,
 }
 
 /// Outcome of accumulating a single commit.
@@ -369,6 +384,8 @@ pub enum AccumulateDecision {
         /// handlers, then — if `notify_now` — forwards the same handle
         /// to `BlockCommitted`.
         handle: NotifyHandle,
+        /// The accepted block's committee anchor, for its `BlockCommitted`.
+        committee_anchor: WeightedTimestamp,
         /// True if the `io_loop` should fire `BlockCommitted` immediately.
         /// False under persistence backpressure: the flush closure fires
         /// the event after the disk write completes instead.
@@ -697,12 +714,14 @@ impl BlockCommitCoordinator {
         }
 
         let handle = Arc::clone(&commit.certified);
+        let committee_anchor = commit.committee_anchor;
         commit.committed_notified = notify_now;
         self.pending.push(commit);
 
         AccumulateDecision::Accepted {
             height,
             handle,
+            committee_anchor,
             notify_now,
         }
     }
@@ -762,6 +781,7 @@ impl BlockCommitCoordinator {
                     self.shard,
                     ProtocolEvent::BlockCommitted {
                         certified: commit.certified,
+                        committee_anchor: commit.committee_anchor,
                     },
                 );
             }
@@ -930,11 +950,13 @@ impl BlockCommitCoordinator {
             for (i, _) in heights.iter().enumerate() {
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
-                    let certified = commit.certified;
                     push_protocol_event(
                         &event_tx,
                         shard,
-                        ProtocolEvent::BlockCommitted { certified },
+                        ProtocolEvent::BlockCommitted {
+                            certified: commit.certified,
+                            committee_anchor: commit.committee_anchor,
+                        },
                     );
                 }
             }
@@ -1049,6 +1071,7 @@ mod tests {
             source,
             committed_notified: false,
             witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            committee_anchor: WeightedTimestamp::ZERO,
         };
         let prepared = make_mock_prepared(sink, height.inner());
         (pending, prepared)
@@ -1783,6 +1806,7 @@ mod tests {
             source: CommitSource::Sync,
             committed_notified: false,
             witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            committee_anchor: WeightedTimestamp::ZERO,
         };
         let prepared = make_mock_prepared(sink, height);
         (pending, prepared, hash)

@@ -2007,6 +2007,7 @@ impl ShardCoordinatorSim {
                 certified,
                 source: _,
                 witness,
+                committee_anchor: _,
             }
             | Action::CommitBlockByQcOnly {
                 certified,
@@ -2017,6 +2018,7 @@ impl ShardCoordinatorSim {
                 frontier: _,
                 source: _,
                 witness,
+                committee_anchor: _,
             } => {
                 let block = certified.block();
                 self.commits[emitter_idx].push(CapturedCommit {

@@ -14,13 +14,13 @@
 //! prunes at its validity end plus the retention horizon rather than
 //! encumbering the payer forever.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::FeeHold;
 use hyperscale_types::{
-    Address, Finalization, PrincipalAddr, RETENTION_HORIZON, Transaction, TxHash, Verifiable,
-    WeightedTimestamp,
+    Address, BlockHeight, Finalization, PrincipalAddr, RETENTION_HORIZON, Transaction, TxHash,
+    Verifiable, WeightedTimestamp,
 };
 
 /// One engaged reservation: the payer's owner prefix, the held ceiling,
@@ -31,14 +31,30 @@ struct Hold {
     deadline: WeightedTimestamp,
 }
 
+/// Every reservation the chain engaged and has not yet released, whoever
+/// pays it: which payers this shard answers for is asked of the judged
+/// block's committee where a demand is summed, never of the ledger, so a
+/// reshape cannot drop a hold a block before the cut engaged.
+///
+/// Beside the holds, a ring of what each recent commit released or
+/// pruned, so a demand is summed at the height a balance is read at
+/// rather than at this node's tip: a hold released above that height is
+/// still charged against a balance that has not yet paid the fee.
 pub struct FeeReservationLedger {
     holds: HashMap<TxHash, Hold>,
+    /// `(payer, amount)` each commit released or pruned, by its height.
+    released: BTreeMap<BlockHeight, Vec<(Address, u128)>>,
+    /// The ring answers for every height at or above this one: every
+    /// release above it is recorded.
+    floor: BlockHeight,
 }
 
 impl FeeReservationLedger {
     pub(crate) fn new() -> Self {
         Self {
             holds: HashMap::new(),
+            released: BTreeMap::new(),
+            floor: BlockHeight::GENESIS,
         }
     }
 
@@ -52,14 +68,13 @@ impl FeeReservationLedger {
     /// that every replica's ledger is identical at equal committed
     /// frontiers, and makes block validity depend on node-local memory.
     ///
-    /// Every hold the walk read is taken, whoever pays it: the trie that
-    /// decides which payers this shard answers for is not reachable at
-    /// construction, and [`retain_payers`](Self::retain_payers) drops the
-    /// rest at the first commit. A hold for a payer this shard does not
-    /// hold is invisible to [`held_for`](Self::held_for) meanwhile, which
-    /// sums by the payer asked about.
-    pub(crate) fn seeded(holds: &[FeeHold]) -> Self {
+    /// Every hold the walk read is taken, whoever pays it, as the live
+    /// ledger takes them; [`held_for`](Self::held_for) sums by the payer
+    /// asked about. The release ring starts at `tip`: nothing below it was
+    /// recorded, so a read below it answers `None`.
+    pub(crate) fn seeded(holds: &[FeeHold], tip: BlockHeight) -> Self {
         let mut ledger = Self::new();
+        ledger.floor = tip;
         for hold in holds {
             ledger.holds.insert(
                 hold.tx_hash,
@@ -73,12 +88,8 @@ impl FeeReservationLedger {
         ledger
     }
 
-    /// Record the reservations a committed block engages.
-    ///
-    /// Every transaction the block carries, whoever pays it — which
-    /// payers this shard answers for is
-    /// [`retain_payers`](Self::retain_payers)'s question, asked once
-    /// against the trie rather than here and at the seed separately.
+    /// Record the reservations a committed block engages: every
+    /// transaction the block carries, whoever pays it.
     pub(crate) fn register_committed(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
         for tx in transactions {
             let terms = tx.terms();
@@ -94,31 +105,70 @@ impl FeeReservationLedger {
         }
     }
 
-    /// Release the reservations a committed block's finalizations
-    /// resolve — settlement and abort both arrive as finalizations.
-    pub(crate) fn release_finalized(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
+    /// Release the reservations the finalizations of the block committed
+    /// at `height` resolve — settlement and abort both arrive as
+    /// finalizations — and record each in the ring at that height.
+    pub(crate) fn release_finalized(
+        &mut self,
+        finalizations: &[Arc<Verifiable<Finalization>>],
+        height: BlockHeight,
+    ) {
+        let mut released = Vec::new();
         for tick in finalizations {
             for tx_hash in tick.tx_hashes() {
-                self.holds.remove(&tx_hash);
+                if let Some(hold) = self.holds.remove(&tx_hash) {
+                    released.push((hold.payer.address(), hold.max_fee));
+                }
             }
+        }
+        self.record(height, released);
+    }
+
+    /// Drop holds whose deadline is at or below `anchor`, the anchor of
+    /// the block committed at `height`, and record each in the ring there.
+    pub(crate) fn prune(&mut self, anchor: WeightedTimestamp, height: BlockHeight) {
+        let mut pruned = Vec::new();
+        self.holds.retain(|_, hold| {
+            let keep = hold.deadline > anchor;
+            if !keep {
+                pruned.push((hold.payer.address(), hold.max_fee));
+            }
+            keep
+        });
+        self.record(height, pruned);
+    }
+
+    fn record(&mut self, height: BlockHeight, released: Vec<(Address, u128)>) {
+        if !released.is_empty() {
+            self.released.entry(height).or_default().extend(released);
         }
     }
 
-    /// Drop every hold whose payer this shard does not answer for.
-    ///
-    /// The one place locality is decided: the trie it reads moves at a
-    /// reshape, so a payer whose prefix leaves takes its holds with it,
-    /// and a seed taken before any trie was in scope is narrowed here on
-    /// the first commit.
-    pub(crate) fn retain_payers(&mut self, payer_local: impl Fn(Address) -> bool) {
-        self.holds
-            .retain(|_, hold| payer_local(hold.payer.address()));
+    /// Forget the ring below `floor`, whose reads no pipelined vote can
+    /// still make.
+    pub(crate) fn retire_below(&mut self, floor: BlockHeight) {
+        if floor > self.floor {
+            self.released = self.released.split_off(&floor);
+            self.floor = floor;
+        }
     }
 
-    /// Drop holds past their deadline. `now` is the latest committed
-    /// block's weighted timestamp.
-    pub(crate) fn prune(&mut self, now: WeightedTimestamp) {
-        self.holds.retain(|_, hold| hold.deadline > now);
+    /// The reservation engaged against `payer` as a balance read at
+    /// `height` sees it: every hold still held, and every one released or
+    /// pruned above `height`, whose fee that balance has not yet paid.
+    /// `None` below the ring's floor, where the answer is not held.
+    #[must_use]
+    pub(crate) fn held_for_at(&self, payer: Address, height: BlockHeight) -> Option<u128> {
+        if height < self.floor {
+            return None;
+        }
+        let released = self
+            .released
+            .range(height.next()..)
+            .flat_map(|(_, entries)| entries)
+            .filter(|(released_for, _)| *released_for == payer)
+            .fold(0u128, |sum, (_, amount)| sum.saturating_add(*amount));
+        Some(self.held_for(payer).saturating_add(released))
     }
 
     /// The total engaged reservation against `payer`, saturating.
@@ -169,17 +219,57 @@ mod tests {
             tx.hash(),
             TransactionDecision::Accept,
         )));
-        ledger.release_finalized(std::slice::from_ref(&tick));
+        ledger.release_finalized(std::slice::from_ref(&tick), BlockHeight::new(1));
         assert_eq!(ledger.held_for(PAYER_ADDR), 0);
     }
 
+    fn finalizing(tx: &Arc<Verifiable<Transaction>>) -> Arc<Verifiable<Finalization>> {
+        Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(1),
+            tx.hash(),
+            TransactionDecision::Accept,
+        )))
+    }
+
+    /// A hold engaged at H and released at H+1 is still charged against a
+    /// balance read at H, which has not paid the fee: a voter at tip H+1
+    /// reading at H sums what a voter at tip H sums. A read below the
+    /// ring's floor is not answered.
     #[test]
-    fn a_transaction_this_shard_does_not_pay_for_holds_nothing() {
+    fn holds_and_balance_are_read_at_one_height() {
+        let tx = transaction(1_000, 60_000);
+        let at_h = BlockHeight::new(5);
+
+        let mut at_tip_h = FeeReservationLedger::new();
+        at_tip_h.register_committed(std::slice::from_ref(&tx));
+
+        let mut at_tip_next = FeeReservationLedger::new();
+        at_tip_next.register_committed(std::slice::from_ref(&tx));
+        at_tip_next.release_finalized(&[finalizing(&tx)], at_h.next());
+
+        assert_eq!(at_tip_h.held_for_at(PAYER_ADDR, at_h), Some(1_000));
+        assert_eq!(at_tip_next.held_for_at(PAYER_ADDR, at_h), Some(1_000));
+        assert_eq!(at_tip_next.held_for_at(PAYER_ADDR, at_h.next()), Some(0));
+
+        at_tip_next.retire_below(BlockHeight::new(6));
+        assert_eq!(at_tip_next.held_for_at(PAYER_ADDR, at_h), None);
+        assert_eq!(at_tip_next.held_for_at(PAYER_ADDR, at_h.next()), Some(0));
+    }
+
+    /// A hold engaged before a reshape moved its payer's prefix stays
+    /// held until it is released or pruned: nothing narrows the ledger by
+    /// a trie, so the committee a demand is summed under decides whether
+    /// the payer is local, and a head a fold ahead drops nothing.
+    #[test]
+    fn a_hold_engaged_under_the_old_committee_counts_under_the_new() {
         let mut ledger = FeeReservationLedger::new();
         let tx = transaction(1_000, 60_000);
         ledger.register_committed(std::slice::from_ref(&tx));
-        ledger.retain_payers(|_| false);
-        assert_eq!(ledger.held_for(PAYER_ADDR), 0);
+        ledger.prune(WeightedTimestamp::from_millis(1_000), BlockHeight::new(2));
+        assert_eq!(
+            ledger.held_for_at(PAYER_ADDR, BlockHeight::new(2)),
+            Some(1_000)
+        );
     }
 
     /// A restart resumes the holds the chain already engaged. Constructed
@@ -202,14 +292,15 @@ mod tests {
             deadline: WeightedTimestamp::from_millis(60_000).plus(RETENTION_HORIZON),
         };
 
-        let mut ledger = FeeReservationLedger::seeded(&[hold, other]);
+        let tip = BlockHeight::new(40);
+        let mut ledger = FeeReservationLedger::seeded(&[hold, other], tip);
         assert_eq!(ledger.held_for(PAYER_ADDR), 1_000);
 
-        // A hold for a payer this shard does not answer for was never
-        // summed into one it does, and the first commit drops it.
-        ledger.retain_payers(|address| address == PAYER_ADDR);
-        assert_eq!(ledger.held_for(PAYER_ADDR), 1_000);
-        assert_eq!(ledger.held_for(PrincipalAddr::new([0xBB; 31]).address()), 0);
+        // A hold for another payer is never summed into this one's.
+        assert_eq!(ledger.held_for(PrincipalAddr::new([0xBB; 31]).address()), 7);
+        // Nothing below the tip it resumed at was recorded.
+        assert_eq!(ledger.held_for_at(PAYER_ADDR, tip), Some(1_000));
+        assert_eq!(ledger.held_for_at(PAYER_ADDR, BlockHeight::new(39)), None);
 
         // And the resumed hold releases on the finalization the chain
         // carries next, exactly as one this process registered would.
@@ -218,7 +309,7 @@ mod tests {
             tx.hash(),
             TransactionDecision::Accept,
         )));
-        ledger.release_finalized(std::slice::from_ref(&tick));
+        ledger.release_finalized(std::slice::from_ref(&tick), tip.next());
         assert_eq!(ledger.held_for(PAYER_ADDR), 0);
     }
 
@@ -228,13 +319,16 @@ mod tests {
         let tx = transaction(1_000, 100);
         ledger.register_committed(std::slice::from_ref(&tx));
 
-        ledger.prune(WeightedTimestamp::from_millis(100));
+        ledger.prune(WeightedTimestamp::from_millis(100), BlockHeight::new(1));
         assert_eq!(ledger.held_for(PAYER_ADDR), 1_000);
 
-        let past = WeightedTimestamp::from_millis(100)
-            .plus(RETENTION_HORIZON)
-            .plus(std::time::Duration::from_millis(1));
-        ledger.prune(past);
+        let deadline = WeightedTimestamp::from_millis(100).plus(RETENTION_HORIZON);
+        ledger.prune(deadline, BlockHeight::new(2));
         assert_eq!(ledger.held_for(PAYER_ADDR), 0);
+        assert_eq!(
+            ledger.held_for_at(PAYER_ADDR, BlockHeight::new(1)),
+            Some(1_000),
+            "a balance read below the prune still carries the hold",
+        );
     }
 }
