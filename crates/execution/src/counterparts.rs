@@ -487,6 +487,13 @@ pub struct Counterparts {
     /// settles nothing.
     local_crossings: BTreeSet<CrossingId>,
 
+    /// Where this shard's halt recovery resumed it, from the head
+    /// schedule: the start of the bridge epoch's window. A reclaim a
+    /// recovery discard dropped is composed again only from a fresh
+    /// reading of its answer, so an escrowed record's question stands one
+    /// validity range past this, however long past its own window.
+    resumed_at: Option<WeightedTimestamp>,
+
     /// The questions this validator has put to counterparts, by the
     /// shard asked and the cell: the header each was asked at, and
     /// whether the fetch returned. A probe lives while its question is
@@ -524,6 +531,7 @@ impl Counterparts {
             records: RecordReads::new(),
             local_crossings: BTreeSet::new(),
             probes: BTreeMap::new(),
+            resumed_at: None,
         }
     }
 
@@ -545,6 +553,9 @@ impl Counterparts {
         wanted: &[WantedRecord],
     ) -> CommitFolded {
         let windows = topology_schedule.windows();
+        self.resumed_at = topology_schedule
+            .certified_recovery(self.ledger.local())
+            .map(|(bridge, _)| windows.window_of(bridge).start);
         self.gc_settled_sets(topology_schedule, now);
         self.wanted = wanted.iter().map(|wanted| wanted.key).collect();
         // What the block's claims settle is marked gone on the entry that
@@ -821,6 +832,33 @@ impl Counterparts {
         }
     }
 
+    /// When a record's question about its answer disarms, and the pacing
+    /// it carries: past its window for an escrowed record, or one
+    /// validity range past where a halt recovery resumed the shard,
+    /// whichever is later; never for an owed one. A question the recovery
+    /// re-arms starts its pacing over.
+    fn answer_pacing(
+        &self,
+        claim: SubstateKey,
+        due_from: WeightedTimestamp,
+        terms: Terms,
+    ) -> (Option<WeightedTimestamp>, Option<BlockHeight>, u32) {
+        let disarm_at = matches!(terms, Terms::Escrowed { .. }).then(|| {
+            due_from
+                .max(self.resumed_at.unwrap_or(due_from))
+                .plus(MAX_VALIDITY_RANGE)
+        });
+        match self.asks.get(&claim) {
+            Some(Asked::Answer {
+                asked_at,
+                step,
+                disarm_at: carried,
+                ..
+            }) if *carried >= disarm_at => (disarm_at, *asked_at, *step),
+            _ => (disarm_at, None, 0),
+        }
+    }
+
     /// The questions this shard's crossing rows put, rebuilt from the
     /// rows the index holds under this shard's prefix, keeping the pacing
     /// of every question that still stands; and the local crossings a
@@ -871,12 +909,8 @@ impl Counterparts {
                         }
                         continue;
                     }
-                    let (asked_at, step) = match self.asks.get(&claim) {
-                        Some(Asked::Answer { asked_at, step, .. }) => (*asked_at, *step),
-                        _ => (None, 0),
-                    };
-                    let disarm_at = matches!(cell.terms, Terms::Escrowed { .. })
-                        .then(|| due_from.plus(MAX_VALIDITY_RANGE));
+                    let (disarm_at, asked_at, step) =
+                        self.answer_pacing(claim, due_from, cell.terms);
                     for asked in [claim, decline] {
                         asks.insert(
                             asked,
@@ -2794,6 +2828,16 @@ mod tests {
     /// of consumer headers `1..=last`, at the committed clock `now`, for
     /// a record of `terms`.
     fn asked_heights(terms: Terms, now: WeightedTimestamp, last: u64) -> Vec<u64> {
+        asked_heights_resumed(terms, now, last, None)
+    }
+
+    /// [`asked_heights`] on a shard a halt recovery resumed at `resumed_at`.
+    fn asked_heights_resumed(
+        terms: Terms,
+        now: WeightedTimestamp,
+        last: u64,
+        resumed_at: Option<WeightedTimestamp>,
+    ) -> Vec<u64> {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000));
         let anchors = Arc::new(ProvenAnchors::default());
         let rows = Arc::new(TestRows::default());
@@ -2810,6 +2854,7 @@ mod tests {
             ReadFrontier::default(),
         );
         let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        producer.resumed_at = resumed_at;
         producer.derive_asks(&trie);
         let mut asked = Vec::new();
         for height in 1..=last {
@@ -2866,6 +2911,76 @@ mod tests {
             "the row stands as a strand, asked about by nobody",
         );
         assert!(!asked_heights(Terms::Owed, past, 4).is_empty());
+    }
+
+    /// A halt recovery re-arms an escrowed record's question for one
+    /// validity range past where it resumed the shard: a reclaim its
+    /// discard dropped is composed again only from a fresh reading.
+    #[test]
+    fn a_recovery_rearms_an_escrowed_records_question_past_its_window() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000)).at();
+        let past = deadline
+            .plus(MAX_VALIDITY_RANGE)
+            .plus(Duration::from_millis(1));
+        let escrowed = Terms::Escrowed {
+            credit: producer_record(0),
+        };
+        assert!(
+            !asked_heights_resumed(escrowed, past, 4, Some(past)).is_empty(),
+            "the record is asked about again once the recovery resumed the shard",
+        );
+    }
+
+    /// A re-armed question starts its pacing over, so it is not held
+    /// behind the backoff its unanswered asks built up.
+    #[test]
+    fn the_rearm_resets_the_pacing() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(36_000));
+        let anchors = Arc::new(ProvenAnchors::default());
+        let rows = Arc::new(TestRows::default());
+        let escrowed = CrossingCell {
+            terms: Terms::Escrowed {
+                credit: producer_record(0),
+            },
+            ..producer_cell(0, deadline)
+        };
+        rows.put(record_of(0, deadline), escrowed.to_bytes());
+        let mut producer = Counterparts::new(
+            PRODUCER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            rows,
+            ReadFrontier::default(),
+        );
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        producer.derive_asks(&trie);
+        let now = deadline.at();
+        for height in 1..=4 {
+            anchors.record(Anchor {
+                shard: CONSUMER,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::from_raw(Hash::ZERO),
+                ts: WeightedTimestamp::ZERO,
+            });
+            let _ = producer.probe(&trie, now, &[], EpochWindows::new(0));
+        }
+        let pacing = |producer: &Counterparts| {
+            producer
+                .asks
+                .values()
+                .find_map(|asked| match asked {
+                    Asked::Answer { asked_at, step, .. } => Some((*asked_at, *step)),
+                    Asked::Record { .. } | Asked::Exit => None,
+                })
+                .expect("the record asks its answer")
+        };
+        assert!(pacing(&producer).1 > 0, "the asks built up a backoff");
+
+        producer.resumed_at = Some(now.plus(MAX_VALIDITY_RANGE));
+        producer.derive_asks(&trie);
+        assert_eq!(pacing(&producer), (None, 0), "the re-arm starts it over");
+        producer.derive_asks(&trie);
+        assert_eq!(pacing(&producer), (None, 0), "and only once");
     }
 
     /// A pushed answer that lands before the deadline is kept to offer,
