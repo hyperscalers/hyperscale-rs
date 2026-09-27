@@ -12,8 +12,8 @@
 //!
 //! Batch receipts are batch-dependent (reservation feasibility is judged
 //! with the whole batch's holds in place), so VM outputs are never
-//! memoized in the per-transaction `ProcessExecutionCache` — the same
-//! transaction in a different block may abort differently.
+//! memoized per transaction — the same transaction in a different block
+//! may abort differently.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};

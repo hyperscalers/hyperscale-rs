@@ -1,6 +1,6 @@
 # State, checkpointing, and synchronization
 
-All ledger state in Hyperscale lives in one conceptual structure: a global, versioned, **binary Jellyfish Merkle Tree** (JMT) over a 256-bit keyspace. Shards are prefix subtrees of it. This one decision carries the rest of the document: it gives every shard a succinct state commitment per block, it gives cross-shard provisioning its merkle proofs, it gives new nodes a verifiable fast-sync path, and it turns dynamic resharding into a tree operation. This document covers the tree, the mapping from keyspace to shards, the storage stack, checkpointing, the three synchronization protocols (snap-sync, block sync, and remote-header sync), and divergence recovery.
+All ledger state in Hyperscale lives in one conceptual structure: a global, versioned, **binary Jellyfish Merkle Tree** (JMT) over a 384-bit keyspace. Shards are prefix subtrees of it. This one decision carries the rest of the document: it gives every shard a succinct state commitment per block, it gives cross-shard provisioning its merkle proofs, it gives new nodes a verifiable fast-sync path, and it turns dynamic resharding into a tree operation. This document covers the tree, the mapping from keyspace to shards, the storage stack, checkpointing, the three synchronization protocols (snap-sync, block sync, and remote-header sync), and divergence recovery.
 
 Main code homes: `crates/jmt` (the tree), `crates/storage` / `storage-rocksdb` / `storage-memory` (the storage stack), `crates/remote-headers` (cross-shard header tracking), and `crates/node` (snap-sync, block sync, the commit pipeline).
 
@@ -8,13 +8,13 @@ Main code homes: `crates/jmt` (the tree), `crates/storage` / `storage-rocksdb` /
 
 ## 1. The binary JMT
 
-The tree (`Tree` in `crates/jmt`) is a binary-radix Jellyfish Merkle Tree, generic over the hasher. Arity is a compile-time parameter; the deployed arity is binary. The deployed hasher is Blake3, and the parameterization anticipates an eventual arithmetic-friendly hash such as Poseidon2 for proof-system integration. Keys are fixed 32-byte values. Leaves store precomputed value hashes; raw values live beside the tree in substate storage.
+The tree (`Tree` in `crates/jmt`) is a binary-radix Jellyfish Merkle Tree, generic over the hasher. Arity is a compile-time parameter; the deployed arity is binary. The deployed hasher is Blake3, and the parameterization anticipates an eventual arithmetic-friendly hash such as Poseidon2 for proof-system integration. Keys are fixed 48-byte values. Leaves store precomputed value hashes; raw values live beside the tree in substate storage.
 
-- **Versioned.** Every block commit produces a new tree version via `apply_updates_at(parent_version, new_version, root_path, updates)`, which returns the new root hash and a `TreeUpdateBatch` of created and stale nodes. Old versions remain readable: multiple roots coexist in storage, back to the retention floor — the oldest version still within `RETENTION_HORIZON` of the tip's weighted timestamp. Everything that reads history — provision fallback serving, historical ownership resolution — is licensed inside that same span, so the two are one window rather than two that have to be reconciled (INV-STATE-4).
+- **Versioned.** Every block commit produces a new tree version via `apply_updates_at(parent_version, new_version, root_path, updates)`, which returns the new root hash and a `TreeUpdateBatch` of created and stale nodes. Old versions remain readable: multiple roots coexist in storage, back to the retention floor — the oldest version still within `RETENTION_HORIZON` of the tip's weighted timestamp, held no higher than what this node has persisted and executed. Everything that reads history — a reclaim probe, provision fallback serving, a state proof — is licensed inside that same span, so the two are one window rather than two that have to be reconciled (INV-STATE-4).
 - **Batched multiproofs.** `Tree::prove(root, keys)` produces a `MultiProof`: per-key claims (present-leaf, empty-subtree, or mismatch-leaf) plus a deduplicated sibling set. One proof covers an arbitrary key batch. Batched proofs are the workhorse of cross-shard provisioning ([04-atomic-commitment.md](04-atomic-commitment.md)) and snap-sync chunk verification.
 - **Subtree-rooted operations.** Updates and proofs are computed against an explicit root *path*, not only the global root, so a shard operates entirely within its own prefix subtree.
 
-The state root in every shard block header is the shard's subtree root at that block, recomputed independently by every replica from the parent state plus the block's receipts. Because execution is deterministic, the root is an agreement point: same parent, same receipts, same root, on every honest node (INV-STATE-1).
+The state root in every shard block header is the shard's subtree root at that block, recomputed independently by every replica from the parent state plus the block's receipts and the writes the chain derives from the block itself — committed-transaction markers, tick member rows, fee holds, the read frontier, crossing settlements, and sweep removals. Because execution is deterministic, the root is an agreement point: same parent, same receipts, same root, on every honest node (INV-STATE-1).
 
 ## 2. Mapping the keyspace to shards
 
@@ -23,7 +23,7 @@ The state root in every shard block header is the shard's subtree root at that b
 **Owner-prefixed keying** is the rule that keeps this partition meaningful. Every substate's flat storage key is an owner prefix and a local half, both fixed-width, and its JMT leaf key is those two halves by identity:
 
 ```
-flat key:  owner(16) || local(16)
+flat key:  owner(32) || local(16)
 leaf key:  [ owner | local ]
 ```
 
@@ -43,7 +43,7 @@ Storage is trait-abstracted (`crates/storage`) with two full backends: RocksDB f
 - committed-chain reads and writes: blocks, certificates, receipts;
 - raw JMT node access;
 - boundary import for checkpoints and snap-sync (`BoundaryStore`);
-- the uncommitted block index (`PendingChain`), whose views **walk parent-hash links back to the committed tip**, so orphaned forks are structurally invisible (INV-STATE-6).
+- the uncommitted block index (`PendingChain`), whose views **walk parent-hash links back to the persisted tip**, so orphaned forks are structurally invisible (INV-STATE-6).
 
 Two RocksDB facts matter above the storage layer. JMT node keys are laid out version-first, so writes stay LSM-append-friendly. Checkpoints are hard-link snapshots — cheap and copy-free.
 
@@ -55,7 +55,7 @@ A **checkpoint** is the durable, servable image of a shard at an epoch boundary 
 
 - **When.** Boundary detection runs at commit time, on the *child* of the boundary block: the crossing is detected when a committed block's `parent_qc.weighted_timestamp` lands in a new epoch window. The child's parent-QC timestamp is the canonical one ([01-consensus-layers.md](01-consensus-layers.md) §1.3), so every replica pins the same boundary block. The boundary block's own QC would not serve: it can be re-certified with a different timestamp, which would flip the verdict.
 - **What.** A hard-link snapshot that pins the full state at the boundary height: substates and JMT nodes. Each shard retains a ring of recent boundary pins sized to the join budget: a joiner syncing a large shard must be able to finish against a boundary its peers still pin, so production retention covers the full `ready_timeout_epochs` budget plus slack for the attestation lag of the anchor a joiner selects at placement. Hard links pin superseded SSTs, so the ring's disk overhead scales with churn across the window, not with state size.
-- **Attestation.** The same boundary block is the shard's contribution to the beacon that epoch. The resulting `ShardBoundary` record, projected to shards as `ShardAnchor { state_root, block_hash, height, weighted_timestamp, settled_txs_root }`, is the beacon-attested description of the checkpoint. An anchor is trustworthy not because a peer served it but because the joiner's own beacon fold produced it.
+- **Attestation.** The same boundary block is the shard's contribution to the beacon that epoch. The resulting `ShardBoundary` record, projected to shards as `ShardAnchor { state_root, block_hash, height, weighted_timestamp, terminal_settled_txs, … }`, is the beacon-attested description of the checkpoint. An anchor is trustworthy not because a peer served it but because the joiner's own beacon fold produced it.
 
 ## 5. Snap-sync
 
@@ -85,7 +85,7 @@ Both protocols are instances of one generic sliding-window FSM (`Sync<B: SyncBin
 
 Divergence recovery defends against one failure mode: a replica whose local execution is wrong (bad build, cosmic ray, latent bug) silently corrupting its own store or, worse, exporting corruption to peers.
 
-- **One prepare path.** Both live-consensus commits and sync-path commits run the same `prepare_block_commit`: recompute the state root from the parent state plus the block's finalized receipts, then compare it against the header's QC-attested root (INV-STATE-5). On the sync path this comparison is the sole execution check, which is what makes it decisive.
+- **One prepare path.** Both live-consensus commits and sync-path commits run the same `prepare_block_commit`: recompute the state root from the parent state plus the block's finalized receipts and the chain writes it derives, then compare it against the header's QC-attested root (INV-STATE-5). On the sync path this comparison is the sole execution check, which is what makes it decisive.
 - **Divergence at EC admission.** If a validator's own execution vote disagrees with the EC its shard's quorum admitted, the tick is marked locally divergent and permanently barred from local finalization, and the replica recovers the canonical `Finalization` through block sync. Locally produced receipts therefore never enter the finalized store unless they match the quorum's attestation (INV-EXEC-8). The same containment is what makes it sound for serving peers to skip re-serving certificates that a syncing node can reconstruct.
 - **Ingress validation.** `Finalization`s received from peers are validated receipt by receipt against their EC's attestation (existence, hash, outcome) before admission.
 - **Fail-fast on poison.** If a sync-path commit's recomputed root mismatches the QC-attested header root, the parent state itself has diverged from canon. A corrupted tree has no block-granular repair, so the node emits a full diagnostic (heights, hashes, expected and computed roots) and halts; an operator restores from a checkpoint or resyncs. Halting loudly is the design: a node with poisoned state must not keep voting.

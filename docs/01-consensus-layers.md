@@ -42,11 +42,11 @@ Votes are BLS signatures over a domain-separated message binding the vote's full
 
 ### 1.3 Quorum certificates and weighted time
 
-2f+1 votes aggregate into a `QuorumCertificate`: the block identity fields, a signer bitfield indexed by committee order, one aggregated BLS signature, and a **weighted timestamp** — each voter's clock reading clamped to be no earlier than the parent QC's weighted timestamp, then averaged over the quorum (every vote weighs one).
+2f+1 votes aggregate into a `QuorumCertificate`: the block identity fields, a signer bitfield indexed by committee order, one aggregated BLS signature, and a **weighted timestamp** — each voter's clock reading clamped to be no earlier than the parent QC's weighted timestamp, then taken as the median over the quorum (every vote weighs one).
 
 Two facts about this timestamp matter downstream:
 
-- **It is Byzantine-bounded.** The per-vote clamp makes the clock monotone along the chain, so Byzantine voters cannot drag it backwards at all. Forward skew is possible — a mean moves with every vote — but capped. A timestamp implausibly far ahead of the local clock is rejected wherever an untrusted QC enters chain state: header validation, synced-block admission, timeout `high_qc` adoption, and local aggregation itself. A far-future value therefore cannot poison the chain's clock.
+- **It is Byzantine-bounded.** The per-vote clamp makes the clock monotone along the chain, so Byzantine voters cannot drag it backwards at all. Forward skew is bounded by honest clocks: the median of a quorum's clamped readings is always an honest voter's own reading, wherever the forged values sort. A timestamp implausibly far ahead of the local clock is rejected wherever a QC someone else built enters chain state: header validation, synced-block admission, and timeout `high_qc` adoption. A far-future value therefore cannot poison the chain's clock.
 - **The canonical value for a block is the one in its committing child.** A QC is not unique (the same block can be re-certified in later rounds, for example during a reshape coast), and a QC's timestamp field rides outside the vote-signed message. The hash-pinned, consensus-canonical timestamp of block `B` is `child.parent_qc.weighted_timestamp` — the value embedded in the child block that committed `B`. This canonical value is also `B`'s **anchor**: where `B` sits on the weighted-time grid is `B.parent_qc.weighted_timestamp`, the canonical timestamp of the block it extends. Every protocol that anchors deadlines or committee lookups uses this parent-QC form (INV-SHARD-6); committee lookups read it one block up — a block's committee keys on its *parent's* anchor, never on the aggregate over the parent (§4). The distinction is load-bearing: reshape genesis derivation once diverged precisely by reading a re-cert QC's timestamp instead of the canonical one.
 
 ### 1.4 The commit rule
@@ -55,7 +55,7 @@ A block `B` commits when a QC forms for a child at **exactly** `B.round + 1` —
 
 The division of labor between the two rules is the heart of fork safety. The safe-vote rule alone does *not* prevent two QCs at one height: two siblings both extending the same parent QC can each gather a quorum without any validator violating its lock. What it cannot allow is both siblings *committing*. Committing `B` requires a contiguous chain of QCs above it, and quorum intersection (any two 2f+1 quorums share an honest validator, whose lock has ratcheted) forces every subsequent QC to extend the committed branch. One height, at most one committed block (INV-SHARD-1). The `fork_safety` test asserts exactly this under adversarial scheduling.
 
-Every committed block's parent hash must equal the previously committed hash — commit order is exactly chain order (INV-SHARD-5). At commit, the chain state advances atomically: committed height/hash/state-root, the tip's block and committee anchor timestamps, dedup indices for committed transactions/certificates/provisions (retention-bounded), the beacon-witness accumulator (§3.3), and byte-growth counters that feed reshape triggers.
+Every committed block's parent hash must equal the previously committed hash — commit order is exactly chain order (INV-SHARD-5). At commit, the chain state advances atomically: committed height/hash/state-root, the tip's block and committee anchor timestamps, a committed-transaction marker cell per transaction, retention-bounded dedup indices for verdicts, certificates and provisions, the beacon-witness accumulator (§3.3), and byte-growth counters that feed reshape triggers.
 
 ### 1.5 The pacemaker
 
@@ -64,13 +64,13 @@ Liveness under partial synchrony (INV-SHARD-8) is handled by timeout messages, n
 - When a round timer fires, the validator broadcasts `Timeout { shard, round, high_qc }` — a BLS share over `(shard, round)`, carrying its highest known QC.
 - **f+1 timeouts** for a round trigger Bracha-style amplification: broadcast your own timeout if you haven't. This guarantees that if any honest validator abandons a round, all eventually do — partitions cannot strand a minority in an old round.
 - **2f+1 timeouts** advance the round. The new round's proposer adopts the quorum-max `high_qc` from the collected timeouts, so the chain always continues from the highest certified block any quorum member knew.
-- Timers **retransmit** on every fire; a one-shot timeout lost to a partition would wedge the round after healing. The round timeout grows linearly with the number of failed rounds at a height, is capped, and is computed from QC-attested data, so all replicas agree on the deadline.
+- Timers **retransmit** on every fire; a one-shot timeout lost to a partition would wedge the round after healing. The round timeout doubles with each round abandoned at a height, is capped, and is computed from QC-attested data, so all replicas agree on the deadline.
 
 View synchronization is bounded: observing headers or votes from far-future rounds advances the local view only within a capped gap of the highest known QC, and speculative verification of far-round blocks is bounded, so Byzantine peers cannot inflate a replica's view or burn its CPU ([05-byzantine-safety.md](05-byzantine-safety.md) §6).
 
 ### 1.6 What a block carries
 
-The `BlockHeader` binds, under the QC, everything other layers depend on. The load-bearing commitments (a characterization, not a field inventory) are: the parent QC itself (the timestamp source); the state root after this block; merkle roots over the block's content — transactions, finalizations, receipts, outbound provisions, and per-destination provision-transaction roots; the beacon-witness root (the shard-to-beacon channel, §3.3); and, near reshape boundaries only, the child state roots and the settled-transaction root ([02-dynamic-sharding.md](02-dynamic-sharding.md)). The body carries the corresponding content; full provision bodies are dropped to hashes once the block seals past its execution window.
+The `BlockHeader` binds, under the QC, everything other layers depend on. The load-bearing commitments (a characterization, not a field inventory) are: the parent QC itself (the timestamp source); the state root after this block; merkle roots over the block's content — transactions, finalizations, receipts, outbound provisions, per-destination provision-transaction roots, and the tick manifest naming what the block's tick holds and lets go; the beacon-witness root (the shard-to-beacon channel, §3.3); and, near reshape boundaries only, the child state roots and the settled-transaction root ([02-dynamic-sharding.md](02-dynamic-sharding.md)). The body carries the corresponding content; full provision bodies are dropped to hashes once the block seals past its execution window.
 
 ---
 
@@ -80,13 +80,13 @@ Ordering and execution are deliberately decoupled. Shard consensus commits block
 
 ### 2.1 Ticks
 
-At block commit the shard composes a **tick** — the unit of execution agreement, and one batch. It takes the committed transactions that can reach their outcome in it: those reaching no further than this shard, and every cross-shard leg whose counterparties' provisions have arrived and verified ([04-atomic-commitment.md](04-atomic-commitment.md)). A transaction that cannot waits (`TickCandidates`, `crates/execution`) and joins whichever later tick can take it; it has attested nothing meanwhile, so waiting costs it latency and nothing else.
+Each block names its own **tick** — the unit of execution agreement, and one batch. The proposer lists its members in the block's tick manifest (`TickManifest`), and every voter checks each line against committed content at the block's parent, so replicas at different committed tips name one list. A member joins when everything it needs has committed: one reaching no further than this shard, and every cross-shard leg whose counterparts' bundles and consumed crossings have committed ([04-atomic-commitment.md](04-atomic-commitment.md)). The lines fold into member rows held as committed state. A transaction that cannot join waits (`TickCandidates`, `crates/execution`) and a later block names it; it has attested nothing meanwhile, so waiting costs it latency and nothing else.
 
 ### 2.2 From votes to the ExecutionCertificate
 
-Every validator executes the tick locally — deterministically: same engine, same inputs, same outputs — and sends an `ExecutionVote` asserting the tick's `global_receipt_root`, a merkle root over the per-transaction outcomes. The vote goes to the tick's leader, chosen by a deterministic hash of the tick id over the committee seated at the tick's own block. 2f+1 agreeing votes aggregate into an **`ExecutionCertificate`** (EC). Alongside the usual quorum material (signer bitfield, aggregated BLS signature), the EC carries the tick identity, a BFT-attested anchor timestamp, the receipt root, and the explicit per-transaction outcome vector (succeeded, aborted, or rejected).
+Every validator executes the tick locally — deterministically: same engine, same inputs, same outputs — and sends an `ExecutionVote` asserting the tick's `global_receipt_root`, a merkle root over the per-transaction outcomes. The vote goes to the tick's leader, chosen by a deterministic hash of the tick id over the committee seated at the tick's own block. 2f+1 agreeing votes aggregate into an **`ExecutionCertificate`** (EC). Alongside the usual quorum material (signer bitfield, aggregated BLS signature), the EC carries the tick identity, a BFT-attested anchor timestamp, the receipt root, and per-transaction outcomes (succeeded, aborted, or rejected) — every one on the producing shard's own copy, and on a copy sent to a participant only those naming it, with a sparse proof binding them to the root.
 
-A structural detail with safety weight: on decode, an EC's receipt root is **recomputed from its outcome vector** and must match the attested root. A Byzantine aggregator cannot assemble a signature-valid certificate whose claimed root diverges from its claimed outcomes (INV-EXEC-2).
+A structural detail with safety weight: on decode, an EC's receipt root is **recomputed from the outcomes it carries**, at their leaf indices and with its proof, and must match the attested root. A Byzantine aggregator cannot assemble a signature-valid certificate whose claimed root diverges from its claimed outcomes (INV-EXEC-2).
 
 ### 2.3 Finalization
 
@@ -156,4 +156,4 @@ The result: dozens of shard chains run at their own speeds, execution agreement 
 
 ## 5. Properties
 
-The invariants this document motivates — INV-SHARD-1 through INV-SHARD-9, INV-BEACON-1 through INV-BEACON-7, and the execution-layer INV-EXEC-1/2/5 — are stated precisely in [08-invariants.md](08-invariants.md).
+The invariants this document motivates — INV-SHARD-1 through INV-SHARD-9, INV-BEACON-1 through INV-BEACON-7 and INV-BEACON-12, and the execution-layer INV-EXEC-1/2/5/8 — are stated precisely in [08-invariants.md](08-invariants.md).

@@ -244,11 +244,11 @@ pub const RESHAPE_READY_TTL_EPOCHS: u64 = 8;
 pub const RESHAPE_HANDOFF_TTL_EPOCHS: u64 = 12;
 
 /// How long a departed shard's terminal evidence stays readable, measured
-/// in epochs from its terminal cut.
+/// in epochs from the epoch the beacon stamps its handoff complete.
 ///
 /// A terminated shard's `settled_txs_root` is what a surviving counterpart
 /// resolves its straddlers against, and it only becomes beacon-attested two
-/// folds after the cut: the terminal block satisfies `parent ≤ cut < qc`, so
+/// folds after the cut: the terminal block's parent QC lands past the cut, so
 /// it cannot exist until the window after the one it closes, and the beacon
 /// block for that window is composed while the crossing is still being
 /// produced — so the crossing folds one window later again. The survivor
