@@ -64,6 +64,7 @@ use hyperscale_scenarios::{
     an_abandoned_never_is_read_seen_and_goes, an_abandoned_never_outlives_a_late_record,
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
+    an_unseen_never_goes_when_its_producer_aborts,
     answers_end_at_the_read_frontier_across_a_reshape, attested_load_reaches_the_beacon,
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
@@ -2225,4 +2226,20 @@ fn an_abandoned_never_outlives_a_late_record_sim() {
         GenesisPackages::with_fixtures(),
     );
     cluster.run_faultable(|c| an_abandoned_never_outlives_a_late_record(c, epochs(40)));
+}
+
+#[test]
+fn an_unseen_never_goes_when_its_producer_aborts_sim() {
+    let mut accounts = departing_caller_ballast();
+    accounts.extend(venue_genesis_accounts_on(
+        STRADDLER_SURVIVOR,
+        &[STRADDLER_SPLITTER],
+    ));
+    let mut cluster = SimCluster::with_packages_on_dedicated_pool_hosts(
+        &departing_venue_config(),
+        11,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(|c| an_unseen_never_goes_when_its_producer_aborts(c, epochs(24)));
 }

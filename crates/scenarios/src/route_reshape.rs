@@ -13,6 +13,7 @@
 //! shard keeps clearing from admission through the cut and from the
 //! successor after it.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -654,6 +655,102 @@ pub fn answers_end_at_the_read_frontier_across_a_reshape<C: FaultableCluster>(
     );
     set.settle_with_nothing_locked(c, &charges, budget, "answers across a producer's split");
     report_crossing_measures(c, "answers_end_at_the_read_frontier_across_a_reshape");
+}
+
+/// An abandonment's `Never` for a record its producer never writes goes
+/// on the producer member's exit, read at one anchor.
+///
+/// A caller on the splitter swaps against a venue on the survivor, each
+/// committee on hosts of its own. The caller's execution votes are cut
+/// among its own committee, so its leg commits and never finalizes: the
+/// escrowed record it would write is never written, and the splitter
+/// aborts the leg before it ends. The venue waits on its input to the deadline
+/// and its abandonment writes an unseen `Never`. No record presence can
+/// ever mark it seen, and its record's absence alone deletes no unseen
+/// answer; what ends it is the exit proof, read at one anchor of the
+/// child holding the caller's prefix: the leg's member row absent, and
+/// the committed marker present or the anchor past the swap's validity
+/// end. The caller is charged the abort and keeps its input, and both
+/// worlds are conserved with nothing locked.
+///
+/// # Panics
+///
+/// Panics as [`departing_callers`] does, if the two committees share a
+/// host, if the splitter does not abort the leg or a child holds its
+/// row, if the record is ever
+/// written, if the venue does not abandon with a `Never` or the `Never`
+/// outlives the budget, if the votes were never cut, if the caller is
+/// not charged the abort alone, or if either world is not conserved.
+pub fn an_unseen_never_goes_when_its_producer_aborts<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let (venue_shard, caller_shard) = (STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
+    let mut set = departing_callers(c, venue_shard, caller_shard);
+    let cut = scheduled_cut(c, caller_shard, budget);
+    assert!(
+        clock(c) < cut,
+        "the swap goes while the callers' shard still runs"
+    );
+    let leg_hosts = c.committee_hosts(caller_shard);
+    assert!(
+        c.committee_hosts(venue_shard)
+            .iter()
+            .all(|host| !leg_hosts.contains(host)),
+        "the venue's committee and the callers' share no host",
+    );
+    let mut charges = Charges::default();
+    let (key, caller) = &set.swappers[0];
+    let swap = build_swap_tx(
+        key,
+        *caller,
+        &set.venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let input = crossing_cells(c, &swap)
+        .into_iter()
+        .find(|crossing| owning_shard(c, crossing.record.owner) == caller_shard)
+        .expect("a swap's input crosses from its caller");
+    let funded = held(c, caller.address(), *PROTOCOL_RESOURCE);
+    let price = declared_price(c, &swap);
+    let held_leg = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
+    let hash = charges.submit(c, swap);
+    set.protocol_resource.owing(charges.records(c));
+
+    let written = Cell::new(false);
+    let watch = |c: &C| written.set(written.get() || stands_at(c, input.record));
+    assert!(
+        c.run_until(budget, |c| {
+            watch(c);
+            stands_at(c, input.never)
+        }),
+        "the venue must abandon the swap with a Never",
+    );
+    assert!(
+        c.run_until(budget, |c| {
+            watch(c);
+            !stands_at(c, input.never)
+        }),
+        "the Never must go on its producer member's exit",
+    );
+    let children: [ShardId; 2] = caller_shard.children().into();
+    assert_fated_off(c, caller_shard, hash, &children);
+    assert!(!written.get(), "the record is never written");
+    assert!(
+        held_leg.fired() > 0,
+        "the leg's votes must actually have been cut"
+    );
+    c.clear_drops();
+
+    set.settle_with_nothing_locked(c, &charges, budget, "a Never its producer's exit ends");
+    assert_eq!(
+        held(c, caller.address(), *PROTOCOL_RESOURCE),
+        funded - price,
+        "the caller keeps its input and pays the abort",
+    );
 }
 
 /// A swap issued on a merging shard reaches its venue, and the parent the
