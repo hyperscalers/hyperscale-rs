@@ -16,9 +16,9 @@ use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, ChainWrites, FeeTerms, JmtSnapshot, MemberIndex, MemberInputs, ParentAnchor,
     PendingChain, ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex,
-    TerminalWindow, VersionedStore, colliding_committed_cell, colliding_member_row,
-    committed_tx_cells, creations_of, decode_total, load_read_frontier, record_arrivals,
-    sweep_for_block, without_colliding_committed_cells, without_colliding_member_rows,
+    TerminalWindow, VersionedStore, committed_tx_cells, creations_of, decode_total,
+    record_arrivals, sweep_for_block, without_colliding_committed_cells,
+    without_colliding_member_rows,
 };
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -49,10 +49,8 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{ProtocolHasher, fee_hold_total_key};
 
-use crate::local_crossings::{
-    disagreeing_parent_reading, keep_standing_unclaimed, misstated_unclaimed, parent_claims,
-};
-use crate::read_fence::{Dropped, drop_refused};
+use crate::local_crossings::keep_standing_unclaimed;
+use crate::parent_checks::{AtParent, ProposalClaims, proposal_claims, refused_at_parent};
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -1203,98 +1201,22 @@ where
                 });
                 return;
             }
-            // A block carries no transaction this chain already
-            // committed — its own or inherited marker present in the
-            // parent state — and none whose marker another of its
-            // transactions names. The first is the re-inclusion rule,
-            // read off state so a restarted or snap-synced voter answers
-            // as a live one does; two creations at one key would halt
-            // every replica in the fold's assert. A validity rule at vote
-            // time, judged against the anchored view: a replica following
-            // a certified block never evaluates it.
-            if let Some(key) = colliding_committed_cell(&creations, &anchored) {
-                tracing::warn!(
-                    ?block_hash,
-                    height = block_height.inner(),
-                    ?key,
-                    "Rejecting block whose committed cell is already present or named twice"
-                );
-                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
-                    block_hash,
-                    kind: VerificationKind::StateRoot,
-                    outcome: CheckOutcome::Refused,
-                });
-                return;
-            }
-            // Nor one whose member row key a standing row or another
-            // of its transactions takes: one row would stand for two.
-            if let Some(tx) = colliding_member_row(
-                members.shard,
-                members.transactions.iter().map(|(tx, _)| *tx),
+            if let Err(refusal) = refused_at_parent(
+                &AtParent {
+                    local: ctx.shard,
+                    creations: &creations,
+                    members: &members,
+                    fence: &fence,
+                    state_claims: &state_claims,
+                    abandonment_records: &abandonment_records,
+                },
                 &anchored,
             ) {
                 tracing::warn!(
                     ?block_hash,
                     height = block_height.inner(),
-                    ?tx,
-                    "Rejecting block whose member row key is already taken"
-                );
-                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
-                    block_hash,
-                    kind: VerificationKind::StateRoot,
-                    outcome: CheckOutcome::Refused,
-                });
-                return;
-            }
-            // The read frontier's fence, judged against the parent
-            // state: a record presence below the floor its producer's
-            // lineage has been read to, one below a same-block absence
-            // of its key, or a deleting absence below the floor or off
-            // the record's owner. A validity rule at vote time, like the
-            // collision above: a replica following a certified block
-            // never evaluates it.
-            let parent_frontier = load_read_frontier(&anchored, ctx.shard);
-            if let Err(refusal) = fence.check(&parent_frontier) {
-                tracing::warn!(
-                    ?block_hash,
-                    height = block_height.inner(),
                     %refusal,
-                    "Rejecting block the read frontier refuses"
-                );
-                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
-                    block_hash,
-                    kind: VerificationKind::StateRoot,
-                    outcome: CheckOutcome::Refused,
-                });
-                return;
-            }
-            // A reading the block takes at its own parent is held to
-            // this replica's own parent view, since it carries no proof.
-            // Which crossings the proposer read there is its choice;
-            // what each reading says is not.
-            if let Some(key) = disagreeing_parent_reading(&state_claims, ctx.shard, &anchored) {
-                tracing::warn!(
-                    ?block_hash,
-                    height = block_height.inner(),
-                    ?key,
-                    "Rejecting block whose parent-anchored reading disagrees with the parent state"
-                );
-                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
-                    block_hash,
-                    kind: VerificationKind::StateRoot,
-                    outcome: CheckOutcome::Refused,
-                });
-                return;
-            }
-            // A crossing a departure names off this shard's leaf carries
-            // no proof: its record is held to this replica's own parent
-            // view, present and as the name restates it.
-            if let Some(key) = misstated_unclaimed(&abandonment_records, &anchored) {
-                tracing::warn!(
-                    ?block_hash,
-                    height = block_height.inner(),
-                    ?key,
-                    "Rejecting block naming a crossing whose record the parent state does not hold"
+                    "Rejecting block its parent state refuses"
                 );
                 ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
                     block_hash,
@@ -1464,38 +1386,28 @@ where
             let view = ctx
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
-            // What the read frontier would refuse, dropped before the
-            // block is built so a proposal never refuses itself: every
-            // refused presence or deleting absence is cut from its claim.
-            // The frontier's inputs are then recomputed over the claims
-            // kept.
-            let (state_claims, frontier) = {
-                let anchored = view.snapshot();
-                let parent_frontier = load_read_frontier(&anchored, shard_id);
-                let Dropped { claims, refused } =
-                    drop_refused(state_claims, &fence, frontier.windows, &parent_frontier);
-                if refused > 0 {
-                    tracing::debug!(
-                        ?shard_id,
-                        height = height.inner(),
-                        refused,
-                        "Dropped what the read frontier refuses from the proposal"
-                    );
-                }
-                // The crossings whose ends share this shard, read at the
-                // parent through the same anchored view, beside the
-                // claims in the section's order.
-                let mut claims = claims;
-                claims.extend(parent_claims(&local_crossings, parent_anchor, &anchored));
-                claims.sort_unstable();
-                let frontier = FrontierInputs::for_block(
-                    &claims,
-                    frontier.windows,
-                    frontier.anchor,
-                    frontier.local,
+            // What the read frontier would refuse is dropped before the
+            // block is built, so a proposal never refuses itself.
+            let ProposalClaims {
+                claims: state_claims,
+                frontier,
+                refused,
+            } = proposal_claims(
+                state_claims,
+                &fence,
+                &frontier,
+                &local_crossings,
+                parent_anchor,
+                &view.snapshot(),
+            );
+            if refused > 0 {
+                tracing::debug!(
+                    ?shard_id,
+                    height = height.inner(),
+                    refused,
+                    "Dropped what the read frontier refuses from the proposal"
                 );
-                (claims, frontier)
-            };
+            }
             // A crossing named off a leaf the parent no longer holds as
             // named would refuse the block at every voter.
             let abandonment_records =

@@ -808,8 +808,8 @@ pub enum Action {
         /// root being verified.
         members: MemberInputs,
         /// What the read frontier judges of the block against the parent
-        /// state: its record presences, its absences and its late
-        /// deliveries' answers. A refusal refuses the state root.
+        /// state: its record presences, its absences and the answers
+        /// its absences delete. A refusal refuses the state root.
         fence: ReadFence,
         /// The block's claims, whose readings license the crossing
         /// settlements folded under the root, and among which the

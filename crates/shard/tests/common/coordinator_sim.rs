@@ -30,8 +30,8 @@ use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Capped;
 use hyperscale_shard::action_handlers::{build_proposal, committing_shards, verify_and_build_qc};
-use hyperscale_shard::local_crossings::{
-    disagreeing_parent_reading, misstated_unclaimed, parent_claims,
+use hyperscale_shard::parent_checks::{
+    AtParent, ProposalClaims, proposal_claims, refused_at_parent,
 };
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
@@ -1463,7 +1463,7 @@ impl ShardCoordinatorSim {
                 settled_txs_window_floor,
                 classification_topology_snapshot: classification_topology,
                 frontier,
-                fence: _,
+                fence,
                 parent_anchor,
                 local_crossings,
                 manifest,
@@ -1541,18 +1541,17 @@ impl ShardCoordinatorSim {
                     };
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
-                let mut state_claims = state_claims;
-                state_claims.extend(parent_claims(
+                let ProposalClaims {
+                    claims: state_claims,
+                    frontier,
+                    ..
+                } = proposal_claims(
+                    state_claims,
+                    &fence,
+                    &frontier,
                     &local_crossings,
                     parent_anchor,
                     &view.snapshot(),
-                ));
-                state_claims.sort_unstable();
-                let frontier = FrontierInputs::for_block(
-                    &state_claims,
-                    frontier.windows,
-                    frontier.anchor,
-                    frontier.local,
                 );
                 let terminal_settled_txs = carry_terminal_settled_txs.then(|| {
                     self.pending_chains[emitter_idx]
@@ -1860,7 +1859,7 @@ impl ShardCoordinatorSim {
                 claimed_sweep_frontier,
                 frontier,
                 members,
-                fence: _,
+                fence,
                 state_claims,
                 abandonment_records,
             } => {
@@ -1908,27 +1907,20 @@ impl ShardCoordinatorSim {
                     computed_sweep_frontier, claimed_sweep_frontier,
                     "the sim's proposer and verifier walk the same interval",
                 );
-                assert!(
-                    colliding_committed_cell(&creations, &view.snapshot()).is_none(),
-                    "the sim's proposer defers a transaction whose committed cell collides",
-                );
-                assert!(
-                    colliding_member_row(
-                        members.shard,
-                        members.transactions.iter().map(|(tx, _)| *tx),
+                assert_eq!(
+                    refused_at_parent(
+                        &AtParent {
+                            local: self.shard,
+                            creations: &creations,
+                            members: &members,
+                            fence: &fence,
+                            state_claims: &state_claims,
+                            abandonment_records: &abandonment_records,
+                        },
                         &view.snapshot(),
-                    )
-                    .is_none(),
-                    "the sim's proposer defers a transaction whose member row collides",
-                );
-                assert!(
-                    disagreeing_parent_reading(&state_claims, self.shard, &view.snapshot())
-                        .is_none(),
-                    "the sim's proposer reads its parent as its verifiers do",
-                );
-                assert!(
-                    misstated_unclaimed(&abandonment_records, &view.snapshot()).is_none(),
-                    "the sim's proposer names only the crossings its parent holds",
+                    ),
+                    Ok(()),
+                    "the sim's proposer builds what its parent state admits",
                 );
                 // The coordinator's rows are the state's own: at a parent
                 // that is its committed tip, the two read one family.

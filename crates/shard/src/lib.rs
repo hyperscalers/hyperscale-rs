@@ -87,6 +87,7 @@ mod delay;
 mod fence;
 pub mod local_crossings;
 mod lookups;
+pub mod parent_checks;
 mod pending;
 mod precut;
 mod proposal;
