@@ -121,6 +121,9 @@ where
             Action::ClearTickChain => {
                 self.io.tick_chain.clear();
             }
+            Action::RaiseTickFloor { floor } => {
+                self.io.tick_chain.raise_floor(floor);
+            }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
             Action::StartBlockSync { target } => {

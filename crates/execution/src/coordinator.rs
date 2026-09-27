@@ -217,6 +217,7 @@ struct TickedBatch {
 
 /// One seated but undispatched tick: the block's identity anchors plus
 /// the members that joined at its commit.
+#[derive(Clone)]
 struct PendingTick {
     tick: BlockHeight,
     tick_ts: WeightedTimestamp,
@@ -225,6 +226,15 @@ struct PendingTick {
     /// Whether this node holds everything the tick's lines name: a body
     /// for each member and the bundles each one named to run needs.
     in_hand: bool,
+}
+
+/// A tick this coordinator dispatched, kept until the tick leaves the
+/// registry: what re-runs it when a raised tick chain floor withdraws
+/// the run, and the fates recorded for it, which re-apply to the entry
+/// the re-run appends.
+struct Dispatched {
+    tick: PendingTick,
+    resolutions: Vec<TickResolution>,
 }
 
 /// One seated tick in dispatch order.
@@ -521,6 +531,19 @@ pub struct ExecutionCoordinator {
     /// outstanding.
     tick_in_flight: bool,
 
+    /// Every tick dispatched and not yet out of the registry, by height.
+    dispatched: BTreeMap<BlockHeight, Dispatched>,
+
+    /// The tick chain floor this coordinator has raised: a halt
+    /// recovery's attested frontier, at or below which no tick runs or
+    /// is read.
+    recovery_floor: BlockHeight,
+
+    /// Whether the batch in flight was dispatched before the floor last
+    /// rose: its run read a withdrawn baseline, so its completion records
+    /// nothing and the tick runs again.
+    stale_in_flight: bool,
+
     /// Whether the committed tip is past this chain's terminal window.
     ///
     /// Derived in every fold from the tip header's parent QC, before
@@ -790,6 +813,9 @@ impl ExecutionCoordinator {
             held: BTreeSet::new(),
             code,
             tick_in_flight: false,
+            dispatched: BTreeMap::new(),
+            recovery_floor: BlockHeight::GENESIS,
+            stale_in_flight: false,
             terminated: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
@@ -1783,6 +1809,10 @@ impl ExecutionCoordinator {
         );
         record_batch_unavailable();
         self.tick_in_flight = false;
+        if std::mem::take(&mut self.stale_in_flight) {
+            // The raise that made it stale queued the tick again.
+            return self.dispatch_next_tick();
+        }
         self.pending_ticks.push_front(Queued::Run(PendingTick {
             tick,
             tick_ts,
@@ -1808,6 +1838,13 @@ impl ExecutionCoordinator {
         outcome: TickBatchOutcome,
     ) -> Vec<Action> {
         self.tick_in_flight = false;
+        if std::mem::take(&mut self.stale_in_flight) {
+            // Its run read a baseline the raised floor withdrew; the
+            // chain refused its output, and the raise queued it again.
+            let mut actions = self.drain_ready_tick_resolutions();
+            actions.extend(self.dispatch_next_tick());
+            return actions;
+        }
         self.last_completed_tick = self.last_completed_tick.max(tick);
         let mut actions = Vec::new();
 
@@ -3105,6 +3142,7 @@ impl ExecutionCoordinator {
         committee_anchor: WeightedTimestamp,
         naming: Naming,
     ) -> CommitEffects {
+        let floor = self.apply_recovery_floor(topology_schedule);
         let block = certified.block();
         let height = block.height();
 
@@ -3136,11 +3174,10 @@ impl ExecutionCoordinator {
         // before that commit seats.
         let terminal = !self.terminated
             && topology_schedule.past_terminal(self.local_shard, self.committed_ts);
-        let mut actions = if terminal {
-            self.terminate()
-        } else {
-            Vec::new()
-        };
+        let mut actions = floor;
+        if terminal {
+            actions.extend(self.terminate());
+        }
         self.provisioning.advance_clock(self.committed_ts);
         self.parked_claims.retire_below(self.committed_ts);
         self.sweep_candidates();
@@ -3238,7 +3275,10 @@ impl ExecutionCoordinator {
             });
         }
         let ticks = &self.ticks;
+        let local = self.local_shard;
         self.held.retain(|tick_id| ticks.contains_tick(tick_id));
+        self.dispatched
+            .retain(|height, _| ticks.contains_tick(&TickId::new(local, *height)));
         actions.extend(self.drain_ready_tick_resolutions());
 
         let mut named = Vec::new();
@@ -3586,12 +3626,14 @@ impl ExecutionCoordinator {
             verified_power = tally.map_or(0, |tracker| tracker.total_verified_power().inner()),
             "Discarding a tick a halt recovery left no quorum to certify"
         );
-        let released: Vec<TxHash> = self
-            .ticks
-            .get_tick(&tick_id)
-            .map_or_else(Vec::new, |tick| tick.tx_hashes().to_vec());
+        debug_assert!(
+            tick_id.block_height() <= self.recovery_floor,
+            "a recovery discard names a tick the raised floor already withdrew",
+        );
         self.ticks.discard_tick(&tick_id);
-        self.release_chain_holds(tick_id, &released, true);
+        // The raised floor dropped its chain entry whole, holds and all,
+        // so nothing is left to abandon on it.
+        self.ticked.remove(&tick_id);
         self.finalized.remove_tick(&tick_id);
         self.exec_certs.evict(&tick_id);
         let height = tick_id.block_height();
@@ -3835,8 +3877,65 @@ impl ExecutionCoordinator {
         {
             ticked.legs.retain(|leg| !members.contains(leg));
         }
+        if let Some(dispatched) = self.dispatched.get_mut(&tick_id.block_height()) {
+            dispatched.resolutions.push(resolution.clone());
+        }
         self.pending_tick_resolutions
             .push((*tick_id, tick_id.block_height(), resolution));
+    }
+
+    /// Raise the tick chain floor to this shard's halt recovery frontier,
+    /// where the head schedule records one above the floor already
+    /// raised: no tick above the frontier reads a contribution at or
+    /// below it, which is exactly what a replica snap-synced there holds.
+    ///
+    /// The frontier is committed beacon content, so every replica keys
+    /// the floor alike; only when this one learns it is local, and the
+    /// re-runs make the outcome independent of that. Every queued tick at
+    /// or below the frontier goes, and every tick dispatched above it
+    /// runs again from its kept requests, its recorded fates re-applied
+    /// once it appends again. A batch in flight is marked stale, so its
+    /// completion records nothing.
+    fn apply_recovery_floor(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        let Some((_, frontier)) = topology_schedule.certified_recovery(self.local_shard) else {
+            return Vec::new();
+        };
+        if frontier <= self.recovery_floor {
+            return Vec::new();
+        }
+        self.recovery_floor = frontier;
+        self.pending_ticks.retain(|queued| match queued {
+            Queued::Run(pending) => pending.tick > frontier,
+            Queued::Held(tick_id) => tick_id.block_height() > frontier,
+        });
+        self.held
+            .retain(|tick_id| tick_id.block_height() > frontier);
+        self.pending_tick_resolutions
+            .retain(|(_, tick, _)| *tick > frontier);
+        let rerun = self.dispatched.split_off(&frontier.next());
+        self.dispatched.clear();
+        for (height, dispatched) in rerun.iter().rev() {
+            if let Some(state) = self
+                .ticks
+                .get_tick_mut(&TickId::new(self.local_shard, *height))
+            {
+                state.forget_run();
+            }
+            self.pending_ticks
+                .push_front(Queued::Run(dispatched.tick.clone()));
+        }
+        for (height, dispatched) in &rerun {
+            let tick_id = TickId::new(self.local_shard, *height);
+            self.pending_tick_resolutions.extend(
+                dispatched
+                    .resolutions
+                    .iter()
+                    .map(|resolution| (tick_id, *height, resolution.clone())),
+            );
+        }
+        self.last_completed_tick = frontier;
+        self.stale_in_flight = self.tick_in_flight;
+        vec![Action::RaiseTickFloor { floor: frontier }]
     }
 
     /// Emit every buffered resolution whose tick is now on the chain.
@@ -3869,11 +3968,14 @@ impl ExecutionCoordinator {
         }
         // A held tick blocks until its determined half has settled: its
         // readable writes are in the chain then, seated from the receipts.
+        // One at or below the tick chain floor is read by no tick above
+        // it, so nothing waits on it.
         while let Some(Queued::Held(tick_id)) = self.pending_ticks.front() {
-            if self
-                .ticks
-                .get_tick(tick_id)
-                .is_some_and(TickState::determined_unsettled)
+            if tick_id.block_height() > self.recovery_floor
+                && self
+                    .ticks
+                    .get_tick(tick_id)
+                    .is_some_and(TickState::determined_unsettled)
             {
                 return Vec::new();
             }
@@ -3908,8 +4010,16 @@ impl ExecutionCoordinator {
             return Vec::new();
         };
         self.tick_in_flight = true;
+        self.dispatched.insert(
+            tick.tick,
+            Dispatched {
+                tick: tick.clone(),
+                resolutions: Vec::new(),
+            },
+        );
         vec![Action::ExecuteTransactions {
             tick: tick.tick,
+            floor: self.recovery_floor,
             tick_ts: tick.tick_ts,
             env: tick.env,
             requests: tick.requests,
@@ -3964,11 +4074,13 @@ impl ExecutionCoordinator {
         topology_schedule: &TopologySchedule,
         ec: &Arc<Verified<ExecutionCertificate>>,
     ) -> Vec<Action> {
+        // No certificate is reconciled against a run the floor withdraws.
+        let mut actions = self.apply_recovery_floor(topology_schedule);
         // What a core says of a transaction a leg here issued for is
         // read before routing: the leg's tick settled long ago, so the
         // certificate routes nowhere, and the refusal is the one thing
         // in it this shard still has a use for.
-        let mut actions = self.counterparts.on_certificate(ec, self.committed_ts);
+        actions.extend(self.counterparts.on_certificate(ec, self.committed_ts));
 
         let routing = self.ticks.classify_attestation(ec);
 
@@ -4948,6 +5060,7 @@ mod tests {
             tick_ts,
             env,
             requests,
+            ..
         }) = actions
             .into_iter()
             .find(|action| matches!(action, Action::ExecuteTransactions { .. }))

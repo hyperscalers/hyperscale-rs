@@ -776,7 +776,8 @@ impl TopologySchedule {
     /// committee binding must not change when the pending record clears
     /// on the shard's first crossing, so the completed recovery keeps
     /// answering for the band below it, permanently.
-    fn certified_recovery(&self, shard: ShardId) -> Option<(Epoch, BlockHeight)> {
+    #[must_use]
+    pub fn certified_recovery(&self, shard: ShardId) -> Option<(Epoch, BlockHeight)> {
         if let Some(recovery) = self.head.pending_recoveries().get(&shard) {
             return Some((recovery.rotated_at.next(), recovery.attested_frontier));
         }

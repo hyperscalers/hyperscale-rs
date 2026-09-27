@@ -1172,6 +1172,11 @@ pub enum Action {
     ExecuteTransactions {
         /// Tick identifier: the committing block's height.
         tick: BlockHeight,
+        /// The tick chain floor the coordinator dispatched the tick under:
+        /// the chain appends the output only while its floor is still this
+        /// one, so a run dispatched before a halt recovery raised it lands
+        /// nothing, whenever it reads.
+        floor: BlockHeight,
         /// The committing block's parent-QC weighted timestamp.
         tick_ts: WeightedTimestamp,
         /// What the block fixed about the environment: the seeds a
@@ -1200,6 +1205,14 @@ pub enum Action {
     /// ends and successors seed from settled state, never from tick
     /// outputs.
     ClearTickChain,
+
+    /// Raise the tick chain floor to a halt recovery's attested frontier:
+    /// no tick above it reads a contribution at or below it, and a run
+    /// that read under a lower floor lands nothing.
+    RaiseTickFloor {
+        /// The frontier.
+        floor: BlockHeight,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Block Commit
@@ -1884,6 +1897,7 @@ impl Action {
             | Self::ExecuteTransactions { .. }
             | Self::ResolveTicks { .. }
             | Self::ClearTickChain
+            | Self::RaiseTickFloor { .. }
             | Self::CommitBlock { .. }
             | Self::CommitBlockByQcOnly { .. }
             | Self::EmitTransactionStatus { .. }
@@ -2018,6 +2032,7 @@ impl Action {
             | Self::AttachCertifiedUncommitted { .. }
             | Self::CancelTimer { .. }
             | Self::ClearTickChain
+            | Self::RaiseTickFloor { .. }
             | Self::CommitBeaconBlock { .. }
             | Self::CommitBlock { .. }
             | Self::CommitBlockByQcOnly { .. }

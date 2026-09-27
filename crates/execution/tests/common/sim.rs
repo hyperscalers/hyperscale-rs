@@ -46,13 +46,13 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
-    ConsensusReceipt, CounterpartMirror, DeclaredRange, EventRoot, ExecutionCertificate,
+    ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EventRoot, ExecutionCertificate,
     ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt, LocalKey,
-    MerkleInclusionProof, Movement, ProvenAnchors, ProvisionEntry, Provisions, ResourceAddr,
-    SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot, StateWrites, StoredReceipt,
-    SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
-    read_amount,
+    MerkleInclusionProof, Movement, ProvenAnchors, ProvisionEntry, Provisions, RecoveryCause,
+    ResourceAddr, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield, StateRoot,
+    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    compute_global_receipt_root, read_amount,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -223,6 +223,8 @@ impl VersionedStore for StubBase {
 /// A tick dispatched but not yet completed.
 struct PendingBatch {
     tick: BlockHeight,
+    /// The tick chain floor it was dispatched under.
+    floor: BlockHeight,
     requests: Vec<CrossShardExecutionRequest>,
     /// Height at which the schedule releases it.
     release_at: BlockHeight,
@@ -294,6 +296,49 @@ impl ExecutionSim {
             base,
             local_shard,
         }
+    }
+
+    /// A replica seated fresh at `height`: its coordinator holds the
+    /// committed state there and no tick chain below it, as a halt
+    /// recovery's snap-synced committee does at the attested frontier.
+    #[must_use]
+    pub fn seated_at(schedule: Schedule, height: BlockHeight) -> Self {
+        let mut sim = Self::new(schedule);
+        sim.height = height;
+        let recovered = RecoveredState {
+            committed_height: height,
+            ..RecoveredState::default()
+        };
+        sim.coord = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            sim.local_shard,
+            Arc::new(AllCodeRuns),
+            Arc::new(CrossingIndexSlot::default()),
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
+        );
+        sim
+    }
+
+    /// The beacon records a halt recovery of this shard at `frontier`:
+    /// the schedule's head carries it from the next commit on.
+    pub fn recover(&mut self, frontier: BlockHeight) {
+        let recorded = (*self.snapshot)
+            .clone()
+            .with_pending_recoveries(BTreeMap::from([(
+                self.local_shard,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::GENESIS,
+                    retained: Vec::new(),
+                    attested_frontier: frontier,
+                },
+            )]));
+        self.snapshot = Arc::new(recorded);
+        self.topology = TopologySchedule::single(Arc::clone(&self.snapshot));
     }
 
     /// Commit a block carrying `txs` and `certificates`, then run whatever
@@ -438,7 +483,12 @@ impl ExecutionSim {
     fn absorb(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::ExecuteTransactions { tick, requests, .. } => {
+                Action::ExecuteTransactions {
+                    tick,
+                    floor,
+                    requests,
+                    ..
+                } => {
                     let release_at = match self.schedule {
                         Schedule::Eager => self.height,
                         Schedule::Lagged(n) => BlockHeight::new(
@@ -447,6 +497,7 @@ impl ExecutionSim {
                     };
                     self.pending.push_back(PendingBatch {
                         tick,
+                        floor,
                         requests,
                         release_at,
                     });
@@ -457,6 +508,7 @@ impl ExecutionSim {
                     }
                 }
                 Action::ClearTickChain => self.chain.clear(),
+                Action::RaiseTickFloor { floor } => self.chain.raise_floor(floor),
                 _ => {}
             }
         }
@@ -469,7 +521,12 @@ impl ExecutionSim {
     /// coordinator dispatches the next tick on that notification and its
     /// baseline has to include this one.
     fn run_batch(&mut self, batch: PendingBatch) -> Vec<Action> {
-        let PendingBatch { tick, requests, .. } = batch;
+        let PendingBatch {
+            tick,
+            floor,
+            requests,
+            ..
+        } = batch;
         let view = self
             .chain
             .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
@@ -514,7 +571,7 @@ impl ExecutionSim {
         };
 
         self.outputs.push((tick, output.clone()));
-        self.chain.append(tick, output, view.generation());
+        self.chain.append(tick, output, floor);
         self.coord
             .on_execution_batch_completed(&self.topology, tick, outcome)
     }

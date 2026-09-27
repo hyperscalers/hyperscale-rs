@@ -264,6 +264,7 @@ where
         }
         Action::ExecuteTransactions {
             tick,
+            floor,
             tick_ts,
             env,
             requests,
@@ -334,7 +335,7 @@ where
 
             // Append before notifying: the coordinator dispatches the next
             // tick on this event, and its baseline must include this one.
-            ctx.tick_chain.append(tick, output, view.generation());
+            ctx.tick_chain.append(tick, output, floor);
             ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted {
                 tick,
                 outcome: TickBatchOutcome {

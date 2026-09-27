@@ -205,10 +205,10 @@ struct TickEntry {
     /// merging every tick's contributions into one map, which is what
     /// keeps a read's cost off the whole content of the retained chain.
     folded: Option<CachedFold>,
-    /// The chain generation a run appended this entry under, or `None`
-    /// for one only restored receipts seated: a run read a baseline, and
-    /// receipts restate committed writes that depend on none.
-    ran: Option<u64>,
+    /// Whether a run appended this entry, rather than restored receipts
+    /// alone: a run read a baseline, and receipts restate committed
+    /// writes that depend on none.
+    ran: bool,
 }
 
 impl TickEntry {
@@ -219,7 +219,7 @@ impl TickEntry {
             readable: BTreeMap::new(),
             pending: BTreeMap::new(),
             folded: None,
-            ran: None,
+            ran: false,
         }
     }
 
@@ -241,8 +241,8 @@ impl TickEntry {
         self.folded = None;
     }
 
-    /// The entry one tick's output produces, run under `generation`.
-    fn from_output(output: TickOutput, generation: u64) -> Self {
+    /// The entry one tick's run produces.
+    fn from_output(output: TickOutput) -> Self {
         Self {
             readable: output
                 .determined
@@ -263,7 +263,7 @@ impl TickEntry {
                 .map(|tx| (tx.tx_hash, tx))
                 .collect(),
             folded: None,
-            ran: Some(generation),
+            ran: true,
         }
     }
 
@@ -435,10 +435,6 @@ pub struct TickChain<S> {
     /// recovery's attested frontier, below which the fresh committee
     /// holds settled state and nothing else.
     floor: RwLock<BlockHeight>,
-    /// Bumped by every raise of the floor. A run's output is appended
-    /// only under the generation its view read, so a batch that read
-    /// under a lower floor never lands.
-    generation: RwLock<u64>,
 }
 
 impl<S> TickChain<S>
@@ -458,7 +454,6 @@ where
             executed: RwLock::new(BlockHeight::GENESIS),
             persisted: RwLock::new(persisted),
             floor: RwLock::new(BlockHeight::GENESIS),
-            generation: RwLock::new(0),
         }
     }
 
@@ -473,19 +468,19 @@ where
     /// write unchanged and apply every movement it carries a second
     /// time, and it would re-add ticks the chain has since resolved.
     ///
-    /// Dropped too at or below the floor, or when `generation` is not the
-    /// chain's own: the run read a baseline a raise of the floor has
-    /// since withdrawn, so its output is not the committee's.
-    pub fn append(&self, height: BlockHeight, output: TickOutput, generation: u64) {
+    /// Dropped too at or below the floor, or when the run was dispatched
+    /// under another floor than the chain's: it was dispatched before a
+    /// raise withdrew what it may have read, so its output is not the
+    /// committee's, whenever it happened to read.
+    pub fn append(&self, height: BlockHeight, output: TickOutput, dispatched_under: BlockHeight) {
         let mut entries = write_or_recover(&self.entries);
-        if height <= *read_or_recover(&self.floor)
-            || generation != *read_or_recover(&self.generation)
-        {
+        let floor = *read_or_recover(&self.floor);
+        if height <= floor || dispatched_under != floor {
             return;
         }
         entries
             .entry(height)
-            .or_insert_with(|| TickEntry::from_output(output, generation));
+            .or_insert_with(|| TickEntry::from_output(output));
         drop(entries);
         let mut executed = write_or_recover(&self.executed);
         *executed = (*executed).max(height);
@@ -497,9 +492,9 @@ where
     /// Every entry at or below the floor goes whole, readable or pending.
     /// Every entry above it a run appended goes too, since it read a
     /// baseline that held them; an entry above it only receipts seated
-    /// stays, since receipts depend on no baseline. The generation moves,
-    /// so a run in flight appends nothing. The base is held at the floor,
-    /// so the runs that replace what went read a baseline still there.
+    /// stays, since receipts depend on no baseline. A run dispatched under
+    /// the old floor appends nothing. The base is held at the floor, so
+    /// the runs that replace what went read a baseline still there.
     ///
     /// A floor at or below the current one does nothing, so every vnode
     /// sharing the chain may raise it and it applies once.
@@ -512,8 +507,7 @@ where
             }
             *current = floor;
         }
-        *write_or_recover(&self.generation) += 1;
-        entries.retain(|height, entry| *height > floor && entry.ran.is_none());
+        entries.retain(|height, entry| *height > floor && !entry.ran);
         drop(entries);
         *write_or_recover(&self.executed) = floor;
         let persisted = *read_or_recover(&self.persisted);
@@ -653,14 +647,12 @@ where
                 }
             }
         }
-        let generation = *read_or_recover(&self.generation);
         drop(entries);
         TickView {
             base: Arc::clone(&self.base),
             anchor: base_at,
             overlays: Arc::new(overlays),
             holds: Arc::new(holds),
-            generation,
         }
     }
 }
@@ -678,17 +670,6 @@ pub struct TickView<S> {
     /// writes sit above an earlier tick's.
     overlays: Arc<Vec<Arc<StateWrites>>>,
     holds: Arc<ProvisionalHolds>,
-    /// The chain generation the view was read under, which a run's
-    /// output is appended under.
-    generation: u64,
-}
-
-impl<S> TickView<S> {
-    /// The chain generation this view was read under.
-    #[must_use]
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
 }
 
 impl<S: VersionedStore> TickView<S> {
@@ -1008,7 +989,7 @@ mod tests {
                 )],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
         chain.append(
             BlockHeight::new(2),
@@ -1016,7 +997,7 @@ mod tests {
                 determined: vec![(tx(2), writes(&[(key(1), None)]))],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         // Anchored below tick 2: tick 1's write shadows base.
@@ -1045,7 +1026,7 @@ mod tests {
                 determined: vec![(tx(1), debit(key(1), 300))],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         let view = chain.view_at(BlockHeight::new(1));
@@ -1065,7 +1046,7 @@ mod tests {
                 determined: vec![(tx(1), debit(key(1), 300))],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
         chain.append(
             BlockHeight::new(2),
@@ -1076,7 +1057,7 @@ mod tests {
                 )],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         let view = chain.view_at(BlockHeight::new(2));
@@ -1099,7 +1080,7 @@ mod tests {
                 )],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
         chain.append(
             BlockHeight::new(2),
@@ -1107,7 +1088,7 @@ mod tests {
                 determined: vec![(tx(2), debit(key(1), 200))],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         let view = chain.view_at(BlockHeight::new(2));
@@ -1125,7 +1106,7 @@ mod tests {
                     determined: vec![(tx(member), debit(key(1), moved))],
                     provisional: Vec::new(),
                 },
-                0,
+                BlockHeight::GENESIS,
             );
         }
 
@@ -1174,7 +1155,7 @@ mod tests {
                     })
                     .collect(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
         // Each leg's counterpart certifies in a block of its own.
         for (member, height) in [(tx(7), 5u64), (tx(8), 9)] {
@@ -1262,7 +1243,7 @@ mod tests {
                 determined: vec![(tx(7), writes(&[(key(1), Some(b"ran"))]))],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
         chain.resolve(
             &tick(3),
@@ -1304,7 +1285,7 @@ mod tests {
                 ],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
         chain.append(
             BlockHeight::new(2),
@@ -1315,7 +1296,7 @@ mod tests {
                 ],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         let view = chain.view_at(BlockHeight::new(2));
@@ -1368,7 +1349,11 @@ mod tests {
             b"settled",
         ));
         let chain = TickChain::new(Arc::clone(&store));
-        chain.append(BlockHeight::new(4), TickOutput::default(), 0);
+        chain.append(
+            BlockHeight::new(4),
+            TickOutput::default(),
+            BlockHeight::GENESIS,
+        );
         chain.prune_persisted(BlockHeight::new(9));
 
         assert_eq!(
@@ -1377,7 +1362,11 @@ mod tests {
             "the hold is what has executed, which trails what has persisted"
         );
 
-        chain.append(BlockHeight::new(9), TickOutput::default(), 0);
+        chain.append(
+            BlockHeight::new(9),
+            TickOutput::default(),
+            BlockHeight::GENESIS,
+        );
         chain.prune_persisted(BlockHeight::new(9));
 
         assert_eq!(
@@ -1406,12 +1395,12 @@ mod tests {
         chain.append(
             BlockHeight::new(2),
             determined(&[(key(1), Some(b"two"))], 2),
-            0,
+            BlockHeight::GENESIS,
         );
         chain.append(
             BlockHeight::new(3),
             determined(&[(key(2), Some(b"three"))], 3),
-            0,
+            BlockHeight::GENESIS,
         );
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"two".to_vec()));
 
@@ -1433,7 +1422,7 @@ mod tests {
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
-            0,
+            BlockHeight::GENESIS,
         );
         chain.resolve(
             &tick(6),
@@ -1448,32 +1437,30 @@ mod tests {
         assert_eq!(read_at(&chain, 7, key(2)), Some(b"six".to_vec()));
     }
 
-    /// An append read under an older generation lands nothing, and nor
-    /// does one at or below the floor; one read after the raise lands.
+    /// A run dispatched under an older floor lands nothing, whenever it
+    /// reads, and nor does one at or below the floor; one dispatched
+    /// under the raised floor lands.
     #[test]
-    fn an_append_read_under_an_older_floor_is_refused() {
+    fn an_append_dispatched_under_an_older_floor_is_refused() {
+        let floor = BlockHeight::new(3);
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        let stale = chain.view_at(BlockHeight::new(4)).generation();
-        chain.raise_floor(BlockHeight::new(3));
+        chain.raise_floor(floor);
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
-            stale,
+            BlockHeight::GENESIS,
         );
         assert!(chain.is_empty(), "the stale run lands nothing");
-
-        let fresh = chain.view_at(BlockHeight::new(4)).generation();
-        assert_ne!(fresh, stale);
         chain.append(
             BlockHeight::new(3),
             determined(&[(key(1), Some(b"three"))], 3),
-            fresh,
+            floor,
         );
         assert!(chain.is_empty(), "nothing lands at the floor");
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
-            fresh,
+            floor,
         );
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"five".to_vec()));
     }
@@ -1482,18 +1469,17 @@ mod tests {
     /// second raise at the same floor, or a lower one, drops no re-run.
     #[test]
     fn raising_the_floor_twice_is_one_raise() {
+        let floor = BlockHeight::new(3);
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        chain.raise_floor(BlockHeight::new(3));
-        let generation = chain.view_at(BlockHeight::new(4)).generation();
+        chain.raise_floor(floor);
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
-            generation,
+            floor,
         );
-        chain.raise_floor(BlockHeight::new(3));
+        chain.raise_floor(floor);
         chain.raise_floor(BlockHeight::new(2));
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"five".to_vec()));
-        assert_eq!(chain.view_at(BlockHeight::new(4)).generation(), generation);
     }
 
     /// The base is held at the floor, so the runs that replace what the
@@ -1525,7 +1511,7 @@ mod tests {
                     reserved: BTreeMap::new(),
                 }],
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         let view = chain.view_at(BlockHeight::new(1));
@@ -1562,7 +1548,7 @@ mod tests {
                         reserved: BTreeMap::new(),
                     }],
                 },
-                0,
+                BlockHeight::GENESIS,
             );
         }
 
@@ -1602,7 +1588,7 @@ mod tests {
                     reserved: BTreeMap::new(),
                 }],
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         chain.resolve(
@@ -1633,7 +1619,7 @@ mod tests {
                     reserved: BTreeMap::new(),
                 }],
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         chain.resolve(
@@ -1671,7 +1657,7 @@ mod tests {
                     reserved: BTreeMap::new(),
                 }],
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         // The determined half settles on its own; the leg is untouched.
@@ -1721,8 +1707,8 @@ mod tests {
             determined: vec![(tx(1), debit(key(1), 100))],
             provisional: Vec::new(),
         };
-        chain.append(BlockHeight::new(1), output(), 0);
-        chain.append(BlockHeight::new(1), output(), 0);
+        chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS);
+        chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS);
 
         let view = chain.view_at(BlockHeight::new(1));
         assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 900);
@@ -1755,7 +1741,7 @@ mod tests {
                     reserved: BTreeMap::new(),
                 }],
             },
-            0,
+            BlockHeight::GENESIS,
         );
         chain.resolve(
             &w,
@@ -1797,7 +1783,7 @@ mod tests {
                 determined: vec![(tx(1), writes(&[(key(1), Some(b"one"))]))],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
 
         // Unresolved: survives any persistence progress.
@@ -1830,7 +1816,7 @@ mod tests {
                 determined: vec![(tx(3), writes(&[(key(1), Some(b"three"))]))],
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
         chain.prune_persisted(BlockHeight::new(2));
         assert_eq!(chain.len(), 2, "persistence has not caught up");
@@ -1856,7 +1842,7 @@ mod tests {
                 determined: Vec::new(),
                 provisional: Vec::new(),
             },
-            0,
+            BlockHeight::GENESIS,
         );
         chain.resolve(&w, &settled);
         chain.resolve(&w, &settled);

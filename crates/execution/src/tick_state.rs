@@ -244,6 +244,9 @@ struct Seat {
     /// later than the halves being emitted, since a handed-off
     /// finalization still has to reach a block.
     settled: bool,
+    /// The engine returned a result for the member: what a run of the
+    /// tick left, which a raised tick chain floor withdraws.
+    ran: bool,
 }
 
 impl Seat {
@@ -260,6 +263,7 @@ impl Seat {
             refusal_receipt: None,
             covered_by: BTreeSet::new(),
             aborted_anywhere: false,
+            ran: false,
             settled: false,
         }
     }
@@ -547,7 +551,33 @@ impl TickState {
         if let Some(seat) = self.seats.get_mut(&tx_hash) {
             seat.result.get_or_insert(outcome);
             seat.awaiting_result = false;
+            seat.ran = true;
         }
+    }
+
+    /// Withdraw what a run of the tick left, so a second run lands over
+    /// it: the run read a baseline a raised tick chain floor withdrew.
+    /// Every seat the engine returned a result for waits on one again,
+    /// and the tick votes again. A refusal receipt recorded for a seat
+    /// that never ran, an abandonment's, stays.
+    ///
+    /// Called only before the tick's local certificate is out, which the
+    /// floor's ordering holds: a certificate over the run it withdraws
+    /// would be one the second run's receipts could not match.
+    pub fn forget_run(&mut self) {
+        debug_assert!(
+            !self.local_ec_emitted,
+            "a run is withdrawn only before its tick is certified"
+        );
+        for seat in self.seats.values_mut().filter(|seat| seat.ran) {
+            seat.ran = false;
+            seat.result = None;
+            seat.receipt = None;
+            seat.refusal_receipt = None;
+            seat.awaiting_result = true;
+        }
+        self.voted = false;
+        self.local_vote_global_receipt_root = None;
     }
 
     /// Record a local receipt from the engine. First-write-wins.
@@ -1381,6 +1411,41 @@ mod tests {
             ),
         )));
         (tick, determined, leg)
+    }
+
+    /// A run a raised tick chain floor withdraws is forgotten, and a
+    /// second batch lands over it: the tick waits on its member again,
+    /// votes again, and keeps what no run produced.
+    #[test]
+    fn a_second_batch_lands_over_a_forgotten_first() {
+        let local = shard(0);
+        let ran = tx(1);
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        tick.admit(
+            ran,
+            Membership::whole(BTreeSet::from([local])),
+            Some(10),
+            Joins::Executes,
+        );
+        let succeeded = ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+        };
+        tick.record_execution_result(ran, succeeded.clone());
+        tick.record_receipt(receipt(ran));
+        assert!(tick.build_vote_data().is_some(), "the first run votes");
+
+        tick.forget_run();
+        assert_eq!(tick.receipt_count(), 0, "the run's receipt is withdrawn");
+        assert!(!tick.can_emit_vote(), "and the member is awaited again");
+
+        tick.record_execution_result(ran, succeeded);
+        tick.record_receipt(receipt(ran));
+        assert_eq!(tick.receipt_count(), 1);
+        assert!(tick.can_emit_vote(), "the second run votes");
     }
 
     /// A counterpart that ran the member as a leg awaited nobody, and its
