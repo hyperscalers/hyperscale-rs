@@ -59,6 +59,7 @@ use hyperscale_scenarios::{
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
     a_withheld_fallback_is_asked_by_an_honest_validator, abort_converges,
+    an_abandoned_never_is_read_seen_and_goes,
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
     attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
@@ -803,6 +804,13 @@ fn route_cluster_on_dedicated_hosts() -> SimCluster {
 /// The refusal's own shape: a venue refuses its member, and the `Never`
 /// rides its rejecting finalization. Sim-only for the same reason as its
 /// neighbours — the conservation runs to the producer's own reclaim.
+/// An abandoned decline is read seen off its record and goes with it.
+#[test]
+fn an_abandoned_never_is_read_seen_and_goes_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(an_abandoned_never_is_read_seen_and_goes);
+}
+
 #[test]
 fn a_crossing_the_consumer_refuses_is_declined_sim() {
     let mut cluster = route_cluster_on_dedicated_hosts();

@@ -14,10 +14,11 @@ use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
-    Address, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
-    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, ShardTrie,
+    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
+    Window,
 };
-use hyperscale_vm_effects::{CrossingId, Kind};
+use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind};
 use hyperscale_vm_types::{LegRole, LegShape};
 
 use crate::straddler::isolate_ec_intake;
@@ -505,6 +506,146 @@ fn assert_nothing_spoke<C: Cluster>(c: &C, hash: TxHash, trader: PrincipalAddr, 
             "and neither may write a Never for a crossing its member may still take",
         );
     }
+}
+
+/// A decline an abandonment wrote, unseen, is read seen off its record
+/// and goes once the record does.
+///
+/// The route's second venue never engages: every bundle it would need is
+/// cut away from it, so the route never enters a block there. The first
+/// venue commits the route, holds the trader's escrowed input past its
+/// deadline with its sibling silent, and is aborted, declining the
+/// input's crossing unseen, since its member never ran on the record. An
+/// absence alone must not delete such a decline, which might predate the
+/// record's write. Here the record stands: the first venue's asks read it
+/// present, which marks the decline seen, the trader's shard reclaims on
+/// the decline, and the record's absence then deletes it. The trader's
+/// input comes home and both worlds settle with nothing locked.
+///
+/// Requires disjoint committees, as its neighbours do.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the first
+/// venue never commits the route or never declines the crossing unseen,
+/// if the second venue engages, if the decline outlives its record, if
+/// the input does not come home, or if either world is not conserved.
+pub fn an_abandoned_never_is_read_seen_and_goes<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, trader) = &traders[0];
+    let second_hosts = c.committee_hosts(SECOND_VENUE_SHARD);
+    let others: Vec<usize> = (0..c.host_count())
+        .filter(|host| !second_hosts.contains(host))
+        .collect();
+    let cut = [
+        c.drop_type_between(&others, &second_hosts, "provisions.broadcast"),
+        c.drop_type_between(&second_hosts, &others, "provision.request"),
+    ];
+    let (mut protocol_resource, units) = route_worlds(c, &first, &second, &traders);
+
+    let mut charges = Charges::default();
+    let funded = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let price = declared_price(c, &route);
+    let decline = crossing_between(c, &route, TRADER_SHARD, FIRST_VENUE_SHARD)
+        .answer_key(&ProtocolHasher, Answered::Never);
+    let hash = charges.submit(c, route);
+    protocol_resource.owing(charges.records(c));
+
+    assert!(
+        c.run_until(epochs(8), |c| c
+            .chain_fate(FIRST_VENUE_SHARD, hash)
+            .0
+            .is_some()),
+        "the first venue must commit the route",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| stands_at(c, decline)),
+        "the first venue must decline the input it held past its deadline",
+    );
+    assert!(
+        c.substate(FIRST_VENUE_SHARD, decline.owner, decline.local.0)
+            .as_deref()
+            .and_then(CrossingAnswer::from_bytes)
+            .is_some_and(|answer| answer.answered == Answered::Never),
+        "and the decline is the abandonment's",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| !stands_at(c, decline)),
+        "the decline must go once its record, read present and reclaimed, is read absent",
+    );
+    assert!(
+        c.chain_fate(SECOND_VENUE_SHARD, hash).0.is_none(),
+        "the second venue must never have engaged",
+    );
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the bundles must actually have been cut",
+    );
+    c.clear_drops();
+
+    assert!(
+        c.run_until(epochs(12), |c| held(
+            c,
+            trader.address(),
+            *PROTOCOL_RESOURCE
+        ) == funded - price),
+        "the trader's input must come home, less the price: holds {} against {}",
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+        funded - price,
+    );
+    let locked = protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "an abandoned decline read seen",
+    );
+    assert!(locked.is_empty(), "nothing stays locked: {locked:?}");
+    units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(8),
+        "an abandoned decline read seen",
+    );
+}
+
+/// The crossing a route hands from its node on `producer` to its node on
+/// `consumer`.
+///
+/// # Panics
+///
+/// Panics if the route does not derive, or crosses no edge between the
+/// two.
+fn crossing_between<C: Cluster>(
+    c: &C,
+    route: &Transaction,
+    producer: ShardId,
+    consumer: ShardId,
+) -> CrossingId {
+    let legs = &route
+        .try_derived(c.derivation().as_ref())
+        .expect("a scenario route derives")
+        .legs;
+    let trie = ShardTrie::uniform(2);
+    legs.iter()
+        .flat_map(|to| to.edges.iter().map(move |edge| (to, edge)))
+        .find_map(|(to, edge)| {
+            let from = &legs[edge.source as usize];
+            (trie.shard_for_prefix(from.target) == producer
+                && trie.shard_for_prefix(to.target) == consumer)
+                .then(|| CrossingId::of_edge(from, to.target, edge.output))
+        })
+        .expect("the route crosses from the producer's venue to the consumer's")
 }
 
 /// A crossing whose consumer has refused it is declined by the

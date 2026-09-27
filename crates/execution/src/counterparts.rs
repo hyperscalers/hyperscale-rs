@@ -19,6 +19,7 @@ use hyperscale_metrics::{
     record_crossing_fallback_ask, record_fenced_claim, record_rebuilt_record_entry,
     record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
+use hyperscale_storage::{committed_tx_cell_key, member_row_leaf};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
@@ -239,20 +240,32 @@ enum Asked {
         due_from: WeightedTimestamp,
         /// The newest producer anchor a reading of the record present was
         /// folded at: a question worth putting only at a newer header.
-        seen: Option<Anchor>,
+        present_at: Option<Anchor>,
         /// A pushed absence of the record was refused below the read
         /// frontier's floor, so the record is read again at once,
         /// whatever the deadline.
         reread: bool,
+        /// For a decline whose consumer never read the record: the
+        /// declining transaction and its validity end, whose member row
+        /// and committed marker on the record's shard are read beside
+        /// the record, so an absence can carry the proof that the
+        /// producer's member exited.
+        exit: Option<(TxHash, WeightedTimestamp)>,
     },
+    /// A key read beside an unseen decline's record to prove its
+    /// producer's member exited: the member row or the committed marker.
+    /// Stands exactly while the decline does.
+    Exit,
 }
 
 impl Asked {
     /// Whether a reading taken at `anchor` could still move the question.
     fn wants(self, anchor: Anchor) -> bool {
         match self {
-            Self::Answer { .. } => true,
-            Self::Record { seen, .. } => seen.is_none_or(|seen| anchor.height > seen.height),
+            Self::Answer { .. } | Self::Exit => true,
+            Self::Record { present_at, .. } => {
+                present_at.is_none_or(|present| anchor.height > present.height)
+            }
         }
     }
 }
@@ -886,19 +899,28 @@ impl Counterparts {
                         }
                         continue;
                     }
-                    let (seen, reread) = match self.asks.get(&record) {
-                        Some(Asked::Record { seen, reread, .. }) => (*seen, *reread),
+                    let (present_at, reread) = match self.asks.get(&record) {
+                        Some(Asked::Record {
+                            present_at, reread, ..
+                        }) => (*present_at, *reread),
                         _ => (None, false),
                     };
-                    let due_from =
-                        Deadline::of(WeightedTimestamp::from_millis(answer.validity_end_ms)).at();
+                    let validity_end = WeightedTimestamp::from_millis(answer.validity_end_ms);
+                    let exit = (answer.answered == Answered::Never && !answer.seen)
+                        .then_some((answer.tx, validity_end));
+                    if let Some((tx, _)) = exit {
+                        let holder = trie.shard_for_prefix(record.owner);
+                        asks.insert(member_row_leaf(holder, tx), Asked::Exit);
+                        asks.insert(committed_tx_cell_key(holder, tx, validity_end), Asked::Exit);
+                    }
                     asks.insert(
                         record,
                         Asked::Record {
                             id,
-                            due_from,
-                            seen,
+                            due_from: Deadline::of(validity_end).at(),
+                            present_at,
                             reread,
+                            exit,
                         },
                     );
                 }
@@ -976,7 +998,7 @@ impl Counterparts {
                 Asked::Answer { id, .. } => {
                     **key == id.answer_key(&ProtocolHasher, Answered::Taken)
                 }
-                Asked::Record { .. } => false,
+                Asked::Record { .. } | Asked::Exit => false,
             })
             .map(|(key, asked)| (*key, *asked))
             .collect();
@@ -1109,8 +1131,9 @@ impl Counterparts {
             let Asked::Record {
                 id,
                 due_from,
-                seen,
+                present_at,
                 reread,
+                exit,
             } = asked
             else {
                 continue;
@@ -1139,14 +1162,20 @@ impl Counterparts {
                         Asked::Record {
                             id,
                             due_from,
-                            seen,
+                            present_at,
                             reread: false,
+                            exit,
                         },
                     );
                 } else {
                     record_crossing_fallback_ask("consumer");
                 }
-                wanted.entry(anchor).or_default().push(record);
+                let asking = wanted.entry(anchor).or_default();
+                asking.push(record);
+                if let Some((tx, validity_end)) = exit {
+                    asking.push(member_row_leaf(shard, tx));
+                    asking.push(committed_tx_cell_key(shard, tx, validity_end));
+                }
             }
         }
     }
@@ -1324,7 +1353,7 @@ impl Counterparts {
         let questions = self.ledger.questions(trie);
         for claim in block.state_claims() {
             self.fold_cells(claim, &questions);
-            self.fold_seen(claim);
+            self.fold_present(claim);
         }
     }
 
@@ -1433,19 +1462,19 @@ impl Counterparts {
     /// read frontier's floor is the fold's licence to delete the answer,
     /// which takes its row and so its question with it; one below the
     /// floor licenses nothing, and the question is put again.
-    fn fold_seen(&mut self, stated: &StateClaim) {
+    fn fold_present(&mut self, stated: &StateClaim) {
         let shard = stated.anchor.shard;
         for (key, asked) in &mut self.asks {
-            let Asked::Record { seen, .. } = asked else {
+            let Asked::Record { present_at, .. } = asked else {
                 continue;
             };
             if !ShardTrie::shard_owns_prefix(shard, key.owner) {
                 continue;
             }
             if matches!(stated.reading(*key), Some(Inclusion::Present(_)))
-                && seen.is_none_or(|seen| stated.anchor.height > seen.height)
+                && present_at.is_none_or(|present| stated.anchor.height > present.height)
             {
-                *seen = Some(stated.anchor);
+                *present_at = Some(stated.anchor);
             }
         }
     }
@@ -1902,7 +1931,9 @@ mod tests {
         AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
         MAX_FINALIZATION_DELAY, ResourceAddr, RoutePrefix, StateRoot, evidence_admits_block,
     };
-    use hyperscale_vm_effects::{Answered, CrossingCell, Hash32, IntentHash, Terms};
+    use hyperscale_vm_effects::{
+        Answered, CrossingAnswer, CrossingCell, Hash32, IntentHash, Terms,
+    };
 
     use super::*;
 
@@ -1965,18 +1996,22 @@ mod tests {
     }
 
     fn answering() -> Answering {
+        answering_with(|id, cell| id.answer(cell.tx, Answered::Taken, cell.validity_end_ms))
+    }
+
+    /// [`answering`] with the consumer standing `answer_of` the record.
+    fn answering_with(
+        answer_of: impl Fn(&CrossingId, &CrossingCell) -> CrossingAnswer,
+    ) -> Answering {
         let anchors = Arc::new(ProvenAnchors::default());
         let rows = Arc::new(TestRows::default());
         // A deadline at the clock the tests ask at: nothing is asked
         // before it.
         let cell = producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(36_000)));
         let id = CrossingId::of_record(producer_record(0x42).owner, &cell);
-        let answer = id.answer_key(&ProtocolHasher, Answered::Taken);
-        rows.put(
-            answer,
-            id.answer(cell.tx, Answered::Taken, cell.validity_end_ms)
-                .to_bytes(),
-        );
+        let standing = answer_of(&id, &cell);
+        let answer = id.answer_key(&ProtocolHasher, standing.answered);
+        rows.put(answer, standing.to_bytes());
         let mut counterparts = Counterparts::new(
             CONSUMER,
             Arc::clone(&anchors),
@@ -2169,7 +2204,7 @@ mod tests {
             matches!(landed.reading(record), Some(Inclusion::Present(_))),
             "the fixture's proof says the record stands",
         );
-        counterparts.fold_seen(&landed);
+        counterparts.fold_present(&landed);
         counterparts.release_answered_fetches(&trie);
         assert!(
             !counterparts
@@ -2228,7 +2263,7 @@ mod tests {
         let asked = |counterparts: &Counterparts| counterparts.asks[&record];
         assert!(asked(&counterparts).wants(at(1_000)));
 
-        counterparts.fold_seen(&reading(at(1_000), record, Inclusion::Present([7; 32])));
+        counterparts.fold_present(&reading(at(1_000), record, Inclusion::Present([7; 32])));
         assert!(
             !asked(&counterparts).wants(at(1_000)),
             "not asked again at the header it was already read at",
@@ -2238,7 +2273,7 @@ mod tests {
             "but at the next one it is"
         );
 
-        counterparts.fold_seen(&reading(at(1_001), record, Inclusion::Absent));
+        counterparts.fold_present(&reading(at(1_001), record, Inclusion::Absent));
         assert!(
             asked(&counterparts).wants(at(1_001)),
             "an absence records nothing here",
@@ -2314,6 +2349,56 @@ mod tests {
         );
     }
 
+    /// A decline an abandonment wrote asks, beside its record and at the
+    /// same anchor, the two keys that prove its producer's member exited:
+    /// the member row and the committed marker on the record's shard.
+    /// A seen answer asks its record alone
+    /// ([`a_consumer_asks_its_producer_about_the_record_its_answer_names`]).
+    #[test]
+    fn an_unseen_never_asks_its_exit_keys_at_one_anchor() {
+        let cell = producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(36_000)));
+        let Answering {
+            mut counterparts,
+            trie,
+            anchors,
+            record,
+            ..
+        } = answering_with(|id, cell| id.unseen_never(cell.tx, cell.validity_end_ms));
+        let now = WeightedTimestamp::from_millis(60_000);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(7),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: now,
+        };
+        anchors.record(anchor);
+        let asked = counterparts.probe(&trie, now, &[], EpochWindows::new(0));
+        let validity_end = WeightedTimestamp::from_millis(cell.validity_end_ms);
+        let mut expected = vec![
+            (anchor, record),
+            (anchor, member_row_leaf(PRODUCER, cell.tx)),
+            (
+                anchor,
+                committed_tx_cell_key(PRODUCER, cell.tx, validity_end),
+            ),
+        ];
+        expected.sort_unstable();
+        let [
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::StateProofs(keys),
+                shard,
+                ..
+            }),
+        ] = asked.as_slice()
+        else {
+            panic!("one ask for the record and its exit keys: {asked:?}");
+        };
+        let mut keys = keys.clone();
+        keys.sort_unstable();
+        assert_eq!(*shard, PRODUCER);
+        assert_eq!(keys, expected, "all three at the one anchor");
+    }
+
     /// A reading from a shard that does not own the record's prefix
     /// moves nothing, whatever its anchor: a leaf owns exactly its
     /// path's prefixes while it is live, so a sibling's reading of a key
@@ -2338,17 +2423,17 @@ mod tests {
             )
         };
         let seen = |counterparts: &Counterparts| match counterparts.asks[&record] {
-            Asked::Record { seen, .. } => seen,
-            Asked::Answer { .. } => panic!("an answer asks about its record"),
+            Asked::Record { present_at, .. } => present_at,
+            Asked::Answer { .. } | Asked::Exit => panic!("an answer asks about its record"),
         };
-        counterparts.fold_seen(&present_at(CONSUMER));
+        counterparts.fold_present(&present_at(CONSUMER));
         assert_eq!(
             seen(&counterparts),
             None,
             "the consumer's own anchor does not own the producer's prefix",
         );
         let owner = present_at(PRODUCER);
-        counterparts.fold_seen(&owner);
+        counterparts.fold_present(&owner);
         assert_eq!(seen(&counterparts), Some(owner.anchor));
     }
 
@@ -2440,7 +2525,7 @@ mod tests {
         // at the producer's next header. An absence has no successor —
         // it is the licence itself — so it could not tell a spent
         // reading from a held-down one.
-        counterparts.fold_seen(&reading(anchor, record, Inclusion::Present([9; 32])));
+        counterparts.fold_present(&reading(anchor, record, Inclusion::Present([9; 32])));
         counterparts.release_answered_fetches(&trie);
         assert!(
             !counterparts
@@ -2668,7 +2753,7 @@ mod tests {
             MerkleInclusionProof::dummy(),
         )
         .naming([(decline, id)]);
-        producer.fold_seen(&read);
+        producer.fold_present(&read);
         producer.derive_asks(&trie);
         assert!(
             producer.asks.contains_key(&claim) && producer.asks.contains_key(&decline),
