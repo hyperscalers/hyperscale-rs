@@ -736,20 +736,13 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
     );
     await_cut(c, venue_shard);
 
-    let fate = c.chain_fate(venue_shard, hash).1;
     let (left, right) = venue_shard.children();
     let terminal = anchored_genesis_height(c, left).and_then(BlockHeight::prev);
-    assert!(
-        matches!(fate, Some((at, TransactionDecision::Aborted)) if Some(at) == terminal),
-        "the venue's terminal at {terminal:?} must fate the swap it held; fate = {fate:?}",
+    assert_eq!(
+        Some(assert_fated_off(c, venue_shard, hash, &[left, right])),
+        terminal,
+        "the venue's terminal must fate the swap it held",
     );
-    for child in [left, right] {
-        assert!(
-            c.member_rows(child)
-                .is_none_or(|rows| !rows.contains(&hash)),
-            "{child:?} reads the fated swap's row as its own",
-        );
-    }
     assert!(
         held_back.iter().any(|handle| handle.fired() > 0),
         "the readings must actually have been cut, or the venue ran the swap",
@@ -910,6 +903,34 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
         budget,
         "a crossing its merged consumer never took",
     );
+}
+
+/// Assert that `venue`'s chain aborted `hash` and that none of its
+/// `successors` reads the transaction's member row as its own, returning
+/// the height the abort committed at.
+///
+/// # Panics
+///
+/// Panics if the chain holds no abort of `hash`, or a successor holds its
+/// row.
+fn assert_fated_off<C: Cluster>(
+    c: &C,
+    venue: ShardId,
+    hash: TxHash,
+    successors: &[ShardId],
+) -> BlockHeight {
+    let fate = c.chain_fate(venue, hash).1;
+    let Some((at, TransactionDecision::Aborted)) = fate else {
+        panic!("{venue:?} must abort the transaction it held; fate = {fate:?}");
+    };
+    for successor in successors {
+        assert!(
+            c.member_rows(*successor)
+                .is_none_or(|rows| !rows.contains(&hash)),
+            "{successor:?} reads {venue:?}'s fated row as its own",
+        );
+    }
+    at
 }
 
 /// How far before the venue's cut the fated swap's window opens, and how
@@ -1630,28 +1651,8 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
     );
     let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
-    // The activation carries the run past the floor the grow's own split
-    // pinned and past the horizon the commit's window would otherwise
-    // have been kept under, so the departure it schedules leaves the
-    // route's commit on the far side of every floor.
-    assert!(
-        c.run_until(epochs(28), |c| c.beacon_state().is_some_and(|s| s
-            .params
-            .reshape_thresholds
-            .split_bytes
-            == LATE_SPLIT_BYTES)),
-        "the late vote must activate at {activates_at:?}",
-    );
-    assert!(
-        await_merge_keeper_count(c, LATE_MERGED_PARENT, 3, epochs(28)),
-        "the activated threshold must pair the departing venue's shard with its sibling",
-    );
-
-    assert!(
-        await_serves(c, LATE_MERGED_PARENT, epochs(28)),
-        "the merged parent must be served within budget",
-    );
-
+    await_late_departure(c, activates_at);
+    assert_fated_off(c, departing, hash, &[LATE_MERGED_PARENT]);
     assert!(
         c.run_until(epochs(32), |c| c.committed_txs_in_flight(survivor)
             == Some(baseline)),
@@ -1686,6 +1687,36 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
         c,
         &charges,
         "a route committed before its departure was voted",
+    );
+}
+
+/// Drive the late vote through to the merged parent serving.
+///
+/// The activation carries the run past the floor the grow's own split
+/// pinned and past the horizon the commit's window would otherwise have
+/// been kept under, so the departure it schedules leaves the route's
+/// commit on the far side of every floor.
+///
+/// # Panics
+///
+/// Panics if the vote never activates, the pair never pairs its keepers,
+/// or the merged parent is unserved within budget.
+fn await_late_departure<C: Cluster>(c: &mut C, activates_at: Epoch) {
+    assert!(
+        c.run_until(epochs(28), |c| c.beacon_state().is_some_and(|s| s
+            .params
+            .reshape_thresholds
+            .split_bytes
+            == LATE_SPLIT_BYTES)),
+        "the late vote must activate at {activates_at:?}",
+    );
+    assert!(
+        await_merge_keeper_count(c, LATE_MERGED_PARENT, 3, epochs(28)),
+        "the activated threshold must pair the departing venue's shard with its sibling",
+    );
+    assert!(
+        await_serves(c, LATE_MERGED_PARENT, epochs(28)),
+        "the merged parent must be served within budget",
     );
 }
 
@@ -1857,6 +1888,20 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     // The cut. The departing venue's cells land under a child, and its
     // settled set reaches the survivor.
     await_departed(c);
+    // The departing venue's core never combined, so its tick was in
+    // flight at the terminal, which fates it; neither child reads its
+    // row as its own.
+    let (left, right) = departing.children();
+    assert!(
+        await_anchor_seeded(c, left, epochs(6)),
+        "the beacon must compose the departed venue's children's anchor",
+    );
+    let terminal = anchored_genesis_height(c, left).and_then(BlockHeight::prev);
+    assert_eq!(
+        Some(assert_fated_off(c, departing, hash, &[left, right])),
+        terminal,
+        "the departing venue's terminal must fate the route's core",
+    );
     assert!(
         c.run_until(epochs(12), |c| c.committed_txs_in_flight(survivor)
             == Some(baseline)),
