@@ -131,14 +131,40 @@ pub trait FaultableCluster: Cluster {
     /// Some("transaction"))`), summed across hosts. An unlabelled read of
     /// a labelled counter is the sum over its labels.
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64;
+
+    /// Read the `q` quantile of a cluster-wide histogram over the
+    /// observations above `floor`, within an eighth above the true value;
+    /// `None` before any such observation.
+    fn metric_quantile_above(
+        &self,
+        name: &'static str,
+        label: Option<&str>,
+        q: f64,
+        floor: f64,
+    ) -> Option<f64>;
+
+    /// Read how many observations a cluster-wide histogram holds.
+    fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64;
 }
 
-/// Report the fenced claims `c`'s replicas carried and refused, by what
-/// each read, as the read frontier's refusal rate over the run.
-pub fn report_fenced_claims(c: &impl FaultableCluster, scenario: &str) {
+/// Report what the run's crossings cost: the fenced claims `c`'s
+/// replicas carried and refused, by what each read, and the weight of
+/// the claims section each committed block carried.
+pub fn report_crossing_measures(c: &impl FaultableCluster, scenario: &str) {
     for reading in ["record", "removed"] {
         let carried = c.metric("fenced_claims_carried", Some(reading));
         let refused = c.metric("fenced_claims_refused", Some(reading));
         println!("{scenario}: fenced `{reading}` claims carried {carried}, refused {refused}");
     }
+    let blocks = c.metric_count("state_claims_weight", None);
+    let carrying = |q| {
+        c.metric_quantile_above("state_claims_weight", None, q, 0.0)
+            .unwrap_or(0.0)
+    };
+    println!(
+        "{scenario}: claims weight over the blocks carrying claims of {blocks} committed: \
+         p99 {:.0}, max {:.0} bytes",
+        carrying(0.99),
+        carrying(1.0),
+    );
 }

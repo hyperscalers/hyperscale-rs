@@ -11,7 +11,7 @@ use hyperscale_types::{
 use crate::reshape::split_lifecycle;
 use crate::straddler::{STRADDLER_PAYMENT, chain_settled};
 use crate::support::conservation::{Charges, World, probe_world};
-use crate::support::faultable::{FaultableCluster, report_fenced_claims};
+use crate::support::faultable::{FaultableCluster, report_crossing_measures};
 use crate::support::query::{beacon_epoch, vault_balance};
 use crate::support::tx::{
     HALT_STRADDLER_BATCH, PaymentLeg, account_shard, build_composed_tx, build_probe_transfer_tx,
@@ -364,7 +364,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         epochs(12),
         "every answer ends after the recovery",
     );
-    report_fenced_claims(c, "halted_shard_straddler_atomic");
+    report_crossing_measures(c, "halted_shard_straddler_atomic");
 }
 
 /// Assert one crossing's halves under the severance: the payer settles

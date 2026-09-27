@@ -467,4 +467,18 @@ impl FaultableCluster for ProdCluster {
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64 {
         global_recorder().counter(name, label)
     }
+
+    fn metric_quantile_above(
+        &self,
+        name: &'static str,
+        label: Option<&str>,
+        q: f64,
+        floor: f64,
+    ) -> Option<f64> {
+        global_recorder().histogram_quantile_above(name, label, q, floor)
+    }
+
+    fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64 {
+        global_recorder().histogram_count(name, label)
+    }
 }

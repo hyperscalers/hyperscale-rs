@@ -34,7 +34,7 @@ use crate::straddler::{
     straddler_split_bytes, vote_splitter_down_to,
 };
 use crate::support::conservation::{Charges, World};
-use crate::support::faultable::report_fenced_claims;
+use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
     anchored_genesis_height, beacon_epoch, clock, crossing_cells, declared_price,
     epoch_duration_ms, held, held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch,
@@ -653,7 +653,7 @@ pub fn answers_end_at_the_read_frontier_across_a_reshape<C: FaultableCluster>(
         "the swap's crossings end across the cut",
     );
     set.settle_with_nothing_locked(c, &charges, budget, "answers across a producer's split");
-    report_fenced_claims(c, "answers_end_at_the_read_frontier_across_a_reshape");
+    report_crossing_measures(c, "answers_end_at_the_read_frontier_across_a_reshape");
 }
 
 /// A swap issued on a merging shard reaches its venue, and the parent the
@@ -1169,7 +1169,7 @@ pub fn a_crossing_a_merge_converges_finishes_on_the_successor<C: FaultableCluste
         funded - refused_price,
         "the refused swap's input comes home once, less its price",
     );
-    report_fenced_claims(c, "a_crossing_a_merge_converges_finishes_on_the_successor");
+    report_crossing_measures(c, "a_crossing_a_merge_converges_finishes_on_the_successor");
 }
 
 /// Assert that `venue`'s chain aborted `hash` and that none of its

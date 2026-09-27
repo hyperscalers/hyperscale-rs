@@ -3,7 +3,9 @@
 //! Implements [`hyperscale_metrics::MetricsRecorder`] backed by an
 //! `Arc<Mutex<_>>` map so tests and simulation harnesses can read recorded
 //! values back. Counters, gauges, and histogram count/sum are stored per
-//! `(metric_name, label)` key.
+//! `(metric_name, label)` key, and each histogram's observations in
+//! log-linear buckets, so a quantile reads within an eighth of its value
+//! in memory bounded by the value range rather than the run's length.
 //!
 //! # Usage
 //!
@@ -39,6 +41,38 @@ struct Inner {
     gauges: BTreeMap<Key, f64>,
     histogram_count: BTreeMap<Key, u64>,
     histogram_sum: BTreeMap<Key, f64>,
+    histogram_buckets: BTreeMap<Key, BTreeMap<u16, u64>>,
+}
+
+/// The bucket a histogram observation falls in: a positive value's
+/// exponent and top three mantissa bits, so buckets order as the values
+/// do and each spans an eighth of its lower edge. Zero and below share
+/// the lowest.
+fn bucket_of(value: f64) -> u16 {
+    if value > 0.0 {
+        u16::try_from(value.to_bits() >> 49).expect("a positive double's top fifteen bits")
+    } else {
+        0
+    }
+}
+
+/// The lower edge of `bucket`; the lowest, which holds zero and below,
+/// reaches down to the least double.
+fn bucket_floor(bucket: u16) -> f64 {
+    if bucket == 0 {
+        f64::MIN
+    } else {
+        f64::from_bits(u64::from(bucket) << 49)
+    }
+}
+
+/// The upper edge of `bucket`; zero for the lowest, which holds zero.
+fn bucket_ceiling(bucket: u16) -> f64 {
+    if bucket == 0 {
+        0.0
+    } else {
+        f64::from_bits((u64::from(bucket) + 1) << 49)
+    }
 }
 
 /// In-memory metrics recorder. Cheaply cloneable; clones share state.
@@ -110,6 +144,54 @@ impl MemoryRecorder {
             .unwrap_or(0.0)
     }
 
+    /// The `q` quantile of a histogram's observations, as the upper edge
+    /// of the bucket it falls in: never below the true quantile and at
+    /// most an eighth above it. `None` if nothing has been observed.
+    ///
+    /// # Panics
+    ///
+    /// If `q` is outside `[0, 1]`.
+    #[must_use]
+    pub fn histogram_quantile(
+        &self,
+        name: &'static str,
+        label: Option<&str>,
+        q: f64,
+    ) -> Option<f64> {
+        self.histogram_quantile_above(name, label, q, f64::NEG_INFINITY)
+    }
+
+    /// [`Self::histogram_quantile`] over the observations whose bucket
+    /// lies wholly above `floor`, so a floor of zero drops the zeros: the
+    /// quantile of a histogram that records
+    /// zero for most events among the events it measures.
+    ///
+    /// # Panics
+    ///
+    /// If `q` is outside `[0, 1]`.
+    #[must_use]
+    pub fn histogram_quantile_above(
+        &self,
+        name: &'static str,
+        label: Option<&str>,
+        q: f64,
+        floor: f64,
+    ) -> Option<f64> {
+        assert!((0.0..=1.0).contains(&q), "a quantile lies in [0, 1]: {q}");
+        let key = (name, label.map(str::to_owned));
+        let mut buckets = self.inner.lock().histogram_buckets.get(&key)?.clone();
+        buckets.retain(|bucket, _| bucket_floor(*bucket) > floor);
+        if buckets.is_empty() {
+            return None;
+        }
+        let rank = q * buckets.values().sum::<u64>() as f64;
+        let mut seen = 0;
+        buckets.iter().find_map(|(bucket, count)| {
+            seen += count;
+            (seen as f64 >= rank).then(|| bucket_ceiling(*bucket))
+        })
+    }
+
     /// Drop all recorded values.
     pub fn reset(&self) {
         let mut inner = self.inner.lock();
@@ -117,6 +199,7 @@ impl MemoryRecorder {
         inner.gauges.clear();
         inner.histogram_count.clear();
         inner.histogram_sum.clear();
+        inner.histogram_buckets.clear();
     }
 
     /// Snapshot all recorded values for debugging or golden-file output.
@@ -145,7 +228,13 @@ impl MemoryRecorder {
         let key = (name, label.map(str::to_owned));
         let mut inner = self.inner.lock();
         *inner.histogram_count.entry(key.clone()).or_insert(0) += 1;
-        *inner.histogram_sum.entry(key).or_insert(0.0) += value;
+        *inner.histogram_sum.entry(key.clone()).or_insert(0.0) += value;
+        *inner
+            .histogram_buckets
+            .entry(key)
+            .or_default()
+            .entry(bucket_of(value))
+            .or_insert(0) += 1;
     }
 }
 
@@ -453,6 +542,49 @@ impl MetricsRecorder for MemoryRecorder {
 
 #[cfg(test)]
 mod tests {
+    /// A quantile reads the upper edge of its bucket: at or above the
+    /// true value and within an eighth of it, the maximum at `1.0`, and
+    /// nothing before any observation. Above a floor of zero the zeros
+    /// drop out.
+    #[test]
+    fn a_histogram_quantile_reads_within_an_eighth() {
+        let recorder = MemoryRecorder::new();
+        assert_eq!(recorder.histogram_quantile("weight", None, 0.99), None);
+        for value in 1..=1_000 {
+            recorder.observe("weight", None, f64::from(value));
+        }
+        for (q, truth) in [(0.5, 500.0), (0.99, 990.0), (1.0, 1_000.0)] {
+            let read = recorder
+                .histogram_quantile("weight", None, q)
+                .expect("observed");
+            assert!(
+                read >= truth && read <= truth * 1.125,
+                "q {q}: read {read} against {truth}",
+            );
+        }
+        assert_eq!(
+            recorder.histogram_quantile("weight", Some("other"), 0.5),
+            None
+        );
+
+        for _ in 0..1_000 {
+            recorder.observe("weight", None, 0.0);
+        }
+        assert_eq!(recorder.histogram_quantile("weight", None, 0.5), Some(0.0));
+        let above = recorder
+            .histogram_quantile_above("weight", None, 0.5, 0.0)
+            .expect("observed above zero");
+        assert!(
+            (500.0..=562.5).contains(&above),
+            "the zeros are not counted above the floor: {above}",
+        );
+        recorder.observe("empty", None, 0.0);
+        assert_eq!(
+            recorder.histogram_quantile_above("empty", None, 0.5, 0.0),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]
