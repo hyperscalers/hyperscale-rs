@@ -40,7 +40,7 @@ pub fn serve_state_proof_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
     req: &GetStateProofRequest,
 ) -> GetStateProofResponse {
-    let view = pending_chain.view_at_committed_tip();
+    let view = pending_chain.view_at_persisted_tip();
     if !view.serves_at(req.height) {
         record_fetch_response_sent("state_proof", 0);
         return GetStateProofResponse::not_found();
@@ -69,7 +69,7 @@ pub fn serve_state_proof_request<S: ShardStorage>(
 }
 
 /// Serve an inbound cells query: the point cells and collection
-/// intervals a declaration reaches, at this shard's committed tip.
+/// intervals a declaration reaches, at this shard's persisted tip.
 ///
 /// What [`serve_state_proof_request`] does for named keys, in the terms
 /// a declaration is written in — and at an anchor this server picks
@@ -96,7 +96,7 @@ pub fn serve_cells_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
     req: &GetCellsRequest,
 ) -> GetCellsResponse {
-    let view = pending_chain.view_at_committed_tip();
+    let view = pending_chain.view_at_persisted_tip();
     let height = view.base().committed_height();
     // The header is what makes the answer checkable, so an anchor this
     // node cannot produce one for is no answer at all.
@@ -322,7 +322,7 @@ mod tests {
             test_transaction(1).validity_range().end_timestamp_exclusive,
         );
 
-        let view = chain.view_at_committed_tip();
+        let view = chain.view_at_persisted_tip();
         assert!(
             !view.serves_at(BlockHeight::new(1)),
             "block one has aged out"

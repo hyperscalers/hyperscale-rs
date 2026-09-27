@@ -48,7 +48,7 @@ fn a_range_serves_its_leaves_and_the_receiver_rederives_the_interval() {
     };
 
     let chain = Arc::new(PendingChain::new(Arc::new(storage), ChainOrigin::ROOT));
-    let view = chain.view_at_committed_tip();
+    let view = chain.view_at_persisted_tip();
     let provisions = build_provisions(
         &view,
         ShardId::leaf(1, 0),

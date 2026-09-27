@@ -637,7 +637,7 @@ where
         let handles = self.dispatch_handles.per_shard.load();
         let chain = &handles.get(&payer_shard)?.pending_chain;
 
-        let view = chain.view_at_committed_tip();
+        let view = chain.view_at_persisted_tip();
         // The tip's own QC timestamp: a candidate has no committing
         // block to take a clock from, and this node's freshest committed
         // reading is the nearest thing that exists.

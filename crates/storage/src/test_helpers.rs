@@ -3034,7 +3034,7 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
     );
     let restarted = chain_over(serving);
     assert_eq!(
-        colliding_committed_cell(&rows, &restarted.view_at_committed_tip().snapshot()),
+        colliding_committed_cell(&rows, &restarted.view_at_persisted_tip().snapshot()),
         Some(marker),
         "a restarted replica reads the marker off its store",
     );
@@ -3043,14 +3043,14 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
     import_boundary_state(fresh, BlockHeight::new(1), &leaves, WitnessSeed::default()).unwrap();
     let synced = chain_over(fresh);
     assert_eq!(
-        colliding_committed_cell(&rows, &synced.view_at_committed_tip().snapshot()),
+        colliding_committed_cell(&rows, &synced.view_at_persisted_tip().snapshot()),
         Some(marker),
         "a snap-synced replica reads the marker off the imported state",
     );
 
     let pending = chain_over(unpersisted);
     assert_eq!(
-        colliding_committed_cell(&rows, &pending.view_at_committed_tip().snapshot()),
+        colliding_committed_cell(&rows, &pending.view_at_persisted_tip().snapshot()),
         None,
         "nothing is committed yet",
     );

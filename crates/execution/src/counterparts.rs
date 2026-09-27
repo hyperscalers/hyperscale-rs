@@ -96,18 +96,19 @@ impl Budget {
     }
 }
 
-/// The crossing leaves this shard's committed state holds, read through
-/// the committed tip: what the askers ask about.
+/// The crossing leaves this shard's persisted state holds: what the
+/// askers ask about.
 ///
-/// Derived storage, and a pacing input only. Nothing composed from a
-/// block reads it: a question it raises is answered by a reading every
-/// voter re-proves, and a question it misses costs latency.
+/// Derived storage, and a pacing input only. It lags the committed
+/// chain by what is not yet persisted. Nothing composed from a block
+/// reads it: a question it raises is answered by a reading every voter
+/// re-proves, and a question it misses or asks late costs latency.
 pub trait CrossingIndex: Send + Sync {
     /// The crossing records and answers under `shard`'s prefix, each
-    /// with its bytes as the committed tip holds them, ascending by key.
+    /// with its bytes as the persisted tip holds them, ascending by key.
     fn crossing_rows(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)>;
 
-    /// Whether `key` reads present at the committed tip.
+    /// Whether `key` reads present at the persisted tip.
     fn present(&self, key: SubstateKey) -> bool;
 }
 
@@ -293,7 +294,7 @@ fn wants_reading(
 
 /// Whether `claim` holds at `key` an owed record this shard's commit
 /// fold would credit: one whose consumer sits under `local`'s prefix and
-/// for which no `Taken` stands at the committed tip.
+/// for which no `Taken` stands at the persisted tip.
 ///
 /// Nothing here asks about such a record — the shard runs no member of
 /// its transaction — so a push of it is kept on this rule alone, until

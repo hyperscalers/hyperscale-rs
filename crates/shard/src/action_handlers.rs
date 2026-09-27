@@ -867,7 +867,7 @@ where
             // its own commit pipeline has materialized it — so every
             // replica reads identical state regardless of local commit
             // or persistence progress.
-            let view = ctx.pending_chain.view_at_committed_tip();
+            let view = ctx.pending_chain.view_at_persisted_tip();
             let (mut result, held) = match held_demands(
                 &view,
                 ctx.pending_chain,
@@ -2065,7 +2065,7 @@ mod tests {
             );
         }
         let chain = Arc::new(PendingChain::new(Arc::new(storage), ChainOrigin::ROOT));
-        let view = chain.view_at_committed_tip();
+        let view = chain.view_at_persisted_tip();
         let span = |read: u64, floor: u64| FeeSpan {
             read_height: BlockHeight::new(read),
             walk_floor: BlockHeight::new(floor),

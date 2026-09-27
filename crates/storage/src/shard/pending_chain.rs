@@ -246,12 +246,15 @@ where
         Arc::new(self.build_view(parent_block_hash, parent_height))
     }
 
-    /// Build a view anchored at the latest committed block.
+    /// Build a view anchored at the latest block the store has persisted.
     /// For actions without a natural parent (RPC reads, fetch handlers).
     ///
-    /// If no blocks have been committed yet, returns a view with no
-    /// pending entries (reads fall through to base storage).
-    pub fn view_at_committed_tip(self: &Arc<Self>) -> Arc<SubstateView<S>> {
+    /// A block committed but not yet persisted is not seen: the anchor is
+    /// the store's own head, which moves when the store commits, so every
+    /// read through the view is one the store can prove. If nothing is
+    /// persisted yet, returns a view with no pending entries (reads fall
+    /// through to base storage).
+    pub fn view_at_persisted_tip(self: &Arc<Self>) -> Arc<SubstateView<S>> {
         match self.base.committed_head() {
             (height, Some(hash)) => self.view_at(hash, height),
             (_, None) => Arc::new(SubstateView::base_only(
@@ -1547,7 +1550,7 @@ mod tests {
             entry_at(bh(b"parent"), BlockHeight::new(5), &StateWrites::default()),
         );
         assert_eq!(
-            chain.view_at_committed_tip().anchor_height,
+            chain.view_at_persisted_tip().anchor_height,
             BlockHeight::new(5)
         );
     }
@@ -1708,9 +1711,9 @@ mod tests {
     }
 
     #[test]
-    fn view_at_committed_tip_with_no_commits_returns_base_only() {
+    fn view_at_persisted_tip_with_no_commits_returns_base_only() {
         let chain = empty_chain();
-        let view = chain.view_at_committed_tip();
+        let view = chain.view_at_persisted_tip();
         assert_eq!(view.cell(cell(test_prefix(9), [1; 16])), None);
     }
 

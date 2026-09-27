@@ -59,7 +59,7 @@ pub fn serve_provision_request<S: ShardStorage>(
         request.targets = vec![req.target_shard];
         requests.push(request);
     }
-    let view = pending_chain.view_at_committed_tip();
+    let view = pending_chain.view_at_persisted_tip();
     let provisions = build_provisions(
         &view,
         local_shard,

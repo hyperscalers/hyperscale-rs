@@ -773,7 +773,7 @@ fn build_shard_io<S: ShardStorage>(
         rep.state.shard_coordinator().chain_origin(),
     ));
     // Every vnode of the group asks its crossing questions of this
-    // chain's committed tip, now that the chain is open.
+    // chain's persisted tip, now that the chain is open.
     rep.state
         .execution_coordinator()
         .crossing_index()
