@@ -25,6 +25,7 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::{
     Budget, Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
+    a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
@@ -2005,6 +2006,19 @@ fn a_merged_pair_locks_a_crossing_its_consumer_never_took_sim() {
     );
     cluster
         .run_faultable(|c| a_merged_pair_locks_a_crossing_its_consumer_never_took(c, epochs(24)));
+}
+
+#[test]
+fn a_crossing_a_merge_converges_finishes_on_the_successor_sim() {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &merging_caller_config(),
+        11,
+        &merged_pair_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(|c| {
+        a_crossing_a_merge_converges_finishes_on_the_successor(c, epochs(24));
+    });
 }
 
 #[test]

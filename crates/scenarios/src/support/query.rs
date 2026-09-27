@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 
 use hyperscale_effects_bridge::ProtocolHasher;
+use hyperscale_effects_bridge::vm_statics::crossing_ids;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::ShardChainReader;
@@ -138,6 +139,45 @@ pub(crate) fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
 pub(crate) fn stands_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> bool {
     let shard = owning_shard(c, cell.owner);
     c.substate(shard, cell.owner, cell.local.0).is_some()
+}
+
+/// The cells one crossing can stand at: its record and its two answers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CrossingCells {
+    /// The record, under the producer.
+    pub(crate) record: SubstateKey,
+    /// The consumer's `Taken`.
+    pub(crate) taken: SubstateKey,
+    /// The consumer's `Never`.
+    pub(crate) never: SubstateKey,
+}
+
+impl CrossingCells {
+    /// All three cells.
+    pub(crate) const fn all(self) -> [SubstateKey; 3] {
+        [self.record, self.taken, self.never]
+    }
+}
+
+/// The cells of every crossing `tx` derives, whichever of them the run
+/// writes.
+///
+/// # Panics
+///
+/// Panics if `tx` does not derive, which would be a defect in the
+/// scenario world rather than in the transaction.
+pub(crate) fn crossing_cells<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> Vec<CrossingCells> {
+    let derived = tx
+        .try_derived(c.derivation().as_ref())
+        .expect("a scenario fixture derives");
+    crossing_ids(&derived.legs)
+        .into_iter()
+        .map(|id| CrossingCells {
+            record: id.record_key(&ProtocolHasher),
+            taken: id.answer_key(&ProtocolHasher, Answered::Taken),
+            never: id.answer_key(&ProtocolHasher, Answered::Never),
+        })
+        .collect()
 }
 
 /// What a crossing record standing at `cell` still owes, in `resource`.

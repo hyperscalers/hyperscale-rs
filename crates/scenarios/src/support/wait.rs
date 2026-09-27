@@ -7,11 +7,11 @@
 use std::cell::Cell;
 use std::time::Duration;
 
-use hyperscale_types::{BlockHeight, Epoch, ShardId, TransactionStatus, TxHash};
+use hyperscale_types::{BlockHeight, Epoch, ShardId, SubstateKey, TransactionStatus, TxHash};
 
 use super::query::{
-    anchor_root, anchored_genesis_height, beacon_epoch, epoch_duration_ms, merge_keeper_count,
-    split_admitted,
+    CrossingCells, anchor_root, anchored_genesis_height, beacon_epoch, epoch_duration_ms,
+    merge_keeper_count, split_admitted, stands_at,
 };
 use super::{Budget, Cluster, epochs};
 
@@ -199,5 +199,31 @@ pub(crate) fn assert_height_frozen<C: Cluster>(c: &mut C, shard: ShardId, budget
     assert!(
         after <= before,
         "{shard:?} advanced from {before:?} to {after:?} over {budget:?}; expected stopped"
+    );
+}
+
+/// Wait until no record or answer of `crossings` stands.
+///
+/// # Panics
+///
+/// Panics naming what still stands if any does once `budget` runs out.
+pub(crate) fn await_crossings_end<C: Cluster>(
+    c: &mut C,
+    crossings: &[CrossingCells],
+    budget: Budget,
+    what: &str,
+) {
+    let cells: Vec<SubstateKey> = crossings
+        .iter()
+        .flat_map(|crossing| crossing.all())
+        .collect();
+    let ended = c.run_until(budget, |c| cells.iter().all(|cell| !stands_at(c, *cell)));
+    assert!(
+        ended,
+        "{what}: a record or answer still stands: {:?}",
+        cells
+            .iter()
+            .filter(|cell| stands_at(c, **cell))
+            .collect::<Vec<_>>(),
     );
 }

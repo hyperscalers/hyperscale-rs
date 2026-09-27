@@ -64,28 +64,37 @@ fn intent_accounts(admitted: &Admitted) -> Vec<Address> {
         .collect()
 }
 
-/// The record cell of every value edge among `legs`, in `(producer,
+/// The crossing of every value edge among `legs`, in `(producer,
 /// output)` order.
 ///
 /// Every edge, not only the ones that turn out to cross: which cross is
 /// a placement fact read at an anchor, while the cells are fixed by what
 /// each producing node's own signer signed — the intent, the node's index
 /// within it, and that intent's expiry — so two compositions of one
-/// subintent derive the same record for its nodes.
+/// subintent derive the same crossing for its nodes.
 #[must_use]
-pub fn crossing_records(legs: &[LegShape]) -> Vec<SubstateKey> {
-    let mut records: Vec<((u32, u32), SubstateKey)> = legs
+pub fn crossing_ids(legs: &[LegShape]) -> Vec<CrossingId> {
+    let mut ids: Vec<((u32, u32), CrossingId)> = legs
         .iter()
         .flat_map(|consumer| consumer.edges.iter().map(move |edge| (consumer, edge)))
         .filter_map(|(consumer, edge)| {
             let producer = legs.get(edge.source as usize)?;
-            let record = CrossingId::of_edge(producer, consumer.target, edge.output)
-                .record_key(&ProtocolHasher);
-            Some(((edge.source, edge.output), record))
+            let id = CrossingId::of_edge(producer, consumer.target, edge.output);
+            Some(((edge.source, edge.output), id))
         })
         .collect();
-    records.sort_unstable_by_key(|(edge, _)| *edge);
-    records.into_iter().map(|(_, record)| record).collect()
+    ids.sort_unstable_by_key(|(edge, _)| *edge);
+    ids.into_iter().map(|(_, id)| id).collect()
+}
+
+/// The record cell of every value edge among `legs`, in `(producer,
+/// output)` order: [`crossing_ids`]' records.
+#[must_use]
+pub fn crossing_records(legs: &[LegShape]) -> Vec<SubstateKey> {
+    crossing_ids(legs)
+        .iter()
+        .map(|id| id.record_key(&ProtocolHasher))
+        .collect()
 }
 
 /// The footprint of one point write on the effects schedule: what a

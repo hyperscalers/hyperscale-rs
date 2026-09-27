@@ -132,3 +132,13 @@ pub trait FaultableCluster: Cluster {
     /// a labelled counter is the sum over its labels.
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64;
 }
+
+/// Report the fenced claims `c`'s replicas carried and refused, by what
+/// each read, as the read frontier's refusal rate over the run.
+pub fn report_fenced_claims(c: &impl FaultableCluster, scenario: &str) {
+    for reading in ["record", "removed"] {
+        let carried = c.metric("fenced_claims_carried", Some(reading));
+        let refused = c.metric("fenced_claims_refused", Some(reading));
+        println!("{scenario}: fenced `{reading}` claims carried {carried}, refused {refused}");
+    }
+}

@@ -93,7 +93,8 @@ pub use route::{
     route_genesis_accounts,
 };
 pub use route_reshape::{
-    MERGE_TRAIN, SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,
+    MERGE_TRAIN, SPLIT_TRAIN, a_crossing_a_merge_converges_finishes_on_the_successor,
+    a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
@@ -105,10 +106,11 @@ pub use route_reshape::{
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
-    a_venue_sealed_on_a_fresh_split_child_runs, departing_caller_ballast,
-    departing_route_genesis_accounts, departing_venue_ballast, departing_venue_split_bytes,
-    late_departing_route_genesis_accounts, merge_train_genesis_accounts,
-    merged_pair_genesis_accounts, merging_caller_genesis_accounts, split_train_genesis_accounts,
+    a_venue_sealed_on_a_fresh_split_child_runs, answers_end_at_the_read_frontier_across_a_reshape,
+    departing_caller_ballast, departing_route_genesis_accounts, departing_venue_ballast,
+    departing_venue_split_bytes, late_departing_route_genesis_accounts,
+    merge_train_genesis_accounts, merged_pair_genesis_accounts, merging_caller_genesis_accounts,
+    split_train_genesis_accounts,
 };
 pub use straddler::{
     a_delivery_is_owed_when_its_deliverer_splits,

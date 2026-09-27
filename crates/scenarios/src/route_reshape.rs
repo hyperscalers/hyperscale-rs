@@ -21,20 +21,23 @@ use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
-    TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, WeightedTimestamp,
+    TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
 use crate::straddler::{
-    STRADDLER_PAYMENT, cast_splitter_vote, cast_threshold_vote, isolate_ec_intake,
+    STRADDLER_PAYMENT, cast_splitter_vote, cast_threshold_vote, isolate_ec_intake, merge_executed,
     straddler_split_bytes, vote_splitter_down_to,
 };
 use crate::support::conservation::{Charges, World};
+use crate::support::faultable::report_fenced_claims;
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, clock, declared_price, epoch_duration_ms, held, held_at,
-    merge_keeper_count, scheduled_terminal_epoch, split_admitted,
+    anchored_genesis_height, beacon_epoch, clock, crossing_cells, declared_price,
+    epoch_duration_ms, held, held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch,
+    split_admitted, stands_at,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
@@ -44,8 +47,8 @@ use crate::support::tx::{
     split_train_setup, validity_around, voted_split_bytes,
 };
 use crate::support::wait::{
-    await_anchor_seeded, await_merge_keeper_count, await_serves, await_split_admitted,
-    await_tx_terminal, measure_blocks_per_epoch,
+    await_anchor_seeded, await_crossings_end, await_merge_keeper_count, await_serves,
+    await_split_admitted, await_tx_terminal, measure_blocks_per_epoch,
 };
 use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
 use crate::venue::{
@@ -287,6 +290,36 @@ struct DepartingCallers {
     units: World,
 }
 
+impl DepartingCallers {
+    /// Both worlds settle within `budget` with nothing locked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either world misses its budget or locks a record.
+    fn settle_with_nothing_locked<C: Cluster>(
+        &self,
+        c: &mut C,
+        charges: &Charges,
+        budget: Budget,
+        what: &str,
+    ) {
+        let locked = self
+            .protocol_resource
+            .assert_settles_within(c, charges, budget, what);
+        assert!(
+            locked.is_empty(),
+            "{what}: nothing stays locked: {locked:?}"
+        );
+        let locked = self
+            .units
+            .assert_settles_within(c, &Charges::default(), budget, what);
+        assert!(
+            locked.is_empty(),
+            "{what}: no delivery stays locked: {locked:?}"
+        );
+    }
+}
+
 /// Stand a venue up on `venue_shard` with its callers on `caller_shard`,
 /// then vote the splitter down so one of the two is leaving.
 ///
@@ -519,6 +552,100 @@ fn swaps_across_the_callers_cut<C: Cluster>(
 pub fn a_leg_issued_on_a_departing_shard_reaches_its_venue(c: &mut impl Cluster, budget: Budget) {
     let set = departing_callers(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
     swaps_across_the_callers_cut(c, set, |c| await_cut(c, STRADDLER_SPLITTER), budget);
+}
+
+/// An answer outlives its producer's split and ends at the read
+/// frontier the producer's lineage carries across it.
+///
+/// A caller on the splitting shard swaps against a venue that stays.
+/// Once the venue has taken the input, every pushed reading and every
+/// proof asked is cut, so the caller never reads the venue's `Taken`
+/// and its escrowed record stands across the cut, now under the child
+/// that inherits the caller's prefix. The swap's delivery back is owed
+/// to that child in turn. When the cut lifts, the child reads the
+/// `Taken` and retires the record, the venue reads the record absent at
+/// the child, which its frontier holds as the splitter's lineage, and
+/// deletes the `Taken`; the delivery ends the same way in the other
+/// direction. Reports the fenced claims the run carried and refused.
+///
+/// # Panics
+///
+/// Panics as [`departing_callers`] does, if the venue does not take the
+/// input, if the record or its answer does not stand across the cut, if
+/// the cuts never fired, if any record or answer of the swap stands once
+/// they lift, or if either resource is not conserved with nothing
+/// locked.
+pub fn answers_end_at_the_read_frontier_across_a_reshape<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let mut set = departing_callers(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
+    let venue_hosts = c.committee_hosts(STRADDLER_SURVIVOR);
+    let caller_hosts = c.committee_hosts(STRADDLER_SPLITTER);
+    assert!(
+        venue_hosts.iter().all(|host| !caller_hosts.contains(host)),
+        "the venue's committee and the callers' share no host",
+    );
+    let unheard = [
+        c.drop_type_between(&venue_hosts, &caller_hosts, "crossing.readings"),
+        c.drop_type_between(&caller_hosts, &venue_hosts, "state_proof.request"),
+    ];
+    let mut charges = Charges::default();
+    let (key, caller) = &set.swappers[0];
+    let swap = build_swap_tx(
+        key,
+        *caller,
+        &set.venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let crossings = crossing_cells(c, &swap);
+    let input = *crossings
+        .iter()
+        .find(|crossing| owning_shard(c, crossing.record.owner) == STRADDLER_SPLITTER)
+        .expect("a swap's input crosses from its caller");
+    charges.submit(c, swap);
+    set.protocol_resource.owing(charges.records(c));
+    set.units.owing(charges.records(c));
+
+    assert!(
+        c.run_until(budget, |c| stands_at(c, input.taken)),
+        "the venue must take the caller's input",
+    );
+    assert!(
+        c.serves_shard(STRADDLER_SPLITTER)
+            && anchored_genesis_height(c, STRADDLER_SPLITTER.children().0).is_none(),
+        "the venue takes the input while the caller's shard still runs",
+    );
+    assert!(
+        stands_at(c, input.record),
+        "the caller never reads the venue's answer",
+    );
+    // The children seat on hosts of their own: nothing is heard across
+    // the cut until it lands.
+    c.drop_type("crossing.readings");
+    c.drop_type("state_proof.request");
+    await_cut(c, STRADDLER_SPLITTER);
+    assert!(
+        stands_at(c, input.record) && stands_at(c, input.taken),
+        "the record and its answer stand across the producer's cut",
+    );
+    assert!(
+        unheard.iter().all(|cut| cut.fired() > 0),
+        "the venue's readings and the caller's asks must actually have been cut",
+    );
+    c.clear_drops();
+
+    await_crossings_end(
+        c,
+        &crossings,
+        budget,
+        "the swap's crossings end across the cut",
+    );
+    set.settle_with_nothing_locked(c, &charges, budget, "answers across a producer's split");
+    report_fenced_claims(c, "answers_end_at_the_read_frontier_across_a_reshape");
 }
 
 /// A swap issued on a merging shard reaches its venue, and the parent the
@@ -903,6 +1030,137 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
         budget,
         "a crossing its merged consumer never took",
     );
+}
+
+/// Crossings whose two ends a merge brings together finish on the
+/// successor, off readings it takes at its own parent.
+///
+/// The venue sits on the merging right quarter and its callers on the
+/// left, each committee on hosts of its own. Every reading the venue
+/// pushes to the callers' hosts, and every proof the callers ask of it,
+/// is cut for the whole run. The venue takes one swap's input and
+/// refuses another's, so a `Taken` and a `Never` stand that their
+/// producer never reads, and the first swap's delivery back is never
+/// read either. The pair merges with every record standing. The merged
+/// parent holds both ends of each crossing and reads them at its own
+/// parent: it retires the taken record, reclaims the refused one to its
+/// caller and credits the delivery, and each answer goes once its record
+/// reads absent. The cuts stay in place throughout, so nothing but the
+/// successor's own readings finishes them.
+///
+/// # Panics
+///
+/// Panics if a quarter is unserved, if the two committees share a host,
+/// if the answers do not stand before the merge or a record does not
+/// stand with its answer, if the merged parent is not served or leaves a
+/// record or answer standing, if the cuts never fired, if the refused
+/// swap's input does not come home once, or if either resource is not
+/// conserved with nothing locked.
+pub fn a_crossing_a_merge_converges_finishes_on_the_successor<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let (venue_shard, caller_shard) = (MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_LEFT);
+    let parent = venue_shard.parent().expect("a depth-2 leaf has a parent");
+    assert!(
+        (0..4).all(|path| await_serves(c, ShardId::leaf(2, path), epochs(4))),
+        "the grown four-shard topology must seat every quarter",
+    );
+    let mut set = stock_callers_against(c, venue_shard, caller_shard);
+    let venue_hosts = c.committee_hosts(venue_shard);
+    let caller_hosts = c.committee_hosts(caller_shard);
+    assert!(
+        venue_hosts.iter().all(|host| !caller_hosts.contains(host)),
+        "the venue's committee and the callers' share no host",
+    );
+    let cuts = [
+        c.drop_type_between(&venue_hosts, &caller_hosts, "crossing.readings"),
+        c.drop_type_between(&caller_hosts, &venue_hosts, "state_proof.request"),
+    ];
+
+    let mut charges = Charges::default();
+    let window = validity_around(c.now());
+    let (taking_key, taking) = &set.swappers[0];
+    let (refused_key, refused) = &set.swappers[1];
+    let taken_swap = build_swap_tx(
+        taking_key,
+        *taking,
+        &set.venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        window,
+    );
+    let refused_swap = build_swap_tx(
+        refused_key,
+        *refused,
+        &set.venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        SWAP_INPUT * 100,
+        window,
+    );
+    let input = |c: &C, swap: &Transaction| {
+        crossing_cells(c, swap)
+            .into_iter()
+            .find(|crossing| owning_shard(c, crossing.record.owner) == caller_shard)
+            .expect("a swap's input crosses from its caller")
+    };
+    let (taken, refusal) = (input(c, &taken_swap), input(c, &refused_swap));
+    let funded = held(c, refused.address(), *PROTOCOL_RESOURCE);
+    let refused_price = declared_price(c, &refused_swap);
+    charges.submit(c, taken_swap);
+    charges.submit(c, refused_swap);
+    set.protocol_resource.owing(charges.records(c));
+    set.units.owing(charges.records(c));
+    let crossings = charges.crossings(c);
+
+    assert!(
+        c.run_until(budget, |c| stands_at(c, taken.taken)
+            && stands_at(c, refusal.never)),
+        "the venue must take one input and refuse the other before the merge",
+    );
+    assert!(
+        !merge_executed(c, parent),
+        "both answers must stand before the pair merges",
+    );
+    assert!(
+        stands_at(c, taken.record) && stands_at(c, refusal.record),
+        "neither producer reads its answer while the venue's readings are cut",
+    );
+    assert!(
+        c.run_until(budget, |c| merge_executed(c, parent)),
+        "the pair must merge within budget",
+    );
+    assert!(
+        [taken.record, taken.taken, refusal.record, refusal.never]
+            .into_iter()
+            .all(|cell| stands_at(c, cell)),
+        "every record and answer stands on the pair as it merges",
+    );
+    assert!(
+        await_serves(c, parent, budget) && await_anchor_seeded(c, parent, budget),
+        "the merged parent must serve on its seeded anchor within budget",
+    );
+    await_crossings_end(
+        c,
+        &crossings,
+        budget,
+        "the successor finishes every crossing",
+    );
+    assert!(
+        cuts.iter().all(|cut| cut.fired() > 0),
+        "the venue's readings and the callers' asks must actually have been cut",
+    );
+    c.clear_drops();
+
+    set.settle_with_nothing_locked(c, &charges, budget, "crossings a merge converged");
+    assert_eq!(
+        held(c, refused.address(), *PROTOCOL_RESOURCE),
+        funded - refused_price,
+        "the refused swap's input comes home once, less its price",
+    );
+    report_fenced_claims(c, "a_crossing_a_merge_converges_finishes_on_the_successor");
 }
 
 /// Assert that `venue`'s chain aborted `hash` and that none of its

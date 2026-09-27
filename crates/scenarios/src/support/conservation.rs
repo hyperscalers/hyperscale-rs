@@ -23,8 +23,8 @@ use hyperscale_types::{
 };
 
 use super::query::{
-    Locked, MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at, locked_at,
-    owed_at, stands_at, unclaimable_at,
+    CrossingCells, Locked, MAX_SEARCHED_DEPTH, assert_a_full_block_fits, crossing_cells,
+    declared_price, held, held_at, locked_at, owed_at, stands_at, unclaimable_at,
 };
 use super::tx::{LEFT_PROBE_SENDER, recipient, sender};
 use super::{Budget, Cluster};
@@ -369,6 +369,14 @@ impl Charges {
             .values()
             .filter_map(|tx| tx.try_derived(derivation.as_ref()).ok())
             .flat_map(|derived| crossing_records(&derived.legs))
+            .collect()
+    }
+
+    /// The cells of every crossing the recorded transactions derive.
+    pub(crate) fn crossings<C: Cluster + ?Sized>(&self, c: &C) -> Vec<CrossingCells> {
+        self.owed
+            .values()
+            .flat_map(|tx| crossing_cells(c, tx))
             .collect()
     }
 

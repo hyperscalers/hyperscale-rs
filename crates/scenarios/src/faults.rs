@@ -11,14 +11,16 @@ use hyperscale_types::{
 use crate::reshape::split_lifecycle;
 use crate::straddler::{STRADDLER_PAYMENT, chain_settled};
 use crate::support::conservation::{Charges, World, probe_world};
-use crate::support::faultable::FaultableCluster;
+use crate::support::faultable::{FaultableCluster, report_fenced_claims};
 use crate::support::query::{beacon_epoch, vault_balance};
 use crate::support::tx::{
     HALT_STRADDLER_BATCH, PaymentLeg, account_shard, build_composed_tx, build_probe_transfer_tx,
     build_transfer_tx, cross_shard_fault_cast, halt_straddler_setup, payment_request_for,
     validity_around,
 };
-use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
+use crate::support::wait::{
+    await_beacon_epoch, await_crossings_end, await_height, await_tx_terminal,
+};
 use crate::support::{Cluster, epochs};
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
@@ -351,6 +353,18 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     );
 
     world.assert_settles_within(c, &charges, epochs(8), "a halt and its recovery");
+
+    // Every answer ends at the read frontier across the recovery: what
+    // the survivor accepted into the frozen shard is credited by the
+    // fresh committee, retired on the survivor off that `Taken`, and the
+    // `Taken` deleted once the recovered shard reads the record absent.
+    await_crossings_end(
+        c,
+        &charges.crossings(c),
+        epochs(12),
+        "every answer ends after the recovery",
+    );
+    report_fenced_claims(c, "halted_shard_straddler_atomic");
 }
 
 /// Assert one crossing's halves under the severance: the payer settles

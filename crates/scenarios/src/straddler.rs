@@ -32,8 +32,8 @@ use crate::support::tx::{
     split_issuer_straddler_setup, split_straddler_setup, validity_around, voted_split_bytes,
 };
 use crate::support::wait::{
-    await_anchor_seeded, await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor,
-    await_serves, await_split_admitted, await_tx_terminal,
+    await_anchor_seeded, await_beacon_epoch, await_crossings_end, await_merge_keeper_count,
+    await_root_matches_anchor, await_serves, await_split_admitted, await_tx_terminal,
 };
 use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
 
@@ -648,7 +648,6 @@ pub fn a_delivery_is_owed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut
     // Past every instant the delivery window used to close at, with the
     // cut standing the whole way: no chain that ever held the recipient
     // had a reading to credit from.
-    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
         c.run_until(epochs(12), |c| clock(c) >= past_window),
         "the cut must stand past where the delivery used to lapse",
@@ -802,7 +801,6 @@ pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableClus
     // Past every instant the delivery window used to close at, with the
     // cut standing: the survivor never had a reading to credit from, so
     // its claim cell is absent and stays so.
-    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
         c.run_until(epochs(12), |c| clock(c) >= past_window),
         "the cut must stand past where the delivery used to lapse",
@@ -842,6 +840,20 @@ pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableClus
     );
     c.clear_drops();
     world.assert_settled(c, &charges, "a record owed by the successor");
+
+    // Once the cut lifts the recipient is credited off the child's
+    // record, and its answer ends at the frontier the splitter's lineage
+    // carries: the child retires the record on reading the `Taken`, and
+    // the survivor deletes the `Taken` on reading the record absent at
+    // the child.
+    assert_credited_once_the_cut_lifts(c, *recipient, recipient_before);
+    await_crossings_end(
+        c,
+        &charges.crossings(c),
+        epochs(12),
+        "the owed crossing ends across its issuer's split",
+    );
+    world.assert_settles_within(c, &charges, epochs(8), "a record owed by the successor");
 }
 
 /// Verify a surviving sibling's second-generation split seats correctly.
@@ -1132,7 +1144,7 @@ pub fn an_owed_crossing_a_merge_converges_is_credited_on_the_successor<C: Faulta
 
 /// Whether the merge into `parent` has executed: the reformed parent is seated
 /// in the lookahead committee set and no longer pending.
-fn merge_executed<C: Cluster>(c: &C, parent: ShardId) -> bool {
+pub fn merge_executed<C: Cluster>(c: &C, parent: ShardId) -> bool {
     c.beacon_state().is_some_and(|state| {
         !state.pending_reshapes.contains_key(&parent)
             && state.next_shard_committees.contains_key(&parent)
