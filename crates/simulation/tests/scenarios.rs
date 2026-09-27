@@ -37,6 +37,7 @@ use hyperscale_scenarios::{
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
+    a_merged_pair_locks_a_crossing_its_consumer_never_took,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_priority_is_charged_over_the_table_price,
     a_published_package_runs_where_it_was_never_committed,
@@ -78,9 +79,10 @@ use hyperscale_scenarios::{
     late_departing_route_genesis_accounts, livelock_resolves_promptly, liveness_baseline,
     merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,
     merge_seats_full_keeper_committee, merge_straddler_atomic, merge_train_genesis_accounts,
-    merging_caller_genesis_accounts, minority_fragment_rejoins_after_partition,
-    multi_vnode_progress, nullifier_race_admits_exactly_one, participant_count_sweep,
-    partition_halts_and_heals, partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
+    merged_pair_genesis_accounts, merging_caller_genesis_accounts,
+    minority_fragment_rejoins_after_partition, multi_vnode_progress,
+    nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
+    partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     pool_transfer_moves_operatorship, preview_reports_resource_changes,
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
@@ -1983,6 +1985,18 @@ fn a_leg_issued_on_a_merging_shard_reaches_its_venue_sim() {
         GenesisPackages::with_fixtures(),
     );
     a_leg_issued_on_a_merging_shard_reaches_its_venue(&mut cluster, epochs(12));
+}
+
+#[test]
+fn a_merged_pair_locks_a_crossing_its_consumer_never_took_sim() {
+    let mut cluster = SimCluster::with_grown_packages(
+        &merging_caller_config(),
+        11,
+        &merged_pair_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster
+        .run_faultable(|c| a_merged_pair_locks_a_crossing_its_consumer_never_took(c, epochs(24)));
 }
 
 #[test]

@@ -97,6 +97,7 @@ pub use route_reshape::{
     a_departing_venues_terminal_hands_on_what_it_never_took,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
+    a_merged_pair_locks_a_crossing_its_consumer_never_took,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
@@ -106,7 +107,7 @@ pub use route_reshape::{
     a_venue_sealed_on_a_fresh_split_child_runs, departing_caller_ballast,
     departing_route_genesis_accounts, departing_venue_ballast, departing_venue_split_bytes,
     late_departing_route_genesis_accounts, merge_train_genesis_accounts,
-    merging_caller_genesis_accounts, split_train_genesis_accounts,
+    merged_pair_genesis_accounts, merging_caller_genesis_accounts, split_train_genesis_accounts,
 };
 pub use straddler::{
     a_delivery_is_owed_when_its_deliverer_splits,

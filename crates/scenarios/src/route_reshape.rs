@@ -23,6 +23,7 @@ use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
     TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, WeightedTimestamp,
 };
+use hyperscale_vm_effects::Kind;
 
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
@@ -36,11 +37,11 @@ use crate::support::query::{
     merge_keeper_count, scheduled_terminal_epoch, split_admitted,
 };
 use crate::support::tx::{
-    MERGE_STRADDLER_LEFT, MERGE_STRADDLER_SURVIVOR, ParamBallot, STRADDLER_SPLITTER,
-    STRADDLER_SURVIVOR, armed_split_bytes, ballast_to, build_param_vote_tx, build_route_tx,
-    build_swap_tx, build_transfer_tx, departing_target, merge_survivor_ballast_accounts,
-    merge_train_setup, pool_operator, split_ballast_accounts_for, split_train_setup,
-    validity_around, voted_split_bytes,
+    MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
+    STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, ballast_to, build_param_vote_tx,
+    build_route_tx, build_swap_tx, build_transfer_tx, departing_target,
+    merge_survivor_ballast_accounts, merge_train_setup, pool_operator, split_ballast_accounts_for,
+    split_train_setup, validity_around, voted_split_bytes,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_merge_keeper_count, await_serves, await_split_admitted,
@@ -782,6 +783,135 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
     );
 }
 
+/// A crossing whose consumer is fated at its terminal, when producer and
+/// consumer merge into one parent, stays locked and is credited nowhere.
+///
+/// The venue sits on the merging right quarter and its callers on the
+/// left, so the swap's leg issues an escrowed record on the pair that is
+/// leaving and the core that would take it leaves beside it. The leg's
+/// readings to the venue are cut, so the venue includes the swap and
+/// holds it as a member waiting on its input until its terminal fates
+/// it. The two chains end together, so neither ever holds the other's
+/// attested settled set: no abandonment record names the swap, the
+/// merged parent holds the record escrowed, and nothing credits it or
+/// takes it back. The resource is conserved with the record counted
+/// locked, which is the one record of the strand class a consumer fated
+/// at its terminal whose producer names no departure.
+///
+/// # Panics
+///
+/// Panics if a quarter is unserved, if the venue misses its budget
+/// standing up, if the merge is never scheduled or the venue does not
+/// include the swap before it, if the swap is not fated, if any record
+/// names it, if the input is credited to either side, or if the resource
+/// is not conserved with exactly that record locked.
+pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let (venue_shard, caller_shard) = (MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_LEFT);
+    let parent = venue_shard.parent().expect("a depth-2 leaf has a parent");
+    assert!(
+        (0..4).all(|path| await_serves(c, ShardId::leaf(2, path), epochs(4))),
+        "the grown four-shard topology must seat every quarter",
+    );
+    let mut set = stock_callers_against(c, venue_shard, caller_shard);
+    assert!(
+        c.run_until(budget, |c| scheduled_terminal_epoch(c, parent).is_some()),
+        "the beacon must schedule the pair's merge",
+    );
+    let terminal = scheduled_terminal_epoch(c, parent).expect("scheduled above");
+    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
+    let cut = EpochWindows::new(epoch_ms).window_of(terminal).end;
+    let window = TimestampRange::new(
+        cut.minus(FATED_OPENS_BEFORE_THE_CUT),
+        cut.plus(FATED_CLOSES_AFTER_THE_CUT),
+    );
+    assert!(
+        c.run_until(budget, |c| clock(c) >= window.start_timestamp_inclusive),
+        "the swap's window must open before the cut",
+    );
+
+    let mut charges = Charges::default();
+    let (key, caller) = &set.swappers[0];
+    let held_back = [
+        c.drop_type("crossing.readings"),
+        c.drop_type("state_proof.request"),
+        c.drop_type("remote_header.request"),
+    ];
+    let funded = held(c, caller.address(), *PROTOCOL_RESOURCE);
+    let swap = build_swap_tx(
+        key,
+        *caller,
+        &set.venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        window,
+    );
+    let price = declared_price(c, &swap);
+    let hash = charges.submit(c, swap);
+    set.protocol_resource.owing(charges.records(c));
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(venue_shard, hash).0.is_some()),
+        "the venue must include the swap before its terminal",
+    );
+    assert!(
+        await_serves(c, parent, budget),
+        "the merged parent must serve within budget",
+    );
+    let fate = c.chain_fate(venue_shard, hash).1;
+    assert!(
+        matches!(fate, Some((_, TransactionDecision::Aborted))),
+        "the venue's terminal must fate the swap it held; fate = {fate:?}",
+    );
+    assert!(
+        held_back.iter().any(|handle| handle.fired() > 0),
+        "the readings must actually have been cut, or the venue ran the swap",
+    );
+    c.clear_drops();
+
+    let paid = funded - SWAP_INPUT - price;
+    let locked = set.protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        budget,
+        "a crossing its merged consumer never took",
+    );
+    for shard in [caller_shard, parent] {
+        assert!(
+            c.named_unsettled(shard, hash).is_empty(),
+            "no record may name the swap, the two chains having ended together; \
+             {shard:?} names {:?}",
+            c.named_unsettled(shard, hash),
+        );
+    }
+    assert_eq!(
+        held(c, caller.address(), *PROTOCOL_RESOURCE),
+        paid,
+        "the input is not taken back",
+    );
+    assert_eq!(
+        held_at(c, set.reserve),
+        set.stocked,
+        "the venue never took the input",
+    );
+    assert_eq!(
+        locked
+            .iter()
+            .map(|lock| (lock.kind, lock.amount))
+            .collect::<Vec<_>>(),
+        vec![(Kind::Escrowed, SWAP_INPUT)],
+        "the one escrowed record stands locked: {locked:?}",
+    );
+    set.units.assert_settles_within(
+        c,
+        &Charges::default(),
+        budget,
+        "a crossing its merged consumer never took",
+    );
+}
+
 /// How far before the venue's cut the fated swap's window opens, and how
 /// far past it the window closes: together one validity range less a
 /// margin, so the venue can include it before it coasts and its deadline
@@ -981,6 +1111,18 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
         budget,
         "a swap committed after the venue's cut",
     );
+}
+
+/// The merged-pair genesis: the merge ballast, the venue on the merging
+/// right quarter and its callers on the left.
+#[must_use]
+pub fn merged_pair_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = merge_survivor_ballast_accounts(&GenesisPackages::with_fixtures());
+    accounts.extend(venue_genesis_accounts_on(
+        MERGE_STRADDLER_RIGHT,
+        &[MERGE_STRADDLER_LEFT],
+    ));
+    accounts
 }
 
 /// Genesis funding for [`a_leg_issued_on_a_merging_shard_reaches_its_venue`].
