@@ -49,7 +49,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Member, Runs, Unclaimable, never_answer};
+use hyperscale_engine::legs::{Classified, Member, Runs, Unclaimable, abandoned_never};
 use hyperscale_engine::tick_select::{ProvisionalCells, Requirement, requirements_of};
 use hyperscale_engine::{
     CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
@@ -1320,7 +1320,7 @@ impl ExecutionCoordinator {
                     classified
                         .refusable_consumed(local_shard)
                         .map(|edge| {
-                            never_answer(tx_hash, deadline.validity_end().as_millis(), edge)
+                            abandoned_never(tx_hash, deadline.validity_end().as_millis(), edge)
                         })
                         .filter(|(key, _)| trie.shard_for_prefix(key.owner) == local_shard)
                         .collect()
@@ -12021,7 +12021,7 @@ mod tests {
     fn an_answer_goes_in_the_fold_on_one_reading_of_its_record_absent() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, answer_key, id) = answered_crossing(&mut state, &schedule, 0x7A);
+        let (record_key, _, id) = answered_crossing(&mut state, &schedule, 0x7A);
         let at = WeightedTimestamp::from_millis(10_000);
         state.committed_ts = at;
         let (claim, _) = proven_at(&mut state, &schedule, PEER, 9, at, &[], &[record_key]);
@@ -12035,9 +12035,9 @@ mod tests {
         assert!(
             claim
                 .naming([(record_key, id)])
-                .settles()
-                .contains(&answer_key),
-            "the record read gone at or above the floor is the answer's removal",
+                .deleting()
+                .any(|deleting| deleting == record_key),
+            "the record read gone at or above the floor licenses its seen answer's removal",
         );
         assert!(
             !actions
@@ -13313,7 +13313,7 @@ mod tests {
         let classified = peer_fed_core_classified();
         let edges: Vec<_> = classified.refusable_consumed(HOME).collect();
         assert_eq!(edges.len(), 1, "the fixture hands the core one crossing");
-        never_answer(
+        abandoned_never(
             transaction.hash(),
             transaction
                 .validity_range()

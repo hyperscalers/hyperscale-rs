@@ -28,8 +28,9 @@
 //! identity beside such a key, and what the reading licenses the commit
 //! fold to remove is read off the identity: a consumer's `Taken` read
 //! present licenses removing the producer's record, and a record read
-//! absent licenses removing both of its answers. The identity is bound
-//! to its key by derivation, checked where the claim's form is.
+//! absent licenses removing an answer the commit fold judges its
+//! consumer to have read the record for. The identity is bound to its
+//! key by derivation, checked where the claim's form is.
 
 use hyperscale_hbor::{Bytes, Capped, Hbor};
 use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
@@ -199,32 +200,30 @@ impl StateClaim {
             .map(|(_, id)| *id)
     }
 
-    /// The cells the readings license the commit fold to remove,
-    /// ascending and each once: the record of a crossing whose `Taken`
-    /// is read present, and both answers of a crossing whose record is
-    /// read absent. Every other reading licenses nothing.
+    /// The records the readings retire, ascending and each once: the
+    /// record of a crossing whose `Taken` is read present. Every other
+    /// reading retires nothing.
     ///
     /// The one statement of the rule, read by the root's fold and by
     /// every mirror of it. Each arm reads one reading, so a claim cut
-    /// into pieces licenses what the whole did; it derives keys and
-    /// decodes nothing.
+    /// into pieces retires what the whole did; it derives keys and
+    /// decodes nothing. What a record read absent does to its answers
+    /// depends on the answers themselves, so the fold, which reads
+    /// them, decides it.
     #[must_use]
-    pub fn settles(&self) -> Vec<SubstateKey> {
-        let mut removed: Vec<SubstateKey> = Vec::new();
-        for (key, id) in self.crossings.iter() {
-            let [record, taken, never] = crossing_keys(id);
-            match self.reading(*key) {
-                Some(Inclusion::Present(_)) if *key == taken => removed.push(record),
-                Some(Inclusion::Absent) if *key == record => {
-                    removed.push(taken);
-                    removed.push(never);
-                }
-                _ => {}
-            }
-        }
-        removed.sort_unstable();
-        removed.dedup();
-        removed
+    pub fn retires(&self) -> Vec<SubstateKey> {
+        let mut retired: Vec<SubstateKey> = self
+            .crossings
+            .iter()
+            .filter_map(|(key, id)| {
+                let [record, taken, _] = crossing_keys(id);
+                matches!(self.reading(*key), Some(Inclusion::Present(_)) if *key == taken)
+                    .then_some(record)
+            })
+            .collect();
+        retired.sort_unstable();
+        retired.dedup();
+        retired
     }
 
     /// The record keys read absent that name their crossing: the
@@ -608,35 +607,32 @@ mod tests {
         );
 
         assert_eq!(
-            speaking(vec![(taken, present, Some(id))]).settles(),
+            speaking(vec![(taken, present, Some(id))]).retires(),
             vec![record],
             "the consumer's Taken read present retires the record",
         );
-        assert_eq!(
-            speaking(vec![(record, Inclusion::Absent, Some(id))]).settles(),
-            {
-                let mut both = vec![taken, never];
-                both.sort_unstable();
-                both
-            },
-            "the record read absent deletes both answers",
+        assert!(
+            speaking(vec![(record, Inclusion::Absent, Some(id))])
+                .retires()
+                .is_empty(),
+            "a record read absent retires nothing; its answers are the fold's",
         );
         assert!(
             speaking(vec![(record, present, Some(id))])
-                .settles()
+                .retires()
                 .is_empty()
         );
         assert!(
             speaking(vec![(taken, Inclusion::Absent, Some(id))])
-                .settles()
+                .retires()
                 .is_empty()
         );
         assert!(
             speaking(vec![(never, present, Some(id))])
-                .settles()
+                .retires()
                 .is_empty()
         );
-        assert!(speaking(vec![(taken, present, None)]).settles().is_empty());
+        assert!(speaking(vec![(taken, present, None)]).retires().is_empty());
 
         let deleting: Vec<SubstateKey> = speaking(vec![
             (record, Inclusion::Absent, Some(id)),

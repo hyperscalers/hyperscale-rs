@@ -537,7 +537,7 @@ impl Counterparts {
         // What the block's claims settle is marked gone on the entry that
         // issued it, as the fold removes it from state: a record removed
         // on its consumer's `Taken` closes its entry's share.
-        for key in block.state_claims().iter().flat_map(StateClaim::settles) {
+        for key in block.state_claims().iter().flat_map(StateClaim::retires) {
             self.ledger.settled(key);
         }
         // The reads still worth pacing: the records something here
@@ -3144,7 +3144,7 @@ mod tests {
         )
         .naming([(claim, id), (decline, id)]);
         assert_eq!(
-            both.settles(),
+            both.retires(),
             vec![id.record_key(&ProtocolHasher)],
             "the claim is what the record is answered by: the fold removes it",
         );

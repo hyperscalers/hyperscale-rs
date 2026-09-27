@@ -84,7 +84,7 @@ pub fn crossing_changes(
                 .map(|writes| writes.cells.clone())
         })
         .flat_map(BTreeMap::into_keys)
-        .chain(block.state_claims().iter().flat_map(StateClaim::settles))
+        .chain(block.state_claims().iter().flat_map(StateClaim::retires))
         .chain(
             block
                 .state_claims()

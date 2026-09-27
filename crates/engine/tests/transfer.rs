@@ -1735,16 +1735,19 @@ fn taken_read_present(id: CrossingId, consumer: ShardId) -> StateClaim {
     .naming([(taken, id)])
 }
 
-/// Apply to `store` what the commit fold removes for `claims`, and
-/// return what it removed.
+/// Apply to `store` what the commit fold does for `claims`, and return
+/// what it removed.
 fn fold_settlements(store: &mut MapDb, claims: &[StateClaim]) -> Vec<SubstateKey> {
-    let removed = crossing_settlements(claims, &SettledWrites::default(), store);
+    let settled = crossing_settlements(claims, ShardId::ROOT, &SettledWrites::default(), store);
     let mut writes = StateWrites::default();
-    for key in &removed {
+    for key in &settled.removed {
         writes.cells.insert(*key, None);
     }
+    for (key, value) in settled.seen {
+        writes.cells.insert(key, Some(value));
+    }
     store.apply(&writes);
-    removed
+    settled.removed
 }
 
 /// Once the recipient's claim is on record, the sender's shard removes

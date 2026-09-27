@@ -125,12 +125,18 @@ pub fn settled_writes_at(
         baseline,
         prefix,
     );
-    let settled = crossing_settlements(chain.state_claims, &merged, baseline);
+    let settled = crossing_settlements(chain.state_claims, chain.members.shard, &merged, baseline);
+    let creations: Vec<(SubstateKey, Vec<u8>)> = chain
+        .creations
+        .iter()
+        .cloned()
+        .chain(settled.seen)
+        .collect();
     with_frontier(
         with_sweep(
             merged,
-            chain.creations,
-            &removals_of(chain.removals, &settled),
+            &creations,
+            &removals_of(chain.removals, &settled.removed),
         ),
         protocol_entries,
     )

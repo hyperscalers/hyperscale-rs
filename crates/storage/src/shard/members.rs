@@ -23,7 +23,7 @@ use hyperscale_types::{
     DiscardCause, EntryKey, Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK,
     MAX_VALIDITY_RANGE, Movement, Reach, SettledEntries, Settlement, ShardId, ShardTrie,
     StateWrites, SubstateKey, TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash,
-    TxOutcome, Verifiable, Verified, WeightedTimestamp,
+    TxOutcome, Verifiable, Verified, WeightedTimestamp, entry_leaf_key,
 };
 use hyperscale_vm_effects::{
     ProtocolHasher, TICK_MEMBER_SLOT, collection_id, fee_hold_key, protocol_resource,
@@ -254,6 +254,13 @@ pub fn member_order(tx: TxHash) -> u128 {
     let mut high = [0u8; 16];
     high.copy_from_slice(&tx.as_bytes()[..16]);
     u128::from_be_bytes(high)
+}
+
+/// The tree leaf of `tx`'s member row in `shard`'s collection: the key a
+/// state claim reads to prove the row standing or gone.
+#[must_use]
+pub fn member_row_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
+    entry_leaf_key(&ProtocolHasher, member_entry(shard, tx))
 }
 
 fn member_entry(shard: ShardId, tx: TxHash) -> EntryKey {

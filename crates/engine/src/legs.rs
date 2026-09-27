@@ -728,10 +728,13 @@ impl Runs {
     }
 }
 
-/// The `Never` answer `tx` writes for `edge`: the decline cell under the
-/// consuming node's target, and its bytes naming the producer whose
-/// record it answers for.
+/// The `Never` answer a member that ran writes for `edge`: the decline
+/// cell under the consuming node's target, and its bytes naming the
+/// producer whose record it answers for, seen.
 ///
+/// A member runs only once every escrowed edge it consumes has arrived,
+/// and an arrival is a committed claim reading the record present, so
+/// the consumer's chain read the record before this answer stood.
 /// Derived through the crossing's one identity, so the member's refusal
 /// receipt and the abandonment cannot derive two different cells.
 #[must_use]
@@ -744,6 +747,22 @@ pub fn never_answer(
     (
         id.answer_key(&ProtocolHasher, Answered::Never),
         id.answer(tx, Answered::Never, validity_end_ms).to_bytes(),
+    )
+}
+
+/// The `Never` answer an abandonment writes for `edge`: the same cell as
+/// [`never_answer`], unseen, since the abandoned member never read the
+/// record it declines.
+#[must_use]
+pub fn abandoned_never(
+    tx: TxHash,
+    validity_end_ms: u64,
+    edge: &CrossingEdge,
+) -> (SubstateKey, Vec<u8>) {
+    let id = edge.crossing.id;
+    (
+        id.answer_key(&ProtocolHasher, Answered::Never),
+        id.unseen_never(tx, validity_end_ms).to_bytes(),
     )
 }
 

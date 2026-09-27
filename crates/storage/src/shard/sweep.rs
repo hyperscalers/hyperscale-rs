@@ -518,12 +518,14 @@ pub fn followed_block_writes(
         prefix,
     );
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
-    let settled = crossing_settlements(block.state_claims(), &merged, prior);
-    let removals = removals_of(&swept, &settled);
+    let settled = crossing_settlements(block.state_claims(), members.shard, &merged, prior);
+    let removals = removals_of(&swept, &settled.removed);
+    let creations: Vec<(SubstateKey, Vec<u8>)> =
+        creations.iter().cloned().chain(settled.seen).collect();
     let mut raised = read_frontier_writes(prior, frontier);
     raised.extend(member_writes(prior, &members));
     filter_writes_to_prefix(
-        &with_frontier(with_sweep(merged, creations, &removals), raised),
+        &with_frontier(with_sweep(merged, &creations, &removals), raised),
         prefix,
     )
 }

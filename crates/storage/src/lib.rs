@@ -46,14 +46,16 @@ pub use shard::boundary::{
 pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
 pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
-pub use shard::crossings::{crossing_settlements, live_record, record_arrivals};
+pub use shard::crossings::{
+    CrossingSettlements, crossing_settlements, live_record, record_arrivals,
+};
 pub use shard::dedup_window::DedupWindow;
 pub use shard::derived::{Indexed, LeafRows, RowChange, index_leaf};
 pub use shard::fee_holds::{FeeTerms, decode_total};
 pub use shard::genesis::GenesisCommit;
 pub use shard::members::{
     MemberIndex, MemberInputs, MemberRow, RowState, SettledHalf, TickRow, colliding_member_row,
-    member_order, member_writes, without_colliding_member_rows,
+    member_order, member_row_leaf, member_writes, without_colliding_member_rows,
 };
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
