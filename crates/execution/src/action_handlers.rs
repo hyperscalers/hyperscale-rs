@@ -334,7 +334,7 @@ where
 
             // Append before notifying: the coordinator dispatches the next
             // tick on this event, and its baseline must include this one.
-            ctx.tick_chain.append(tick, output);
+            ctx.tick_chain.append(tick, output, view.generation());
             ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted {
                 tick,
                 outcome: TickBatchOutcome {

@@ -514,7 +514,7 @@ impl ExecutionSim {
         };
 
         self.outputs.push((tick, output.clone()));
-        self.chain.append(tick, output);
+        self.chain.append(tick, output, view.generation());
         self.coord
             .on_execution_batch_completed(&self.topology, tick, outcome)
     }

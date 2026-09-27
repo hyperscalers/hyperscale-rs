@@ -622,6 +622,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
                 determined: vec![(executed[0].tx_hash, updates.clone())],
                 provisional: Vec::new(),
             },
+            baseline.generation(),
         );
     }
     assert_eq!(
