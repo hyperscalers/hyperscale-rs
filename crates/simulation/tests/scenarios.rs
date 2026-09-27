@@ -63,10 +63,10 @@ use hyperscale_scenarios::{
     an_abandoned_never_is_read_seen_and_goes,
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
-    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
-    cross_shard_fraction, cross_shard_header_fetch_fallback,
+    answers_end_at_the_read_frontier_across_a_reshape, attested_load_reaches_the_beacon,
+    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -1681,6 +1681,22 @@ fn a_departing_venue_clears_swaps_and_carries_on_sim() {
 
 /// The split-straddler pair with the venue on the surviving side and its
 /// callers on the splitter: the callers' shard is the one that leaves.
+#[test]
+fn answers_end_at_the_read_frontier_across_a_reshape_sim() {
+    let mut accounts = departing_caller_ballast();
+    accounts.extend(venue_genesis_accounts_on(
+        STRADDLER_SURVIVOR,
+        &[STRADDLER_SPLITTER],
+    ));
+    let mut cluster = SimCluster::with_packages_on_dedicated_pool_hosts(
+        &departing_venue_config(),
+        11,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(|c| answers_end_at_the_read_frontier_across_a_reshape(c, epochs(12)));
+}
+
 #[test]
 fn a_leg_issued_on_a_departing_shard_reaches_its_venue_sim() {
     let mut accounts = departing_caller_ballast();
