@@ -131,7 +131,8 @@ pub use venue::{
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
-    a_swap_the_venue_refuses_gives_its_caller_back_its_leg, grind_onto, hot_venue_clears_swaps,
+    a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
+    an_abandoned_never_outlives_a_late_record, grind_onto, hot_venue_clears_swaps,
     hot_venue_clears_swaps_on, stand_up_venue, venue_genesis_accounts, venue_genesis_accounts_on,
     wide_swapper_shards,
 };

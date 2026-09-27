@@ -61,7 +61,7 @@ use hyperscale_scenarios::{
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
     a_withheld_fallback_is_asked_by_an_honest_validator, abort_converges,
-    an_abandoned_never_is_read_seen_and_goes,
+    an_abandoned_never_is_read_seen_and_goes, an_abandoned_never_outlives_a_late_record,
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
     answers_end_at_the_read_frontier_across_a_reshape, attested_load_reaches_the_beacon,
@@ -2214,4 +2214,15 @@ fn surviving_sibling_split_seats_full_committees_sim() {
         ExecutionMode::Serial,
     );
     surviving_sibling_split_seats_full_committees(&mut cluster);
+}
+
+#[test]
+fn an_abandoned_never_outlives_a_late_record_sim() {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &venue_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(|c| an_abandoned_never_outlives_a_late_record(c, epochs(40)));
 }

@@ -33,7 +33,8 @@ use hyperscale_vm_fixtures::amm;
 
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    assert_reclaimed_leg, clock, declared_price, held, held_at, stands_at, vault_balance,
+    assert_reclaimed_leg, clock, crossing_cells, declared_price, held, held_at, owning_shard,
+    stands_at, vault_balance,
 };
 use crate::support::tx::{
     GENESIS_POOL_ID, account_routing_to_n, build_add_liquidity_tx, build_instantiate_tx,
@@ -958,5 +959,104 @@ pub fn a_held_core_keeps_its_sponsors_hold_until_it_aborts<C: FaultableCluster>(
 
     let world = "a held core's sponsored hold";
     protocol_resource.assert_settles_within(c, &charges, budget, world);
+    units.assert_settles_within(c, &Charges::default(), budget, world);
+}
+
+/// An abandonment's `Never` outlives an absence of its record read
+/// before the record was written, and ends once the record is.
+///
+/// The swap's caller and venue sit on committees of their own hosts, and
+/// the caller's execution votes are cut among its own committee, so its
+/// leg commits and cannot finalize: the escrowed record it would write
+/// stands unwritten. The venue waits on its input to the deadline, and its
+/// abandonment writes an unseen `Never`. The venue then asks for the
+/// record and carries its absence, read before any write; that absence
+/// alone deletes no unseen answer, so the `Never` stands. Once the votes
+/// return the leg finalizes and writes the record, the caller reads the
+/// `Never` and reclaims its input, and the `Never` goes on the record's
+/// absence. Both worlds are conserved with nothing locked.
+///
+/// # Panics
+///
+/// Panics if the venue does not abandon the swap while the leg is held,
+/// if the venue carries no absence of the record, if that absence
+/// deletes the `Never`, if the leg does not finalize once the votes
+/// return, if the record or the `Never` outlives the reclaim, if the
+/// input does not come home, or if either world is not conserved.
+pub fn an_abandoned_never_outlives_a_late_record<C: FaultableCluster>(c: &mut C, budget: Budget) {
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
+    let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let (mut protocol_resource, units) = venue_worlds(c, &venue, [caller]);
+    let mut charges = Charges::default();
+    let leg_hosts = c.committee_hosts(SWAPPER_SHARD);
+    assert!(
+        c.committee_hosts(VENUE_SHARD)
+            .iter()
+            .all(|host| !leg_hosts.contains(host)),
+        "the caller's committee and the venue's share no host",
+    );
+
+    let swap = build_swap_tx(
+        &caller_key,
+        caller,
+        &venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let input = crossing_cells(c, &swap)
+        .into_iter()
+        .find(|crossing| owning_shard(c, crossing.record.owner) == SWAPPER_SHARD)
+        .expect("a swap's input crosses from its caller");
+    let funded = held(c, caller.address(), *PROTOCOL_RESOURCE);
+    let price = declared_price(c, &swap);
+    let held_leg = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
+    let hash = charges.submit(c, swap);
+    protocol_resource.owing(charges.records(c));
+
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(VENUE_SHARD, hash).1.is_some()),
+        "the venue must abandon the swap at its deadline",
+    );
+    assert!(
+        stands_at(c, input.never) && !stands_at(c, input.record),
+        "the abandonment writes a Never for a record not yet written",
+    );
+    let absences = c.metric("fenced_claims_carried", Some("removed"));
+    assert!(
+        c.run_until(budget, |c| c
+            .metric("fenced_claims_carried", Some("removed"))
+            > absences),
+        "the venue must carry an absence of the unwritten record",
+    );
+    assert!(
+        stands_at(c, input.never),
+        "an absence read before the record was written deletes no unseen Never",
+    );
+    assert!(
+        held_leg.fired() > 0,
+        "the leg's votes must actually have been cut"
+    );
+    c.clear_drops();
+
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(SWAPPER_SHARD, hash).1.is_some()),
+        "the leg must finalize once its votes return",
+    );
+    assert!(
+        c.run_until(budget, |c| !stands_at(c, input.record)
+            && !stands_at(c, input.never)),
+        "the caller reclaims on the Never and the Never goes on the record's absence",
+    );
+    assert!(
+        c.run_until(budget, |c| held(c, caller.address(), *PROTOCOL_RESOURCE)
+            == funded - price),
+        "the input comes home, less the price",
+    );
+    let world = "an abandoned Never outliving a late record";
+    let locked = protocol_resource.assert_settles_within(c, &charges, budget, world);
+    assert!(locked.is_empty(), "nothing stays locked: {locked:?}");
     units.assert_settles_within(c, &Charges::default(), budget, world);
 }
