@@ -209,7 +209,9 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 /// the standing records reach the fresh committee, which credits each
 /// once. Once the recovery record clears, a fresh transfer per direction
 /// must settle and credit — the recovered shard's cross-shard rail serves
-/// again.
+/// again. Every record and answer the run wrote then ends, the recovered
+/// shard's `Taken`s on reading their records absent at the survivor.
+/// Reports the fenced claims and claims weight the run carried.
 ///
 /// Requires [`halt_straddler_setup`] at genesis, a dedicated host per
 /// validator, and two committees' worth of pool surplus.
@@ -222,7 +224,8 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 /// committee rather than the first one completes the recovery, an
 /// in-flight tick hangs, a recipient is credited other than once for an
 /// accepted transfer, a crossing the survivor accepted is not credited
-/// after the recovery, or the post-recovery transfers fail to settle.
+/// after the recovery, the post-recovery transfers fail to settle, or a
+/// record or answer outlives the settled world.
 pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     let (halted, survivor) = ShardId::ROOT.children();
     let setup = halt_straddler_setup();

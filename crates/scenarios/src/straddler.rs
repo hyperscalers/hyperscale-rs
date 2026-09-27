@@ -728,12 +728,19 @@ fn assert_credited_once_the_cut_lifts<C: FaultableCluster>(
 /// so it could not tell whose the value was even if the record named a
 /// cell. The record carrying its own recourse is what settles it.
 ///
+/// Once the cut lifts the survivor credits the recipient off the child's
+/// record, the child retires the record on reading the `Taken`, and the
+/// survivor deletes the `Taken` on reading the record absent at the
+/// child, which its read frontier holds as the splitter's lineage.
+///
 /// # Panics
 ///
 /// Panics if the splitter does not commit the leg before the vote, if
 /// the leg does not accept alone, if the push is never exercised, if the
 /// delivery lands on any chain, if the children are not served within
-/// budget, or if any child credits the payment back.
+/// budget, if any child credits the payment back, or if, once the cut
+/// lifts, the recipient is not credited once or the record or its answer
+/// outlives the budget.
 pub fn a_record_is_owed_by_the_successor_when_its_issuer_splits<C: FaultableCluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;

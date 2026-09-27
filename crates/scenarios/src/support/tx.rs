@@ -2156,6 +2156,31 @@ pub(crate) fn build_route_tx(
     })
 }
 
+/// [`build_route_tx`] of the protocol resource taking whatever the second
+/// venue quotes, with its fee paid by `sponsor`, which attests the root
+/// first.
+///
+/// # Panics
+///
+/// As [`build_route_tx`].
+#[must_use]
+pub(crate) fn build_sponsored_route_tx(
+    sponsor: &Ed25519PrivateKey,
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venues: (&InstanceMeta, &InstanceMeta),
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let metas = [venues.0.clone(), venues.1.clone()];
+    build_venues_tx(payer, Some(sponsor), &metas, validity, &|pools, b| {
+        let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
+        let mid = pools[0].swap(b, funds, 0)?;
+        let out = pools[1].swap(b, mid, 0)?;
+        account::deposit(b, from, out)
+    })
+}
+
 /// One call against a sealed venue, typed against the record the seal
 /// wrote.
 fn build_venue_tx(

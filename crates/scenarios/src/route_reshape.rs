@@ -575,7 +575,8 @@ pub fn a_leg_issued_on_a_departing_shard_reaches_its_venue(c: &mut impl Cluster,
 /// `Taken` and retires the record, the venue reads the record absent at
 /// the child, which its frontier holds as the splitter's lineage, and
 /// deletes the `Taken`; the delivery ends the same way in the other
-/// direction. Reports the fenced claims the run carried and refused.
+/// direction. Reports the fenced claims and claims weight the run
+/// carried.
 ///
 /// # Panics
 ///
@@ -1152,7 +1153,8 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
 /// parent: it retires the taken record, reclaims the refused one to its
 /// caller and credits the delivery, and each answer goes once its record
 /// reads absent. The cuts stay in place throughout, so nothing but the
-/// successor's own readings finishes them.
+/// successor's own readings finishes them. Reports the fenced claims and
+/// claims weight the run carried.
 ///
 /// # Panics
 ///

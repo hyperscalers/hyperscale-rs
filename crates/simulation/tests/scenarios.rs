@@ -105,6 +105,7 @@ use hyperscale_scenarios::{
 #[cfg(feature = "production-epochs")]
 use hyperscale_scenarios::{
     a_route_whose_core_never_combines_holds_its_input,
+    a_route_whose_held_core_keeps_its_sponsors_hold,
     a_skip_deferred_split_keeps_every_settlement_in_its_window,
 };
 use hyperscale_simulation::ExecutionMode;
@@ -839,6 +840,16 @@ fn a_crossing_the_consumer_refuses_is_declined_sim() {
 fn a_route_whose_core_never_combines_holds_its_input_sim() {
     let mut cluster = route_cluster_on_dedicated_hosts();
     cluster.run_faultable(a_route_whose_core_never_combines_holds_its_input);
+}
+
+/// `a_route_whose_core_never_combines_holds_its_input_sim` with the
+/// fee paid by a sponsor on the first venue's shard. Under the
+/// production epoch length only, as its sibling.
+#[cfg(feature = "production-epochs")]
+#[test]
+fn a_route_whose_held_core_keeps_its_sponsors_hold_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(a_route_whose_held_core_keeps_its_sponsors_hold);
 }
 
 #[test]

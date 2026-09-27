@@ -11095,9 +11095,7 @@ mod tests {
     fn held_settlement(proved: Proved, owed_here: bool) -> Option<Runs> {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        // Past the deadline, where a question is first asked, and short
-        // of the abandon window's close, where an escrowed record's is
-        // asked no more.
+        // Past the deadline, where a question is first asked.
         let validity_end_ms = 400_000;
         let (record_key, claim, cell) = owned_record(validity_end_ms);
         if owed_here {

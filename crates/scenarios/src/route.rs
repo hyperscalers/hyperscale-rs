@@ -18,7 +18,7 @@ use hyperscale_types::{
     SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
     Window,
 };
-use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind};
+use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
 
 use crate::straddler::isolate_ec_intake;
@@ -26,7 +26,9 @@ use crate::support::conservation::{Charges, World};
 use crate::support::query::{
     assert_reclaimed_leg, declared_price, held, held_at, stands_at, vault_balance,
 };
-use crate::support::tx::{build_route_tx, build_swap_tx, validity_around};
+use crate::support::tx::{
+    build_route_tx, build_sponsored_route_tx, build_swap_tx, validity_around,
+};
 use crate::support::wait::await_blocks;
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
@@ -55,9 +57,11 @@ pub const ROUTES: usize = 4;
 /// this is well clear of it.
 const REFUSED_FLOOR: u128 = ROUTE_INPUT * 100;
 
-/// A provider on each venue's shard and the traders, with the funding
-/// each needs. Stocking is local to its venue, so it costs no crossing
-/// and is not part of the shape under test.
+/// A provider on each venue's shard, the traders, and a sponsor on the
+/// first venue's shard, each funded for what it does.
+///
+/// Stocking is local to its venue, so it costs no crossing and is not
+/// part of the shape under test.
 #[must_use]
 pub fn route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     let mut taken = Vec::new();
@@ -76,7 +80,14 @@ pub fn route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
             .into_iter()
             .map(|(_, account)| (account, SWAPPER_FUNDING)),
     );
+    accounts.push((sponsor(&mut taken).1, SWAPPER_FUNDING));
     accounts
+}
+
+/// An account on the first venue's shard that pays a sponsored route's
+/// fee, ground after the traders.
+fn sponsor(taken: &mut Vec<u8>) -> (Ed25519PrivateKey, PrincipalAddr) {
+    grind_onto(FIRST_VENUE_SHARD, taken)
 }
 
 fn traders(taken: &mut Vec<u8>) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
@@ -182,7 +193,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
         isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
     ];
-    let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
+    let (protocol_resource, units) = route_worlds(c, &first, &second, accounts(&traders));
 
     let mut charges = Charges::default();
     let validity = validity_around(c.now());
@@ -329,6 +340,15 @@ fn assert_venues_gave_back<C: Cluster>(
     );
 }
 
+/// Who pays a held route's fee.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FeePayer {
+    /// The trader, whose own leg charges it.
+    Trader,
+    /// A sponsor on the first venue's shard, whose core member charges it.
+    Sponsor,
+}
+
 /// A core whose siblings never combine holds its input, and settles
 /// whole once they do.
 ///
@@ -341,7 +361,9 @@ fn assert_venues_gave_back<C: Cluster>(
 /// member awaiting a sibling is never released for being wedged and
 /// never abandoned while uncovered, so once the cut lifts the core
 /// combines, the route settles whole, the resource is conserved and the
-/// report is empty.
+/// report is empty. The trader's leg burns the price before the core is
+/// held, and the burn, not the verdict the core still owes, ends the fee
+/// hold.
 ///
 /// **The verdict is a presence, and only the consumer speaks it.** A
 /// claim's absence answers nothing at any anchor, and a core member held
@@ -356,41 +378,74 @@ fn assert_venues_gave_back<C: Cluster>(
 /// Panics if either venue misses its budget standing up, if the trader's
 /// leg never pays, if the cut never fires, if anything moves the input
 /// while the cut stands, if a venue writes a `Never` for a crossing its
-/// member may still take, if the route does not settle whole once the
-/// cut lifts, or if the resource is not conserved.
+/// member may still take, if the fee hold outlives the leg's burn, if
+/// the route does not settle whole once the cut lifts, or if the
+/// resource is not conserved.
 pub fn a_route_whose_core_never_combines_holds_its_input<C: FaultableCluster>(c: &mut C) {
+    route_held_by_a_silent_sibling(c, FeePayer::Trader);
+}
+
+/// A core member its silent sibling holds keeps its sponsor's fee hold
+/// for as long as the strand lasts, and settles it once with the route.
+///
+/// [`a_route_whose_core_never_combines_holds_its_input`] with the fee
+/// paid by a sponsor on the first venue's shard, so the charge is the
+/// held core member's rather than the trader's leg's. The hold and the
+/// vault's total stand under the member while its sibling is silent past
+/// the close of [`Window::Core`]: an unsettled member is released only
+/// beside a charge, and nothing charges it there. Once the cut lifts the
+/// route settles whole and the sponsor is charged its price once.
+///
+/// # Panics
+///
+/// As [`a_route_whose_core_never_combines_holds_its_input`], and if the
+/// sponsor's hold does not stand while the core is held or the sponsor
+/// is not charged its price once.
+pub fn a_route_whose_held_core_keeps_its_sponsors_hold<C: FaultableCluster>(c: &mut C) {
+    route_held_by_a_silent_sibling(c, FeePayer::Sponsor);
+}
+
+/// Hold one route's core by cutting its siblings' certificates past the
+/// close of [`Window::Core`], then lift the cut and settle it, its fee
+/// paid by `payer`.
+fn route_held_by_a_silent_sibling<C: FaultableCluster>(c: &mut C, payer: FeePayer) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
+    let sponsor = sponsor(&mut taken);
     let (key, trader) = &traders[0];
     let cut = [
         isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
         isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
     ];
-    let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
+    let (protocol_resource, units) =
+        route_worlds(c, &first, &second, accounts(&traders).chain([sponsor.1]));
 
     let mut charges = Charges::default();
     let validity = validity_around(c.now());
     let funded = held(c, trader.address(), *PROTOCOL_RESOURCE);
-    let route = build_route_tx(
-        key,
-        *trader,
-        (&first.meta, &second.meta),
-        *PROTOCOL_RESOURCE,
-        ROUTE_INPUT,
-        0,
-        validity,
-    );
-    route
-        .try_declared(c.derivation().as_ref())
-        .expect("a route declares its terms");
-    let fee_hold = FeeTerms::of(&route).hold_key();
+    let venues = (&first.meta, &second.meta);
+    let route = match payer {
+        FeePayer::Trader => build_route_tx(
+            key,
+            *trader,
+            venues,
+            *PROTOCOL_RESOURCE,
+            ROUTE_INPUT,
+            0,
+            validity,
+        ),
+        FeePayer::Sponsor => {
+            build_sponsored_route_tx(&sponsor.0, key, *trader, venues, ROUTE_INPUT, validity)
+        }
+    };
+    let fee = FeeHeld::of(c, &route, sponsor.1);
     let hash = charges.submit(c, route);
 
     assert!(
         c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
-            < funded - ROUTE_INPUT),
-        "the trader's leg must pay the input and the price before the core is asked anything",
+            <= funded - ROUTE_INPUT),
+        "the trader's leg must pay the input before the core is asked anything",
     );
     let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
@@ -401,13 +456,7 @@ pub fn a_route_whose_core_never_combines_holds_its_input<C: FaultableCluster>(c:
         "the certificate channel must actually have been exercised and cut",
     );
     assert_nothing_spoke(c, hash, *trader, paid);
-    // The trader's leg burned the price, and the burn ends the hold: a
-    // reservation lasts until the payer's shard charges, not until the
-    // verdict the held core still owes.
-    assert!(
-        !stands_at(c, fee_hold),
-        "the leg's burn ends its payer's fee hold whatever the core still owes",
-    );
+    fee.assert_while_held(c, payer);
     let locked = protocol_resource.locked(c, &charges);
     assert_eq!(
         locked.len(),
@@ -456,6 +505,59 @@ pub fn a_route_whose_core_never_combines_holds_its_input<C: FaultableCluster>(c:
         epochs(10),
         "a route whose core never combined",
     );
+    if payer == FeePayer::Sponsor {
+        fee.assert_sponsor_charged_once(c);
+    }
+}
+
+/// A held route's fee hold, and what its sponsor held before.
+struct FeeHeld {
+    hold: SubstateKey,
+    total: SubstateKey,
+    sponsor: PrincipalAddr,
+    funded: u128,
+    price: u128,
+}
+
+impl FeeHeld {
+    fn of<C: Cluster>(c: &C, route: &Transaction, sponsor: PrincipalAddr) -> Self {
+        route
+            .try_declared(c.derivation().as_ref())
+            .expect("a route declares its terms");
+        let fee = FeeTerms::of(route);
+        Self {
+            hold: fee.hold_key(),
+            total: fee_hold_total_key(&ProtocolHasher, fee.vault),
+            sponsor,
+            funded: held(c, sponsor.address(), *PROTOCOL_RESOURCE),
+            price: declared_price(c, route),
+        }
+    }
+
+    /// While the core is held: the trader's leg burned the price, and the
+    /// burn ends the hold, since a reservation lasts until the payer's
+    /// shard charges; a sponsor's hold stands under the held core member,
+    /// which nothing charges.
+    fn assert_while_held<C: Cluster>(&self, c: &C, payer: FeePayer) {
+        match payer {
+            FeePayer::Trader => assert!(
+                !stands_at(c, self.hold),
+                "the leg's burn ends its payer's fee hold whatever the core still owes",
+            ),
+            FeePayer::Sponsor => assert!(
+                stands_at(c, self.hold) && stands_at(c, self.total),
+                "a core member its sibling holds keeps its sponsor's hold and total",
+            ),
+        }
+    }
+
+    fn assert_sponsor_charged_once<C: Cluster>(&self, c: &C) {
+        assert_eq!(
+            held(c, self.sponsor.address(), *PROTOCOL_RESOURCE),
+            self.funded - self.price,
+            "the sponsor pays the route's price once",
+        );
+    }
 }
 
 /// Run past the close of the core window and hold there for the tail a
@@ -543,7 +645,7 @@ pub fn an_abandoned_never_is_read_seen_and_goes<C: FaultableCluster>(c: &mut C) 
         c.drop_type_between(&others, &second_hosts, "provisions.broadcast"),
         c.drop_type_between(&second_hosts, &others, "provision.request"),
     ];
-    let (mut protocol_resource, units) = route_worlds(c, &first, &second, &traders);
+    let (mut protocol_resource, units) = route_worlds(c, &first, &second, accounts(&traders));
 
     let mut charges = Charges::default();
     let funded = held(c, trader.address(), *PROTOCOL_RESOURCE);
@@ -682,7 +784,7 @@ pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut 
     // the road that verdict takes to the shard holding the record, so
     // the producer has nothing to reclaim off while the cut stands.
     let cut = isolate_ec_intake(c, TRADER_SHARD, FIRST_VENUE_SHARD);
-    let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
+    let (protocol_resource, units) = route_worlds(c, &first, &second, accounts(&traders));
 
     let mut charges = Charges::default();
     let validity = validity_around(c.now());
@@ -748,16 +850,20 @@ pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut 
 /// Everything that can hold each side of the pair in a route scenario:
 /// the traders and the two venues themselves. The providers stocked and
 /// hold nothing a route can reach.
+/// The accounts of `keyed` signers.
+fn accounts(
+    keyed: &[(Ed25519PrivateKey, PrincipalAddr)],
+) -> impl Iterator<Item = PrincipalAddr> + '_ {
+    keyed.iter().map(|(_, account)| *account)
+}
+
 fn route_worlds<C: Cluster>(
     c: &C,
     first: &StockedVenue,
     second: &StockedVenue,
-    traders: &[(Ed25519PrivateKey, PrincipalAddr)],
+    holders: impl IntoIterator<Item = PrincipalAddr>,
 ) -> (World, World) {
-    let holders: Vec<Address> = traders
-        .iter()
-        .map(|(_, account)| account.address())
-        .collect();
+    let holders: Vec<Address> = holders.into_iter().map(PrincipalAddr::address).collect();
     let protocol_resource = World::open(
         c,
         *PROTOCOL_RESOURCE,
@@ -816,7 +922,7 @@ fn drive_routes<C: Cluster>(
     traders: &[(Ed25519PrivateKey, PrincipalAddr)],
     budget: Budget,
 ) -> RouteReport {
-    let (protocol_resource, units) = route_worlds(c, first, second, traders);
+    let (protocol_resource, units) = route_worlds(c, first, second, accounts(traders));
 
     let start = c.now();
     let mut charges = Charges::default();
@@ -967,7 +1073,7 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         "both venues have to be holding something, or the reserve check \
          holds trivially at zero: {first_before} and {second_before}",
     );
-    let (protocol_resource, units) = route_worlds(c, &first, &second, &cast[..1]);
+    let (protocol_resource, units) = route_worlds(c, &first, &second, accounts(&cast[..1]));
     let mut charges = Charges::default();
     let refused_hash = charges.submit(c, refused);
 
