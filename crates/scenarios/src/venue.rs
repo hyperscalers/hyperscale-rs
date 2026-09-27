@@ -22,21 +22,25 @@ use std::time::Duration;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::stake_unit;
+use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
-    ComponentAddr, Ed25519PrivateKey, MIN_STAKE_FLOOR, PrincipalAddr, ProtocolHasher, ResourceAddr,
-    ShardId, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    ComponentAddr, Deadline, Ed25519PrivateKey, MIN_STAKE_FLOOR, PrincipalAddr, ProtocolHasher,
+    ResourceAddr, ShardId, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
+    TxHash,
 };
-use hyperscale_vm_effects::{InstanceMeta, Value, child_key};
+use hyperscale_vm_effects::{InstanceMeta, Value, child_key, fee_hold_total_key};
 use hyperscale_vm_fixtures::amm;
 
 use crate::support::conservation::{Charges, World};
-use crate::support::query::{assert_reclaimed_leg, declared_price, held, held_at, vault_balance};
+use crate::support::query::{
+    assert_reclaimed_leg, clock, declared_price, held, held_at, stands_at, vault_balance,
+};
 use crate::support::tx::{
     GENESIS_POOL_ID, account_routing_to_n, build_add_liquidity_tx, build_instantiate_tx,
-    build_stake_tx, build_swap_tx, pool_at, validity_around, venue_on,
+    build_sponsored_swap_tx, build_stake_tx, build_swap_tx, pool_at, validity_around, venue_on,
 };
 use crate::support::wait::await_tx_terminal;
-use crate::support::{Budget, Cluster, epochs};
+use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 
 /// What the liquidity provider is funded with: enough to stake the
 /// floor, stock the pool's protocol resource side, and pay for both.
@@ -110,7 +114,7 @@ pub fn venue_genesis_accounts_on(
 
 /// The caller [`venue_genesis_accounts_on`] funds on the venue's own
 /// shard, ground in the same order.
-fn caller_on_the_venues_shard(
+pub fn caller_on_the_venues_shard(
     venue_shard: ShardId,
     caller_shards: &[ShardId],
 ) -> (Ed25519PrivateKey, PrincipalAddr) {
@@ -852,4 +856,107 @@ fn settle_swaps<C: Cluster>(
         blocks: closed.saturating_sub(opened),
         idle_blocks: 0,
     }
+}
+
+/// A member that cannot settle keeps its fee hold until the line that
+/// ends it, and that line releases the hold beside its charge.
+///
+/// The swap's fee is paid by a sponsor on the venue's own shard, so its
+/// hold stands under the venue's member rather than the caller's leg,
+/// which settles and burns nothing of the sponsor's. Every crossing
+/// reading and every proof the venue could ask is cut, so the venue
+/// includes the swap and holds its member waiting on an input that never
+/// arrives. The hold stands through the caller's leg and up to the
+/// deadline; the member's abandonment then commits its `Aborted` line,
+/// which charges the sponsor its abort charge and deletes the hold and
+/// the vault's total in the same block. Once the cut lifts the caller
+/// reclaims its leg and both worlds are conserved.
+///
+/// # Panics
+///
+/// Panics if the venue does not include the swap, if the hold does not
+/// stand until the deadline or the member ends before it, if the member
+/// is not aborted, if its abort leaves the hold or the total standing or
+/// charges the sponsor nothing, or if either world is not conserved.
+pub fn a_held_core_keeps_its_sponsors_hold_until_it_aborts<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
+    let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let (sponsor_key, sponsor) = caller_on_the_venues_shard(VENUE_SHARD, &[SWAPPER_SHARD]);
+    let (protocol_resource, units) = venue_worlds(c, &venue, [caller, sponsor]);
+    let mut charges = Charges::default();
+
+    let validity = validity_around(c.now());
+    let swap = build_sponsored_swap_tx(
+        &sponsor_key,
+        &caller_key,
+        caller,
+        &venue.meta,
+        SWAP_INPUT,
+        0,
+        validity,
+    );
+    swap.try_declared(c.derivation().as_ref())
+        .expect("a swap declares its terms");
+    let fee = FeeTerms::of(&swap);
+    let (hold, total) = (
+        fee.hold_key(),
+        fee_hold_total_key(&ProtocolHasher, fee.vault),
+    );
+    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
+    let funded = held(c, sponsor.address(), *PROTOCOL_RESOURCE);
+    let held_back = [
+        c.drop_type("crossing.readings"),
+        c.drop_type("state_proof.request"),
+    ];
+    let hash = charges.submit(c, swap);
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(VENUE_SHARD, hash).0.is_some()),
+        "the venue must include the swap",
+    );
+    assert!(
+        c.run_until(budget, |c| clock(c)
+            >= deadline.minus(Duration::from_secs(1))
+            || !stands_at(c, hold)),
+        "the run must reach the deadline",
+    );
+    assert!(
+        stands_at(c, hold) && stands_at(c, total),
+        "the waiting member keeps its sponsor's hold up to its deadline",
+    );
+    assert!(
+        c.chain_fate(VENUE_SHARD, hash).1.is_none(),
+        "nothing ends the member before its deadline",
+    );
+
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(VENUE_SHARD, hash).1.is_some()),
+        "the member must be ended past its deadline",
+    );
+    let fate = c.chain_fate(VENUE_SHARD, hash).1;
+    assert!(
+        matches!(fate, Some((_, TransactionDecision::Aborted))),
+        "the waiting member is aborted; fate = {fate:?}",
+    );
+    assert!(
+        !stands_at(c, hold) && !stands_at(c, total),
+        "the abort releases the hold and the total with it",
+    );
+    let abort_charge = funded - held(c, sponsor.address(), *PROTOCOL_RESOURCE);
+    assert!(
+        abort_charge > 0 && abort_charge <= fee.max_fee,
+        "the abort charges the sponsor within its ceiling: {abort_charge}",
+    );
+    assert!(
+        held_back.iter().all(|cut| cut.fired() > 0),
+        "the readings must actually have been cut",
+    );
+    c.clear_drops();
+
+    let world = "a held core's sponsored hold";
+    protocol_resource.assert_settles_within(c, &charges, budget, world);
+    units.assert_settles_within(c, &Charges::default(), budget, world);
 }

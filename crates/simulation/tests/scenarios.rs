@@ -33,6 +33,7 @@ use hyperscale_scenarios::{
     a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
     a_fee_hold_stands_until_its_burn, a_healed_network_delivers_past_the_old_window,
+    a_held_core_keeps_its_sponsors_hold_until_it_aborts,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_inside_its_window,
@@ -746,6 +747,12 @@ fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
         0,
         "an escrowed crossing's answers and removals arrive by push",
     );
+}
+
+#[test]
+fn a_held_core_keeps_its_sponsors_hold_until_it_aborts_sim() {
+    let mut cluster = venue_cluster(42);
+    cluster.run_faultable(|c| a_held_core_keeps_its_sponsors_hold_until_it_aborts(c, epochs(40)));
 }
 
 #[test]

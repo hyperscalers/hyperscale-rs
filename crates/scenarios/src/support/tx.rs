@@ -2091,6 +2091,36 @@ pub fn build_swap_tx(
     })
 }
 
+/// [`build_swap_tx`] of the protocol resource, with its fee paid by
+/// `sponsor`, which attests the root first: the fee reserves and burns
+/// against the sponsor's vault, on whichever shard holds it.
+///
+/// # Panics
+///
+/// As [`build_swap_tx`].
+#[must_use]
+pub fn build_sponsored_swap_tx(
+    sponsor: &Ed25519PrivateKey,
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venue: &InstanceMeta,
+    amount: u128,
+    min_out: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    build_venues_tx(
+        payer,
+        Some(sponsor),
+        std::slice::from_ref(venue),
+        validity,
+        &|pools, b| {
+            let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
+            let bought = pools[0].swap(b, funds, min_out)?;
+            account::deposit(b, from, bought)
+        },
+    )
+}
+
 /// A two-hop route: withdraw one side, price it at the first venue,
 /// price what comes back at the second, and bank the result.
 ///
@@ -2118,7 +2148,7 @@ pub(crate) fn build_route_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let metas = [venues.0.clone(), venues.1.clone()];
-    build_venues_tx(payer, &metas, validity, &|pools, b| {
+    build_venues_tx(payer, None, &metas, validity, &|pools, b| {
         let funds = account::withdraw(b, from, paying, amount)?;
         let mid = pools[0].swap(b, funds, 0)?;
         let out = pools[1].swap(b, mid, second_min_out)?;
@@ -2134,9 +2164,13 @@ fn build_venue_tx(
     validity: TimestampRange,
     leg: &dyn Fn(&amm::Amm, &mut TypedBuilder<'_>) -> Result<(), TypedError>,
 ) -> Transaction {
-    build_venues_tx(payer, std::slice::from_ref(venue), validity, &|pools, b| {
-        leg(&pools[0], b)
-    })
+    build_venues_tx(
+        payer,
+        None,
+        std::slice::from_ref(venue),
+        validity,
+        &|pools, b| leg(&pools[0], b),
+    )
 }
 
 /// What a route does with the venues an envelope composed: one closure
@@ -2156,6 +2190,7 @@ type VenueRoute<'a> = dyn Fn(&[amm::Amm], &mut TypedBuilder<'_>) -> Result<(), T
 /// If the scenario world does not answer the call.
 fn build_venues_tx(
     payer: &Ed25519PrivateKey,
+    sponsor: Option<&Ed25519PrivateKey>,
     venues: &[InstanceMeta],
     validity: TimestampRange,
     route: &VenueRoute<'_>,
@@ -2174,11 +2209,16 @@ fn build_venues_tx(
         scenario_header(validity),
     );
     route(&pools, &mut root).expect("every venue call types against its signature");
-    let tree = root.build().expect("the intent declares no hole");
+    let mut tree = root.build().expect("the intent declares no hole");
+    // A sponsor attests the root first, which makes it the fee payer.
+    let signers: Vec<&Ed25519PrivateKey> = sponsor.into_iter().chain([payer]).collect();
+    tree.root.attested_by =
+        Capped::new(signers.iter().map(|signer| principal_of(*signer)).collect())
+            .expect("two attesters at most");
 
     Transaction::new(client.sign_tree(
         &tree,
-        &[payer],
+        &signers,
         Terms {
             max_fee: MAX_FEE,
             ceilings: Ceilings::Guessed,

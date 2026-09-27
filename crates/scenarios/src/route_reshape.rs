@@ -19,12 +19,13 @@ use std::time::Duration;
 use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
     TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
     WeightedTimestamp,
 };
-use hyperscale_vm_effects::Kind;
+use hyperscale_vm_effects::{Kind, ProtocolHasher, fee_hold_total_key};
 
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
@@ -42,7 +43,7 @@ use crate::support::query::{
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
     STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, ballast_to, build_param_vote_tx,
-    build_route_tx, build_swap_tx, build_transfer_tx, departing_target,
+    build_route_tx, build_sponsored_swap_tx, build_swap_tx, build_transfer_tx, departing_target,
     merge_survivor_ballast_accounts, merge_train_setup, pool_operator, split_ballast_accounts_for,
     split_train_setup, validity_around, voted_split_bytes,
 };
@@ -52,8 +53,8 @@ use crate::support::wait::{
 };
 use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
 use crate::venue::{
-    PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell,
-    stand_up_venue, swappers_on, venue_genesis_accounts_on,
+    PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, caller_on_the_venues_shard,
+    grind_onto, reserve_cell, stand_up_venue, swappers_on, venue_genesis_accounts_on,
 };
 
 /// The most transfers the train carries into the splitter, and what the
@@ -284,6 +285,9 @@ pub fn departing_caller_ballast() -> Vec<(PrincipalAddr, u128)> {
 struct DepartingCallers {
     venue: StockedVenue,
     swappers: Vec<(Ed25519PrivateKey, PrincipalAddr)>,
+    /// A funded account on the venue's own shard, which pays a
+    /// sponsored swap's fee.
+    sponsor: (Ed25519PrivateKey, PrincipalAddr),
     reserve: SubstateKey,
     stocked: u128,
     protocol_resource: World,
@@ -403,6 +407,7 @@ fn stock_callers_against<C: Cluster>(
     let mut taken = Vec::new();
     let venue = stand_up_venue(c, venue_shard, &mut taken);
     let swappers = swappers_on(&[caller_shard], &mut taken);
+    let sponsor = caller_on_the_venues_shard(venue_shard, &[caller_shard]);
     let reserve = reserve_cell(&venue.meta, *PROTOCOL_RESOURCE);
     let stocked = held_at(c, reserve);
     assert!(
@@ -411,6 +416,7 @@ fn stock_callers_against<C: Cluster>(
     );
     let holders: Vec<_> = swappers
         .iter()
+        .chain([&sponsor])
         .map(|(_, account)| account.address())
         .collect();
     let protocol_resource = World::open(c, *PROTOCOL_RESOURCE, holders.iter().copied(), [reserve]);
@@ -423,6 +429,7 @@ fn stock_callers_against<C: Cluster>(
     DepartingCallers {
         venue,
         swappers,
+        sponsor,
         reserve,
         stocked,
         protocol_resource,
@@ -456,6 +463,7 @@ fn swaps_across_the_callers_cut<C: Cluster>(
     let DepartingCallers {
         venue,
         swappers,
+        sponsor: _,
         reserve,
         stocked,
         protocol_resource,
@@ -813,13 +821,18 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
 /// survivor reads the venue's settled set without the swap, names it in
 /// an abandonment record, and the escrowed input comes back to the
 /// caller exactly once; both worlds are conserved with nothing locked.
+/// A second swap's fee is paid by a sponsor on the venue's shard, so its
+/// hold stands under the venue's member: the terminal burns the charge
+/// beside the fate and releases the hold, and none reaches a child.
 ///
 /// # Panics
 ///
 /// Panics as [`departing_callers`] does, and if the venue does not
-/// include the swap before its terminal, if the terminal does not fate
-/// it, if a child holds its row, if the readings were never cut, if the
-/// input does not come home once, or if either world is not conserved.
+/// include both swaps before its terminal, if the sponsor's hold does
+/// not stand while the venue holds its swap, if the terminal does not
+/// fate both, if a child holds a row or the hold, if the readings were
+/// never cut, if an input does not come home once or the sponsor is not
+/// charged once, or if either world is not conserved.
 pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
@@ -828,17 +841,7 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
     let (set, cut) = callers_against_a_scheduled_cut(c, venue_shard, caller_shard, budget);
     let mut charges = Charges::default();
     let (key, caller) = &set.swappers[0];
-    // A window closing past the cut, so no deadline ends the member
-    // before the terminal does; submitted as it opens, while the venue
-    // still includes.
-    let window = TimestampRange::new(
-        cut.minus(FATED_OPENS_BEFORE_THE_CUT),
-        cut.plus(FATED_CLOSES_AFTER_THE_CUT),
-    );
-    assert!(
-        c.run_until(budget, |c| clock(c) >= window.start_timestamp_inclusive),
-        "the swap's window must open before the cut",
-    );
+    let window = await_fated_window(c, cut, budget);
 
     let held_back = [
         c.drop_type("crossing.readings"),
@@ -857,19 +860,25 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
     );
     let price = declared_price(c, &swap);
     let hash = charges.submit(c, swap);
+    let sponsored = Sponsored::submit(c, &set, 1, &mut charges, window);
     assert!(
-        c.run_until(budget, |c| c.chain_fate(venue_shard, hash).0.is_some()),
-        "the venue must include the swap before its terminal",
+        c.run_until(budget, |c| [hash, sponsored.hash]
+            .iter()
+            .all(|hash| c.chain_fate(venue_shard, *hash).0.is_some())),
+        "the venue must include both swaps before its terminal",
     );
+    sponsored.assert_held(c);
     await_cut(c, venue_shard);
 
     let (left, right) = venue_shard.children();
     let terminal = anchored_genesis_height(c, left).and_then(BlockHeight::prev);
-    assert_eq!(
-        Some(assert_fated_off(c, venue_shard, hash, &[left, right])),
-        terminal,
-        "the venue's terminal must fate the swap it held",
-    );
+    for hash in [hash, sponsored.hash] {
+        assert_eq!(
+            Some(assert_fated_off(c, venue_shard, hash, &[left, right])),
+            terminal,
+            "the venue's terminal must fate each swap it held",
+        );
+    }
     assert!(
         held_back.iter().any(|handle| handle.fired() > 0),
         "the readings must actually have been cut, or the venue ran the swap",
@@ -901,6 +910,7 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
         home,
         "the input comes home once",
     );
+    sponsored.assert_released_at_the_terminal(c, set.sponsor.1);
 }
 
 /// A crossing whose consumer is fated at its terminal, when producer and
@@ -914,17 +924,22 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
 /// it. The two chains end together, so neither ever holds the other's
 /// attested settled set: no abandonment record names the swap, the
 /// merged parent holds the record escrowed, and nothing credits it or
-/// takes it back. The resource is conserved with the record counted
-/// locked, which is the one record of the strand class a consumer fated
-/// at its terminal whose producer names no departure.
+/// takes it back. The resource is conserved with the records counted
+/// locked, the strand class a consumer fated at its terminal whose
+/// producer names no departure. The second swap's fee is paid by a
+/// sponsor on the venue's shard: its hold stands under the venue's
+/// member until the terminal burns the charge, and none reaches the
+/// merged parent.
 ///
 /// # Panics
 ///
 /// Panics if a quarter is unserved, if the venue misses its budget
 /// standing up, if the merge is never scheduled or the venue does not
-/// include the swap before it, if the swap is not fated, if any record
-/// names it, if the input is credited to either side, or if the resource
-/// is not conserved with exactly that record locked.
+/// include both swaps before it, if the sponsor's hold does not stand
+/// meanwhile, if either swap is not fated, if any record names one, if
+/// an input is credited to either side, if the sponsor is not charged
+/// once or its hold reaches the parent, or if the resource is not
+/// conserved with exactly those records locked.
 pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
@@ -936,21 +951,8 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
         "the grown four-shard topology must seat every quarter",
     );
     let mut set = stock_callers_against(c, venue_shard, caller_shard);
-    assert!(
-        c.run_until(budget, |c| scheduled_terminal_epoch(c, parent).is_some()),
-        "the beacon must schedule the pair's merge",
-    );
-    let terminal = scheduled_terminal_epoch(c, parent).expect("scheduled above");
-    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
-    let cut = EpochWindows::new(epoch_ms).window_of(terminal).end;
-    let window = TimestampRange::new(
-        cut.minus(FATED_OPENS_BEFORE_THE_CUT),
-        cut.plus(FATED_CLOSES_AFTER_THE_CUT),
-    );
-    assert!(
-        c.run_until(budget, |c| clock(c) >= window.start_timestamp_inclusive),
-        "the swap's window must open before the cut",
-    );
+    let cut = scheduled_cut(c, parent, budget);
+    let window = await_fated_window(c, cut, budget);
 
     let mut charges = Charges::default();
     let (key, caller) = &set.swappers[0];
@@ -971,20 +973,26 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
     );
     let price = declared_price(c, &swap);
     let hash = charges.submit(c, swap);
+    let sponsored = Sponsored::submit(c, &set, 1, &mut charges, window);
     set.protocol_resource.owing(charges.records(c));
     assert!(
-        c.run_until(budget, |c| c.chain_fate(venue_shard, hash).0.is_some()),
-        "the venue must include the swap before its terminal",
+        c.run_until(budget, |c| [hash, sponsored.hash]
+            .iter()
+            .all(|hash| c.chain_fate(venue_shard, *hash).0.is_some())),
+        "the venue must include both swaps before its terminal",
     );
+    sponsored.assert_held(c);
     assert!(
-        await_serves(c, parent, budget),
-        "the merged parent must serve within budget",
+        await_serves(c, parent, budget) && await_anchor_seeded(c, parent, budget),
+        "the merged parent must serve on its seeded anchor within budget",
     );
-    let fate = c.chain_fate(venue_shard, hash).1;
-    assert!(
-        matches!(fate, Some((_, TransactionDecision::Aborted))),
-        "the venue's terminal must fate the swap it held; fate = {fate:?}",
-    );
+    for hash in [hash, sponsored.hash] {
+        let fate = c.chain_fate(venue_shard, hash).1;
+        assert!(
+            matches!(fate, Some((_, TransactionDecision::Aborted))),
+            "the venue's terminal must fate each swap it held; fate = {fate:?}",
+        );
+    }
     assert!(
         held_back.iter().any(|handle| handle.fired() > 0),
         "the readings must actually have been cut, or the venue ran the swap",
@@ -1021,8 +1029,8 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
             .iter()
             .map(|lock| (lock.kind, lock.amount))
             .collect::<Vec<_>>(),
-        vec![(Kind::Escrowed, SWAP_INPUT)],
-        "the one escrowed record stands locked: {locked:?}",
+        vec![(Kind::Escrowed, SWAP_INPUT); 2],
+        "each swap's escrowed record stands locked: {locked:?}",
     );
     set.units.assert_settles_within(
         c,
@@ -1030,6 +1038,7 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
         budget,
         "a crossing its merged consumer never took",
     );
+    sponsored.assert_released_at_the_terminal(c, set.sponsor.1);
 }
 
 /// Crossings whose two ends a merge brings together finish on the
@@ -1191,6 +1200,112 @@ fn assert_fated_off<C: Cluster>(
     at
 }
 
+/// When `shard`'s scheduled reshape cuts it: the end of its terminal
+/// epoch's window.
+///
+/// # Panics
+///
+/// Panics if the beacon schedules no reshape of `shard` within `budget`.
+fn scheduled_cut<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> WeightedTimestamp {
+    assert!(
+        c.run_until(budget, |c| scheduled_terminal_epoch(c, shard).is_some()),
+        "the beacon must schedule {shard:?}'s reshape",
+    );
+    let terminal = scheduled_terminal_epoch(c, shard).expect("scheduled above");
+    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
+    EpochWindows::new(epoch_ms).window_of(terminal).end
+}
+
+/// A window closing past `cut`, so no deadline ends a member before the
+/// terminal does, waited for until it opens, while the venue still
+/// includes.
+///
+/// # Panics
+///
+/// Panics if the window does not open within `budget`.
+fn await_fated_window<C: Cluster>(
+    c: &mut C,
+    cut: WeightedTimestamp,
+    budget: Budget,
+) -> TimestampRange {
+    let window = TimestampRange::new(
+        cut.minus(FATED_OPENS_BEFORE_THE_CUT),
+        cut.plus(FATED_CLOSES_AFTER_THE_CUT),
+    );
+    assert!(
+        c.run_until(budget, |c| clock(c) >= window.start_timestamp_inclusive),
+        "the swap's window must open before the cut",
+    );
+    window
+}
+
+/// A swap a sponsor on the venue's own shard pays for, so its fee hold
+/// stands under the venue's member of it.
+struct Sponsored {
+    hash: TxHash,
+    hold: SubstateKey,
+    total: SubstateKey,
+    funded: u128,
+    price: u128,
+}
+
+impl Sponsored {
+    /// Submit a swap by `set`'s caller `index` in `window`, its fee paid
+    /// by `set`'s sponsor.
+    fn submit<C: Cluster>(
+        c: &mut C,
+        set: &DepartingCallers,
+        index: usize,
+        charges: &mut Charges,
+        window: TimestampRange,
+    ) -> Self {
+        let (key, caller) = &set.swappers[index];
+        let (sponsor_key, sponsor) = &set.sponsor;
+        let swap = build_sponsored_swap_tx(
+            sponsor_key,
+            key,
+            *caller,
+            &set.venue.meta,
+            SWAP_INPUT,
+            0,
+            window,
+        );
+        let price = declared_price(c, &swap);
+        let fee = FeeTerms::of(&swap);
+        let funded = held(c, sponsor.address(), *PROTOCOL_RESOURCE);
+        let hash = charges.submit(c, swap);
+        Self {
+            hash,
+            hold: fee.hold_key(),
+            total: fee_hold_total_key(&ProtocolHasher, fee.vault),
+            funded,
+            price,
+        }
+    }
+
+    /// Assert the hold stands under the venue while it holds the swap.
+    fn assert_held<C: Cluster>(&self, c: &C) {
+        assert!(
+            stands_at(c, self.hold) && stands_at(c, self.total),
+            "the sponsor's hold and its total stand while the venue holds the swap",
+        );
+    }
+
+    /// Assert the terminal burned the sponsor's charge once and no hold or
+    /// total reached the successor.
+    fn assert_released_at_the_terminal<C: Cluster>(&self, c: &C, sponsor: PrincipalAddr) {
+        assert!(
+            !stands_at(c, self.hold) && !stands_at(c, self.total),
+            "no fee hold crosses the cut",
+        );
+        assert_eq!(
+            held(c, sponsor.address(), *PROTOCOL_RESOURCE),
+            self.funded - self.price,
+            "the terminal burns the sponsor's charge once",
+        );
+    }
+}
+
 /// How far before the venue's cut the fated swap's window opens, and how
 /// far past it the window closes: together one validity range less a
 /// margin, so the venue can include it before it coasts and its deadline
@@ -1234,14 +1349,7 @@ fn callers_against_a_scheduled_cut<C: Cluster>(
     budget: Budget,
 ) -> (DepartingCallers, WeightedTimestamp) {
     let set = departing_callers(c, venue_shard, caller_shard);
-    assert!(
-        c.run_until(budget, |c| scheduled_terminal_epoch(c, venue_shard)
-            .is_some()),
-        "the beacon must schedule the venue's cut",
-    );
-    let terminal = scheduled_terminal_epoch(c, venue_shard).expect("scheduled above");
-    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
-    let cut = EpochWindows::new(epoch_ms).window_of(terminal).end;
+    let cut = scheduled_cut(c, venue_shard, budget);
     assert!(
         clock(c) < cut.minus(OPENS_BEFORE_THE_CUT),
         "the cut must still be ahead when the swap's window opens; now {:?}, cut {cut:?}",
