@@ -1368,7 +1368,7 @@ impl SimulationRunner {
 
     fn schedule_event(&mut self, host: NodeIndex, time: Duration, event: HostEvent) -> EventKey {
         self.sequence += 1;
-        let key = EventKey::new(time, &event, host, self.sequence);
+        let key = EventKey::new(time, &event, host, self.sequence, self.seed);
         self.event_queue.insert(key, event);
         key
     }
