@@ -23,6 +23,7 @@
 //! sequencing.
 
 pub mod history;
+pub mod responder;
 pub mod snap_sync;
 pub mod state_range_serve;
 pub mod witness_history;
@@ -30,7 +31,8 @@ pub mod witness_history_serve;
 
 use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_storage::{
-    GenesisCommit, ImportProgress, MemberIndex, RecoveredState, ShardChainReader, WitnessSeed,
+    BoundaryStore, GenesisCommit, ImportProgress, MemberIndex, RecoveredState, ShardChainReader,
+    WitnessSeed,
 };
 use hyperscale_types::network::request::{
     GetBlockRequest, GetStateRangeRequest, GetWitnessHistoryRequest,
@@ -45,6 +47,7 @@ use hyperscale_types::{
 };
 
 use self::history::{HistoryBackfill, HistoryOutcome};
+pub use self::responder::{BootstrapResponse, StoreResponder};
 use self::snap_sync::SnapSync;
 pub use self::snap_sync::StateRangeOutcome;
 use self::witness_history::WitnessHistorySync;
@@ -464,6 +467,47 @@ impl ShardBootstrap {
         outcome
     }
 
+    /// Feed one served response and write what it verified into
+    /// `store`: a staged state chunk, or the history blocks its hash line
+    /// reached. Returns whether the sequencer accepted it; a rejected
+    /// response re-arms its work for the next [`Self::next_requests`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when staging a verified chunk failed.
+    pub fn absorb<S: BoundaryStore>(
+        &mut self,
+        response: &BootstrapResponse,
+        store: &S,
+    ) -> Result<bool, String> {
+        Ok(match response {
+            BootstrapResponse::StateRange(id, response) => {
+                match self.on_state_range(*id, response) {
+                    StateRangeOutcome::Staged { leaves, progress } => {
+                        store.stage_import_chunk(&progress, &leaves)?;
+                        true
+                    }
+                    StateRangeOutcome::Rejected(_) => false,
+                }
+            }
+            BootstrapResponse::WitnessHistory(response) => {
+                self.on_witness_history(response) == BootstrapOutcome::Accepted
+            }
+            BootstrapResponse::History(height, response) => {
+                match self.on_history_block(*height, response) {
+                    HistoryOutcome::Verified(blocks) => {
+                        for certified in &blocks {
+                            store.import_historical_block(certified);
+                        }
+                        true
+                    }
+                    HistoryOutcome::Accepted => true,
+                    HistoryOutcome::Rejected(_) => false,
+                }
+            }
+        })
+    }
+
     /// Re-arm the witness fetch after a transport-level failure.
     pub fn on_witness_history_failure(&mut self) {
         if let Phase::Witness(witness) = &mut self.phase {
@@ -533,8 +577,8 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_provisions::ProvisionStore;
-    use hyperscale_storage::test_helpers::{pin_snap_sync_replica, stake_deposit};
-    use hyperscale_storage::{BoundaryStore, ImportCursor, PendingChain, SubstateStore};
+    use hyperscale_storage::test_helpers::{commit_one, pin_snap_sync_replica, stake_deposit};
+    use hyperscale_storage::{BOUNDARY_RETAIN, ImportCursor, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{ChainOrigin, Epoch, LEAF_KEY_BYTES, ReadMark, ShardWitnessPayload};
@@ -685,6 +729,76 @@ mod tests {
                 .get_beacon_witness_payload_range(0, leaves.len() as u64),
             leaves,
         );
+    }
+
+    /// A replica that committed past its pinned anchor answers a rebuild
+    /// of itself on its own: the staging store imports the anchor's state
+    /// and nothing the replica committed above it.
+    #[test]
+    fn a_store_committed_past_its_anchor_rebuilds_to_the_anchor() {
+        let leaves = witness_leaves();
+        let (old, anchor) = replica(&leaves);
+        for seed in 0x40..0x44 {
+            commit_one(&*old, seed);
+        }
+        assert!(old.committed_height() > anchor.height);
+        assert_ne!(old.state_root(), anchor.state_root);
+
+        let responder = StoreResponder::new(Arc::clone(&old));
+        let staging = SimShardStorage::default();
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        for _ in 0..1_000 {
+            if bootstrap.is_complete() {
+                break;
+            }
+            if let Some((height, witnesses)) = bootstrap.take_finalize() {
+                let root = staging.finalize_boundary_import(height, witnesses).unwrap();
+                bootstrap.on_imported(root).unwrap();
+                continue;
+            }
+            for request in bootstrap.next_requests() {
+                // The walk's window asks below the block that ends it.
+                if bootstrap.is_complete() {
+                    break;
+                }
+                let response = responder
+                    .answer(&request)
+                    .expect("a store pinning its anchor answers every request");
+                assert!(bootstrap.absorb(&response, &staging).unwrap());
+            }
+        }
+        assert!(bootstrap.is_complete());
+
+        let recovered = bootstrap
+            .into_recovered_state(ReadFrontier::default(), MemberIndex::empty(ShardId::ROOT));
+        assert_eq!(recovered.committed_height, anchor.height);
+        assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
+        assert_eq!(recovered.jmt_root, Some(anchor.state_root));
+        assert_eq!(staging.state_root(), anchor.state_root);
+    }
+
+    /// A store whose ring evicted the anchor declines the state ranges,
+    /// leaving them to peers, rather than answering something
+    /// unverifiable.
+    #[test]
+    fn a_store_that_evicted_its_anchor_declines_its_state() {
+        let (old, anchor) = replica(&[]);
+        for seed in 0x40..0x40 + u8::try_from(BOUNDARY_RETAIN).unwrap() {
+            commit_one(&*old, seed);
+            old.pin_boundary(old.committed_height()).unwrap();
+        }
+        assert!(old.open_boundary(anchor.height).is_none());
+
+        let request = BootstrapRequest::StateRange(
+            0,
+            GetStateRangeRequest {
+                height: anchor.height,
+                start: [0u8; LEAF_KEY_BYTES],
+                end: [0xFF; LEAF_KEY_BYTES],
+                limit: STATE_CHUNK_LIMIT,
+            },
+        );
+        assert!(StoreResponder::new(old).answer(&request).is_none());
     }
 
     /// The full sequencing: state fan-out, import + root check against
