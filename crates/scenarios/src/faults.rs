@@ -3,9 +3,10 @@
 use std::fmt::Write;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, PrincipalAddr, ShardId,
-    StateRoot, TransactionDecision, TransactionStatus, TxHash,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
 };
 
 use crate::reshape::split_lifecycle;
@@ -149,13 +150,11 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
 /// from the pool.
 ///
 /// After the root grows, two members of the left child's four-member
-/// committee go silent at the consensus layer only: their outbound
-/// proposals, votes, and timeouts are dropped, and vote delivery to them
-/// is cut (a silent member aggregates no QCs of its own), while every
-/// other channel — beacon participation, pool ratification, block
-/// serving — stays connected. The honest remainder is short of the 2f+1
-/// quorum, so the shard freezes while its sibling and the beacon keep
-/// committing. Once
+/// committee go silent at the consensus layer only: they stop signing
+/// proposals, votes, and timeouts, while every other duty — beacon
+/// participation, pool ratification, block serving — carries on. The
+/// honest remainder is short of the 2f+1 quorum, so the shard freezes
+/// while its sibling and the beacon keep committing. Once
 /// the boundary watermark stalls past the halt threshold the beacon flags
 /// the shard, seats a fresh committee from the pool spares, and retains
 /// the replaced members in the routing view; the incomers sync the halted
@@ -172,9 +171,8 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
 /// agree the assertion is out of play there, and that agreement is what
 /// this scenario exercises.
 ///
-/// Requires [`halt_straddler_setup`] at genesis, a dedicated
-/// host per validator, and two committees' worth of pool surplus — one
-/// grow cohort, one recovery committee.
+/// Requires [`halt_straddler_setup`] at genesis and two committees'
+/// worth of pool surplus — one grow cohort, one recovery committee.
 ///
 /// [`halt_straddler_setup`]: crate::tx::halt_straddler_setup
 ///
@@ -213,8 +211,8 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 /// shard's `Taken`s on reading their records absent at the survivor.
 /// Reports the fenced claims and claims weight the run carried.
 ///
-/// Requires [`halt_straddler_setup`] at genesis, a dedicated host per
-/// validator, and two committees' worth of pool surplus.
+/// Requires [`halt_straddler_setup`] at genesis and two committees' worth
+/// of pool surplus.
 ///
 /// [`halt_straddler_setup`]: crate::tx::halt_straddler_setup
 ///
@@ -598,55 +596,46 @@ struct StagedHalt {
     sibling_at_halt: u64,
 }
 
-/// Freeze `shard` with a staged consensus cut against two of its four
-/// committee members.
+/// Freeze `shard` by having two of its four committee members withhold
+/// their consensus.
 ///
-/// f+1 of the committee withhold: their outbound consensus messages stop
-/// reaching everyone else. The honest remainder is 2f, short of quorum,
-/// so the shard halts; nothing else is cut. Vote delivery TO the
-/// withholding pair is cut too — a silent member collects no votes —
-/// else the pair keeps aggregating QCs only it holds and privately
-/// commits a suffix the recovery must orphan, and the faulted hosts
-/// (honest code under a network fault) would panic on the commit-linkage
-/// break instead of modeling adversaries that simply stop.
+/// f+1 of the committee withhold, as validators: they stop signing their
+/// shard consensus on whichever hosts run them, while every other vnode on
+/// those hosts, and their own beacon, execution and serving, carry on. The
+/// honest remainder is 2f, short of quorum, so the shard halts; nothing else
+/// stops.
 ///
-/// The cut is staged. Cutting everything at one instant leaves the same
-/// private-commit race in the in-flight window: a pair member due to
-/// aggregate the next rounds' votes can hold a QC no one else ever sees
-/// and commit one height past the beacon-attested frontier — a suffix the
-/// recovery orphans, and the linkage break kills the host. So first
-/// starve aggregation (votes toward the pair), then drain an epoch — any
-/// QC a pair member already holds is broadcast and becomes common
-/// knowledge in this window, while consensus keeps committing through the
-/// pair's timed-out leader rounds — and only then silence the pair's
-/// outbound channels.
+/// The withholding is staged. A pair member due to aggregate the next
+/// rounds' votes can hold a QC no one else ever sees and commit one height
+/// past the beacon-attested frontier — a suffix the recovery orphans, and
+/// the linkage break kills its host. So the pair first withholds its votes,
+/// which stops every quorum from forming while a QC a pair member already
+/// holds still leaves in its next proposal and becomes common knowledge;
+/// an epoch later it withholds its proposals and timeouts too.
 ///
-/// `at_freeze_edge` runs between the drain and the silencing — the last
-/// instant new work enters the shard's pipeline with any chance to
-/// commit.
+/// `at_freeze_edge` runs just before the votes stop — the last instant new
+/// work enters the shard's pipeline with any chance to commit.
 fn freeze_shard<C: FaultableCluster>(
     c: &mut C,
     shard: ShardId,
     sibling: ShardId,
     at_freeze_edge: impl FnOnce(&mut C),
 ) -> StagedHalt {
-    let committee = c.committee_hosts(shard);
+    let members: Vec<ValidatorId> = c
+        .beacon_state()
+        .and_then(|state| state.shard_consensus_members.get(&shard).cloned())
+        .expect("the halting shard has a consensus committee");
     assert_eq!(
-        committee.len(),
+        members.len(),
         4,
         "the halting shard must be served by a four-member committee",
     );
-    let withholding = &committee[..2];
-    let others: Vec<usize> = (0..c.host_count())
-        .filter(|host| !withholding.contains(host))
-        .collect();
+    let withholding = &members[..2];
 
-    c.drop_type_between(&others, withholding, "block.vote");
-    c.run_until(epochs(1), |_| false);
     at_freeze_edge(c);
-    let votes_withheld = c.drop_type_between(withholding, &others, "block.vote");
-    c.drop_type_between(withholding, &others, "block.header");
-    c.drop_type_between(withholding, &others, "shard.timeout");
+    let votes_withheld = c.withhold(withholding, Withheld::Votes);
+    c.run_until(epochs(1), |_| false);
+    c.withhold(withholding, Withheld::Consensus);
 
     // In-flight rounds drain, then the shard freezes.
     c.run_until(epochs(1), |_| false);
@@ -671,7 +660,7 @@ fn freeze_shard<C: FaultableCluster>(
     );
     assert!(
         votes_withheld.fired() >= 1,
-        "the withheld votes must actually be dropped",
+        "the withheld votes must actually be refused",
     );
     StagedHalt {
         shard,
@@ -689,8 +678,8 @@ fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
     let shard = halt.shard;
 
     // The boundary watermark stalls past the threshold; the beacon flags
-    // the shard and re-draws its committee from the pool spares. The cut is
-    // permanent, so detection is guaranteed — the budget is a generous
+    // the shard and re-draws its committee from the pool spares. The
+    // withholding is permanent, so detection is guaranteed — the budget is a generous
     // ceiling, not the expected latency: cross-shard traffic in flight at
     // the freeze lets the shard commit a few more blocks before it stalls,
     // and on a real-network harness the per-fold cadence varies, so the
@@ -728,11 +717,11 @@ fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
     // bridges the halt gap, and resumes committing past the frozen height.
     // The pool the recovery draws from holds exactly `shard_size` spares,
     // so the fresh committee is whatever the tenure shuffle rotated into
-    // the pool — here one of the withholding hosts, cycled off the halted
+    // the pool — possibly a withholding validator, cycled off the halted
     // shard before the flag and redrawn (the recovery is only as clean as
     // a fresh draw at the pool's corrupt fraction). The fresh committee
-    // keeps its honest majority and recovers, but a lone isolated member
-    // dropping a quarter of the views stretches the resume, so the budget
+    // keeps its honest majority and recovers, but a lone withholding
+    // member silencing a quarter of the views stretches the resume, so the budget
     // is generous — a ceiling on the wait, not the expected latency.
     assert!(
         await_height(c, shard, halt.frozen_at + 3, epochs(40)),

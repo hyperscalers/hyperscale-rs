@@ -33,6 +33,7 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
+use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
     BeaconChainConfig, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash, GenesisValidators,
     LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees, ShardId, Signer,
@@ -207,7 +208,13 @@ pub struct SimulationRunner {
 
     /// Signing keys for every registered validator, retained so a
     /// relocated vnode's state machine can be rebuilt on its new shard.
+    /// The same signers as [`Self::withholding`], shared with every vnode
+    /// a validator runs.
     signers: Vec<Arc<dyn Signer>>,
+
+    /// Every registered validator's signer, able to withhold its shard
+    /// consensus when a scenario asks it to.
+    withholding: Vec<Arc<WithholdingSigner>>,
 
     /// Scheme verifier every simulated coordinator runs, per
     /// [`SimConfig::crypto_scheme`]. Cloned into runtime-built
@@ -402,7 +409,7 @@ impl SimulationRunner {
         let registered_validators = committee_size + network_config.pool_surplus;
         let crypto_scheme = network_config.crypto_scheme;
         let verifier: Arc<dyn Verifier> = scheme_verifier(crypto_scheme);
-        let signers: Vec<Arc<dyn Signer>> = (0..registered_validators)
+        let withholding: Vec<Arc<WithholdingSigner>> = (0..registered_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed
@@ -410,8 +417,15 @@ impl SimulationRunner {
                     .wrapping_mul(0x517c_c1b7_2722_0a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
-                scheme_signer(crypto_scheme, &seed_bytes)
+                Arc::new(WithholdingSigner::new(scheme_signer(
+                    crypto_scheme,
+                    &seed_bytes,
+                )))
             })
+            .collect();
+        let signers: Vec<Arc<dyn Signer>> = withholding
+            .iter()
+            .map(|signer| Arc::clone(signer) as Arc<dyn Signer>)
             .collect();
         let public_keys: Vec<ConsensusPublicKey> =
             signers.iter().map(|key| key.public_key()).collect();
@@ -611,6 +625,7 @@ impl SimulationRunner {
             event_rxs,
             event_txs: host_event_txs,
             signers,
+            withholding,
             verifier,
             crypto_scheme,
             accounts: network_config.accounts.clone(),
@@ -905,6 +920,21 @@ impl SimulationRunner {
     #[must_use]
     pub fn verifier(&self) -> Arc<dyn Verifier> {
         Arc::clone(&self.verifier)
+    }
+
+    /// Make `validator` withhold `withheld` of its shard consensus from now
+    /// on, on every vnode it runs, and return its signer to count what it
+    /// refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `validator` is not registered.
+    pub fn withhold(&self, validator: ValidatorId, withheld: Withheld) -> Arc<WithholdingSigner> {
+        let signer = Arc::clone(
+            &self.withholding[usize::try_from(validator.inner()).expect("id fits usize")],
+        );
+        signer.withhold(withheld);
+        signer
     }
 
     /// Derive a fresh signer under the runner's configured scheme —

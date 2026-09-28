@@ -22,9 +22,10 @@ use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, submission_shards,
     vote_reshape_threshold,
 };
+use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeight, Derivation, LocalKey, NetworkDefinition,
-    PrincipalAddr, ReshapeThresholds, ShardId, StateRoot, SubstateKey, Transaction,
+    PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, Transaction,
     TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 use tokio::runtime::{Builder, Runtime};
@@ -58,6 +59,9 @@ pub struct ProdCluster {
     /// hosts hold their own; this one answers alike for anything the
     /// chain has not sealed since.
     derivation: Arc<dyn Derivation>,
+    /// Every validator's signer, by validator id, able to withhold its
+    /// shard consensus when a scenario asks it to.
+    withholding: Vec<Arc<WithholdingSigner>>,
 }
 
 impl ProdCluster {
@@ -101,7 +105,7 @@ impl ProdCluster {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let spec = Self::spec(args);
+        let (spec, withholding) = Self::spec(args);
         let epoch_ms = args.epoch_ms;
         // Claim the global recorder before the runner installs its Prometheus one
         // (`set_global_recorder` is first-wins), so `metric()` reads node counters.
@@ -117,6 +121,7 @@ impl ProdCluster {
             epoch_ms,
             started,
             derivation,
+            withholding,
         }
     }
 
@@ -153,15 +158,19 @@ impl ProdCluster {
     /// followers (the reshape cohort), chunked `vnodes_per_host` per host. At one
     /// vnode per host each validator lands on its own host, the layout the
     /// reshape flip needs (each seat its own store).
-    fn spec(args: &StartArgs<'_>) -> ClusterSpec {
+    fn spec(args: &StartArgs<'_>) -> (ClusterSpec, Vec<Arc<WithholdingSigner>>) {
         let config = args.config;
         let fixtures =
             TestFixtures::with_surplus(args.seed, config.shard_size, config.pool_surplus);
         let total = config.shard_size + config.pool_surplus;
+        let withholding: Vec<Arc<WithholdingSigner>> = (0..total)
+            .map(|i| Arc::new(WithholdingSigner::new(fixtures.signer(i))))
+            .collect();
         let validators: Vec<LocalValidator> = (0..total)
-            .map(|i| LocalValidator {
+            .zip(&withholding)
+            .map(|(i, signer)| LocalValidator {
                 validator_id: ValidatorId::new(u64::from(i)),
-                signer: fixtures.signer(i),
+                signer: Arc::clone(signer) as Arc<dyn Signer>,
             })
             .collect();
         let group = config.vnodes_per_host.max(1) as usize;
@@ -169,7 +178,7 @@ impl ProdCluster {
             .chunks(group)
             .map(|chunk| HostSpec::new(chunk.to_vec()))
             .collect();
-        ClusterSpec {
+        let spec = ClusterSpec {
             genesis: fixtures.genesis_validators(),
             hosts,
             beacon_chain_config: BeaconChainConfig {
@@ -196,7 +205,8 @@ impl ProdCluster {
                 packages: GenesisPackages::protocol(),
             }),
             simulated_outbound_latency: config.latency,
-        }
+        };
+        (spec, withholding)
     }
 
     /// A host serving any shard `tx` touches, for submission routing.
@@ -423,6 +433,20 @@ impl FaultableCluster for ProdCluster {
 
     fn clear_drops(&mut self) {
         self.inner.fault_clear_all();
+    }
+
+    fn withhold(&mut self, validators: &[ValidatorId], withheld: Withheld) -> FaultHandle {
+        let signers: Vec<Arc<WithholdingSigner>> = validators
+            .iter()
+            .map(|validator| {
+                let signer = Arc::clone(
+                    &self.withholding[usize::try_from(validator.inner()).expect("id fits usize")],
+                );
+                signer.withhold(withheld);
+                signer
+            })
+            .collect();
+        FaultHandle::new(move || signers.iter().map(|signer| signer.refused()).sum())
     }
 
     fn drop_type_between(

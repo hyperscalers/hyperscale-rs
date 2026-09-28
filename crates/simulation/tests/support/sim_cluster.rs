@@ -30,6 +30,7 @@ use hyperscale_scenarios::{
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
 use hyperscale_storage::{MemberIndex, ShardChainReader, SubstateStore};
+use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock,
     ConsensusReceipt, Derivation, Event, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId,
@@ -882,6 +883,14 @@ impl FaultableCluster for SimCluster {
             }
         }
         FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+    }
+
+    fn withhold(&mut self, validators: &[ValidatorId], withheld: Withheld) -> FaultHandle {
+        let signers: Vec<_> = validators
+            .iter()
+            .map(|&validator| self.runner.withhold(validator, withheld))
+            .collect();
+        FaultHandle::new(move || signers.iter().map(|signer| signer.refused()).sum())
     }
 
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
