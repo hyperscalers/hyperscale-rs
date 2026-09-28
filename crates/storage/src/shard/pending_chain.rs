@@ -378,23 +378,34 @@ where
     ///
     /// [`Block::Live`]: hyperscale_types::Block::Live
     pub fn block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
-        // Committed entry first; then a certified-but-uncommitted one —
-        // the fetcher adopts the QC without committing on it, so the
-        // certified tip is servable before its committing child exists.
-        let pending = self
-            .pending_certified_at(height)
-            .or_else(|| self.pending_certified_uncommitted_at(height));
-        if let Some(certified) = pending {
-            let block = certified.block().clone();
-            let qc = certified.qc().clone();
-            let provision_hashes = block.provision_hashes();
-            return Some(BlockForSync {
-                block,
-                qc,
-                provision_hashes: provision_hashes.into_inner(),
-            });
+        // Committed first; then a certified-but-uncommitted entry — the
+        // fetcher adopts the QC without committing on it, so the certified
+        // tip is servable before its committing child exists.
+        self.committed_block_for_sync(height).or_else(|| {
+            self.pending_certified_uncommitted_at(height)
+                .map(|certified| Self::for_sync(&certified))
+        })
+    }
+
+    /// [`Self::block_for_sync`] for a committed block only. A certified
+    /// tip can still lose its height to a sibling, so a fetcher that
+    /// cannot set aside a block it has taken asks for this one.
+    pub fn committed_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
+        self.pending_certified_at(height).map_or_else(
+            || self.base.get_block_for_sync(height),
+            |certified| Some(Self::for_sync(&certified)),
+        )
+    }
+
+    fn for_sync(certified: &Verified<CertifiedBlock>) -> BlockForSync {
+        let block = certified.block().clone();
+        let qc = certified.qc().clone();
+        let provision_hashes = block.provision_hashes();
+        BlockForSync {
+            block,
+            qc,
+            provision_hashes: provision_hashes.into_inner(),
         }
-        self.base.get_block_for_sync(height)
     }
 
     /// The stored metadata row for the block at `height`, spanning

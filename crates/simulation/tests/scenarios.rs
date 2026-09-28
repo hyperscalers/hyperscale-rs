@@ -1338,7 +1338,9 @@ seeded!(
 #[allow(clippy::too_many_lines)] // one scripted fault scenario end to end
 fn shard_fork_drives_committee_recovery_sim() {
     let setup = halt_straddler_setup();
-    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 11, &setup.accounts);
+    // A seed whose recovery draw seats a fresh member on a host that kept
+    // the forked shard, the rebuild this checks.
+    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 1, &setup.accounts);
     // A fork recovery supersedes whatever the old committee committed past
     // the attested boundary: the fresh committee rebuilds from the anchor,
     // so the retained replicas' suffix and the fresh chain conflict.

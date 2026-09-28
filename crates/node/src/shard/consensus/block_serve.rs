@@ -31,6 +31,10 @@ use tracing::{trace, warn};
 /// bodies still has everything the walk asks for, and refusing it would
 /// wedge a joiner against a height no peer can ever answer.
 ///
+/// A `BlockIntent::Follow` request is answered by a committed block only,
+/// never a certified tip that could still lose its height to a sibling,
+/// and is otherwise served as `Execute`.
+///
 /// For `BlockIntent::Execute`, whether the requester needs `Block::Live` is
 /// a function of the block's own age against the dedup horizon: until
 /// `block_ts + RETENTION_HORIZON` passes, every honest validator still keeps
@@ -66,11 +70,16 @@ pub fn serve_block_request<S: ShardStorage>(
         intent = ?req.intent,
         "Handling block sync request"
     );
+    let found = if req.intent.admits_uncommitted() {
+        pending_chain.block_for_sync(req.height)
+    } else {
+        pending_chain.committed_block_for_sync(req.height)
+    };
     let Some(BlockForSync {
         block,
         qc,
         provision_hashes,
-    }) = pending_chain.block_for_sync(req.height)
+    }) = found
     else {
         return GetBlockResponse::not_found();
     };
@@ -281,6 +290,49 @@ mod tests {
             "a history answer carries no provision bodies",
         );
         assert_eq!(certified.height(), BlockHeight::new(1));
+    }
+
+    /// A certified tip that has not committed answers a sync, which can
+    /// set it aside if a sibling wins the height, but never a follow,
+    /// which applies what it takes and cannot.
+    #[test]
+    fn a_follow_request_is_answered_by_a_committed_block_only() {
+        let storage = Arc::new(SimShardStorage::default());
+        let chain = PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT);
+        let block = make_test_block(BlockHeight::new(1));
+        chain.insert(
+            block.hash(),
+            ChainEntry {
+                parent_block_hash: block.header().parent_block_hash(),
+                height: BlockHeight::new(1),
+                settled_txs: Vec::new(),
+                jmt_snapshot: Arc::new(JmtSnapshot::from_collected_writes(
+                    CollectedWrites::default(),
+                    SettledWrites::default(),
+                    StateRoot::ZERO,
+                    BlockHeight::GENESIS,
+                    StateRoot::ZERO,
+                    BlockHeight::GENESIS,
+                )),
+                certified_block: None,
+                certified_uncommitted: Some(make_test_certified(block)),
+            },
+        );
+        let serve = |intent| {
+            serve_block_request(
+                &chain,
+                &ProvisionStore::new(),
+                &GetBlockRequest::new(BlockHeight::new(1), intent),
+            )
+        };
+        assert!(
+            serve(BlockIntent::Execute).certified.is_some(),
+            "a sync takes the certified tip",
+        );
+        assert!(
+            serve(BlockIntent::Follow).certified.is_none(),
+            "a follow is not answered by a block that may still lose its height",
+        );
     }
 
     /// A history walk that lands on a height still in the serving

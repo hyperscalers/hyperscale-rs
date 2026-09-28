@@ -500,7 +500,7 @@ impl ObserverTail {
             return None;
         }
         self.in_flight = true;
-        Some(GetBlockRequest::new(self.next, BlockIntent::Execute))
+        Some(GetBlockRequest::new(self.next, BlockIntent::Follow))
     }
 
     /// The next certified-header fetch from `source`, for a recognizing

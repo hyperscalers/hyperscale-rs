@@ -26,6 +26,22 @@ pub enum BlockIntent {
     /// nothing here, so a server that retired them still holds
     /// everything this asks for.
     History,
+    /// The requester applies the block's writes to a store it cannot
+    /// roll back — a split observer following its parent's chain — so
+    /// only a committed block answers. A certified tip can still lose its
+    /// height to a sibling, and a follow that applied the loser could
+    /// never extend the chain that committed. Served as [`Self::Execute`]
+    /// is otherwise.
+    Follow,
+}
+
+impl BlockIntent {
+    /// Whether a certified block that has not committed answers the
+    /// request.
+    #[must_use]
+    pub const fn admits_uncommitted(self) -> bool {
+        !matches!(self, Self::Follow)
+    }
 }
 
 /// Request to fetch a full Block by height during sync or catch-up.
