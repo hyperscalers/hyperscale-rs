@@ -53,25 +53,24 @@ mod membership;
 mod pool;
 mod reshape;
 
-use membership::CompletedBootstrap;
+use membership::{CompletedBootstrap, Rebuild};
 use pool::PoolThread;
 use reshape::ReshapeIo;
 
 /// The process-scoped resource bundle as the production runner types it.
 type ProdProcessIo = ProcessIo<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
 
-/// Opens (or creates) one shard's `RocksDB` storage at the host's
-/// data-dir convention. Supplied by the validator binary, which owns
-/// the directory layout.
+/// Opens (or creates) one shard's `RocksDB` storage at a directory.
+/// Supplied by the validator binary, which owns the storage config.
 pub type StorageFactory =
-    Arc<dyn Fn(ShardId) -> Result<Arc<RocksDbShardStorage>, String> + Send + Sync>;
+    Arc<dyn Fn(&Path, ShardId) -> Result<Arc<RocksDbShardStorage>, String> + Send + Sync>;
 
 /// Resolves one shard's storage directory at the host's data-dir
-/// convention — the location [`StorageFactory`] opens.
+/// convention — the location a seat opens through [`StorageFactory`].
 ///
-/// Exposed separately so a split flip can seed the directory from a
-/// parent checkpoint before the open. Supplied by the validator binary
-/// alongside the factory.
+/// A split flip seeds the directory from a parent checkpoint before the
+/// open, and a rebuild stages a replacement beside it. Supplied by the
+/// validator binary alongside the factory.
 pub type StorageDirResolver = Arc<dyn Fn(ShardId) -> PathBuf + Send + Sync>;
 
 /// The directory `shard`'s store lives at under `root`.
@@ -126,6 +125,9 @@ pub enum SupervisorEvent {
     },
     /// A snap-sync bootstrap settled (`Err` carries the failed shard).
     Bootstrapped(Result<CompletedBootstrap, ShardId>),
+    /// A running shard's rebuild staged its store at the attested anchor
+    /// (`Err` carries the shard whose rebuild failed).
+    Rebuilt(Result<CompletedBootstrap, ShardId>),
     /// A reshape orchestrator io result settled.
     Reshape(ReshapeIo),
     /// A shard loop admitted a queued seat.
@@ -194,6 +196,10 @@ pub struct ShardSupervisor {
     /// racing a double import; a `Leave` meanwhile decrements,
     /// abandoning the join at zero.
     bootstrapping: HashMap<ShardId, usize>,
+    /// Running shards rebuilding at a fork recovery's attested anchor. A
+    /// join for one waits for the swap, which seats every placed local
+    /// validator.
+    rebuilding: HashMap<ShardId, Rebuild>,
     /// The sans-io reshape orchestrator — discovers this host's observer
     /// and keeper duties from the committed-state projection and sequences
     /// them. The supervisor pumps it on a timer and on every placement
@@ -289,6 +295,7 @@ impl ShardSupervisor {
             genesis_offset_ms,
             shards: HashMap::new(),
             bootstrapping: HashMap::new(),
+            rebuilding: HashMap::new(),
             reshape: ReshapeOrchestrator::new(vnode_keys.keys().copied().collect()),
             reshape_stores: HashMap::new(),
             pending_reshape_prep: HashMap::new(),
@@ -320,6 +327,7 @@ impl ShardSupervisor {
                 outcome,
             } => self.on_opened(shard, vnodes, outcome),
             SupervisorEvent::Bootstrapped(done) => self.finish_join(done),
+            SupervisorEvent::Rebuilt(done) => self.on_rebuilt(done),
             SupervisorEvent::Reshape(io) => self.on_reshape_io(io),
             SupervisorEvent::Seated { shard, validator } => self.on_seated(shard, validator),
             SupervisorEvent::TornDown {

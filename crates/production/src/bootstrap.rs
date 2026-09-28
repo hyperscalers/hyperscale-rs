@@ -20,7 +20,7 @@ use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_node::SharedTopologySnapshot;
 use hyperscale_node::bootstrap::history::{HistoryOutcome, history_floor};
 use hyperscale_node::bootstrap::{
-    BootstrapOutcome, BootstrapRequest, ShardBootstrap, StateRangeOutcome,
+    BootstrapOutcome, BootstrapRequest, ShardBootstrap, StateRangeOutcome, StoreResponder,
 };
 use hyperscale_storage::{RecoveredState, ShardStorage};
 use hyperscale_types::network::request::GetBlockRequest;
@@ -44,6 +44,12 @@ const ROUNDS_BEFORE_ANCHOR_REFRESH: u32 = 30;
 /// boot from. The caller has already established that `storage` is
 /// fresh and an anchor exists.
 ///
+/// A `local` store this host already holds for the shard answers each
+/// request before the network is asked: a host rebuilding a shard it
+/// runs reads the anchor from its own store until the store cannot
+/// answer, and every answer is verified against the anchor exactly as a
+/// peer's is. A local answer the sequencer rejects retires the source.
+///
 /// # Errors
 ///
 /// Returns a description of the failure. Errors are terminal for this
@@ -54,11 +60,13 @@ pub async fn bootstrap_shard_state<S, N>(
     topology_snapshot: &SharedTopologySnapshot,
     storage: &Arc<S>,
     shard: ShardId,
+    local: Option<Arc<S>>,
 ) -> Result<RecoveredState, String>
 where
     S: ShardStorage,
     N: Network,
 {
+    let mut local = local.map(|store| Arc::new(StoreResponder::new(store)));
     'anchor: loop {
         let Some(anchor) = topology_snapshot.load().boundary(shard) else {
             return Err(format!("shard {shard:?} has no attested anchor"));
@@ -116,8 +124,7 @@ where
                 continue;
             }
 
-            let requests = lock(&bootstrap).next_requests();
-            let accepted = run_round(network, shard, storage, &bootstrap, requests).await?;
+            let accepted = pump_round(network, shard, storage, &bootstrap, &mut local).await?;
             if accepted == 0 {
                 fruitless += 1;
                 if fruitless >= ROUNDS_BEFORE_ANCHOR_REFRESH {
@@ -167,6 +174,94 @@ where
         return Ok(bootstrap
             .into_recovered_state(storage.read_frontier(shard), storage.member_index(shard)));
     }
+}
+
+/// Run one round of the bootstrap's requests: the `local` store answers
+/// what it can, then peers answer the rest. Returns how many responses the
+/// sequencer accepted. A local answer the sequencer rejects retires the
+/// local store.
+///
+/// # Errors
+///
+/// Returns a description when a staging write failed.
+async fn pump_round<S: ShardStorage, N: Network>(
+    network: &Arc<N>,
+    shard: ShardId,
+    storage: &Arc<S>,
+    bootstrap: &Arc<Mutex<ShardBootstrap>>,
+    local: &mut Option<Arc<StoreResponder<S>>>,
+) -> Result<usize, String> {
+    let mut requests = lock(bootstrap).next_requests();
+    let mut accepted = 0;
+    if let Some(responder) = local.clone() {
+        let answered = answer_locally(responder, storage, bootstrap, requests).await?;
+        requests = answered.unanswered;
+        accepted = answered.accepted;
+        if answered.rejected {
+            warn!(
+                ?shard,
+                "Local store answered off the attested chain; asking peers"
+            );
+            *local = None;
+        }
+    }
+    Ok(accepted + run_round(network, shard, storage, bootstrap, requests).await?)
+}
+
+/// What [`answer_locally`] made of one round.
+struct LocalRound {
+    /// Answers the sequencer accepted.
+    accepted: usize,
+    /// Whether it rejected any answer.
+    rejected: bool,
+    /// Requests the local store could not answer, left for peers.
+    unanswered: Vec<BootstrapRequest>,
+}
+
+/// Answer each of `requests` the local store can from that store, writing
+/// what the sequencer verifies into `storage`, off the runtime workers.
+///
+/// # Errors
+///
+/// Returns a description when a staging write failed.
+async fn answer_locally<S: ShardStorage>(
+    responder: Arc<StoreResponder<S>>,
+    storage: &Arc<S>,
+    bootstrap: &Arc<Mutex<ShardBootstrap>>,
+    requests: Vec<BootstrapRequest>,
+) -> Result<LocalRound, String> {
+    let storage = Arc::clone(storage);
+    let bootstrap = Arc::clone(bootstrap);
+    spawn_blocking(move || {
+        let mut round = LocalRound {
+            accepted: 0,
+            rejected: false,
+            unanswered: Vec::new(),
+        };
+        let mut sequencer = lock(&bootstrap);
+        for request in requests {
+            // The history walk's window asks below the block that ends it.
+            if sequencer.is_complete() {
+                return Ok(LocalRound {
+                    unanswered: Vec::new(),
+                    ..round
+                });
+            }
+            match responder.answer(&request) {
+                Some(response) => {
+                    if sequencer.absorb(&response, storage.as_ref())? {
+                        round.accepted += 1;
+                    } else {
+                        round.rejected = true;
+                    }
+                }
+                None => round.unanswered.push(request),
+            }
+        }
+        Ok(round)
+    })
+    .await
+    .map_err(|error| format!("local bootstrap task died: {error}"))?
 }
 
 /// Dispatch one round of requests and await every response callback,
@@ -365,8 +460,10 @@ mod tests {
         serve_block_request, serve_state_range_request, serve_witness_history_request,
     };
     use hyperscale_provisions::ProvisionStore;
-    use hyperscale_storage::test_helpers::{completed_import_progress, pin_snap_sync_replica};
-    use hyperscale_storage::{BoundaryStore, PendingChain, SubstateStore};
+    use hyperscale_storage::test_helpers::{
+        commit_one, completed_import_progress, pin_snap_sync_replica,
+    };
+    use hyperscale_storage::{BoundaryStore, PendingChain, ShardChainReader, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::{
         GetBlockRequest, GetStateRangeRequest, GetWitnessHistoryRequest,
@@ -528,7 +625,7 @@ mod tests {
         let topology_snapshot = shared_topology(anchor, shard);
         let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
 
-        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard)
+        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, None)
             .await
             .expect("bootstrap succeeds");
 
@@ -538,6 +635,32 @@ mod tests {
         assert!(recovered.beacon_witness_leaf_hashes.is_empty());
         // The imported store reproduces the attested root.
         assert_eq!(fresh.state_root(), anchor.state_root);
+    }
+
+    /// A host rebuilding a shard it runs answers the bootstrap from its
+    /// own store, committed past the anchor, without a network round: every
+    /// peer request would fail, and none is sent.
+    #[tokio::test]
+    async fn pump_answers_a_rebuild_from_the_local_store() {
+        let (local, anchor) = replica();
+        for seed in 0x40..0x44 {
+            commit_one(&*local, seed);
+        }
+        assert!(local.committed_height() > anchor.height);
+        let shard = ShardId::ROOT;
+        let network = Arc::new(StubNetwork::new(Arc::clone(&local), usize::MAX));
+        let topology_snapshot = shared_topology(anchor, shard);
+        let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
+
+        let recovered =
+            bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, Some(local))
+                .await
+                .expect("bootstrap succeeds");
+
+        assert_eq!(recovered.committed_height, anchor.height);
+        assert_eq!(recovered.jmt_root, Some(anchor.state_root));
+        assert_eq!(fresh.state_root(), anchor.state_root);
+        assert_eq!(network.flaky_failures.load(Ordering::Relaxed), usize::MAX);
     }
 
     /// The pump resumes a staged assembly a previous process left
@@ -583,7 +706,7 @@ mod tests {
 
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
         let topology_snapshot = shared_topology(anchor, shard);
-        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard)
+        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, None)
             .await
             .expect("bootstrap succeeds");
 
@@ -618,7 +741,7 @@ mod tests {
 
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
         let topology_snapshot = shared_topology(anchor, shard);
-        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard)
+        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, None)
             .await
             .expect("bootstrap succeeds");
 

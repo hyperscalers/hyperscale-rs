@@ -463,7 +463,7 @@ impl ProductionRunnerBuilder {
         // `maybe_initialize_genesis` once the host is assembled.
         let mut storages: HashMap<ShardId, Arc<RocksDbShardStorage>> = HashMap::new();
         for shard in &local_shards {
-            let store = (self.storage_factory)(*shard)
+            let store = (self.storage_factory)(&(self.storage_dir)(*shard), *shard)
                 .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
             storages.insert(*shard, store);
         }
@@ -759,6 +759,12 @@ impl ProductionRunner {
     #[must_use]
     pub const fn network(&self) -> &Arc<Libp2pAdapter> {
         &self.network
+    }
+
+    /// The topology snapshot the host's shards and supervisor read.
+    #[must_use]
+    pub const fn topology_snapshot(&self) -> &SharedTopologySnapshot {
+        &self.topology_snapshot
     }
 
     /// Get the process-wide transaction status cache shared from

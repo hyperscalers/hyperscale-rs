@@ -254,7 +254,7 @@ impl ShardSupervisor {
                     std::fs::remove_dir_all(&dir)
                         .map_err(|e| format!("stale reshape store wipe: {e}"))?;
                 }
-                let storage = factory(shard)?;
+                let storage = factory(&dir, shard)?;
                 // The directory was just wiped, so the store is fresh: it must
                 // carry the engine bootstrap on its substate side before the
                 // duty's child-span or merged-union import, or the seated shard
@@ -310,7 +310,7 @@ impl ShardSupervisor {
                 parent_storage
                     .checkpoint_into(&dir)
                     .map_err(|e| format!("child checkpoint: {e}"))?;
-                let storage = factory(child)?;
+                let storage = factory(&dir, child)?;
                 let recovered = storage.load_recovered_state(child);
                 Ok((storage, recovered))
             })();

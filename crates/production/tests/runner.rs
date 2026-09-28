@@ -7,20 +7,26 @@
 
 mod support;
 
-use std::fmt::Debug;
+use std::collections::BTreeMap;
+use std::fmt::{Debug, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyperscale_network_libp2p::test_utils::TestFixtures;
-use hyperscale_production::{ShardCommand, VnodeConfig};
+use hyperscale_production::{LocalValidator, ShardCommand, VnodeConfig};
 use hyperscale_storage::BeaconChainReader;
-use hyperscale_types::{BeaconChainConfig, ReshapeThresholds, ShardId, ValidatorId};
+use hyperscale_types::{
+    BeaconChainConfig, BlockHash, Epoch, RecoveryCause, ReshapeThresholds, ShardId, ShardRecovery,
+    ValidatorId,
+};
 use serial_test::serial;
-use support::{CONNECTION_TIMEOUT, build_runner, temp_storage_factory};
+use support::harness::{ClusterSpec, Harness, HostSpec};
+use support::{CONNECTION_TIMEOUT, build_runner, temp_storage_dir, temp_storage_factory};
 use tokio::task::spawn;
 use tokio::time::{sleep, timeout};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, Registry, fmt};
@@ -213,9 +219,10 @@ async fn leaving_a_shard_releases_its_store() {
 
     // The lock is what the reopen below measures: while the shard is
     // hosted, its thread holds it and a second opener is refused.
-    let open = temp_storage_factory(&dir);
+    let open = temp_storage_factory();
+    let root_dir = temp_storage_dir(&dir)(ShardId::ROOT);
     assert!(
-        open(ShardId::ROOT).is_err(),
+        open(&root_dir, ShardId::ROOT).is_err(),
         "a hosted shard holds its store's lock",
     );
 
@@ -235,7 +242,7 @@ async fn leaving_a_shard_releases_its_store() {
 
     let reopened = timeout(CONNECTION_TIMEOUT, async {
         loop {
-            match open(ShardId::ROOT) {
+            match open(&root_dir, ShardId::ROOT) {
                 Ok(storage) => break storage,
                 Err(_) => sleep(Duration::from_millis(50)).await,
             }
@@ -285,7 +292,8 @@ async fn beacon_chain_config_reaches_genesis() {
     );
 }
 
-/// Every event message the process logs, in order.
+/// Every event the process logs, in order: its message, then each other
+/// field as `name=value`.
 #[derive(Clone, Default)]
 struct Messages(Arc<Mutex<Vec<String>>>);
 
@@ -301,17 +309,26 @@ impl Messages {
 
 impl<S: Subscriber> Layer<S> for Messages {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        struct Message<'a>(&'a mut String);
-        impl Visit for Message<'_> {
+        #[derive(Default)]
+        struct Message {
+            text: String,
+            fields: String,
+        }
+        impl Visit for Message {
             fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
                 if field.name() == "message" {
-                    *self.0 = format!("{value:?}");
+                    self.text = format!("{value:?}");
+                } else {
+                    let _ = write!(self.fields, " {}={value:?}", field.name());
                 }
             }
         }
-        let mut message = String::new();
-        event.record(&mut Message(&mut message));
-        self.0.lock().expect("messages lock").push(message);
+        let mut message = Message::default();
+        event.record(&mut message);
+        self.0
+            .lock()
+            .expect("messages lock")
+            .push(message.text + &message.fields);
     }
 }
 
@@ -379,4 +396,114 @@ async fn a_join_for_a_running_shard_seats_into_its_loop() {
     let result = timeout(Duration::from_secs(5), handle).await;
     assert!(result.is_ok(), "runner exits after the seat changes");
     assert!(result.unwrap().is_ok(), "runner returns Ok");
+}
+
+/// A join for a running shard under a fork recovery, whose store has
+/// committed past the recovery's attested frontier, rebuilds the shard at
+/// its anchor rather than seating the joiner onto the loop's tip: the
+/// rebuilt loop resumes at the frontier.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
+    // Four hosts' consensus at trace level floods the run; the supervisor's
+    // lines are at info.
+    let messages = Messages::default();
+    let _ = Registry::default()
+        .with(messages.clone().with_filter(LevelFilter::INFO))
+        .with(
+            fmt::layer()
+                .with_test_writer()
+                .with_filter(LevelFilter::INFO),
+        )
+        .try_init();
+
+    // ROOT's four seats on four hosts; host 0 also carries the pooled
+    // surplus validator the join names.
+    let fixtures = TestFixtures::with_surplus(46, 4, 1);
+    let local = |i: u32| LocalValidator {
+        validator_id: ValidatorId::new(u64::from(i)),
+        signer: fixtures.signer(i),
+    };
+    let surplus = ValidatorId::new(4);
+    let mut cluster = Harness::start(ClusterSpec {
+        genesis: fixtures.genesis_validators(),
+        hosts: vec![
+            HostSpec::new(vec![local(0), local(4)]),
+            HostSpec::new(vec![local(1)]),
+            HostSpec::new(vec![local(2)]),
+            HostSpec::new(vec![local(3)]),
+        ],
+        beacon_chain_config: BeaconChainConfig {
+            epoch_duration_ms: 3_000,
+            shard_size: 4,
+            ..BeaconChainConfig::default()
+        },
+        genesis_config: None,
+        simulated_outbound_latency: Duration::from_millis(50),
+    })
+    .await;
+
+    // The beacon attests a ROOT boundary host 0's loop has committed
+    // past; a fork recovery pinned there makes everything above it a
+    // suffix no fresh member may extend.
+    let topology = cluster.topology(0);
+    let frontier = timeout(CONNECTION_TIMEOUT * 12, async {
+        loop {
+            let snapshot = topology.load_full();
+            if let Some(anchor) = snapshot
+                .boundary(ShardId::ROOT)
+                .filter(|anchor| anchor.block_hash != BlockHash::ZERO)
+            {
+                let forked = (*snapshot)
+                    .clone()
+                    .with_pending_recoveries(BTreeMap::from([(
+                        ShardId::ROOT,
+                        ShardRecovery {
+                            cause: RecoveryCause::Fork,
+                            rotated_at: Epoch::GENESIS,
+                            retained: Vec::new(),
+                            attested_frontier: anchor.height,
+                        },
+                    )]));
+                topology.store(Arc::new(forked));
+                break anchor.height;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the beacon attests a ROOT boundary");
+
+    cluster
+        .reconfigure(0)
+        .send(ShardCommand::Join {
+            shard: ShardId::ROOT,
+            vnodes: vec![VnodeConfig {
+                validator_id: surplus,
+                local_shard: ShardId::ROOT,
+                signer: fixtures.signer(4),
+            }],
+        })
+        .await
+        .expect("supervisor accepts commands");
+    let rebuilt = format!(
+        "Shard rebuilt at its attested anchor shard=ShardId {{ depth: 0, path: 0 }} committed={}",
+        frontier.inner()
+    );
+    timeout(CONNECTION_TIMEOUT * 2, async {
+        while !messages.contains(&rebuilt) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the join rebuilds the shard at the attested frontier");
+    timeout(CONNECTION_TIMEOUT, async {
+        while !messages.contains("Shard joined at runtime") {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the rebuilt store is seated");
+
+    cluster.shutdown().await;
 }
