@@ -41,6 +41,7 @@ use hyperscale_types::{
     StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
     ValidatorSet, Verifier, cache, shard_prefix_path,
 };
+use invariants::Invariants;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use tracing::{debug, info, trace};
@@ -48,6 +49,7 @@ use tracing::{debug, info, trace};
 use crate::event_queue::EventKey;
 use crate::memo_verifier::MemoVerifier;
 
+mod invariants;
 pub mod membership;
 pub mod reshape;
 
@@ -290,6 +292,9 @@ pub struct SimulationRunner {
     /// scope, type and sequence. Two runs agree on it exactly when they
     /// processed the same events in the same order.
     trace: Blake3Hasher,
+
+    /// Cross-replica safety checks, run at the end of every `run_until`.
+    invariants: Invariants,
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
@@ -652,6 +657,7 @@ impl SimulationRunner {
             timers: HashMap::new(),
             stats: SimulationStats::default(),
             trace: Blake3Hasher::new(),
+            invariants: Invariants::default(),
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
@@ -762,10 +768,30 @@ impl SimulationRunner {
             .and_then(|nl| nl.tx_status(tx_hash))
     }
 
+    /// A host's last emitted status for `tx_hash`, with the shard that
+    /// emitted it.
+    #[must_use]
+    pub fn tx_status_entry(
+        &self,
+        host: NodeIndex,
+        tx_hash: &TxHash,
+    ) -> Option<(TransactionStatus, ShardId)> {
+        self.hosts
+            .get(host as usize)
+            .and_then(|nl| nl.tx_status_entry(tx_hash))
+    }
+
     /// Get simulation statistics.
     #[must_use]
     pub const fn stats(&self) -> &SimulationStats {
         &self.stats
+    }
+
+    /// Stop treating conflicting commits as a failure, for a run that
+    /// drives a shard past its fault bound on purpose. The other
+    /// invariants still hold.
+    pub const fn permit_forks(&mut self) {
+        self.invariants.permit_forks();
     }
 
     /// Digest of every event processed so far, in processing order. Equal
@@ -1172,6 +1198,10 @@ impl SimulationRunner {
         if self.now < end_time {
             self.now = end_time;
         }
+
+        let mut invariants = std::mem::take(&mut self.invariants);
+        invariants.check(self);
+        self.invariants = invariants;
 
         trace!(
             events_processed = self.stats.events_processed,

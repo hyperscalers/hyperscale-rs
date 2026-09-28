@@ -574,7 +574,14 @@ where
     /// [`TxStatusCache`]: crate::process::TxStatusCache
     #[must_use]
     pub fn tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
-        self.process.tx_status.get(hash).map(|(status, _)| status)
+        self.tx_status_entry(hash).map(|(status, _)| status)
+    }
+
+    /// The merged status for `hash` together with the shard that emitted
+    /// it.
+    #[must_use]
+    pub fn tx_status_entry(&self, hash: &TxHash) -> Option<(TransactionStatus, ShardId)> {
+        self.process.tx_status.get(hash)
     }
 
     // ─── Event Processing ───────────────────────────────────────────────

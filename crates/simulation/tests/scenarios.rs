@@ -1335,6 +1335,10 @@ fn halted_shard_straddler_atomic_seed_45_sim() {
 fn shard_fork_drives_committee_recovery_sim() {
     let setup = halt_straddler_setup();
     let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 11, &setup.accounts);
+    // A fork recovery supersedes whatever the old committee committed past
+    // the attested boundary: the fresh committee rebuilds from the anchor,
+    // so the retained replicas' suffix and the fresh chain conflict.
+    cluster.runner_mut().permit_forks();
     // Grow to two children before injecting the fork. Recovering the sole
     // ROOT committee would starve beacon epoch production: in a single-shard
     // topology the beacon committee *is* the ROOT committee, so re-drawing it

@@ -6,7 +6,7 @@
 //! before each slice and checking the predicate between slices, up to the
 //! budget.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -563,6 +563,13 @@ impl SimCluster {
     }
 }
 
+/// Where one store's chain committed a transaction, and where it finalized
+/// it with which decision.
+type ChainFate = (
+    Option<BlockHeight>,
+    Option<(BlockHeight, TransactionDecision)>,
+);
+
 /// A portable `0..host_count` host index as the sim's [`NodeIndex`].
 fn host_index(host: usize) -> NodeIndex {
     NodeIndex::try_from(host).expect("host index fits a NodeIndex")
@@ -711,8 +718,31 @@ impl Cluster for SimCluster {
     }
 
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus> {
-        (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.tx_status(host, &tx))
+        let statuses: Vec<(NodeIndex, TransactionStatus, ShardId)> = (0..self.runner.num_hosts())
+            .filter_map(|host| {
+                let (status, shard) = self.runner.tx_status_entry(host, &tx)?;
+                Some((host, status, shard))
+            })
+            .collect();
+        // Hosts sit at different stages, so the furthest status is the
+        // answer; but every host that heard a decision from one shard heard
+        // the same one. Shards each decide their own leg, so two shards may
+        // decide differently.
+        let mut decided: BTreeMap<ShardId, (NodeIndex, TransactionDecision)> = BTreeMap::new();
+        for (host, status, shard) in &statuses {
+            let &TransactionStatus::Completed(decision) = status else {
+                continue;
+            };
+            let &mut (first_host, first) = decided.entry(*shard).or_insert((*host, decision));
+            assert_eq!(
+                decision, first,
+                "replicas of {shard:?} disagree on {tx:?}: host {first_host} decided {first:?}, \
+                 host {host} decided {decision:?}",
+            );
+        }
+        statuses
+            .into_iter()
+            .map(|(_, status, _)| status)
             .max_by_key(status_rank)
     }
 
@@ -795,14 +825,29 @@ impl Cluster for SimCluster {
         Option<(BlockHeight, TransactionDecision)>,
     ) {
         // Merged across every store of the shard, since a runtime seat's
-        // chain starts at its snap-sync anchor; the chains agree wherever
-        // they overlap.
-        (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .map(|store| chain_fate(store, tx))
-            .fold((None, None), |(committed, finalized), (c, f)| {
-                (committed.or(c), finalized.or(f))
-            })
+        // chain starts at its snap-sync anchor; wherever two stores both
+        // answer, they must answer alike.
+        let fates: Vec<(NodeIndex, ChainFate)> = (0..self.runner.num_hosts())
+            .filter_map(|host| Some((host, chain_fate(self.runner.hosts_shard(host, shard)?, tx))))
+            .collect();
+        let mut merged: ChainFate = (None, None);
+        for (host, (committed, finalized)) in fates {
+            if let (Some(seen), Some(here)) = (merged.0, committed) {
+                assert_eq!(
+                    seen, here,
+                    "replicas of {shard:?} committed {tx:?} at different heights; \
+                     host {host} at {here:?}",
+                );
+            }
+            if let (Some(seen), Some(here)) = (merged.1, finalized) {
+                assert_eq!(
+                    seen, here,
+                    "replicas of {shard:?} finalized {tx:?} differently; host {host} has {here:?}",
+                );
+            }
+            merged = (merged.0.or(committed), merged.1.or(finalized));
+        }
+        merged
     }
 }
 
