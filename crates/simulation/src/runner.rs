@@ -34,7 +34,7 @@ use hyperscale_node::{
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
-use hyperscale_storage::{BeaconStorage, RecoveredState};
+use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
@@ -1426,6 +1426,23 @@ impl Drop for SimulationRunner {
             hex_digest(&self.trace_digest()),
             self.seed,
         );
+        eprintln!("committed heights per host:");
+        for host in 0..self.num_hosts() {
+            let heights: Vec<String> = self
+                .hosted_shards_of(host)
+                .into_iter()
+                .filter_map(|shard| {
+                    let store = self.hosts_shard(host, shard)?;
+                    Some(format!(
+                        "{}/{}@{}",
+                        shard.depth(),
+                        shard.path(),
+                        store.committed_height().inner()
+                    ))
+                })
+                .collect();
+            eprintln!("  host {host}: {}", heights.join(" "));
+        }
     }
 }
 
