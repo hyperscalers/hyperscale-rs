@@ -474,6 +474,10 @@ impl FaultableCluster for ProdCluster {
         FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
     }
 
+    fn host_of(&self, validator: ValidatorId) -> Option<usize> {
+        self.inner.host_of(validator)
+    }
+
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
         self.inner.hosts_serving(shard)
     }

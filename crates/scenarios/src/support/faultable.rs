@@ -79,6 +79,9 @@ pub trait FaultableCluster: Cluster {
         type_id: &'static str,
     ) -> FaultHandle;
 
+    /// The host running `validator`, or `None` when no host runs it.
+    fn host_of(&self, validator: ValidatorId) -> Option<usize>;
+
     /// The hosts whose vnode sits in `shard`'s live committee — the copy
     /// currently seated, not a terminated chain lingering on old hosts.
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize>;

@@ -2457,6 +2457,8 @@ dependencies = [
  "hyperscale-vm-sdk",
  "hyperscale-vm-stdlib",
  "hyperscale-vm-types",
+ "rand 0.10.2",
+ "rand_chacha 0.10.0",
 ]
 
 [[package]]

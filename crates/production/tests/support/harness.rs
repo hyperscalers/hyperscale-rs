@@ -360,6 +360,13 @@ impl Harness {
         })
     }
 
+    /// The host running `validator`, if any.
+    pub fn host_of(&self, validator: ValidatorId) -> Option<usize> {
+        self.hosts
+            .iter()
+            .position(|h| h.validator_ids.contains(&validator))
+    }
+
     /// Every host index serving `shard` — its committee members, before a
     /// terminating reshape relocates them.
     pub fn hosts_serving(&self, shard: ShardId) -> Vec<usize> {

@@ -28,6 +28,7 @@ mod reshape;
 mod route;
 mod route_reshape;
 mod straddler;
+mod swarm;
 mod transactions;
 mod venue;
 mod witnesses;
@@ -123,9 +124,11 @@ pub use straddler::{
     split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
 };
 pub use support::{
-    Budget, Cluster, DISCARD, FaultHandle, FaultableCluster, ScenarioConfig, assume, conservation,
-    discard, epochs, grow_to, query, submission_shards, tx, vote_reshape_threshold, wait,
+    Budget, Cluster, DISCARD, FaultHandle, FaultableCluster, Nemesis, ScenarioConfig, assume,
+    conservation, discard, epochs, grow_to, query, submission_shards, tx, vote_reshape_threshold,
+    wait,
 };
+pub use swarm::{SWARM_ACCOUNTS, transfers_survive_a_nemesis};
 pub use transactions::livelock_resolves_promptly;
 pub use venue::{
     SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, StockedVenue, VENUE_SHARD, VenueReport, WIDE_VENUE_SHARD,

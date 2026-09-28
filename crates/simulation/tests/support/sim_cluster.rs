@@ -921,6 +921,11 @@ impl FaultableCluster for SimCluster {
         FaultHandle::new(move || signers.iter().map(|signer| signer.refused()).sum())
     }
 
+    fn host_of(&self, validator: ValidatorId) -> Option<usize> {
+        let host = self.runner.network().validator_to_node(validator);
+        (host < self.runner.num_hosts()).then_some(host as usize)
+    }
+
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
         self.live_committee_hosts(shard)
             .into_iter()
