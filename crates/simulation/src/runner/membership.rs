@@ -61,6 +61,10 @@ pub enum JoinKind {
         /// The retained store's committed tip at rejoin.
         committed_height: BlockHeight,
     },
+    /// Fresh store, but this host's topology does not yet carry the
+    /// shard's attested anchor: nothing was seated, and the placement scan
+    /// retries next slice once the fold reaches the host.
+    AwaitingAnchor,
 }
 
 impl SimulationRunner {
@@ -79,9 +83,9 @@ impl SimulationRunner {
     ///
     /// # Panics
     ///
-    /// Panics if the shard has no attested anchor or no serving host
-    /// (the simulation models neither genesis replay nor a fully dark
-    /// committee), or if the imported root diverges from the anchor.
+    /// Panics if the shard has no serving host (the simulation models no
+    /// fully dark committee), or if the imported root diverges from the
+    /// anchor.
     pub fn join_shard(
         &mut self,
         host: NodeIndex,
@@ -110,8 +114,8 @@ impl SimulationRunner {
     ///
     /// # Panics
     ///
-    /// Panics if a fresh store has no attested anchor or no serving host, or if
-    /// the imported root diverges from the anchor.
+    /// Panics if a fresh store has no serving host, or if the imported root
+    /// diverges from the anchor.
     fn seat_joined_group(
         &mut self,
         host: NodeIndex,
@@ -128,9 +132,9 @@ impl SimulationRunner {
                 .process()
                 .topology_snapshot()
                 .load_full();
-            let anchor = snapshot
-                .boundary(shard)
-                .expect("runtime join requires an attested anchor");
+            let Some(anchor) = snapshot.boundary(shard) else {
+                return JoinKind::AwaitingAnchor;
+            };
             // A fresh store needs the engine bootstrap (system packages, the
             // intent-hash tracker) before the snap-sync import, exactly as the
             // reshape duty and the production supervisor seed a fresh store —
