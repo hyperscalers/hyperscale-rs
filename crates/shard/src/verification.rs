@@ -1104,7 +1104,8 @@ impl VerificationPipeline {
         let thresholds = count_source.thresholds;
         let substate_bytes = match self.witness_substate_bytes(
             committed_hash,
-            header.parent_block_hash(),
+            committed_block_anchor_wt,
+            header,
             pending_blocks,
             local_shard,
             schedule,
@@ -1179,24 +1180,22 @@ impl VerificationPipeline {
     ///
     /// With reshaping disabled the predicate can never fire, so the count is
     /// irrelevant and verification proceeds without it — bit-identical to a
-    /// network without the feature. Enabled, a missing ancestor delta parks
+    /// network without the feature. Enabled, a missing parent delta parks
     /// the verification exactly like a missing witness ancestor — except when
-    /// the walk crosses a halt recovery's sync-admitted suffix: those blocks
-    /// are QC-attested but never locally executed, so no delta can ever land,
-    /// and the halted tip's commit needs the successor QC this very
-    /// verification gates. There the predicate is out of play (`None`) and the
-    /// required assertion is absent; every replica that synced the suffix
-    /// agrees byte-for-byte on its absence. The band holds through the
-    /// completed recovery record — a member whose walk still crosses the
-    /// suffix after the pending record clears on the first crossing must not
-    /// start parking, or the circular drain wedges it permanently. A
-    /// sync-admitted block outside the band — an ordinary lagging replica's
-    /// local state, whatever the shard's recovery history — parks as usual and
-    /// commits from the live quorum drain it.
+    /// the parent sits in a halt recovery's suffix band, anchored and
+    /// certified below its bridge. There the predicate is out of play
+    /// (`None`), decided by the parent's anchor and the QC over it (the
+    /// block's own `parent_qc`) alone: the suffix is QC-attested history
+    /// this replica may or may not have executed yet, and a total that
+    /// turned on which it had would split the replicas voting on the block.
+    /// The band is read off every binding the shard's history keeps, so it
+    /// holds after the recovery completes and past later ones.
+    #[allow(clippy::too_many_arguments)] // the walk's inputs beside the parent's anchors
     fn witness_substate_bytes(
         &self,
         committed_hash: BlockHash,
-        parent_block_hash: BlockHash,
+        committed_block_anchor_wt: WeightedTimestamp,
+        header: &BlockHeader,
         pending_blocks: &PendingBlocks,
         local_shard: ShardId,
         schedule: &TopologySchedule,
@@ -1205,29 +1204,30 @@ impl VerificationPipeline {
         if count_source.thresholds == ReshapeThresholds::DISABLED {
             return Ok(None);
         }
-        match count_source.count_behind(
+        let parent_hash = header.parent_block_hash();
+        if self
+            .block_anchor(
+                parent_hash,
+                committed_hash,
+                committed_block_anchor_wt,
+                pending_blocks,
+            )
+            .is_some_and(|parent_anchor| {
+                schedule.recovery_suffix_band(
+                    local_shard,
+                    parent_anchor,
+                    header.parent_qc().weighted_timestamp(),
+                )
+            })
+        {
+            return Ok(None);
+        }
+        count_source.count_behind(
             committed_hash,
-            parent_block_hash,
+            parent_hash,
             pending_blocks,
             &self.verified_certified_blocks,
-        ) {
-            Ok(count) => Ok(count),
-            Err(SubstateCountBlocked::SyncAdmitted(blocking_hash))
-                if self
-                    .verified_certified_blocks
-                    .get(&blocking_hash)
-                    .is_some_and(|certified| {
-                        schedule.recovery_suffix_band(
-                            local_shard,
-                            certified.block().header().parent_qc().weighted_timestamp(),
-                            certified.qc().weighted_timestamp(),
-                        )
-                    }) =>
-            {
-                Ok(None)
-            }
-            Err(blocked) => Err(blocked.blocking_hash()),
-        }
+        )
     }
 
     /// The parent header's reveal chain and the two committee anchors the
@@ -1450,41 +1450,6 @@ pub struct SubstateCountSource<'a> {
     pub(crate) deltas: &'a HashMap<BlockHash, i64>,
 }
 
-/// Why a substate-byte resolution blocked
-/// ([`SubstateCountSource::count_behind`]).
-///
-/// Neither arm covers an *absent* total: a parent whose own resolution was
-/// out of play is answered `Ok(None)` instead, because that is a settled
-/// fact rather than something a caller can wait out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubstateCountBlocked {
-    /// The parent's content or execution delta is still in flight — the
-    /// caller parks on it; its completion (or its commit) re-drives the
-    /// resolution.
-    Outstanding(BlockHash),
-    /// The parent is a sync-admitted certified block: QC-attested but never
-    /// locally executed, so no byte delta can ever land for it — only its
-    /// commit (whose persistence reconciles the frontier from storage)
-    /// resolves it. For a block inside a halt
-    /// recovery's suffix band (pending or completed —
-    /// `TopologySchedule::recovery_suffix_band`), every replica that
-    /// synced the suffix agrees on the absent delta, so the caller
-    /// suppresses the reshape assertion; outside the band it is one
-    /// lagging replica's local state, and the caller parks as for
-    /// [`Self::Outstanding`].
-    SyncAdmitted(BlockHash),
-}
-
-impl SubstateCountBlocked {
-    /// The block whose progress unblocks the resolution, whichever way it
-    /// blocked — the hash callers park on.
-    pub(crate) const fn blocking_hash(self) -> BlockHash {
-        match self {
-            Self::Outstanding(hash) | Self::SyncAdmitted(hash) => hash,
-        }
-    }
-}
-
 impl SubstateCountSource<'_> {
     /// Substate count behind `parent_hash`'s post-state.
     ///
@@ -1502,19 +1467,23 @@ impl SubstateCountSource<'_> {
     /// the argument `beacon_witness_base` already makes for reading the
     /// window base off the header instead of rebuilding beacon state.
     ///
-    /// `Err` classifies the blocked resolution — the parent's delta still
-    /// outstanding (or, for a frontier lagging the tip, the tip's
-    /// persistence reconcile), or a parent whose delta can never land.
+    /// `Err` names the block whose progress unblocks the resolution, the
+    /// hash callers park on: the parent whose delta is still outstanding
+    /// (or, for a frontier lagging the tip, the tip awaiting its
+    /// persistence reconcile). A sync-admitted parent is never executed
+    /// here, so its delta never lands; only its commit, reconciling the
+    /// frontier from storage, resolves it. Inside a recovery's suffix band
+    /// the callers answer `None` before walking at all.
     pub(crate) fn count_behind(
         &self,
         committed_hash: BlockHash,
         parent_hash: BlockHash,
         pending_blocks: &PendingBlocks,
         certified_blocks: &HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
-    ) -> Result<Option<u64>, SubstateCountBlocked> {
+    ) -> Result<Option<u64>, BlockHash> {
         if parent_hash == committed_hash {
             if self.frontier.0 != self.committed_height {
-                return Err(SubstateCountBlocked::Outstanding(committed_hash));
+                return Err(committed_hash);
             }
             return Ok(Some(self.frontier.1));
         }
@@ -1527,7 +1496,7 @@ impl SubstateCountSource<'_> {
                     .map(|certified| certified.block().header())
             })
         else {
-            return Err(SubstateCountBlocked::Outstanding(parent_hash));
+            return Err(parent_hash);
         };
         // The parent's own claim is the total behind *its* parent, already
         // checked against this same recurrence when the parent was voted —
@@ -1542,17 +1511,12 @@ impl SubstateCountSource<'_> {
         let Some(behind_parent) = parent.load().substate_bytes else {
             return Ok(None);
         };
-        let Some(delta) = self.deltas.get(&parent_hash) else {
-            // A certified block that was never executed locally has no delta
-            // and never will; only its commit resolves the walk.
-            if certified_blocks.contains_key(&parent_hash) {
-                return Err(SubstateCountBlocked::SyncAdmitted(parent_hash));
-            }
-            return Err(SubstateCountBlocked::Outstanding(parent_hash));
+        let Some(&delta) = self.deltas.get(&parent_hash) else {
+            return Err(parent_hash);
         };
         Ok(Some(
             behind_parent
-                .checked_add_signed(*delta)
+                .checked_add_signed(delta)
                 .expect("substate byte total must not go negative"),
         ))
     }
@@ -2776,7 +2740,7 @@ mod tests {
         let missing = bh(b"missing");
         assert_eq!(
             source.count_behind(committed_hash, missing, &pending, empty_certified()),
-            Err(SubstateCountBlocked::Outstanding(missing)),
+            Err(missing),
         );
 
         // The same chain shape, but with the ancestor held only in the
@@ -2804,7 +2768,7 @@ mod tests {
         )]);
         assert_eq!(
             source.count_behind(committed_hash, synced_hash, &pending, &certified),
-            Err(SubstateCountBlocked::SyncAdmitted(synced_hash)),
+            Err(synced_hash),
         );
 
         // A parent whose own total was out of play answers `None` rather
@@ -2838,7 +2802,7 @@ mod tests {
         };
         assert_eq!(
             undelta_source.count_behind(committed_hash, block_hash, &pending, empty_certified()),
-            Err(SubstateCountBlocked::Outstanding(block_hash)),
+            Err(block_hash),
         );
     }
 

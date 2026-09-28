@@ -193,8 +193,8 @@ use crate::validation::{
     validate_coast_block_for_vote, validate_header, validate_proposer,
 };
 use crate::verification::{
-    InFlightCheck, ReadyStateRootVerification, SubstateCountBlocked, SubstateCountSource,
-    VerificationPipeline, committed_cells_for,
+    InFlightCheck, ReadyStateRootVerification, SubstateCountSource, VerificationPipeline,
+    committed_cells_for,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -2634,24 +2634,31 @@ impl ShardCoordinator {
 
     /// Substate count behind the proposal parent's post-state for the
     /// reshape predicate, or `None` when the predicate is out of play —
-    /// reshaping disabled (it can never fire), or the parent's ancestry
-    /// crosses a pending halt recovery's sync-admitted suffix, whose
-    /// byte total is unknowable until the suffix commits (a commit that
-    /// needs this very proposal's QC). Every replica that can vote
-    /// synced the same suffix and recomputes the same `None`, so the
-    /// header's absent assertion stays byte-agreed. `Err` names the
-    /// ancestor whose delta — or, for a frontier lagging the committed
-    /// tip, the tip's persistence reconcile — is still outstanding; the
-    /// caller defers the build and retries, mirroring the verifier's park
-    /// on the same gap.
+    /// reshaping disabled (it can never fire), or the parent, anchored at
+    /// `parent_anchor_wt` and certified under `parent_qc_wt`, sits in a
+    /// halt recovery's suffix band. The band is the verifier's test on the
+    /// same two stamps, so the header's absent assertion stays byte-agreed
+    /// whether or not either side has executed the suffix. `Err` names the
+    /// ancestor whose delta — or, for a frontier lagging the committed tip,
+    /// the tip's persistence reconcile — is still outstanding; the caller
+    /// defers the build and retries, mirroring the verifier's park on the
+    /// same gap.
     fn proposal_substate_bytes(
         &self,
         topology_schedule: &TopologySchedule,
         topology_snapshot: &TopologySnapshot,
         parent_block_hash: BlockHash,
+        parent_anchor_wt: WeightedTimestamp,
+        parent_qc_wt: WeightedTimestamp,
     ) -> Result<Option<u64>, BlockHash> {
         let thresholds = topology_snapshot.reshape_thresholds();
-        if thresholds == ReshapeThresholds::DISABLED {
+        if thresholds == ReshapeThresholds::DISABLED
+            || topology_schedule.recovery_suffix_band(
+                self.local_shard,
+                parent_anchor_wt,
+                parent_qc_wt,
+            )
+        {
             return Ok(None);
         }
         let count_source = SubstateCountSource {
@@ -2660,22 +2667,12 @@ impl ShardCoordinator {
             committed_height: self.committed_height,
             deltas: &self.pending_bytes_deltas,
         };
-        match count_source.count_behind(
+        count_source.count_behind(
             self.committed_hash,
             parent_block_hash,
             &self.pending_blocks,
             self.verification.verified_certified_blocks(),
-        ) {
-            Ok(count) => Ok(count),
-            Err(SubstateCountBlocked::SyncAdmitted(_))
-                if topology_schedule
-                    .recovery_bridge(self.local_shard)
-                    .is_some() =>
-            {
-                Ok(None)
-            }
-            Err(blocked) => Err(blocked.blocking_hash()),
-        }
+        )
     }
 
     /// The reshape assertion for a proposal: the load predicate over the
@@ -2898,6 +2895,8 @@ impl ShardCoordinator {
             topology_schedule,
             committee,
             parent_block_hash,
+            committee_anchor_wt,
+            parent_qc.weighted_timestamp(),
         ) {
             Ok(count) => count,
             Err(blocking) => {
@@ -11524,6 +11523,67 @@ mod tests {
         state.retained_tip = Some(RetainedTip::Offered(BlockHeight::new(5)));
         state.set_block_syncing(false);
         (state, schedule, four, five)
+    }
+
+    /// A proposal on a synced suffix block claims no substate total,
+    /// whether or not this member has executed that block yet: the
+    /// suffix band decides it, read off the parent's anchor and the QC
+    /// over it, which every verifier reads too. A delta landing mid-build
+    /// must not turn the claim into a count its voters cannot derive.
+    #[test]
+    fn a_suffix_parent_claims_no_substate_total_with_or_without_its_delta() {
+        let (mut state, schedule, _, synced_five) = harvested_unexecuted_suffix();
+        // The suffix's own blocks claim the total behind them, as the
+        // retained committee produced them before the halt.
+        let five = Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                load: ShardLoad {
+                    substate_bytes: Some(4_096),
+                    ..ShardLoad::ZERO
+                },
+                ..synced_five.header().clone().into_parts()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        install_complete_block(&mut state, &five);
+        let snapshot = Arc::new(schedule.head().as_ref().clone().with_params(NetworkParams {
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 0,
+                split_fullness: u32::MAX,
+            },
+            ..NetworkParams::default()
+        }));
+        let schedule = TopologySchedule::single(Arc::clone(&snapshot));
+        let parent_anchor = state.block_anchor(five.hash()).expect("five is held");
+        let parent_qc = make_test_qc(five.hash(), BlockHeight::new(5));
+        assert!(schedule.recovery_suffix_band(
+            state.local_shard,
+            parent_anchor,
+            parent_qc.weighted_timestamp()
+        ));
+
+        for delta in [None, Some(64)] {
+            if let Some(delta) = delta {
+                state.pending_bytes_deltas.insert(five.hash(), delta);
+            }
+            assert_eq!(
+                state.proposal_substate_bytes(
+                    &schedule,
+                    &snapshot,
+                    five.hash(),
+                    parent_anchor,
+                    parent_qc.weighted_timestamp(),
+                ),
+                Ok(None),
+                "delta {delta:?}",
+            );
+        }
     }
 
     /// Once the harvest has sat `HALT_HARVEST_WAIT` without applying
