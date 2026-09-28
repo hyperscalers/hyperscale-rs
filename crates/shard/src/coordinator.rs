@@ -14372,6 +14372,10 @@ mod tests {
         assert_eq!(terminal(1_500, 900), Some(true));
         assert_eq!(terminal(900, 500), Some(false), "both inside");
         assert_eq!(terminal(1_600, 1_500), Some(false), "both past");
+        // A parent QC exactly on the cut has not crossed it: the block it
+        // anchors is a final-window block, and the one after it the terminal.
+        assert_eq!(terminal(1_000, 900), Some(false), "anchored on the cut");
+        assert_eq!(terminal(1_500, 1_000), Some(true), "after one on the cut");
     }
 
     /// The terminal alone carries the terminal settled root: neither a
@@ -14392,6 +14396,16 @@ mod tests {
         assert_eq!(carry(900, 500), Some(false), "a final-window block");
         assert_eq!(carry(1_500, 900), Some(true), "the terminal");
         assert_eq!(carry(1_600, 1_500), Some(false), "a coast block after it");
+        assert_eq!(
+            carry(1_000, 900),
+            Some(false),
+            "a final-window block anchored on the cut"
+        );
+        assert_eq!(
+            carry(1_500, 1_000),
+            Some(true),
+            "the terminal after a block anchored on the cut"
+        );
     }
 
     /// The terminal names a fate for every row the chain holds, each at

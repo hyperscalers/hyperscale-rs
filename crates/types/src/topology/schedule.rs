@@ -447,6 +447,14 @@ impl TopologySchedule {
     /// does, flagged `true`. A `wt` whose window carries no trace of the
     /// shard in any retained window resolves [`Evicted`](ScheduleLookup::Evicted)
     /// — it claims a committee no honest artifact can be attested by.
+    ///
+    /// A `wt` exactly on the shard's cut resolves the same final window
+    /// but is not past it: an anchor on a boundary belongs to the window
+    /// it closes ([`anchor_epoch_for`](Self::anchor_epoch_for)), which is
+    /// how the terminal-carry predicates read it. Were it flagged past,
+    /// the block anchored there would carry the final window's split
+    /// roots while the block after it failed the terminal test, and no
+    /// header of the chain would carry the terminal settled root.
     #[must_use]
     pub fn lookup_for_shard(
         &self,
@@ -456,8 +464,11 @@ impl TopologySchedule {
         match self.lookup_snapshot(wt) {
             ScheduleLookup::Committee(snapshot) if !snapshot.shard_trie().contains(shard) => self
                 .terminal_window(shard, wt)
-                .map_or((ScheduleLookup::Evicted, true), |(_, s)| {
-                    (ScheduleLookup::Committee(s), true)
+                .map_or((ScheduleLookup::Evicted, true), |(epoch, s)| {
+                    (
+                        ScheduleLookup::Committee(s),
+                        epoch != self.anchor_epoch_for(wt),
+                    )
                 }),
             other => (other, false),
         }
@@ -1779,6 +1790,41 @@ mod tests {
             sched.terminates_at_next_boundary(p, WeightedTimestamp::from_millis(6000)),
             Some(false)
         );
+    }
+
+    /// The past-terminal flag reads a boundary instant as the carry
+    /// predicates do: an anchor exactly on the cut resolves the final
+    /// window's committee and is not past it; anything later is.
+    #[test]
+    fn boundary_instant_anchor_is_not_past_the_terminal() {
+        let p = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let (left, right) = p.children();
+        let final_window = reshape_snap(&[p, sibling], &[p], &[], &[(p, 6)]);
+        let mut sched = TopologySchedule::new(
+            1000,
+            Epoch::new(5),
+            reshape_snap(&[p, sibling], &[p], &[], &[]),
+        );
+        sched.insert(Epoch::new(6), Arc::clone(&final_window));
+        sched.insert(
+            Epoch::new(7),
+            reshape_snap(&[left, right, sibling], &[], &[], &[]),
+        );
+
+        let on_cut = sched
+            .at_for_shard(p, WeightedTimestamp::from_millis(7000))
+            .expect("the final window is retained");
+        assert!(Arc::ptr_eq(on_cut.0, &final_window));
+        assert!(!on_cut.1);
+        assert!(!sched.past_terminal(p, WeightedTimestamp::from_millis(7000)));
+        let past = sched
+            .at_for_shard(p, WeightedTimestamp::from_millis(7001))
+            .expect("the final window is retained");
+        assert!(Arc::ptr_eq(past.0, &final_window));
+        assert!(past.1);
+        // A shard alive in the next window is never past a cut.
+        assert!(!sched.past_terminal(sibling, WeightedTimestamp::from_millis(7000)));
     }
 
     /// A pending split with no cut scheduled at this window's end is
