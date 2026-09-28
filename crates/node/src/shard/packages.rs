@@ -4,10 +4,13 @@
 //! An artifact's cell sits under its own content address, so a node that
 //! can name a package knows which shard is obliged to keep it and needs
 //! nothing global to ask. What it asks for is what something asked it to
-//! run: a derivation that could not resolve the code names it, the bytes
-//! come back, are verified by hashing them, and are installed into the
-//! engine and persisted beside the beacon store so a restart re-learns
-//! them instead of refetching the world.
+//! run: a derivation that could not resolve the code names it, or a
+//! committed tick waits on it. A store this node serves is asked first,
+//! since a store filled by an import or an adoption rather than by
+//! commits holds code the engine never saw, and a node alone on the
+//! custodian's committee has no peer to ask. Whatever no hosted store
+//! holds is fetched, verified by hashing it, and persisted beside the
+//! beacon store so a restart re-learns it instead of refetching the world.
 //!
 //! Acquisition says nothing about what may execute. An envelope naming
 //! code this node cannot resolve waits at the door rather than being
@@ -15,7 +18,7 @@
 //! the dispatch head — both local answers, neither a fact about the
 //! chain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
@@ -158,17 +161,29 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Ask for the artifacts an envelope's derivation named and this
-    /// node cannot resolve.
+    /// Acquire the code `packages` names that the engine cannot run yet:
+    /// from a store this node serves where one holds it, and from the
+    /// custodian's committee otherwise.
     ///
     /// A package reaches a node because something asked to run it, and
     /// which shard to ask follows from the content address alone.
     pub(crate) fn fetch_wanted_packages(&mut self, packages: Vec<Hash>) {
         let executor = Arc::clone(&self.process.dispatch_handles.executor);
+        let hosted = self.process.dispatch_handles.per_shard.load_full();
         let snapshot = self.process.topology_snapshot.load();
+        let mut held: Vec<(Hash, Vec<u8>)> = Vec::new();
         let mut by_shard: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
-        for package in packages {
-            if executor.needs_artifact(package) {
+        let wanted: BTreeSet<Hash> = packages.into_iter().collect();
+        for package in wanted {
+            if !executor.needs_artifact(package) {
+                continue;
+            }
+            if let Some(artifact) = hosted
+                .values()
+                .find_map(|handles| handles.storage.package_artifact(package))
+            {
+                held.push((package, artifact));
+            } else {
                 by_shard
                     .entry(snapshot.shard_trie().shard_for_prefix(custodian(package)))
                     .or_default()
@@ -176,6 +191,7 @@ where
             }
         }
         drop(snapshot);
+        self.install_artifacts(held);
         self.request_artifacts(by_shard);
     }
 
@@ -191,8 +207,17 @@ where
         }
     }
 
-    /// Install verified fetched artifacts: code into the engine, bytes
-    /// into the node-level cache a restart reconciles from.
+    /// Install verified fetched artifacts and retire their fetch.
+    pub(crate) fn handle_package_artifacts_fetched(&mut self, artifacts: Vec<(Hash, Vec<u8>)>) {
+        let ids: Vec<Hash> = artifacts.iter().map(|(package, _)| *package).collect();
+        self.install_artifacts(artifacts);
+        self.drive_fetch::<PackageArtifactBinding>(FetchInput::Admitted { ids });
+    }
+
+    /// Install artifacts already checked against their content address:
+    /// code into the engine, bytes into the node-level cache a restart
+    /// reconciles from, which outlives this node serving the store it
+    /// may have read them from.
     ///
     /// Both halves run off the shard loop. Admitting an artifact means
     /// clearing the deterministic wasm profile and parsing every export
@@ -200,21 +225,21 @@ where
     /// per artifact, at a transaction's whole byte budget each. The loop
     /// this would otherwise run on drives vnode state machines and
     /// consensus timers, and nothing here is on the path of a verdict:
-    /// the bytes were verified against their content address before this
-    /// was ever posted, and what waits on them waits at a door of this
-    /// node's own.
+    /// what waits on these bytes waits at a door of this node's own.
     ///
     /// The engine is the node's, not the shard's, so a host carrying
     /// several shards can be handed one artifact once per shard that
     /// asked for it. Installing is idempotent either way; skipping what
     /// the engine already holds is what keeps the second copy from
     /// paying for a full re-validation of bytes already judged.
-    pub(crate) fn handle_package_artifacts_fetched(&mut self, artifacts: Vec<(Hash, Vec<u8>)>) {
-        let ids: Vec<Hash> = artifacts.iter().map(|(package, _)| *package).collect();
+    fn install_artifacts(&self, artifacts: Vec<(Hash, Vec<u8>)>) {
+        if artifacts.is_empty() {
+            return;
+        }
+        let installed: Vec<Hash> = artifacts.iter().map(|(package, _)| *package).collect();
         let handles = Arc::clone(&self.process.dispatch_handles);
         let events = self.event_sender().clone();
         let shard = self.shard;
-        let installed = ids.clone();
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
@@ -238,7 +263,6 @@ where
                     },
                 );
             });
-        self.drive_fetch::<PackageArtifactBinding>(FetchInput::Admitted { ids });
     }
 
     /// Offer the envelopes that were waiting on `packages` again.
