@@ -5,6 +5,7 @@
 
 mod support;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1333,11 +1334,7 @@ fn halted_shard_straddler_atomic_seed_45_sim() {
 #[allow(clippy::too_many_lines)] // one scripted fault scenario end to end
 fn shard_fork_drives_committee_recovery_sim() {
     let setup = halt_straddler_setup();
-    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
-        &halt_recovery_config(),
-        11,
-        &setup.accounts,
-    );
+    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 11, &setup.accounts);
     // Grow to two children before injecting the fork. Recovering the sole
     // ROOT committee would starve beacon epoch production: in a single-shard
     // topology the beacon committee *is* the ROOT committee, so re-drawing it
@@ -1438,6 +1435,31 @@ fn shard_fork_drives_committee_recovery_sim() {
     let _votes_withheld = cluster.withhold(&members[..2], Withheld::Votes);
     cluster.run_until(epochs(1), |_| false);
 
+    // The retained chain above the attested boundary as the withheld votes
+    // froze it, read before a host co-seating a fresh member rebuilds its
+    // store at the anchor and the old blocks are gone from it.
+    let retained_suffix: BTreeMap<BlockHeight, BlockHash> = {
+        let storage = cluster
+            .runner()
+            .hosts_shard(
+                u32::try_from(committee[0]).expect("host index fits a node index"),
+                shard,
+            )
+            .expect("old committee host serves the shard");
+        let attested = cluster
+            .beacon_state()
+            .and_then(|state| state.boundaries.get(&shard).map(|b| b.height))
+            .expect("boundary recorded");
+        (attested.inner()..=storage.committed_height().inner())
+            .map(BlockHeight::new)
+            .filter_map(|height| {
+                storage
+                    .get_certified_header(height)
+                    .map(|certified| (height, certified.block_hash()))
+            })
+            .collect()
+    };
+
     // Inject on the real gossip ingress of a committee member. The fork-proof
     // gossip is global scope, so the silenced committee still relays it to the
     // beacon proposers that fold the recovery.
@@ -1536,50 +1558,47 @@ fn shard_fork_drives_committee_recovery_sim() {
         "the fresh committee's crossing must clear the fork recovery"
     );
 
-    // The fresh chain's first block extends the beacon-attested anchor — not
-    // either branch head, and not the retained committee's unattested suffix
-    // above the frontier.
-    let fresh_host = cluster
-        .committee_hosts(shard)
-        .into_iter()
-        .next()
-        .expect("recovered shard has a live committee host");
-    let storage = cluster
-        .runner()
-        .hosts_shard(
-            u32::try_from(fresh_host).expect("host index fits a node index"),
-            shard,
-        )
-        .expect("fresh committee host serves the shard");
-    let bridge = storage
-        .get_certified_header(BlockHeight::new(frontier.inner() + 1))
-        .expect("fresh chain holds its first block past the frontier");
-    assert_eq!(
-        bridge.header().parent_block_hash(),
-        anchor,
-        "the fresh chain must extend the beacon-attested anchor"
+    // A fresh member drawn onto a host that kept running the forked shard
+    // seats on a store rebuilt at the anchor, not on the loop's forked tip.
+    let recovered: BTreeSet<usize> = cluster.committee_hosts(shard).into_iter().collect();
+    assert!(
+        recovered.iter().any(|host| committee.contains(host)),
+        "the fresh committee must seat a member on a host that kept the forked \
+         shard; kept {committee:?}, recovered {recovered:?}",
     );
 
-    // The retained committee's own real suffix above the frontier is refused
-    // like the branch heads: the fresh chain re-produces `frontier + 1`
-    // rather than adopting the old committee's block there. A retained head
-    // above the beacon-attested anchor is unattestable — the incomers cannot
-    // know it is the branches' common prefix rather than one side's forgery.
-    let old_storage = cluster
-        .runner()
-        .hosts_shard(
-            u32::try_from(committee[0]).expect("host index fits a node index"),
-            shard,
-        )
-        .expect("old committee host still serves its stalled chain");
-    let old_block = old_storage
-        .get_certified_header(BlockHeight::new(frontier.inner() + 1))
+    // Every fresh replica's first block past the frontier extends the
+    // beacon-attested anchor — not either branch head, and not the retained
+    // committee's unattested suffix. The retained suffix is refused like the
+    // branch heads: the fresh chain re-produces `frontier + 1` rather than
+    // adopting the old committee's block there. A retained head above the
+    // beacon-attested anchor is unattestable — the incomers cannot know it
+    // is the branches' common prefix rather than one side's forgery.
+    let old_block = retained_suffix
+        .get(&BlockHeight::new(frontier.inner() + 1))
         .expect("the old chain committed past the frontier before the fork");
-    assert_ne!(
-        old_block.block_hash(),
-        bridge.block_hash(),
-        "the fresh chain must not adopt the retained suffix above the frontier"
-    );
+    for &host in &recovered {
+        let storage = cluster
+            .runner()
+            .hosts_shard(
+                u32::try_from(host).expect("host index fits a node index"),
+                shard,
+            )
+            .expect("fresh committee host serves the shard");
+        let bridge = storage
+            .get_certified_header(BlockHeight::new(frontier.inner() + 1))
+            .expect("fresh chain holds its first block past the frontier");
+        assert_eq!(
+            bridge.header().parent_block_hash(),
+            anchor,
+            "host {host}: the fresh chain must extend the beacon-attested anchor"
+        );
+        assert_ne!(
+            *old_block,
+            bridge.block_hash(),
+            "host {host}: the fresh chain must not adopt the retained suffix above the frontier"
+        );
+    }
 }
 
 /// Assert the seeded 50%-request-loss scenario at `seed`: the shared body's

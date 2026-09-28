@@ -467,6 +467,16 @@ impl ShardBootstrap {
         outcome
     }
 
+    /// Re-arm `request`'s work after it went unanswered, so the next
+    /// [`Self::next_requests`] asks for it again.
+    pub fn on_request_failure(&mut self, request: &BootstrapRequest) {
+        match request {
+            BootstrapRequest::StateRange(id, _) => self.on_state_range_failure(*id),
+            BootstrapRequest::WitnessHistory(_) => self.on_witness_history_failure(),
+            BootstrapRequest::History(height, _) => self.on_history_failure(*height),
+        }
+    }
+
     /// Feed one served response and write what it verified into
     /// `store`: a staged state chunk, or the history blocks its hash line
     /// reached. Returns whether the sequencer accepted it; a rejected
