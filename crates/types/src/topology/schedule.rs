@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    Anchor, BlockHeight, Epoch, EpochWindows, PriceTable, ReshapeThresholds, ShardAnchor, ShardId,
-    ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
+    Anchor, BlockHeight, Epoch, EpochWindows, PriceTable, RecoveryBinding, ReshapeThresholds,
+    ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
 /// Per-shard committees for request **routing**, terminal-clamped.
@@ -555,16 +555,11 @@ impl TopologySchedule {
         }
     }
 
-    /// The first epoch whose committee bridges `shard`'s halt gap — the
-    /// window after the head's pending recovery seated the fresh
-    /// committee — or `None` when no recovery is in flight.
-    ///
-    /// A halted chain's tip anchor is many windows stale, and the anchor's
-    /// window resolves the committee that halted. While a recovery is
-    /// pending, work anchored below this epoch binds to the fresh
-    /// committee instead (the recovery bridge); the record clears on the
-    /// shard's first crossing under the fresh committee, after which
-    /// anchors are current and resolution is ordinary again.
+    /// The bridge of the recovery in flight on `shard` — the window after
+    /// the head's pending recovery seated the fresh committee — or `None`
+    /// when none is. What a recovery in flight gates (the seating-window
+    /// quiesce, the harvest) reads this; committee resolution reads the
+    /// shard's bindings, which outlive it.
     #[must_use]
     pub fn recovery_bridge(&self, shard: ShardId) -> Option<Epoch> {
         self.head
@@ -573,16 +568,36 @@ impl TopologySchedule {
             .map(|recovery| recovery.rotated_at.next())
     }
 
-    /// The bridge epoch when live work anchored at `wt` rides `shard`'s
-    /// pending halt recovery: a recovery is in flight and `wt`'s epoch
-    /// sits below the bridge.
+    /// `shard`'s recovery bindings as the head folds them, oldest first.
+    /// Bridges increase along them and attested frontiers never decrease.
+    fn bindings(&self, shard: ShardId) -> impl DoubleEndedIterator<Item = RecoveryBinding> + '_ {
+        self.head.recovery_bindings(shard)
+    }
+
+    /// `shard`'s newest recovery, pending or not.
+    #[must_use]
+    pub fn newest_recovery(&self, shard: ShardId) -> Option<RecoveryBinding> {
+        self.bindings(shard).next_back()
+    }
+
+    /// The bridge live work anchored at `wt` binds through: the newest
+    /// recovery's, when `wt`'s epoch sits below it.
+    ///
+    /// A halted chain's tip anchor is many windows stale, and the anchor's
+    /// window resolves the committee that halted, so such work binds to
+    /// the fresh committee instead. The binding does not end when the
+    /// recovery completes: a fresh member still a QC behind the first
+    /// crossing holds a tip anchored before the halt, and resolving the
+    /// replaced committee for it would drop the very timeouts that carry
+    /// it forward. Anchors at or past the bridge resolve as ordinary.
     fn live_bridge(&self, shard: ShardId, wt: WeightedTimestamp) -> Option<Epoch> {
-        self.recovery_bridge(shard)
+        self.newest_recovery(shard)
+            .map(RecoveryBinding::bridge)
             .filter(|&bridge| self.epoch_for(wt) < bridge)
     }
 
-    /// Whether live work anchored at `wt` rides `shard`'s pending halt
-    /// recovery bridge — the band
+    /// Whether live work anchored at `wt` rides `shard`'s newest recovery
+    /// bridge — the band
     /// [`lookup_for_shard_live`](Self::lookup_for_shard_live) re-binds to
     /// the fresh committee. The one predicate every consumer reads
     /// (proposer gating, state-root deferral, the live lookup itself), so
@@ -608,11 +623,16 @@ impl TopologySchedule {
     /// A shuffle does not answer true here and must not: rotating a
     /// validator into or out of a shard changes later windows and leaves
     /// the one an old anchor names exactly as it was seated. Only a
-    /// recovery replaces a committee *retroactively*. Reads the certified
-    /// record rather than the pending one, so the answer does not flip
-    /// when the recovery clears on the shard's first crossing: a tick
-    /// unattestable during the recovery is unattestable after it, and a
-    /// replica that folded the clear must not start believing otherwise.
+    /// recovery replaces a committee *retroactively*. Reads every binding
+    /// the shard's history keeps, so the answer does not flip when a
+    /// recovery completes or a later one is seated: a tick unattestable
+    /// during a recovery is unattestable after it, and a replica that
+    /// folded either must not start believing otherwise.
+    ///
+    /// Any binding's band answers, not only the resolving one's: a tick
+    /// at or below some recovery's frontier resolves a committee that
+    /// recovery replaced, since frontiers never decrease along the
+    /// history and a newer binding re-binds only above its own.
     #[must_use]
     pub fn committee_replaced_for_anchored(
         &self,
@@ -620,47 +640,17 @@ impl TopologySchedule {
         anchor_wt: WeightedTimestamp,
         height: BlockHeight,
     ) -> bool {
-        self.certified_recovery(shard)
-            .is_some_and(|(bridge, frontier)| {
-                self.epoch_for(anchor_wt) < bridge && height <= frontier
-            })
+        let anchor = self.epoch_for(anchor_wt);
+        self.bindings(shard)
+            .any(|binding| anchor < binding.bridge() && height <= binding.attested_frontier)
     }
 
-    /// Whether the committee that certified a block of `shard` anchored
-    /// at `anchor_wt` under a QC stamped `qc_wt` is one a halt recovery
-    /// has replaced.
+    /// The attested frontier of the newest halt recovery `snapshot`
+    /// records for `shard`, where the block anchored at `anchor_wt` and
+    /// certified under a QC stamped `qc_wt` is that recovery's fresh
+    /// committee's.
     ///
-    /// Reads the band
-    /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified)
-    /// binds to the fresh committee, so the two never disagree about who
-    /// certified a block: a suffix block, anchored and certified below
-    /// the bridge, is the replaced committee's; a bridge block, anchored
-    /// below it but certified at or one skew window under it, is the
-    /// fresh committee's, as is everything anchored at the bridge or
-    /// past it.
-    ///
-    /// What makes this readable at a commit: a replica commits a block
-    /// only after resolving its certifying committee, and a fresh
-    /// committee resolves only through the bridge, so every replica that
-    /// commits a fresh-certified block holds the record this reads.
-    #[must_use]
-    pub fn committee_replaced_for_certified(
-        &self,
-        shard: ShardId,
-        anchor_wt: WeightedTimestamp,
-        qc_wt: WeightedTimestamp,
-    ) -> bool {
-        self.certified_recovery_bridge(shard).is_some_and(|bridge| {
-            self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge
-        })
-    }
-
-    /// The attested frontier of the halt recovery `snapshot` records for
-    /// `shard`, where the block anchored at `anchor_wt` and certified under
-    /// a QC stamped `qc_wt` is the fresh committee's.
-    ///
-    /// The band [`committee_replaced_for_certified`](Self::committee_replaced_for_certified)
-    /// reads, off a snapshot the caller names rather than the head, so a
+    /// Reads off a snapshot the caller names rather than the head, so a
     /// block-validity input reads one record on every replica: the
     /// snapshot governing the block's own anchor.
     #[must_use]
@@ -671,18 +661,9 @@ impl TopologySchedule {
         anchor_wt: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
     ) -> Option<BlockHeight> {
-        let (rotated_at, frontier) = snapshot
-            .pending_recoveries()
-            .get(&shard)
-            .map(|recovery| (recovery.rotated_at, recovery.attested_frontier))
-            .or_else(|| {
-                snapshot
-                    .latest_completed_recovery(shard)
-                    .map(|completed| (completed.rotated_at, completed.attested_frontier))
-            })?;
-        let bridge = rotated_at.next();
-        let replaced = self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge;
-        (!replaced).then_some(frontier)
+        let newest = snapshot.recovery_bindings(shard).next_back()?;
+        (!self.below_bridge_band(newest.bridge(), anchor_wt, qc_wt))
+            .then_some(newest.attested_frontier)
     }
 
     /// Whether a cross-shard artifact from `shard` at `height` is fenced by
@@ -736,14 +717,24 @@ impl TopologySchedule {
             .is_some_and(|bridge| self.below_bridge_band(bridge, anchor_wt, qc_wt))
     }
 
-    /// Whether a certified block of `shard` sits inside a halt recovery's
-    /// suffix band — anchored and certified below the bridge epoch — for a
-    /// recovery pending **or** completed. The same banding as
-    /// [`recovery_resolves_retained`](Self::recovery_resolves_retained),
-    /// held permanently through the completed record: a suffix block is
-    /// QC-attested but never locally executed on any replica that synced
-    /// it, and that stays true after the pending record clears on the
-    /// shard's first crossing.
+    /// Whether a certified block of `shard` sits inside some halt
+    /// recovery's suffix band — anchored and certified below its bridge —
+    /// which is to say its certifying committee is one a recovery
+    /// replaced.
+    ///
+    /// Mirrors [`lookup_for_shard_certified`](Self::lookup_for_shard_certified),
+    /// so the two never disagree about who certified a block: a suffix
+    /// block is the replaced committee's; a bridge block, anchored below a
+    /// bridge but certified at or one skew window under it, is that
+    /// recovery's fresh committee's until a later recovery's band takes it
+    /// in. A suffix block is QC-attested but never locally executed on a
+    /// replica that synced it, and every binding the history keeps holds
+    /// that answer through the recovery's completion and past later ones.
+    ///
+    /// What makes this readable at a commit: a replica commits a block
+    /// only after resolving its certifying committee, and a fresh
+    /// committee resolves only through its bridge, so every replica that
+    /// commits a fresh-certified block holds the binding this reads.
     #[must_use]
     pub fn recovery_suffix_band(
         &self,
@@ -751,12 +742,12 @@ impl TopologySchedule {
         anchor_wt: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
     ) -> bool {
-        self.certified_recovery_bridge(shard)
-            .is_some_and(|bridge| self.below_bridge_band(bridge, anchor_wt, qc_wt))
+        self.bindings(shard)
+            .any(|binding| self.below_bridge_band(binding.bridge(), anchor_wt, qc_wt))
     }
 
-    /// The suffix-band test shared by the pending and certified recovery
-    /// predicates: both the anchor and the QC stamp resolve below the
+    /// The suffix-band test the pending and the historical recovery
+    /// predicates share: both the anchor and the QC stamp resolve below the
     /// bridge epoch. A bridge block fails it — anchored below but
     /// certified at or past the bridge.
     fn below_bridge_band(
@@ -766,29 +757,6 @@ impl TopologySchedule {
         qc_wt: WeightedTimestamp,
     ) -> bool {
         self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge
-    }
-
-    /// The bridge epoch — the first whose committee bridges `shard`'s
-    /// halt gap — and the attested frontier of `shard`'s halt recovery,
-    /// pending or completed. Certified and anchored resolution read this
-    /// rather than [`recovery_bridge`](Self::recovery_bridge): a
-    /// committee binding must not change when the pending record clears
-    /// on the shard's first crossing, so the completed recovery keeps
-    /// answering for the band below it, permanently.
-    #[must_use]
-    pub fn certified_recovery(&self, shard: ShardId) -> Option<(Epoch, BlockHeight)> {
-        if let Some(recovery) = self.head.pending_recoveries().get(&shard) {
-            return Some((recovery.rotated_at.next(), recovery.attested_frontier));
-        }
-        self.head
-            .latest_completed_recovery(shard)
-            .map(|completed| (completed.bridge(), completed.attested_frontier))
-    }
-
-    /// The bridge epoch of
-    /// [`certified_recovery`](Self::certified_recovery).
-    fn certified_recovery_bridge(&self, shard: ShardId) -> Option<Epoch> {
-        self.certified_recovery(shard).map(|(bridge, _)| bridge)
     }
 
     /// The committee entry the recovery bridge resolves: the bridge
@@ -853,11 +821,11 @@ impl TopologySchedule {
     /// A tick at or below the frontier keeps the committee its anchor
     /// names: a certificate that committee formed before the halt may
     /// still be arriving late at a counterpart, and must verify there
-    /// however late. Reads the certified record — pending or completed —
-    /// for both the bridge and the frontier, so the binding does not
-    /// move when the record clears, and pins the bridge window's own
-    /// entry, so a mid-recovery top-up or a later shuffle never re-binds
-    /// it.
+    /// however late. Reads the newest binding in the shard's history
+    /// whose band holds the tick, for both the bridge and the frontier,
+    /// so the binding does not move when a recovery completes or a later
+    /// one is seated, and pins the bridge window's own entry, so a
+    /// mid-recovery top-up or a later shuffle never re-binds it.
     ///
     /// A shuffle alone never re-binds: rotating a validator into or out
     /// of a shard changes later windows and leaves the one an old anchor
@@ -870,11 +838,13 @@ impl TopologySchedule {
         anchor_wt: WeightedTimestamp,
         height: BlockHeight,
     ) -> (ScheduleLookup<'_>, bool) {
-        if let Some((bridge, frontier)) = self.certified_recovery(shard)
-            && self.epoch_for(anchor_wt) < bridge
-            && height > frontier
+        let anchor = self.epoch_for(anchor_wt);
+        if let Some(binding) = self
+            .bindings(shard)
+            .rev()
+            .find(|binding| anchor < binding.bridge() && height > binding.attested_frontier)
         {
-            return self.bridged_for_shard(shard, bridge);
+            return self.bridged_for_shard(shard, binding.bridge());
         }
         self.lookup_for_shard(shard, anchor_wt)
     }
@@ -897,11 +867,12 @@ impl TopologySchedule {
     /// or after it, and resolves the fresh committee; the halted suffix —
     /// certified while the old committee still governed, so its QC
     /// timestamps sit a full halt gap below the bridge — resolves by its
-    /// anchor as ever. The bridge outlives the pending record: once the
-    /// recovery completes, the completed-recovery epoch keeps the band
-    /// re-binding, so a replica that verifies or commits a bridge block
-    /// after the shard's first crossing binds it to the same committee as
-    /// one that processed it during the recovery. The QC bound tolerates
+    /// anchor as ever. The newest binding whose band holds the block
+    /// answers, and every binding outlives its pending record and later
+    /// recoveries, so a replica that verifies or commits a bridge block
+    /// after the shard's first crossing, or after a chained recovery,
+    /// binds it to the same committee as one that processed it during
+    /// the recovery. The QC bound tolerates
     /// one window below the bridge because the seating-window quiesce
     /// holds each honest vote at or past the bridge window, so an
     /// honest-majority quorum's mean stamp cannot fall more than a skew
@@ -929,9 +900,12 @@ impl TopologySchedule {
         anchor_wt: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
     ) -> (ScheduleLookup<'_>, bool) {
-        if let Some(bridge) = self.certified_recovery_bridge(shard)
-            && self.epoch_for(anchor_wt) < bridge
-            && self.epoch_for(qc_wt).next() >= bridge
+        let (anchor, certified) = (self.epoch_for(anchor_wt), self.epoch_for(qc_wt).next());
+        if let Some(bridge) = self
+            .bindings(shard)
+            .rev()
+            .map(RecoveryBinding::bridge)
+            .find(|&bridge| anchor < bridge && bridge <= certified)
         {
             return self.bridged_for_shard(shard, bridge);
         }
@@ -2208,23 +2182,23 @@ mod tests {
         assert!(!sched.committee_replaced_for_anchored(shard, bridge_qc, BlockHeight::GENESIS));
 
         assert!(
-            sched.committee_replaced_for_certified(shard, stale_anchor, suffix_qc),
+            sched.recovery_suffix_band(shard, stale_anchor, suffix_qc),
             "a suffix block is the replaced committee's"
         );
         for qc_wt in [edge_qc, bridge_qc] {
             assert!(
-                !sched.committee_replaced_for_certified(shard, stale_anchor, qc_wt),
+                !sched.recovery_suffix_band(shard, stale_anchor, qc_wt),
                 "a bridge block certified at {} is the fresh committee's",
                 qc_wt.as_millis()
             );
         }
-        assert!(!sched.committee_replaced_for_certified(shard, bridge_qc, bridge_qc));
+        assert!(!sched.recovery_suffix_band(shard, bridge_qc, bridge_qc));
 
         // Without a recovery nothing is replaced, whatever the anchor.
         let mut plain = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
         plain.insert(Epoch::new(21), snap(&fresh));
         assert!(!plain.committee_replaced_for_anchored(shard, stale_anchor, BlockHeight::GENESIS));
-        assert!(!plain.committee_replaced_for_certified(shard, stale_anchor, suffix_qc));
+        assert!(!plain.recovery_suffix_band(shard, stale_anchor, suffix_qc));
     }
 
     /// Anchored resolution splits the band below the bridge at the
@@ -2355,8 +2329,9 @@ mod tests {
     /// map), certified resolution still re-binds the bridge band to the
     /// fresh committee — pinned to the bridge window's own entry, so a
     /// post-recovery shuffle landing in a later entry never re-binds it —
-    /// while the suffix keeps its old committee, live resolution returns
-    /// to the plain anchor lookup, and the pending-scoped fences go inert.
+    /// while the suffix keeps its old committee, live work at a stale
+    /// anchor keeps binding the fresh committee, and the pending-scoped
+    /// fences go inert.
     #[test]
     fn recovery_bridge_binding_survives_the_pending_records_clear() {
         use crate::ValidatorInfo;
@@ -2431,10 +2406,18 @@ mod tests {
             ),
             old,
         );
-        // Live resolution is ordinary again once no recovery is pending.
+        // A tip still anchored before the halt keeps binding the fresh
+        // committee: a member one QC behind the first crossing must not
+        // resolve the committee the recovery replaced.
         assert_eq!(
             committee_of(sched.lookup_for_shard_live(shard, stale_anchor).0),
-            old,
+            fresh,
+        );
+        // Live work anchored at the bridge or past it resolves as ordinary.
+        let current = WeightedTimestamp::from_millis(23_500);
+        assert_eq!(
+            committee_of(sched.lookup_for_shard_live(shard, current).0),
+            shuffled,
         );
         // The pending-scoped fences do not outlive the recovery.
         assert!(!sched.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
@@ -2447,6 +2430,124 @@ mod tests {
         assert!(!sched.recovery_suffix_band(shard, stale_anchor, bridge_qc));
         // A shard with no recovery history has no band.
         assert!(!sched.recovery_suffix_band(ShardId::leaf(1, 1), stale_anchor, suffix_qc));
+    }
+
+    /// A recovery whose fresh committee stalls is followed by a second.
+    /// The first recovery's bridge blocks keep resolving the committee it
+    /// seated while the second is pending and after it completes; they sit
+    /// in the second recovery's suffix band; and live work at any stale
+    /// anchor binds the newest fresh committee.
+    #[test]
+    fn a_chained_recovery_keeps_the_first_bridge_bound() {
+        use crate::ValidatorInfo;
+
+        let validators: Vec<ValidatorInfo> = (0..12)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let set = ValidatorSet::new(validators);
+        let shard = ShardId::leaf(1, 0);
+        let old: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let first: Vec<ValidatorId> = (4..8).map(ValidatorId::new).collect();
+        let second: Vec<ValidatorId> = (8..12).map(ValidatorId::new).collect();
+        let snap = |committee: &[ValidatorId], second_completed: Option<bool>| {
+            let mut history = vec![RecoveryBinding {
+                rotated_at: Epoch::new(20),
+                attested_frontier: BlockHeight::new(10),
+                completed: false,
+            }];
+            let mut snapshot = TopologySnapshot::with_shard_committees(
+                NetworkDefinition::simulator(),
+                2,
+                &set,
+                std::iter::once((shard, committee.to_vec())).collect(),
+            );
+            if let Some(completed) = second_completed {
+                history.push(RecoveryBinding {
+                    rotated_at: Epoch::new(40),
+                    attested_frontier: BlockHeight::new(12),
+                    completed,
+                });
+                if !completed {
+                    snapshot = snapshot.with_pending_recoveries(
+                        std::iter::once((
+                            shard,
+                            halt_recovery_at(40, &first, BlockHeight::new(12)),
+                        ))
+                        .collect(),
+                    );
+                }
+            }
+            Arc::new(snapshot.with_recoveries(std::iter::once((shard, history)).collect()))
+        };
+        let committee_of = |lookup: ScheduleLookup<'_>| match lookup {
+            ScheduleLookup::Committee(snapshot) => snapshot.committee_for_shard(shard).to_vec(),
+            _ => panic!("expected a resolved committee"),
+        };
+        let stale_anchor = WeightedTimestamp::from_millis(2_500);
+        let first_bridge_qc = WeightedTimestamp::from_millis(21_100);
+        let first_era_anchor = WeightedTimestamp::from_millis(21_500);
+        let first_era_qc = WeightedTimestamp::from_millis(21_900);
+
+        for second_completed in [false, true] {
+            let mut sched = TopologySchedule::new(1000, Epoch::new(2), snap(&old, None));
+            sched.insert(Epoch::new(21), snap(&first, None));
+            let head = snap(&second, Some(second_completed));
+            sched.insert(Epoch::new(41), Arc::clone(&head));
+            sched.set_head(head);
+
+            // The first recovery's bridge block verifies against the
+            // committee that certified it.
+            assert_eq!(
+                committee_of(
+                    sched
+                        .lookup_for_shard_certified(shard, stale_anchor, first_bridge_qc)
+                        .0
+                ),
+                first,
+            );
+            // So does a block the first fresh committee certified in its
+            // own windows.
+            assert_eq!(
+                committee_of(
+                    sched
+                        .lookup_for_shard_certified(shard, first_era_anchor, first_era_qc)
+                        .0
+                ),
+                first,
+            );
+            // Both are the second recovery's suffix: the committee that
+            // certified them has been replaced.
+            assert!(sched.recovery_suffix_band(shard, stale_anchor, first_bridge_qc));
+            assert!(sched.recovery_suffix_band(shard, first_era_anchor, first_era_qc));
+            // A tick at the stale anchor above the first frontier is the
+            // first fresh committee's, and one that committee left behind;
+            // above the second, the second's.
+            for (height, committee, replaced) in [(11, &first, true), (13, &second, false)] {
+                let height = BlockHeight::new(height);
+                assert_eq!(
+                    committee_of(
+                        sched
+                            .lookup_for_shard_anchored(shard, stale_anchor, height)
+                            .0
+                    ),
+                    *committee,
+                );
+                assert_eq!(
+                    sched.committee_replaced_for_anchored(shard, stale_anchor, height),
+                    replaced,
+                );
+            }
+            // Live work at either era's anchor binds the newest committee.
+            for anchor in [stale_anchor, first_era_anchor] {
+                assert_eq!(
+                    committee_of(sched.lookup_for_shard_live(shard, anchor).0),
+                    second,
+                );
+            }
+        }
     }
 
     /// A window entry carrying an arbitrary reshape projection: which

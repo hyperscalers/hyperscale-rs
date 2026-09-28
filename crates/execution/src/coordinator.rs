@@ -3591,7 +3591,7 @@ impl ExecutionCoordinator {
         certified: &CertifiedBlock,
     ) -> Vec<TickId> {
         let local_shard = self.local_shard;
-        if topology_schedule.committee_replaced_for_certified(
+        if topology_schedule.recovery_suffix_band(
             local_shard,
             self.committed_committee_anchor_wt,
             certified.qc().weighted_timestamp(),
@@ -3899,7 +3899,10 @@ impl ExecutionCoordinator {
     /// once it appends again. A batch in flight is marked stale, so its
     /// completion records nothing.
     fn apply_recovery_floor(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        let Some((_, frontier)) = topology_schedule.certified_recovery(self.local_shard) else {
+        let Some(frontier) = topology_schedule
+            .newest_recovery(self.local_shard)
+            .map(|binding| binding.attested_frontier)
+        else {
             return Vec::new();
         };
         if frontier <= self.recovery_floor {
