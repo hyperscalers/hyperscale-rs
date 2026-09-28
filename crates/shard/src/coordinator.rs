@@ -2845,6 +2845,13 @@ impl ShardCoordinator {
             return vec![];
         }
         let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
+        // A genesis QC parents only the chain's first block. A member seated
+        // above its chain's origin with no QC yet — a recovery's fresh
+        // committee before it adopts the anchor QC — waits for that QC
+        // rather than build a block no honest validator accepts.
+        if parent_qc.is_genesis() && parent_qc.height().next() != height {
+            return vec![];
+        }
         // The block we build belongs to its parent's window — the same
         // committee `can_propose` drew our slot from and the same one every
         // verifier resolves for it. Its proposer schedule (missed-proposal
@@ -12078,7 +12085,16 @@ mod tests {
         // proposer_for(4, 4) = validator 0 (local).
         state.view_change.view = Round::new(4);
 
-        let block_3_hash = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
+        // Block 3 is the committed tip and its header is in memory, so the
+        // QC over it is adopted and the proposal extends it.
+        let block_3 = make_header_at_height(BlockHeight::new(3), 99_000);
+        let block_3_hash = block_3.hash();
+        state.committed_hash = block_3_hash;
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            block_3,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
 
         let qc = {
             let __qc = make_test_qc(block_3_hash, BlockHeight::new(3));
@@ -12141,7 +12157,16 @@ mod tests {
         let envelope_ms =
             u64::try_from((MAX_TIMESTAMP_DELAY + MAX_TIMESTAMP_RUSH).as_millis()).unwrap();
 
-        let block_3_hash = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
+        // Block 3 is the committed tip and its header is in memory, so the
+        // QC over it is adopted and the proposal extends it.
+        let block_3 = make_header_at_height(BlockHeight::new(3), 99_000);
+        let block_3_hash = block_3.hash();
+        state.committed_hash = block_3_hash;
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            block_3,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
         let base = make_test_qc(block_3_hash, BlockHeight::new(3));
         // SAFETY: synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(

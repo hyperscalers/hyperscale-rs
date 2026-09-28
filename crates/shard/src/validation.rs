@@ -164,6 +164,17 @@ pub fn validate_header(
             "genesis QC only valid for first block after committed height, got height {}",
             height.inner()
         ));
+    } else if header.parent_qc().height().next() != height {
+        // A genesis QC sits at its chain's origin height, directly below
+        // the chain's first block. Above that, a block has a real parent
+        // and must carry the QC certifying it; a genesis QC there would
+        // skip the quorum and linkage checks and anchor the block's
+        // validity window at the origin's weighted time.
+        return Err(format!(
+            "genesis QC at height {} cannot parent block height {}",
+            header.parent_qc().height().inner(),
+            height.inner()
+        ));
     }
 
     // The parent QC's `weighted_timestamp` anchors this block's
@@ -1012,6 +1023,29 @@ pub mod tests {
             provision_tx_roots: Capped::default(),
             ..Default::default()
         })
+    }
+
+    /// A genesis QC parents only its chain's first block. A block further up
+    /// the chain carrying one — a fresh committee proposing before it holds
+    /// a real QC — is rejected even when it sits one above the committed tip.
+    #[test]
+    fn a_genesis_qc_cannot_parent_a_block_above_the_origin() {
+        let now = LocalTimestamp::from_millis(1_000_000);
+        let first = header_at_height(BlockHeight::new(1), now.as_millis());
+        validate_header(None, None, local_shard(), &first, BlockHeight::GENESIS, now)
+            .expect("a genesis QC parents the chain's first block");
+
+        let above = header_at_height(BlockHeight::new(1165), now.as_millis());
+        let err = validate_header(
+            None,
+            None,
+            local_shard(),
+            &above,
+            BlockHeight::new(1164),
+            now,
+        )
+        .expect_err("a genesis QC cannot parent a block above the chain's origin");
+        assert!(err.contains("cannot parent"), "unexpected rejection: {err}");
     }
 
     #[test]
