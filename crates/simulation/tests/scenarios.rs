@@ -1241,11 +1241,7 @@ fn halt_recovery_config() -> ScenarioConfig {
 #[test]
 fn halted_shard_recovers_by_committee_redraw_sim() {
     let setup = halt_straddler_setup();
-    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
-        &halt_recovery_config(),
-        11,
-        &setup.accounts,
-    );
+    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 11, &setup.accounts);
     cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
 }
 
@@ -1271,11 +1267,7 @@ fn halted_shard_recovery_agrees_across_retained_and_fresh_sim() {
 /// the straddler's settlement against the re-draw differently.
 fn halted_shard_straddler_atomic_at_seed(seed: u64) {
     let setup = halt_straddler_setup();
-    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
-        &halt_recovery_config(),
-        seed,
-        &setup.accounts,
-    );
+    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), seed, &setup.accounts);
     cluster.run_faultable(halted_shard_straddler_atomic);
 }
 

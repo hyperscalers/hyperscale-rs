@@ -165,8 +165,10 @@ impl SimCluster {
     /// Build a genesis cluster giving each pool extra its own shard-less
     /// follower host rather than riding a committee host. This is a sim-only
     /// layout the shuffle-relocation tests (`vnode_relocation`, `pool_reseat`)
-    /// need: a rotated vnode must move onto a host not already serving the
-    /// destination shard, so every committee host stays single-shard. Portable
+    /// need: they follow a vnode onto a host not already serving the
+    /// destination shard, and a host whose only occupant is a pool follower.
+    /// A vnode drawn onto a host already serving its shard seats into the
+    /// running loop instead, which `co_hosted_seat` covers. Portable
     /// scenarios never need it — they express host packing through
     /// `vnodes_per_host` alone.
     #[must_use]
