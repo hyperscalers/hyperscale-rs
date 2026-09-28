@@ -1190,6 +1190,14 @@ impl VerificationPipeline {
     /// turned on which it had would split the replicas voting on the block.
     /// The band is read off every binding the shard's history keeps, so it
     /// holds after the recovery completes and past later ones.
+    ///
+    /// A block naming a [`substate_base`](BlockHeader::substate_base)
+    /// counts from that committed height instead of its parent's claim:
+    /// the verification parks on the ancestor there until this replica
+    /// commits it, then counts from its own committed tip, which gives the
+    /// proposer's total from any tip between the base and the parent. A
+    /// base above the parent, or a parent this replica has already
+    /// committed past, derives no total, so a claimed one is refused.
     #[allow(clippy::too_many_arguments)] // the walk's inputs beside the parent's anchors
     fn witness_substate_bytes(
         &self,
@@ -1222,12 +1230,44 @@ impl VerificationPipeline {
         {
             return Ok(None);
         }
-        count_source.count_behind(
+        let Some(base) = header.substate_base() else {
+            return count_source.count_behind(
+                committed_hash,
+                parent_hash,
+                pending_blocks,
+                &self.verified_certified_blocks,
+            );
+        };
+        let parent_height = header.height().prev().unwrap_or(BlockHeight::GENESIS);
+        if base > parent_height || count_source.committed_height > parent_height {
+            return Ok(None);
+        }
+        if count_source.committed_height < base {
+            return Err(self.ancestor_at(parent_hash, base, pending_blocks));
+        }
+        count_source.count_from_committed(
             committed_hash,
             parent_hash,
             pending_blocks,
             &self.verified_certified_blocks,
         )
+    }
+
+    /// The hash of `block_hash`'s ancestor at `height`, walking held
+    /// headers down from it — or the first block on the way whose header
+    /// is not held, which is what a caller parked on it waits for.
+    fn ancestor_at(
+        &self,
+        mut block_hash: BlockHash,
+        height: BlockHeight,
+        pending_blocks: &PendingBlocks,
+    ) -> BlockHash {
+        while let Some(header) = self.held_header(block_hash, pending_blocks)
+            && header.height() > height
+        {
+            block_hash = header.parent_block_hash();
+        }
+        block_hash
     }
 
     /// The parent header's reveal chain and the two committee anchors the
@@ -1516,6 +1556,53 @@ impl SubstateCountSource<'_> {
         };
         Ok(Some(
             behind_parent
+                .checked_add_signed(delta)
+                .expect("substate byte total must not go negative"),
+        ))
+    }
+
+    /// Substate count behind `parent_hash`'s post-state counted from the
+    /// committed tip: its persisted total plus the delta of every block
+    /// from the tip up to the parent. Deltas add up, so the answer is the
+    /// same from any committed tip on the parent's ancestry; what it needs
+    /// is every delta on the way.
+    ///
+    /// `Ok(None)` when the walk reaches the committed height without
+    /// meeting the committed tip: the parent is on another branch. `Err`
+    /// names what to park on, as [`Self::count_behind`] does: a block on
+    /// the way whose delta or header is missing, or the tip awaiting its
+    /// persistence reconcile.
+    pub(crate) fn count_from_committed(
+        &self,
+        committed_hash: BlockHash,
+        parent_hash: BlockHash,
+        pending_blocks: &PendingBlocks,
+        certified_blocks: &HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
+    ) -> Result<Option<u64>, BlockHash> {
+        if self.frontier.0 != self.committed_height {
+            return Err(committed_hash);
+        }
+        let mut delta = 0i64;
+        let mut hash = parent_hash;
+        while hash != committed_hash {
+            let header = pending_blocks
+                .get(hash)
+                .map(PendingBlock::header)
+                .or_else(|| {
+                    certified_blocks
+                        .get(&hash)
+                        .map(|certified| certified.block().header())
+                })
+                .ok_or(hash)?;
+            if header.height() <= self.committed_height {
+                return Ok(None);
+            }
+            delta += *self.deltas.get(&hash).ok_or(hash)?;
+            hash = header.parent_block_hash();
+        }
+        Ok(Some(
+            self.frontier
+                .1
                 .checked_add_signed(delta)
                 .expect("substate byte total must not go negative"),
         ))
@@ -2697,6 +2784,79 @@ mod tests {
     /// `SyncAdmitted`: QC-attested, never locally executed, so no delta
     /// ever lands for it. A fully delta'd pending chain resolves to the
     /// frontier count plus the deltas.
+    /// A block naming a committed base counts from it: every replica
+    /// whose committed tip sits between the base and the parent derives
+    /// the proposer's total, one below the base parks on the ancestor
+    /// there, and a base above the parent derives none.
+    #[test]
+    fn a_named_base_counts_from_any_tip_between_it_and_the_parent() {
+        let vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let schedule = dummy_schedule(&TestCommittee::new(4, 7).topology_snapshot(1));
+
+        // Heights 1..=3 over a committed genesis, none claiming a total —
+        // the out-of-play run a recovery's suffix leaves behind.
+        let genesis = bh(b"genesis");
+        let mut pending = PendingBlocks::new();
+        let mut hashes = vec![genesis];
+        for height in 1..=3 {
+            let block = block_claiming(
+                BlockHeight::new(height),
+                *hashes.last().expect("seeded"),
+                0,
+                vec![],
+                None,
+            );
+            hashes.push(block.hash());
+            let mut pb =
+                PendingBlock::from_complete_block(&block, vec![], vec![], LocalTimestamp::ZERO);
+            pb.construct_block()
+                .expect("complete block constructs cleanly");
+            pending.insert(pb);
+        }
+        let deltas = HashMap::from([(hashes[1], 10i64), (hashes[2], 20), (hashes[3], 30)]);
+        let parent = hashes[3];
+        let child = |base: u64| {
+            BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(4),
+                parent_block_hash: parent,
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                substate_base: Some(BlockHeight::new(base)),
+                ..Default::default()
+            })
+        };
+        let derive = |tip: usize, count: u64, header: &BlockHeader| {
+            let source = SubstateCountSource {
+                thresholds: ReshapeThresholds {
+                    split_bytes: 1_000,
+                    split_fullness: u32::MAX,
+                },
+                frontier: (BlockHeight::new(tip as u64), count),
+                committed_height: BlockHeight::new(tip as u64),
+                deltas: &deltas,
+            };
+            vp.witness_substate_bytes(
+                hashes[tip],
+                WeightedTimestamp::ZERO,
+                header,
+                &pending,
+                ShardId::ROOT,
+                &schedule,
+                &source,
+            )
+        };
+
+        // Proposed from a tip at height 1 holding 1_000: 1_000 + 20 + 30.
+        let named = child(1);
+        assert_eq!(derive(1, 1_000, &named), Ok(Some(1_050)));
+        // A replica that committed height 2 holds 1_020 there, and gets
+        // the same total with one delta left to add.
+        assert_eq!(derive(2, 1_020, &named), Ok(Some(1_050)));
+        // One still at genesis parks on the base's block until it commits.
+        assert_eq!(derive(0, 990, &named), Err(hashes[1]));
+        // A base above the parent derives nothing.
+        assert_eq!(derive(1, 1_000, &child(4)), Ok(None));
+    }
+
     #[test]
     fn count_behind_classifies_walk_blockers() {
         let committed_hash = bh(b"committed");

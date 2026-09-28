@@ -3,6 +3,8 @@
 use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::{BASIS_POINTS, DeclaredWork, FiveWay, Utilization};
 
+use crate::BlockHeight;
+
 /// What a block attests about its shard's load: what the chain has
 /// consumed, what its blocks reserved, and the state it holds.
 ///
@@ -112,6 +114,29 @@ impl ShardLoad {
             blocks: self.blocks.saturating_add(1),
             substate_bytes,
         }
+    }
+}
+
+/// What a block claims of the substate byte total behind its parent.
+///
+/// The total, or `None` where the reshape predicate is out of play, and
+/// the committed height it is counted from when the parent claims none
+/// ([`BlockHeader::substate_base`]).
+///
+/// [`BlockHeader::substate_base`]: crate::BlockHeader::substate_base
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubstateClaim {
+    /// The total behind the parent's post-state.
+    pub bytes: Option<u64>,
+    /// The committed height `bytes` is counted from.
+    pub base: Option<BlockHeight>,
+}
+
+impl SubstateClaim {
+    /// A total that follows from the parent's claim.
+    #[must_use]
+    pub const fn following(bytes: Option<u64>) -> Self {
+        Self { bytes, base: None }
     }
 }
 

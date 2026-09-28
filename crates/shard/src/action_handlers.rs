@@ -39,13 +39,14 @@ use hyperscale_types::{
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, Resolutions, RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad,
     SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext, Stopwatch,
-    StoredReceipt, SubstateKey, SweepFrontier, TickManifest, TickManifestRoot, Timeout,
-    TimeoutContext, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash,
-    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells,
-    commit_witness_window, derive_leaves, fees_over_certificates, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
-    signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
+    StoredReceipt, SubstateClaim, SubstateKey, SweepFrontier, TickManifest, TickManifestRoot,
+    Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
+    TransactionRootContext, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
+    VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
+    WitnessSources, absorb_committed_cells, commit_witness_window, derive_leaves,
+    fees_over_certificates, local_settled_tx_hashes, missed_proposals_since_prev_commit,
+    next_reveal_chain, protocol_statics, shard_reveal_sign, signed_bytes,
+    verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 use hyperscale_vm_effects::{ProtocolHasher, fee_hold_total_key};
 
@@ -239,7 +240,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
     parent_load: Option<ShardLoad>,
-    substate_bytes: Option<u64>,
+    substate: SubstateClaim,
     ready_signals: Capped<Vec<ReadySignal>, MAX_READY_SIGNALS_PER_BLOCK>,
     reshape_trigger: Option<ReshapeTrigger>,
     randomness_reveal: VrfProof,
@@ -462,7 +463,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
             topology_snapshot.shard_trie(),
             local_shard,
         ),
-        substate_bytes,
+        substate.bytes,
     );
 
     // What departed shards left unresolved, committed so a verdict on it
@@ -505,6 +506,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         split_child_roots,
         terminal_settled_txs,
         load,
+        substate_base: substate.base,
     });
 
     let block = Block::Live {
@@ -1348,7 +1350,7 @@ where
             parent_settled_frontier,
             parent_sweep_frontier,
             parent_load,
-            substate_bytes,
+            substate,
             ready_signals,
             reshape_trigger,
             parent_witness_leaves,
@@ -1588,7 +1590,7 @@ where
                 parent_settled_frontier,
                 parent_sweep_frontier,
                 parent_load,
-                substate_bytes,
+                substate,
                 ready_signals,
                 reshape_trigger,
                 randomness_reveal,

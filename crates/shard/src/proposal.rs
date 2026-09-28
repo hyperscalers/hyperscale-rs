@@ -23,8 +23,8 @@ use hyperscale_types::{
     Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
     ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, TopologySnapshot, Transaction, UnsettledTx,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, TopologySnapshot, Transaction,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
@@ -482,7 +482,7 @@ pub fn assemble_build_action(
     classification_topology_snapshot: Arc<TopologySnapshot>,
     fee_checks: Vec<FeeDemand>,
     fee_span: FeeSpan,
-    substate_bytes: Option<u64>,
+    substate: SubstateClaim,
     windows: EpochWindows,
     manifest: ManifestInputs,
 ) -> BuildActionPlan {
@@ -566,7 +566,7 @@ pub fn assemble_build_action(
         parent_settled_frontier,
         parent_sweep_frontier,
         parent_load,
-        substate_bytes,
+        substate,
         ready_signals,
         reshape_trigger,
         parent_witness_leaves,
