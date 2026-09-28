@@ -25,7 +25,7 @@ use hyperscale_types::{
 use tracing::{debug, warn};
 
 use crate::rules;
-use crate::shard_source::ShardSourceTracker;
+use crate::shard_source::{ObservedCrossing, ShardSourceTracker};
 
 /// Whether every boundary QC a peer proposes is admissible.
 ///
@@ -110,8 +110,7 @@ pub(crate) fn source_boundary_qcs(
     sourced
         .into_iter()
         .filter_map(|shard| {
-            let watermark = state.fold_watermark(shard);
-            let crossing = shard_source.next_crossing_to_source(shard, watermark)?;
+            let crossing = crossing_to_source(state, shard_source, shard)?;
             let qc = crossing.canonical_qc();
             let split_parent_terminal = crossing.boundary_header().split_child_roots().is_some();
             let folded = state
@@ -139,6 +138,27 @@ pub(crate) fn source_boundary_qcs(
                 .then(|| (shard, Some(qc.clone())))
         })
         .collect()
+}
+
+/// The crossing `shard`'s boundary QC and witness chunk are sourced from:
+/// the tracker's pick against the fold watermark, among the crossings the
+/// fold would take as a contribution — the test admission applies.
+pub(crate) fn crossing_to_source<'a>(
+    state: &BeaconState,
+    shard_source: &'a ShardSourceTracker,
+    shard: ShardId,
+) -> Option<&'a ObservedCrossing> {
+    let windows = state.chain_config.epoch_windows();
+    shard_source.next_crossing_to_source(shard, state.fold_watermark(shard), |crossing| {
+        rules::contributed_epoch(
+            state,
+            shard,
+            crossing.boundary_header(),
+            crossing.canonical_qc(),
+            windows,
+        )
+        .is_some()
+    })
 }
 
 /// Assemble this epoch's per-shard boundary contributions — the canonical

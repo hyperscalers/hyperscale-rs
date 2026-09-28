@@ -488,18 +488,25 @@ impl ShardSourceTracker {
     /// back to the latest, so a terminated shard's folded terminal keeps being
     /// sourced for merge composition — the caller's `crossing_fully_folded`
     /// gate drops it for a live shard.
+    ///
+    /// Only crossings `contributes` accepts are candidates. A terminating
+    /// chain coasts past its terminal until its successors are live, and a
+    /// coast long enough to cross another boundary records a crossing newer
+    /// than the terminal that no fold admits; sourcing it would have every
+    /// verifier abstain on the proposal carrying it.
     #[must_use]
     pub fn next_crossing_to_source(
         &self,
         shard: ShardId,
         watermark: u64,
+        contributes: impl Fn(&ObservedCrossing) -> bool,
     ) -> Option<&ObservedCrossing> {
         let per_shard = self.boundary_crossings.get(&shard)?;
-        per_shard
-            .values()
-            .rev()
+        let mut candidates = per_shard.values().rev().filter(|c| contributes(c));
+        let latest = candidates.clone().next();
+        candidates
             .find(|c| c.boundary_header().beacon_witness_leaf_count().inner() > watermark)
-            .or_else(|| per_shard.values().next_back())
+            .or(latest)
     }
 
     /// Called by the coordinator when a commit rotates the local
@@ -908,6 +915,44 @@ mod tests {
             crossing.canonical_qc().weighted_timestamp(),
             WeightedTimestamp::from_millis(1_600),
         );
+    }
+
+    /// A chain that coasts past its terminal into the next epoch records a
+    /// crossing newer than the terminal. A caller that refuses it is
+    /// handed the terminal, whatever the watermark says of either.
+    #[test]
+    fn next_crossing_to_source_passes_over_a_refused_crossing() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 7);
+        let terminal = linked_header_settling(
+            shard(0),
+            3,
+            2,
+            b.block_hash(),
+            1_500,
+            7,
+            Some(SettledTxsRoot::ZERO),
+        );
+        let coast = linked_header(shard(0), 4, 3, terminal.block_hash(), 1_600, 7);
+        let across = linked_header(shard(0), 5, 4, coast.block_hash(), 2_500, 7);
+        let above = linked_header(shard(0), 6, 5, across.block_hash(), 2_600, 7);
+        for header in [&b, &terminal, &coast, &across, &above] {
+            note(&mut t, header, 1_000);
+        }
+        let terminal_only = |c: &ObservedCrossing| c.boundary_header().settled_txs_root().is_some();
+        for watermark in [0, 7] {
+            assert_eq!(
+                t.next_crossing_to_source(shard(0), watermark, |_| true)
+                    .map(|c| c.boundary_header().hash()),
+                Some(coast.block_hash()),
+                "the coast crossing is the newest",
+            );
+            assert_eq!(
+                t.next_crossing_to_source(shard(0), watermark, terminal_only)
+                    .map(|c| c.boundary_header().hash()),
+                Some(terminal.block_hash()),
+            );
+        }
     }
 
     /// A `(B, C)` pair whose rounds gap — a view change between them —

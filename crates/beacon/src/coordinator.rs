@@ -1928,9 +1928,10 @@ impl BeaconCoordinator {
     /// run at the fold's per-epoch budget, which bounds the work one
     /// header can trigger.
     fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
-        let watermark = self.state.fold_watermark(shard);
         let (anchor, block_height, prior, chunk_end) = {
-            let Some(crossing) = self.shard_source.next_crossing_to_source(shard, watermark) else {
+            let Some(crossing) =
+                boundary::crossing_to_source(&self.state, &self.shard_source, shard)
+            else {
                 return Vec::new();
             };
             let boundary_header = crossing.boundary_header();
