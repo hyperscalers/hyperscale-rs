@@ -1450,7 +1450,7 @@ impl ShardCoordinatorSim {
                 parent_settled_frontier,
                 parent_sweep_frontier,
                 parent_load,
-                substate_bytes,
+                substate,
                 ready_signals,
                 reshape_trigger,
                 parent_witness_leaves,
@@ -1590,7 +1590,7 @@ impl ShardCoordinatorSim {
                     parent_settled_frontier,
                     parent_sweep_frontier,
                     parent_load,
-                    substate_bytes,
+                    substate,
                     Capped::new(ready_signals).expect("a list written out in a test"),
                     reshape_trigger,
                     // Sign a genuine reveal with the proposer's key so the

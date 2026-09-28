@@ -187,7 +187,7 @@ pub use shard::limits::{
     budget_admits_block, caps_admit_transaction, drain_admits_block, evidence_admits_block,
     state_claims_admit_block, sweep_admits_block, tick_manifest_admits_block,
 };
-pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad};
+pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad, SubstateClaim};
 pub use shard::manifest::{BlockManifest, BlockMetadata};
 pub use shard::proven_anchors::ProvenAnchors;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};

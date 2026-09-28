@@ -22,9 +22,10 @@ use hyperscale_types::{
     RevealChain, Round, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
     SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
     SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot,
-    SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx,
-    ValidatorId, Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
+    SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -1091,9 +1092,10 @@ pub enum Action {
         /// Committed substate byte total behind the parent's post-state —
         /// the level this block attests, resolved by the coordinator ahead
         /// of the build so the header and the reshape assertion it carries
-        /// agree on one value. `None` takes the reshape predicate out of
+        /// agree on one value — and the committed height it is counted
+        /// from, if any. A `None` total takes the reshape predicate out of
         /// play, and the header states that absence rather than guessing.
-        substate_bytes: Option<u64>,
+        substate: SubstateClaim,
         /// Number of transactions finalized by finalizations in this block.
         /// Dwell-eligible [`ReadySignal`]s drained from the proposer's pool
         /// for inclusion in the block's manifest. Beacon's `Ready` witness

@@ -20,8 +20,8 @@ use hyperscale_types::{
     Deadline, DeferOn, Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
     MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash,
     ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary,
-    StateClaim, StoredReceipt, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
-    WindowLookup, derive_reshape_trigger, ready_signal_window,
+    StateClaim, StoredReceipt, SubstateClaim, SubstateKey, TxsInFlight, VerificationKind,
+    WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -2643,6 +2643,12 @@ impl ShardCoordinator {
     /// the tip's persistence reconcile — is still outstanding; the caller
     /// defers the build and retries, mirroring the verifier's park on the
     /// same gap.
+    ///
+    /// A parent claiming no total leaves the recurrence nothing to advance,
+    /// so the count re-anchors on the committed tip: its persisted total
+    /// plus every delta up to the parent, naming the tip as the block's
+    /// base. Missing any of those, the block claims none, as its parent
+    /// did, and a later one re-anchors.
     fn proposal_substate_bytes(
         &self,
         topology_schedule: &TopologySchedule,
@@ -2650,7 +2656,7 @@ impl ShardCoordinator {
         parent_block_hash: BlockHash,
         parent_anchor_wt: WeightedTimestamp,
         parent_qc_wt: WeightedTimestamp,
-    ) -> Result<Option<u64>, BlockHash> {
+    ) -> Result<SubstateClaim, BlockHash> {
         let thresholds = topology_snapshot.reshape_thresholds();
         if thresholds == ReshapeThresholds::DISABLED
             || topology_schedule.recovery_suffix_band(
@@ -2659,7 +2665,7 @@ impl ShardCoordinator {
                 parent_qc_wt,
             )
         {
-            return Ok(None);
+            return Ok(SubstateClaim::default());
         }
         let count_source = SubstateCountSource {
             thresholds,
@@ -2667,12 +2673,28 @@ impl ShardCoordinator {
             committed_height: self.committed_height,
             deltas: &self.pending_bytes_deltas,
         };
-        count_source.count_behind(
+        let certified = self.verification.verified_certified_blocks();
+        if let Some(bytes) = count_source.count_behind(
             self.committed_hash,
             parent_block_hash,
             &self.pending_blocks,
-            self.verification.verified_certified_blocks(),
-        )
+            certified,
+        )? {
+            return Ok(SubstateClaim::following(Some(bytes)));
+        }
+        Ok(count_source
+            .count_from_committed(
+                self.committed_hash,
+                parent_block_hash,
+                &self.pending_blocks,
+                certified,
+            )
+            .ok()
+            .flatten()
+            .map_or_else(SubstateClaim::default, |bytes| SubstateClaim {
+                bytes: Some(bytes),
+                base: Some(self.committed_height),
+            }))
     }
 
     /// The reshape assertion for a proposal: the load predicate over the
@@ -2891,14 +2913,14 @@ impl ShardCoordinator {
         // build — the verifier parks on the same gap — rather than emitting
         // a header whose omitted assertion every replica recomputes as
         // required and rejects.
-        let substate_bytes = match self.proposal_substate_bytes(
+        let substate = match self.proposal_substate_bytes(
             topology_schedule,
             committee,
             parent_block_hash,
             committee_anchor_wt,
             parent_qc.weighted_timestamp(),
         ) {
-            Ok(count) => count,
+            Ok(claim) => claim,
             Err(blocking) => {
                 trace!(
                     validator = ?self.me,
@@ -2921,7 +2943,7 @@ impl ShardCoordinator {
             committee,
             parent_qc.weighted_timestamp(),
             parent_block_hash,
-            substate_bytes,
+            substate.bytes,
             committee_anchor_epoch,
         );
 
@@ -2992,7 +3014,7 @@ impl ShardCoordinator {
             Arc::clone(committee),
             fee_checks,
             fee_span,
-            substate_bytes,
+            substate,
             topology_schedule.windows(),
             manifest,
         );
@@ -11525,6 +11547,49 @@ mod tests {
         (state, schedule, four, five)
     }
 
+    /// A parent claiming no substate total re-anchors its child's count on
+    /// the committed tip: the tip's persisted total plus the parent's
+    /// delta, naming the tip as the base. Without the parent's delta the
+    /// child claims none, as its parent did.
+    #[test]
+    fn a_parent_claiming_no_total_re_anchors_on_the_committed_tip() {
+        let (mut state, schedule) = make_test_state();
+        let snapshot = Arc::new(schedule.head().as_ref().clone().with_params(NetworkParams {
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 1 << 40,
+                split_fullness: u32::MAX,
+            },
+            ..NetworkParams::default()
+        }));
+        let schedule = TopologySchedule::single(Arc::clone(&snapshot));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"committed_3"));
+        state.seed_substate_bytes_frontier(BlockHeight::new(3), 4_096);
+        let parent = block_chained_on(BlockHeight::new(4), state.committed_hash, 100);
+        assert_eq!(parent.header().load().substate_bytes, None);
+        install_complete_block(&mut state, &parent);
+        let claim = |state: &ShardCoordinator| {
+            state.proposal_substate_bytes(
+                &schedule,
+                &snapshot,
+                parent.hash(),
+                WeightedTimestamp::from_millis(100),
+                WeightedTimestamp::from_millis(200),
+            )
+        };
+
+        assert_eq!(claim(&state), Ok(SubstateClaim::default()));
+
+        state.pending_bytes_deltas.insert(parent.hash(), 64);
+        assert_eq!(
+            claim(&state),
+            Ok(SubstateClaim {
+                bytes: Some(4_160),
+                base: Some(BlockHeight::new(3)),
+            })
+        );
+    }
+
     /// A proposal on a synced suffix block claims no substate total,
     /// whether or not this member has executed that block yet: the
     /// suffix band decides it, read off the parent's anchor and the QC
@@ -11580,7 +11645,7 @@ mod tests {
                     parent_anchor,
                     parent_qc.weighted_timestamp(),
                 ),
-                Ok(None),
+                Ok(SubstateClaim::default()),
                 "delta {delta:?}",
             );
         }

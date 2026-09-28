@@ -164,6 +164,14 @@ pub struct BlockHeader {
     /// committed load carries the committee's quorum behind it. See
     /// [`ShardLoad`].
     load: ShardLoad,
+    /// The committed height `load`'s substate total is counted from, when
+    /// the parent's own claim is absent: the persisted total there plus
+    /// every block's delta up to the parent. `None` on a block whose
+    /// total, if any, follows from its parent's claim. A verifier derives
+    /// the same total from its own committed tip once that tip reaches
+    /// this height, so the count resumes past a recovery's suffix, whose
+    /// total no replica can derive, without any replica guessing it.
+    substate_base: Option<BlockHeight>,
 }
 
 /// Every field of a [`BlockHeader`], named.
@@ -209,6 +217,7 @@ pub struct BlockHeaderParts {
     pub split_child_roots: Option<SplitChildRoots>,
     pub terminal_settled_txs: Option<SettledTxsRoot>,
     pub load: ShardLoad,
+    pub substate_base: Option<BlockHeight>,
 }
 
 impl Default for BlockHeaderParts {
@@ -243,6 +252,7 @@ impl Default for BlockHeaderParts {
             split_child_roots: None,
             terminal_settled_txs: None,
             load: ShardLoad::ZERO,
+            substate_base: None,
         }
     }
 }
@@ -281,6 +291,7 @@ impl BlockHeader {
             split_child_roots,
             terminal_settled_txs,
             load,
+            substate_base,
         } = parts;
         Self {
             shard_id,
@@ -311,6 +322,7 @@ impl BlockHeader {
             split_child_roots,
             terminal_settled_txs,
             load,
+            substate_base,
         }
     }
 
@@ -726,6 +738,13 @@ impl BlockHeader {
         self.load
     }
 
+    /// The committed height this block's substate total is counted from,
+    /// when its parent claims none.
+    #[must_use]
+    pub const fn substate_base(&self) -> Option<BlockHeight> {
+        self.substate_base
+    }
+
     /// The running values a block extending this one is checked against.
     #[must_use]
     pub const fn committed_tip(&self) -> CommittedTip {
@@ -775,6 +794,7 @@ impl BlockHeader {
             split_child_roots: self.split_child_roots,
             terminal_settled_txs: self.terminal_settled_txs,
             load: self.load,
+            substate_base: self.substate_base,
         }
     }
 
