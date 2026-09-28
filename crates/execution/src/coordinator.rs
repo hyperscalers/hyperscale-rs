@@ -250,15 +250,17 @@ enum Queued {
 }
 
 impl PendingTick {
-    /// Whether every package this tick's members run resolves on this
+    /// The packages this tick's members run that do not resolve on this
     /// node.
-    fn runnable(&self, code: &dyn CodeAvailability) -> bool {
-        self.requests.iter().all(|request| {
-            request
-                .transaction
-                .as_ref()
-                .is_none_or(|body| body.packages().iter().all(|package| code.can_run(*package)))
-        })
+    fn missing_code(&self, code: &dyn CodeAvailability) -> Vec<Hash> {
+        let missing: BTreeSet<Hash> = self
+            .requests
+            .iter()
+            .filter_map(|request| request.transaction.as_ref())
+            .flat_map(|body| body.packages().iter().copied())
+            .filter(|package| !code.can_run(*package))
+            .collect();
+        missing.into_iter().collect()
     }
 }
 
@@ -3996,15 +3998,18 @@ impl ExecutionCoordinator {
         // Asked of the engine rather than read off a set kept in step
         // with it. A set has to be seeded, and a shard seated mid-epoch
         // is handed ticks before anything has seeded it; asking leaves
-        // nothing to seed. The next commit seats and dispatches
-        // again, which is what retries a tick held here.
-        if !head.runnable(self.code.as_ref()) {
+        // nothing to seed. The held tick names what it waits on, so its
+        // code is sought whatever else did or did not ask for it, and the
+        // next commit seats and dispatches again, which is what retries
+        // a tick held here.
+        let missing = head.missing_code(self.code.as_ref());
+        if !missing.is_empty() {
             tracing::debug!(
                 shard = %self.local_shard,
                 tick = %head.tick,
                 "Holding a tick whose members run code this node has not fetched"
             );
-            return Vec::new();
+            return vec![Action::Fetch(FetchRequest::Packages { wanted: missing })];
         }
         let Some(Queued::Run(tick)) = self.pending_ticks.pop_front() else {
             return Vec::new();
@@ -4967,7 +4972,8 @@ mod tests {
     ///
     /// Nothing reports the shortfall beforehand: the coordinator is
     /// asked, which is all a shard seated mid-epoch and handed a tick
-    /// has to go on.
+    /// has to go on. The held tick names the code it waits on, so the
+    /// fetch does not hang on whatever else asked for it.
     #[test]
     fn a_tick_waits_at_the_dispatch_head_for_code_this_node_lacks() {
         let package = Hash::from_bytes(b"a package this node has not fetched");
@@ -4997,6 +5003,13 @@ mod tests {
         assert!(
             state.ticks.tick_assignment(tx_hash).is_some(),
             "the tick is composed regardless — only its dispatch waits"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch(FetchRequest::Packages { wanted }) if *wanted == [package]
+            )),
+            "the held tick asks for the code it waits on"
         );
 
         // The fetch lands. Nothing reports it: the next commit seats

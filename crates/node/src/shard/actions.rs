@@ -673,6 +673,7 @@ where
                     });
                 }
             }
+            FetchRequest::Packages { wanted } => self.fetch_wanted_packages(wanted),
         }
     }
 

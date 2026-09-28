@@ -17,7 +17,9 @@
 //! variants retain `(source_shard, block_height)` because that scope IS
 //! the fetch key (no id-set to enumerate).
 
-use hyperscale_types::{Anchor, MessageClass, ShardId, SubstateKey, TerminalEvidence, ValidatorId};
+use hyperscale_types::{
+    Anchor, Hash, MessageClass, ShardId, SubstateKey, TerminalEvidence, ValidatorId,
+};
 
 use crate::FetchIds;
 
@@ -103,5 +105,13 @@ pub enum FetchRequest {
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
+    },
+    /// The code a committed tick waits on at the dispatch head. The node
+    /// takes each package from a store it serves where one holds it, and
+    /// asks the committee its content address names otherwise, so no
+    /// routing shard rides here.
+    Packages {
+        /// Packages the head tick's members run and this node cannot.
+        wanted: Vec<Hash>,
     },
 }
