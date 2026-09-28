@@ -418,6 +418,15 @@ where
         self.shards.get(&shard).map_or(0, |g| g.vnodes.len())
     }
 
+    /// The validators seated on `shard`'s loop, in vnode order; empty if
+    /// `shard` isn't hosted. A seat still queued is not among them.
+    #[must_use]
+    pub fn seated_validators(&self, shard: ShardId) -> Vec<ValidatorId> {
+        self.shards.get(&shard).map_or_else(Vec::new, |g| {
+            g.vnodes.iter().map(|v| v.validator_id).collect()
+        })
+    }
+
     /// Shard consensus statistics of every vnode hosted in `shard`, in
     /// vnode order; empty if `shard` isn't hosted.
     #[must_use]
