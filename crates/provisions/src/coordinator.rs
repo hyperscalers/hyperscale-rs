@@ -1344,7 +1344,7 @@ mod tests {
     ) -> Vec<Action> {
         coordinator
             .fork_fence
-            .engage(shard, fork_height, &BTreeMap::new())
+            .engage(shard, fork_height, None)
             .map_or_else(Vec::new, |frontier| {
                 coordinator.on_fork_fenced(shard, frontier)
             })
@@ -1441,20 +1441,21 @@ mod tests {
 
     /// A head-only schedule whose `shard` carries a completed recovery.
     fn sched_recovered(shard: ShardId, frontier: BlockHeight) -> TopologySchedule {
-        use hyperscale_types::{CompletedRecovery, Epoch};
+        use hyperscale_types::{Epoch, RecoveryBinding};
         TopologySchedule::single(Arc::new(
             TopologySnapshot::new(
                 NetworkDefinition::simulator(),
                 1,
                 ValidatorSet::new(Vec::new()),
             )
-            .with_completed_recoveries(
+            .with_recoveries(
                 std::iter::once((
                     shard,
-                    CompletedRecovery {
+                    vec![RecoveryBinding {
                         rotated_at: Epoch::new(2),
                         attested_frontier: frontier,
-                    },
+                        completed: true,
+                    }],
                 ))
                 .collect(),
             ),
@@ -1502,7 +1503,7 @@ mod tests {
         assert_eq!(
             coordinator
                 .fork_fence
-                .clear_completed(recovered.head().completed_recoveries()),
+                .clear_completed(|shard| recovered.head().latest_completed_recovery(shard)),
             vec![source]
         );
         coordinator.on_block_committed(&recovered, &make_block(BlockHeight::new(2)));

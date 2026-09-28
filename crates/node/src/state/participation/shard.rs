@@ -208,7 +208,7 @@ impl ShardParticipation {
     ) -> Vec<Action> {
         let shard = proof.shard();
         let fork_height = proof.height();
-        let completed = topology_schedule.head().completed_recoveries();
+        let completed = topology_schedule.head().latest_completed_recovery(shard);
 
         let Some(frontier) = self.fork_fence.engage(shard, fork_height, completed) else {
             return Vec::new();
@@ -246,7 +246,9 @@ impl ShardParticipation {
         if !self.fork_fence.engages(
             proof.shard(),
             proof.height(),
-            topology_schedule.head().completed_recoveries(),
+            topology_schedule
+                .head()
+                .latest_completed_recovery(proof.shard()),
         ) {
             return Vec::new();
         }

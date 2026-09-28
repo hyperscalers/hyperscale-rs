@@ -415,6 +415,7 @@ fn recover_committee(
             attested_frontier,
         },
     );
+    state.record_recovery(shard, state.current_epoch, attested_frontier);
     true
 }
 
@@ -593,7 +594,7 @@ mod tests {
 
     use hyperscale_types::{
         Admission, BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash,
-        BlockHeight, DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR,
+        BlockHeight, DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, JailReason, MIN_STAKE_FLOOR,
         PendingReshape, Randomness, RecoveryCause, ShardBoundary, ShardCommittee, ShardId,
         ShardWitnessPayload, Stake, StakePool, StakePoolId, StateRoot, TransitionCause,
         ValidatorId, ValidatorStatus, WeightedTimestamp,
@@ -604,8 +605,8 @@ mod tests {
         resolve_pending_rotations, run_shuffle_step,
     };
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, empty_state, possession_proof, single_pool_state,
-        validator_record,
+        apply_next_epoch, apply_witness_chunk, empty_state, live_boundary, possession_proof,
+        single_pool_state, validator_record,
     };
     use crate::state::vrf::jail_validator;
     // ─── run_shuffle_step + shard_committee_transitions diff ─────────────
@@ -1888,28 +1889,6 @@ mod tests {
 
     /// A live boundary record the fold has observed missing for
     /// `misses` consecutive folds.
-    fn live_boundary(misses: u32) -> ShardBoundary {
-        ShardBoundary {
-            state_root: StateRoot::ZERO,
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
-            height: BlockHeight::new(5),
-            weighted_timestamp: WeightedTimestamp::ZERO,
-            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            witness_base: BeaconWitnessLeafCount::ZERO,
-            used: DeclaredWork::ZERO,
-            blocks: 0,
-            cumulative_fees: 0,
-            substate_bytes: 0,
-            last_live_epoch: Epoch::new(1),
-            consecutive_misses: misses,
-            terminal_epoch: None,
-            handoff_complete: None,
-            terminal_delivered: false,
-            terminal_settled_txs: None,
-            reshape_admitted_epoch: None,
-        }
-    }
-
     /// One more miss than the halt threshold tolerates.
     fn over_threshold() -> u32 {
         u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1
@@ -2139,11 +2118,10 @@ mod tests {
 
     /// The shard's next observed crossing completes the recovery: the
     /// retained committee is released from the routing view, and the
-    /// seating epoch moves to the permanent completed record so the
-    /// bridge band keeps resolving the fresh committee.
+    /// recovery's binding stays in the shard's history, marked completed.
     #[test]
     fn recovery_clears_when_the_shard_commits_again() {
-        use hyperscale_types::{CompletedRecovery, RecoveryCause, ShardRecovery};
+        use hyperscale_types::{RecoveryBinding, RecoveryCause, ShardRecovery};
 
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
@@ -2157,6 +2135,7 @@ mod tests {
                 attested_frontier: BlockHeight::GENESIS,
             },
         );
+        state.record_recovery(ShardId::leaf(1, 0), rotated_at, BlockHeight::GENESIS);
 
         apply_witness_chunk(
             &mut state,
@@ -2169,10 +2148,11 @@ mod tests {
 
         assert!(state.pending_recoveries.is_empty());
         assert_eq!(
-            state.completed_recoveries.get(&ShardId::leaf(1, 0)),
-            Some(&CompletedRecovery {
+            state.latest_completed_recovery(ShardId::leaf(1, 0)),
+            Some(RecoveryBinding {
                 rotated_at,
                 attested_frontier: BlockHeight::GENESIS,
+                completed: true,
             }),
         );
     }
@@ -2333,6 +2313,58 @@ mod tests {
             state.pending_recoveries[&s0].cause,
             RecoveryCause::Fork,
             "fork provenance is sticky across a stalled halt re-draw",
+        );
+    }
+
+    /// A recovery that stalls and is re-drawn keeps its binding beside its
+    /// successor's, oldest first: the fresh committee it seated certified
+    /// blocks that still resolve through it. Neither crossed, so neither
+    /// is completed.
+    #[test]
+    fn a_chained_recovery_keeps_both_bindings() {
+        let s0 = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 8);
+        state.current_epoch = Epoch::new(10);
+        state.boundaries.insert(s0, live_boundary(0));
+        recover_committees(&mut state, &BTreeSet::from([s0]));
+        state.current_epoch = Epoch::new(20);
+        recover_committees(&mut state, &BTreeSet::from([s0]));
+
+        let history: Vec<_> = state.recoveries[&s0]
+            .iter()
+            .map(|binding| (binding.rotated_at, binding.completed))
+            .collect();
+        assert_eq!(
+            history,
+            vec![(Epoch::new(10), false), (Epoch::new(20), false)]
+        );
+        assert_eq!(state.latest_completed_recovery(s0), None);
+    }
+
+    /// The history keeps the newest [`RECOVERY_HISTORY_DEPTH`] bindings of
+    /// a shard, and completing one marks only that one.
+    #[test]
+    fn the_recovery_history_keeps_the_newest_bindings() {
+        use hyperscale_types::RECOVERY_HISTORY_DEPTH;
+
+        let s0 = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(4);
+        let depth = u64::try_from(RECOVERY_HISTORY_DEPTH).expect("depth fits u64");
+        for epoch in 0..=depth {
+            state.record_recovery(s0, Epoch::new(epoch), BlockHeight::new(epoch));
+        }
+        let kept: Vec<_> = state.recoveries[&s0]
+            .iter()
+            .map(|binding| binding.rotated_at.inner())
+            .collect();
+        assert_eq!(kept, (1..=depth).collect::<Vec<_>>());
+
+        state.complete_recovery(s0, Epoch::new(2));
+        assert_eq!(
+            state
+                .latest_completed_recovery(s0)
+                .map(|binding| binding.rotated_at),
+            Some(Epoch::new(2)),
         );
     }
 

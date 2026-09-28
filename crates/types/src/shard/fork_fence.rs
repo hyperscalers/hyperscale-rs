@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::{BlockHeight, CompletedRecovery, Epoch, ShardId};
+use crate::{BlockHeight, Epoch, RecoveryBinding, ShardId};
 
 /// Gossip-timed local fork fences, one per provably-forked shard.
 ///
@@ -28,7 +28,7 @@ use crate::{BlockHeight, CompletedRecovery, Epoch, ShardId};
 ///   [`recovery_fences`](crate::TopologySnapshot::recovery_fences) govern
 ///   validity over the same interval.
 /// - **Clear** when the recovery completes ([`Self::clear_completed`]):
-///   the shard's completed-recovery record is newer than the one the
+///   the shard's latest completed recovery is newer than the one the
 ///   fence engaged over.
 ///
 /// Empty under honest operation.
@@ -42,7 +42,7 @@ struct Fence {
     /// Last unfenced height, `fork_height − 1`: [`ForkFence::is_fenced`]
     /// is `height > frontier`, covering the forked height itself.
     frontier: BlockHeight,
-    /// The seating epoch of the shard's completed-recovery record when the
+    /// The seating epoch of the shard's latest completed recovery when the
     /// fence engaged (`None` if the shard had never recovered). A completed
     /// record newer than this is the recovery this fence's fork armed —
     /// the clear edge.
@@ -66,22 +66,20 @@ impl ForkFence {
 
     /// Whether a proof forking `shard` at `fork_height` would engage a
     /// fence — read-only twin of [`Self::engage`]. Callers use it to dedup
-    /// a gossiped proof before spending verification on it.
+    /// a gossiped proof before spending verification on it. `completed` is
+    /// the shard's latest completed recovery.
     #[must_use]
     pub fn engages(
         &self,
         shard: ShardId,
         fork_height: BlockHeight,
-        completed: &BTreeMap<ShardId, CompletedRecovery>,
+        completed: Option<RecoveryBinding>,
     ) -> bool {
         // The beacon fold drops a proof at or below the last completed
         // recovery's frontier as already-answered history, so no recovery
         // would ever fold to clear a fence it engaged — refuse it here for
         // the same reason.
-        if completed
-            .get(&shard)
-            .is_some_and(|record| fork_height <= record.attested_frontier)
-        {
+        if completed.is_some_and(|record| fork_height <= record.attested_frontier) {
             return false;
         }
         // Never loosen: only a strictly lower fork tightens an engaged fence.
@@ -100,7 +98,7 @@ impl ForkFence {
         &self,
         shard: ShardId,
         fork_height: BlockHeight,
-        completed: &BTreeMap<ShardId, CompletedRecovery>,
+        completed: Option<RecoveryBinding>,
     ) -> Option<BlockHeight> {
         if !self.engages(shard, fork_height, completed) {
             return None;
@@ -110,24 +108,24 @@ impl ForkFence {
             shard,
             Fence {
                 frontier,
-                engaged_over: completed.get(&shard).map(|record| record.rotated_at),
+                engaged_over: completed.map(|record| record.rotated_at),
             },
         );
         Some(frontier)
     }
 
     /// Clear every fence whose recovery has completed — the shard's
-    /// completed-recovery record is newer than the one the fence engaged
-    /// over. Returns the cleared shards so consumers can release work they
-    /// withheld while fenced.
+    /// latest completed recovery, as `completed` reports it, is newer than
+    /// the one the fence engaged over. Returns the cleared shards so
+    /// consumers can release work they withheld while fenced.
     #[must_use]
     pub fn clear_completed(
         &self,
-        completed: &BTreeMap<ShardId, CompletedRecovery>,
+        completed: impl Fn(ShardId) -> Option<RecoveryBinding>,
     ) -> Vec<ShardId> {
         let mut cleared = Vec::new();
         self.write().retain(|&shard, fence| {
-            let done = completed.get(&shard).map(|record| record.rotated_at) > fence.engaged_over;
+            let done = completed(shard).map(|record| record.rotated_at) > fence.engaged_over;
             if done {
                 cleared.push(shard);
             }
@@ -178,19 +176,21 @@ const fn frontier_below(fork_height: BlockHeight) -> BlockHeight {
 mod tests {
     use super::*;
 
-    fn completed(
+    const fn completed(rotated_at: u64, frontier: u64) -> RecoveryBinding {
+        RecoveryBinding {
+            rotated_at: Epoch::new(rotated_at),
+            attested_frontier: BlockHeight::new(frontier),
+            completed: true,
+        }
+    }
+
+    /// `shard`'s latest completed recovery is `record`; no other shard
+    /// has one.
+    fn only(
         shard: ShardId,
-        rotated_at: u64,
-        frontier: u64,
-    ) -> BTreeMap<ShardId, CompletedRecovery> {
-        std::iter::once((
-            shard,
-            CompletedRecovery {
-                rotated_at: Epoch::new(rotated_at),
-                attested_frontier: BlockHeight::new(frontier),
-            },
-        ))
-        .collect()
+        record: RecoveryBinding,
+    ) -> impl Fn(ShardId) -> Option<RecoveryBinding> {
+        move |s| (s == shard).then_some(record)
     }
 
     #[test]
@@ -198,7 +198,7 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
         let fence = ForkFence::new();
         assert_eq!(
-            fence.engage(shard, BlockHeight::new(5), &BTreeMap::new()),
+            fence.engage(shard, BlockHeight::new(5), None),
             Some(BlockHeight::new(4)),
         );
         assert!(fence.is_fenced(shard, BlockHeight::new(5)));
@@ -214,33 +214,33 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
         let node = ForkFence::new();
         let consumers = [node.clone(), node.clone(), node.clone()];
-        assert!(
-            node.engage(shard, BlockHeight::new(5), &BTreeMap::new())
-                .is_some()
-        );
+        assert!(node.engage(shard, BlockHeight::new(5), None).is_some());
         for consumer in &consumers {
             assert!(consumer.is_fenced(shard, BlockHeight::new(5)));
             assert_eq!(consumer.engaged(), vec![(shard, BlockHeight::new(4))]);
         }
-        assert_eq!(node.clear_completed(&completed(shard, 3, 4)), vec![shard]);
+        assert_eq!(
+            node.clear_completed(only(shard, completed(3, 4))),
+            vec![shard]
+        );
         assert!(consumers.iter().all(ForkFence::is_empty));
     }
 
     #[test]
     fn engage_never_loosens() {
         let shard = ShardId::leaf(1, 0);
-        let none = BTreeMap::new();
+        let none = None;
         let fence = ForkFence::new();
-        assert!(fence.engage(shard, BlockHeight::new(5), &none).is_some());
+        assert!(fence.engage(shard, BlockHeight::new(5), none).is_some());
 
         // Same or higher fork height: no-op.
-        assert_eq!(fence.engage(shard, BlockHeight::new(5), &none), None);
-        assert_eq!(fence.engage(shard, BlockHeight::new(8), &none), None);
+        assert_eq!(fence.engage(shard, BlockHeight::new(5), none), None);
+        assert_eq!(fence.engage(shard, BlockHeight::new(8), none), None);
         assert!(!fence.is_fenced(shard, BlockHeight::new(4)));
 
         // A strictly lower fork tightens.
         assert_eq!(
-            fence.engage(shard, BlockHeight::new(3), &none),
+            fence.engage(shard, BlockHeight::new(3), none),
             Some(BlockHeight::new(2)),
         );
         assert!(fence.is_fenced(shard, BlockHeight::new(3)));
@@ -249,19 +249,19 @@ mod tests {
     #[test]
     fn already_recovered_forks_do_not_engage() {
         let shard = ShardId::leaf(1, 0);
-        let recovered = completed(shard, 7, 10);
+        let recovered = Some(completed(7, 10));
         let fence = ForkFence::new();
 
         // At and below the completed frontier: a replay, refused.
-        assert!(!fence.engages(shard, BlockHeight::new(10), &recovered));
-        assert_eq!(fence.engage(shard, BlockHeight::new(4), &recovered), None);
+        assert!(!fence.engages(shard, BlockHeight::new(10), recovered));
+        assert_eq!(fence.engage(shard, BlockHeight::new(4), recovered), None);
         assert!(fence.is_empty());
 
         // Above the frontier: a genuine re-fork, engages.
-        assert!(fence.engages(shard, BlockHeight::new(11), &recovered));
+        assert!(fence.engages(shard, BlockHeight::new(11), recovered));
         assert!(
             fence
-                .engage(shard, BlockHeight::new(11), &recovered)
+                .engage(shard, BlockHeight::new(11), recovered)
                 .is_some()
         );
     }
@@ -270,36 +270,42 @@ mod tests {
     fn clears_on_recovery_completion_not_before() {
         let shard = ShardId::leaf(1, 0);
         let fence = ForkFence::new();
-        assert!(
-            fence
-                .engage(shard, BlockHeight::new(5), &BTreeMap::new())
-                .is_some()
-        );
+        assert!(fence.engage(shard, BlockHeight::new(5), None).is_some());
 
         // No completed record (the recovery is at most pending): held.
-        assert!(fence.clear_completed(&BTreeMap::new()).is_empty());
+        assert!(fence.clear_completed(|_| None).is_empty());
         assert!(fence.is_engaged(shard));
 
         // The recovery completes: cleared, and the cleared shard reported.
-        assert_eq!(fence.clear_completed(&completed(shard, 3, 4)), vec![shard]);
+        assert_eq!(
+            fence.clear_completed(only(shard, completed(3, 4))),
+            vec![shard]
+        );
         assert!(fence.is_empty());
     }
 
     #[test]
     fn a_stale_completed_record_does_not_clear_a_refork() {
         let shard = ShardId::leaf(1, 0);
-        let old = completed(shard, 3, 10);
+        let old = completed(3, 10);
         let fence = ForkFence::new();
 
         // A re-fork above the old recovery's frontier engages over it.
-        assert!(fence.engage(shard, BlockHeight::new(20), &old).is_some());
+        assert!(
+            fence
+                .engage(shard, BlockHeight::new(20), Some(old))
+                .is_some()
+        );
 
         // The same stale record must not clear the new fence.
-        assert!(fence.clear_completed(&old).is_empty());
+        assert!(fence.clear_completed(only(shard, old)).is_empty());
         assert!(fence.is_engaged(shard));
 
         // Only the re-fork's own (newer) recovery clears it.
-        assert_eq!(fence.clear_completed(&completed(shard, 9, 19)), vec![shard],);
+        assert_eq!(
+            fence.clear_completed(only(shard, completed(9, 19))),
+            vec![shard],
+        );
         assert!(fence.is_empty());
     }
 }

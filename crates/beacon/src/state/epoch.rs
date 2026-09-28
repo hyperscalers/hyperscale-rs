@@ -7,11 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BLOCK_CAPS, BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, Block, BlockHash,
-    BlockHeader, CertifiedBeaconBlock, CompletedRecovery, DeclaredWork, Epoch, EpochWindows,
-    FiveWay, KeptSeat, NetworkDefinition, ObserverSeat, PendingReshape, QcContext,
-    QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RecoveryCause, RevealChain, ShardBoundary,
-    ShardEpochContribution, ShardFullness, ShardId, SlotEffects, TerminalRef, TopologySnapshot,
-    TransitionCause, Utilization, ValidatorId, ValidatorStatus, Verifier, Verify,
+    BlockHeader, CertifiedBeaconBlock, DeclaredWork, Epoch, EpochWindows, FiveWay, KeptSeat,
+    NetworkDefinition, ObserverSeat, PendingReshape, QcContext, QuorumCertificate,
+    RESHAPE_HANDOFF_TTL_EPOCHS, RecoveryCause, RevealChain, ShardBoundary, ShardEpochContribution,
+    ShardFullness, ShardId, SlotEffects, TerminalRef, TopologySnapshot, TransitionCause,
+    Utilization, ValidatorId, ValidatorStatus, Verifier, Verify,
 };
 
 use crate::rules::{
@@ -824,8 +824,7 @@ fn ingest_fork_proofs(
             // jailed, and the fresh committee seated. Re-arming would
             // re-draw the innocent successor committee forever.
             if state
-                .completed_recoveries
-                .get(&shard)
+                .latest_completed_recovery(shard)
                 .is_some_and(|completed| proof.height() <= completed.attested_frontier)
             {
                 continue;
@@ -1059,20 +1058,12 @@ fn record_boundaries(
         state.advanced.insert(*shard);
         // A crossing under an in-flight halt recovery means the fresh
         // committee produced: the recovery is complete, so release the
-        // retained replaced committee from the routing view. The seating
-        // epoch and attested frontier move to the permanent record —
-        // certified resolution of the recovery's bridge band reads the
-        // epoch so blocks anchored below the bridge keep binding to the
-        // fresh committee that produced them, and the frontier tombstones
-        // replayed fork proofs for the recovered history.
+        // retained replaced committee from the routing view. Its binding
+        // stays in the shard's history, now marked completed, so its
+        // attested frontier tombstones replayed fork proofs for the
+        // recovered history.
         if let Some(recovery) = state.pending_recoveries.remove(shard) {
-            state.completed_recoveries.insert(
-                *shard,
-                CompletedRecovery {
-                    rotated_at: recovery.rotated_at,
-                    attested_frontier: recovery.attested_frontier,
-                },
-            );
+            state.complete_recovery(*shard, recovery.rotated_at);
         }
 
         // A terminal shard's contribution crossing its final cut is the
@@ -1192,12 +1183,15 @@ fn gc_terminal_boundaries(state: &mut BeaconState, epoch: Epoch, windows: EpochW
                 .is_none_or(|done| now <= windows.handoff_evidence_expiry(done))
     });
     // A shard that left `boundaries` is gone; drop its produced mark and
-    // any in-flight recovery record too.
+    // its recovery records too.
     state
         .advanced
         .retain(|shard| state.boundaries.contains_key(shard));
     state
         .pending_recoveries
+        .retain(|shard, _| state.boundaries.contains_key(shard));
+    state
+        .recoveries
         .retain(|shard, _| state.boundaries.contains_key(shard));
 }
 
@@ -1432,16 +1426,18 @@ mod tests {
         BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin,
         DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash, MAX_RANGE_PROOF_NODES,
         MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable, QuorumCertificate,
-        RETENTION_HORIZON, ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
-        ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
-        SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS,
-        TopologySchedule, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
-        compute_merkle_root, compute_range_proof, derive_reshape_trigger,
+        RETENTION_HORIZON, RecoveryBinding, ReshapeThresholds, Round, SettledTxsRoot,
+        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad, ShardRecovery,
+        ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
+        StateRoot, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule, TransitionCause, ValidatorId,
+        VrfProof, WeightedTimestamp, compute_merkle_root, compute_range_proof,
+        derive_reshape_trigger,
     };
 
     use super::*;
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, net, single_pool_state, validator_record,
+        apply_next_epoch, apply_witness_chunk, live_boundary, net, single_pool_state,
+        validator_record,
     };
     use crate::state::witness::apply_shard_payload;
 
@@ -1884,13 +1880,14 @@ mod tests {
     fn ingest_fork_proofs_drops_a_replay_below_the_completed_frontier() {
         let mut state = single_pool_state(4);
         let shard = ShardId::leaf(1, 0);
-        state.completed_recoveries.insert(
+        state.recoveries.insert(
             shard,
-            CompletedRecovery {
+            vec![RecoveryBinding {
                 rotated_at: Epoch::new(3),
                 // `fork_committed` forks at height 5 — at the frontier.
                 attested_frontier: BlockHeight::new(5),
-            },
+                completed: true,
+            }],
         );
         let committed = [fork_committed(shard)];
         ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(4), &committed);
@@ -1904,12 +1901,13 @@ mod tests {
     fn ingest_fork_proofs_rearms_for_a_fork_above_the_completed_frontier() {
         let mut state = single_pool_state(4);
         let shard = ShardId::leaf(1, 0);
-        state.completed_recoveries.insert(
+        state.recoveries.insert(
             shard,
-            CompletedRecovery {
+            vec![RecoveryBinding {
                 rotated_at: Epoch::new(3),
                 attested_frontier: BlockHeight::new(4),
-            },
+                completed: true,
+            }],
         );
         let committed = [fork_committed(shard)];
         ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(4), &committed);
@@ -2052,7 +2050,7 @@ mod tests {
             state.pending_recoveries.contains_key(&shard),
             "the recovery is not cleared by the forked committee's own crossing",
         );
-        assert!(!state.completed_recoveries.contains_key(&shard));
+        assert_eq!(state.latest_completed_recovery(shard), None);
     }
 
     /// A beacon state whose shard-`leaf(1,0)` consensus committee is
@@ -5348,5 +5346,22 @@ mod tests {
             split_child_roots: Some(pair),
             ..Default::default()
         })
+    }
+
+    /// A shard whose boundary record is gone takes its recovery history
+    /// with it; a shard still carried keeps its.
+    #[test]
+    fn a_departed_shard_takes_its_recovery_history() {
+        let (kept, gone) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut state = single_pool_state(4);
+        state.boundaries.insert(kept, live_boundary(0));
+        state.record_recovery(gone, Epoch::new(1), BlockHeight::new(1));
+        state.record_recovery(kept, Epoch::new(1), BlockHeight::new(1));
+
+        let windows = state.chain_config.epoch_windows();
+        gc_terminal_boundaries(&mut state, Epoch::new(2), windows);
+
+        assert!(!state.recoveries.contains_key(&gone));
+        assert!(state.recoveries.contains_key(&kept));
     }
 }

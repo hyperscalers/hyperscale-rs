@@ -677,8 +677,7 @@ impl TopologySchedule {
             .map(|recovery| (recovery.rotated_at, recovery.attested_frontier))
             .or_else(|| {
                 snapshot
-                    .completed_recoveries()
-                    .get(&shard)
+                    .latest_completed_recovery(shard)
                     .map(|completed| (completed.rotated_at, completed.attested_frontier))
             })?;
         let bridge = rotated_at.next();
@@ -782,9 +781,8 @@ impl TopologySchedule {
             return Some((recovery.rotated_at.next(), recovery.attested_frontier));
         }
         self.head
-            .completed_recoveries()
-            .get(&shard)
-            .map(|completed| (completed.rotated_at.next(), completed.attested_frontier))
+            .latest_completed_recovery(shard)
+            .map(|completed| (completed.bridge(), completed.attested_frontier))
     }
 
     /// The bridge epoch of
@@ -1283,7 +1281,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, Hash, NetworkDefinition,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, NetworkDefinition, RecoveryBinding,
         RecoveryCause, ReshapeSeat, SettledTxsRoot, ShardAnchor, ShardRecovery, StateRoot,
         ValidatorSet,
     };
@@ -2276,13 +2274,14 @@ mod tests {
         let completed = || {
             let completed = |committee: &[ValidatorId]| {
                 Arc::new(
-                    snap(committee).as_ref().clone().with_completed_recoveries(
+                    snap(committee).as_ref().clone().with_recoveries(
                         std::iter::once((
                             shard,
-                            CompletedRecovery {
+                            vec![RecoveryBinding {
                                 rotated_at: Epoch::new(20),
                                 attested_frontier: frontier,
-                            },
+                                completed: true,
+                            }],
                         ))
                         .collect(),
                     ),
@@ -2383,13 +2382,14 @@ mod tests {
         };
         let completed = |committee: &[ValidatorId]| {
             Arc::new(
-                snap(committee).as_ref().clone().with_completed_recoveries(
+                snap(committee).as_ref().clone().with_recoveries(
                     std::iter::once((
                         shard,
-                        CompletedRecovery {
+                        vec![RecoveryBinding {
                             rotated_at: Epoch::new(20),
                             attested_frontier: BlockHeight::GENESIS,
-                        },
+                            completed: true,
+                        }],
                     ))
                     .collect(),
                 ),

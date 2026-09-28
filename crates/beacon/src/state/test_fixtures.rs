@@ -16,11 +16,12 @@ use hyperscale_hbor::Capped;
 use hyperscale_types::{
     AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusSignature,
-    Epoch, Hash, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal,
-    QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId,
-    ShardVoteEquivocation, ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool,
-    StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
-    beacon_reveal_sign, compute_merkle_root, compute_range_proof, validator_possession_proof_sign,
+    DeclaredWork, Epoch, Hash, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation,
+    PendingWithdrawal, QuorumCertificate, Round, ShardBoundary, ShardCommittee,
+    ShardEpochContribution, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SignerBitfield,
+    SlotEffects, Stake, StakePool, StakePoolId, StateRoot, ValidatorId, ValidatorRecord,
+    ValidatorStatus, VrfProof, WeightedTimestamp, beacon_reveal_sign, compute_merkle_root,
+    compute_range_proof, validator_possession_proof_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -72,6 +73,30 @@ pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> Validato
         status,
         registered_at_epoch: Epoch::GENESIS,
         pubkey: pubkey(id),
+    }
+}
+
+/// A live shard's boundary record at height 5, `misses` folds without a
+/// crossing.
+pub fn live_boundary(misses: u32) -> ShardBoundary {
+    ShardBoundary {
+        state_root: StateRoot::ZERO,
+        block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
+        height: BlockHeight::new(5),
+        weighted_timestamp: WeightedTimestamp::ZERO,
+        witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+        witness_base: BeaconWitnessLeafCount::ZERO,
+        used: DeclaredWork::ZERO,
+        blocks: 0,
+        cumulative_fees: 0,
+        substate_bytes: 0,
+        last_live_epoch: Epoch::new(1),
+        consecutive_misses: misses,
+        terminal_epoch: None,
+        handoff_complete: None,
+        terminal_delivered: false,
+        terminal_settled_txs: None,
+        reshape_admitted_epoch: None,
     }
 }
 

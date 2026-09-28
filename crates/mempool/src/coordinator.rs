@@ -3111,7 +3111,7 @@ mod tests {
         assert!(
             mempool
                 .fork_fence
-                .engage(fenced_shard, BlockHeight::new(5), &BTreeMap::new())
+                .engage(fenced_shard, BlockHeight::new(5), None)
                 .is_some()
         );
         mempool.on_submit_transaction(
@@ -3152,7 +3152,7 @@ mod tests {
     /// step of its own.
     #[test]
     fn fork_fence_holds_admission_until_the_node_clears_it() {
-        use hyperscale_types::{CompletedRecovery, Epoch};
+        use hyperscale_types::{Epoch, RecoveryBinding};
 
         let topology_snapshot = make_cross_shard_topology();
         let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
@@ -3162,7 +3162,7 @@ mod tests {
         let node_fence = mempool.fork_fence.clone();
         assert!(
             node_fence
-                .engage(fenced_shard, BlockHeight::new(5), &BTreeMap::new())
+                .engage(fenced_shard, BlockHeight::new(5), None)
                 .is_some()
         );
 
@@ -3192,16 +3192,13 @@ mod tests {
             "a commit alone does not reopen admission"
         );
 
-        let cleared = node_fence.clear_completed(
-            &std::iter::once((
-                fenced_shard,
-                CompletedRecovery {
-                    rotated_at: Epoch::new(2),
-                    attested_frontier: BlockHeight::new(4),
-                },
-            ))
-            .collect(),
-        );
+        let cleared = node_fence.clear_completed(|shard| {
+            (shard == fenced_shard).then_some(RecoveryBinding {
+                rotated_at: Epoch::new(2),
+                attested_frontier: BlockHeight::new(4),
+                completed: true,
+            })
+        });
         assert_eq!(cleared, vec![fenced_shard]);
         let after = submit(&mut mempool, 8);
         assert!(

@@ -164,8 +164,8 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        AggregateSignature, BlockHeight, CompletedRecovery, Epoch, GlobalReceiptRoot,
-        NetworkDefinition, ShardId, Signer, SignerBitfield, TopologySnapshot, ValidatorId,
+        AggregateSignature, BlockHeight, Epoch, GlobalReceiptRoot, NetworkDefinition,
+        RecoveryBinding, ShardId, Signer, SignerBitfield, TopologySnapshot, ValidatorId,
         ValidatorInfo, ValidatorSet, WeightedTimestamp,
     };
 
@@ -197,13 +197,14 @@ mod tests {
                     &set,
                     std::iter::once((shard, committee.to_vec())).collect(),
                 )
-                .with_completed_recoveries(
+                .with_recoveries(
                     std::iter::once((
                         shard,
-                        CompletedRecovery {
+                        vec![RecoveryBinding {
                             rotated_at: Epoch::new(20),
                             attested_frontier: frontier,
-                        },
+                            completed: true,
+                        }],
                     ))
                     .collect(),
                 ),

@@ -12,8 +12,8 @@ use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::PriceTable;
 
 use crate::{
-    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
-    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, SeedRing,
+    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, DeclaredKey,
+    Epoch, NetworkDefinition, NetworkParams, RecoveryBinding, ReshapeThresholds, Round, SeedRing,
     SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
     ValidatorSet, VoteCount, WeightedTimestamp,
 };
@@ -182,12 +182,11 @@ pub struct TopologySnapshot {
     /// Cleared when the shard commits again and the beacon drops the
     /// record. Like `advanced`, a live head value.
     pending_recoveries: BTreeMap<ShardId, ShardRecovery>,
-    /// Each shard's most recent completed recovery, projected from
-    /// `BeaconState.completed_recoveries`. Permanent, unlike
-    /// `pending_recoveries`: the schedule's certified resolution reads it
-    /// so the recovery's bridge band keeps resolving the fresh committee
-    /// after the pending record clears.
-    completed_recoveries: BTreeMap<ShardId, CompletedRecovery>,
+    /// Each shard's recovery history, projected from
+    /// `BeaconState.recoveries`. Outlives `pending_recoveries`: the
+    /// schedule's committee resolution reads it so every recovery's
+    /// bridge band keeps resolving the fresh committee it seated.
+    recoveries: BTreeMap<ShardId, Vec<RecoveryBinding>>,
     /// Governable network parameters in force for this window, projected
     /// from `BeaconState.params` (head) or `next_params` (lookahead).
     /// Frozen one epoch ahead like the committee, so every member resolves
@@ -265,7 +264,7 @@ impl TopologySnapshot {
             scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
-            completed_recoveries: BTreeMap::new(),
+            recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
@@ -315,7 +314,7 @@ impl TopologySnapshot {
             scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
-            completed_recoveries: BTreeMap::new(),
+            recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
@@ -374,7 +373,7 @@ impl TopologySnapshot {
             scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
-            completed_recoveries: BTreeMap::new(),
+            recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
@@ -469,7 +468,7 @@ impl TopologySnapshot {
             settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
             pending_recoveries: BTreeMap::new(),
-            completed_recoveries: BTreeMap::new(),
+            recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
@@ -547,16 +546,13 @@ impl TopologySnapshot {
         self
     }
 
-    /// Set each shard's most recent completed recovery (see
-    /// [`Self::completed_recoveries`]). Defaults empty; the beacon
-    /// projection supplies the `BeaconState.completed_recoveries` value.
-    /// Builder-set under the [`Self::with_advanced`] rationale.
+    /// Set each shard's recovery history (see [`Self::recoveries`]).
+    /// Defaults empty; the beacon projection supplies the
+    /// `BeaconState.recoveries` value. Builder-set under the
+    /// [`Self::with_advanced`] rationale.
     #[must_use]
-    pub fn with_completed_recoveries(
-        mut self,
-        completed_recoveries: BTreeMap<ShardId, CompletedRecovery>,
-    ) -> Self {
-        self.completed_recoveries = completed_recoveries;
+    pub fn with_recoveries(mut self, recoveries: BTreeMap<ShardId, Vec<RecoveryBinding>>) -> Self {
+        self.recoveries = recoveries;
         self
     }
 
@@ -849,13 +845,26 @@ impl TopologySnapshot {
             .is_some_and(|recovery| height > recovery.attested_frontier)
     }
 
-    /// Each shard's most recent completed recovery. The schedule's
-    /// certified resolution reads the seating epoch so the recovery's
-    /// bridge band binds stably after the pending record clears; the
-    /// attested frontier tombstones replayed fork proofs.
+    /// `shard`'s recoveries, oldest first. The schedule resolves
+    /// committees across each one's bridge.
     #[must_use]
-    pub const fn completed_recoveries(&self) -> &BTreeMap<ShardId, CompletedRecovery> {
-        &self.completed_recoveries
+    pub fn recoveries(&self, shard: ShardId) -> &[RecoveryBinding] {
+        self.recoveries.get(&shard).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every shard's recovery history, oldest first within each.
+    pub fn recovery_histories(&self) -> impl Iterator<Item = (ShardId, &[RecoveryBinding])> + '_ {
+        self.recoveries
+            .iter()
+            .map(|(&shard, history)| (shard, history.as_slice()))
+    }
+
+    /// `shard`'s newest completed recovery. Its attested frontier
+    /// tombstones replayed fork proofs, and a fork fence engaged before it
+    /// has been answered.
+    #[must_use]
+    pub fn latest_completed_recovery(&self, shard: ShardId) -> Option<RecoveryBinding> {
+        RecoveryBinding::latest_completed(self.recoveries(shard))
     }
 
     /// Get the ordered committee members for a shard — full membership,
