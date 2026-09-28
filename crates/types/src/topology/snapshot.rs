@@ -13,9 +13,9 @@ use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, DeclaredKey,
-    Epoch, NetworkDefinition, NetworkParams, RecoveryBinding, ReshapeThresholds, Round, SeedRing,
-    SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
-    ValidatorSet, VoteCount, WeightedTimestamp,
+    Epoch, NetworkDefinition, NetworkParams, RecoveryBinding, RecoveryCause, ReshapeThresholds,
+    Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction,
+    ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -845,6 +845,18 @@ impl TopologySnapshot {
             .is_some_and(|recovery| height > recovery.attested_frontier)
     }
 
+    /// The attested frontier of `shard`'s pending recovery when a fork
+    /// caused it. Above it the retained committee certified two branches,
+    /// so a replica whose store committed past it holds a suffix no fresh
+    /// member may extend.
+    #[must_use]
+    pub fn fork_recovery_frontier(&self, shard: ShardId) -> Option<BlockHeight> {
+        self.pending_recoveries
+            .get(&shard)
+            .filter(|recovery| recovery.cause == RecoveryCause::Fork)
+            .map(|recovery| recovery.attested_frontier)
+    }
+
     /// `shard`'s recoveries, oldest first. The schedule resolves
     /// committees across each one's bridge.
     #[must_use]
@@ -1277,6 +1289,29 @@ mod tests {
             make_snapshot(4).reshape_observer_child(shard, observer),
             None
         );
+    }
+
+    /// Only a fork names a frontier a replica must not extend past: a
+    /// halted chain has one tip, and every replica holding it may resume.
+    #[test]
+    fn fork_recovery_frontier_answers_forks_only() {
+        let (fork, halt) = ShardId::ROOT.children();
+        let recovery = |cause| ShardRecovery {
+            cause,
+            rotated_at: Epoch::new(3),
+            retained: Vec::new(),
+            attested_frontier: BlockHeight::new(40),
+        };
+        let snapshot = make_snapshot(4).with_pending_recoveries(BTreeMap::from([
+            (fork, recovery(RecoveryCause::Fork)),
+            (halt, recovery(RecoveryCause::Halt)),
+        ]));
+        assert_eq!(
+            snapshot.fork_recovery_frontier(fork),
+            Some(BlockHeight::new(40))
+        );
+        assert_eq!(snapshot.fork_recovery_frontier(halt), None);
+        assert_eq!(snapshot.fork_recovery_frontier(ShardId::ROOT), None);
     }
 
     /// The seatable view drops an observer riding its splitting parent's
