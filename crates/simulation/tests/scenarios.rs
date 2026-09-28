@@ -6,6 +6,7 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,7 +75,7 @@ use hyperscale_scenarios::{
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
     delegation_folds_into_beacon_state, departing_caller_ballast, departing_route_genesis_accounts,
-    departing_venue_ballast, departing_venue_split_bytes, deploy_storm_rides_out, epochs,
+    departing_venue_ballast, departing_venue_split_bytes, deploy_storm_rides_out, discard, epochs,
     events_land_on_their_emitters_home_shard, failure_charges_its_payer,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
     grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
@@ -116,7 +117,7 @@ use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, PrincipalAddr, RecoveryCause, Round, ShardForkProof,
     ShardId, Timeout, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
 };
-use support::{SimCluster, seeded};
+use support::{SEED_VAR, SimCluster, seeded};
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
 const fn liveness_config() -> ScenarioConfig {
@@ -742,6 +743,10 @@ const FAN_IN_SEEDS: [u64; 4] = [42, 7, 11, 1337];
 /// three times over. What the four seeds read is under a fifth of that.
 #[test]
 fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
+    // The bar reads four seeds' aggregate; one swept seed is not a sample of it.
+    if env::var(SEED_VAR).is_ok() {
+        discard("the fan-in bar reads its own seeds' aggregate");
+    }
     let mut single = 0;
     let mut fanned = 0;
     for seed in FAN_IN_SEEDS {
