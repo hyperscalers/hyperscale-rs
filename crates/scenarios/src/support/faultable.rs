@@ -9,7 +9,8 @@
 //!
 //! [`drop_type`]: FaultableCluster::drop_type
 
-use hyperscale_types::{BlockHeight, ShardId, StateRoot};
+use hyperscale_types::test_utils::Withheld;
+use hyperscale_types::{BlockHeight, ShardId, StateRoot, ValidatorId};
 
 use super::Cluster;
 
@@ -94,6 +95,13 @@ pub trait FaultableCluster: Cluster {
     /// every host converged on one root after a heal — the stall-not-fork
     /// guarantee a cluster-wide read cannot see.
     fn host_committed_state_root(&self, host: usize, shard: ShardId) -> Option<StateRoot>;
+
+    /// Make `validators` withhold `withheld` of their shard consensus from
+    /// now on: each signature it names is refused, on whichever hosts run
+    /// them, while their beacon duties, execution and serving carry on.
+    /// Unlike a host cut, it touches no other vnode sharing their hosts
+    /// and no validator drawn later. The handle counts the refusals.
+    fn withhold(&mut self, validators: &[ValidatorId], withheld: Withheld) -> FaultHandle;
 
     /// Remove every installed drop rule, on every host — lifting any transient
     /// outage so the suppressed channel flows again. Leaves partitions intact

@@ -1,11 +1,13 @@
 //! Test utilities.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use hyperscale_crypto::{Signer, Verifier};
+use hyperscale_crypto::{SignError, Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_hbor::{
-    Bytes, Capped, Hash32, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
+    Bytes, Capped, Hash32, Hbor, HborSignedWith, from_slice as hbor_from_slice,
+    to_vec as hbor_to_vec, varint,
 };
 use hyperscale_vm_types::{
     Address, AddressClass, DeclaredWork, IntentHash, LegRole, LegShape, LocalKey, Mode, Moves,
@@ -16,17 +18,17 @@ use hyperscale_vm_types::{
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
     AbortCharge, AggregateSignature, Anchor, Attested, Block, BlockHash, BlockHeader,
-    BlockHeaderParts, BlockHeight, BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader,
-    ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
-    DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt, ExecutionCertificate,
-    ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins, MerkleInclusionProof,
-    NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp, ProtocolStatics,
-    QuorumCertificate, Role, Round, Routing, Settlement, ShardForkProof, ShardId, ShardLoad,
-    SignerBitfield, StateClaim, StateRoot, StateWrites, StoredReceipt, TickHalf, TickId, TickLine,
-    TimestampRange, TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope,
-    TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
-    WeightedTimestamp, WitnessSources, compute_global_receipt_root, install_protocol_statics,
-    protocol_statics_installed, signed_bytes,
+    BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVoteMessage, CertifiedBlock,
+    CertifiedBlockHeader, ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt,
+    ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt,
+    ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins,
+    MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
+    ProtocolStatics, QuorumCertificate, Role, Round, Routing, Settlement, ShardForkProof, ShardId,
+    ShardLoad, SignerBitfield, StateClaim, StateRoot, StateWrites, StoredReceipt, TickHalf, TickId,
+    TickLine, Timeout, TimestampRange, TopologySnapshot, Transaction, TransactionDecision,
+    TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+    Verified, VrfProof, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
+    install_protocol_statics, protocol_statics_installed, signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -1715,6 +1717,96 @@ pub fn proven_claim(
     StateClaim::new(anchor, cells, proof)
 }
 
+/// What a [`WithholdingSigner`] refuses to sign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Withheld {
+    /// Nothing: it signs as the signer it wraps.
+    Nothing,
+    /// Its block votes. No quorum it belongs to forms, while a QC it
+    /// already holds still leaves in its next proposal.
+    Votes,
+    /// Its block votes, block proposals and timeouts: its whole part in
+    /// its shard's consensus.
+    Consensus,
+}
+
+/// A validator's signer that can be told to withhold its shard consensus.
+///
+/// Every consensus send signs first and abstains on a refusal, so the
+/// validator goes silent in its shard's consensus while its beacon, its
+/// execution and its serving carry on — withholding as a validator does
+/// it, whichever host it runs on and whichever vnodes share that host.
+#[derive(Debug)]
+pub struct WithholdingSigner {
+    inner: Arc<dyn Signer>,
+    withheld: AtomicU8,
+    refused: AtomicU64,
+}
+
+impl WithholdingSigner {
+    /// Wrap `inner`, withholding nothing until told to.
+    #[must_use]
+    pub fn new(inner: Arc<dyn Signer>) -> Self {
+        Self {
+            inner,
+            withheld: AtomicU8::new(Withheld::Nothing as u8),
+            refused: AtomicU64::new(0),
+        }
+    }
+
+    /// Refuse `withheld` from now on. Withholding only widens: asking
+    /// for less than it already refuses changes nothing.
+    pub fn withhold(&self, withheld: Withheld) {
+        self.withheld.fetch_max(withheld as u8, Ordering::Relaxed);
+    }
+
+    /// How many shard consensus signatures this signer has refused.
+    #[must_use]
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    fn refuses(&self, message: &[u8]) -> bool {
+        let withheld = self.withheld.load(Ordering::Relaxed);
+        let votes = <BlockVoteMessage as HborSignedWith>::SIGNING_DOMAIN;
+        let refused: &[&[u8]] = if withheld >= Withheld::Consensus as u8 {
+            &[
+                votes,
+                <BlockProposalMessage as HborSignedWith>::SIGNING_DOMAIN,
+                <Timeout as HborSignedWith>::SIGNING_DOMAIN,
+            ]
+        } else if withheld >= Withheld::Votes as u8 {
+            &[votes]
+        } else {
+            &[]
+        };
+        refused.iter().any(|domain| {
+            let mut framed = Vec::with_capacity(domain.len() + 4);
+            varint::write(&mut framed, domain.len()).expect("a signing domain is short");
+            framed.extend_from_slice(domain);
+            message.starts_with(&framed)
+        })
+    }
+}
+
+impl Signer for WithholdingSigner {
+    fn public_key(&self) -> ConsensusPublicKey {
+        self.inner.public_key()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<ConsensusSignature, SignError> {
+        if self.refuses(message) {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(SignError::Exhausted);
+        }
+        self.inner.sign(message)
+    }
+
+    fn vrf_sign(&self, message: &[u8]) -> Result<VrfProof, SignError> {
+        self.inner.vrf_sign(message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1786,5 +1878,42 @@ mod tests {
 
         // Should not verify with different public key
         assert!(!BlsVerifier.verify(committee.public_key(1), message, &signature));
+    }
+
+    #[test]
+    fn a_withholding_signer_refuses_what_it_withholds() {
+        let committee = TestCommittee::new(4, 42);
+        let signer = WithholdingSigner::new(committee.signer(0));
+        let network = NetworkDefinition::simulator();
+        let vote = signed_bytes(
+            &BlockVoteMessage {
+                shard_group: ShardId::ROOT,
+                height: BlockHeight::new(1),
+                round: Round::new(0),
+                block_hash: BlockHash::ZERO,
+                parent_block_hash: BlockHash::ZERO,
+            },
+            &network,
+        );
+        let proposal = signed_bytes(
+            &BlockProposalMessage {
+                shard_group: ShardId::ROOT,
+                height: BlockHeight::new(1),
+                round: Round::new(0),
+                block_hash: BlockHash::ZERO,
+            },
+            &network,
+        );
+        let other = b"any other message";
+
+        assert!(signer.sign(&vote).is_ok(), "signs until told to withhold");
+        signer.withhold(Withheld::Votes);
+        assert!(signer.sign(&vote).is_err());
+        assert!(signer.sign(&proposal).is_ok());
+        signer.withhold(Withheld::Consensus);
+        signer.withhold(Withheld::Votes);
+        assert!(signer.sign(&proposal).is_err(), "withholding only widens");
+        assert!(signer.sign(other).is_ok());
+        assert_eq!(signer.refused(), 2);
     }
 }
