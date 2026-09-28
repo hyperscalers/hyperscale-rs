@@ -852,6 +852,26 @@ impl TopologySnapshot {
         self.recoveries.get(&shard).map_or(&[], Vec::as_slice)
     }
 
+    /// `shard`'s recovery bindings, oldest first: its history, ending with
+    /// the pending recovery. The fold stamps a pending recovery into the
+    /// history as it seats it; a snapshot built with only the pending
+    /// record still binds through it.
+    pub fn recovery_bindings(
+        &self,
+        shard: ShardId,
+    ) -> impl DoubleEndedIterator<Item = RecoveryBinding> + '_ {
+        let history = self.recoveries(shard);
+        let unstamped = self.pending_recoveries.get(&shard).and_then(|pending| {
+            (history.last().map(|binding| binding.rotated_at) != Some(pending.rotated_at))
+                .then_some(RecoveryBinding {
+                    rotated_at: pending.rotated_at,
+                    attested_frontier: pending.attested_frontier,
+                    completed: false,
+                })
+        });
+        history.iter().copied().chain(unstamped)
+    }
+
     /// Every shard's recovery history, oldest first within each.
     pub fn recovery_histories(&self) -> impl Iterator<Item = (ShardId, &[RecoveryBinding])> + '_ {
         self.recoveries
