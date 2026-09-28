@@ -77,13 +77,13 @@ use hyperscale_scenarios::{
     events_land_on_their_emitters_home_shard, failure_charges_its_payer,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
     grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
-    halted_shard_straddler_atomic, hot_recipient, hot_venue_clears_swaps,
-    hot_venue_clears_swaps_on, insolvent_payer_engages_nothing,
-    inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
-    late_departing_route_genesis_accounts, livelock_resolves_promptly, liveness_baseline,
-    merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,
-    merge_seats_full_keeper_committee, merge_straddler_atomic, merge_train_genesis_accounts,
-    merged_pair_genesis_accounts, merging_caller_genesis_accounts,
+    halted_shard_recovery_agrees_across_retained_and_fresh, halted_shard_straddler_atomic,
+    hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
+    insolvent_payer_engages_nothing, inter_shard_partition_strands_ticks_until_it_heals,
+    isolated_validator_still_settles, late_departing_route_genesis_accounts,
+    livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
+    merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
+    merge_train_genesis_accounts, merged_pair_genesis_accounts, merging_caller_genesis_accounts,
     minority_fragment_rejoins_after_partition, multi_vnode_progress,
     nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
     partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
@@ -1247,6 +1247,23 @@ fn halted_shard_recovers_by_committee_redraw_sim() {
         &setup.accounts,
     );
     cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
+}
+
+/// Seed whose recovery draw seats the fresh committee on both a host that
+/// kept the halted shard and one that did not. `RETAINED_SEED` overrides it.
+const RETAINED_AND_FRESH_SEED: u64 = 11;
+
+/// Without dedicated hosts, so a fresh member can land beside a replaced
+/// one on a host that never stopped running the shard.
+#[test]
+fn halted_shard_recovery_agrees_across_retained_and_fresh_sim() {
+    let seed = std::env::var("RETAINED_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(RETAINED_AND_FRESH_SEED);
+    let setup = halt_straddler_setup();
+    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), seed, &setup.accounts);
+    cluster.run_faultable(halted_shard_recovery_agrees_across_retained_and_fresh);
 }
 
 /// Assert straddler atomicity across a halted shard's recovery at `seed`. The
