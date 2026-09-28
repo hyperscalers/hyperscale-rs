@@ -1,5 +1,6 @@
 //! Portable network-fault scenarios.
 
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
@@ -366,6 +367,97 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         "every answer ends after the recovery",
     );
     report_crossing_measures(c, "halted_shard_straddler_atomic");
+}
+
+/// A halted shard's recovery lands on retained and fresh hosts alike, and
+/// every replica agrees on what the recovered shard runs.
+///
+/// The fresh committee seats partly on hosts that kept running the shard
+/// across the halt and partly on hosts that seat it afresh. Laid out without dedicated hosts, so validators share hosts and the
+/// beacon's host-blind draw puts a fresh member beside a replaced one:
+/// that host seats it into the shard loop it never stopped, whose tick
+/// chain still carries what it ran up to the freeze. Transfers go in flight
+/// at the freeze edge, so that chain holds ticks at or below the recovery
+/// frontier which the fresh committee never runs. The recovery raises the
+/// chain's floor to the frontier; above it the retained replica has to
+/// produce the receipts a freshly seated one does, or its vote diverges
+/// from the committee's certificate and its host panics. The in-flight and
+/// post-recovery transfers then settle, and the committee's replicas
+/// converge on one state root.
+///
+/// Requires [`halt_straddler_setup`] at genesis, two committees' worth of
+/// pool surplus, and a seed whose recovery draw lands on both a host that
+/// kept the shard and one that did not.
+///
+/// [`halt_straddler_setup`]: crate::tx::halt_straddler_setup
+///
+/// # Panics
+///
+/// Panics if the halt or recovery misses a lifecycle budget, the fresh
+/// committee lands only on retained or only on fresh hosts, a retained
+/// replica diverges, a transfer fails to settle, or the replicas never
+/// agree on a state root.
+pub fn halted_shard_recovery_agrees_across_retained_and_fresh(c: &mut impl FaultableCluster) {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let setup = halt_straddler_setup();
+    split_lifecycle(c);
+
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        setup
+            .straddlers
+            .iter()
+            .chain(&setup.post_recovery)
+            .flat_map(|(_, from, _, to)| [from.address(), to.address()]),
+        [],
+    );
+    let mut charges = Charges::default();
+    let kept: BTreeSet<usize> = c.committee_hosts(halted).into_iter().collect();
+
+    let halt = freeze_shard(c, halted, survivor, |c| {
+        for leg in &setup.straddlers[..HALT_STRADDLER_BATCH] {
+            submit_probe(c, &mut charges, leg);
+        }
+    });
+    await_halt_recovery(c, &halt);
+
+    let recovered: BTreeSet<usize> = c.committee_hosts(halted).into_iter().collect();
+    assert!(
+        recovered.intersection(&kept).next().is_some(),
+        "the fresh committee must seat a member on a host that kept the shard \
+         across the halt; kept {kept:?}, recovered {recovered:?}",
+    );
+    assert!(
+        recovered.difference(&kept).next().is_some(),
+        "the fresh committee must seat a member on a host that seats the shard \
+         afresh; kept {kept:?}, recovered {recovered:?}",
+    );
+
+    let revived: Vec<Probe> = setup
+        .post_recovery
+        .iter()
+        .map(|leg| submit_probe(c, &mut charges, leg))
+        .collect();
+    assert!(
+        c.run_until(epochs(40), |c| {
+            revived
+                .iter()
+                .all(|p| chain_settled(c, p.payer_shard, p.hash) && credited_once(c, p))
+        }),
+        "a post-recovery transfer per direction must settle and credit its recipient once; {}",
+        revival_report(c, halted, survivor, &revived),
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a recovery across retained and fresh replicas",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| agreed_state_root(c, halted).is_some()),
+        "the recovered shard's replicas, retained and fresh, must agree on one state root",
+    );
 }
 
 /// Assert one crossing's halves under the severance: the payer settles
