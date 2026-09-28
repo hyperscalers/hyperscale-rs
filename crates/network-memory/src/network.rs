@@ -8,8 +8,7 @@
 //! # Determinism
 //!
 //! Latency, jitter, and packet loss draw from a [`ChaCha8Rng`] seeded by
-//! the test harness. Inter-shard latency and intra-shard latency are
-//! configurable independently. All randomness flows through this RNG, so
+//! the test harness. All randomness flows through this RNG, so
 //! reordering of network events between runs only happens if the harness
 //! reseeds.
 //!
@@ -100,10 +99,10 @@ const HEALTH_WEIGHT_NEUTRAL: f64 = 0.5;
 /// [`HostLayout`], never as config fields here.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
-    /// Base latency between two hosts that serve a shard in common.
-    pub intra_shard_latency: Duration,
-    /// Base latency between two hosts that serve no shard in common.
-    pub cross_shard_latency: Duration,
+    /// Base latency between any two hosts. Shard membership is a random
+    /// draw, unrelated to where a host sits, so a link within a shard is no
+    /// nearer than one between shards.
+    pub latency: Duration,
     /// Jitter as a fraction of base latency (0.0 - 1.0).
     pub jitter_fraction: f64,
     /// Packet loss rate (0.0 - 1.0). Messages are dropped with this probability.
@@ -113,8 +112,7 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            intra_shard_latency: Duration::from_millis(150),
-            cross_shard_latency: Duration::from_millis(150),
+            latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
         }
@@ -827,25 +825,12 @@ impl SimulatedNetwork {
         }
 
         // Message will be delivered - sample latency
-        Some(self.sample_latency(from, to, rng))
+        Some(self.sample_latency(rng))
     }
 
-    /// Sample latency for a message between two nodes. Two hosts that
-    /// serve a shard in common take `intra_shard_latency`; otherwise
-    /// `cross_shard_latency`. Co-location is read from the live registries
-    /// (see [`Self::hosts_share_shard`]), so a host that joins a shard at
-    /// runtime becomes near to that shard's peers.
-    pub(crate) fn sample_latency(
-        &self,
-        from: NodeIndex,
-        to: NodeIndex,
-        rng: &mut ChaCha8Rng,
-    ) -> Duration {
-        let base = if self.hosts_share_shard(from, to) {
-            self.config.intra_shard_latency
-        } else {
-            self.config.cross_shard_latency
-        };
+    /// Sample one message's latency: the base plus uniform jitter.
+    pub(crate) fn sample_latency(&self, rng: &mut ChaCha8Rng) -> Duration {
+        let base = self.config.latency;
 
         // Add jitter
         let jitter_range = base.as_secs_f64() * self.config.jitter_fraction;
@@ -853,18 +838,6 @@ impl SimulatedNetwork {
         let latency_secs = (base.as_secs_f64() + jitter).max(0.001);
 
         Duration::from_secs_f64(latency_secs)
-    }
-
-    /// Whether hosts `a` and `b` serve at least one shard in common — the
-    /// latency model's "near" classifier. Reads each host's registry
-    /// hosted set, the same source [`Self::peers_in_shard`] routes on, so it
-    /// tracks reshape: a shard-less follower (empty hosted set) shares with
-    /// nobody and is far from every peer.
-    #[must_use]
-    fn hosts_share_shard(&self, a: NodeIndex, b: NodeIndex) -> bool {
-        let a_shards = self.registries[a as usize].hosted_shards();
-        let b_shards = self.registries[b as usize].hosted_shards();
-        a_shards.iter().any(|shard| b_shards.contains(shard))
     }
 
     /// Get all hosts (`IoLoop` indices) whose registry hosts `shard` — the
@@ -1163,8 +1136,8 @@ impl SimulatedNetwork {
 
         // Sampled per leg, in request-then-response order, because that is
         // the order the RNG is drawn in and each leg is a delivery of its own.
-        let out_leg = self.sample_latency(requester, peer, rng);
-        let rtt = out_leg + self.sample_latency(peer, requester, rng);
+        let out_leg = self.sample_latency(rng);
+        let rtt = out_leg + self.sample_latency(rng);
 
         // A missing handler or empty payload is an application-level error:
         // the peer answered, but with nothing usable.
@@ -1734,29 +1707,13 @@ mod tests {
     }
 
     #[test]
-    fn latency_classifies_by_shared_shard() {
-        let network = sim_network(2, 4);
-
-        // Hosts 0-3 serve shard 0; hosts 4-7 serve shard 1.
-        assert!(network.hosts_share_shard(0, 3), "same-shard hosts are near");
-        assert!(
-            network.hosts_share_shard(0, 0),
-            "a host shares its own shards"
-        );
-        assert!(
-            !network.hosts_share_shard(0, 4),
-            "cross-shard hosts are far"
-        );
-    }
-
-    #[test]
     fn test_hyperscale_latency() {
         let network = sim_network(2, 4);
         let mut rng1 = ChaCha8Rng::seed_from_u64(42);
         let mut rng2 = ChaCha8Rng::seed_from_u64(42);
 
-        let latency1 = network.sample_latency(0, 1, &mut rng1);
-        let latency2 = network.sample_latency(0, 1, &mut rng2);
+        let latency1 = network.sample_latency(&mut rng1);
+        let latency2 = network.sample_latency(&mut rng2);
 
         assert_eq!(latency1, latency2, "Same seed should produce same latency");
     }

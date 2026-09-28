@@ -125,10 +125,8 @@ pub struct SimConfig {
     /// Override the beacon chain config (epoch duration, committee sizes).
     /// `None` uses [`BeaconChainConfig::default`].
     pub beacon_chain_config: Option<BeaconChainConfig>,
-    /// Base latency between two hosts that serve a shard in common.
-    pub intra_shard_latency: Duration,
-    /// Base latency between two hosts that serve no shard in common.
-    pub cross_shard_latency: Duration,
+    /// Base latency between any two hosts.
+    pub latency: Duration,
     /// Jitter as a fraction of base latency (0.0 - 1.0).
     pub jitter_fraction: f64,
     /// Packet loss rate (0.0 - 1.0).
@@ -164,8 +162,7 @@ impl Default for SimConfig {
             pool_surplus: 0,
             dedicated_pool_hosts: false,
             beacon_chain_config: None,
-            intra_shard_latency: Duration::from_millis(150),
-            cross_shard_latency: Duration::from_millis(150),
+            latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
             crypto_scheme: CryptoScheme::default(),
@@ -181,8 +178,7 @@ impl SimConfig {
     /// The transport-only config the simulated network consumes.
     const fn network_config(&self) -> NetworkConfig {
         NetworkConfig {
-            intra_shard_latency: self.intra_shard_latency,
-            cross_shard_latency: self.cross_shard_latency,
+            latency: self.latency,
             jitter_fraction: self.jitter_fraction,
             packet_loss_rate: self.packet_loss_rate,
         }

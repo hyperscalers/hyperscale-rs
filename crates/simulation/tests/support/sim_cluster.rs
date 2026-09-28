@@ -211,8 +211,7 @@ impl SimCluster {
             pool_surplus: config.pool_surplus,
             dedicated_pool_hosts: args.dedicated_pool_hosts,
             beacon_chain_config: Some(beacon_chain_config),
-            intra_shard_latency: config.latency,
-            cross_shard_latency: config.latency,
+            latency: config.latency,
             // Every cluster funds the pool operator and seats the pools,
             // because the founding pool's vote is how any cluster retunes
             // a network parameter — the same reason the statics register
