@@ -7,7 +7,8 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyperscale_network_libp2p::test_utils::TestFixtures;
@@ -18,7 +19,11 @@ use serial_test::serial;
 use support::{CONNECTION_TIMEOUT, build_runner, temp_storage_factory};
 use tokio::task::spawn;
 use tokio::time::{sleep, timeout};
-use tracing_subscriber::fmt;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{Layer, Registry, fmt};
 
 /// A single-validator runner builds against real networking, listens on
 /// localhost QUIC, and exits cleanly (returning `Ok`) when its shutdown
@@ -278,4 +283,100 @@ async fn beacon_chain_config_reaches_genesis() {
         state.params.reshape_thresholds.split_bytes, 50_000,
         "custom split threshold seeds the live network params at genesis"
     );
+}
+
+/// Every event message the process logs, in order.
+#[derive(Clone, Default)]
+struct Messages(Arc<Mutex<Vec<String>>>);
+
+impl Messages {
+    fn contains(&self, needle: &str) -> bool {
+        self.0
+            .lock()
+            .expect("messages lock")
+            .iter()
+            .any(|message| message.contains(needle))
+    }
+}
+
+impl<S: Subscriber> Layer<S> for Messages {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        struct Message<'a>(&'a mut String);
+        impl Visit for Message<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+                if field.name() == "message" {
+                    *self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = String::new();
+        event.record(&mut Message(&mut message));
+        self.0.lock().expect("messages lock").push(message);
+    }
+}
+
+/// A validator joining a shard its host already runs is seated into the
+/// running loop rather than refused, and the committed-view reconcile
+/// releases it again — the committee never placed it — while the host's
+/// other seat keeps the shard up throughout.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_join_for_a_running_shard_seats_into_its_loop() {
+    let messages = Messages::default();
+    let _ = Registry::default()
+        .with(messages.clone())
+        .with(fmt::layer().with_test_writer())
+        .try_init();
+
+    // Validator 0 holds ROOT's one seat; validator 1, local to the same
+    // host, is left pooled.
+    let fixtures = TestFixtures::with_surplus(46, 1, 1);
+    let surplus = ValidatorId::new(1);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[0, 1], vec![], None);
+
+    let adapter = Arc::clone(runner.network());
+    let reconfigure = runner.reconfigure_handle();
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
+    let handle = spawn(runner.run());
+    sleep(Duration::from_millis(200)).await;
+    assert!(adapter.local_shards().contains(&ShardId::ROOT));
+
+    reconfigure
+        .send(ShardCommand::Join {
+            shard: ShardId::ROOT,
+            vnodes: vec![VnodeConfig {
+                validator_id: surplus,
+                local_shard: ShardId::ROOT,
+                signer: fixtures.signer(1),
+            }],
+        })
+        .await
+        .expect("supervisor accepts commands");
+    for (needle, what) in [
+        (
+            "Seat admitted on a running shard",
+            "the running loop admits the seat",
+        ),
+        (
+            "Vnode left a running shard",
+            "the reconcile releases a seat the committee never placed",
+        ),
+    ] {
+        timeout(CONNECTION_TIMEOUT, async {
+            while !messages.contains(needle) {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect(what);
+        assert!(
+            adapter.local_shards().contains(&ShardId::ROOT),
+            "the shard stays up across its seat changes"
+        );
+    }
+
+    drop(shutdown);
+    let result = timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "runner exits after the seat changes");
+    assert!(result.unwrap().is_ok(), "runner returns Ok");
 }

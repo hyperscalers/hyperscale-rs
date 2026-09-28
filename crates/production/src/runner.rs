@@ -47,7 +47,7 @@ use hyperscale_node::shard::{
 };
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, ShardGenesis,
-    SharedTopologySnapshot, TxStatusCache, VnodeInit, seat_follower, seat_vnode_group,
+    SharedTopologySnapshot, TxStatusCache, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -71,7 +71,9 @@ use crate::rpc::{
     MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
 };
 use crate::status::SyncStatus;
-use crate::supervisor::{ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory};
+use crate::supervisor::{
+    ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -1270,6 +1272,18 @@ pub struct ShardChannels {
     pub(crate) callback_rx: Receiver<HostEvent>,
     pub(crate) shutdown_tx: Sender<()>,
     pub(crate) shutdown_rx: Receiver<()>,
+    pub(crate) control_tx: Sender<ShardControl>,
+    pub(crate) control_rx: Receiver<ShardControl>,
+}
+
+/// A change to a running shard loop's seats, sent by the supervisor to
+/// the shard's thread.
+pub enum ShardControl {
+    /// Queue a validator's seat; the loop admits it once its store is at
+    /// rest and reports it as [`SupervisorEvent::Seated`].
+    Seat(Box<VnodeSeat>),
+    /// Take a validator off the loop while another seat keeps it running.
+    Remove(ValidatorId),
 }
 
 impl ShardChannels {
@@ -1281,6 +1295,7 @@ impl ShardChannels {
         let (timer_tx, timer_rx) = unbounded();
         let (callback_tx, callback_rx) = unbounded();
         let (shutdown_tx, shutdown_rx) = unbounded();
+        let (control_tx, control_rx) = unbounded();
         (
             Self {
                 timer_tx,
@@ -1288,6 +1303,8 @@ impl ShardChannels {
                 callback_rx,
                 shutdown_tx,
                 shutdown_rx,
+                control_tx,
+                control_rx,
             },
             callback_tx,
         )
@@ -1394,12 +1411,16 @@ pub struct ShardLoopConfig {
     pub(crate) timer_rx: Receiver<HostEvent>,
     pub(crate) callback_rx: Receiver<HostEvent>,
     pub(crate) shutdown_rx: Receiver<()>,
+    /// Seat changes from the supervisor.
+    pub(crate) control_rx: Receiver<ShardControl>,
     pub(crate) tokio_handle: TokioHandle,
     pub(crate) initial_timer_ops: Vec<TimerOp>,
     /// Placement deltas emitted by this shard's vnodes, forwarded to
-    /// the runner's reconfiguration loop. `None` in tests that drive a
-    /// loop without a runner.
-    pub(crate) participation_tx: Option<mpsc::UnboundedSender<ParticipationChange>>,
+    /// the runner's reconfiguration loop.
+    pub(crate) participation_tx: mpsc::UnboundedSender<ParticipationChange>,
+    /// The supervisor's event channel, told of every seat the loop
+    /// admits.
+    pub(crate) supervisor_tx: mpsc::UnboundedSender<SupervisorEvent>,
     /// Shared RPC publishers. Each shard's thread writes its own slots
     /// on the metrics tick (per-vnode status entries, its sync-status
     /// key, and its vnodes' mempool snapshots); concurrent shards
@@ -1416,8 +1437,9 @@ pub struct ShardLoopConfig {
 /// the shard's shutdown signal fires.
 ///
 /// Priority cascade: `timer_rx` (scheduled view-change / cleanup /
-/// fetch tick fires) before `callback_rx` (off-thread results, inbound
-/// network deliveries, RPC fanout). When both are empty the cascade
+/// fetch tick fires) before `control_rx` (seat changes) before
+/// `callback_rx` (off-thread results, inbound network deliveries, RPC
+/// fanout). When all are empty the cascade
 /// blocks on `select!` with a timeout drawn from the shard's nearest
 /// batch deadline so the shard wakes precisely when its earliest
 /// expiring batch is due.
@@ -1445,6 +1467,10 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
             if let Ok(e) = config.timer_rx.try_recv() {
                 break 'recv Some(e);
             }
+            if let Ok(control) = config.control_rx.try_recv() {
+                apply_shard_control(&mut shard_loop, &config, &mut timer_mgr, control);
+                break 'recv None;
+            }
             if let Ok(e) = config.callback_rx.try_recv() {
                 break 'recv Some(e);
             }
@@ -1459,6 +1485,12 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
                     return;
                 }
                 recv(config.timer_rx) -> e => e.ok(),
+                recv(config.control_rx) -> control => {
+                    if let Ok(control) = control {
+                        apply_shard_control(&mut shard_loop, &config, &mut timer_mgr, control);
+                    }
+                    None
+                }
                 recv(config.callback_rx) -> e => e.ok(),
                 default(timeout) => None,
             }
@@ -1483,15 +1515,7 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
                 }
             };
             let output = shard_loop.run_step(input);
-            for op in output.timer_ops {
-                timer_mgr.process_op(op);
-            }
-            if let Some(tx) = &config.participation_tx {
-                for change in output.participation_changes {
-                    // Send failure means the runner is shutting down.
-                    let _ = tx.send(change);
-                }
-            }
+            apply_step_output(shard, output, &config, &mut timer_mgr);
         }
 
         shard_loop.flush_expired_batches(consensus_clock(config.genesis_offset_ms));
@@ -1507,6 +1531,62 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
     }
 
     info!(shard = ?shard, "Shard event loop exiting");
+}
+
+/// Carry out one of the supervisor's seat changes on the shard's thread.
+fn apply_shard_control(
+    shard_loop: &mut ProdShardLoop,
+    config: &ShardLoopConfig,
+    timer_mgr: &mut ProdTimerManager,
+    control: ShardControl,
+) {
+    match control {
+        ShardControl::Seat(seat) => {
+            let output = shard_loop.seat_vnode(*seat);
+            apply_step_output(shard_loop.shard, output, config, timer_mgr);
+        }
+        ShardControl::Remove(validator) => {
+            if shard_loop.remove_vnode(validator) {
+                scrub_mempool_slot(config, validator);
+            }
+        }
+    }
+}
+
+/// Hand one step's output to the timer manager, the runner and the
+/// supervisor. Send failures mean the runner is shutting down.
+fn apply_step_output(
+    shard: ShardId,
+    output: StepOutput,
+    config: &ShardLoopConfig,
+    timer_mgr: &mut ProdTimerManager,
+) {
+    for op in output.timer_ops {
+        timer_mgr.process_op(op);
+    }
+    for change in output.participation_changes {
+        let _ = config.participation_tx.send(change);
+    }
+    for validator in output.seated {
+        let _ = config
+            .supervisor_tx
+            .send(SupervisorEvent::Seated { shard, validator });
+    }
+}
+
+/// Drop a validator's mempool slot once its vnode leaves this shard. The
+/// slot is keyed by validator alone and written only by the threads that
+/// carry it, so a departed one would otherwise hold a stale snapshot, and
+/// a vnode still carried on another shard republishes it on that shard's
+/// next tick.
+fn scrub_mempool_slot(config: &ShardLoopConfig, validator: ValidatorId) {
+    if let Some(ref mempool_snapshot) = config.publishers.mempool {
+        mempool_snapshot.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.vnodes.remove(&validator.inner());
+            Arc::new(updated)
+        });
+    }
 }
 
 /// Write this shard's contribution into the shared RPC state. Each slot is

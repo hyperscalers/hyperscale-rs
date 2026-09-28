@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
-use hyperscale_node::{SeatConfig, SeatVnodeGroup, VnodeInit, seat_vnode_group};
+use hyperscale_node::{SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_vnode_group};
 use hyperscale_storage::RecoveredState;
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
@@ -31,7 +31,7 @@ use tracing::{info, warn};
 
 use super::{ShardSupervisor, ShardThread, SupervisorEvent};
 use crate::bootstrap::bootstrap_shard_state;
-use crate::runner::{ShardChannels, VnodeConfig, consensus_clock, spawn_shard_loop};
+use crate::runner::{ShardChannels, ShardControl, VnodeConfig, consensus_clock, spawn_shard_loop};
 
 /// A finished snap-sync bootstrap, ready for the supervisor to seat:
 /// the imported storage verified against the attested anchor, plus the
@@ -48,10 +48,11 @@ impl ShardSupervisor {
     /// in [`Self::on_opened`] — seat directly for a retained store or a
     /// genesis replay, or snap-sync against the beacon-attested anchor
     /// first. A join for a shard still tearing down queues and replays
-    /// once the teardown finishes.
+    /// once the teardown finishes; one for a shard already running seats
+    /// into its loop.
     pub(super) fn join(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
-        if self.shards.contains_key(&shard) || self.bootstrapping.contains_key(&shard) {
-            warn!(shard = ?shard, "Join rejected: shard already hosted or bootstrapping");
+        if self.bootstrapping.contains_key(&shard) {
+            warn!(shard = ?shard, "Join rejected: shard still bootstrapping");
             return;
         }
         if vnodes.is_empty() || vnodes.iter().any(|v| v.local_shard != shard) {
@@ -87,6 +88,10 @@ impl ShardSupervisor {
             || self.pending_reshape_prep.contains_key(&shard)
         {
             info!(shard = ?shard, "Join superseded by an active reshape duty; the orchestrator seats it");
+            return;
+        }
+        if self.shards.contains_key(&shard) {
+            self.seat_into_running(shard, vnodes);
             return;
         }
 
@@ -278,6 +283,7 @@ impl ShardSupervisor {
             .insert(shard, storage);
 
         let shutdown_tx = channels.shutdown_tx.clone();
+        let control_tx = channels.control_tx.clone();
         let validator_ids = vnodes.iter().map(|v| v.validator_id.inner()).collect();
         let cfg = self.loop_config(channels, initial_timer_ops);
         let join = spawn_shard_loop(shard_loop, cfg);
@@ -286,6 +292,8 @@ impl ShardSupervisor {
             ShardThread {
                 join,
                 shutdown_tx,
+                control_tx,
+                queued: Vec::new(),
                 vnode_count,
                 validator_ids,
             },
@@ -297,6 +305,54 @@ impl ShardSupervisor {
             self.unfollow_in_pool(cfg.validator_id);
         }
         info!(shard = ?shard, vnodes = vnode_count, "Shard joined at runtime");
+    }
+
+    /// Queue each of `vnodes` the running loop of `shard` does not already
+    /// carry or queue: a validator drawn onto a shard this host serves
+    /// joins the loop rather than a thread of its own. The loop admits it
+    /// once its store is at rest and reports it back as
+    /// [`SupervisorEvent::Seated`].
+    fn seat_into_running(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
+        let config = self.seat_config();
+        let Some(entry) = self.shards.get_mut(&shard) else {
+            return;
+        };
+        for vnode in vnodes {
+            let id = vnode.validator_id.inner();
+            if entry.validator_ids.contains(&id) || entry.queued.contains(&id) {
+                continue;
+            }
+            let seat = VnodeSeat {
+                config: config.clone(),
+                validator: vnode.validator_id,
+                signer: Arc::clone(&vnode.signer),
+            };
+            if entry
+                .control_tx
+                .send(ShardControl::Seat(Box::new(seat)))
+                .is_ok()
+            {
+                entry.queued.push(id);
+                info!(shard = ?shard, validator = id, "Seat queued on a running shard");
+            }
+        }
+    }
+
+    /// A running loop admitted a queued seat: count the validator among
+    /// the shard's, and retire its pool follower, since it drives its
+    /// beacon from this shard now.
+    pub(super) fn on_seated(&mut self, shard: ShardId, validator: ValidatorId) {
+        let Some(entry) = self.shards.get_mut(&shard) else {
+            return;
+        };
+        let id = validator.inner();
+        entry.queued.retain(|&queued| queued != id);
+        if !entry.validator_ids.contains(&id) {
+            entry.validator_ids.push(id);
+            entry.vnode_count += 1;
+        }
+        self.unfollow_in_pool(validator);
+        info!(shard = ?shard, validator = id, "Seat admitted on a running shard");
     }
 
     /// Release one vnode's membership; tear the shard down at zero. A
@@ -392,6 +448,33 @@ impl ShardSupervisor {
             );
             self.tear_down(shard);
         }
+        // A shard that stays up releases, by the same rule applied per
+        // validator, each vnode that no longer holds a role in it, while
+        // another seat keeps the loop running.
+        let mut released: Vec<ValidatorId> = Vec::new();
+        for (&shard, entry) in &mut self.shards {
+            for id in entry.validator_ids.clone() {
+                let validator = ValidatorId::new(id);
+                let alone = HashSet::from([validator]);
+                if entry.validator_ids.len() > 1
+                    && shard_retired(shard, &topology_snapshot, &routing, &alone)
+                    && entry
+                        .control_tx
+                        .send(ShardControl::Remove(validator))
+                        .is_ok()
+                {
+                    entry.validator_ids.retain(|&kept| kept != id);
+                    entry.vnode_count = entry.vnode_count.saturating_sub(1);
+                    released.push(validator);
+                    info!(shard = ?shard, validator = id, "Vnode left a running shard");
+                }
+            }
+        }
+        for validator in released {
+            if !self.validator_on_any_shard(validator) {
+                self.follow_in_pool(validator);
+            }
+        }
     }
 
     /// Reconcile hosted shards against the committed committee assignment: bring
@@ -412,6 +495,17 @@ impl ShardSupervisor {
     pub(crate) fn reconcile_joins(&mut self) {
         let topology_snapshot = self.process.topology_snapshot().load_full();
         let host_ids: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
+        // A running shard seats a local member it does not yet carry.
+        let running: Vec<ShardId> = self
+            .shards
+            .keys()
+            .copied()
+            .filter(|&shard| !self.reshape.is_seating(shard))
+            .collect();
+        for shard in running {
+            let vnodes = self.local_committee_vnodes(&topology_snapshot, shard);
+            self.seat_into_running(shard, &vnodes);
+        }
         let needed: Vec<ShardId> = topology_snapshot
             .shard_trie()
             .leaves()
@@ -544,16 +638,7 @@ impl ShardSupervisor {
         recovered: &RecoveredState,
     ) -> Vec<VnodeInit> {
         seat_vnode_group(SeatVnodeGroup {
-            config: SeatConfig {
-                verifier: Arc::new(BlsVerifier),
-                derivation: self.process.derivation(),
-                code: self.process.code(),
-                beacon_network: self.beacon_network.clone(),
-                beacon_config_hash: self.beacon_config_hash,
-                shard_config: self.shard_config.clone(),
-                mempool_config: self.mempool_config.clone(),
-                provision_config: self.provision_config,
-            },
+            config: self.seat_config(),
             beacon_storage: self.process.beacon_storage().as_ref(),
             now: consensus_clock(self.genesis_offset_ms),
             shard,
@@ -563,6 +648,20 @@ impl ShardSupervisor {
                 .map(|cfg| (cfg.validator_id, Arc::clone(&cfg.signer)))
                 .collect(),
         })
+    }
+
+    /// How this host builds every vnode it seats at runtime.
+    fn seat_config(&self) -> SeatConfig {
+        SeatConfig {
+            verifier: Arc::new(BlsVerifier),
+            derivation: self.process.derivation(),
+            code: self.process.code(),
+            beacon_network: self.beacon_network.clone(),
+            beacon_config_hash: self.beacon_config_hash,
+            shard_config: self.shard_config.clone(),
+            mempool_config: self.mempool_config.clone(),
+            provision_config: self.provision_config,
+        }
     }
 }
 
