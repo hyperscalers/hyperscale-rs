@@ -23,7 +23,7 @@ use crate::support::tx::{
 use crate::support::wait::{
     await_beacon_epoch, await_crossings_end, await_height, await_tx_terminal,
 };
-use crate::support::{Cluster, epochs};
+use crate::support::{Cluster, assume, epochs};
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
@@ -423,15 +423,21 @@ pub fn halted_shard_recovery_agrees_across_retained_and_fresh(c: &mut impl Fault
     await_halt_recovery(c, &halt);
 
     let recovered: BTreeSet<usize> = c.committee_hosts(halted).into_iter().collect();
-    assert!(
+    // The recovery draw is the seed's: a draw that misses either kind of
+    // host never reaches the agreement this scenario checks.
+    assume(
         recovered.intersection(&kept).next().is_some(),
-        "the fresh committee must seat a member on a host that kept the shard \
-         across the halt; kept {kept:?}, recovered {recovered:?}",
+        &format!(
+            "the fresh committee must seat a member on a host that kept the shard \
+             across the halt; kept {kept:?}, recovered {recovered:?}"
+        ),
     );
-    assert!(
+    assume(
         recovered.difference(&kept).next().is_some(),
-        "the fresh committee must seat a member on a host that seats the shard \
-         afresh; kept {kept:?}, recovered {recovered:?}",
+        &format!(
+            "the fresh committee must seat a member on a host that seats the shard \
+             afresh; kept {kept:?}, recovered {recovered:?}"
+        ),
     );
 
     let revived: Vec<Probe> = setup

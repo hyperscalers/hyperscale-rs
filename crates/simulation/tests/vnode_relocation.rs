@@ -32,7 +32,8 @@ use tracing_test::traced_test;
 
 mod support;
 
-use support::{PER_SHARD, SimCluster, committee_member_host, discard, rotation_config};
+use hyperscale_scenarios::discard;
+use support::{PER_SHARD, SimCluster, committee_member_host, rotation_config};
 
 /// Seed for the grown placement the rotation runs against.
 const SEED: u64 = 7;

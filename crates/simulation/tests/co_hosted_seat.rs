@@ -17,7 +17,8 @@ use hyperscale_types::{BlockHeight, ShardId, ValidatorId};
 
 mod support;
 
-use support::{SimCluster, assume, rotation_config};
+use hyperscale_scenarios::assume;
+use support::{SimCluster, rotation_config};
 
 /// Seed for the grown placement the shuffle runs against.
 const SEED: u64 = 7;

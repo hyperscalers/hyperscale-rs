@@ -56,31 +56,6 @@ pub fn sim_seed(default: u64) -> u64 {
     })
 }
 
-/// Discard the run, rather than fail it, when a seed does not produce the
-/// setup a test needs. Only for preconditions checked before the first fault
-/// or workload op: past that point a broken expectation is a failure. A sweep
-/// classifies a panic carrying [`DISCARD`] as a discard.
-///
-/// # Panics
-///
-/// Panics with [`DISCARD`] when `condition` does not hold.
-pub fn assume(condition: bool, what: &str) {
-    assert!(condition, "{DISCARD} {what}");
-}
-
-/// Discard the run unconditionally: [`assume`] for a value the seed did
-/// not produce.
-///
-/// # Panics
-///
-/// Always, with [`DISCARD`].
-pub fn discard(what: &str) -> ! {
-    panic!("{DISCARD} {what}");
-}
-
-/// Prefix of the panic [`assume`] and [`discard`] raise.
-pub const DISCARD: &str = "SIM-DISCARD:";
-
 /// Committee validators per shard — the production `shard_size`. The split
 /// seats each child at full strength (`2+2` parent half plus cohort), so the
 /// committee top-up never fires here: this exercises the shuffle, not top-up.

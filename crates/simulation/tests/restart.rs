@@ -26,12 +26,12 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig, VENUE_SHARD,
-    a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
-    venue_genesis_accounts,
+    a_rejoined_producer_asks_a_lost_answer, assume, epochs, grind_onto, split_lifecycle,
+    stand_up_venue, venue_genesis_accounts,
 };
 use hyperscale_storage::BoundaryStore;
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
-use support::{SimCluster, assume, seeded};
+use support::{SimCluster, seeded};
 
 /// The halt scenarios' topology: a split leaves a live sibling to carry
 /// the beacon through the folds that detect a stalled shard, and the pool
