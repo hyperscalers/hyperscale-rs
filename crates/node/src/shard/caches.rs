@@ -14,11 +14,13 @@
 
 use std::sync::Arc;
 
-use hyperscale_execution::{ExecCertStore, FinalizationStore};
+use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
 use hyperscale_types::{Finalization, FinalizationHash, Verifiable};
 use quick_cache::sync::Cache as QuickCache;
+
+use crate::vnode::GroupStores;
 
 /// Default certificate cache capacity.
 pub(super) const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
@@ -62,20 +64,23 @@ pub struct SharedCaches {
     /// Per-shard finalization store, shared with every same-shard
     /// `ExecutionCoordinator`.
     pub(crate) finalization_store: Arc<FinalizationStore>,
+    /// The group's crossing index slot, bound to the shard's chain once
+    /// the chain is open.
+    pub(crate) crossing_index: Arc<CrossingIndexSlot>,
 }
 
 impl SharedCaches {
-    /// Construct caches at `io_loop` startup. The `ProvisionStore`,
-    /// `TxStore`, `ExecCertStore` and `FinalizationStore` are owned by
-    /// their respective state machines; clones are passed in so the same
-    /// `Arc`s flow into network handler closures and sync helpers.
-    pub(crate) fn new(
-        provision_store: Arc<ProvisionStore>,
-        verified_headers: Arc<VerifiedHeaderBuffer>,
-        tx_store: Arc<TxStore>,
-        exec_cert_store: Arc<ExecCertStore>,
-        finalization_store: Arc<FinalizationStore>,
-    ) -> Self {
+    /// Construct caches at `io_loop` startup over the group's stores,
+    /// which its state machines co-own; the same `Arc`s flow into
+    /// network handler closures and sync helpers.
+    pub(crate) fn new(stores: GroupStores, verified_headers: Arc<VerifiedHeaderBuffer>) -> Self {
+        let GroupStores {
+            provision_store,
+            tx_store,
+            exec_cert_store,
+            finalization_store,
+            crossing_index,
+        } = stores;
         Self {
             tx_store,
             finalization: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
@@ -83,6 +88,18 @@ impl SharedCaches {
             verified_headers,
             exec_cert_store,
             finalization_store,
+            crossing_index,
+        }
+    }
+
+    /// The stores a vnode joining this group is built over.
+    pub(crate) fn group_stores(&self) -> GroupStores {
+        GroupStores {
+            provision_store: Arc::clone(&self.provision_store),
+            tx_store: Arc::clone(&self.tx_store),
+            exec_cert_store: Arc::clone(&self.exec_cert_store),
+            finalization_store: Arc::clone(&self.finalization_store),
+            crossing_index: Arc::clone(&self.crossing_index),
         }
     }
 }

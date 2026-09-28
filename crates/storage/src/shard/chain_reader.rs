@@ -8,9 +8,11 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, Transaction, TxHash,
-    Verifiable, Verified,
+    ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
+    TxHash, Verifiable, Verified,
 };
+
+use crate::RecoveredState;
 
 /// A sync-ready block retrieved from storage.
 ///
@@ -79,6 +81,15 @@ pub trait ShardChainReader: Send + Sync + 'static {
 
     /// Get the latest quorum certificate.
     fn latest_qc(&self) -> Option<Verified<QuorumCertificate>>;
+
+    /// The state a vnode resumes consensus from, read at this store's
+    /// persisted tip. A fresh store reads back at genesis.
+    ///
+    /// `shard` is the shard this store is resumed as, which narrows the
+    /// escrow records to the ones it owns: a split child's cell column
+    /// is a superset of its own leaves until the sibling's are
+    /// compacted out of it.
+    fn load_recovered_state(&self, shard: ShardId) -> RecoveredState;
 
     /// Get a complete block for serving sync requests from persisted
     /// storage.

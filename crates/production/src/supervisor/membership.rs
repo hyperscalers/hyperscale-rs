@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
-use hyperscale_node::{SeatVnodeGroup, VnodeInit, seat_vnode_group};
+use hyperscale_node::{SeatConfig, SeatVnodeGroup, VnodeInit, seat_vnode_group};
 use hyperscale_storage::RecoveredState;
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
@@ -544,18 +544,20 @@ impl ShardSupervisor {
         recovered: &RecoveredState,
     ) -> Vec<VnodeInit> {
         seat_vnode_group(SeatVnodeGroup {
-            verifier: Arc::new(BlsVerifier),
-            derivation: self.process.derivation(),
-            code: self.process.code(),
+            config: SeatConfig {
+                verifier: Arc::new(BlsVerifier),
+                derivation: self.process.derivation(),
+                code: self.process.code(),
+                beacon_network: self.beacon_network.clone(),
+                beacon_config_hash: self.beacon_config_hash,
+                shard_config: self.shard_config.clone(),
+                mempool_config: self.mempool_config.clone(),
+                provision_config: self.provision_config,
+            },
             beacon_storage: self.process.beacon_storage().as_ref(),
-            beacon_network: self.beacon_network.clone(),
-            beacon_config_hash: self.beacon_config_hash,
             now: consensus_clock(self.genesis_offset_ms),
             shard,
             recovered,
-            shard_config: &self.shard_config,
-            mempool_config: self.mempool_config.clone(),
-            provision_config: self.provision_config,
             vnodes: vnodes
                 .iter()
                 .map(|cfg| (cfg.validator_id, Arc::clone(&cfg.signer)))

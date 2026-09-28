@@ -21,7 +21,7 @@ use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
-use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, VnodeInit};
+use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, SeatConfig, VnodeInit, VnodeSeat};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
@@ -150,6 +150,53 @@ impl Fixture {
             state,
             signer: self.committee.signer(idx),
         }
+    }
+
+    /// A queued seat for `committee[idx]`.
+    fn seat(&self, idx: usize) -> VnodeSeat {
+        VnodeSeat {
+            config: SeatConfig {
+                verifier: Arc::new(BlsVerifier),
+                derivation: Arc::new(StubVmStatics),
+                code: Arc::new(AllCodeRuns),
+                beacon_network: NetworkDefinition::simulator(),
+                beacon_config_hash: self.config_hash,
+                shard_config: ShardConsensusConfig::default(),
+                mempool_config: MempoolConfig::default(),
+                provision_config: ProvisionConfig::default(),
+            },
+            validator: self.committee.validator_id(idx),
+            signer: self.committee.signer(idx),
+        }
+    }
+
+    /// A host running shard A with `committee[0]` seated, plus a pool
+    /// follower for each of `followers`.
+    fn shard_a_host(
+        &self,
+        followers: &[usize],
+    ) -> NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch> {
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD_A).collect()));
+        let network = SimNetworkAdapter::new(registry);
+        let (event_tx, _event_rx) = unbounded();
+        let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
+        beacon_storage
+            .commit_beacon_block(&self.genesis_block, &Arc::new(self.genesis_state.clone()));
+        let mut inits = vec![self.vnode_init(0, SHARD_A)];
+        inits.extend(followers.iter().map(|&idx| self.pooled_vnode_init(idx)));
+        NodeHost::new(
+            inits,
+            std::iter::once((SHARD_A, SimShardStorage::new(shard_prefix_path(SHARD_A)))).collect(),
+            beacon_storage,
+            NetworkDefinition::simulator(),
+            Arc::new(Executor::new(ExecutionMode::Serial)),
+            network,
+            SyncDispatch,
+            std::iter::once((SHARD_A, event_tx.clone())).collect(),
+            event_tx,
+            Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
+            NodeConfig::default(),
+        )
     }
 
     /// A shard-less, beacon-following vnode for `committee[idx]`.
@@ -445,4 +492,83 @@ fn remove_unknown_shard_is_none() {
     );
     assert!(host.remove_shard(SHARD_B).is_none());
     assert!(host.hosted_shards().any(|s| s == SHARD_A));
+}
+
+/// A validator drawn onto a shard its host already runs joins the running
+/// loop, over the stores its first seat's group co-owns, and its pool
+/// follower retires once it is seated.
+#[test]
+fn a_second_seat_joins_the_running_loop_over_its_stores() {
+    let fix = fixture();
+    let mut host = fix.shard_a_host(&[1]);
+    assert_eq!(host.pooled_len(), 1);
+
+    let out = host.seat_vnode(SHARD_A, fix.seat(1));
+
+    assert_eq!(out.seated, vec![fix.committee.validator_id(1)]);
+    assert_eq!(host.vnodes_len(SHARD_A), 2);
+    assert_eq!(
+        host.pooled_len(),
+        0,
+        "the seated validator's follower retires"
+    );
+    let first = host.vnode_state(SHARD_A, 0);
+    let joiner = host.vnode_state(SHARD_A, 1);
+    assert_eq!(joiner.validator_id(), fix.committee.validator_id(1));
+    assert!(Arc::ptr_eq(
+        first.mempool_coordinator().tx_store(),
+        joiner.mempool_coordinator().tx_store()
+    ));
+    let (first, joiner) = (
+        first.execution_coordinator(),
+        joiner.execution_coordinator(),
+    );
+    assert!(Arc::ptr_eq(
+        first.exec_cert_store(),
+        joiner.exec_cert_store()
+    ));
+    assert!(Arc::ptr_eq(
+        first.finalization_store(),
+        joiner.finalization_store()
+    ));
+    assert!(Arc::ptr_eq(first.crossing_index(), joiner.crossing_index()));
+}
+
+/// A seat for a validator the loop already carries is dropped.
+#[test]
+fn a_seat_the_loop_already_carries_is_dropped() {
+    let fix = fixture();
+    let mut host = fix.shard_a_host(&[]);
+
+    let out = host.seat_vnode(SHARD_A, fix.seat(0));
+
+    assert!(out.seated.is_empty());
+    assert_eq!(host.vnodes_len(SHARD_A), 1);
+}
+
+/// Removing one of two seats leaves the other running on the loop.
+#[test]
+fn removing_one_seat_leaves_the_other_running() {
+    let fix = fixture();
+    let mut host = fix.shard_a_host(&[]);
+    let _ = host.seat_vnode(SHARD_A, fix.seat(1));
+
+    assert!(host.remove_vnode(SHARD_A, fix.committee.validator_id(0)));
+
+    assert!(host.hosted_shards().any(|s| s == SHARD_A));
+    assert_eq!(host.vnodes_len(SHARD_A), 1);
+    assert_eq!(
+        host.vnode_state(SHARD_A, 0).validator_id(),
+        fix.committee.validator_id(1)
+    );
+    assert!(!host.remove_vnode(SHARD_A, fix.committee.validator_id(2)));
+}
+
+/// The last seat leaves with its loop, never through `remove_vnode`.
+#[test]
+#[should_panic(expected = "leaves with its loop")]
+fn the_last_seat_leaves_only_with_its_loop() {
+    let fix = fixture();
+    let mut host = fix.shard_a_host(&[]);
+    host.remove_vnode(SHARD_A, fix.committee.validator_id(0));
 }

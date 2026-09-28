@@ -1217,7 +1217,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::BlockForSync;
+    use crate::{BlockForSync, RecoveredState};
 
     /// Minimal stub implementing every trait `PendingChain<S>` requires.
     /// Returns no data by default; tests that need persisted fall-through
@@ -1401,6 +1401,9 @@ mod tests {
         }
         fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
             None
+        }
+        fn load_recovered_state(&self, _shard: ShardId) -> RecoveredState {
+            RecoveredState::default()
         }
         fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
             self.sync_block_reads.fetch_add(1, Ordering::Relaxed);

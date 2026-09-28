@@ -30,8 +30,8 @@ use hyperscale_node::bootstrap::{
     BootstrapRequest, ShardBootstrap, StateRangeOutcome, replicate_engine_bootstrap,
 };
 use hyperscale_node::{
-    SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group, serve_block_request,
-    serve_state_range_request, serve_witness_history_request,
+    SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
+    serve_block_request, serve_state_range_request, serve_witness_history_request,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -536,18 +536,20 @@ impl SimulationRunner {
             Arc::clone(&self.signers[usize::try_from(validator.inner()).expect("id fits usize")])
                 as Arc<dyn Signer>;
         seat_vnode_group(SeatVnodeGroup {
-            verifier: Arc::clone(&self.verifier),
-            derivation: host.derivation(),
-            code: host.code(),
+            config: SeatConfig {
+                verifier: Arc::clone(&self.verifier),
+                derivation: host.derivation(),
+                code: host.code(),
+                beacon_network: self.beacon_network.clone(),
+                beacon_config_hash: self.beacon_config_hash,
+                shard_config: ShardConsensusConfig::default(),
+                mempool_config: MempoolConfig::default(),
+                provision_config: ProvisionConfig::default(),
+            },
             beacon_storage: host.beacon_storage().as_ref(),
-            beacon_network: self.beacon_network.clone(),
-            beacon_config_hash: self.beacon_config_hash,
             now,
             shard,
             recovered,
-            shard_config: &ShardConsensusConfig::default(),
-            mempool_config: MempoolConfig::default(),
-            provision_config: ProvisionConfig::default(),
             vnodes: vec![(validator, signer)],
         })
         .pop()

@@ -56,4 +56,7 @@ pub use shard::cross_shard::{
 };
 pub use shard::{SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;
-pub use vnode::{SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, seat_follower, seat_vnode_group};
+pub use vnode::{
+    SeatConfig, SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, VnodeSeat, seat_follower,
+    seat_vnode_group,
+};

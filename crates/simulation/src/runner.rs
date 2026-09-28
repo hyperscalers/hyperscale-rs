@@ -26,8 +26,8 @@ use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
-    NodeConfig, NodeHost, NodeStateMachine, SeatFollower, SeatVnodeGroup, ShardGenesis, TimerOp,
-    VnodeInit, seat_follower, seat_vnode_group, timer_event,
+    NodeConfig, NodeHost, NodeStateMachine, SeatConfig, SeatFollower, SeatVnodeGroup, ShardGenesis,
+    TimerOp, VnodeInit, seat_follower, seat_vnode_group, timer_event,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
@@ -501,18 +501,20 @@ impl SimulationRunner {
                     })
                     .collect();
                 vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
-                    verifier: Arc::clone(&verifier),
-                    derivation: executor.derivation(),
-                    code: Arc::clone(&executor) as _,
+                    config: SeatConfig {
+                        verifier: Arc::clone(&verifier),
+                        derivation: executor.derivation(),
+                        code: Arc::clone(&executor) as _,
+                        beacon_network: beacon_network.clone(),
+                        beacon_config_hash,
+                        shard_config: ShardConsensusConfig::default(),
+                        mempool_config: MempoolConfig::default(),
+                        provision_config: ProvisionConfig::default(),
+                    },
                     beacon_storage: beacon_storage.as_ref(),
-                    beacon_network: beacon_network.clone(),
-                    beacon_config_hash,
                     now: LocalTimestamp::ZERO,
                     shard: *shard,
                     recovered: &RecoveredState::default(),
-                    shard_config: &ShardConsensusConfig::default(),
-                    mempool_config: MempoolConfig::default(),
-                    provision_config: ProvisionConfig::default(),
                     vnodes,
                 }));
             }

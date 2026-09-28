@@ -4,12 +4,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::read_or_recover;
-use hyperscale_storage::{BlockForSync, ShardChainReader};
+use hyperscale_storage::{BlockForSync, RecoveredState, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, Transaction, TxHash,
-    Verifiable, Verified,
+    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
+    TxHash, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -68,6 +68,10 @@ impl ShardChainReader for SimShardStorage {
             .committed_qc
             .clone()
             .map(Verified::<QuorumCertificate>::from_persisted)
+    }
+
+    fn load_recovered_state(&self, shard: ShardId) -> RecoveredState {
+        Self::load_recovered_state(self, shard)
     }
 
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
