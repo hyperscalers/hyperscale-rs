@@ -1754,10 +1754,10 @@ impl WithholdingSigner {
         }
     }
 
-    /// Refuse `withheld` from now on. Withholding only widens: asking
-    /// for less than it already refuses changes nothing.
+    /// Refuse exactly `withheld` from now on, replacing whatever it
+    /// refused before; [`Withheld::Nothing`] lifts the fault.
     pub fn withhold(&self, withheld: Withheld) {
-        self.withheld.fetch_max(withheld as u8, Ordering::Relaxed);
+        self.withheld.store(withheld as u8, Ordering::Relaxed);
     }
 
     /// How many shard consensus signatures this signer has refused.
@@ -1911,9 +1911,15 @@ mod tests {
         assert!(signer.sign(&vote).is_err());
         assert!(signer.sign(&proposal).is_ok());
         signer.withhold(Withheld::Consensus);
-        signer.withhold(Withheld::Votes);
-        assert!(signer.sign(&proposal).is_err(), "withholding only widens");
+        assert!(signer.sign(&proposal).is_err());
         assert!(signer.sign(other).is_ok());
+        signer.withhold(Withheld::Votes);
+        assert!(
+            signer.sign(&proposal).is_ok(),
+            "withholding replaces, never accumulates"
+        );
+        signer.withhold(Withheld::Nothing);
+        assert!(signer.sign(&vote).is_ok(), "nothing lifts the fault");
         assert_eq!(signer.refused(), 2);
     }
 }

@@ -986,9 +986,9 @@ impl SimulationRunner {
         Arc::clone(&self.verifier)
     }
 
-    /// Make `validator` withhold `withheld` of its shard consensus from now
-    /// on, on every vnode it runs, and return its signer to count what it
-    /// refuses.
+    /// Make `validator` withhold exactly `withheld` of its shard consensus
+    /// from now on, on every vnode it runs, and return its signer to count
+    /// what it refuses. [`Withheld::Nothing`] lifts the fault.
     ///
     /// # Panics
     ///

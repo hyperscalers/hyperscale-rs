@@ -99,9 +99,11 @@ pub trait FaultableCluster: Cluster {
     /// guarantee a cluster-wide read cannot see.
     fn host_committed_state_root(&self, host: usize, shard: ShardId) -> Option<StateRoot>;
 
-    /// Make `validators` withhold `withheld` of their shard consensus from
-    /// now on: each signature it names is refused, on whichever hosts run
-    /// them, while their beacon duties, execution and serving carry on.
+    /// Make `validators` withhold exactly `withheld` of their shard
+    /// consensus from now on, replacing what they withheld before, so
+    /// [`Withheld::Nothing`] lifts the fault: each signature it names is
+    /// refused, on whichever hosts run them, while their beacon duties,
+    /// execution and serving carry on.
     /// Unlike a host cut, it touches no other vnode sharing their hosts
     /// and no validator drawn later. The handle counts the refusals.
     fn withhold(&mut self, validators: &[ValidatorId], withheld: Withheld) -> FaultHandle;
