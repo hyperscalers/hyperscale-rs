@@ -329,6 +329,16 @@ pub struct VerificationPipeline {
     /// refuse a new key rather than drop an old one.
     beacon_witness_awaiting_committee: BTreeSet<BlockHash>,
 
+    /// Sync-admitted blocks whose state-root verification could not start
+    /// because this node's schedule does not yet hold the block's window.
+    /// Their tree is what a child's state-root check reads, so a replica
+    /// that never prepares one cannot vote on the child, and when that vote
+    /// is pivotal the child never certifies and the block never commits to
+    /// prepare its tree inline. Retried when the beacon advances
+    /// (`on_beacon_block_persisted`); a key whose block has since left the
+    /// certified cache is dropped at the retry.
+    synced_state_roots_awaiting_window: BTreeSet<BlockHash>,
+
     // === Drain total verification ===
     /// Blocks whose claimed drain total was re-derived and matched.
     verified_in_flight: HashSet<BlockHash>,
@@ -371,6 +381,7 @@ impl VerificationPipeline {
             roots: HashMap::new(),
             deferred_beacon_witness_verifications: BTreeMap::new(),
             beacon_witness_awaiting_committee: BTreeSet::new(),
+            synced_state_roots_awaiting_window: BTreeSet::new(),
             verified_in_flight: HashSet::new(),
             pending_assemblies: HashMap::new(),
             verified_certified_blocks: HashMap::new(),
@@ -1414,6 +1425,20 @@ impl VerificationPipeline {
     /// caller re-initiates each; any still beacon-behind re-parks itself.
     pub(crate) fn take_beacon_witness_awaiting_committee(&mut self) -> Vec<BlockHash> {
         std::mem::take(&mut self.beacon_witness_awaiting_committee)
+            .into_iter()
+            .collect()
+    }
+
+    /// Park a sync-admitted block's state-root verification until the
+    /// beacon commits the window its anchor falls in.
+    pub(crate) fn park_synced_state_root_awaiting_window(&mut self, block_hash: BlockHash) {
+        self.synced_state_roots_awaiting_window.insert(block_hash);
+    }
+
+    /// Drain the sync-admitted blocks parked awaiting their window. The
+    /// caller re-initiates each; any still beacon-behind re-parks itself.
+    pub(crate) fn take_synced_state_roots_awaiting_window(&mut self) -> Vec<BlockHash> {
+        std::mem::take(&mut self.synced_state_roots_awaiting_window)
             .into_iter()
             .collect()
     }

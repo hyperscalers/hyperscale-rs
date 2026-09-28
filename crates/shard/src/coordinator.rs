@@ -4908,6 +4908,23 @@ impl ShardCoordinator {
             .collect()
     }
 
+    /// Re-initiate the state-root verification of every sync-admitted block
+    /// parked because its window was not yet in the schedule. A block that
+    /// has committed or been pruned has left the certified cache and is
+    /// dropped; one still beacon-behind re-parks.
+    fn retry_synced_state_roots_awaiting_window(&mut self, topology_schedule: &TopologySchedule) {
+        for block_hash in self.verification.take_synced_state_roots_awaiting_window() {
+            let Some(certified) = self
+                .verification
+                .cached_verified_certified_block(block_hash)
+                .map(Arc::clone)
+            else {
+                continue;
+            };
+            self.initiate_synced_state_root_verification(topology_schedule, certified.block());
+        }
+    }
+
     /// Resolve `block_hash`'s governing committee and dispatch its
     /// beacon-witness root verification. Empty if the block is no longer
     /// pending (committed or pruned). On a committee miss the block's header
@@ -6032,6 +6049,9 @@ impl ShardCoordinator {
         // now seat a block's committee — retry any beacon-witness verification
         // that was parked on that lag before it strands the shard.
         actions.extend(self.retry_beacon_witness_awaiting_committee(topology_schedule));
+        // A sync-admitted block whose window was missing when it applied
+        // prepares its tree now, so this replica can vote on its child.
+        self.retry_synced_state_roots_awaiting_window(topology_schedule);
         // And a vote deferred because the window at its block's anchor was
         // not committed here is re-driven by the beacon block that commits
         // it, rather than waiting on a view change.
@@ -6204,8 +6224,10 @@ impl ShardCoordinator {
             debug!(
                 validator = ?self.me,
                 height = block.height().inner(),
-                "Synced block's window missing from the schedule; leaving its tree to the commit"
+                "Synced block's window missing from the schedule; parking its tree until the beacon commits it"
             );
+            self.verification
+                .park_synced_state_root_awaiting_window(block.hash());
             return;
         };
         let settled_txs_window_floor =
