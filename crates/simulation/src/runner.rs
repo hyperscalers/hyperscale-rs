@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use blake3::Hasher as Blake3Hasher;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
@@ -284,6 +285,11 @@ pub struct SimulationRunner {
 
     /// Statistics.
     stats: SimulationStats,
+
+    /// Running digest of every event processed, in order: its time, host,
+    /// scope, type and sequence. Two runs agree on it exactly when they
+    /// processed the same events in the same order.
+    trace: Blake3Hasher,
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
@@ -645,6 +651,7 @@ impl SimulationRunner {
             rng,
             timers: HashMap::new(),
             stats: SimulationStats::default(),
+            trace: Blake3Hasher::new(),
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
@@ -759,6 +766,14 @@ impl SimulationRunner {
     #[must_use]
     pub const fn stats(&self) -> &SimulationStats {
         &self.stats
+    }
+
+    /// Digest of every event processed so far, in processing order. Equal
+    /// digests mean two runs processed the same events in the same order;
+    /// it is the check that a seed replays identically.
+    #[must_use]
+    pub fn trace_digest(&self) -> [u8; 32] {
+        *self.trace.finalize().as_bytes()
     }
 
     /// Start recording what the transport delivers, keeping at most
@@ -1137,6 +1152,7 @@ impl SimulationRunner {
 
                 self.stats.events_processed += 1;
                 self.stats.events_by_priority[event.priority() as usize] += 1;
+                self.fold_into_trace(key, &event);
 
                 // A fired pool tick clears its pending slot so the post-step
                 // refresh can re-arm the next one if the sync is still running.
@@ -1302,6 +1318,29 @@ impl SimulationRunner {
         let key = EventKey::new(time, &event, host, self.sequence);
         self.event_queue.insert(key, event);
         key
+    }
+
+    /// Fold one processed event into the trace digest.
+    fn fold_into_trace(&mut self, key: EventKey, event: &HostEvent) {
+        self.trace.update(&key.time.as_nanos().to_le_bytes());
+        self.trace.update(&key.node_index.to_le_bytes());
+        self.trace.update(&key.sequence.to_le_bytes());
+        match event {
+            HostEvent::Shard(shard, _) => {
+                self.trace.update(&[0]);
+                self.trace.update(&shard.depth().to_le_bytes());
+                self.trace.update(&shard.path().to_le_bytes());
+            }
+            HostEvent::Process(_) => {
+                self.trace.update(&[1]);
+            }
+            HostEvent::Beacon(_) => {
+                self.trace.update(&[2]);
+            }
+        }
+        // Type names are ASCII, so a 0xFF terminator delimits them.
+        self.trace.update(event.type_name().as_bytes());
+        self.trace.update(&[0xFF]);
     }
 
     /// The current simulation time as the [`LocalTimestamp`] fed to hosts.

@@ -2485,7 +2485,9 @@ name = "hyperscale-simulation"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "blake3",
  "crossbeam",
+ "hex",
  "hyperscale-beacon",
  "hyperscale-core",
  "hyperscale-crypto-bls",
