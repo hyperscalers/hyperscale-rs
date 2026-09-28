@@ -58,10 +58,28 @@ where
         self.process_block_sync_outputs(outputs);
     }
 
-    /// Handle `Action::SyncBlockApplied`: the height is in chain state
-    /// with its commit pending. The FSM holds it out of the window and
-    /// may report the sync complete.
-    pub(crate) fn process_sync_block_applied(&mut self, height: BlockHeight) {
+    /// Handle `Action::SyncBlockApplied`: the height is in the chain
+    /// state of the vnode at `vnode_idx`, with its commit pending. Once
+    /// every seat holds it, the FSM holds it out of the window and may
+    /// report the sync complete.
+    pub(crate) fn process_sync_block_applied(&mut self, vnode_idx: usize, height: BlockHeight) {
+        let seat = self.vnode(vnode_idx).validator_id;
+        self.io.consensus.seat_frontiers.applied(seat, height);
+        self.feed_held_sync_frontier();
+    }
+
+    /// The height every seat holds, the frontier the FSM counts from.
+    pub(crate) fn held_sync_frontier(&self) -> BlockHeight {
+        let committed = BlockHeight::new(self.io.consensus.block_sync.status(&()).current_height);
+        self.io
+            .consensus
+            .seat_frontiers
+            .held(self.vnodes.iter().map(|v| v.validator_id), committed)
+    }
+
+    /// Tell the FSM the height every seat holds.
+    pub(crate) fn feed_held_sync_frontier(&mut self) {
+        let height = self.held_sync_frontier();
         let outputs = self
             .io
             .consensus
@@ -70,10 +88,31 @@ where
         self.process_block_sync_outputs(outputs);
     }
 
-    /// Handle `Action::ReopenSyncHeight`: the block applied at `height`
-    /// has a certified sibling that is committing instead. The FSM
-    /// fetches the height again.
-    pub(crate) fn process_reopen_sync_height(&mut self, height: BlockHeight) {
+    /// Sync a seat that restored at `restored` up to `held`, what its
+    /// siblings hold: the heights they applied above the committed tip
+    /// are fetched again, and the FSM counts them once the new seat has
+    /// applied them too.
+    pub(crate) fn reopen_for_seat(&mut self, restored: BlockHeight, held: BlockHeight) {
+        let mut outputs = Vec::new();
+        let mut height = restored.next();
+        while height <= held {
+            outputs.extend(
+                self.io
+                    .consensus
+                    .block_sync
+                    .handle(BlockSyncInput::Reopen { scope: (), height }),
+            );
+            height = height.next();
+        }
+        self.process_block_sync_outputs(outputs);
+    }
+
+    /// Handle `Action::ReopenSyncHeight`: the block the vnode at
+    /// `vnode_idx` applied at `height` has a certified sibling that is
+    /// committing instead. The FSM fetches the height again.
+    pub(crate) fn process_reopen_sync_height(&mut self, vnode_idx: usize, height: BlockHeight) {
+        let seat = self.vnode(vnode_idx).validator_id;
+        self.io.consensus.seat_frontiers.reopened(seat, height);
         let outputs = self
             .io
             .consensus

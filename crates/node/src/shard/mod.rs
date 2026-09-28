@@ -421,6 +421,9 @@ where
     pub(crate) fn step(&mut self, input: ShardScopedInput) {
         self.dispatch_input(input);
         self.admit_seats();
+        if self.io.consensus.seat_frontiers.take_released() {
+            self.feed_held_sync_frontier();
+        }
         self.update_fetch_tick_timer();
     }
 
@@ -462,6 +465,7 @@ where
             self.shard
         );
         self.vnodes.remove(index);
+        self.io.consensus.seat_frontiers.released(validator);
         true
     }
 
@@ -504,6 +508,11 @@ where
             )
             .pop()
             .expect("one seat in, one vnode out");
+            let held = self.held_sync_frontier();
+            self.io
+                .consensus
+                .seat_frontiers
+                .seated(seat.validator, recovered.committed_height);
             self.vnodes.push(init.into_vnode());
             let vnode_idx = self.vnodes.len() - 1;
             let now = self.now;
@@ -512,6 +521,7 @@ where
                 .state
                 .handle(now, committed_state_restored(&recovered));
             self.drain_actions(vnode_idx, actions);
+            self.reopen_for_seat(recovered.committed_height, held);
             self.seated.push(seat.validator);
         }
     }
