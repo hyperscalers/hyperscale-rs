@@ -8,6 +8,7 @@
 
 mod network;
 mod sim_network;
+mod streams;
 mod traffic;
 
 // Faults are host-granular and the sim's `NodeIndex` is the host index, so it
@@ -19,6 +20,7 @@ pub use network::{
     SimulatedNetwork,
 };
 pub use sim_network::{OutboxEntry, PendingNotification, SimNetworkAdapter};
+pub use streams::LinkStreams;
 pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 
 /// Type alias for deterministic node indexing in simulation.

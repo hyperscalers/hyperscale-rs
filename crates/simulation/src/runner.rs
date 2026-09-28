@@ -21,8 +21,8 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
-    BandwidthReport, DeliveryDrain, HostLayout, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
-    SimNetworkAdapter, SimulatedNetwork,
+    BandwidthReport, DeliveryDrain, HostLayout, LinkStreams, NetworkConfig, NetworkTrafficAnalyzer,
+    NodeIndex, SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::pool_loop::POOL_FETCH_TICK_INTERVAL;
 use hyperscale_node::reshape::PreparedStore;
@@ -44,8 +44,6 @@ use hyperscale_types::{
     ValidatorSet, Verifier, cache, shard_prefix_path,
 };
 use invariants::Invariants;
-use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
 use tracing::{debug, info, trace};
 
 use crate::event_queue::EventKey;
@@ -131,6 +129,10 @@ pub struct SimConfig {
     pub jitter_fraction: f64,
     /// Packet loss rate (0.0 - 1.0).
     pub packet_loss_rate: f64,
+    /// Seed for validator keys, and so committees and leader schedules,
+    /// when it should differ from the run seed. `None` draws them from the
+    /// run seed; a fixed value sweeps network schedules over one world.
+    pub world_seed: Option<u64>,
     /// Consensus crypto scheme every simulated validator runs.
     pub crypto_scheme: CryptoScheme,
     /// Genesis-funded accounts (owner prefix, balance). Seeds the funded
@@ -165,6 +167,7 @@ impl Default for SimConfig {
             latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
+            world_seed: None,
             crypto_scheme: CryptoScheme::default(),
             accounts: Vec::new(),
             pools: Vec::new(),
@@ -275,8 +278,8 @@ pub struct SimulationRunner {
     /// Network simulator (latency, partitions, packet loss).
     network: SimulatedNetwork,
 
-    /// RNG for network conditions (seeded for determinism).
-    rng: ChaCha8Rng,
+    /// The transport's random streams, one per link, derived from the seed.
+    streams: LinkStreams,
 
     /// Timer registry for cancellation support.
     /// Maps `(host, owner, timer_id) -> event_key` for removal; the owner
@@ -296,6 +299,10 @@ pub struct SimulationRunner {
 
     /// The seed this run was built from.
     seed: u64,
+
+    /// The seed its keys and committees were drawn from: the run seed
+    /// unless [`SimConfig::world_seed`] pinned another.
+    world_seed: u64,
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
@@ -403,7 +410,11 @@ impl SimulationRunner {
             network_layout(&host_layout),
             seed,
         );
-        let rng = ChaCha8Rng::seed_from_u64(seed);
+        let streams = LinkStreams::new(seed);
+        // Keys, and so committees and leader schedules, come from the world
+        // seed; the transport's draws from the run seed. Pinning the world
+        // seed sweeps schedules over one fixed set of committees.
+        let world_seed = network_config.world_seed.unwrap_or(seed);
 
         // The engine the first host runs, and the one every other host's
         // is forked from below. Each holds its own world, its own
@@ -427,7 +438,7 @@ impl SimulationRunner {
         let withholding: Vec<Arc<WithholdingSigner>> = (0..registered_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
-                let key_seed = seed
+                let key_seed = world_seed
                     .wrapping_add(u64::from(i))
                     .wrapping_mul(0x517c_c1b7_2722_0a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
@@ -654,7 +665,8 @@ impl SimulationRunner {
             sequence: 0,
             now: Duration::ZERO,
             network,
-            rng,
+            streams,
+            world_seed,
             timers: HashMap::new(),
             stats: SimulationStats::default(),
             trace: Blake3Hasher::new(),
@@ -1238,7 +1250,7 @@ impl SimulationRunner {
         for entry in outbox {
             let stats = self
                 .network
-                .accept_gossip(host, self.now, entry, &mut self.rng);
+                .accept_gossip(host, self.now, entry, &mut self.streams);
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
@@ -1253,7 +1265,7 @@ impl SimulationRunner {
         if !pending_requests.is_empty() {
             let stats =
                 self.network
-                    .accept_requests(host, self.now, pending_requests, &mut self.rng);
+                    .accept_requests(host, self.now, pending_requests, &mut self.streams);
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
@@ -1267,7 +1279,7 @@ impl SimulationRunner {
                 host,
                 self.now,
                 pending_notifications,
-                &mut self.rng,
+                &mut self.streams,
             );
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
@@ -1412,10 +1424,15 @@ impl Drop for SimulationRunner {
         } else {
             "--release"
         };
+        let world = if self.world_seed == self.seed {
+            String::new()
+        } else {
+            format!(" HYPERSCALE_SIM_WORLD_SEED={}", self.world_seed)
+        };
         eprintln!(
             "\nsimulation failed: seed {} at {:?} after {} events, trace {}\n\
-             replay: HYPERSCALE_SIM_SEED={} cargo nextest run {profile} -p hyperscale-simulation\
-             {feature_args} -E 'test(={test})'\n",
+             replay: HYPERSCALE_SIM_SEED={}{world} cargo nextest run {profile} \
+             -p hyperscale-simulation{feature_args} -E 'test(={test})'\n",
             self.seed,
             self.now,
             self.stats.events_processed,

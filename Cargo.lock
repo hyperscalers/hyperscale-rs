@@ -2509,8 +2509,6 @@ dependencies = [
  "hyperscale-storage",
  "hyperscale-storage-memory",
  "hyperscale-types",
- "rand 0.10.2",
- "rand_chacha 0.10.0",
  "tracing",
  "tracing-test",
 ]

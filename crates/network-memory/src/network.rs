@@ -45,11 +45,11 @@ use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use tracing::{debug, trace};
 
-use crate::NodeIndex;
 use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
 use crate::traffic::NetworkTrafficAnalyzer;
+use crate::{LinkStreams, NodeIndex};
 
 // Retry / rotation parameters mirroring the libp2p `RequestManagerConfig`
 // defaults, so the simulated transport rotates and backs off the way the real
@@ -894,11 +894,11 @@ impl SimulatedNetwork {
         requester: NodeIndex,
         now: Duration,
         requests: Vec<PendingRequest>,
-        rng: &mut ChaCha8Rng,
+        streams: &mut LinkStreams,
     ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
         for request in requests {
-            self.fulfill_request(requester, now, request, rng, &mut stats);
+            self.fulfill_request(requester, now, request, streams, &mut stats);
         }
         stats
     }
@@ -916,7 +916,7 @@ impl SimulatedNetwork {
         requester: NodeIndex,
         now: Duration,
         request: PendingRequest,
-        rng: &mut ChaCha8Rng,
+        streams: &mut LinkStreams,
         stats: &mut FulfillmentStats,
     ) {
         let PendingRequest {
@@ -929,7 +929,8 @@ impl SimulatedNetwork {
             on_response,
         } = request;
 
-        let (candidates, initial) = self.request_candidates(requester, shard, preferred_peer, rng);
+        let (candidates, initial) =
+            self.request_candidates(requester, shard, preferred_peer, streams.picker(requester));
         // An empty committee surfaces `NoPeers` after only the short
         // discovery delay.
         let Some(mut current_peer) = initial else {
@@ -958,7 +959,7 @@ impl SimulatedNetwork {
         // `schedule_response` below delivers it after `elapsed` — whichever
         // attempt produced it.
         let outcome = loop {
-            match self.attempt_request(&attempt, current_peer, now + elapsed, rng, stats) {
+            match self.attempt_request(&attempt, current_peer, now + elapsed, streams, stats) {
                 AttemptOutcome::Success {
                     bytes,
                     rtt,
@@ -991,9 +992,12 @@ impl SimulatedNetwork {
                     // A timed-out peer might just have dropped a packet: retry
                     // it before rotating, then back off.
                     if current_peer_attempts >= RETRIES_BEFORE_ROTATION {
-                        if let Some(next) =
-                            self.select_peer_excluding(requester, &candidates, current_peer, rng)
-                        {
+                        if let Some(next) = self.select_peer_excluding(
+                            requester,
+                            &candidates,
+                            current_peer,
+                            streams.picker(requester),
+                        ) {
                             current_peer = next;
                         }
                         current_peer_attempts = 0;
@@ -1010,9 +1014,12 @@ impl SimulatedNetwork {
                     }
                     // An application-level error won't fix itself on retry:
                     // rotate immediately, no backoff.
-                    if let Some(next) =
-                        self.select_peer_excluding(requester, &candidates, current_peer, rng)
-                    {
+                    if let Some(next) = self.select_peer_excluding(
+                        requester,
+                        &candidates,
+                        current_peer,
+                        streams.picker(requester),
+                    ) {
                         current_peer = next;
                     }
                     current_peer_attempts = 0;
@@ -1085,7 +1092,7 @@ impl SimulatedNetwork {
         req: &RequestAttempt<'_>,
         peer: NodeIndex,
         attempt_now: Duration,
-        rng: &mut ChaCha8Rng,
+        streams: &mut LinkStreams,
         stats: &mut FulfillmentStats,
     ) -> AttemptOutcome {
         let RequestAttempt {
@@ -1102,12 +1109,12 @@ impl SimulatedNetwork {
             trace!(requester, peer, "Request dropped: partition");
             return AttemptOutcome::Timeout;
         }
-        if self.should_drop_packet(rng) {
+        if self.should_drop_packet(streams.link(requester, peer)) {
             stats.messages_dropped_loss += 1;
             trace!(requester, peer, "Request dropped: packet loss");
             return AttemptOutcome::Timeout;
         }
-        if self.should_drop_packet(rng) {
+        if self.should_drop_packet(streams.link(peer, requester)) {
             stats.messages_dropped_loss += 1;
             trace!(requester, peer, "Response dropped: packet loss");
             return AttemptOutcome::Timeout;
@@ -1136,8 +1143,8 @@ impl SimulatedNetwork {
 
         // Sampled per leg, in request-then-response order, because that is
         // the order the RNG is drawn in and each leg is a delivery of its own.
-        let out_leg = self.sample_latency(rng);
-        let rtt = out_leg + self.sample_latency(rng);
+        let out_leg = self.sample_latency(streams.link(requester, peer));
+        let rtt = out_leg + self.sample_latency(streams.link(peer, requester));
 
         // A missing handler or empty payload is an application-level error:
         // the peer answered, but with nothing usable.
@@ -1289,7 +1296,7 @@ impl SimulatedNetwork {
         sender: NodeIndex,
         now: Duration,
         notifications: Vec<PendingNotification>,
-        rng: &mut ChaCha8Rng,
+        streams: &mut LinkStreams,
     ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
 
@@ -1317,7 +1324,7 @@ impl SimulatedNetwork {
             for &recipient in &recipients {
                 let to = self.validator_to_node(recipient);
 
-                match self.should_deliver(sender, to, rng) {
+                match self.should_deliver(sender, to, streams.link(sender, to)) {
                     None => {
                         if self.is_partitioned(sender, to) {
                             stats.messages_dropped_partition += 1;
@@ -1392,7 +1399,7 @@ impl SimulatedNetwork {
         from: NodeIndex,
         now: Duration,
         entry: OutboxEntry,
-        rng: &mut ChaCha8Rng,
+        streams: &mut LinkStreams,
     ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
 
@@ -1433,7 +1440,7 @@ impl SimulatedNetwork {
                 continue;
             }
 
-            match self.should_deliver(from, to, rng) {
+            match self.should_deliver(from, to, streams.link(from, to)) {
                 None => {
                     if self.is_partitioned(from, to) {
                         stats.messages_dropped_partition += 1;
@@ -1983,7 +1990,7 @@ mod tests {
     fn test_accept_requests_happy_path() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Register echo handler on node 1
         let adapter1 = network.create_adapter(1);
@@ -2012,7 +2019,7 @@ mod tests {
     fn test_accept_requests_rotates_around_partitioned_peer() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Every peer can serve; only the preferred one is unreachable.
         for i in 0..4 {
@@ -2051,7 +2058,7 @@ mod tests {
             4,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         for i in 0..4 {
             let adapter = network.create_adapter(i);
@@ -2081,7 +2088,7 @@ mod tests {
             4,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         for i in 0..4 {
             let adapter = network.create_adapter(i);
@@ -2110,7 +2117,7 @@ mod tests {
     fn test_accept_requests_no_handler_anywhere_exhausts() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // No peer registers a handler: every attempt is an application error
         // that rotates and ultimately exhausts.
@@ -2128,7 +2135,7 @@ mod tests {
     fn test_accept_requests_empty_response_exhausts() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Only the preferred peer answers, and only with an empty payload; the
         // others have no handler. Every attempt is an application error, so the
@@ -2177,7 +2184,7 @@ mod tests {
     fn test_accept_requests_random_peer_selection() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Register handlers on all nodes
         for i in 0..4 {
@@ -2202,7 +2209,7 @@ mod tests {
     #[test]
     fn test_accept_requests_single_node_no_peers() {
         let mut network = sim_network(1, 1);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let adapter0 = network.create_adapter(0);
         register_echo(&adapter0, "test.request", ShardId::leaf(1, 0));
@@ -2229,7 +2236,7 @@ mod tests {
             4,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let adapter1 = network.create_adapter(1);
         register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
@@ -2332,7 +2339,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Node 0 is in shard 0, along with node 1. Nodes 2,3 are in shard 1.
         let entry = make_gossip_entry(BroadcastTarget::Shard(ShardId::leaf(1, 0)));
@@ -2374,7 +2381,7 @@ mod tests {
             0,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let on_left = make_gossip_entry(BroadcastTarget::Shard(left));
         let on_right = make_gossip_entry(BroadcastTarget::Shard(right));
@@ -2399,7 +2406,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
@@ -2424,7 +2431,7 @@ mod tests {
             4,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
@@ -2448,7 +2455,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Partition node 0 → node 1
         network.partition_unidirectional(0, 1);
@@ -2476,7 +2483,7 @@ mod tests {
             4,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
@@ -2502,7 +2509,7 @@ mod tests {
             4,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
@@ -2534,7 +2541,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let original_payload = b"test gossip payload";
         let entry = make_gossip_entry(BroadcastTarget::Global);
@@ -2563,7 +2570,7 @@ mod tests {
             1,
             4,
         );
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let received: Vec<Arc<RecordingHandler>> = (0..network.total_nodes() as NodeIndex)
             .map(|i| {
@@ -2626,7 +2633,7 @@ mod tests {
             4,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let nth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&nth);
@@ -2664,7 +2671,7 @@ mod tests {
     fn test_accept_gossip_invalid_compressed_data() {
         let mut network = sim_network(1, 2);
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Pass garbage data that can't be decompressed
         let entry = OutboxEntry {
@@ -2696,7 +2703,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Partition node 0 → node 2
         network.partition_unidirectional(0, 2);
@@ -2725,7 +2732,7 @@ mod tests {
             2,
         );
         let _handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // No pending gossip
         assert!(network.next_gossip_delivery_time().is_none());
@@ -2748,7 +2755,7 @@ mod tests {
     fn test_create_adapter_shares_handler_slot() {
         let mut network = sim_network(1, 2);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Create adapter for node 1 and register handler through it
         let adapter1 = network.create_adapter(1);
@@ -2782,7 +2789,7 @@ mod tests {
             2,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Register per-type handlers for "transaction.gossip" on each node.
         // Register directly on registry since we want raw recording handlers.

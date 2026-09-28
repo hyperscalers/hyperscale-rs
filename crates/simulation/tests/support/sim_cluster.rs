@@ -38,7 +38,7 @@ use hyperscale_types::{
     TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
 };
 
-use super::sim_seed;
+use super::{sim_seed, sim_world_seed};
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
 /// internal predicate loop — and so the resolution of anything a scenario
@@ -212,6 +212,7 @@ impl SimCluster {
             dedicated_pool_hosts: args.dedicated_pool_hosts,
             beacon_chain_config: Some(beacon_chain_config),
             latency: config.latency,
+            world_seed: sim_world_seed(),
             // Every cluster funds the pool operator and seats the pools,
             // because the founding pool's vote is how any cluster retunes
             // a network parameter — the same reason the statics register

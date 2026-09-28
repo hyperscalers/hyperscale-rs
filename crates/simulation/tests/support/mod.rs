@@ -56,6 +56,24 @@ pub fn sim_seed(default: u64) -> u64 {
     })
 }
 
+/// Environment variable that pins the seed validator keys, and so
+/// committees and leader schedules, are drawn from, while [`SEED_VAR`] still
+/// varies the network schedule.
+pub const WORLD_SEED_VAR: &str = "HYPERSCALE_SIM_WORLD_SEED";
+
+/// The world seed [`WORLD_SEED_VAR`] pins, if any.
+///
+/// # Panics
+///
+/// Panics if [`WORLD_SEED_VAR`] is set to something other than a `u64`.
+#[must_use]
+pub fn sim_world_seed() -> Option<u64> {
+    env::var(WORLD_SEED_VAR).ok().map(|seed| {
+        seed.parse()
+            .unwrap_or_else(|_| panic!("{WORLD_SEED_VAR}={seed} is not a u64 seed"))
+    })
+}
+
 /// Committee validators per shard — the production `shard_size`. The split
 /// seats each child at full strength (`2+2` parent half plus cohort), so the
 /// committee top-up never fires here: this exercises the shuffle, not top-up.
