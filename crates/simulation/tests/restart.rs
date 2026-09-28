@@ -31,7 +31,7 @@ use hyperscale_scenarios::{
 };
 use hyperscale_storage::BoundaryStore;
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
-use support::SimCluster;
+use support::{SimCluster, assume};
 
 /// The halt scenarios' topology: a split leaves a live sibling to carry
 /// the beacon through the folds that detect a stalled shard, and the pool
@@ -555,11 +555,12 @@ fn payer_reclaims_after_restart(seed: u64, co_hosted: bool) {
 
     let hosts = cluster.committee_hosts(SWAPPER_SHARD);
     if co_hosted {
-        assert!(
+        assume(
             hosts.len() < venue_config().shard_size as usize,
-            "the seed must place two of the payer shard's members on one host; \
-             its {} members sit on hosts {hosts:?}",
-            venue_config().shard_size,
+            &format!(
+                "the payer shard's {} members must share a host; they sit on {hosts:?}",
+                venue_config().shard_size,
+            ),
         );
     }
     let before = cluster.committed_height(SWAPPER_SHARD).expect("running");

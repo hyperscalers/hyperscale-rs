@@ -38,6 +38,8 @@ use hyperscale_types::{
     TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
 };
 
+use super::sim_seed;
+
 /// The clock slice `run_until` advances per poll, matching the runner's own
 /// internal predicate loop — and so the resolution of anything a scenario
 /// reads off the clock between polls.
@@ -227,7 +229,7 @@ impl SimCluster {
             pools: world_pools(),
             ..SimConfig::default()
         };
-        let mut runner = SimulationRunner::new(&sim_config, args.seed);
+        let mut runner = SimulationRunner::new(&sim_config, sim_seed(args.seed));
         runner.initialize_genesis();
 
         Self {

@@ -4,7 +4,9 @@
 //! controlling event scheduling, network delivery, and time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -295,6 +297,9 @@ pub struct SimulationRunner {
 
     /// Cross-replica safety checks, run at the end of every `run_until`.
     invariants: Invariants,
+
+    /// The seed this run was built from.
+    seed: u64,
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
@@ -658,6 +663,7 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             trace: Blake3Hasher::new(),
             invariants: Invariants::default(),
+            seed,
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
@@ -785,6 +791,12 @@ impl SimulationRunner {
     #[must_use]
     pub const fn stats(&self) -> &SimulationStats {
         &self.stats
+    }
+
+    /// The seed this run was built from.
+    #[must_use]
+    pub const fn seed(&self) -> u64 {
+        self.seed
     }
 
     /// Stop treating conflicting commits as a failure, for a run that
@@ -1377,6 +1389,53 @@ impl SimulationRunner {
     fn local_now(&self) -> LocalTimestamp {
         LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX))
     }
+}
+
+/// A run that panics names what replays it: the seed, the features that
+/// shape its sample space, and a command that reruns the failing test.
+impl Drop for SimulationRunner {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            return;
+        }
+        let test = thread::current().name().unwrap_or("<test name>").to_owned();
+        let mut features = Vec::new();
+        if cfg!(feature = "bls") {
+            features.push("bls");
+        }
+        if cfg!(feature = "production-epochs") {
+            features.push("production-epochs");
+        }
+        let feature_args = if features.is_empty() {
+            String::new()
+        } else {
+            format!(" --features {}", features.join(","))
+        };
+        let profile = if cfg!(debug_assertions) {
+            "--cargo-profile ci"
+        } else {
+            "--release"
+        };
+        eprintln!(
+            "\nsimulation failed: seed {} at {:?} after {} events, trace {}\n\
+             replay: HYPERSCALE_SIM_SEED={} cargo nextest run {profile} -p hyperscale-simulation\
+             {feature_args} -E 'test(={test})'\n",
+            self.seed,
+            self.now,
+            self.stats.events_processed,
+            hex_digest(&self.trace_digest()),
+            self.seed,
+        );
+    }
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 /// Project the host plans into the [`HostLayout`] the simulated transport

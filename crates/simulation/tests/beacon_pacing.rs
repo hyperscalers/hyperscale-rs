@@ -14,11 +14,14 @@
 //! the beacon races ahead of wall-clock and stays there. This test pins the
 //! pacing bound through exactly that phase.
 
+mod support;
+
 use std::time::Duration;
 
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{BeaconChainConfig, Epoch};
+use support::sim_seed;
 use tracing_test::traced_test;
 
 const VALIDATORS: u32 = 4;
@@ -52,7 +55,7 @@ fn latest_beacon_epoch(runner: &SimulationRunner, node: NodeIndex) -> u64 {
 #[traced_test]
 #[test]
 fn beacon_never_commits_an_epoch_ahead_of_wall_clock() {
-    let mut runner = SimulationRunner::new(&pacing_config(), 11);
+    let mut runner = SimulationRunner::new(&pacing_config(), sim_seed(11));
     runner.initialize_genesis();
 
     // The whole timeline rides on the epoch length: warm-up, outage budget,

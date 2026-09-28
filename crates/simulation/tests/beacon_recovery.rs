@@ -5,11 +5,14 @@
 //! the chain advances past the obstruction — by skip cert or proposal fetch —
 //! with every host agreeing on the committed `(block, state)` pair.
 
+mod support;
+
 use std::time::Duration;
 
 use hyperscale_network_memory::HostId;
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{BeaconCert, BeaconChainConfig, Epoch, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT};
+use support::sim_seed;
 use tracing_test::traced_test;
 
 /// The single-shard beacon chain config at `epoch_duration_ms`. One shard of
@@ -77,7 +80,7 @@ fn assert_beacon_consensus(runner: &SimulationRunner, epoch: Epoch, num_hosts: u
 #[traced_test]
 #[test]
 fn skip_path_advances_past_blocked_epoch() {
-    let mut runner = SimulationRunner::new(&beacon_committee_config(), 0xBE_AC);
+    let mut runner = SimulationRunner::new(&beacon_committee_config(), sim_seed(0xBE_AC));
     runner.initialize_genesis();
 
     // Suppress every channel SPC needs to commit. Beacon proposal
@@ -174,7 +177,7 @@ fn fetch_recovery_path_unblocks_dropped_peer() {
     // shuffle, so a fetch-recovered block never commits against an evicted
     // committee — the 3-epoch topology retention window is sized for exactly
     // this shape.
-    let mut runner = SimulationRunner::new(&beacon_committee_config(), 0xFE_7C);
+    let mut runner = SimulationRunner::new(&beacon_committee_config(), sim_seed(0xFE_7C));
     runner.initialize_genesis();
 
     let drop_rule = runner

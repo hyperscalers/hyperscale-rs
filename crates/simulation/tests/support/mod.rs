@@ -9,13 +9,57 @@
 
 pub mod sim_cluster;
 
+use std::env;
 use std::time::Duration;
 
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_scenarios::ScenarioConfig;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{ShardId, ValidatorId};
+#[allow(unused_imports)] // same per-binary subset as the dead_code allow above
 pub use sim_cluster::SimCluster;
+
+/// Environment variable that replaces every test's seed, so any test can be
+/// swept or replayed at any seed without editing it.
+pub const SEED_VAR: &str = "HYPERSCALE_SIM_SEED";
+
+/// The seed a test runs at: `default`, unless [`SEED_VAR`] names another.
+///
+/// # Panics
+///
+/// Panics if [`SEED_VAR`] is set to something other than a `u64`.
+#[must_use]
+pub fn sim_seed(default: u64) -> u64 {
+    env::var(SEED_VAR).map_or(default, |seed| {
+        seed.parse()
+            .unwrap_or_else(|_| panic!("{SEED_VAR}={seed} is not a u64 seed"))
+    })
+}
+
+/// Discard the run, rather than fail it, when a seed does not produce the
+/// setup a test needs. Only for preconditions checked before the first fault
+/// or workload op: past that point a broken expectation is a failure. A sweep
+/// classifies a panic carrying [`DISCARD`] as a discard.
+///
+/// # Panics
+///
+/// Panics with [`DISCARD`] when `condition` does not hold.
+pub fn assume(condition: bool, what: &str) {
+    assert!(condition, "{DISCARD} {what}");
+}
+
+/// Discard the run unconditionally: [`assume`] for a value the seed did
+/// not produce.
+///
+/// # Panics
+///
+/// Always, with [`DISCARD`].
+pub fn discard(what: &str) -> ! {
+    panic!("{DISCARD} {what}");
+}
+
+/// Prefix of the panic [`assume`] and [`discard`] raise.
+pub const DISCARD: &str = "SIM-DISCARD:";
 
 /// Committee validators per shard — the production `shard_size`. The split
 /// seats each child at full strength (`2+2` parent half plus cohort), so the
