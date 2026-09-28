@@ -25,8 +25,8 @@ use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{
-    NodeConfig, NodeHost, SeatFollower, SeatVnodeGroup, TimerOp, VnodeInit, seat_follower,
-    seat_vnode_group,
+    NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, TimerOp, VnodeInit,
+    seat_follower, seat_vnode_group,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -130,18 +130,20 @@ impl Fixture {
         let vnodes: Vec<(ValidatorId, Arc<dyn Signer>)> =
             vec![(self.committee.validator_id(idx), self.committee.signer(idx))];
         seat_vnode_group(SeatVnodeGroup {
-            derivation: Arc::new(StubVmStatics),
-            code: Arc::new(AllCodeRuns),
-            verifier: Arc::new(BlsVerifier),
+            config: SeatConfig {
+                verifier: Arc::new(BlsVerifier),
+                derivation: Arc::new(StubVmStatics),
+                code: Arc::new(AllCodeRuns),
+                beacon_network: NetworkDefinition::simulator(),
+                beacon_config_hash: self.config_hash,
+                shard_config: ShardConsensusConfig::default(),
+                mempool_config: MempoolConfig::default(),
+                provision_config: ProvisionConfig::default(),
+            },
             beacon_storage: self.beacon_storage.as_ref(),
-            beacon_network: NetworkDefinition::simulator(),
-            beacon_config_hash: self.config_hash,
             now: LocalTimestamp::ZERO,
             shard,
             recovered: &RecoveredState::default(),
-            shard_config: &ShardConsensusConfig::default(),
-            mempool_config: MempoolConfig::default(),
-            provision_config: ProvisionConfig::default(),
             vnodes,
         })
     }

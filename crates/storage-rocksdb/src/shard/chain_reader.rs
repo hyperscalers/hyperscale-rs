@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
-use hyperscale_storage::{BlockForSync, ShardChainReader};
+use hyperscale_storage::{BlockForSync, RecoveredState, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, Transaction, TxHash,
-    Verifiable, Verified,
+    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
+    TxHash, Verifiable, Verified,
 };
 
 use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, TxFinalizationsCf};
@@ -70,6 +70,10 @@ impl ShardChainReader for RocksDbShardStorage {
 
     fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
         self.read_latest_qc()
+    }
+
+    fn load_recovered_state(&self, shard: ShardId) -> RecoveredState {
+        Self::load_recovered_state(self, shard)
     }
 
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {

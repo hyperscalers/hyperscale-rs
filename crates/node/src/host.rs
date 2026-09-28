@@ -53,7 +53,7 @@ use crate::shard::{
     DispatchHandles, HostEvent, HostedCells, ProcessScopedInput, ShardDispatchHandles, ShardIo,
     ShardLoop, SharedTopologySnapshot, StepOutput,
 };
-use crate::vnode::{Vnode, VnodeInit};
+use crate::vnode::{GroupStores, Vnode, VnodeInit, VnodeSeat};
 
 /// Output of [`NodeHost::into_parts`].
 ///
@@ -275,6 +275,8 @@ where
                     emitted_statuses: Vec::new(),
                     pending_participation_changes: Vec::new(),
                     actions_generated: 0,
+                    seated: Vec::new(),
+                    pending_seats: Vec::new(),
                 };
                 (shard, shard_loop)
             })
@@ -330,6 +332,32 @@ where
         let mut shard_loop = attach_shard(&self.process, &self.config, vnodes, storage, sender);
         shard_loop.set_time(self.now);
         self.shards.insert(shard, shard_loop);
+    }
+
+    /// Queue `seat` on `shard`'s running loop, a validator drawn onto a
+    /// shard this host already serves. The loop admits it once its store
+    /// is at rest (see [`ShardLoop::seat_vnode`]); its pool follower, if
+    /// any, retires when it is.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shard` isn't hosted.
+    pub fn seat_vnode(&mut self, shard: ShardId, seat: VnodeSeat) -> StepOutput {
+        let out = self.shard_loop_mut(shard).seat_vnode(seat);
+        self.retire_seated_followers(&out.seated);
+        out
+    }
+
+    /// Take `validator` off `shard`'s loop while another seat keeps the
+    /// loop running. Returns whether the loop carried it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shard` isn't hosted, or if `validator` is its last
+    /// seat — that seat leaves with the loop, through
+    /// [`Self::remove_shard`].
+    pub fn remove_vnode(&mut self, shard: ShardId, validator: ValidatorId) -> bool {
+        self.shard_loop_mut(shard).remove_vnode(validator)
     }
 
     /// Stop hosting `shard`: exclude it from the network's hosted set,
@@ -620,7 +648,16 @@ where
         if let Some(pool) = &mut self.pool {
             out.merge(pool.take_output());
         }
+        self.retire_seated_followers(&out.seated);
         out
+    }
+
+    /// Retire the pool follower of every validator a loop just seated:
+    /// it drives its beacon from the shard now.
+    fn retire_seated_followers(&mut self, seated: &[ValidatorId]) {
+        for &validator in seated {
+            self.drop_pooled_vnode(validator);
+        }
     }
 
     /// Flush any batch accumulators whose deadlines have expired across
@@ -709,6 +746,8 @@ where
         emitted_statuses: Vec::new(),
         pending_participation_changes: Vec::new(),
         actions_generated: 0,
+        seated: Vec::new(),
+        pending_seats: Vec::new(),
     };
     register_shard_request_handlers(process, &shard_loop.io, shard);
     shard_loop
@@ -757,11 +796,14 @@ fn build_shard_io<S: ShardStorage>(
     // the sync FSM and boundary memo still key off the coordinator height.
     let tree_height = storage.jmt_height();
     let caches = SharedCaches::new(
-        Arc::clone(rep.state.provisions_coordinator().store()),
+        GroupStores {
+            provision_store: Arc::clone(rep.state.provisions_coordinator().store()),
+            tx_store: Arc::clone(rep.state.mempool_coordinator().tx_store()),
+            exec_cert_store: Arc::clone(rep.state.execution_coordinator().exec_cert_store()),
+            finalization_store: Arc::clone(rep.state.execution_coordinator().finalization_store()),
+            crossing_index: Arc::clone(rep.state.execution_coordinator().crossing_index()),
+        },
         Arc::clone(rep.state.provisions_coordinator().verified_headers()),
-        Arc::clone(rep.state.mempool_coordinator().tx_store()),
-        Arc::clone(rep.state.execution_coordinator().exec_cert_store()),
-        Arc::clone(rep.state.execution_coordinator().finalization_store()),
     );
     let storage = Arc::new(storage);
     // The chain's own origin, which the committed-window walks floor on
@@ -774,9 +816,8 @@ fn build_shard_io<S: ShardStorage>(
     ));
     // Every vnode of the group asks its crossing questions of this
     // chain's persisted tip, now that the chain is open.
-    rep.state
-        .execution_coordinator()
-        .crossing_index()
+    caches
+        .crossing_index
         .bind(Arc::new(ChainCrossings(Arc::clone(&pending_chain))));
     let tick_chain = Arc::new(TickChain::new(Arc::clone(&storage)));
     let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);

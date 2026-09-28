@@ -489,6 +489,10 @@ pub struct BlockCommitCoordinator {
     /// `QcOnlyCommitPrepared` / `QcOnlyCommitDiverged` arrives, which
     /// also pops the next queue entry if any.
     qc_only_in_flight: bool,
+
+    /// Highest height whose `BlockCommitted` the loop has fanned out to
+    /// its vnodes. Fan-out runs in height order, once per height.
+    broadcast_height: BlockHeight,
 }
 
 impl BlockCommitCoordinator {
@@ -507,7 +511,28 @@ impl BlockCommitCoordinator {
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             qc_only_queue: VecDeque::new(),
             qc_only_in_flight: false,
+            broadcast_height: initial_persisted_height,
         }
+    }
+
+    /// Record that the loop fanned `height`'s `BlockCommitted` out.
+    pub(crate) fn note_broadcast(&mut self, height: BlockHeight) {
+        self.broadcast_height = self.broadcast_height.max(height);
+    }
+
+    /// Highest height whose `BlockCommitted` the loop has fanned out.
+    pub(crate) const fn broadcast_height(&self) -> BlockHeight {
+        self.broadcast_height
+    }
+
+    /// Whether the store is at rest under this pipeline: nothing
+    /// accumulated awaiting a flush, no flush writing, nothing flushed
+    /// awaiting its `BlockPersisted`. A read of the store's tip taken
+    /// while this holds cannot move under the reader.
+    pub(crate) fn is_quiet(&self) -> bool {
+        self.pending.is_empty()
+            && !self.commit_in_flight.load(Ordering::Acquire)
+            && self.flushed_height <= self.persisted_height
     }
 
     /// Install the epoch-boundary pin trigger.
@@ -1180,6 +1205,36 @@ mod tests {
             AccumulateDecision::Skip
         ));
         assert_eq!(coord.pending_len(), 0);
+    }
+
+    /// A seat reads the store's tip while the pipeline is quiet, so
+    /// quiet holds only while nothing accepted can still reach the store.
+    #[test]
+    fn the_pipeline_is_quiet_only_once_every_accepted_commit_is_acknowledged() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+        assert!(coord.is_quiet());
+
+        enqueue(
+            &mut coord,
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        assert!(!coord.is_quiet(), "an accumulated commit awaits its flush");
+
+        coord.flush(&tx, &dispatch);
+        assert!(
+            !coord.is_quiet(),
+            "a flushed commit awaits its BlockPersisted"
+        );
+
+        coord.mark_persisted(BlockHeight::new(1));
+        assert!(coord.is_quiet());
     }
 
     #[test]

@@ -46,8 +46,8 @@ use hyperscale_node::shard::{
     HostEvent, PoolScopedInput, ShardLoop, StepOutput, TimerOp, timer_event,
 };
 use hyperscale_node::{
-    NodeConfig, NodeHost, SeatFollower, SeatVnodeGroup, ShardGenesis, SharedTopologySnapshot,
-    TxStatusCache, VnodeInit, seat_follower, seat_vnode_group,
+    NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, ShardGenesis,
+    SharedTopologySnapshot, TxStatusCache, VnodeInit, seat_follower, seat_vnode_group,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -509,18 +509,20 @@ impl ProductionRunnerBuilder {
         for (shard, shard_vnodes) in &seated_by_shard {
             let recovered = storages[shard].load_recovered_state(*shard);
             vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
-                verifier: Arc::new(BlsVerifier),
-                derivation: executor.derivation(),
-                code: Arc::clone(&executor) as _,
+                config: SeatConfig {
+                    verifier: Arc::new(BlsVerifier),
+                    derivation: executor.derivation(),
+                    code: Arc::clone(&executor) as _,
+                    beacon_network: beacon_network.clone(),
+                    beacon_config_hash,
+                    shard_config: shard_config.clone(),
+                    mempool_config: self.mempool_config.clone(),
+                    provision_config: self.provision_config,
+                },
                 beacon_storage: self.beacon_storage.as_ref(),
-                beacon_network: beacon_network.clone(),
-                beacon_config_hash,
                 now,
                 shard: *shard,
                 recovered: &recovered,
-                shard_config: &shard_config,
-                mempool_config: self.mempool_config.clone(),
-                provision_config: self.provision_config,
                 vnodes: shard_vnodes.clone(),
             }));
         }

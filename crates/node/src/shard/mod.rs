@@ -58,7 +58,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain};
 use hyperscale_types::{
     Address, Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, SubstateKey, TopologySnapshot,
-    TransactionStatus, TxHash, Verified,
+    TransactionStatus, TxHash, ValidatorId, Verified,
 };
 pub use io::ShardIo;
 
@@ -71,7 +71,7 @@ pub use crate::event::{
 use crate::fetch::Release;
 use crate::process::ProcessIo;
 use crate::shard::commit::PreparedCommitMap;
-use crate::vnode::Vnode;
+use crate::vnode::{SeatVnodeGroup, Vnode, VnodeSeat, seat_vnode_into_group};
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -288,6 +288,10 @@ pub struct StepOutput {
     /// membership from these — they are requests to the process layer,
     /// not state-machine state.
     pub participation_changes: Vec<ParticipationChange>,
+    /// Validators whose queued seat the loop admitted during this step.
+    /// Each now drives its beacon from the shard, so any pool follower
+    /// it carried retires.
+    pub seated: Vec<ValidatorId>,
 }
 
 impl StepOutput {
@@ -301,6 +305,7 @@ impl StepOutput {
         self.timer_ops.extend(other.timer_ops);
         self.participation_changes
             .extend(other.participation_changes);
+        self.seated.extend(other.seated);
     }
 }
 
@@ -367,6 +372,12 @@ where
     /// during the step. Drained into [`StepOutput`] for the runner's
     /// metrics; reset at step entry.
     pub(crate) actions_generated: usize,
+    /// Per-step scratch: validators whose seat was admitted during the
+    /// step. Drained into [`StepOutput`].
+    pub(crate) seated: Vec<ValidatorId>,
+    /// Seats waiting for the store to come to rest at the last height
+    /// the loop fanned out. See [`Self::admit_seats`].
+    pub(crate) pending_seats: Vec<VnodeSeat>,
 }
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -409,7 +420,100 @@ where
     /// [`NodeHost::step`]: crate::host::NodeHost::step
     pub(crate) fn step(&mut self, input: ShardScopedInput) {
         self.dispatch_input(input);
+        self.admit_seats();
         self.update_fetch_tick_timer();
+    }
+
+    /// Queue `validator`'s seat on this running loop, admitting it at
+    /// once if the store is already at rest. A seat for a validator the
+    /// loop already carries or queues is dropped. Returns the output of
+    /// the admission under [`Self::run_step`]'s contract.
+    pub fn seat_vnode(&mut self, seat: VnodeSeat) -> StepOutput {
+        self.clear_scratch();
+        let validator = seat.validator;
+        if !self.carries(validator) && !self.pending_seats.iter().any(|s| s.validator == validator)
+        {
+            self.pending_seats.push(seat);
+            self.admit_seats();
+            self.update_fetch_tick_timer();
+        }
+        self.take_output()
+    }
+
+    /// Take `validator` off this loop, whether seated or still queued.
+    /// Returns whether the loop carried it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `validator` is the loop's last seated vnode: the last
+    /// seat leaves with its loop.
+    pub fn remove_vnode(&mut self, validator: ValidatorId) -> bool {
+        let queued = self.pending_seats.len();
+        self.pending_seats.retain(|s| s.validator != validator);
+        if self.pending_seats.len() != queued {
+            return true;
+        }
+        let Some(index) = self.vnodes.iter().position(|v| v.validator_id == validator) else {
+            return false;
+        };
+        assert!(
+            self.vnodes.len() > 1,
+            "the last seat on shard {:?} leaves with its loop",
+            self.shard
+        );
+        self.vnodes.remove(index);
+        true
+    }
+
+    /// Whether `validator` holds a seated vnode on this loop.
+    fn carries(&self, validator: ValidatorId) -> bool {
+        self.vnodes.iter().any(|v| v.validator_id == validator)
+    }
+
+    /// Admit every queued seat once the store is at rest at the last
+    /// height the loop fanned out.
+    ///
+    /// Each vnode's shard coordinator commits on its own, and the loop
+    /// fans every height's `BlockCommitted` out to all of them once. A
+    /// joiner restored at exactly that height has missed no fan-out and
+    /// receives every later one with its siblings, so it seats as a
+    /// restart does. Restored anywhere below, it would never hear the
+    /// heights between: their commits skip at the pipeline's flushed
+    /// frontier. The store is read only while no flush can move it.
+    fn admit_seats(&mut self) {
+        if self.pending_seats.is_empty()
+            || !self.io.block_commit.is_quiet()
+            || self.io.storage.committed_height() != self.io.block_commit.broadcast_height()
+        {
+            return;
+        }
+        let recovered = self.io.storage.load_recovered_state(self.shard);
+        let stores = self.io.caches.group_stores();
+        let beacon_storage = Arc::clone(&self.process.beacon_storage);
+        for seat in std::mem::take(&mut self.pending_seats) {
+            let init = seat_vnode_into_group(
+                SeatVnodeGroup {
+                    config: seat.config,
+                    beacon_storage: beacon_storage.as_ref(),
+                    now: self.now,
+                    shard: self.shard,
+                    recovered: &recovered,
+                    vnodes: vec![(seat.validator, seat.signer)],
+                },
+                &stores,
+            )
+            .pop()
+            .expect("one seat in, one vnode out");
+            self.vnodes.push(init.into_vnode());
+            let vnode_idx = self.vnodes.len() - 1;
+            let now = self.now;
+            let actions = self
+                .vnode_mut(vnode_idx)
+                .state
+                .handle(now, committed_state_restored(&recovered));
+            self.drain_actions(vnode_idx, actions);
+            self.seated.push(seat.validator);
+        }
     }
 
     #[allow(clippy::too_many_lines)] // single dispatch over ShardScopedInput variants
@@ -572,6 +676,9 @@ where
         // what this asks the shards holding them for, and the code
         // follows once they seat a derivation.
         if let ProtocolEvent::BlockCommitted { certified, .. } = &event {
+            self.io
+                .block_commit
+                .note_broadcast(certified.block().height());
             let mut packages: Vec<Hash> = Vec::new();
             let mut records: Vec<Address> = Vec::new();
             for tx in certified.block().transactions().iter() {
@@ -730,6 +837,7 @@ where
         self.emitted_statuses.clear();
         self.pending_participation_changes.clear();
         self.actions_generated = 0;
+        self.seated.clear();
     }
 
     /// Drain this step's accumulated scratch into a [`StepOutput`]. The
@@ -741,6 +849,7 @@ where
             actions_generated: std::mem::replace(&mut self.actions_generated, 0),
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
             participation_changes: std::mem::take(&mut self.pending_participation_changes),
+            seated: std::mem::take(&mut self.seated),
         }
     }
 

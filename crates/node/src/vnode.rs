@@ -56,10 +56,11 @@ impl VnodeInit {
     }
 }
 
-/// Everything one same-shard vnode group boots from at seat time —
-/// startup, runtime join, or sim harness alike.
-pub struct SeatVnodeGroup<'a> {
-    /// Scheme verifier shared by every coordinator in the group.
+/// What every vnode a host seats is built with, whichever group it joins
+/// and whenever it joins it.
+#[derive(Clone)]
+pub struct SeatConfig {
+    /// Scheme verifier shared by every coordinator the seat builds.
     pub verifier: Arc<dyn Verifier>,
     /// What this node derives envelopes through — its own caches, held
     /// by its own engine.
@@ -67,14 +68,27 @@ pub struct SeatVnodeGroup<'a> {
     /// Whether this node can run a package's code — the same engine's
     /// answer, asked at tick dispatch.
     pub code: Arc<dyn CodeAvailability>,
-    /// Host beacon storage; the group's coordinators resume from its
-    /// committed tip.
-    pub beacon_storage: &'a dyn BeaconStorage,
     /// The network identity bound into beacon signatures.
     pub beacon_network: NetworkDefinition,
     /// Genesis config hash bound into beacon signatures alongside the
     /// network.
     pub beacon_config_hash: GenesisConfigHash,
+    /// Consensus knobs.
+    pub shard_config: ShardConsensusConfig,
+    /// Mempool knobs, cloned into each vnode's coordinator.
+    pub mempool_config: MempoolConfig,
+    /// Provision coordinator knobs.
+    pub provision_config: ProvisionConfig,
+}
+
+/// Everything one same-shard vnode group boots from at seat time —
+/// startup, runtime join, or sim harness alike.
+pub struct SeatVnodeGroup<'a> {
+    /// How each vnode is built.
+    pub config: SeatConfig,
+    /// Host beacon storage; the group's coordinators resume from its
+    /// committed tip.
+    pub beacon_storage: &'a dyn BeaconStorage,
     /// Wall clock (production) or sim time; bounds the resume floor.
     pub now: LocalTimestamp,
     /// Shard every vnode in the group targets.
@@ -82,35 +96,73 @@ pub struct SeatVnodeGroup<'a> {
     /// Boot state — loaded from retained storage, synthesized from a
     /// snap-synced anchor, or default for a genesis replay.
     pub recovered: &'a RecoveredState,
-    /// Consensus knobs, shared by every vnode in the group.
-    pub shard_config: &'a ShardConsensusConfig,
-    /// Mempool knobs, cloned into each vnode's coordinator.
-    pub mempool_config: MempoolConfig,
-    /// Provision coordinator knobs.
-    pub provision_config: ProvisionConfig,
     /// `(validator, signer)` per seated vnode.
     pub vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
 }
 
-/// Build one [`VnodeInit`] per vnode in a same-shard group: a beacon
-/// coordinator resumed from the host's committed beacon chain and a
-/// `NodeStateMachine` booted from `recovered`.
+/// One validator waiting to join a shard its host already runs. The loop
+/// builds it when it admits the seat, from its own store and its group's
+/// stores.
+pub struct VnodeSeat {
+    /// How the vnode is built.
+    pub config: SeatConfig,
+    /// The validator taking the seat.
+    pub validator: ValidatorId,
+    /// Its signer.
+    pub signer: Arc<dyn Signer>,
+}
+
+/// The stores every vnode of one shard's group co-owns.
+///
+/// Determinism guarantees same-shard vnodes admit identical sets, but
+/// co-owning the stores makes the canonical view explicit and gives the
+/// request/sync handlers one place to read. Per-shard scoping matters
+/// for `ProvisionStore`: under cross-shard packing the co-hosted source
+/// shard's `OutboundProvisionTracker` evicts on every acknowledged EC,
+/// and a host-wide store would let that eviction delete entries the
+/// inbound coordinator on the target shard still needs to verify
+/// proposals against.
+#[derive(Clone)]
+pub struct GroupStores {
+    pub provision_store: Arc<ProvisionStore>,
+    pub tx_store: Arc<TxStore>,
+    pub exec_cert_store: Arc<ExecCertStore>,
+    pub finalization_store: Arc<FinalizationStore>,
+    pub crossing_index: Arc<CrossingIndexSlot>,
+}
+
+impl GroupStores {
+    /// Stores for a group seated from `recovered`. The bodies its own
+    /// committed blocks carried go back in the store everything reads
+    /// them from: a stored block keeps only their hashes, so without
+    /// them a restarted host holds blocks it cannot serve and legs it
+    /// cannot replay.
+    fn fresh(recovered: &RecoveredState) -> Self {
+        let provision_store = Arc::new(ProvisionStore::new());
+        for provisions in &recovered.retained_provisions {
+            provision_store.insert(Arc::clone(provisions));
+        }
+        Self {
+            provision_store,
+            tx_store: Arc::new(TxStore::new()),
+            exec_cert_store: Arc::new(ExecCertStore::new()),
+            finalization_store: Arc::new(FinalizationStore::new()),
+            crossing_index: Arc::new(CrossingIndexSlot::default()),
+        }
+    }
+}
+
+/// Build one [`VnodeInit`] per vnode in a same-shard group, over one
+/// fresh set of [`GroupStores`].
+///
+/// Each vnode is a beacon coordinator resumed from the host's committed
+/// beacon chain and a `NodeStateMachine` booted from `recovered`. The
+/// stores are shared across the group and into the `NodeHost`'s
+/// `SharedCaches`.
 ///
 /// The coordinators' schedule history is bounded by [`retention_floor`]
 /// so every committee a consumer frontier still reaches stays
 /// resolvable.
-///
-/// One fresh `ProvisionStore` + `TxStore` + `ExecCertStore` +
-/// `FinalizationStore` is shared across the group (and into the
-/// `NodeHost`'s `SharedCaches`). Determinism guarantees same-shard
-/// vnodes admit identical sets, but co-owning the stores makes the
-/// canonical view explicit and gives the request/sync handlers one
-/// place to read. Per-shard scoping matters for `ProvisionStore`:
-/// under cross-shard packing the co-hosted source shard's
-/// `OutboundProvisionTracker` evicts on every acknowledged EC, and a
-/// host-wide store would let that eviction delete entries the inbound
-/// coordinator on the target shard still needs to verify proposals
-/// against.
 ///
 /// # Panics
 ///
@@ -118,6 +170,17 @@ pub struct SeatVnodeGroup<'a> {
 /// host commits the genesis pair before seating vnodes.
 #[must_use]
 pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
+    let stores = GroupStores::fresh(args.recovered);
+    seat_vnode_into_group(args, &stores)
+}
+
+/// Build one [`VnodeInit`] per vnode over `stores`, the stores of the
+/// group the vnodes join.
+///
+/// # Panics
+///
+/// Panics if `beacon_storage` holds no committed beacon block.
+pub fn seat_vnode_into_group(args: SeatVnodeGroup<'_>, stores: &GroupStores) -> Vec<VnodeInit> {
     let (latest_block, latest_state) = args
         .beacon_storage
         .latest_committed()
@@ -133,33 +196,21 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
         .into_iter()
         .map(|state| state.as_ref().clone())
         .collect();
-
-    // The bodies our own committed blocks carried, back in the store
-    // everything reads them from. A stored block keeps only their
-    // hashes, so without this a restarted host holds blocks it cannot
-    // serve and legs it cannot replay.
-    let provision_store = Arc::new(ProvisionStore::new());
-    for provisions in &args.recovered.retained_provisions {
-        provision_store.insert(Arc::clone(provisions));
-    }
-    let tx_store = Arc::new(TxStore::new());
-    let exec_cert_store = Arc::new(ExecCertStore::new());
-    let finalization_store = Arc::new(FinalizationStore::new());
-    let crossing_index = Arc::new(CrossingIndexSlot::default());
+    let config = &args.config;
 
     args.vnodes
         .into_iter()
         .map(|(validator, signer)| {
             let mut beacon_coordinator = BeaconCoordinator::new(
-                Arc::clone(&args.verifier),
+                Arc::clone(&config.verifier),
                 Arc::clone(&latest_block),
                 beacon_history.clone(),
                 validator,
                 args.shard,
                 args.recovered.committee_anchor_wt(),
                 args.recovered.block_anchor_wt(),
-                args.beacon_network.clone(),
-                args.beacon_config_hash,
+                config.beacon_network.clone(),
+                config.beacon_config_hash,
             );
             // Seed the coordinator's clock from the seat instant so the
             // startup-timer durations measure from now, not from a frozen
@@ -174,19 +225,19 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
             }
             let state = NodeStateMachine::new(
                 validator,
-                Arc::clone(&args.derivation),
-                Arc::clone(&args.code),
+                Arc::clone(&config.derivation),
+                Arc::clone(&config.code),
                 args.shard,
-                args.shard_config,
+                &config.shard_config,
                 args.recovered,
                 beacon_coordinator,
-                args.mempool_config.clone(),
-                args.provision_config,
-                Arc::clone(&provision_store),
-                Arc::clone(&tx_store),
-                Arc::clone(&exec_cert_store),
-                Arc::clone(&finalization_store),
-                Arc::clone(&crossing_index),
+                config.mempool_config.clone(),
+                config.provision_config,
+                Arc::clone(&stores.provision_store),
+                Arc::clone(&stores.tx_store),
+                Arc::clone(&stores.exec_cert_store),
+                Arc::clone(&stores.finalization_store),
+                Arc::clone(&stores.crossing_index),
             );
             VnodeInit { state, signer }
         })
