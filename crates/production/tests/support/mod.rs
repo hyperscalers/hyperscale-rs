@@ -10,6 +10,7 @@
 pub mod harness;
 pub mod prod_cluster;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,7 +67,7 @@ pub fn build_runner(
         ShardConsensusConfig::default(),
         beacon_reader,
         network_config,
-        temp_storage_factory(&temp_dir),
+        temp_storage_factory(),
         temp_storage_dir(&temp_dir),
     );
     if let Some(cfg) = beacon_chain_config {
@@ -84,12 +85,11 @@ pub fn temp_storage_dir(dir: &TempDir) -> StorageDirResolver {
     Arc::new(move |shard: ShardId| shard_data_dir(&root, shard))
 }
 
-/// Storage factory rooted in the test's temp dir, opening a fresh
-/// `RocksDbShardStorage` for any shard the supervisor joins at runtime.
-pub fn temp_storage_factory(dir: &TempDir) -> StorageFactory {
-    let resolve = temp_storage_dir(dir);
-    Arc::new(move |shard: ShardId| {
-        RocksDbShardStorage::open(resolve(shard), shard_prefix_path(shard))
+/// Storage factory opening a `RocksDbShardStorage` at whatever directory
+/// the supervisor names.
+pub fn temp_storage_factory() -> StorageFactory {
+    Arc::new(|dir: &Path, shard: ShardId| {
+        RocksDbShardStorage::open(dir, shard_prefix_path(shard))
             .map(Arc::new)
             .map_err(|e| format!("{e:?}"))
     })

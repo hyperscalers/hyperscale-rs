@@ -12,6 +12,7 @@
 //! small `epoch_duration_ms` and mark `#[serial]`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -19,10 +20,10 @@ use arc_swap::ArcSwap;
 use hyperscale_engine::GenesisConfig;
 use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-use hyperscale_node::TxStatusCache;
+use hyperscale_node::{SharedTopologySnapshot, TxStatusCache};
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
-    LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageFactory,
+    LocalValidator, ProductionRunner, RunnerError, ShardCommand, ShutdownHandle, StorageFactory,
 };
 use hyperscale_scenarios::query::{
     RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
@@ -37,6 +38,7 @@ use hyperscale_types::{
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn};
 use tokio::time::{sleep, timeout};
 
@@ -64,16 +66,21 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Like [`temp_storage_factory`], but records every opened store into a
 /// shared registry so the harness can scan a runtime-joined shard's chain
 /// (a split child, a merged parent) the same way it scans a startup shard.
+///
+/// Only a store at the shard's own directory is recorded; a rebuild's
+/// staging store beside it holds no chain the harness should read.
 fn capturing_storage_factory(dir: &TempDir, registry: StoreRegistry) -> StorageFactory {
     let resolve = temp_storage_dir(dir);
-    Arc::new(move |shard: ShardId| {
-        let store = RocksDbShardStorage::open(resolve(shard), shard_prefix_path(shard))
+    Arc::new(move |path: &Path, shard: ShardId| {
+        let store = RocksDbShardStorage::open(path, shard_prefix_path(shard))
             .map(Arc::new)
             .map_err(|e| format!("{e:?}"))?;
-        registry
-            .lock()
-            .expect("store registry")
-            .insert(shard, Arc::downgrade(&store));
+        if path == resolve(shard) {
+            registry
+                .lock()
+                .expect("store registry")
+                .insert(shard, Arc::downgrade(&store));
+        }
         Ok(store)
     })
 }
@@ -139,6 +146,10 @@ struct Host {
     /// Every `RocksDbShardStorage` this host has opened, shared live with
     /// the runner for chain scans and byte-total reads.
     stores: StoreRegistry,
+    /// Membership commands into this host's supervisor.
+    reconfigure: mpsc::Sender<ShardCommand>,
+    /// The topology snapshot this host's shards and supervisor read.
+    topology: SharedTopologySnapshot,
     shutdown: Option<ShutdownHandle>,
     join: JoinHandle<Result<(), RunnerError>>,
 }
@@ -202,6 +213,8 @@ impl Harness {
         let mut running = Vec::with_capacity(built.len());
         for mut bh in built {
             let shutdown = bh.runner.shutdown_handle().expect("shutdown handle");
+            let reconfigure = bh.runner.reconfigure_handle();
+            let topology = Arc::clone(bh.runner.topology_snapshot());
             let join = spawn(bh.runner.run());
             running.push(Host {
                 validator_ids: bh.validator_ids,
@@ -211,6 +224,8 @@ impl Harness {
                 tx_submission: bh.tx_submission,
                 tx_status: bh.tx_status,
                 stores: bh.stores,
+                reconfigure,
+                topology,
                 shutdown: Some(shutdown),
                 join,
             });
@@ -225,6 +240,16 @@ impl Harness {
     /// Number of hosts in the cluster.
     pub const fn host_count(&self) -> usize {
         self.hosts.len()
+    }
+
+    /// Membership commands into `host`'s supervisor.
+    pub fn reconfigure(&self, host: usize) -> mpsc::Sender<ShardCommand> {
+        self.hosts[host].reconfigure.clone()
+    }
+
+    /// The topology snapshot `host` reads.
+    pub fn topology(&self, host: usize) -> SharedTopologySnapshot {
+        Arc::clone(&self.hosts[host].topology)
     }
 
     /// Highest committed height observed for `shard` across all hosts'

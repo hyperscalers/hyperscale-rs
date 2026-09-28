@@ -15,17 +15,19 @@
 //! riders included).
 
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
 use hyperscale_node::{SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_vnode_group};
-use hyperscale_storage::RecoveredState;
+use hyperscale_storage::{RecoveredState, ShardChainReader};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
 };
+use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -41,6 +43,16 @@ pub struct CompletedBootstrap {
     vnodes: Vec<VnodeConfig>,
     storage: Arc<RocksDbShardStorage>,
     recovered: RecoveredState,
+}
+
+/// A running shard's rebuild at its attested anchor.
+pub enum Rebuild {
+    /// The staging store is syncing while the old loop keeps running.
+    Staging,
+    /// The staging store verified; the old loop is tearing down, and
+    /// these vnodes seat on the staging store once it is renamed into
+    /// the shard's directory.
+    Swapping(Box<CompletedBootstrap>),
 }
 
 impl ShardSupervisor {
@@ -91,7 +103,7 @@ impl ShardSupervisor {
             return;
         }
         if self.shards.contains_key(&shard) {
-            self.seat_into_running(shard, vnodes);
+            self.seat_on_running(shard, vnodes);
             return;
         }
 
@@ -101,11 +113,12 @@ impl ShardSupervisor {
         // and lets a `Leave` during the open release memberships.
         self.bootstrapping.insert(shard, vnodes.len());
         let factory = Arc::clone(&self.storage_factory);
+        let dir = (self.storage_dir)(shard);
         let engine_bootstrap = self.engine_bootstrap.clone();
         let events = self.events_tx.clone();
         let vnodes = vnodes.to_vec();
         self.tokio_handle.spawn_blocking(move || {
-            let outcome = factory(shard).map(|storage| {
+            let outcome = factory(&dir, shard).map(|storage| {
                 let recovered = storage.load_recovered_state(shard);
                 // A brand-new store (no commits, no imported JMT) gets
                 // the engine bootstrap before the snap-sync import or
@@ -179,6 +192,7 @@ impl ShardSupervisor {
                     process.topology_snapshot(),
                     &storage,
                     shard,
+                    None,
                 )
                 .await
                 {
@@ -305,6 +319,204 @@ impl ShardSupervisor {
             self.unfollow_in_pool(cfg.validator_id);
         }
         info!(shard = ?shard, vnodes = vnode_count, "Shard joined at runtime");
+    }
+
+    /// Seat `vnodes` on `shard`'s running loop, or rebuild the loop first
+    /// when a fork recovery would seat one of them above its attested
+    /// frontier. A shard already rebuilding seats every placed validator
+    /// when its swap lands.
+    fn seat_on_running(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
+        if self.rebuilding.contains_key(&shard) {
+            return;
+        }
+        if self.rebuild_due(shard, vnodes) {
+            self.rebuild(shard, vnodes);
+        } else {
+            self.seat_into_running(shard, vnodes);
+        }
+    }
+
+    /// Whether seating `vnodes` on `shard`'s running loop would restore a
+    /// fresh member above a fork recovery's attested frontier: the loop's
+    /// store committed past it on a branch the fresh committee must not
+    /// extend, and a store cannot un-commit.
+    fn rebuild_due(&self, shard: ShardId, vnodes: &[VnodeConfig]) -> bool {
+        let Some(frontier) = self
+            .process
+            .topology_snapshot()
+            .load()
+            .fork_recovery_frontier(shard)
+        else {
+            return false;
+        };
+        let Some(entry) = self.shards.get(&shard) else {
+            return false;
+        };
+        let unseated = vnodes
+            .iter()
+            .any(|vnode| !entry.validator_ids.contains(&vnode.validator_id.inner()));
+        unseated
+            && self
+                .storages
+                .lock()
+                .expect("storages lock")
+                .get(&shard)
+                .is_some_and(|storage| storage.committed_height() > frontier)
+    }
+
+    /// Rebuild `shard` at its attested anchor, make before break: a
+    /// staging store beside the shard's directory snap-syncs while the old
+    /// loop keeps running and serving, reading the old store first and
+    /// peers for what it no longer holds. [`Self::on_rebuilt`] swaps it
+    /// in.
+    fn rebuild(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
+        let old = self
+            .storages
+            .lock()
+            .expect("storages lock")
+            .get(&shard)
+            .cloned();
+        let Some(old) = old else {
+            return;
+        };
+        self.rebuilding.insert(shard, Rebuild::Staging);
+        info!(shard = ?shard, "Rebuilding a forked shard's store at its attested anchor");
+        let staging_dir = staging_dir(&(self.storage_dir)(shard));
+        let factory = Arc::clone(&self.storage_factory);
+        let engine_bootstrap = self.engine_bootstrap.clone();
+        let process = Arc::clone(&self.process);
+        let events = self.events_tx.clone();
+        let vnodes = vnodes.to_vec();
+        self.tokio_handle.spawn(async move {
+            let opened = spawn_blocking(move || {
+                // A staging directory an interrupted rebuild left behind
+                // is no store anything reads; start from nothing.
+                if staging_dir.exists() {
+                    std::fs::remove_dir_all(&staging_dir)
+                        .map_err(|e| format!("stale staging store wipe: {e}"))?;
+                }
+                let storage = factory(&staging_dir, shard)?;
+                engine_bootstrap.replicate_into(storage.as_ref());
+                Ok::<_, String>(storage)
+            })
+            .await
+            .map_err(|e| format!("staging open task died: {e}"))
+            .flatten();
+            let staged = match opened {
+                Ok(storage) => bootstrap_shard_state(
+                    process.network(),
+                    process.topology_snapshot(),
+                    &storage,
+                    shard,
+                    Some(old),
+                )
+                .await
+                .map(|recovered| CompletedBootstrap {
+                    shard,
+                    vnodes,
+                    storage,
+                    recovered,
+                }),
+                Err(error) => Err(error),
+            };
+            let done = staged.map_err(|error| {
+                warn!(shard = ?shard, error, "Shard rebuild failed; its loop keeps running");
+                shard
+            });
+            // Send failure means the runner is shutting down; the rebuild
+            // dies with it.
+            let _ = events.send(SupervisorEvent::Rebuilt(done));
+        });
+    }
+
+    /// Settle a rebuild's staging: tear the old loop down, and seat on the
+    /// staging store every local validator placed on the shard, the
+    /// joiner that triggered the rebuild included, once
+    /// [`Self::on_torn_down`] has renamed it into place. A validator the
+    /// old loop carried and the shard no longer places follows the beacon
+    /// in the pool, as any drained validator does.
+    pub(super) fn on_rebuilt(&mut self, done: Result<CompletedBootstrap, ShardId>) {
+        let mut done = match done {
+            Ok(done) => done,
+            Err(shard) => {
+                self.rebuilding.remove(&shard);
+                return;
+            }
+        };
+        let shard = done.shard;
+        if !self.shards.contains_key(&shard) {
+            // Torn down while the staging store synced: nothing to swap.
+            self.rebuilding.remove(&shard);
+            let staging_dir = staging_dir(&(self.storage_dir)(shard));
+            self.tokio_handle.spawn_blocking(move || {
+                drop(done);
+                if let Err(error) = std::fs::remove_dir_all(&staging_dir) {
+                    warn!(shard = ?shard, %error, "Abandoned staging store left on disk");
+                }
+            });
+            return;
+        }
+        let snapshot = self.process.topology_snapshot().load_full();
+        let mut vnodes = self.local_committee_vnodes(&snapshot, shard);
+        for joiner in std::mem::take(&mut done.vnodes) {
+            if !vnodes.iter().any(|v| v.validator_id == joiner.validator_id) {
+                vnodes.push(joiner);
+            }
+        }
+        done.vnodes = vnodes;
+        self.rebuilding
+            .insert(shard, Rebuild::Swapping(Box::new(done)));
+        self.tear_down(shard);
+    }
+
+    /// Replace `shard`'s store with its rebuilt one and seat it: once the
+    /// old store's last handle is gone, remove its directory, rename the
+    /// staging directory into its place, and reopen it there, settling
+    /// through [`Self::finish_join`] as a snap-synced join does.
+    fn swap_rebuilt(&mut self, done: CompletedBootstrap, old: Option<Weak<RocksDbShardStorage>>) {
+        let CompletedBootstrap {
+            shard,
+            vnodes,
+            storage,
+            recovered,
+        } = done;
+        self.bootstrapping.insert(shard, vnodes.len());
+        let dir = (self.storage_dir)(shard);
+        let factory = Arc::clone(&self.storage_factory);
+        let events = self.events_tx.clone();
+        self.tokio_handle.spawn_blocking(move || {
+            drop(storage);
+            let outcome = (|| -> Result<Arc<RocksDbShardStorage>, String> {
+                await_release(old);
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)
+                        .map_err(|e| format!("replaced store removal: {e}"))?;
+                }
+                std::fs::rename(staging_dir(&dir), &dir)
+                    .map_err(|e| format!("rebuilt store rename: {e}"))?;
+                factory(&dir, shard)
+            })();
+            let done = outcome
+                .map(|storage| {
+                    info!(
+                        shard = ?shard,
+                        committed = recovered.committed_height.inner(),
+                        "Shard rebuilt at its attested anchor"
+                    );
+                    CompletedBootstrap {
+                        shard,
+                        vnodes,
+                        storage,
+                        recovered,
+                    }
+                })
+                .map_err(|error| {
+                    warn!(shard = ?shard, error, "Rebuilt store swap failed; join abandoned");
+                    shard
+                });
+            // Send failure means the runner is shutting down.
+            let _ = events.send(SupervisorEvent::Bootstrapped(done));
+        });
     }
 
     /// Queue each of `vnodes` the running loop of `shard` does not already
@@ -504,7 +716,7 @@ impl ShardSupervisor {
             .collect();
         for shard in running {
             let vnodes = self.local_committee_vnodes(&topology_snapshot, shard);
-            self.seat_into_running(shard, &vnodes);
+            self.seat_on_running(shard, &vnodes);
         }
         let needed: Vec<ShardId> = topology_snapshot
             .shard_trie()
@@ -532,6 +744,7 @@ impl ShardSupervisor {
     pub(super) fn on_torn_down(&mut self, shard: ShardId, validator_ids: &[u64]) {
         detach_shard(&self.process, shard);
         let storage = self.storages.lock().expect("storages lock").remove(&shard);
+        let released = storage.as_ref().map(Arc::downgrade);
         if let Some(storage) = storage {
             // A store handle that outlives its teardown holds the RocksDB
             // directory lock, and every later re-seat of this host onto the
@@ -567,6 +780,9 @@ impl ShardSupervisor {
             if !self.validator_on_any_shard(validator) {
                 self.follow_in_pool(validator);
             }
+        }
+        if let Some(Rebuild::Swapping(done)) = self.rebuilding.remove(&shard) {
+            self.swap_rebuilt(*done, released);
         }
         if let Some(vnodes) = self.pending_joins.remove(&shard) {
             self.join(shard, &vnodes);
@@ -662,6 +878,36 @@ impl ShardSupervisor {
             mempool_config: self.mempool_config.clone(),
             provision_config: self.provision_config,
         }
+    }
+}
+
+/// How long a swap waits for the replaced store's last handle to drop
+/// before removing its directory regardless — the teardown's own leak
+/// probe waits as long before warning.
+const STORE_RELEASE_GRACE: Duration = Duration::from_secs(5);
+
+/// Where a rebuild stages the store that replaces the one at `dir`:
+/// beside it, so the swap is a rename within one filesystem.
+fn staging_dir(dir: &Path) -> PathBuf {
+    let mut staging = dir.as_os_str().to_owned();
+    staging.push(".rebuild");
+    PathBuf::from(staging)
+}
+
+/// Block until the replaced store's last handle drops — a serving
+/// request or GC pass that outlived the teardown — or the grace runs
+/// out.
+fn await_release(store: Option<Weak<RocksDbShardStorage>>) {
+    let Some(store) = store else {
+        return;
+    };
+    let deadline = Instant::now() + STORE_RELEASE_GRACE;
+    while store.strong_count() > 0 {
+        if Instant::now() >= deadline {
+            warn!("Replaced store still held at its swap; removing its directory regardless");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

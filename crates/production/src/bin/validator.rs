@@ -1143,11 +1143,9 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // The runner derives which shards to open from the committed beacon
     // state, so the host opens none up front.
     let factory_rocksdb_config = rocksdb_config.clone();
-    let factory_storage_dir = Arc::clone(&storage_dir);
-    let storage_factory: StorageFactory = Arc::new(move |shard: ShardId| {
-        let shard_dir = factory_storage_dir(shard);
+    let storage_factory: StorageFactory = Arc::new(move |shard_dir: &Path, shard: ShardId| {
         RocksDbShardStorage::open_with_config(
-            &shard_dir,
+            shard_dir,
             &factory_rocksdb_config,
             shard_prefix_path(shard),
         )
