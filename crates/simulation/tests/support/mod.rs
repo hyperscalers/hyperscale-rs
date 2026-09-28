@@ -19,6 +19,26 @@ use hyperscale_types::{ShardId, ValidatorId};
 #[allow(unused_imports)] // same per-binary subset as the dead_code allow above
 pub use sim_cluster::SimCluster;
 
+/// One `#[test]` per seed for a `fn(u64)` scenario, in a module named after
+/// it: `seeded!(scenario: seed_7 = 7, seed_11 = 11)` gives `scenario::seed_7`
+/// and `scenario::seed_11`, which nextest runs in parallel and reports one
+/// by one.
+#[allow(unused_macros)] // same per-binary subset as the dead_code allow above
+macro_rules! seeded {
+    ($scenario:ident: $($cell:ident = $seed:literal),+ $(,)?) => {
+        mod $scenario {
+            $(
+                #[test]
+                fn $cell() {
+                    super::$scenario($seed);
+                }
+            )+
+        }
+    };
+}
+#[allow(unused_imports)] // same per-binary subset as the dead_code allow above
+pub(crate) use seeded;
+
 /// Environment variable that replaces every test's seed, so any test can be
 /// swept or replayed at any seed without editing it.
 pub const SEED_VAR: &str = "HYPERSCALE_SIM_SEED";

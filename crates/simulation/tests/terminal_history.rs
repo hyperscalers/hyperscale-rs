@@ -31,7 +31,7 @@ use hyperscale_scenarios::tx::{build_probe_transfer_tx, genesis_accounts, validi
 use hyperscale_scenarios::wait::{await_beacon_epoch, await_split_admitted};
 use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig, epochs};
 use hyperscale_types::ShardId;
-use support::SimCluster;
+use support::{SimCluster, seeded};
 
 /// Single-shard config with the split trigger armed (`split_bytes = 0`)
 /// and one cohort of pool surplus — an organic root split, so the root
@@ -93,35 +93,44 @@ fn split_completes_with_wiped_members(seed: u64, wiped: usize) -> bool {
     })
 }
 
-/// The seeds both runs sweep. One seed is one leader schedule, and the
-/// wipe lands differently against each — the first shape of this test
-/// passed on a seed where the joiner's anchor happened to sit below the
-/// window floor, which exercised nothing.
-const SEEDS: [u64; 4] = [11, 42, 7, 2026];
+// Both runs sweep four seeds. One seed is one leader schedule, and the
+// wipe lands differently against each — the first shape of this test
+// passed on a seed where the joiner's anchor happened to sit below the
+// window floor, which exercised nothing.
 
 /// The control: nothing removed, and the split completes on this clock.
 /// Without it a wiped run that completes for its own reasons would read
 /// as a pass.
-#[test]
-fn a_split_completes_when_every_member_holds_its_window() {
-    for seed in SEEDS {
-        assert!(
-            split_completes_with_wiped_members(seed, 0),
-            "seed {seed}: the unperturbed split must complete, or the wiped run proves nothing",
-        );
-    }
+fn a_split_completes_when_every_member_holds_its_window(seed: u64) {
+    assert!(
+        split_completes_with_wiped_members(seed, 0),
+        "seed {seed}: the unperturbed split must complete, or the wiped run proves nothing",
+    );
 }
+
+seeded!(
+    a_split_completes_when_every_member_holds_its_window:
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_2026 = 2026,
+);
 
 /// Two of four members holding no block below their anchor is past `f`,
 /// so nothing else can carry the terminal block: it certifies only if a
 /// member that arrived by snap-sync can fold its own terminal window.
-#[test]
-fn a_split_completes_when_more_than_f_members_arrive_by_sync() {
-    for seed in SEEDS {
-        assert!(
-            split_completes_with_wiped_members(seed, 2),
-            "seed {seed}: two members of four short of their window must still reach the \
-             terminal block",
-        );
-    }
+fn a_split_completes_when_more_than_f_members_arrive_by_sync(seed: u64) {
+    assert!(
+        split_completes_with_wiped_members(seed, 2),
+        "seed {seed}: two members of four short of their window must still reach the \
+         terminal block",
+    );
 }
+
+seeded!(
+    a_split_completes_when_more_than_f_members_arrive_by_sync:
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_2026 = 2026,
+);

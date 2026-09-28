@@ -31,7 +31,7 @@ use hyperscale_scenarios::{
 };
 use hyperscale_storage::BoundaryStore;
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
-use support::{SimCluster, assume};
+use support::{SimCluster, assume, seeded};
 
 /// The halt scenarios' topology: a split leaves a live sibling to carry
 /// the beacon through the folds that detect a stalled shard, and the pool
@@ -81,9 +81,8 @@ fn owed_an_outcome(c: &SimCluster, shard: ShardId, tx: TxHash) -> bool {
     committed.is_some() && outcome.is_none()
 }
 
-/// The seeds every restart here runs under: one seed is one leader
-/// schedule, and a restart lands differently against each.
-const SEEDS: [u64; 8] = [42, 7, 11, 1337, 2026, 99, 5, 8];
+// Every restart here runs at eight seeds: one seed is one leader schedule,
+// and a restart lands differently against each.
 
 /// Every host's committed height on `shard`, `None` where the host does
 /// not carry it — the stall report a wedge is read from.
@@ -150,14 +149,23 @@ fn restart_and_advance(restarted: usize, seed: u64) {
 /// restart fails to rebuild stops the shard instead of healing behind it
 /// — which is why the sweep runs to the largest minority rather than
 /// asserting one restart and calling the path covered.
-#[test]
-fn a_committee_advances_after_part_of_it_restarts() {
-    for seed in SEEDS {
-        for restarted in 1..=3 {
-            restart_and_advance(restarted, seed);
-        }
+fn a_committee_advances_after_part_of_it_restarts(seed: u64) {
+    for restarted in 1..=3 {
+        restart_and_advance(restarted, seed);
     }
 }
+
+seeded!(
+    a_committee_advances_after_part_of_it_restarts:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+    seed_99 = 99,
+    seed_5 = 5,
+    seed_8 = 8,
+);
 
 /// A committee whose every replica restarts mid-traffic resumes, given a
 /// live counterpart.
@@ -271,12 +279,21 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
 /// committed and I would be forking away from it". So the block travels
 /// with the record that locks on it, and the committee comes back able to
 /// extend its own certificate.
-#[test]
-fn a_committee_advances_after_all_of_it_restarts() {
-    for seed in SEEDS {
-        restart_and_advance(4, seed);
-    }
+fn a_committee_advances_after_all_of_it_restarts(seed: u64) {
+    restart_and_advance(4, seed);
 }
+
+seeded!(
+    a_committee_advances_after_all_of_it_restarts:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+    seed_99 = 99,
+    seed_5 = 5,
+    seed_8 = 8,
+);
 
 /// The lowest tick any host's store holds in flight on `shard`, with its
 /// members.
@@ -384,14 +401,23 @@ fn a_tick_in_flight_survives(restarted: usize, seed: u64) {
 
 /// [`a_tick_in_flight_survives`] with two and with three of four
 /// restarted, across the seeds.
-#[test]
-fn a_tick_in_flight_survives_more_than_f_restarting() {
-    for seed in SEEDS {
-        for restarted in 2..=3 {
-            a_tick_in_flight_survives(restarted, seed);
-        }
+fn a_tick_in_flight_survives_more_than_f_restarting(seed: u64) {
+    for restarted in 2..=3 {
+        a_tick_in_flight_survives(restarted, seed);
     }
 }
+
+seeded!(
+    a_tick_in_flight_survives_more_than_f_restarting:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+    seed_99 = 99,
+    seed_5 = 5,
+    seed_8 = 8,
+);
 
 /// A restarted member agrees with its peers about what it executed.
 ///
