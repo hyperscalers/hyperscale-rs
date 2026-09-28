@@ -5043,9 +5043,31 @@ impl ShardCoordinator {
         // block's PreparedCommit.
         self.verification.mark_proposal_fully_verified(block);
 
+        // The head routes a proposal. A splitting parent can drop out of the
+        // head before its handoff is on the committed chain: the terminal and
+        // the first coast block, whose parent QC is the terminal's canonical
+        // certificate. Until that block commits, its proposals go to the
+        // terminal-clamped committee that certifies them, as its votes and
+        // timeouts do.
+        let head = topology_schedule.head();
+        let handed_off =
+            topology_schedule.past_terminal(self.local_shard, self.committed_committee_anchor_wt);
+        let routing = if head.committee_for_shard(self.local_shard).is_empty() && !handed_off {
+            self.committee_of_block(topology_schedule, block_hash)
+                .unwrap_or(head)
+        } else {
+            head
+        };
+        let recipients: Vec<ValidatorId> = routing
+            .committee_for_shard(self.local_shard)
+            .iter()
+            .copied()
+            .filter(|v| *v != self.me)
+            .collect();
         let mut actions = vec![Action::BroadcastBlockHeader {
             header: Box::new(block.header().clone()),
             manifest: Box::new(manifest),
+            recipients,
         }];
 
         // Vote for our own block

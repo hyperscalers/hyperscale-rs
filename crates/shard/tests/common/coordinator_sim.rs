@@ -1232,18 +1232,17 @@ impl ShardCoordinatorSim {
     #[allow(clippy::too_many_lines)] // single dispatch over shard-emitted Action variants
     fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
         match action {
-            Action::BroadcastBlockHeader { header, manifest } => {
+            Action::BroadcastBlockHeader {
+                header,
+                manifest,
+                recipients: committee_ids,
+            } => {
                 let header = Arc::new(*header);
                 let manifest = *manifest;
                 self.header_by_block
                     .insert(header.hash(), Arc::clone(&header));
                 self.manifest_by_block
                     .insert(header.hash(), manifest.clone());
-                let committee_ids: Vec<ValidatorId> = self
-                    .topology_schedule
-                    .head()
-                    .committee_for_shard(self.shard)
-                    .to_vec();
                 // A `DelayProposal` replica holds every header it emits
                 // for `delay` before release; each firing counts, and the
                 // flag persists (sustained) so later slots are held too.

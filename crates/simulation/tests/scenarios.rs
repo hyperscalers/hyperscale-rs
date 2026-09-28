@@ -78,7 +78,7 @@ use hyperscale_scenarios::{
     departing_venue_ballast, departing_venue_split_bytes, deploy_storm_rides_out, discard, epochs,
     events_land_on_their_emitters_home_shard, failure_charges_its_payer,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
-    grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
+    grow_reaches_two_shard_topology, grow_to, halted_shard_recovers_by_committee_redraw,
     halted_shard_recovery_agrees_across_retained_and_fresh, halted_shard_straddler_atomic,
     hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
     insolvent_payer_engages_nothing, inter_shard_partition_strands_ticks_until_it_heals,
@@ -110,7 +110,7 @@ use hyperscale_scenarios::{
     a_route_whose_held_core_keeps_its_sponsors_hold,
     a_skip_deferred_split_keeps_every_settlement_in_its_window,
 };
-use hyperscale_simulation::ExecutionMode;
+use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
@@ -2198,6 +2198,49 @@ const fn grow_config(target_shards: u32) -> ScenarioConfig {
 fn grow_reaches_two_shard_topology_sim() {
     let mut cluster = SimCluster::with_accounts(&grow_config(2), 11, &reshape_lifecycle_accounts());
     grow_reaches_two_shard_topology(&mut cluster);
+}
+
+/// A splitting parent whose chain stalls across its cut still reaches its
+/// terminal once the stall clears. The beacon folds the cut into the head
+/// on its own schedule, so a parent still short of its terminal can find
+/// the head no longer seats it; its coast proposals route to the committee
+/// that certifies them rather than to the head's, which names no one.
+#[test]
+fn a_parent_stalled_across_its_cut_still_reaches_its_terminal() {
+    let mut cluster = SimCluster::with_accounts(&grow_config(2), 11, &reshape_lifecycle_accounts());
+    let terminal_of = |c: &SimCluster| {
+        c.runner()
+            .host_topology(0)
+            .and_then(|head| head.scheduled_terminal(ShardId::ROOT))
+    };
+    assert!(
+        cluster.run_until(Budget(20), |c| terminal_of(c).is_some()),
+        "the split never scheduled its cut",
+    );
+    let terminal = terminal_of(&cluster).expect("the cut is scheduled");
+    let cut = Duration::from_millis((terminal.inner() + 1) * EPOCH_MS);
+
+    // Withhold every proposal from just before the cut until the head has
+    // moved past the parent, so the terminal cannot be proposed while the
+    // head still seats the parent's committee.
+    let stall = cluster
+        .runner_mut()
+        .network_mut()
+        .fault()
+        .drop_type("block.header")
+        .during(cut.saturating_sub(Duration::from_secs(5))..Duration::MAX)
+        .install();
+    assert!(
+        cluster.run_until(Budget(4), |c| {
+            c.runner()
+                .host_topology(0)
+                .is_some_and(|head| head.committee_for_shard(ShardId::ROOT).is_empty())
+        }),
+        "the head never moved past the splitting parent",
+    );
+    assert!(cluster.runner_mut().network_mut().fault().remove(&stall));
+
+    grow_to(&mut cluster, 2);
 }
 
 #[test]

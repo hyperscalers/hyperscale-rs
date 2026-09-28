@@ -1627,7 +1627,11 @@ where
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
-        Action::BroadcastBlockHeader { header, manifest } => {
+        Action::BroadcastBlockHeader {
+            header,
+            manifest,
+            recipients,
+        } => {
             let block_hash = header.hash();
             let msg = signed_bytes(
                 &BlockProposalMessage {
@@ -1643,14 +1647,7 @@ where
                 return;
             };
             let gossip = BlockHeaderNotification::new(*header, *manifest, sig);
-            let local_peers: Vec<ValidatorId> = ctx
-                .topology_snapshot
-                .committee_for_shard(ctx.shard)
-                .iter()
-                .filter(|&&v| v != ctx.me)
-                .copied()
-                .collect();
-            ctx.network.notify(&local_peers, &gossip);
+            ctx.network.notify(&recipients, &gossip);
         }
 
         Action::SignAndBroadcastBlockVote {

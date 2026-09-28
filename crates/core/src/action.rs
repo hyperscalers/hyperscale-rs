@@ -269,6 +269,11 @@ pub enum Action {
         header: Box<BlockHeader>,
         /// Manifest listing the block's tx / cert / provision hashes.
         manifest: Box<BlockManifest>,
+        /// The shard's committee to send the header to, less the proposer:
+        /// the head's, or the terminal-clamped committee that certifies the
+        /// block while a splitting parent the head no longer carries has yet
+        /// to commit its terminal.
+        recipients: Vec<ValidatorId>,
     },
 
     /// Sign and broadcast a block vote to the next proposer(s).
