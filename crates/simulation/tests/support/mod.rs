@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 pub mod sim_cluster;
+pub mod tuning;
 
 use std::env;
 use std::time::Duration;

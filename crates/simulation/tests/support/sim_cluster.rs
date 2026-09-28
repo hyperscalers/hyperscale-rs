@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use hyperscale_engine::genesis::GenesisPackages;
@@ -38,6 +39,7 @@ use hyperscale_types::{
     TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
 };
 
+use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
 use super::{sim_seed, sim_world_seed};
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
@@ -62,6 +64,8 @@ struct BuildArgs<'a> {
     accounts: &'a [(PrincipalAddr, u128)],
     execution_mode: ExecutionMode,
     packages: GenesisPackages,
+    /// Draw transport and node tuning from the seed, as a swarm run does.
+    swarm: bool,
 }
 
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
@@ -71,6 +75,16 @@ pub struct SimCluster {
     /// can read host-emitted counters. The sim is single-threaded, so the
     /// thread-local scoped recorder captures every emission.
     recorder: MemoryRecorder,
+    /// The seed-drawn tuning this cluster runs under, if any.
+    tuning: Option<SimTuning>,
+}
+
+impl Drop for SimCluster {
+    fn drop(&mut self) {
+        if let Some(tuning) = self.tuning.as_ref().filter(|_| thread::panicking()) {
+            eprintln!("swarm tuning ({SWARM_VAR}=1 replays it): {tuning:?}");
+        }
+    }
 }
 
 impl SimCluster {
@@ -108,6 +122,7 @@ impl SimCluster {
             accounts,
             execution_mode,
             packages: GenesisPackages::protocol(),
+            swarm: false,
         })
     }
 
@@ -131,6 +146,7 @@ impl SimCluster {
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages,
+            swarm: false,
         })
     }
 
@@ -152,6 +168,7 @@ impl SimCluster {
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages,
+            swarm: false,
         })
     }
 
@@ -191,6 +208,7 @@ impl SimCluster {
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages: GenesisPackages::protocol(),
+            swarm: false,
         })
     }
 
@@ -205,6 +223,9 @@ impl SimCluster {
             },
             ..BeaconChainConfig::default()
         };
+        let seed = sim_seed(args.seed);
+        let tuning = (args.swarm || swarm_requested()).then(|| SimTuning::drawn(seed));
+        let defaults = SimConfig::default();
         let sim_config = SimConfig {
             shard_size: config.shard_size,
             vnodes_per_host: config.vnodes_per_host,
@@ -227,14 +248,24 @@ impl SimCluster {
             execution_mode: args.execution_mode,
             packages: args.packages.clone(),
             pools: world_pools(),
-            ..SimConfig::default()
+            jitter_fraction: tuning
+                .as_ref()
+                .map_or(defaults.jitter_fraction, |t| t.jitter),
+            packet_loss_rate: tuning
+                .as_ref()
+                .map_or(defaults.packet_loss_rate, |t| t.loss),
+            node_config: tuning
+                .as_ref()
+                .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),
+            ..defaults
         };
-        let mut runner = SimulationRunner::new(&sim_config, sim_seed(args.seed));
+        let mut runner = SimulationRunner::new(&sim_config, seed);
         runner.initialize_genesis();
 
         Self {
             runner,
             recorder: MemoryRecorder::new(),
+            tuning,
         }
     }
 
@@ -261,6 +292,24 @@ impl SimCluster {
         Self::with_grown_packages(config, seed, accounts, GenesisPackages::protocol())
     }
 
+    /// [`Self::with_grown_accounts`] under transport and node tuning drawn
+    /// from the seed, as every swarm run is.
+    #[must_use]
+    pub fn with_grown_accounts_swarmed(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+    ) -> Self {
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            GenesisPackages::protocol(),
+            false,
+            true,
+        )
+    }
+
     /// [`Self::with_grown_accounts`] over a network born running
     /// `packages` — how a scenario reaching a fixture asks for it.
     #[must_use]
@@ -270,7 +319,7 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
-        Self::grown(config, seed, accounts, packages, false)
+        Self::grown(config, seed, accounts, packages, false, false)
     }
 
     /// [`Self::with_grown_accounts`] with every validator on a host of
@@ -282,7 +331,14 @@ impl SimCluster {
         seed: u64,
         accounts: &[(PrincipalAddr, u128)],
     ) -> Self {
-        Self::grown(config, seed, accounts, GenesisPackages::protocol(), true)
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            GenesisPackages::protocol(),
+            true,
+            false,
+        )
     }
 
     /// [`Self::with_grown_packages`] with every pool extra on its own
@@ -296,7 +352,7 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
-        Self::grown(config, seed, accounts, packages, true)
+        Self::grown(config, seed, accounts, packages, true, false)
     }
 
     fn grown(
@@ -305,6 +361,7 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
         dedicated_pool_hosts: bool,
+        swarm: bool,
     ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,
@@ -317,6 +374,7 @@ impl SimCluster {
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages,
+            swarm,
         });
         grow_to(&mut cluster, config.num_shards);
         vote_reshape_threshold(&mut cluster, config.split_bytes);

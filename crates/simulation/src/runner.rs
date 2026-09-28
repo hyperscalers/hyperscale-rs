@@ -133,6 +133,8 @@ pub struct SimConfig {
     /// when it should differ from the run seed. `None` draws them from the
     /// run seed; a fixed value sweeps network schedules over one world.
     pub world_seed: Option<u64>,
+    /// Every host's node configuration: fetch schedules and batch windows.
+    pub node_config: NodeConfig,
     /// Consensus crypto scheme every simulated validator runs.
     pub crypto_scheme: CryptoScheme,
     /// Genesis-funded accounts (owner prefix, balance). Seeds the funded
@@ -168,6 +170,7 @@ impl Default for SimConfig {
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
             world_seed: None,
+            node_config: NodeConfig::default(),
             crypto_scheme: CryptoScheme::default(),
             accounts: Vec::new(),
             pools: Vec::new(),
@@ -597,7 +600,7 @@ impl SimulationRunner {
                 shard_event_senders,
                 event_tx.clone(),
                 topology_arc_for_host,
-                NodeConfig::default(),
+                network_config.node_config.clone(),
             );
 
             hosts.push(host);

@@ -43,6 +43,31 @@ pub struct FetchConfig {
     pub(crate) parallel_chunks_per_tick: usize,
 }
 
+impl FetchConfig {
+    /// A fetch schedule with its limits: ids in flight across every
+    /// entry, ids per request, and requests a tick may emit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any limit is zero: a zero limit never fetches.
+    #[must_use]
+    pub fn new(
+        max_in_flight: usize,
+        max_ids_per_request: usize,
+        parallel_chunks_per_tick: usize,
+    ) -> Self {
+        assert!(
+            max_in_flight > 0 && max_ids_per_request > 0 && parallel_chunks_per_tick > 0,
+            "fetch limits must be positive",
+        );
+        Self {
+            max_in_flight,
+            max_ids_per_request,
+            parallel_chunks_per_tick,
+        }
+    }
+}
+
 impl Default for FetchConfig {
     fn default() -> Self {
         Self {

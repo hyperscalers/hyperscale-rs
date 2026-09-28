@@ -26,7 +26,7 @@ const fn swarm_config() -> ScenarioConfig {
 const ROUNDS: u8 = 12;
 
 fn transfers_under_a_nemesis(seed: u64) {
-    let mut cluster = SimCluster::with_grown_accounts(
+    let mut cluster = SimCluster::with_grown_accounts_swarmed(
         &swarm_config(),
         seed,
         &genesis_accounts(SWARM_ACCOUNTS, SWARM_ACCOUNTS),
