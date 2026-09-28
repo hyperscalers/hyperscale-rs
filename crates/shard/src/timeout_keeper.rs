@@ -13,20 +13,20 @@
 //! the keeper; the carried `high_qc` is a self-authenticating QC, verified
 //! separately at adoption.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use hyperscale_types::{QuorumCertificate, Round, Timeout, ValidatorId, Verified, VoteCount};
 
 /// Per-round tally of verified timeout shares, deduplicated by voter.
 struct RoundTimeouts {
-    by_voter: HashMap<ValidatorId, (Verified<Timeout>, VoteCount)>,
+    by_voter: BTreeMap<ValidatorId, (Verified<Timeout>, VoteCount)>,
     total_power: VoteCount,
 }
 
 impl Default for RoundTimeouts {
     fn default() -> Self {
         Self {
-            by_voter: HashMap::new(),
+            by_voter: BTreeMap::new(),
             total_power: VoteCount::ZERO,
         }
     }

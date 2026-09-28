@@ -19,7 +19,7 @@
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
 //! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -438,7 +438,7 @@ impl ProductionRunnerBuilder {
                 _ => pooled.push((v.validator_id, Arc::clone(&v.signer))),
             }
         }
-        let mut local_shards: HashSet<ShardId> = seated_by_shard.keys().copied().collect();
+        let mut local_shards: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
         // A shard this host ran before a cut still holds what its
         // counterparts read from it — the settled sets an abandonment record
         // is held to, the terminal evidence a successor derives from —
@@ -461,7 +461,7 @@ impl ProductionRunnerBuilder {
         // Open each seated shard's storage through the same factory a runtime
         // join uses. A fresh store's genesis is installed by
         // `maybe_initialize_genesis` once the host is assembled.
-        let mut storages: HashMap<ShardId, Arc<RocksDbShardStorage>> = HashMap::new();
+        let mut storages: BTreeMap<ShardId, Arc<RocksDbShardStorage>> = BTreeMap::new();
         for shard in &local_shards {
             let store = (self.storage_factory)(&(self.storage_dir)(*shard), *shard)
                 .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
@@ -473,8 +473,8 @@ impl ProductionRunnerBuilder {
         // can point at each shard's own callback channel. `ShardChannels`
         // carries both ends; the supervisor keeps the shutdown/callback
         // senders alive for the shard's lifetime.
-        let mut shard_channels: HashMap<ShardId, ShardChannels> = HashMap::new();
-        let mut shard_callback_txs: HashMap<ShardId, Sender<HostEvent>> = HashMap::new();
+        let mut shard_channels: BTreeMap<ShardId, ShardChannels> = BTreeMap::new();
+        let mut shard_callback_txs: BTreeMap<ShardId, Sender<HostEvent>> = BTreeMap::new();
         for shard in &local_shards {
             let (channels, callback_tx) = ShardChannels::new();
             shard_callback_txs.insert(*shard, callback_tx);
@@ -542,7 +542,7 @@ impl ProductionRunnerBuilder {
 
         // A handle per shard for `NodeHost::new`; the runner keeps its own
         // handles for GC and metrics.
-        let storage_handles: HashMap<ShardId, RocksDbShardStorage> = storages
+        let storage_handles: BTreeMap<ShardId, RocksDbShardStorage> = storages
             .iter()
             .map(|(shard, st)| (*shard, (**st).clone()))
             .collect();
@@ -668,7 +668,7 @@ pub struct ProductionRunner {
 
     /// Per-shard receivers (timer + callback + shutdown), built at
     /// construction and consumed when `run()` spawns the shard threads.
-    shard_channels: Option<HashMap<ShardId, ShardChannels>>,
+    shard_channels: Option<BTreeMap<ShardId, ShardChannels>>,
 
     /// Per-shard local vnode counts at startup, seeding the
     /// supervisor's membership refcounts.
@@ -698,11 +698,11 @@ pub struct ProductionRunner {
     /// Per-shard `RocksDB` handles for the JMT GC tick and storage
     /// metrics, shared with the supervisor, which inserts and removes
     /// entries as shards join and leave.
-    storages: Arc<std::sync::Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
+    storages: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<RocksDbShardStorage>>>>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
     /// Every shard this runner hosts vnodes for at startup.
-    local_shards: HashSet<ShardId>,
+    local_shards: BTreeSet<ShardId>,
 
     /// Shared RPC publishers; the metrics tick stamps peer counts into
     /// the status slots.
@@ -1201,7 +1201,7 @@ struct NetworkBuildArgs {
     ed25519_keypair: Keypair,
     /// Shards hosted by this host. Drives per-shard request stream
     /// protocols and gossipsub subscriptions on the adapter.
-    local_shards: HashSet<ShardId>,
+    local_shards: BTreeSet<ShardId>,
     /// One `(validator_id, signer)` per hosted vnode. The bind
     /// service attests as every entry on each handshake.
     bind_vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
@@ -1232,7 +1232,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
         network: args.network,
         keypair: args.ed25519_keypair,
         vnodes: args.bind_vnodes,
-        local_shards: args.local_shards,
+        local_shards: args.local_shards.into_iter().collect(),
         registry: registry.clone(),
         validator_keys: args.initial_validator_keys,
         verifier: args.verifier,
@@ -1325,15 +1325,15 @@ impl ShardChannels {
 struct ProdTimerManager {
     tokio_handle: TokioHandle,
     timer_tx: Sender<HostEvent>,
-    active: HashMap<(Option<ShardId>, TimerId), JoinHandle<()>>,
+    active: BTreeMap<(Option<ShardId>, TimerId), JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
-    fn new(tokio_handle: TokioHandle, timer_tx: Sender<HostEvent>) -> Self {
+    const fn new(tokio_handle: TokioHandle, timer_tx: Sender<HostEvent>) -> Self {
         Self {
             tokio_handle,
             timer_tx,
-            active: HashMap::new(),
+            active: BTreeMap::new(),
         }
     }
 
@@ -1367,7 +1367,7 @@ impl ProdTimerManager {
 
 impl Drop for ProdTimerManager {
     fn drop(&mut self) {
-        for (_, handle) in self.active.drain() {
+        for handle in std::mem::take(&mut self.active).into_values() {
             handle.abort();
         }
     }
@@ -1869,7 +1869,7 @@ pub fn spawn_pool_loop(pool: ProdPoolLoop, config: PoolLoopConfig) -> std::threa
 /// serving is a storage one, and the store is there or it is not.
 fn served_departed_shards(
     boundaries: &BTreeMap<ShardId, ShardBoundary>,
-    seated: &HashSet<ShardId>,
+    seated: &BTreeSet<ShardId>,
     on_disk: impl Fn(ShardId) -> bool,
 ) -> Vec<ShardId> {
     boundaries
@@ -1928,7 +1928,7 @@ mod tests {
             (seated, boundary(Some(4))),
             (elsewhere, boundary(Some(4))),
         ]);
-        let hosted = HashSet::from([seated]);
+        let hosted = BTreeSet::from([seated]);
 
         assert_eq!(
             served_departed_shards(&boundaries, &hosted, |shard| shard != elsewhere),
@@ -1941,7 +1941,7 @@ mod tests {
     #[test]
     fn a_shard_the_beacon_no_longer_bounds_is_not_served() {
         assert!(
-            served_departed_shards(&BTreeMap::new(), &HashSet::new(), |_| true).is_empty(),
+            served_departed_shards(&BTreeMap::new(), &BTreeSet::new(), |_| true).is_empty(),
             "the retention window is the beacon's to keep"
         );
     }

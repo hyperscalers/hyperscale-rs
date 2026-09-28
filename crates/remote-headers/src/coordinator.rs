@@ -241,7 +241,7 @@ pub struct RemoteHeaderCoordinator {
     /// The timestamp is the pruning anchor — retention is measured against
     /// how long ago (in remote wall-clock) each stored header was produced,
     /// so pruning stays meaningful when remote block cadence varies.
-    tips: HashMap<ShardId, (BlockHeight, WeightedTimestamp)>,
+    tips: BTreeMap<ShardId, (BlockHeight, WeightedTimestamp)>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Liveness Tracking (drives header-sync staleness detection)
@@ -299,7 +299,7 @@ impl RemoteHeaderCoordinator {
             recoveries_evicted: BTreeMap::new(),
             wanted_proofs: BTreeMap::new(),
             fork_fence,
-            tips: HashMap::new(),
+            tips: BTreeMap::new(),
             expected: BTreeMap::new(),
             clock,
             committed_once: false,
@@ -939,7 +939,7 @@ impl RemoteHeaderCoordinator {
     /// Used for cross-shard backpressure: RPC nodes can reject transactions
     /// targeting congested remote shards.
     #[must_use]
-    pub fn remote_shard_in_flight(&self) -> HashMap<ShardId, TxsInFlight> {
+    pub fn remote_shard_in_flight(&self) -> BTreeMap<ShardId, TxsInFlight> {
         self.tips
             .iter()
             .filter_map(|(&shard, &(tip_height, _tip_ts))| {
@@ -2065,7 +2065,7 @@ mod tests {
     /// shard.
     #[test]
     fn a_departed_shards_headers_go_when_its_evidence_window_closes() {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         use hyperscale_types::{BeaconWitnessLeafCount, ShardAnchor, StateRoot};
 
@@ -2075,7 +2075,7 @@ mod tests {
         let live = ShardId::leaf(1, 0);
 
         let stamped = |handoff_complete: Option<Epoch>| {
-            let mut boundaries = HashMap::new();
+            let mut boundaries = BTreeMap::new();
             boundaries.insert(
                 departed,
                 ShardAnchor {

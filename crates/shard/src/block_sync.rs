@@ -118,7 +118,7 @@ pub struct BlockSyncManager {
     /// races honest peers to plant a wrong-hash block at a future height
     /// and we'd `Drop` the honest arrival as duplicate. Per-height entry
     /// count is capped by `MAX_BUFFERED_PER_HEIGHT`.
-    buffered_synced_blocks: BTreeMap<BlockHeight, HashMap<BlockHash, CertifiedBlock>>,
+    buffered_synced_blocks: BTreeMap<BlockHeight, BTreeMap<BlockHash, CertifiedBlock>>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps `block_hash` -> pending synced block info.
@@ -622,7 +622,7 @@ impl BlockSyncManager {
                     }
                     _ => None,
                 })
-                .min_by_key(|(height, _)| *height)?;
+                .min()?;
             let Some(PendingSyncedBlockVerification::QcVerified { block, qc }) =
                 self.pending_synced_block_verifications.remove(&block_hash)
             else {
@@ -738,7 +738,10 @@ impl BlockSyncManager {
     /// the unique-height count when multiple distinct hashes are buffered
     /// at the same height (slot-squat defense).
     pub(crate) fn buffered_synced_blocks_len(&self) -> usize {
-        self.buffered_synced_blocks.values().map(HashMap::len).sum()
+        self.buffered_synced_blocks
+            .values()
+            .map(BTreeMap::len)
+            .sum()
     }
 }
 

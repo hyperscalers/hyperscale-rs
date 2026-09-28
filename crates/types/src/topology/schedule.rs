@@ -1298,7 +1298,7 @@ mod tests {
     ) -> Arc<TopologySnapshot> {
         let committees: HashMap<ShardId, Vec<ValidatorId>> =
             live.iter().map(|shard| (*shard, Vec::new())).collect();
-        let boundaries: HashMap<ShardId, ShardAnchor> = terminated
+        let boundaries: BTreeMap<ShardId, ShardAnchor> = terminated
             .iter()
             .map(|(shard, settled)| {
                 (
@@ -1545,7 +1545,7 @@ mod tests {
                 &ValidatorSet::new(Vec::new()),
                 HashMap::from([(ShardId::ROOT, Vec::new())]),
                 HashMap::new(),
-                HashMap::new(),
+                BTreeMap::new(),
                 HashMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -2581,7 +2581,7 @@ mod tests {
                 &ValidatorSet::new(Vec::new()),
                 leaves.iter().map(|s| (*s, Vec::new())).collect(),
                 HashMap::new(),
-                HashMap::new(),
+                BTreeMap::new(),
                 HashMap::new(),
                 BTreeMap::new(),
                 reshape_keepers,

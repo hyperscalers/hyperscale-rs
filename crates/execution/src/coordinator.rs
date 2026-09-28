@@ -6811,7 +6811,7 @@ mod tests {
             ShardId::leaf(1, 1),
             vec![ValidatorId::new(2), ValidatorId::new(3)],
         );
-        let mut boundaries = HashMap::new();
+        let mut boundaries = BTreeMap::new();
         boundaries.insert(
             shard,
             ShardAnchor {
@@ -7630,7 +7630,7 @@ mod tests {
                 2,
                 ValidatorSet::new(validators),
             )
-            .with_boundaries(HashMap::from([(
+            .with_boundaries(BTreeMap::from([(
                 ShardId::ROOT,
                 ShardAnchor {
                     state_root: StateRoot::ZERO,
@@ -12464,7 +12464,7 @@ mod tests {
         cut: &[(ShardId, u64)],
         departed: &[(ShardId, Option<Epoch>)],
     ) -> Arc<TopologySnapshot> {
-        let boundaries: HashMap<ShardId, ShardAnchor> = departed
+        let boundaries: BTreeMap<ShardId, ShardAnchor> = departed
             .iter()
             .map(|(shard, handoff_complete)| {
                 (

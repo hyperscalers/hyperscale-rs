@@ -8,7 +8,7 @@
 //! transaction ordering, `ticks` recomputation, cross-ancestor tx uniqueness)
 //! live in [`crate::validation`].
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand, FeeSpan};
@@ -252,7 +252,7 @@ pub struct VerificationPipeline {
     // === State root verification ===
     /// Blocks waiting for their parent's tree nodes to become available (via
     /// commit or prior verification). Keyed by `parent_block_hash`.
-    deferred_state_root_verifications: HashMap<BlockHash, Vec<PendingStateRootVerification>>,
+    deferred_state_root_verifications: BTreeMap<BlockHash, Vec<PendingStateRootVerification>>,
 
     /// Deferred proposal waiting for the parent's tree nodes to become
     /// available. At most one pending at a time (new proposals replace old).
@@ -309,7 +309,8 @@ pub struct VerificationPipeline {
     /// [`Self::take_deferred_beacon_witness_children`] drains the entry —
     /// on the ancestor's own beacon-witness verification completing, or
     /// on a commit advancing `committed_hash` to it.
-    deferred_beacon_witness_verifications: HashMap<BlockHash, Vec<(BlockHash, BeaconWitnessDefer)>>,
+    deferred_beacon_witness_verifications:
+        BTreeMap<BlockHash, Vec<(BlockHash, BeaconWitnessDefer)>>,
 
     /// Beacon-witness verifications whose block's governing committee is not
     /// yet resolvable because this node's beacon is behind — the topology
@@ -326,7 +327,7 @@ pub struct VerificationPipeline {
     /// nothing to re-acquire, and dropping the key destroys the only edge
     /// that restarts the verification. Bounded at all, it would have to
     /// refuse a new key rather than drop an old one.
-    beacon_witness_awaiting_committee: HashSet<BlockHash>,
+    beacon_witness_awaiting_committee: BTreeSet<BlockHash>,
 
     // === Drain total verification ===
     /// Blocks whose claimed drain total was re-derived and matched.
@@ -361,15 +362,15 @@ impl VerificationPipeline {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
-            deferred_state_root_verifications: HashMap::new(),
+            deferred_state_root_verifications: BTreeMap::new(),
             deferred_proposal: None,
             deferred_substate_ancestor: None,
             ready_state_root_verifications: Vec::new(),
             proposal_unblocked: false,
             last_persisted_height: persisted_height,
             roots: HashMap::new(),
-            deferred_beacon_witness_verifications: HashMap::new(),
-            beacon_witness_awaiting_committee: HashSet::new(),
+            deferred_beacon_witness_verifications: BTreeMap::new(),
+            beacon_witness_awaiting_committee: BTreeSet::new(),
             verified_in_flight: HashSet::new(),
             pending_assemblies: HashMap::new(),
             verified_certified_blocks: HashMap::new(),
@@ -1412,7 +1413,9 @@ impl VerificationPipeline {
     /// Drain the blocks parked awaiting a beacon-resolvable committee. The
     /// caller re-initiates each; any still beacon-behind re-parks itself.
     pub(crate) fn take_beacon_witness_awaiting_committee(&mut self) -> Vec<BlockHash> {
-        self.beacon_witness_awaiting_committee.drain().collect()
+        std::mem::take(&mut self.beacon_witness_awaiting_committee)
+            .into_iter()
+            .collect()
     }
 
     /// Drop deferred beacon-witness verifications keyed on a
@@ -2172,11 +2175,10 @@ impl VerificationPipeline {
 
         // Clean up deferred verifications: remove entries whose child blocks
         // are no longer tracked, and remove parent keys with empty lists.
-        for entries in self.deferred_state_root_verifications.values_mut() {
+        self.deferred_state_root_verifications.retain(|_, entries| {
             entries.retain(|r| tracked(r.block_hash));
-        }
-        self.deferred_state_root_verifications
-            .retain(|_, entries| !entries.is_empty());
+            !entries.is_empty()
+        });
 
         // Clear deferred proposal if its parent is at or below committed height
         // (the proposal is stale — a new round/view will generate a fresh one).
@@ -2198,11 +2200,11 @@ impl VerificationPipeline {
 
         // Drop deferred beacon-witness entries whose child has been
         // pruned. Parent keys whose values empty out are removed too.
-        for children in self.deferred_beacon_witness_verifications.values_mut() {
-            children.retain(|(child, _)| pending_blocks.contains_key(*child));
-        }
         self.deferred_beacon_witness_verifications
-            .retain(|_, children| !children.is_empty());
+            .retain(|_, children| {
+                children.retain(|(child, _)| pending_blocks.contains_key(*child));
+                !children.is_empty()
+            });
 
         self.verified_in_flight
             .retain(|hash| pending_blocks.contains_key(*hash));

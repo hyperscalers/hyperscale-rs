@@ -18,7 +18,7 @@
 //! channel, and a vnode that loses its role in a shard that stays up
 //! leaves the loop the same way.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -179,7 +179,7 @@ pub struct ShardSupervisor {
     tokio_handle: TokioHandle,
     publishers: RpcPublishers,
     /// Per-shard `RocksDB` handles, shared with the runner's GC tick.
-    storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
+    storages: Arc<Mutex<BTreeMap<ShardId, Arc<RocksDbShardStorage>>>>,
     storage_factory: StorageFactory,
     storage_dir: StorageDirResolver,
     /// Replicated into every fresh store this supervisor opens — a
@@ -189,7 +189,7 @@ pub struct ShardSupervisor {
     /// Cloned into every spawned shard loop's config so placement
     /// deltas reach the runner's reconfiguration loop.
     participation_tx: mpsc::UnboundedSender<ParticipationChange>,
-    shards: HashMap<ShardId, ShardThread>,
+    shards: BTreeMap<ShardId, ShardThread>,
     /// Shards whose join is parked on background work — the off-loop
     /// storage open or an in-flight snap-sync bootstrap — mapped to the
     /// count of vnodes still pending. Guards against a second `Join`
@@ -265,7 +265,7 @@ impl ShardSupervisor {
         verifier: Arc<dyn Verifier>,
         tokio_handle: TokioHandle,
         publishers: RpcPublishers,
-        storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
+        storages: Arc<Mutex<BTreeMap<ShardId, Arc<RocksDbShardStorage>>>>,
         storage_factory: StorageFactory,
         storage_dir: StorageDirResolver,
         engine_bootstrap: EngineBootstrap,
@@ -293,7 +293,7 @@ impl ShardSupervisor {
             engine_bootstrap,
             participation_tx,
             genesis_offset_ms,
-            shards: HashMap::new(),
+            shards: BTreeMap::new(),
             bootstrapping: HashMap::new(),
             rebuilding: HashMap::new(),
             reshape: ReshapeOrchestrator::new(vnode_keys.keys().copied().collect()),
@@ -389,7 +389,7 @@ impl ShardSupervisor {
                 tracing::debug!(shard = ?shard, "Shard already exited");
             }
         }
-        for (_, entry) in self.shards.drain() {
+        for entry in std::mem::take(&mut self.shards).into_values() {
             if let Err(e) = entry.join.join() {
                 warn!("Shard thread panicked: {e:?}");
             }

@@ -549,7 +549,7 @@ impl SimulationRunner {
             let (event_tx, event_rx) = unbounded();
 
             // One `SimShardStorage` per hosted shard on this host.
-            let storages: HashMap<ShardId, SimShardStorage> = by_shard
+            let storages: BTreeMap<ShardId, SimShardStorage> = by_shard
                 .keys()
                 .map(|s| (*s, SimShardStorage::new(shard_prefix_path(*s))))
                 .collect();

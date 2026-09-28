@@ -26,7 +26,7 @@
 //! report.print_summary();
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
@@ -69,7 +69,7 @@ pub struct LivelockReport {
     /// Total number of incomplete transactions found
     pub total_incomplete: usize,
     /// Transactions stuck in each status
-    pub by_status: HashMap<String, Vec<StuckTransaction>>,
+    pub by_status: BTreeMap<String, Vec<StuckTransaction>>,
     /// Transactions grouped by shard
     pub by_shard: HashMap<ShardId, Vec<StuckTransaction>>,
     /// Potential livelock cycles detected
@@ -236,7 +236,7 @@ impl LivelockAnalyzer {
         let total_incomplete = self.stuck_transactions.len();
 
         // Group by status
-        let mut by_status: HashMap<String, Vec<StuckTransaction>> = HashMap::new();
+        let mut by_status: BTreeMap<String, Vec<StuckTransaction>> = BTreeMap::new();
         for tx in &self.stuck_transactions {
             by_status
                 .entry(status_name(&tx.status))

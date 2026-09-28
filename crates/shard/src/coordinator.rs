@@ -414,7 +414,7 @@ pub struct ShardCoordinator {
     /// so the commit that materializes it is coming, and
     /// `record_block_committed` sums the demand and dispatches as it
     /// lands.
-    deferred_reservation_checks: HashMap<BlockHash, (Vec<PayerFee>, BlockHeight)>,
+    deferred_reservation_checks: BTreeMap<BlockHash, (Vec<PayerFee>, BlockHeight)>,
     /// Rounds of recently committed blocks by height — the committed
     /// half of the ancestry walk in
     /// [`Self::ancestry_committed_height`], covering ancestors already
@@ -734,7 +734,7 @@ impl ShardCoordinator {
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
-            deferred_reservation_checks: HashMap::new(),
+            deferred_reservation_checks: BTreeMap::new(),
             committed_rounds: BTreeMap::new(),
             // A fresh start's tip is the chain's genesis, whose header
             // carries zero of everything — known, not guessed. A real tip
@@ -7869,7 +7869,7 @@ mod tests {
             handoff_complete: None,
             terminal_epoch: None,
         };
-        let live = |shards: &[ShardId], boundaries: HashMap<ShardId, ShardAnchor>| {
+        let live = |shards: &[ShardId], boundaries: BTreeMap<ShardId, ShardAnchor>| {
             Arc::new(TopologySnapshot::from_explicit_committees(
                 NetworkDefinition::simulator(),
                 &ValidatorSet::new(Vec::new()),
@@ -7883,11 +7883,11 @@ mod tests {
                 BTreeSet::new(),
             ))
         };
-        let mut boundaries = HashMap::new();
+        let mut boundaries = BTreeMap::new();
         boundaries.insert(PARENT, anchor);
         let head = live(&children, boundaries);
         let mut sched =
-            TopologySchedule::new(10_000, Epoch::new(0), live(&[PARENT], HashMap::new()));
+            TopologySchedule::new(10_000, Epoch::new(0), live(&[PARENT], BTreeMap::new()));
         sched.insert(Epoch::new(1), Arc::clone(&head));
         sched.set_head(head);
         sched
@@ -12895,7 +12895,7 @@ mod tests {
             &vs,
             committees,
             consensus,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -12933,7 +12933,7 @@ mod tests {
             &vs,
             committees,
             consensus,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -14315,7 +14315,7 @@ mod tests {
                 2,
                 ValidatorSet::new(validators),
             )
-            .with_boundaries(HashMap::from([(
+            .with_boundaries(BTreeMap::from([(
                 ShardId::ROOT,
                 ShardAnchor {
                     state_root: StateRoot::ZERO,

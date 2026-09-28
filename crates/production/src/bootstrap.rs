@@ -604,7 +604,7 @@ mod tests {
             &ValidatorSet::new(Vec::new()),
             HashMap::from([(shard, Vec::new())]),
             HashMap::new(),
-            HashMap::from([(shard, anchor)]),
+            BTreeMap::from([(shard, anchor)]),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),

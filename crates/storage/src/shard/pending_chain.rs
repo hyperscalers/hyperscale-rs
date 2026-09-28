@@ -650,7 +650,7 @@ where
                     .as_ref()
                     .map(|c| (e.height, c.qc_verified()))
             })
-            .max_by_key(|(h, _)| *h)
+            .max_by_key(|(h, qc)| (*h, qc.round(), qc.block_hash()))
             .map(|(_, qc)| qc.clone());
         drop(entries);
         pending_qc.or_else(|| self.base.latest_qc())

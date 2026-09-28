@@ -5,7 +5,7 @@
 //! registry's request map (serving), gossip fan-out into the event
 //! channel (routing), and the host's own shard accessors.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -65,7 +65,7 @@ fn fixture() -> Fixture {
     // The chain genesises as a single ROOT shard; the two-shard A/B split
     // this test drives is a later runtime state, presented directly through
     // the topology snapshot below rather than baked into genesis.
-    let shard_committees: HashMap<ShardId, Vec<ValidatorId>> = [
+    let shard_committees: BTreeMap<ShardId, Vec<ValidatorId>> = [
         (
             SHARD_A,
             vec![committee.validator_id(0), committee.validator_id(1)],
@@ -339,7 +339,7 @@ fn pooled_vnode_follows_the_beacon_via_the_network_path() {
 
     let mut host = NodeHost::new(
         vec![fix.pooled_vnode_init(0)],
-        HashMap::<ShardId, SimShardStorage>::new(),
+        BTreeMap::<ShardId, SimShardStorage>::new(),
         Arc::clone(&beacon_storage),
         NetworkDefinition::simulator(),
         Arc::new(Executor::new(ExecutionMode::Serial)),

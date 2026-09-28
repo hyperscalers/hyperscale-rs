@@ -116,7 +116,7 @@ pub struct TopologySnapshot {
     network: NetworkDefinition,
     shard_trie: ShardTrie,
     shard_committees: HashMap<ShardId, ShardCommittee>,
-    boundaries: HashMap<ShardId, ShardAnchor>,
+    boundaries: BTreeMap<ShardId, ShardAnchor>,
     /// Shards the beacon fold has observed cross a boundary past their seeded
     /// genesis — projected live from `BeaconState.advanced`. A freshly seeded
     /// reshape successor is absent until it produces; the reshape handoff
@@ -254,7 +254,7 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
-            boundaries: HashMap::new(),
+            boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
@@ -304,7 +304,7 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
-            boundaries: HashMap::new(),
+            boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
@@ -339,7 +339,7 @@ impl TopologySnapshot {
         network: NetworkDefinition,
         num_shards: u64,
         global_validator_set: &ValidatorSet,
-        shard_committees: HashMap<ShardId, Vec<ValidatorId>>,
+        shard_committees: BTreeMap<ShardId, Vec<ValidatorId>>,
     ) -> Self {
         let validator_pubkeys = build_validator_pubkeys(global_validator_set);
 
@@ -363,7 +363,7 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees: committees,
-            boundaries: HashMap::new(),
+            boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
@@ -416,7 +416,7 @@ impl TopologySnapshot {
         global_validator_set: &ValidatorSet,
         shard_committees: HashMap<ShardId, Vec<ValidatorId>>,
         mut consensus_members: HashMap<ShardId, Vec<ValidatorId>>,
-        boundaries: HashMap<ShardId, ShardAnchor>,
+        boundaries: BTreeMap<ShardId, ShardAnchor>,
         witness_bases: HashMap<ShardId, BeaconWitnessLeafCount>,
         mut reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
         mut reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
@@ -592,7 +592,7 @@ impl TopologySnapshot {
     /// Builder-set under the [`Self::with_settled_window_floors`]
     /// rationale.
     #[must_use]
-    pub fn with_boundaries(mut self, boundaries: HashMap<ShardId, ShardAnchor>) -> Self {
+    pub fn with_boundaries(mut self, boundaries: BTreeMap<ShardId, ShardAnchor>) -> Self {
         self.boundaries = boundaries;
         self
     }
@@ -1253,7 +1253,7 @@ mod tests {
             &vs,
             HashMap::from([(shard, members.clone())]),
             HashMap::from([(shard, members)]),
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::from([
                 (
@@ -1333,7 +1333,7 @@ mod tests {
             // Members 0-1 are ready; 2 is a joiner still syncing; the
             // observer and the other split's rider never enter the subset.
             HashMap::from([(parent, members[..2].to_vec())]),
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::from([
                 (
@@ -1407,7 +1407,7 @@ mod tests {
             &vs,
             committees.clone(),
             committees,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -1572,7 +1572,7 @@ mod tests {
     fn test_with_shard_committees() {
         let validators: Vec<_> = (0..4).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
-        let mut committees = HashMap::new();
+        let mut committees = BTreeMap::new();
         committees.insert(
             ShardId::leaf(1, 0),
             vec![ValidatorId::new(0), ValidatorId::new(2)],
@@ -1601,7 +1601,7 @@ mod tests {
     fn test_with_shard_committees_panics_on_unknown_validator() {
         let validators: Vec<_> = (0..2).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
-        let mut committees = HashMap::new();
+        let mut committees = BTreeMap::new();
         // ValidatorId::new(99) isn't in `vs`; constructor must reject.
         committees.insert(
             ShardId::ROOT,
@@ -1635,7 +1635,7 @@ mod tests {
             handoff_complete: None,
             terminal_epoch: None,
         };
-        let mut boundaries = HashMap::new();
+        let mut boundaries = BTreeMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);
 
         let mut witness_bases = HashMap::new();
@@ -1689,7 +1689,7 @@ mod tests {
             &vs,
             committees,
             consensus,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -1739,7 +1739,7 @@ mod tests {
             &vs,
             committees,
             consensus,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -1753,7 +1753,7 @@ mod tests {
     fn test_committee_votes_is_member_count() {
         let validators: Vec<_> = (0..4).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
-        let mut committees = HashMap::new();
+        let mut committees = BTreeMap::new();
         committees.insert(
             ShardId::ROOT,
             vec![
@@ -1798,7 +1798,7 @@ mod tests {
     /// A two-shard topology with two validators seated on each leaf.
     fn two_shard_topology() -> TopologySnapshot {
         let validators: Vec<_> = (0..4).map(make_test_validator).collect();
-        let mut shard_committees: HashMap<ShardId, Vec<ValidatorId>> = HashMap::new();
+        let mut shard_committees: BTreeMap<ShardId, Vec<ValidatorId>> = BTreeMap::new();
         shard_committees.insert(
             ShardId::leaf(1, 0),
             vec![ValidatorId::new(0), ValidatorId::new(1)],

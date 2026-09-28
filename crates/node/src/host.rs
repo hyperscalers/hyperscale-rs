@@ -18,7 +18,7 @@
 //! dispatch and the same `clear_scratch` / `take_output` scratch lifecycle,
 //! so the two drivers cannot drift.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -153,7 +153,7 @@ where
     )] // two-pass construction: build shard io, then process, then assemble
     pub fn new(
         vnodes: Vec<VnodeInit>,
-        mut storages: HashMap<ShardId, S>,
+        mut storages: BTreeMap<ShardId, S>,
         beacon_storage: Arc<dyn BeaconStorage>,
         beacon_network: NetworkDefinition,
         executor: Arc<Executor>,
@@ -194,13 +194,13 @@ where
         // per-shard dispatch handles map. ShardLoop construction is deferred
         // to a second pass because each ShardLoop needs an Arc<ProcessIo>
         // that can only be built after dispatch_handles is finalized.
-        let mut shard_builds: HashMap<ShardId, (ShardIo<S>, Vec<Vnode>)> = HashMap::new();
+        let mut shard_builds: BTreeMap<ShardId, (ShardIo<S>, Vec<Vnode>)> = BTreeMap::new();
         let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
 
         // Split the vnodes into per-shard groups (seated) and the
         // beacon-follower pool (`shard: None`). The hosted-shard set — one
         // `ShardIo` apiece — is exactly the seated groups' keys.
-        let mut by_shard: HashMap<ShardId, Vec<VnodeInit>> = HashMap::new();
+        let mut by_shard: BTreeMap<ShardId, Vec<VnodeInit>> = BTreeMap::new();
         let mut pool_inits: Vec<VnodeInit> = Vec::new();
         for init in vnodes {
             match init.state.seated_shard() {
@@ -208,19 +208,19 @@ where
                 None => pool_inits.push(init),
             }
         }
-        let hosted_shards: HashSet<ShardId> = by_shard.keys().copied().collect();
+        assert!(
+            shard_event_senders.keys().eq(by_shard.keys()),
+            "shard_event_senders must have exactly one entry per hosted shard"
+        );
 
-        for shard in &hosted_shards {
-            let inits = by_shard
-                .remove(shard)
-                .expect("hosted shard derived from vnodes — at least one vnode exists for it");
+        for (shard, inits) in by_shard {
             let storage = storages
-                .remove(shard)
+                .remove(&shard)
                 .unwrap_or_else(|| panic!("NodeHost: missing storage for hosted shard {shard:?}"));
-            let (io, handles) = build_shard_io(*shard, &inits, storage, &config);
-            per_shard_dispatch.insert(*shard, handles);
+            let (io, handles) = build_shard_io(shard, &inits, storage, &config);
+            per_shard_dispatch.insert(shard, handles);
             let vnodes: Vec<Vnode> = inits.into_iter().map(VnodeInit::into_vnode).collect();
-            shard_builds.insert(*shard, (io, vnodes));
+            shard_builds.insert(shard, (io, vnodes));
         }
 
         // The stores this host has open, shared with the engine so a
@@ -236,17 +236,6 @@ where
             beacon_storage: Arc::clone(&beacon_storage),
             per_shard,
         });
-        assert_eq!(
-            shard_event_senders.len(),
-            hosted_shards.len(),
-            "shard_event_senders must have one entry per hosted shard"
-        );
-        for shard in &hosted_shards {
-            assert!(
-                shard_event_senders.contains_key(shard),
-                "shard_event_senders missing entry for hosted shard {shard:?}"
-            );
-        }
         let process = Arc::new(ProcessIo::new(
             network,
             process_verifier,

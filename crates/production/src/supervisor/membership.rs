@@ -1008,7 +1008,7 @@ mod tests {
             &ValidatorSet::new(validators),
             committees,
             HashMap::new(),
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             observers
                 .into_iter()

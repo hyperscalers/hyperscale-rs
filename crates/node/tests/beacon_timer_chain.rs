@@ -10,7 +10,7 @@
 //! never drives SPC rounds, and never casts ratify votes; enough of them
 //! in one ratify pool starves the pool quorum and parks the beacon.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -87,7 +87,7 @@ fn fixture() -> Fixture {
             })
             .collect(),
     );
-    let shard_committees: HashMap<ShardId, Vec<ValidatorId>> = std::iter::once((
+    let shard_committees: BTreeMap<ShardId, Vec<ValidatorId>> = std::iter::once((
         SHARD_A,
         vec![committee.validator_id(0), committee.validator_id(1)],
     ))
@@ -164,7 +164,7 @@ impl Fixture {
         let (event_tx, event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
             vec![self.follower_init(idx)],
-            HashMap::<ShardId, SimShardStorage>::new(),
+            BTreeMap::<ShardId, SimShardStorage>::new(),
             Arc::clone(&self.beacon_storage),
             NetworkDefinition::simulator(),
             Arc::new(Executor::new(ExecutionMode::Serial)),

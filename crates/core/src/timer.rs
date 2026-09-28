@@ -3,7 +3,7 @@
 //! event queue in simulation).
 
 /// Timer identification for scheduled events.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TimerId {
     /// View change timeout — one-shot, reset on leader activity.
     /// Shard-scoped.

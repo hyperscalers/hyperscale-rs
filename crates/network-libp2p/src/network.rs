@@ -3,7 +3,7 @@
 //! [`Libp2pNetwork`] wraps [`Libp2pAdapter`] and [`RequestManager`] to provide
 //! the [`Network`] interface used by `IoLoop` in the production runner.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -238,7 +238,7 @@ impl Network for Libp2pNetwork {
         // — this push is what turns those book entries into connections.
         let self_ids: HashSet<ValidatorId> =
             self.adapter.local_validator_ids().iter().copied().collect();
-        let wanted: HashSet<ValidatorId> = committees
+        let wanted: BTreeSet<ValidatorId> = committees
             .values()
             .flatten()
             .filter(|validator| !self_ids.contains(validator))
@@ -385,7 +385,7 @@ impl Network for Libp2pNetwork {
         // Remote: collapse to unique peers (multi-validator bind can map
         // several recipient vids to one peer, and sending twice on the
         // same stream is wasted bandwidth).
-        let mut unique_peers: HashSet<PeerId> = HashSet::with_capacity(recipients.len());
+        let mut unique_peers: BTreeSet<PeerId> = BTreeSet::new();
         for &validator in recipients {
             if self_ids.contains(&validator) {
                 continue;

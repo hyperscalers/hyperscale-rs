@@ -1164,7 +1164,7 @@ pub(crate) mod fixtures {
         survivors: &[ShardId],
         handoff_complete: Option<Epoch>,
     ) -> TopologySchedule {
-        let window = |shards: &[ShardId], boundaries: HashMap<ShardId, ShardAnchor>| {
+        let window = |shards: &[ShardId], boundaries: BTreeMap<ShardId, ShardAnchor>| {
             Arc::new(TopologySnapshot::from_explicit_committees(
                 NetworkDefinition::simulator(),
                 &ValidatorSet::new(Vec::new()),
@@ -1178,7 +1178,7 @@ pub(crate) mod fixtures {
                 BTreeSet::new(),
             ))
         };
-        let boundaries: HashMap<ShardId, ShardAnchor> = departed
+        let boundaries: BTreeMap<ShardId, ShardAnchor> = departed
             .iter()
             .map(|&shard| {
                 (
@@ -1198,7 +1198,7 @@ pub(crate) mod fixtures {
             .collect();
         let after = window(survivors, boundaries);
         let mut sched =
-            TopologySchedule::new(cut_ms, Epoch::new(0), window(departed, HashMap::new()));
+            TopologySchedule::new(cut_ms, Epoch::new(0), window(departed, BTreeMap::new()));
         for epoch in 1..=20u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&after));
         }

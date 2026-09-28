@@ -1654,7 +1654,7 @@ pub mod tests {
     /// the whole answer.
     #[test]
     fn a_record_after_its_boundary_drops_is_refused_alike() {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         use hyperscale_types::Epoch;
 
@@ -1670,7 +1670,7 @@ pub mod tests {
             ],
             None,
         );
-        let dropped = Arc::new((**deep.head()).clone().with_boundaries(HashMap::new()));
+        let dropped = Arc::new((**deep.head()).clone().with_boundaries(BTreeMap::new()));
         for epoch in 6..=20u64 {
             deep.insert(Epoch::new(epoch), Arc::clone(&dropped));
         }

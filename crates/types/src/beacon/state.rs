@@ -1910,7 +1910,7 @@ impl BeaconState {
         // observed crossing; those aren't attested anchors, so they don't
         // project — `boundary(shard)` returns `None` and a joiner replays
         // from genesis instead of snap-syncing.
-        let boundaries: HashMap<ShardId, ShardAnchor> = self
+        let boundaries: BTreeMap<ShardId, ShardAnchor> = self
             .boundaries
             .iter()
             .filter(|(_, b)| b.block_hash != BlockHash::ZERO)

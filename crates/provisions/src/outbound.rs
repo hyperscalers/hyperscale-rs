@@ -17,7 +17,7 @@
 //! to terminate, so any provisions unacked past `MAX_VALIDITY_RANGE +
 //! MAX_FINALIZATION_DELAY` reference a tx no shard could still be processing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
@@ -38,7 +38,7 @@ pub struct OutboundMemoryStats {
 struct OutboundEntry {
     target_shard: ShardId,
     source_block_height: BlockHeight,
-    pending_txs: HashSet<TxHash>,
+    pending_txs: BTreeSet<TxHash>,
     /// Hard deadline past which the provisions are provably useless: every
     /// tx in them has expired its `validity_range` and terminated.
     /// Counted from the source block the bundle names, which the bundle
@@ -96,7 +96,7 @@ impl OutboundProvisionTracker {
             return;
         }
 
-        let tx_hashes: HashSet<TxHash> = provisions
+        let tx_hashes: BTreeSet<TxHash> = provisions
             .transactions()
             .iter()
             .map(|tx| tx.tx_hash)
