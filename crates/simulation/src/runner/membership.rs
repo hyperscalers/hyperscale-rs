@@ -28,18 +28,14 @@ use std::sync::Arc;
 use hyperscale_core::ParticipationChange;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::bootstrap::history::{HistoryOutcome, history_floor};
-use hyperscale_node::bootstrap::{
-    BootstrapRequest, ShardBootstrap, StateRangeOutcome, replicate_engine_bootstrap,
-};
+use hyperscale_node::bootstrap::history::history_floor;
+use hyperscale_node::bootstrap::{ShardBootstrap, StoreResponder, replicate_engine_bootstrap};
 use hyperscale_node::{
-    SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_follower,
-    seat_vnode_group, serve_block_request, serve_state_range_request,
-    serve_witness_history_request,
+    SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BoundaryStore, RecoveredState};
+use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, Signer, ValidatorId, shard_prefix_path};
 
@@ -140,7 +136,8 @@ impl SimulationRunner {
             // reshape duty and the production supervisor seed a fresh store —
             // the authenticated span import overwrites only the prefix subtree.
             replicate_engine_bootstrap(&storage, &self.genesis_config());
-            let Some(recovered) = self.bootstrap_from_committee(host, shard, anchor, &storage)
+            let Some(recovered) =
+                self.bootstrap_from_committee(host, shard, anchor, &storage, false)
             else {
                 // The attested anchor's state has aged out of the serving
                 // committee — a transient fold freeze. Defer the seat; the
@@ -156,10 +153,23 @@ impl SimulationRunner {
                 },
             )
         };
+        self.seat_group(host, shard, validators, storage, &recovered);
+        kind
+    }
 
+    /// Mount `shard` on `host` over `storage`, seating `validators` from the
+    /// state it recovered to.
+    fn seat_group(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        validators: &[ValidatorId],
+        storage: SimShardStorage,
+        recovered: &RecoveredState,
+    ) {
         let inits: Vec<VnodeInit> = validators
             .iter()
-            .map(|&validator| self.runtime_vnode_init(host, validator, shard, &recovered))
+            .map(|&validator| self.runtime_vnode_init(host, validator, shard, recovered))
             .collect();
         // A co-hosted pool extra has no host in the transport's layout until
         // it is seated: bind it here, as the reshape seat does, or every
@@ -179,10 +189,9 @@ impl SimulationRunner {
         // production supervisor does pre-spawn: this arms the pacemaker and
         // cleanup timers, so a committee seated onto a quiet chain (a halt
         // recovery's fresh committee) still enters consensus.
-        let output = self.hosts[host as usize].resume_shard_committed(shard, &recovered);
+        let output = self.hosts[host as usize].resume_shard_committed(shard, recovered);
         self.process_step_output(host, output);
         self.drain_host_io(host);
-        kind
     }
 
     /// Advance both seaters over the committed topology: reshape duties
@@ -255,10 +264,28 @@ impl SimulationRunner {
                     .filter(|&validator| self.homes_validator(host, validator))
                     .collect();
                 if hosted.contains(&shard) {
+                    let seated = self.hosts[host as usize].seated_validators(shard);
+                    // Under a fork recovery a loop committed past the
+                    // attested frontier holds a suffix the fresh committee
+                    // must not extend, and a store cannot un-commit it: the
+                    // seat goes onto a store rebuilt at the anchor instead.
+                    let past_fork =
+                        snapshot
+                            .fork_recovery_frontier(shard)
+                            .is_some_and(|frontier| {
+                                self.hosts[host as usize]
+                                    .shard_io(shard)
+                                    .storage()
+                                    .committed_height()
+                                    > frontier
+                            });
+                    if past_fork && placed.iter().any(|validator| !seated.contains(validator)) {
+                        self.rebuild_shard(host, shard, &placed);
+                        continue;
+                    }
                     // A validator drawn onto a shard this host already
                     // runs joins the running loop rather than a loop of
                     // its own.
-                    let seated = self.hosts[host as usize].seated_validators(shard);
                     for validator in placed {
                         if !seated.contains(&validator) {
                             self.seat_into_running_loop(host, shard, validator);
@@ -355,6 +382,34 @@ impl SimulationRunner {
         self.drain_host_io(host);
     }
 
+    /// Rebuild `host`'s loop for `shard` at the beacon-attested anchor and
+    /// seat `placed` on it.
+    ///
+    /// Make before break: a staging store snap-syncs while the old loop keeps
+    /// running, reading the old store first and peers for what it no longer
+    /// holds, so hosts rebuilding at once still source each other. Only then
+    /// does the old loop come down with its store; a validator it carried
+    /// that is not placed here follows the beacon in the pool. A staging
+    /// store that cannot complete is dropped and the rebuild retries next
+    /// slice, as a join does.
+    fn rebuild_shard(&mut self, host: NodeIndex, shard: ShardId, placed: &[ValidatorId]) {
+        let anchor = self.hosts[host as usize]
+            .process()
+            .topology_snapshot()
+            .load()
+            .boundary(shard)
+            .expect("a recovering shard has an attested anchor");
+        let staging = SimShardStorage::new(shard_prefix_path(shard));
+        replicate_engine_bootstrap(&staging, &self.genesis_config());
+        let Some(recovered) = self.bootstrap_from_committee(host, shard, anchor, &staging, true)
+        else {
+            return;
+        };
+        drop(self.leave_shard(host, shard));
+        self.retained_storages.remove(&(host, shard));
+        self.seat_group(host, shard, placed, staging, &recovered);
+    }
+
     /// Bounce `host`'s replica of `shard`: tear the shard loop down and seat
     /// every validator it carried again on the storage it kept, as a
     /// process restart does. Seating one member back would leave a host
@@ -442,7 +497,8 @@ impl SimulationRunner {
     /// shard's serving hosts, importing into `storage`, and return the
     /// recovered state the joining vnode boots from. Requests rotate
     /// across the serving hosts; a rejected chunk simply re-arms and
-    /// the rotation retries it elsewhere.
+    /// the rotation retries it elsewhere. With `own_first`, the host's own
+    /// running store answers each request before any peer is asked.
     ///
     /// Returns `None` when the shard cannot be read from a peer yet, in
     /// either of two transient shapes. No serving host holds it at all: a
@@ -453,6 +509,9 @@ impl SimulationRunner {
     /// boundary can leave the anchor stale while the tip runs on, so every
     /// serving member evicts the anchor's state from its pin ring before
     /// the snap-sync can read it.
+    ///
+    /// A rebuild with no peer serving the shard also returns `None` the
+    /// first time its own store cannot answer.
     ///
     /// Either way the caller defers the seat and retries next slice, when
     /// the committee has mounted or the anchor advanced — the
@@ -465,23 +524,32 @@ impl SimulationRunner {
         shard: ShardId,
         anchor: ShardAnchor,
         storage: &SimShardStorage,
+        own_first: bool,
     ) -> Option<RecoveredState> {
         let serving: Vec<usize> = (0..self.hosts.len())
             .filter(|&i| i != host as usize && self.hosts[i].hosted_shards().any(|s| s == shard))
             .collect();
-        if serving.is_empty() {
-            return None;
-        }
+        let mut own = own_first.then(|| {
+            StoreResponder::new(Arc::clone(
+                self.hosts[host as usize].shard_io(shard).storage(),
+            ))
+        });
 
-        // Defer if the attested anchor's state has aged out of every serving
-        // member's pin ring; the join retries against the advanced anchor.
-        if !serving.iter().any(|&i| {
+        // Defer if the attested anchor's state has aged out of every source's
+        // pin ring; the join retries against the advanced anchor.
+        let pins_anchor = |i: usize| {
             self.hosts[i]
                 .shard_io(shard)
                 .storage()
                 .open_boundary(anchor.height)
                 .is_some()
-        }) {
+        };
+        let sources = own
+            .is_some()
+            .then_some(host as usize)
+            .into_iter()
+            .chain(serving.iter().copied());
+        if !sources.into_iter().any(pins_anchor) {
             return None;
         }
 
@@ -496,6 +564,10 @@ impl SimulationRunner {
                 .load()
                 .settled_window_floor(shard),
         );
+        let peers: Vec<StoreResponder<SimShardStorage>> = serving
+            .iter()
+            .map(|&i| StoreResponder::new(Arc::clone(self.hosts[i].shard_io(shard).storage())))
+            .collect();
         let mut bootstrap = ShardBootstrap::new(shard, anchor, floor);
         let mut peer = 0usize;
         for _ in 0..MAX_BOOTSTRAP_ROUNDS {
@@ -512,39 +584,33 @@ impl SimulationRunner {
                 continue;
             }
             for request in bootstrap.next_requests() {
-                let server = &self.hosts[serving[peer % serving.len()]];
+                // The history walk's window asks below the block that ends it.
+                if bootstrap.is_complete() {
+                    break;
+                }
+                if let Some(response) = own.as_ref().and_then(|own| own.answer(&request)) {
+                    // A store forked at or below the anchor answers off the
+                    // attested chain; peers answer everything from then on.
+                    if !bootstrap
+                        .absorb(&response, storage)
+                        .expect("staging into a fresh store")
+                    {
+                        own = None;
+                    }
+                    continue;
+                }
+                if peers.is_empty() {
+                    return None;
+                }
+                let server = &peers[peer % peers.len()];
                 peer += 1;
-                match request {
-                    BootstrapRequest::StateRange(id, request) => {
-                        let response =
-                            serve_state_range_request(server.shard_io(shard).storage(), &request);
-                        if let StateRangeOutcome::Staged { leaves, progress } =
-                            bootstrap.on_state_range(id, &response)
-                        {
-                            storage
-                                .stage_import_chunk(&progress, &leaves)
-                                .expect("chunk staging into a fresh store");
-                        }
+                match server.answer(&request) {
+                    Some(response) => {
+                        bootstrap
+                            .absorb(&response, storage)
+                            .expect("staging into a fresh store");
                     }
-                    BootstrapRequest::WitnessHistory(request) => {
-                        let response = serve_witness_history_request(
-                            server.shard_io(shard).pending_chain(),
-                            &request,
-                        );
-                        bootstrap.on_witness_history(&response);
-                    }
-                    BootstrapRequest::History(height, request) => {
-                        let io = server.shard_io(shard);
-                        let response =
-                            serve_block_request(io.pending_chain(), io.provision_store(), &request);
-                        if let HistoryOutcome::Verified(blocks) =
-                            bootstrap.on_history_block(height, &response)
-                        {
-                            for certified in &blocks {
-                                storage.import_historical_block(certified);
-                            }
-                        }
-                    }
+                    None => bootstrap.on_request_failure(&request),
                 }
             }
         }
