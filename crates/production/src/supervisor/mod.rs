@@ -13,7 +13,10 @@
 //! Membership is refcounted per shard because a host runs several
 //! vnodes and `NodeHost` dedups shard participation: two co-hosted
 //! vnodes on one shard share storage and a thread, and a departing one
-//! must not tear the other down.
+//! must not tear the other down. A join for a shard already running
+//! seats its vnodes into that thread's loop over a [`ShardControl`]
+//! channel, and a vnode that loses its role in a shard that stays up
+//! leaves the loop the same way.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -42,7 +45,9 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::rpc::RpcPublishers;
-use crate::runner::{ProdShardLoop, ShardChannels, ShardLoopConfig, VnodeConfig, spawn_shard_loop};
+use crate::runner::{
+    ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig, spawn_shard_loop,
+};
 
 mod membership;
 mod pool;
@@ -86,8 +91,8 @@ pub fn shard_data_dir(root: &Path, shard: ShardId) -> PathBuf {
 pub enum ShardCommand {
     /// Begin hosting a shard with the given local vnodes. The first
     /// join for a shard brings up storage, thread, and subscriptions;
-    /// a join for an already-hosted shard is rejected — a shard's
-    /// vnodes join together, in one command.
+    /// a join for a shard already running seats the vnodes it does not
+    /// yet carry into its loop.
     Join {
         /// Shard to host.
         shard: ShardId,
@@ -123,6 +128,13 @@ pub enum SupervisorEvent {
     Bootstrapped(Result<CompletedBootstrap, ShardId>),
     /// A reshape orchestrator io result settled.
     Reshape(ReshapeIo),
+    /// A shard loop admitted a queued seat.
+    Seated {
+        /// Shard whose loop seated it.
+        shard: ShardId,
+        /// The validator now seated there.
+        validator: ValidatorId,
+    },
     /// A departing shard's thread joined; the unwire can finish.
     TornDown {
         /// Shard whose thread exited.
@@ -137,6 +149,10 @@ pub enum SupervisorEvent {
 struct ShardThread {
     join: std::thread::JoinHandle<()>,
     shutdown_tx: Sender<()>,
+    /// Seat changes into the running loop.
+    control_tx: Sender<ShardControl>,
+    /// Validators whose seat was sent to the loop and not yet admitted.
+    queued: Vec<u64>,
     /// Local vnodes participating in this shard. The shard tears down
     /// when this reaches zero.
     vnode_count: usize,
@@ -305,6 +321,7 @@ impl ShardSupervisor {
             } => self.on_opened(shard, vnodes, outcome),
             SupervisorEvent::Bootstrapped(done) => self.finish_join(done),
             SupervisorEvent::Reshape(io) => self.on_reshape_io(io),
+            SupervisorEvent::Seated { shard, validator } => self.on_seated(shard, validator),
             SupervisorEvent::TornDown {
                 shard,
                 validator_ids,
@@ -325,6 +342,7 @@ impl ShardSupervisor {
     ) {
         let shard = shard_loop.shard;
         let shutdown_tx = channels.shutdown_tx.clone();
+        let control_tx = channels.control_tx.clone();
         let validator_ids = shard_loop
             .vnodes
             .iter()
@@ -337,6 +355,8 @@ impl ShardSupervisor {
             ShardThread {
                 join,
                 shutdown_tx,
+                control_tx,
+                queued: Vec::new(),
                 vnode_count,
                 validator_ids,
             },
@@ -378,9 +398,11 @@ impl ShardSupervisor {
             timer_rx: channels.timer_rx,
             callback_rx: channels.callback_rx,
             shutdown_rx: channels.shutdown_rx,
+            control_rx: channels.control_rx,
             tokio_handle: self.tokio_handle.clone(),
             initial_timer_ops,
-            participation_tx: Some(self.participation_tx.clone()),
+            participation_tx: self.participation_tx.clone(),
+            supervisor_tx: self.events_tx.clone(),
             publishers: self.publishers.clone(),
             genesis_offset_ms: self.genesis_offset_ms,
         }
