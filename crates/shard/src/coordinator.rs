@@ -1312,6 +1312,22 @@ impl ShardCoordinator {
         self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
     }
 
+    /// Whether the committed chain proves its terminal committed to a
+    /// reader that holds only committed headers: the tip and its parent
+    /// both sit at or above the terminal and their rounds are contiguous.
+    /// That two-chain is the commit proof the beacon folds the terminal
+    /// from. Committing the first coast block is not enough on its own: a
+    /// view change between the terminal and that block breaks the
+    /// contiguity, and only a later committed pair carries the proof.
+    fn terminal_commit_evidenced(&self, topology_schedule: &TopologySchedule) -> bool {
+        let rounds =
+            |height: Option<BlockHeight>| height.and_then(|h| self.committed_rounds.get(&h));
+        topology_schedule.past_terminal(self.local_shard, self.committed_committee_anchor_wt)
+            && rounds(self.committed_height.prev())
+                .zip(rounds(Some(self.committed_height)))
+                .is_some_and(|(parent, tip)| parent.next() == *tip)
+    }
+
     /// Whether content from before this chain began can still be offered
     /// to it.
     ///
@@ -5044,15 +5060,13 @@ impl ShardCoordinator {
         self.verification.mark_proposal_fully_verified(block);
 
         // The head routes a proposal. A splitting parent can drop out of the
-        // head before its handoff is on the committed chain: the terminal and
-        // the first coast block, whose parent QC is the terminal's canonical
-        // certificate. Until that block commits, its proposals go to the
-        // terminal-clamped committee that certifies them, as its votes and
-        // timeouts do.
+        // head before its handoff is on the committed chain; until it is,
+        // its proposals go to the terminal-clamped committee that certifies
+        // them, as its votes and timeouts do.
         let head = topology_schedule.head();
-        let handed_off =
-            topology_schedule.past_terminal(self.local_shard, self.committed_committee_anchor_wt);
-        let routing = if head.committee_for_shard(self.local_shard).is_empty() && !handed_off {
+        let routing = if head.committee_for_shard(self.local_shard).is_empty()
+            && !self.terminal_commit_evidenced(topology_schedule)
+        {
             self.committee_of_block(topology_schedule, block_hash)
                 .unwrap_or(head)
         } else {
@@ -14572,6 +14586,45 @@ mod tests {
         // committed, so the crossing's canonical QC is readable: content stops.
         let done = coordinator_with_committed_anchor(1500);
         assert!(done.quiescent(&sched));
+    }
+
+    /// The terminal's commit is evidenced to a committed-headers reader
+    /// only by a round-contiguous pair at or above it. A view change
+    /// between the terminal and the first coast block leaves that block
+    /// committed without the proof; the next contiguous commit carries it.
+    #[test]
+    fn terminal_commit_evidence_needs_a_round_contiguous_pair_past_the_cut() {
+        let sched = make_terminating_schedule(4);
+        let committed_at = |committee_anchor_ms, rounds: &[(u64, u64)]| {
+            let mut coordinator = coordinator_with_committed_anchor(committee_anchor_ms);
+            coordinator.committed_committee_anchor_wt =
+                WeightedTimestamp::from_millis(committee_anchor_ms);
+            coordinator.committed_rounds = rounds
+                .iter()
+                .map(|&(height, round)| (BlockHeight::new(height), Round::new(round)))
+                .collect();
+            coordinator.committed_height = coordinator
+                .committed_rounds
+                .last_key_value()
+                .map_or(BlockHeight::GENESIS, |(height, _)| *height);
+            coordinator
+        };
+        assert!(
+            !committed_at(900, &[(9, 10), (10, 11)]).terminal_commit_evidenced(&sched),
+            "a contiguous pair inside the final window",
+        );
+        assert!(
+            committed_at(1500, &[(10, 11), (11, 12)]).terminal_commit_evidenced(&sched),
+            "the terminal and a contiguous first coast block",
+        );
+        assert!(
+            !committed_at(1500, &[(10, 11), (11, 13)]).terminal_commit_evidenced(&sched),
+            "a view change between the terminal and the first coast block",
+        );
+        assert!(
+            committed_at(1600, &[(10, 11), (11, 13), (12, 14)]).terminal_commit_evidenced(&sched),
+            "a later contiguous coast pair",
+        );
     }
 
     #[test]
