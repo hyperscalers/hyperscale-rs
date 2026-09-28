@@ -532,20 +532,20 @@ fn diff_split_parent_halves(
 }
 
 /// Drop the parent-half cohort of every child that has committed past its
-/// genesis. A real anchor (non-zero `block_hash`) paired with a non-zero
-/// witness watermark means the child is live and producing — which requires
-/// its members, the parent halves among them, to have seated — so the reshape
-/// orchestrator no longer needs the cohort to discover them.
+/// genesis. A child the boundary fold has seen cross an epoch on its own
+/// chain is live and producing — which requires its members, the parent
+/// halves among them, to have seated — so the reshape orchestrator no
+/// longer needs the cohort to discover them.
+///
+/// Read off [`BeaconState::advanced`] rather than the child's witness
+/// watermark: a quiet child crosses its epochs without ever producing a
+/// witness leaf, and a cohort kept for it holds every host that seated a
+/// parent half in a reshape duty that never ends.
 fn release_seated_parent_halves(state: &mut BeaconState) {
     let established: Vec<ShardId> = state
         .reshape_parent_halves
         .keys()
-        .filter(|child| {
-            state.boundaries.get(child).is_some_and(|b| {
-                b.block_hash != BlockHash::ZERO
-                    && b.witness_leaf_count != BeaconWitnessLeafCount::ZERO
-            })
-        })
+        .filter(|child| state.advanced.contains(child))
         .copied()
         .collect();
     for child in established {
@@ -4466,34 +4466,11 @@ mod tests {
         assert_eq!(parent_halves[&left].len() + parent_halves[&right].len(), 4);
     }
 
-    /// A parent half's cohort survives until its child commits past genesis —
-    /// a real anchor whose witness watermark has advanced.
+    /// A parent half's cohort survives until its child commits past genesis:
+    /// a crossing of its own folds, whether or not it ever produced a
+    /// witness leaf.
     #[test]
     fn parent_halves_release_once_the_child_is_established() {
-        use hyperscale_types::{BlockHeight, Hash, StateRoot, WeightedTimestamp};
-
-        fn boundary(block_hash: BlockHash, witness: BeaconWitnessLeafCount) -> ShardBoundary {
-            ShardBoundary {
-                state_root: StateRoot::ZERO,
-                block_hash,
-                height: BlockHeight::GENESIS,
-                weighted_timestamp: WeightedTimestamp::ZERO,
-                witness_leaf_count: witness,
-                witness_base: BeaconWitnessLeafCount::ZERO,
-                cumulative_fees: 0,
-                used: DeclaredWork::ZERO,
-                blocks: 0,
-                substate_bytes: 0,
-                last_live_epoch: Epoch::GENESIS,
-                consecutive_misses: 0,
-                terminal_epoch: None,
-                handoff_complete: None,
-                terminal_delivered: false,
-                terminal_settled_txs: None,
-                reshape_admitted_epoch: None,
-            }
-        }
-
         let mut state = single_pool_state(4);
         let parent = ShardId::leaf(1, 0);
         let (child, _) = parent.children();
@@ -4502,32 +4479,16 @@ mod tests {
             .reshape_parent_halves
             .insert(child, std::iter::once((member, parent)).collect());
 
-        // A placeholder child (zero anchor) keeps the cohort.
-        state.boundaries.insert(
-            child,
-            boundary(BlockHash::ZERO, BeaconWitnessLeafCount::ZERO),
-        );
+        // Seeded, not yet produced: the fold has seen no crossing of its own.
         release_seated_parent_halves(&mut state);
         assert!(
             state.reshape_parent_halves.contains_key(&child),
-            "a placeholder child keeps its parent halves",
+            "a child that has not crossed past its genesis keeps its parent halves",
         );
 
-        // A seeded anchor that has not yet produced keeps it.
-        let seeded = BlockHash::from_raw(Hash::from_bytes(b"child-genesis"));
-        state
-            .boundaries
-            .insert(child, boundary(seeded, BeaconWitnessLeafCount::ZERO));
-        release_seated_parent_halves(&mut state);
-        assert!(
-            state.reshape_parent_halves.contains_key(&child),
-            "a seeded but quiet child keeps its parent halves",
-        );
-
-        // A live child that has folded a contribution drops it.
-        state
-            .boundaries
-            .insert(child, boundary(seeded, BeaconWitnessLeafCount::new(1)));
+        // A quiet child that crossed past genesis without a witness leaf
+        // is as established as any other.
+        state.advanced.insert(child);
         release_seated_parent_halves(&mut state);
         assert!(
             !state.reshape_parent_halves.contains_key(&child),
