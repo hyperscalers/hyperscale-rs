@@ -54,12 +54,10 @@ impl NodeStateMachine {
         // The node's one fork fence clears here, before any coordinator
         // reads it for this commit, once the attested recovery for a
         // fenced shard completes; a later re-fork can then re-engage.
-        let cleared = s.fork_fence.clear_completed(
-            self.beacon_coordinator
-                .topology_schedule()
-                .head()
-                .completed_recoveries(),
-        );
+        let head = self.beacon_coordinator.topology_schedule().head();
+        let cleared = s
+            .fork_fence
+            .clear_completed(|shard| head.latest_completed_recovery(shard));
 
         actions.extend(s.mempool_coordinator.on_block_committed(
             self.beacon_coordinator.current_topology_snapshot(),

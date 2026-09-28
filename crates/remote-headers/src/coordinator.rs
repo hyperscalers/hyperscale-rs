@@ -206,7 +206,7 @@ pub struct RemoteHeaderCoordinator {
     forks_emitted: HashSet<(ShardId, BlockHeight)>,
 
     /// Highest beacon-attested recovery frontier observed per shard, across
-    /// pending and completed records. Fork assembly is suppressed at or
+    /// pending records and recovery histories. Fork assembly is suppressed at or
     /// below it: a fork there was already answered by a recovery, so
     /// re-assembling it from held siblings would re-flag the healthy
     /// successor committee. Monotone; never pruned (one entry per recovered
@@ -1175,8 +1175,10 @@ impl RemoteHeaderCoordinator {
                 self.evict_superseded(shard, recovery.attested_frontier);
             }
         }
-        for (&shard, completed) in head.completed_recoveries() {
-            self.note_recovery_frontier(shard, completed.attested_frontier);
+        for (shard, history) in head.recovery_histories() {
+            for binding in history {
+                self.note_recovery_frontier(shard, binding.attested_frontier);
+            }
         }
     }
 
@@ -2720,7 +2722,7 @@ mod tests {
         assert!(
             coord
                 .fork_fence
-                .engage(remote, BlockHeight::new(5), &BTreeMap::new())
+                .engage(remote, BlockHeight::new(5), None)
                 .is_some()
         );
 
@@ -2754,7 +2756,7 @@ mod tests {
     #[test]
     fn fork_fence_holds_through_the_fold_and_lifts_on_completion() {
         use hyperscale_types::test_utils::{certify, make_live_block};
-        use hyperscale_types::{CompletedRecovery, RecoveryCause, ShardRecovery};
+        use hyperscale_types::{RecoveryBinding, RecoveryCause, ShardRecovery};
 
         let local = ShardId::leaf(2, 0);
         let remote = ShardId::leaf(2, 1);
@@ -2762,7 +2764,7 @@ mod tests {
         assert!(
             coord
                 .fork_fence
-                .engage(remote, BlockHeight::new(5), &BTreeMap::new())
+                .engage(remote, BlockHeight::new(5), None)
                 .is_some()
         );
 
@@ -2810,20 +2812,21 @@ mod tests {
         // the fence clears and the promotion it withheld replays, so the
         // proven-but-unpromoted height is not stranded.
         let recovered = TopologySchedule::single(Arc::new(
-            shard_snapshot(2, &[0, 1, 2, 3], 0).with_completed_recoveries(
+            shard_snapshot(2, &[0, 1, 2, 3], 0).with_recoveries(
                 std::iter::once((
                     remote,
-                    CompletedRecovery {
+                    vec![RecoveryBinding {
                         rotated_at: Epoch::new(2),
                         attested_frontier: BlockHeight::new(4),
-                    },
+                        completed: true,
+                    }],
                 ))
                 .collect(),
             ),
         ));
         let cleared = coord
             .fork_fence
-            .clear_completed(recovered.head().completed_recoveries());
+            .clear_completed(|shard| recovered.head().latest_completed_recovery(shard));
         let actions = coord.on_block_committed(&recovered, &local_block(2), &cleared);
         assert_eq!(
             committed_heights(&actions),

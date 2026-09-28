@@ -188,6 +188,18 @@ pub const SHUFFLE_SYNC_HEADROOM: u64 = 8;
 /// halt-and-recover path at this value with no spurious flags.
 pub const HALT_THRESHOLD_EPOCHS: u64 = 16;
 
+/// Recoveries of one shard its [`BeaconState::recoveries`] history keeps;
+/// past it the oldest binding is dropped.
+///
+/// A binding is read to resolve the committee of work anchored below its
+/// bridge — a bridge block a replica verifies while syncing through the
+/// recovery. A replica that many recoveries of one shard behind snap-syncs
+/// rather than block-syncs through them, so the oldest bindings resolve
+/// nothing anyone asks for.
+///
+/// [`BeaconState::recoveries`]: crate::BeaconState::recoveries
+pub const RECOVERY_HISTORY_DEPTH: usize = 4;
+
 // ─── Penalties ─────────────────────────────────────────────────────────────
 
 /// How long a `JailReason::Performance` jail must elapse before an

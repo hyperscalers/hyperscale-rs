@@ -33,7 +33,8 @@ use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::{DeclaredWork, PriceTable};
 
 use crate::beacon::constants::{
-    HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET, RESHAPE_READY_TTL_EPOCHS,
+    HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET, RECOVERY_HISTORY_DEPTH,
+    RESHAPE_READY_TTL_EPOCHS,
 };
 use crate::beacon::genesis::BeaconChainConfig;
 use crate::beacon::params::{NetworkParams, ParamProposal};
@@ -618,24 +619,49 @@ pub struct ShardRecovery {
     pub attested_frontier: BlockHeight,
 }
 
-/// The permanent record of a shard's most recent completed recovery.
+/// One halt recovery of a shard in its [`BeaconState::recoveries`]
+/// history: the committee binding it established, kept for as long as
+/// the history keeps it.
 ///
-/// Stamped when the pending [`ShardRecovery`] clears on the shard's
-/// first observed crossing under its fresh committee. One entry per
-/// recovered shard, overwritten by a later recovery.
+/// Stamped when the fold seats the fresh committee, beside the pending
+/// [`ShardRecovery`], and outliving it: the binding is readable from the
+/// seating onward, whether the recovery completes, is superseded by a
+/// chained one, or is long past.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
-pub struct CompletedRecovery {
+pub struct RecoveryBinding {
     /// Epoch the fresh committee was seated
-    /// ([`ShardRecovery::rotated_at`]). Certified resolution of the
-    /// recovery's bridge band reads it so blocks anchored below the
-    /// bridge keep binding to the fresh committee that produced them,
-    /// no matter when a replica commits them.
+    /// ([`ShardRecovery::rotated_at`]). The window after it is the
+    /// recovery's bridge: work anchored below it binds to the fresh
+    /// committee that produced it, no matter when a replica sees it.
     pub rotated_at: Epoch,
     /// The recovery's beacon-attested frontier
-    /// ([`ShardRecovery::attested_frontier`]). A fork proof whose forked
-    /// height sits at or below it is a replay of already-recovered
+    /// ([`ShardRecovery::attested_frontier`]). Non-decreasing along a
+    /// shard's history. A fork proof whose forked height sits at or below
+    /// a completed recovery's frontier is a replay of already-recovered
     /// history and must not re-arm a recovery.
     pub attested_frontier: BlockHeight,
+    /// Whether the fresh committee crossed, clearing the pending record.
+    /// A recovery a chained one superseded before its first crossing
+    /// keeps its binding but answered nothing.
+    pub completed: bool,
+}
+
+impl RecoveryBinding {
+    /// The first epoch the fresh committee governs.
+    #[must_use]
+    pub const fn bridge(self) -> Epoch {
+        self.rotated_at.next()
+    }
+
+    /// The newest completed recovery in a shard's `history`.
+    #[must_use]
+    pub fn latest_completed(history: &[Self]) -> Option<Self> {
+        history
+            .iter()
+            .rev()
+            .find(|binding| binding.completed)
+            .copied()
+    }
 }
 
 /// The window-frozen half of a beacon projection — see
@@ -899,15 +925,16 @@ pub struct BeaconState {
     /// other way, and a shard's whole map is dropped when a reshape or
     /// recovery re-carves it.
     pub pending_rotations: BTreeMap<ShardId, BTreeMap<ValidatorId, PendingRotation>>,
-    /// Each shard's most recent completed recovery, stamped when the
-    /// pending record clears on the shard's first crossing. Permanent —
-    /// one entry per recovered shard, overwritten by a later recovery —
-    /// so certified resolution of the recovery's bridge band stays a
-    /// pure function of folded chain content (a bridge block re-derived
-    /// after the pending record clears still resolves the fresh
-    /// committee it was produced under), and a replayed fork proof at or
-    /// below the recovered frontier stays inert forever.
-    pub completed_recoveries: BTreeMap<ShardId, CompletedRecovery>,
+    /// Each shard's recoveries, oldest first, stamped at seating and kept
+    /// past the pending record's clear so committee resolution across
+    /// each recovery's bridge stays a pure function of folded chain
+    /// content: a bridge block re-derived after the clear, or after a
+    /// later recovery, still resolves the fresh committee it was produced
+    /// under. At most [`RECOVERY_HISTORY_DEPTH`] entries per shard, and
+    /// dropped with the shard's boundary record.
+    ///
+    /// [`RECOVERY_HISTORY_DEPTH`]: crate::RECOVERY_HISTORY_DEPTH
+    pub recoveries: BTreeMap<ShardId, Vec<RecoveryBinding>>,
     /// Per-validator `MissedProposal` counter, scoped to the current
     /// epoch and the validator's current shard. Incremented when a
     /// `MissedProposal` witness arrives whose proposer is currently
@@ -1228,7 +1255,7 @@ impl BeaconState {
             fork_flagged: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             pending_rotations: BTreeMap::new(),
-            completed_recoveries: BTreeMap::new(),
+            recoveries: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
             last_beacon_service: BTreeMap::new(),
         }
@@ -1400,6 +1427,44 @@ impl BeaconState {
     #[must_use]
     pub fn beacon_eligible(&self) -> Vec<ValidatorId> {
         self.beacon_eligible_ids().collect()
+    }
+
+    /// Stamp `shard`'s recovery seated at `rotated_at` into its history,
+    /// dropping the oldest binding past [`RECOVERY_HISTORY_DEPTH`].
+    pub fn record_recovery(
+        &mut self,
+        shard: ShardId,
+        rotated_at: Epoch,
+        attested_frontier: BlockHeight,
+    ) {
+        let history = self.recoveries.entry(shard).or_default();
+        history.push(RecoveryBinding {
+            rotated_at,
+            attested_frontier,
+            completed: false,
+        });
+        let excess = history.len().saturating_sub(RECOVERY_HISTORY_DEPTH);
+        history.drain(..excess);
+    }
+
+    /// Mark `shard`'s recovery seated at `rotated_at` completed: its
+    /// fresh committee crossed.
+    pub fn complete_recovery(&mut self, shard: ShardId, rotated_at: Epoch) {
+        if let Some(binding) = self
+            .recoveries
+            .get_mut(&shard)
+            .and_then(|history| history.iter_mut().find(|b| b.rotated_at == rotated_at))
+        {
+            binding.completed = true;
+        }
+    }
+
+    /// `shard`'s newest completed recovery.
+    #[must_use]
+    pub fn latest_completed_recovery(&self, shard: ShardId) -> Option<RecoveryBinding> {
+        self.recoveries
+            .get(&shard)
+            .and_then(|history| RecoveryBinding::latest_completed(history))
     }
 
     /// [`Self::beacon_eligible`]'s size without materializing the set,
@@ -1893,7 +1958,7 @@ impl BeaconState {
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
         .with_pending_recoveries(self.pending_recoveries.clone())
-        .with_completed_recoveries(self.completed_recoveries.clone())
+        .with_recoveries(self.recoveries.clone())
         .with_seeds(seeds)
     }
 

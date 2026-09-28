@@ -744,7 +744,7 @@ fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
     // completed record's seating epoch tells the two apart.
     let completed_at = c
         .beacon_state()
-        .and_then(|state| state.completed_recoveries.get(&shard).map(|r| r.rotated_at))
+        .and_then(|state| state.latest_completed_recovery(shard).map(|r| r.rotated_at))
         .expect("a cleared recovery leaves its completed record");
     assert_eq!(
         completed_at, seated_at,
