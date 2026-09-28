@@ -7336,6 +7336,7 @@ mod tests {
             vec![frontier_id],
             "the first fresh-certified commit discards the frontier tick"
         );
+        state.recovery_floor = frontier_id.block_height();
         state.discard_recovered(frontier_id);
         assert!(state.ticks.get_tick(&frontier_id).is_none());
 
