@@ -38,7 +38,7 @@ use hyperscale_types::{
     BeaconChainConfig, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash, GenesisValidators,
     LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees, ShardId, Signer,
     StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
-    ValidatorSet, Verifier, shard_prefix_path,
+    ValidatorSet, Verifier, cache, shard_prefix_path,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -379,6 +379,9 @@ impl SimulationRunner {
             network_config.vnodes_per_host >= 1,
             "vnodes_per_host must be at least 1"
         );
+        // Every cache a host builds evicts by its keys' hashes; fixed keys
+        // make that eviction replay identically in any process.
+        cache::pin_hashing();
         // The harness owns cluster placement: the host layout drives both the
         // transport's routing tables and the per-host vnode seating below.
         let host_layout = build_host_layout(network_config);

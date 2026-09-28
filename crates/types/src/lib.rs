@@ -17,6 +17,7 @@
 //! workspace dependencies are that crypto interface and the JMT whose
 //! inclusion proofs the provisioning types verify.
 
+pub mod cache;
 mod crypto;
 mod hashing;
 pub mod network;

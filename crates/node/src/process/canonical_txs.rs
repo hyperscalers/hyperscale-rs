@@ -3,8 +3,8 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{Transaction, TxHash};
-use quick_cache::sync::Cache as QuickCache;
 
 /// Capacity of the canonical-instance cache. Sized to bridge the
 /// cross-shard validation window, not to store history; entries age
@@ -27,13 +27,13 @@ const CANONICAL_TX_CACHE_SIZE: usize = 10_000;
 /// Identity here is the body hash — the same identity every per-shard
 /// dedup (tx store, pending-validation set) already keys by.
 pub struct CanonicalTxs {
-    cache: QuickCache<TxHash, Arc<Transaction>>,
+    cache: BoundedCache<TxHash, Arc<Transaction>>,
 }
 
 impl CanonicalTxs {
     pub(crate) fn new() -> Self {
         Self {
-            cache: QuickCache::new(CANONICAL_TX_CACHE_SIZE),
+            cache: bounded_cache(CANONICAL_TX_CACHE_SIZE),
         }
     }
 

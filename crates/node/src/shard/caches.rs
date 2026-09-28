@@ -17,8 +17,8 @@ use std::sync::Arc;
 use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
+use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{Finalization, FinalizationHash, Verifiable};
-use quick_cache::sync::Cache as QuickCache;
 
 use crate::vnode::GroupStores;
 
@@ -37,7 +37,7 @@ pub struct SharedCaches {
     /// Finalizations, keyed by `TickId`. Populated by `io_loop`'s
     /// `Continuation(FinalizationsAdmitted)` interception; queried by the
     /// inbound finalization handler.
-    pub(crate) finalization: Arc<QuickCache<FinalizationHash, Arc<Verifiable<Finalization>>>>,
+    pub(crate) finalization: Arc<BoundedCache<FinalizationHash, Arc<Verifiable<Finalization>>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
     /// local-provision, cross-shard provision) can read it without going
@@ -83,7 +83,7 @@ impl SharedCaches {
         } = stores;
         Self {
             tx_store,
-            finalization: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
+            finalization: Arc::new(bounded_cache(DEFAULT_CERT_CACHE_SIZE)),
             provision_store,
             verified_headers,
             exec_cert_store,

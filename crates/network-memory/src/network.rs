@@ -36,6 +36,7 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use blake3::Hasher as Blake3Hasher;
 use hyperscale_network::fault::{
     Decision, DropSpec, Engine, FaultBuilder, HostId, MessageContext, Rewrite, RuleHandle, Tier,
 };
@@ -1667,15 +1668,23 @@ impl SimulatedNetwork {
 /// transaction touching both shards is published to both, and the second copy
 /// is what the other shard's loop admits from.
 fn gossip_message_id(entry: &OutboxEntry) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    entry.data.hash(&mut hasher);
-    entry.message_type.hash(&mut hasher);
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(entry.message_type.as_bytes());
     match entry.target {
-        BroadcastTarget::Shard(shard) => shard.hash(&mut hasher),
-        BroadcastTarget::Global => (),
+        BroadcastTarget::Shard(shard) => {
+            hasher.update(&[1]);
+            hasher.update(&shard.depth().to_le_bytes());
+            hasher.update(&shard.path().to_le_bytes());
+        }
+        BroadcastTarget::Global => {
+            hasher.update(&[0]);
+        }
     }
-    hasher.finish()
+    hasher.update(&entry.data);
+    let digest = hasher.finalize();
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(id)
 }
 
 #[cfg(test)]

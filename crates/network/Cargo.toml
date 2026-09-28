@@ -14,7 +14,6 @@ test-utils = ["dep:parking_lot", "dep:rand", "dep:rand_chacha"]
 arc-swap.workspace = true
 hyperscale-types.workspace = true
 lz4_flex = "0.13.1"
-quick_cache.workspace = true
 hyperscale-hbor.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

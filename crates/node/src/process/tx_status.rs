@@ -1,7 +1,7 @@
 //! Process-wide transaction status view.
 
+use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{ShardId, TransactionStatus, TxHash};
-use quick_cache::sync::Cache as QuickCache;
 
 /// Capacity of the process-wide status cache.
 const TX_STATUS_CACHE_SIZE: usize = 100_000;
@@ -17,7 +17,7 @@ const TX_STATUS_CACHE_SIZE: usize = 100_000;
 /// departure (they age out by LRU) and survive mempool eviction, so
 /// lookups can answer for finalized/expired transactions.
 pub struct TxStatusCache {
-    cache: QuickCache<TxHash, (TransactionStatus, ShardId)>,
+    cache: BoundedCache<TxHash, (TransactionStatus, ShardId)>,
 }
 
 /// Merge rank: statuses only advance `Pending → Committed →
@@ -37,7 +37,7 @@ impl TxStatusCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: QuickCache::new(TX_STATUS_CACHE_SIZE),
+            cache: bounded_cache(TX_STATUS_CACHE_SIZE),
         }
     }
 

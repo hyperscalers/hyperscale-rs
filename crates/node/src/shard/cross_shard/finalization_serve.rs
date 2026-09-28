@@ -5,10 +5,10 @@ use std::sync::Arc;
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
+use hyperscale_types::cache::BoundedCache;
 use hyperscale_types::network::request::GetFinalizationsRequest;
 use hyperscale_types::network::response::GetFinalizationsResponse;
 use hyperscale_types::{Finalization, FinalizationHash, Verifiable};
-use quick_cache::sync::Cache as QuickCache;
 
 /// Serve an inbound finalization fetch request.
 ///
@@ -24,7 +24,7 @@ use quick_cache::sync::Cache as QuickCache;
 /// verification marker is process-local and doesn't cross the network.
 pub fn serve_finalizations_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
-    fw_cache: &QuickCache<FinalizationHash, Arc<Verifiable<Finalization>>>,
+    fw_cache: &BoundedCache<FinalizationHash, Arc<Verifiable<Finalization>>>,
     req: &GetFinalizationsRequest,
 ) -> GetFinalizationsResponse {
     // One finalization per hash asked, so the answer meets the cap the
