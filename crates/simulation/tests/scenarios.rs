@@ -110,10 +110,10 @@ use hyperscale_scenarios::{
 };
 use hyperscale_simulation::ExecutionMode;
 use hyperscale_storage::ShardChainReader;
-use hyperscale_types::test_utils::shard_fork_proof_signed_by;
+use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, PrincipalAddr, RecoveryCause, Round, ShardForkProof,
-    ShardId, Timeout, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN,
+    ShardId, Timeout, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
 };
 use support::SimCluster;
 
@@ -1423,18 +1423,19 @@ fn shard_fork_drives_committee_recovery_sim() {
         [a.certified().qc().clone(), b.certified().qc().clone()]
     };
 
-    // Split the committee's votes down the middle so neither half reaches
-    // quorum — the fork's aftermath, a committee whose halves back different
-    // branches and can certify on neither. Nothing else is cut: headers,
-    // timeouts, and the global fork-proof gossip keep flowing, so the forked
-    // committee stays loud while the recovery runs.
+    // Half the committee stops voting, so neither half reaches quorum —
+    // the fork's aftermath, a committee whose halves back different
+    // branches and can certify on neither. Nothing else is withheld:
+    // headers, timeouts, and the global fork-proof gossip keep flowing, so
+    // the forked committee stays loud while the recovery runs. The fault
+    // follows the two validators, not their hosts, so a fresh member drawn
+    // onto one of those hosts votes freely.
     let committee = cluster.committee_hosts(shard);
-    let half_a: Vec<usize> = committee[..2].to_vec();
-    let rest: Vec<usize> = (0..cluster.host_count())
-        .filter(|h| !half_a.contains(h))
-        .collect();
-    cluster.drop_type_between(&rest, &half_a, "block.vote");
-    cluster.drop_type_between(&half_a, &rest, "block.vote");
+    let members: Vec<ValidatorId> = cluster
+        .beacon_state()
+        .and_then(|state| state.shard_consensus_members.get(&shard).cloned())
+        .expect("the forking shard has a consensus committee");
+    let _votes_withheld = cluster.withhold(&members[..2], Withheld::Votes);
     cluster.run_until(epochs(1), |_| false);
 
     // Inject on the real gossip ingress of a committee member. The fork-proof
