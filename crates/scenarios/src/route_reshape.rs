@@ -37,9 +37,9 @@ use crate::straddler::{
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, clock, crossing_cells, declared_price,
-    epoch_duration_ms, held, held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch,
-    split_admitted, stands_at,
+    anchor_seeded, beacon_epoch, clock, crossing_cells, declared_price, epoch_duration_ms, held,
+    held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch, split_admitted, stands_at,
+    terminal_height,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
@@ -251,7 +251,7 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
         "the beacon must compose the split children's anchor",
     );
     assert!(
-        anchored_genesis_height(c, left).is_some(),
+        anchor_seeded(c, left),
         "the children's seeded genesis pins the venue's cells under a child",
     );
     assert_eq!(
@@ -625,8 +625,7 @@ pub fn answers_end_at_the_read_frontier_across_a_reshape<C: FaultableCluster>(
         "the venue must take the caller's input",
     );
     assert!(
-        c.serves_shard(STRADDLER_SPLITTER)
-            && anchored_genesis_height(c, STRADDLER_SPLITTER.children().0).is_none(),
+        c.serves_shard(STRADDLER_SPLITTER) && !anchor_seeded(c, STRADDLER_SPLITTER.children().0),
         "the venue takes the input while the caller's shard still runs",
     );
     assert!(
@@ -768,7 +767,7 @@ pub fn an_unseen_never_goes_when_its_producer_aborts<C: FaultableCluster>(
 ///
 /// Panics as [`merging_callers`] and [`swaps_across_the_callers_cut`] do,
 /// and if the merged parent is not served within budget.
-pub fn a_leg_issued_on_a_merging_shard_reaches_its_venue(c: &mut impl Cluster, budget: Budget) {
+pub fn a_leg_issued_on_a_merging_shard_reaches_its_venue<C: Cluster>(c: &mut C, budget: Budget) {
     let parent = MERGE_STRADDLER_LEFT
         .parent()
         .expect("a depth-2 leaf has a parent");
@@ -780,6 +779,24 @@ pub fn a_leg_issued_on_a_merging_shard_reaches_its_venue(c: &mut impl Cluster, b
             assert!(
                 await_serves(c, parent, epochs(28)),
                 "the merged parent must be served within budget",
+            );
+            // The parent's id is the one the grow split, so a host still
+            // holding that frozen chain serves it before the merge lands:
+            // the merge has run once the parent commits past both terminals.
+            let (left, right) = parent.children();
+            let merged = |c: &C| {
+                terminal_height(c, left)
+                    .zip(terminal_height(c, right))
+                    .zip(c.committed_height(parent))
+                    .is_some_and(|((left, right), tip)| tip > left.max(right))
+            };
+            assert!(
+                c.run_until(epochs(28), merged),
+                "the merged parent must commit past both children's terminals; terminals {:?} \
+                 and {:?}, tip {:?}",
+                terminal_height(c, left),
+                terminal_height(c, right),
+                c.committed_height(parent),
             );
         },
         budget,
@@ -968,11 +985,11 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
     sponsored.assert_held(c);
     await_cut(c, venue_shard);
 
-    let (left, right) = venue_shard.children();
-    let terminal = anchored_genesis_height(c, left).and_then(BlockHeight::prev);
+    let children: [ShardId; 2] = venue_shard.children().into();
+    let terminal = terminal_height(c, venue_shard);
     for hash in [hash, sponsored.hash] {
         assert_eq!(
-            Some(assert_fated_off(c, venue_shard, hash, &[left, right])),
+            Some(assert_fated_off(c, venue_shard, hash, &children)),
             terminal,
             "the venue's terminal must fate each swap it held",
         );
@@ -1558,7 +1575,7 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
     // that attests the venue's terminal, and the caller's shard fetches
     // the set on reading it.
     assert!(
-        c.run_until(budget, |c| anchored_genesis_height(c, left).is_some()),
+        c.run_until(budget, |c| anchor_seeded(c, left)),
         "the beacon must anchor the split children",
     );
     let landed = clock(c).plus(SETTLED_SET_SLACK);
@@ -1645,7 +1662,7 @@ fn await_cut<C: Cluster>(c: &mut C, splitter: ShardId) {
         "the beacon must compose the split children's anchor",
     );
     assert!(
-        anchored_genesis_height(c, left).is_some(),
+        anchor_seeded(c, left),
         "the children's seeded genesis pins the split shard's cells under a child",
     );
 }
@@ -2361,7 +2378,7 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         await_anchor_seeded(c, left, epochs(6)),
         "the beacon must compose the departed venue's children's anchor",
     );
-    let terminal = anchored_genesis_height(c, left).and_then(BlockHeight::prev);
+    let terminal = terminal_height(c, departing);
     assert_eq!(
         Some(assert_fated_off(c, departing, hash, &[left, right])),
         terminal,

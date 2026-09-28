@@ -642,20 +642,37 @@ pub(crate) fn anchor_root<C: Cluster>(c: &C, shard: ShardId) -> Option<StateRoot
         .and_then(|state| state.boundaries.get(&shard).map(|b| b.state_root))
 }
 
-/// The genesis height the beacon composed onto `shard`'s boundary, once the
-/// fold that publishes the anchor has run.
+/// Whether the beacon has composed `shard`'s reshape anchor onto its
+/// boundary.
 ///
-/// `None` while the record is still the placeholder a reshape cut installs,
+/// False while the record is still the placeholder a reshape cut installs,
 /// which carries a zero block hash. A split child outruns that fold — it
 /// flips from its own follow of the parent and serves from the cut — so
-/// "served" no longer implies "anchored".
+/// "served" does not imply "anchored". The record's height is the seeded
+/// genesis only until the child's first crossing folds over it, so it is
+/// no reading of the parent's terminal: [`terminal_height`] is.
 #[must_use]
-pub(crate) fn anchored_genesis_height<C: Cluster>(c: &C, shard: ShardId) -> Option<BlockHeight> {
+pub(crate) fn anchor_seeded<C: Cluster>(c: &C, shard: ShardId) -> bool {
+    c.beacon_state().is_some_and(|state| {
+        state
+            .boundaries
+            .get(&shard)
+            .is_some_and(|boundary| boundary.block_hash != BlockHash::ZERO)
+    })
+}
+
+/// The height of `shard`'s terminal block, off the terminal record its
+/// final crossing leaves on the beacon.
+///
+/// `None` before that crossing folds, and again once the record's
+/// handoff evidence expires and the beacon drops it.
+#[must_use]
+pub(crate) fn terminal_height<C: Cluster>(c: &C, shard: ShardId) -> Option<BlockHeight> {
     c.beacon_state().and_then(|state| {
         state
             .boundaries
             .get(&shard)
-            .filter(|boundary| boundary.block_hash != BlockHash::ZERO)
+            .filter(|boundary| boundary.terminal_settled_txs.is_some())
             .map(|boundary| boundary.height)
     })
 }

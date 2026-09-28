@@ -6,6 +6,7 @@
 //! when the terminating shard settled it by its terminal block — never one-sided,
 //! and never holding a permanent lock on the ones it didn't.
 
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -22,8 +23,8 @@ use crate::faults::BEACON_COMMIT_CHANNELS;
 use crate::reshape::split_lifecycle;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, clock, committee_size, declared_price, held,
-    split_admitted, vault_balance,
+    beacon_epoch, clock, committee_size, declared_price, held, split_admitted, terminal_height,
+    vault_balance,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, PaymentLeg,
@@ -32,8 +33,8 @@ use crate::support::tx::{
     split_issuer_straddler_setup, split_straddler_setup, validity_around, voted_split_bytes,
 };
 use crate::support::wait::{
-    await_anchor_seeded, await_beacon_epoch, await_crossings_end, await_merge_keeper_count,
-    await_root_matches_anchor, await_serves, await_split_admitted, await_tx_terminal,
+    await_beacon_epoch, await_crossings_end, await_merge_keeper_count, await_root_matches_anchor,
+    await_serves, await_split_admitted, await_tx_terminal,
 };
 use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
 
@@ -58,14 +59,33 @@ pub fn isolate_ec_intake(
     shard: ShardId,
     peer_shard: ShardId,
 ) -> FaultHandle {
-    let shard_hosts = c.committee_hosts(shard);
-    let peer_hosts = c.committee_hosts(peer_shard);
+    let shard_hosts = member_hosts(c, shard);
+    let peer_hosts = member_hosts(c, peer_shard);
     let handles = [
         c.drop_type_between(&peer_hosts, &shard_hosts, "execution.cert.batch"),
         c.drop_type_between(&shard_hosts, &peer_hosts, "execution_cert.request"),
         c.drop_type_between(&shard_hosts, &peer_hosts, "finalization.request"),
     ];
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
+}
+
+/// Every host that runs or is about to run a member of `shard`'s committee:
+/// the seated copies, and the hosts of the members the beacon names for this
+/// epoch and the next. A member the beacon has named joins once its host
+/// reads the shard's anchor, and a cut drawn from the seated copies alone
+/// would leave that member's channel open.
+fn member_hosts(c: &impl FaultableCluster, shard: ShardId) -> Vec<usize> {
+    let mut hosts: BTreeSet<usize> = c.committee_hosts(shard).into_iter().collect();
+    if let Some(state) = c.beacon_state() {
+        hosts.extend(
+            [&state.shard_committees, &state.next_shard_committees]
+                .into_iter()
+                .filter_map(|committees| committees.get(&shard))
+                .flat_map(|committee| &committee.members)
+                .filter_map(|member| c.host_of(*member)),
+        );
+    }
+    hosts.into_iter().collect()
 }
 
 /// Epochs of lead the threshold vote carries beyond the fold budget, covering
@@ -445,16 +465,14 @@ pub fn split_straddler_run<C: Cluster>(
         "both splitter children must be served within budget",
     );
 
-    // The splitter's terminal block sits one below the children's genesis. The
-    // children serve from the cut, ahead of the fold that publishes their
-    // anchor, so the height only reads off the boundary once that fold lands.
+    // The children serve from the cut, ahead of the fold that records the
+    // splitter's terminal crossing, so its height reads off the beacon only
+    // once that fold lands.
     assert!(
-        await_anchor_seeded(c, child_left, epochs(6)),
-        "the beacon must compose the split children's anchor",
+        c.run_until(epochs(6), |c| terminal_height(c, splitter).is_some()),
+        "the beacon must record the splitter's terminal crossing",
     );
-    let terminal_b = anchored_genesis_height(c, child_left)
-        .and_then(BlockHeight::prev)
-        .expect("the children's seeded genesis pins the splitter's terminal block");
+    let terminal_b = terminal_height(c, splitter).expect("recorded above");
 
     // Every straddler must reach a terminal verdict on the survivor.
     for hash in &probes {
