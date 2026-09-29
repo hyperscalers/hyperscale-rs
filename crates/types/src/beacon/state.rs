@@ -1412,7 +1412,9 @@ impl BeaconState {
     /// normal joiner's shard always has a live record. Chains born at
     /// network genesis (pending placeholders with a `GENESIS` creation
     /// epoch) start unconditionally — no flip gates them, so their
-    /// members are eligible from the first fold.
+    /// members are eligible from the first fold. The one place such an
+    /// observer may still serve is a short SPC committee, capped at the
+    /// fault bound; see [`Self::pending_anchor_observers`].
     ///
     /// A recovering shard's fresh committee is excluded under the same
     /// principle: it is seated `ready: true` on trust (the halted chain
@@ -1478,24 +1480,55 @@ impl BeaconState {
     /// The eligibility predicate behind [`Self::beacon_eligible`], in
     /// `ValidatorId` order.
     fn beacon_eligible_ids(&self) -> impl Iterator<Item = ValidatorId> + '_ {
-        self.validators
-            .iter()
-            .filter(|(_, r)| match r.status {
-                ValidatorStatus::OnShard {
-                    shard,
-                    ready: true,
-                    placed_at_epoch,
-                } => {
-                    !self.pending_recoveries.contains_key(&shard)
-                        && !self.boundaries.get(&shard).is_some_and(|b| {
-                            b.block_hash == BlockHash::ZERO
-                                && b.last_live_epoch > Epoch::GENESIS
-                                && placed_at_epoch >= b.last_live_epoch
-                        })
-                }
-                _ => false,
-            })
-            .map(|(id, _)| *id)
+        self.ready_seats()
+            .filter(|(_, shard, placed_at_epoch)| !self.awaits_anchor(*shard, *placed_at_epoch))
+            .map(|(id, _, _)| id)
+    }
+
+    /// Validators the pending-anchor clause alone keeps out of
+    /// [`Self::beacon_eligible`]: split observers placed `ready: true` on a
+    /// child whose anchor has not seeded. Sorted by `ValidatorId`.
+    ///
+    /// Such a node follows the beacon shard-less until the anchor seeds,
+    /// so it can propose and vote on an SPC committee, but it receives no
+    /// shard headers and abstains from every proposal carrying a boundary
+    /// QC. The SPC committee draw tops up from this set, at most `f`
+    /// seats, only when the proven-eligible set falls short of the BFT
+    /// floor; the `n − f` synced members then still carry every
+    /// QC-bearing proposal, including the one that seeds the anchor.
+    #[must_use]
+    pub fn pending_anchor_observers(&self) -> Vec<ValidatorId> {
+        self.ready_seats()
+            .filter(|(_, shard, placed_at_epoch)| self.awaits_anchor(*shard, *placed_at_epoch))
+            .map(|(id, _, _)| id)
+            .collect()
+    }
+
+    /// Every `OnShard { ready: true }` seat on a shard with no pending
+    /// recovery, as `(validator, shard, placed_at_epoch)` in `ValidatorId`
+    /// order.
+    fn ready_seats(&self) -> impl Iterator<Item = (ValidatorId, ShardId, Epoch)> + '_ {
+        self.validators.iter().filter_map(|(id, r)| match r.status {
+            ValidatorStatus::OnShard {
+                shard,
+                ready: true,
+                placed_at_epoch,
+            } if !self.pending_recoveries.contains_key(&shard) => {
+                Some((*id, shard, placed_at_epoch))
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether a member placed on `shard` at `placed_at_epoch` is still
+    /// waiting for the shard's anchor to seed: the record is a runtime-born
+    /// pending placeholder and the member was placed at its creation.
+    fn awaits_anchor(&self, shard: ShardId, placed_at_epoch: Epoch) -> bool {
+        self.boundaries.get(&shard).is_some_and(|b| {
+            b.block_hash == BlockHash::ZERO
+                && b.last_live_epoch > Epoch::GENESIS
+                && placed_at_epoch >= b.last_live_epoch
+        })
     }
 
     /// The recency period — `beacon_eligible / beacon_committee_size`
@@ -1994,12 +2027,6 @@ impl BeaconState {
     /// them before the seed would raise the quorum above the set of
     /// nodes that can vote. The parent halves, serving throughout, carry
     /// the pool across that window.
-    ///
-    /// Membership ⊆ shard-serving nodes is also load-bearing for
-    /// delivery: candidate and ratify-vote gossip reaches a node
-    /// through its hosted shards' global-topic fans, and shard-less
-    /// pool followers drop ratify actions — a pool member serving no
-    /// shard would silently lose its vote.
     #[must_use]
     pub fn derive_active_pool(&self) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         self.beacon_eligible()
@@ -2389,6 +2416,7 @@ mod tests {
         );
 
         assert_eq!(state.beacon_eligible(), vec![parent_half, genesis_member]);
+        assert_eq!(state.pending_anchor_observers(), vec![observer]);
 
         // The child anchor seeds: the observer's flip can proceed, and
         // it becomes eligible.
@@ -2398,6 +2426,7 @@ mod tests {
             state.beacon_eligible(),
             vec![observer, parent_half, genesis_member],
         );
+        assert!(state.pending_anchor_observers().is_empty());
     }
 
     // ─── halted_shards ────────────────────────────────────────────────

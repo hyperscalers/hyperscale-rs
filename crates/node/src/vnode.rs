@@ -261,9 +261,10 @@ pub struct SeatFollower<'a> {
     pub now: LocalTimestamp,
     /// The validator this host follows the beacon for.
     pub validator: ValidatorId,
-    /// Its signer. A follower never signs (it is never
-    /// `beacon_eligible`), but the bundle carries the real signer so a
-    /// later seat does not have to thread one in separately.
+    /// Its signer. A follower signs only as a pending-anchor observer
+    /// drafted onto a short SPC committee; the bundle carries the real
+    /// signer for that and so a later seat does not have to thread one
+    /// in separately.
     pub signer: Arc<dyn Signer>,
 }
 
