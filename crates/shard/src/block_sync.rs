@@ -167,7 +167,7 @@ impl BlockSyncManager {
     }
 
     /// Whether `(height, block_hash)` has already been applied.
-    fn is_applied(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
+    pub(crate) fn is_applied(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
         self.applied_uncommitted
             .get(&height)
             .is_some_and(|hashes| hashes.contains(block_hash))

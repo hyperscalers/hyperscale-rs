@@ -3245,9 +3245,10 @@ impl ShardCoordinator {
 
         let parent_height = header.parent_qc().height();
 
-        // Check for a COMPLETE parent block; an incomplete pending block still
-        // requires sync for the full data.
-        let have_parent = self.has_complete_block_at_height(parent_height);
+        // Check for the COMPLETE parent block the QC certifies; an incomplete
+        // pending block still requires sync for the full data, and a sibling
+        // at the parent's height is not the parent.
+        let have_parent = self.holds_complete_block(parent_height, header.parent_qc().block_hash());
 
         if !have_parent && !self.fork_refuses_retained_suffix(topology_schedule, header.parent_qc())
         {
@@ -4723,7 +4724,7 @@ impl ShardCoordinator {
         // that `absorb_parent_qc_from_header` deferred. Safe to run before
         // `try_vote_on_block` — adoption only mutates `latest_qc` /
         // commit-related state, not the per-block voting machinery.
-        if self.has_complete_block_at_height(verified_qc.height()) {
+        if self.holds_complete_block(verified_qc.height(), parent_block_hash) {
             actions.extend(self.try_adopt_verified_qc(&verified_qc));
         }
 
@@ -7564,6 +7565,21 @@ impl ShardCoordinator {
         suffix
     }
 
+    /// Whether this node holds `block_hash` complete at `height`: at or
+    /// below the committed tip, applied from sync, pending and fully
+    /// assembled, or inside the sync pipeline. Keyed on the hash because a
+    /// sibling at the same height — this node's own proposal in a round the
+    /// chain abandoned, or a synced orphan — is not the block a QC names,
+    /// and taking it for one leaves the certified block unfetched.
+    fn holds_complete_block(&self, height: BlockHeight, block_hash: BlockHash) -> bool {
+        height <= self.committed_height
+            || self.block_sync.is_applied(height, &block_hash)
+            || (self.pending_blocks.is_complete(block_hash)
+                && self.pending_blocks.get_block(block_hash).is_some())
+            || self.block_sync.has_pending_verification(&block_hash)
+            || self.block_sync.has_buffered(height, &block_hash)
+    }
+
     /// Check if we have a COMPLETE block at the given height that can be committed.
     ///
     /// This only returns true if the block is fully
@@ -10111,6 +10127,60 @@ mod tests {
         assert!(
             !state.pending_blocks.contains_key(beyond.hash()),
             "a header beyond the lookahead must not be stored",
+        );
+    }
+
+    /// A header whose parent QC certifies a block this node lacks starts
+    /// sync toward it even when the node holds a complete sibling at that
+    /// height: its own proposal from a round the chain abandoned is not
+    /// the parent, and taking it for one leaves the certified block
+    /// unfetched and the node unable to vote on anything above it.
+    #[test]
+    fn a_held_sibling_does_not_stand_in_for_the_certified_parent() {
+        let (mut state, topology_schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let grandparent = block_with_parent_qc_ts(BlockHeight::new(4), 100);
+        state.committed_height = BlockHeight::new(4);
+        state.committed_hash = grandparent.hash();
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(100);
+
+        let sibling = block_chained_on(BlockHeight::new(5), grandparent.hash(), 200);
+        install_complete_block(&mut state, &sibling);
+        let certified = BlockHash::from_raw(Hash::from_bytes(b"certified_parent"));
+        assert!(state.holds_complete_block(BlockHeight::new(5), sibling.hash()));
+        assert!(!state.holds_complete_block(BlockHeight::new(5), certified));
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(2);
+        signers.set(3);
+        let parent_qc = QuorumCertificate::new(
+            certified,
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            grandparent.hash(),
+            Round::new(7),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(99_000),
+        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(6),
+            parent_block_hash: certified,
+            parent_qc: parent_qc.into(),
+            proposer: ValidatorId::new(0),
+            timestamp: ProposerTimestamp::from_millis(100_000),
+            round: Round::new(8),
+            ..Default::default()
+        });
+
+        let actions = state.absorb_parent_qc_from_header(&topology_schedule, &header);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == BlockHeight::new(5)
+            )),
+            "the certified parent must be fetched; got {actions:?}",
         );
     }
 
