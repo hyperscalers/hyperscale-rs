@@ -1286,21 +1286,20 @@ fn halted_shard_recovers_by_committee_redraw_sim() {
     cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
 }
 
-/// Seed whose recovery draw seats the fresh committee on both a host that
-/// kept the halted shard and one that did not.
-const RETAINED_AND_FRESH_SEED: u64 = 11;
-
-/// Without dedicated hosts, so a fresh member can land beside a replaced
-/// one on a host that never stopped running the shard.
+/// On dedicated pool hosts, so every pooled validator runs on a host of
+/// its own and a host that never ran the halting shard always exists; the
+/// scenario moves drawn members onto the hosts its shape needs.
 #[test]
 fn halted_shard_recovery_agrees_across_retained_and_fresh_sim() {
     let setup = halt_straddler_setup();
-    let mut cluster = SimCluster::with_accounts(
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
         &halt_recovery_config(),
-        RETAINED_AND_FRESH_SEED,
+        11,
         &setup.accounts,
     );
-    cluster.run_faultable(halted_shard_recovery_agrees_across_retained_and_fresh);
+    cluster.run_faultable(|c| {
+        halted_shard_recovery_agrees_across_retained_and_fresh(c, SimCluster::rehome);
+    });
 }
 
 /// Assert straddler atomicity across a halted shard's recovery at `seed`. The

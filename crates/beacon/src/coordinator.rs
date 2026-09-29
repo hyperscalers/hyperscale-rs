@@ -2371,21 +2371,24 @@ impl BeaconCoordinator {
 
     /// Emit one [`FetchRequest::Ask`] of beacon proposals per missing committed
     /// proposal. The routing `shard` is the dispatching vnode's
-    /// `local_shard` (peer selection rides the local committee);
-    /// `preferred` rotates through the beacon committee so multiple
-    /// missing proposals don't all target the same peer.
+    /// `local_shard` (peer selection rides the local committee), and
+    /// each ask prefers the proposal's author: it caches what it signs
+    /// before gossiping it, so it holds the proposal whoever else missed
+    /// it. A peer's empty answer is a delivered response, so the
+    /// transport does not rotate past it, and every retry opens with the
+    /// preferred peer again; preferring a peer that is not the author
+    /// asks it forever when its copy of the gossip was lost too. An
+    /// author outside the local committee is no peer of this route, and
+    /// each retry then picks a local peer afresh.
     fn fetch_missing_proposals(&self, epoch: Epoch, missing: &[ValidatorId]) -> Vec<Action> {
-        let peers = self.spc_recipients();
         let local_shard = self.local_shard;
         missing
             .iter()
-            .enumerate()
-            .map(|(i, &validator)| {
-                let preferred = peers.get(i % peers.len().max(1)).copied();
+            .map(|&validator| {
                 Action::Fetch(FetchRequest::Ask {
                     ids: FetchIds::BeaconProposals(vec![(epoch, validator)]),
                     shard: local_shard,
-                    preferred,
+                    preferred: Some(validator),
                     class: None,
                 })
             })
@@ -4288,6 +4291,48 @@ mod tests {
         );
         assert!(coord.spc.view_one_input_fed());
         assert!(coord.on_spc_input_dwell_timer().is_empty());
+    }
+
+    /// The dwell asks each missing proposal of its author, the one peer
+    /// that holds it whoever else missed its gossip. A peer that lost the
+    /// gossip too answers empty, and an ask pinned to it would be put to
+    /// it again on every retry.
+    #[test]
+    fn input_dwell_asks_each_missing_proposal_of_its_author() {
+        let mut coord = fresh_coord();
+        let _ = coord.bootstrap_spc_for_next_epoch();
+        let me = coord.me;
+        let in_flight = Epoch::GENESIS.next();
+        let _ = coord.on_beacon_proposal_received(me, in_flight, sample_proposal(0xAB));
+        let peers: Vec<ValidatorId> = coord
+            .state
+            .committee
+            .iter()
+            .copied()
+            .filter(|member| *member != me)
+            .collect();
+        let _ = coord.on_beacon_proposal_received(peers[0], in_flight, sample_proposal(0xCD));
+        assert!(coord.proposal_pool.contains(peers[0]));
+
+        let actions = coord.on_spc_input_dwell_timer();
+        let asks: Vec<(ValidatorId, Option<ValidatorId>)> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::BeaconProposals(ids),
+                    preferred,
+                    ..
+                }) => Some((ids[0].1, *preferred)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            peers[1..]
+                .iter()
+                .map(|&member| (member, Some(member)))
+                .collect::<Vec<_>>(),
+        );
     }
 
     /// Drive `signer_positions` of `committee`'s keys through one

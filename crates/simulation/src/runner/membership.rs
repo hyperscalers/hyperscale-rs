@@ -487,6 +487,34 @@ impl SimulationRunner {
         self.seat_joined_group(host, shard, &carried, fresh)
     }
 
+    /// Run `validator` on `host` from here on, as an operator moving a
+    /// validator between machines while it holds no seat: its pool
+    /// follower leaves the host it ran on and follows the beacon from
+    /// `host`, and its next seat lands there. Both hosts rescan their
+    /// placement on the next [`Self::topology_step`], so a placement the
+    /// beacon already committed seats on `host`.
+    ///
+    /// Returns whether it moved: a validator still seated on any host,
+    /// a terminated chain it serves included, stays where it runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `validator` is not a registered validator.
+    pub fn rehome_validator(&mut self, validator: ValidatorId, host: NodeIndex) -> bool {
+        if self.hosts.iter().any(|h| h.hosts_validator(validator)) {
+            return false;
+        }
+        let index = usize::try_from(validator.inner()).expect("id fits usize");
+        let from = self.validator_home[index];
+        self.hosts[from as usize].drop_pooled_vnode(validator);
+        self.validator_home[index] = host;
+        self.network.bind_validator(validator, host);
+        self.follow_in_pool(host, validator);
+        self.placement_epoch[from as usize] = None;
+        self.placement_epoch[host as usize] = None;
+        true
+    }
+
     /// Stop hosting `shard` on `host`, returning a shared handle onto
     /// its storage so a later [`Self::join_shard`] can exercise the
     /// retained-storage fast path.

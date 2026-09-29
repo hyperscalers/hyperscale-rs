@@ -594,6 +594,12 @@ impl SimCluster {
         anchor_height
     }
 
+    /// Run `validator` on `host` from here on, if it holds no seat: its
+    /// next placement seats there. Returns whether it moved.
+    pub fn rehome(&mut self, validator: ValidatorId, host: usize) -> bool {
+        self.runner.rehome_validator(validator, host_index(host))
+    }
+
     /// The host a submission of `tx` enters at: a member of the payer
     /// shard's live committee, else of any touched shard's.
     ///
