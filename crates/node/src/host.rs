@@ -564,7 +564,8 @@ where
         self.process.code()
     }
 
-    /// Look up the latest merged status for a transaction.
+    /// Look up the latest merged status for a transaction: what a hosted
+    /// shard reported for its own leg.
     ///
     /// Reads the process-wide [`TxStatusCache`], which every hosted
     /// shard writes into. Unlike the per-step
@@ -577,8 +578,8 @@ where
         self.tx_status_entry(hash).map(|(status, _)| status)
     }
 
-    /// The merged status for `hash` together with the shard that emitted
-    /// it.
+    /// The merged status for `hash` together with the hosted shard whose
+    /// leg it is.
     #[must_use]
     pub fn tx_status_entry(&self, hash: &TxHash) -> Option<(TransactionStatus, ShardId)> {
         self.process.tx_status.get(hash)

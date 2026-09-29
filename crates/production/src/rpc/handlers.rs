@@ -256,8 +256,8 @@ pub async fn get_transaction_handler(
         }
     };
 
-    // Look up in caches (QuickCache is lock-free, no await needed).
-    // Probe every hosted shard's cache — a tx can live in any of them.
+    // One process-wide cache answers for every hosted shard, reporting a
+    // hosted shard's own leg of the transaction.
     match state.lookup_tx_status(&tx_hash) {
         Some(status) => {
             let (status_str, committed_height, decision, error) =

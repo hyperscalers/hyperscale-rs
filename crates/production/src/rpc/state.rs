@@ -83,7 +83,8 @@ pub struct RpcState {
 }
 
 impl RpcState {
-    /// Look up the latest merged status for `hash`.
+    /// Look up the latest merged status for `hash`: a hosted shard's own
+    /// leg of it (see [`TxStatusCache`]).
     #[must_use]
     pub fn lookup_tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
         self.tx_status.get(hash).map(|(status, _)| status)

@@ -16,6 +16,7 @@ use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use quick_cache::sync::{Cache, DefaultLifecycle};
+pub use quick_cache::sync::{EntryAction, EntryResult};
 use quick_cache::{OptionsBuilder, UnitWeighter};
 
 /// Shard count for every cache, fixed so eviction does not depend on
