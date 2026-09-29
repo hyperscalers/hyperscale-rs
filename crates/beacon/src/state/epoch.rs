@@ -7,11 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BLOCK_CAPS, BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, Block, BlockHash,
-    BlockHeader, CertifiedBeaconBlock, DeclaredWork, Epoch, EpochWindows, FiveWay, KeptSeat,
-    NetworkDefinition, ObserverSeat, PendingReshape, QcContext, QuorumCertificate,
-    RESHAPE_HANDOFF_TTL_EPOCHS, RecoveryCause, RevealChain, ShardBoundary, ShardEpochContribution,
-    ShardFullness, ShardId, SlotEffects, TerminalRef, TopologySnapshot, TransitionCause,
-    Utilization, ValidatorId, ValidatorStatus, Verifier, Verify,
+    BlockHeader, CertifiedBeaconBlock, DeclaredWork, Epoch, EpochWindows, FiveWay,
+    HALT_THRESHOLD_EPOCHS, KeptSeat, NetworkDefinition, ObserverSeat, PendingReshape, QcContext,
+    QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RecoveryCause, RevealChain, ShardBoundary,
+    ShardEpochContribution, ShardFullness, ShardId, SlotEffects, TerminalRef, TopologySnapshot,
+    TransitionCause, Utilization, ValidatorId, ValidatorStatus, Verifier, Verify,
 };
 
 use crate::rules::{
@@ -31,7 +31,7 @@ use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
     WitnessOutcome, apply_contribution_witnesses, defer_reshape_ttls, ingest_equivocations,
-    prune_stale_reshapes,
+    jail_chronic_missers, prune_stale_reshapes,
 };
 
 /// Discriminator for [`apply_epoch`] — distinguishes a Normal epoch
@@ -250,7 +250,11 @@ pub fn apply_epoch(
     // subset) for any window is fixed a full epoch before the window
     // opens, and a validator jailed or readied this epoch changes the
     // consensus set one epoch out rather than mid-window.
-    state.shard_consensus_members = state.ready_consensus_members(&state.next_shard_committees);
+    // The consensus committees that produced the blocks this fold
+    // witnesses, before the promotion replaces them: a proposer's turns
+    // rotate over the committee that ran the rounds.
+    let promoted = state.ready_consensus_members(&state.next_shard_committees);
+    let witnessed_committees = std::mem::replace(&mut state.shard_consensus_members, promoted);
     state.shard_committees = state.next_shard_committees.clone();
     // Promote the lookahead params under the same discipline: a vote
     // tallied a prior epoch installed its change into `next_params` at
@@ -321,6 +325,14 @@ pub fn apply_epoch(
         .iter()
         .map(|(shard, record)| (*shard, (record.used, record.blocks)))
         .collect();
+    // The shards missing crossings as the fold opens: a crossing folded
+    // below refreshes the record it drains a halted chain's backlog on.
+    let halted_before: BTreeSet<ShardId> = state
+        .boundaries
+        .iter()
+        .filter(|(_, record)| u64::from(record.consecutive_misses) > HALT_THRESHOLD_EPOCHS)
+        .map(|(shard, _)| *shard)
+        .collect();
     let (mut witness, reveals) = if let ApplyEpochInput::Normal {
         committed,
         shard_contributions,
@@ -338,6 +350,16 @@ pub fn apply_epoch(
     } else {
         (WitnessOutcome::default(), BTreeMap::new())
     };
+    let blocks_before: BTreeMap<ShardId, u64> = load_marks_before
+        .iter()
+        .map(|(shard, (_, blocks))| (*shard, *blocks))
+        .collect();
+    witness.jailed.extend(jail_chronic_missers(
+        state,
+        &blocks_before,
+        &witnessed_committees,
+        &halted_before,
+    ));
 
     // The boundary fold above advanced each shard's anchor and witness
     // watermark, so drop the parent-half cohort of any child that has now

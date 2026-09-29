@@ -295,19 +295,32 @@ pub const UNBONDING_WINDOW_EPOCHS: u64 = 32;
 /// without confiscating principal.
 pub const IMPOUND_EPOCHS_DEFAULT: u64 = 26_000;
 
-/// Per-epoch `MissedProposal` count that trips a `JailReason::Performance`
-/// jail on a placed validator.
+/// The share of its leader turns, in basis points, a placed validator
+/// may miss within one fold before it is jailed under
+/// `JailReason::Performance`: a third.
 ///
-/// One `MissedProposal` lands per skipped round whenever a shard's
-/// fallback commits past the originally-scheduled proposer. The counter
-/// scopes to the validator's current `OnShard { shard }`: witnesses from
-/// other shards never count, and any status transition out of `OnShard`
-/// resets the count along with the natural per-epoch reset.
+/// One `MissedProposal` lands per skipped round whenever a shard commits
+/// past the round's scheduled proposer, and the fold counts them per
+/// validator, scoped to its current `OnShard { shard }`. Its turns are
+/// the rounds the fold witnessed on that shard — the blocks the shard
+/// committed across the fold plus the rounds it skipped — over the
+/// committee's size, since the proposer rotates round by round. A share
+/// rather than a count, because the turns a validator gets per epoch
+/// scale with the shard's block rate and shrink with its committee: a
+/// fixed count jails an honest proposer on a fast small shard and never
+/// reaches a dead one on a large one.
 ///
-/// Starting value provisional — pending operational data on per-shard
-/// miss cadence under real workloads. Revisit once `MissedProposal`
-/// emission rates settle.
-pub const MISSED_PROPOSAL_JAIL_THRESHOLD: u32 = 16;
+/// Honest proposers lose rounds to the network: at 4.2% message loss a
+/// four-member committee missed 10, 11, 14 and 16 of about 139 turns
+/// each over one 556-round window, 7% to 12%. A third keeps that
+/// inside a threefold margin, while a validator that never proposes
+/// misses every turn it gets.
+pub const MISSED_PROPOSAL_JAIL_SHARE_BPS: u32 = 3_334;
+
+/// The fewest misses within one fold that can jail, whatever share of
+/// its turns they are: a window of a handful of rounds says too little
+/// about a proposer to take its seat.
+pub const MISSED_PROPOSAL_JAIL_FLOOR: u32 = 4;
 
 // ─── Economics ─────────────────────────────────────────────────────────────
 

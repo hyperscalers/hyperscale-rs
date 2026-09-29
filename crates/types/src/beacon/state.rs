@@ -132,8 +132,8 @@ pub struct StakePool {
 pub enum JailReason {
     /// Performance failure. Surfaces from a shard's local miss-counter
     /// crossing threshold (witness emits with this reason), from the
-    /// beacon-side `MissedProposal` counter crossing the jail
-    /// threshold, or from a malformed VRF reveal in the validator's
+    /// beacon-side `MissedProposal` count reaching the jail share of
+    /// the validator's leader turns, or from a malformed VRF reveal in the validator's
     /// own proposal (self-inflicted cryptographic fault, jailed on
     /// first sighting). Unjails after `JAIL_COOLDOWN_EPOCHS`.
     Performance,
@@ -1053,7 +1053,8 @@ pub struct SlotEffects {
     /// auto-deactivation.
     pub deactivated: Vec<ValidatorId>,
     /// Validators jailed this epoch (`Jail` witness, malformed VRF
-    /// reveal, or a beacon-side `MissedProposal` threshold crossing).
+    /// reveal, or `MissedProposal`s reaching the jail share of a
+    /// validator's turns).
     pub jailed: Vec<ValidatorId>,
     /// Validators permanently revoked this epoch on equivocation
     /// evidence.

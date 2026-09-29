@@ -18,10 +18,10 @@ use hyperscale_types::{
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusSignature,
     DeclaredWork, Epoch, Hash, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation,
     PendingWithdrawal, QuorumCertificate, Round, ShardBoundary, ShardCommittee,
-    ShardEpochContribution, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SignerBitfield,
-    SlotEffects, Stake, StakePool, StakePoolId, StateRoot, ValidatorId, ValidatorRecord,
-    ValidatorStatus, VrfProof, WeightedTimestamp, beacon_reveal_sign, compute_merkle_root,
-    compute_range_proof, validator_possession_proof_sign,
+    ShardEpochContribution, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
+    SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot, ValidatorId,
+    ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp, beacon_reveal_sign,
+    compute_merkle_root, compute_range_proof, validator_possession_proof_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -228,6 +228,17 @@ pub fn boundary_chunk(
     prior: u64,
     payloads: Vec<ShardWitnessPayload>,
 ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
+    boundary_chunk_after(shard_n, prior, 0, payloads)
+}
+
+/// [`boundary_chunk`] under a boundary header claiming the shard's
+/// chain has committed `blocks` blocks over its history.
+pub fn boundary_chunk_after(
+    shard_n: u64,
+    prior: u64,
+    blocks: u64,
+    payloads: Vec<ShardWitnessPayload>,
+) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
     let shard = ShardId::leaf(1, shard_n);
     let n = payloads.len() as u64;
 
@@ -238,7 +249,12 @@ pub fn boundary_chunk(
     let boundary_count = prior + n;
 
     let root = compute_merkle_root(&leaf_hashes);
-    let header = boundary_header(shard, BeaconWitnessRoot::from_raw(root), boundary_count);
+    let header = boundary_header(
+        shard,
+        BeaconWitnessRoot::from_raw(root),
+        boundary_count,
+        blocks,
+    );
 
     let lo = usize::try_from(prior).expect("leaf index fits usize");
     let hi = usize::try_from(boundary_count).expect("leaf count fits usize");
@@ -261,6 +277,17 @@ pub fn apply_witness_chunk(
     shard_n: u64,
     payloads: Vec<ShardWitnessPayload>,
 ) -> SlotEffects {
+    apply_witness_chunk_after(state, shard_n, 0, payloads)
+}
+
+/// [`apply_witness_chunk`] from a boundary block claiming the shard's
+/// chain has committed `blocks` blocks over its history.
+pub fn apply_witness_chunk_after(
+    state: &mut BeaconState,
+    shard_n: u64,
+    blocks: u64,
+    payloads: Vec<ShardWitnessPayload>,
+) -> SlotEffects {
     let shard = ShardId::leaf(1, shard_n);
     let dur = state.chain_config.epoch_duration_ms;
     let prior = state
@@ -268,7 +295,7 @@ pub fn apply_witness_chunk(
         .get(&shard)
         .map_or(0, |b| b.witness_leaf_count.inner());
 
-    let (header, payloads, range_proof) = boundary_chunk(shard_n, prior, payloads);
+    let (header, payloads, range_proof) = boundary_chunk_after(shard_n, prior, blocks, payloads);
     let block_hash = header.hash();
 
     // A placeholder boundary QC over `B` at a weighted timestamp past the
@@ -339,7 +366,12 @@ pub fn apply_witness_chunk(
 /// `leaf_count`, crossing the first epoch boundary (predecessor at
 /// weighted timestamp 1, before the cut). Only the fields the boundary
 /// fold reads carry meaning.
-fn boundary_header(shard: ShardId, root: BeaconWitnessRoot, leaf_count: u64) -> BlockHeader {
+fn boundary_header(
+    shard: ShardId,
+    root: BeaconWitnessRoot,
+    leaf_count: u64,
+    blocks: u64,
+) -> BlockHeader {
     let parent_qc = QuorumCertificate::new(
         BlockHash::ZERO,
         shard,
@@ -357,6 +389,10 @@ fn boundary_header(shard: ShardId, root: BeaconWitnessRoot, leaf_count: u64) -> 
         parent_qc: parent_qc.into(),
         beacon_witness_root: root,
         beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
+        load: ShardLoad {
+            blocks,
+            ..ShardLoad::ZERO
+        },
         ..Default::default()
     })
 }
