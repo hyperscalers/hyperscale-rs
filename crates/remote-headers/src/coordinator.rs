@@ -20,8 +20,8 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, CommitProof, CommittedClock, ConsensusPublicKey, Epoch, ForkFence,
     HeaderFetchCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup, ShardForkProof,
-    ShardId, TopologySchedule, TopologySnapshot, TxsInFlight, ValidatorId, Verified,
-    WeightedTimestamp,
+    ShardId, TRANSACTION_EVIDENCE_HORIZON, TopologySchedule, TopologySnapshot, TxsInFlight,
+    ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -38,9 +38,10 @@ use crate::awaiting::AwaitingTopologyBuffer;
 const HEADER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Probe lookahead added to `last_verified_height` when raising the sync
-/// target. Sized to fit one full range fetch at the I/O loop's maximum
-/// batch size, so a single round-trip can close a long gap without
-/// requiring repeated target bumps.
+/// target, for a shard nothing verified above the frontier has shown to
+/// be further on. Sized to fit one full range fetch at the I/O loop's
+/// maximum batch size, so one round trip discovers whether the shard has
+/// moved.
 const DEFAULT_PROBE_LOOKAHEAD: u64 = 64;
 
 /// How long a wanted commit proof waits before its fetch re-issues.
@@ -112,12 +113,35 @@ struct ExpectedHeader {
     /// sync watermark aligned with contiguous coverage, which the
     /// commit-proof walk needs.
     last_verified_height: BlockHeight,
+    /// The highest height of any header verified from this shard,
+    /// contiguous with the frontier or not. Gossip and bundled source
+    /// headers land here long before the frontier reaches them — a member
+    /// seated at the attested boundary hears the live tip a witness window
+    /// above it — and every height between is one the sync has to close
+    /// before a consumer can commit-prove what it holds there.
+    verified_tip: BlockHeight,
     /// Local weighted timestamp when we last verified a header from
     /// this shard. Liveness baseline once set — the timeout measures how
     /// much *local* wall-clock has passed since we last heard from the
     /// remote shard, rather than comparing heights across independent
     /// counters. `None` until the first header is verified.
     last_verified_at: Option<WeightedTimestamp>,
+}
+
+impl ExpectedHeader {
+    /// How far a sync raised now has to reach: every height up to the
+    /// highest header already verified from the shard, and at least one
+    /// probe batch past the frontier.
+    ///
+    /// Reaching only a batch past the frontier would close a wide gap one
+    /// batch per liveness timeout — slower than a live shard produces, so
+    /// a member seated at the attested boundary would never commit-prove a
+    /// source block its consumers hold, and a bundle waiting on one would
+    /// outlive its transaction's deadline.
+    fn sync_target(&self) -> BlockHeight {
+        BlockHeight::new(self.last_verified_height.inner() + DEFAULT_PROBE_LOOKAHEAD)
+            .max(self.verified_tip)
+    }
 }
 
 /// One wanted commit proof: a targeted header fetch re-driven until its
@@ -635,6 +659,9 @@ impl RemoteHeaderCoordinator {
             return self.observe_fork_sibling(verified);
         }
         self.verified.insert(key, Arc::clone(&verified));
+        if let Some(expected) = self.expected.get_mut(&shard) {
+            expected.verified_tip = expected.verified_tip.max(height);
+        }
 
         // Advance the sync frontier only over a contiguous run of verified
         // heights. A header admitted above the frontier — a provision- or
@@ -647,21 +674,7 @@ impl RemoteHeaderCoordinator {
         // and its committing child held contiguously, so only a header that
         // extends the frontier — walking up over any already-held successors —
         // advances it and re-arms the liveness clock.
-        if self
-            .expected
-            .get(&shard)
-            .is_some_and(|e| height == e.last_verified_height.next())
-        {
-            let mut frontier = height;
-            while self.verified.contains_key(&(shard, frontier.next())) {
-                frontier = frontier.next();
-            }
-            let now = self.clock.now();
-            if let Some(expected) = self.expected.get_mut(&shard) {
-                expected.last_verified_height = frontier;
-                expected.last_verified_at = Some(now);
-            }
-        }
+        self.walk_frontier(shard);
 
         let mut actions = vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
             certified_header: verified,
@@ -756,8 +769,7 @@ impl RemoteHeaderCoordinator {
             // `RemoteHeaderSync`. The action is idempotent — the
             // FSM short-circuits if its target is already at or past
             // `target`, and applies its own per-fetch backoff on failures.
-            let target =
-                BlockHeight::new(expected.last_verified_height.inner() + DEFAULT_PROBE_LOOKAHEAD);
+            let target = expected.sync_target();
 
             info!(
                 source_shard = shard.inner(),
@@ -842,8 +854,10 @@ impl RemoteHeaderCoordinator {
                 .or_insert_with(|| ExpectedHeader {
                     discovered_at: self.clock.now(),
                     last_verified_height: anchor_height,
+                    verified_tip: anchor_height,
                     last_verified_at: None,
                 });
+            self.walk_frontier(shard);
         }
     }
 
@@ -870,8 +884,7 @@ impl RemoteHeaderCoordinator {
                 continue;
             }
 
-            let target =
-                BlockHeight::new(expected.last_verified_height.inner() + DEFAULT_PROBE_LOOKAHEAD);
+            let target = expected.sync_target();
 
             info!(
                 source_shard = shard.inner(),
@@ -972,15 +985,13 @@ impl RemoteHeaderCoordinator {
     /// each shard's tip, catching entries that aged out since the last
     /// ingestion-driven prune.
     pub fn cleanup(&mut self) {
-        let cutoffs: Vec<(ShardId, WeightedTimestamp)> = self
+        let tips: Vec<(ShardId, WeightedTimestamp)> = self
             .tips
             .iter()
-            .map(|(&shard, &(_, tip_ts))| (shard, tip_ts.minus(REMOTE_HEADER_RETENTION)))
+            .map(|(&shard, &(_, tip_ts))| (shard, tip_ts))
             .collect();
-        for (shard, cutoff) in cutoffs {
-            if cutoff > WeightedTimestamp::ZERO {
-                self.prune_shard_below(shard, cutoff);
-            }
+        for (shard, tip_ts) in tips {
+            self.prune_shard_behind(shard, tip_ts);
         }
     }
 
@@ -1002,10 +1013,8 @@ impl RemoteHeaderCoordinator {
         if height > tip.0 {
             *tip = (height, header_ts);
         }
-        let cutoff = tip.1.minus(REMOTE_HEADER_RETENTION);
-        if cutoff > WeightedTimestamp::ZERO {
-            self.prune_shard_below(shard, cutoff);
-        }
+        let tip_ts = tip.1;
+        self.prune_shard_behind(shard, tip_ts);
     }
 
     /// Drop everything held for a shard whose handoff evidence window has
@@ -1054,19 +1063,41 @@ impl RemoteHeaderCoordinator {
         }
     }
 
-    /// Drop every held artifact of `shard` whose parent-QC weighted
-    /// timestamp sits below `cutoff` — the retention pass shared by
-    /// ingestion pruning and the cleanup timer. `proven` and `promoted`
-    /// follow `verified` (always subsets of it).
-    fn prune_shard_below(&mut self, shard: ShardId, cutoff: WeightedTimestamp) {
+    /// Drop every held artifact of `shard` older than its retention,
+    /// counted back from the shard's tip at `tip_ts` over each header's
+    /// parent-QC weighted timestamp — the pass shared by ingestion pruning
+    /// and the cleanup timer. `proven` and `promoted` follow `verified`
+    /// (always subsets of it).
+    ///
+    /// A verified header above the sync frontier is held past
+    /// [`REMOTE_HEADER_RETENTION`], to [`TRANSACTION_EVIDENCE_HORIZON`]: it
+    /// is sync progress the frontier has not walked over yet. A sync from
+    /// far below the tip — a member anchored at the attested boundary, a
+    /// witness window back — fetches headers already past the retention,
+    /// and they verify in whatever order the verification pool finishes
+    /// them. Dropping the ones that land ahead of the frontier leaves a
+    /// gap the walk cannot cross, and the sync fetches the same window
+    /// again only to lose it the same way.
+    fn prune_shard_behind(&mut self, shard: ShardId, tip_ts: WeightedTimestamp) {
+        let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
+        if cutoff == WeightedTimestamp::ZERO {
+            return;
+        }
+        let horizon = tip_ts.minus(TRANSACTION_EVIDENCE_HORIZON);
+        let frontier = self
+            .expected
+            .get(&shard)
+            .map(|expected| expected.last_verified_height);
         self.pending.retain(|&(s, _), sender_map| {
             s != shard
                 || sender_map
                     .values()
                     .any(|h| h.header().parent_qc().weighted_timestamp() >= cutoff)
         });
-        self.verified.retain(|&(s, _), hdr| {
-            s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
+        self.verified.retain(|&(s, height), hdr| {
+            let ts = hdr.header().parent_qc().weighted_timestamp();
+            let unwalked = frontier.is_some_and(|frontier| height > frontier);
+            s != shard || ts >= cutoff || (unwalked && ts >= horizon)
         });
         self.proven.retain(|key| self.verified.contains_key(key));
         self.promoted.retain(|key| self.proven.contains(key));
@@ -1205,10 +1236,9 @@ impl RemoteHeaderCoordinator {
         self.promoted.retain(|key| !above(key));
         self.fork_siblings.retain(|key, _| !above(key));
         self.wanted_proofs.retain(|key, _| !above(key));
-        if let Some(expected) = self.expected.get_mut(&shard)
-            && expected.last_verified_height > frontier
-        {
-            expected.last_verified_height = frontier;
+        if let Some(expected) = self.expected.get_mut(&shard) {
+            expected.last_verified_height = expected.last_verified_height.min(frontier);
+            expected.verified_tip = expected.verified_tip.min(frontier);
         }
     }
 
@@ -1525,6 +1555,36 @@ impl RemoteHeaderCoordinator {
                     .flat_map(|by_sender| by_sender.values().map(|h| h.header())),
             )
             .find(|header| header.hash() == hash)
+    }
+
+    /// Walk `shard`'s sync frontier up over the verified headers held
+    /// contiguously above it, re-arming the liveness clock if it moves.
+    ///
+    /// Run wherever the frontier or the headers above it change. A header
+    /// held ahead of the frontier is never admitted a second time — a
+    /// re-delivery of it is a byte-exact duplicate — so a frontier that
+    /// lands just below one, as a re-anchor at the attested boundary does,
+    /// crosses it only here.
+    fn walk_frontier(&mut self, shard: ShardId) {
+        let Some(from) = self
+            .expected
+            .get(&shard)
+            .map(|expected| expected.last_verified_height)
+        else {
+            return;
+        };
+        let mut frontier = from;
+        while self.verified.contains_key(&(shard, frontier.next())) {
+            frontier = frontier.next();
+        }
+        if frontier == from {
+            return;
+        }
+        let now = self.clock.now();
+        if let Some(expected) = self.expected.get_mut(&shard) {
+            expected.last_verified_height = frontier;
+            expected.last_verified_at = Some(now);
+        }
     }
 
     /// Mark every height the insertion at `(shard, height)` newly commit-proves,
@@ -2229,6 +2289,153 @@ mod tests {
         );
     }
 
+    /// A member whose frontier sits far below a header it already verified
+    /// — seated at the attested boundary, hearing the live tip by gossip —
+    /// syncs the whole gap in one go rather than one probe batch per
+    /// liveness timeout, which a live shard outruns.
+    #[test]
+    fn a_sync_reaches_the_highest_verified_header() {
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let sched = TopologySchedule::new(
+            ED,
+            Epoch::new(5),
+            Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)),
+        );
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let target = |actions: &[Action]| {
+            actions.iter().find_map(|a| match a {
+                Action::StartRemoteHeaderSync {
+                    source_shard,
+                    target,
+                    floor,
+                } if *source_shard == remote => Some((*floor, *target)),
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            target(&coord.flush_expected_headers(&sched)),
+            Some((
+                BlockHeight::new(0),
+                BlockHeight::new(DEFAULT_PROBE_LOOKAHEAD)
+            )),
+            "with nothing heard above it, a sync probes one batch past the frontier",
+        );
+
+        let far = DEFAULT_PROBE_LOOKAHEAD * 30;
+        coord.on_verified_remote_header_received(
+            chain_header(remote, far, far, None),
+            ValidatorId::new(0),
+        );
+        assert_eq!(
+            target(&coord.flush_expected_headers(&sched)),
+            Some((BlockHeight::new(0), BlockHeight::new(far))),
+            "a sync reaches the highest header already verified",
+        );
+    }
+
+    /// A header verified ahead of the frontier is held past the retention
+    /// window until the frontier walks over it. A sync from far behind the
+    /// tip fetches headers already past that window, and one that verifies
+    /// before the height below it would otherwise be gone by the time the
+    /// walk reaches it.
+    #[test]
+    fn a_header_ahead_of_the_frontier_outlives_the_retention_until_walked() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.expected.insert(
+            remote,
+            ExpectedHeader {
+                discovered_at: WeightedTimestamp::from_millis(1),
+                last_verified_height: BlockHeight::new(5),
+                verified_tip: BlockHeight::new(5),
+                last_verified_at: Some(WeightedTimestamp::from_millis(1)),
+            },
+        );
+        let six = chain_header(remote, 6, 6, None);
+        let seven = chain_header(remote, 7, 7, Some(&six));
+
+        // Seven verifies first, and the live tip lands a retention window
+        // and more past both.
+        coord.on_verified_remote_header_received(seven, ValidatorId::new(0));
+        let tip = 7 + REMOTE_HEADER_RETENTION.as_secs() * 2;
+        coord.on_verified_remote_header_received(
+            chain_header(remote, tip, tip, None),
+            ValidatorId::new(0),
+        );
+        assert!(
+            coord.verified.contains_key(&(remote, BlockHeight::new(7))),
+            "a header the frontier has not walked over is held past the retention",
+        );
+
+        coord.on_verified_remote_header_received(six, ValidatorId::new(0));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(7)),
+            "the walk crosses the header held ahead of it",
+        );
+
+        coord.cleanup();
+        assert!(
+            !coord.verified.contains_key(&(remote, BlockHeight::new(7))),
+            "once walked over, it ages out as any header does",
+        );
+    }
+
+    /// A frontier re-anchored at the attested boundary walks over the
+    /// headers already held above it. Held, they are never admitted again —
+    /// a re-delivery is a byte-exact duplicate — so nothing else carries the
+    /// frontier across them.
+    #[test]
+    fn a_reanchored_frontier_walks_over_the_headers_held_above_it() {
+        use hyperscale_types::{BeaconWitnessLeafCount, ShardAnchor, StateRoot};
+
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let snapshot = || shard_snapshot(2, &[0, 1, 2, 3], 0);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.refresh_expected(&TopologySchedule::new(
+            ED,
+            Epoch::new(5),
+            Arc::new(snapshot()),
+        ));
+
+        let seven = chain_header(remote, 7, 7, None);
+        let eight = chain_header(remote, 8, 8, Some(&seven));
+        coord.on_verified_remote_header_received(seven, ValidatorId::new(0));
+        coord.on_verified_remote_header_received(eight, ValidatorId::new(0));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(0)),
+            "headers held above an unanchored frontier are not sync progress",
+        );
+
+        let boundary = ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::new(6),
+            weighted_timestamp: WeightedTimestamp::from_millis(6_000),
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: None,
+            handoff_complete: None,
+            terminal_epoch: None,
+        };
+        coord.refresh_expected(&TopologySchedule::new(
+            ED,
+            Epoch::new(5),
+            Arc::new(snapshot().with_boundaries(BTreeMap::from([(remote, boundary)]))),
+        ));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(8)),
+            "the re-anchored frontier crosses the headers held just above it",
+        );
+    }
+
     #[test]
     fn out_of_band_admit_holds_the_frontier_until_the_gap_fills() {
         // A source header admitted above the sync frontier — the shape a
@@ -2246,6 +2453,7 @@ mod tests {
             ExpectedHeader {
                 discovered_at: WeightedTimestamp::from_millis(1),
                 last_verified_height: BlockHeight::new(5),
+                verified_tip: BlockHeight::new(5),
                 last_verified_at: Some(WeightedTimestamp::from_millis(1)),
             },
         );
