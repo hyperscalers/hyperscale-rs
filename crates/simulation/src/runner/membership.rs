@@ -552,7 +552,7 @@ impl SimulationRunner {
             beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,
-            now: self.local_now(),
+            now: self.local_now(host),
             validator,
             signer: self.signer_of(validator),
         });
@@ -707,7 +707,7 @@ impl SimulationRunner {
         seat_vnode_group(SeatVnodeGroup {
             config: self.seat_config(host),
             beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
-            now: self.local_now(),
+            now: self.local_now(host),
             shard,
             recovered,
             vnodes: vec![(validator, self.signer_of(validator))],

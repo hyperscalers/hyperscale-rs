@@ -7,6 +7,7 @@
 //! here is one every node runs alike, so no draw splits consensus.
 
 use std::env;
+use std::time::Duration;
 
 use hyperscale_node::{FetchConfig, NodeConfig};
 use rand::{RngExt, SeedableRng};
@@ -30,6 +31,10 @@ pub struct SimTuning {
     pub loss: f64,
     /// The node configuration every host runs.
     pub node_config: NodeConfig,
+    /// Largest offset any host's clock reads from simulated time.
+    pub clock_skew: Duration,
+    /// Largest drift, in parts per million, of any host's clock.
+    pub clock_drift_ppm: u32,
 }
 
 impl SimTuning {
@@ -58,6 +63,11 @@ impl SimTuning {
             jitter: rng.random_range(0.0..0.5),
             loss: rng.random_range(0.0..0.05),
             node_config,
+            // Two hosts' clocks stay under the 2s rush a proposal's
+            // timestamp may run ahead of a voter's: at most twice the skew
+            // plus both drifts over the longest run.
+            clock_skew: Duration::from_millis(rng.random_range(0..=700)),
+            clock_drift_ppm: rng.random_range(0..=100),
         }
     }
 }

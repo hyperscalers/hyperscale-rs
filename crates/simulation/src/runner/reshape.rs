@@ -40,8 +40,8 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, ShardId, ValidatorId,
-    Verified, shard_prefix_path,
+    Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, ValidatorId, Verified,
+    shard_prefix_path,
 };
 use tracing::error;
 
@@ -85,8 +85,7 @@ impl SimulationRunner {
         // synchronous, so no time passes across its rounds. Anything the
         // orchestrator schedules against the clock therefore advances per
         // slice, as the production tick does, rather than per round.
-        let now =
-            LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX));
+        let now = self.local_now(host);
         for _ in 0..MAX_FIXPOINT_ROUNDS {
             let requests = orch.step(
                 &view,

@@ -257,6 +257,12 @@ impl SimCluster {
             node_config: tuning
                 .as_ref()
                 .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),
+            clock_skew: tuning
+                .as_ref()
+                .map_or(defaults.clock_skew, |t| t.clock_skew),
+            clock_drift_ppm: tuning
+                .as_ref()
+                .map_or(defaults.clock_drift_ppm, |t| t.clock_drift_ppm),
             ..defaults
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);

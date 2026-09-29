@@ -142,6 +142,12 @@ pub struct SimConfig {
     pub world_seed: Option<u64>,
     /// Every host's node configuration: fetch schedules and batch windows.
     pub node_config: NodeConfig,
+    /// Largest offset any host's clock reads from simulated time, either
+    /// way. Each host draws its own offset from the seed.
+    pub clock_skew: Duration,
+    /// Largest rate, in parts per million, at which any host's clock runs
+    /// fast or slow. Each host draws its own from the seed.
+    pub clock_drift_ppm: u32,
     /// Consensus crypto scheme every simulated validator runs.
     pub crypto_scheme: CryptoScheme,
     /// Genesis-funded accounts (owner prefix, balance). Seeds the funded
@@ -178,6 +184,8 @@ impl Default for SimConfig {
             packet_loss_rate: 0.0,
             world_seed: None,
             node_config: NodeConfig::default(),
+            clock_skew: Duration::ZERO,
+            clock_drift_ppm: 0,
             crypto_scheme: CryptoScheme::default(),
             accounts: Vec::new(),
             pools: Vec::new(),
@@ -314,6 +322,9 @@ pub struct SimulationRunner {
     /// unless [`SimConfig::world_seed`] pinned another.
     world_seed: u64,
 
+    /// Each host's clock: its offset from simulated time and its drift.
+    clocks: Vec<HostClock>,
+
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
 
@@ -425,6 +436,16 @@ impl SimulationRunner {
         // seed; the transport's draws from the run seed. Pinning the world
         // seed sweeps schedules over one fixed set of committees.
         let world_seed = network_config.world_seed.unwrap_or(seed);
+        let clocks: Vec<HostClock> = (0..num_hosts)
+            .map(|host| {
+                HostClock::drawn(
+                    seed,
+                    host,
+                    network_config.clock_skew,
+                    network_config.clock_drift_ppm,
+                )
+            })
+            .collect();
 
         // The engine the first host runs, and the one every other host's
         // is forked from below. Each holds its own world, its own
@@ -538,7 +559,10 @@ impl SimulationRunner {
             // Seat each host's vnodes. Same-shard vnodes share one store
             // bundle, created inside `seat_vnode_group`; the host's pool
             // extras follow the beacon shard-less. Genesis boots a fresh
-            // chain, so `recovered` is default and `now` is zero.
+            // chain, so `recovered` is default and `now` is what this
+            // host's clock reads at simulated zero: a follower arms its
+            // beacon startup timers off it at construction.
+            let now = LocalTimestamp::from_millis(clocks[host_index].read(Duration::ZERO));
             let mut vnode_inits: Vec<VnodeInit> =
                 Vec::with_capacity(plan.seated.len() + plan.followers.len());
             for (shard, validator_idxs) in &by_shard {
@@ -563,7 +587,7 @@ impl SimulationRunner {
                         provision_config: ProvisionConfig::default(),
                     },
                     beacon_storage: beacon_storage.as_ref(),
-                    now: LocalTimestamp::ZERO,
+                    now,
                     shard: *shard,
                     recovered: &RecoveredState::default(),
                     vnodes,
@@ -576,7 +600,7 @@ impl SimulationRunner {
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,
-                    now: LocalTimestamp::ZERO,
+                    now,
                     validator: ValidatorId::new(u64::from(validator_idx)),
                     signer,
                 }));
@@ -669,6 +693,7 @@ impl SimulationRunner {
             network,
             streams,
             world_seed,
+            clocks,
             timers: HashMap::new(),
             stats: SimulationStats::default(),
             trace: Blake3Hasher::new(),
@@ -1105,6 +1130,9 @@ impl SimulationRunner {
         shard: ShardId,
         config: &GenesisConfig,
     ) -> Block {
+        // Genesis arms the first beacon timers off the host's own clock.
+        let now = self.local_now(host);
+        self.hosts[host as usize].set_time(now);
         let ShardGenesis {
             block,
             certified,
@@ -1213,7 +1241,7 @@ impl SimulationRunner {
                 // refresh can re-arm the next one if the sync is still running.
                 let fired_pool_tick = event.is_pool_fetch_tick();
 
-                let now = self.local_now();
+                let now = self.local_now(host_index);
                 self.hosts[host_index as usize].set_time(now);
                 let output = self.hosts[host_index as usize].step(event);
                 self.hosts[host_index as usize].flush_all_batches();
@@ -1329,7 +1357,7 @@ impl SimulationRunner {
         }
         if !self.pool_tick_pending[i] {
             self.pool_tick_pending[i] = true;
-            let fire = self.now + POOL_FETCH_TICK_INTERVAL;
+            let fire = self.clocks[i].fire_after(self.now, POOL_FETCH_TICK_INTERVAL);
             self.schedule_event(host, fire, HostEvent::beacon_fetch_tick());
         }
     }
@@ -1346,7 +1374,7 @@ impl SimulationRunner {
                 id,
                 duration,
             } => {
-                let fire_time = self.now + duration;
+                let fire_time = self.clocks[host as usize].fire_after(self.now, duration);
                 let event = timer_event(&id, shard);
                 // Re-arming replaces the pending fire, matching the
                 // production runner (which aborts the old sleep task).
@@ -1403,8 +1431,68 @@ impl SimulationRunner {
     }
 
     /// The current simulation time as the [`LocalTimestamp`] fed to hosts.
-    fn local_now(&self) -> LocalTimestamp {
-        LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX))
+    fn local_now(&self, host: NodeIndex) -> LocalTimestamp {
+        LocalTimestamp::from_millis(self.clocks[host as usize].read(self.now))
+    }
+}
+
+/// One host's clock: a fixed offset from simulated time and a drift rate,
+/// both drawn from the seed within the configured bounds.
+///
+/// The drift is the host's oscillator, so it paces the host's timers as
+/// well as the time it reads: a production node's local clock advances
+/// with the same monotonic source its timers sleep on, and a timer never
+/// fires before its own clock has advanced the armed duration.
+#[derive(Debug, Clone, Copy)]
+struct HostClock {
+    offset_ms: i64,
+    drift_ppm: i64,
+}
+
+impl HostClock {
+    fn drawn(seed: u64, host: usize, skew: Duration, drift_ppm: u32) -> Self {
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(&seed.to_le_bytes());
+        hasher.update(b"clock");
+        hasher.update(&(host as u64).to_le_bytes());
+        let digest = hasher.finalize();
+        let bytes = digest.as_bytes();
+        let draw = |at: usize, bound: i64| -> i64 {
+            if bound == 0 {
+                return 0;
+            }
+            let raw = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+            let span = u64::try_from(2 * bound + 1).expect("a positive span");
+            i64::try_from(raw % span).expect("within the span") - bound
+        };
+        Self {
+            offset_ms: draw(0, i64::try_from(skew.as_millis()).unwrap_or(i64::MAX / 4)),
+            drift_ppm: draw(8, i64::from(drift_ppm)),
+        }
+    }
+
+    /// What this host's clock reads, in milliseconds, at simulated `now`.
+    fn read(self, now: Duration) -> u64 {
+        let now_ms = i64::try_from(now.as_millis()).unwrap_or(i64::MAX / 4);
+        let drifted = now_ms + now_ms * self.drift_ppm / 1_000_000;
+        u64::try_from((drifted + self.offset_ms).max(0)).unwrap_or(0)
+    }
+
+    /// The simulated instant a timer armed at `now` for `duration` fires:
+    /// the first millisecond at which this clock reads `duration` past
+    /// what it read when armed.
+    fn fire_after(self, now: Duration, duration: Duration) -> Duration {
+        let target = self
+            .read(now)
+            .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        let rate =
+            u128::try_from(1_000_000 + self.drift_ppm).expect("drift is under a million ppm");
+        let scaled = duration.as_nanos() * 1_000_000 / rate;
+        let mut fire = now + Duration::from_nanos(u64::try_from(scaled).unwrap_or(u64::MAX));
+        while self.read(fire) < target {
+            fire += Duration::from_millis(1);
+        }
+        fire
     }
 }
 
@@ -1574,4 +1662,56 @@ fn build_committee_host_layout(config: &SimConfig) -> Vec<Vec<(u32, ShardId)>> {
                 .collect()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn a_clock_with_no_skew_or_drift_reads_simulated_time() {
+        let clock = HostClock::drawn(7, 3, Duration::ZERO, 0);
+        assert_eq!(clock.read(Duration::from_secs(90)), 90_000);
+    }
+
+    #[test]
+    fn a_timer_fires_once_its_own_clock_has_advanced_the_duration() {
+        let skew = Duration::from_millis(700);
+        for host in 0..64 {
+            let clock = HostClock::drawn(11, host, skew, 100);
+            for armed_ms in [0_u64, 1_234, 600_000, 899_999] {
+                let armed = Duration::from_millis(armed_ms) + Duration::from_micros(417);
+                for duration_ms in [0_u64, 1, 15_000, 30_000] {
+                    let fire = clock.fire_after(armed, Duration::from_millis(duration_ms));
+                    let target = clock.read(armed) + duration_ms;
+                    assert!(fire >= armed, "host {host} fired before it was armed");
+                    assert!(
+                        clock.read(fire) >= target,
+                        "host {host} fired early: armed {armed_ms}ms for {duration_ms}ms",
+                    );
+                    assert!(
+                        fire == armed
+                            || fire
+                                .checked_sub(Duration::from_millis(2))
+                                .is_none_or(|before| clock.read(before) < target),
+                        "host {host} fired late: armed {armed_ms}ms for {duration_ms}ms",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_skewed_clock_stays_within_its_bounds() {
+        let skew = Duration::from_millis(700);
+        for host in 0..64 {
+            let clock = HostClock::drawn(7, host, skew, 100);
+            let read = i64::try_from(clock.read(Duration::from_secs(1000))).expect("fits");
+            // 700ms of offset and 100ppm of 1000s of drift.
+            assert!(
+                (read - 1_000_000).abs() <= 700 + 100,
+                "host {host} read {read}"
+            );
+        }
+    }
 }
