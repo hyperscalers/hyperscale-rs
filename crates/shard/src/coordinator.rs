@@ -5361,6 +5361,7 @@ impl ShardCoordinator {
             {
                 return vec![Action::ReopenSyncHeight {
                     height: committable_height,
+                    hash: committable_hash,
                 }];
             }
             return vec![];
@@ -13641,9 +13642,10 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::ReopenSyncHeight { height } if *height == BlockHeight::new(4)
+                Action::ReopenSyncHeight { height, hash }
+                    if *height == BlockHeight::new(4) && *hash == winner_hash
             )),
-            "got {actions:?}"
+            "the reopen names the sibling the chain commits; got {actions:?}"
         );
         assert_eq!(
             state.committed_height,

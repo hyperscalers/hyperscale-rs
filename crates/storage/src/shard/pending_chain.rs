@@ -397,6 +397,26 @@ where
         )
     }
 
+    /// [`Self::block_for_sync`] for the block hashing to `hash` at
+    /// `height` only: the committed block there when it is that block,
+    /// else a certified-but-uncommitted entry held under `hash`. A fork
+    /// can certify siblings at one height, and a fetcher that applied the
+    /// loser names the winner, so no other block at the height answers.
+    pub fn named_block_for_sync(
+        &self,
+        height: BlockHeight,
+        hash: BlockHash,
+    ) -> Option<BlockForSync> {
+        if let Some(committed) = self.committed_block_for_sync(height) {
+            return (committed.block.hash() == hash).then_some(committed);
+        }
+        read_or_recover(&self.entries)
+            .get(&hash)
+            .filter(|entry| entry.height == height)
+            .and_then(|entry| entry.certified_uncommitted.clone())
+            .map(|certified| Self::for_sync(&certified))
+    }
+
     fn for_sync(certified: &Verified<CertifiedBlock>) -> BlockForSync {
         let block = certified.block().clone();
         let qc = certified.qc().clone();

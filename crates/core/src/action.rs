@@ -1432,6 +1432,10 @@ pub enum Action {
     ReopenSyncHeight {
         /// The height whose applied block a child's parent QC bypasses.
         height: BlockHeight,
+        /// The certified sibling the chain commits at `height` — the only
+        /// block the fetch accepts, since the requester's own store still
+        /// answers the height with the one it applied.
+        hash: BlockHash,
     },
 
     /// Tell block sync to stop at what it holds: the target it was raised

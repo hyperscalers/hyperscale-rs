@@ -132,8 +132,8 @@ where
             Action::SyncBlockApplied { height } => {
                 self.process_sync_block_applied(vnode_idx, height);
             }
-            Action::ReopenSyncHeight { height } => {
-                self.process_reopen_sync_height(vnode_idx, height);
+            Action::ReopenSyncHeight { height, hash } => {
+                self.process_reopen_sync_height(vnode_idx, height, hash);
             }
             Action::SettleBlockSync => {
                 self.process_settle_block_sync();

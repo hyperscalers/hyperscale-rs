@@ -1873,13 +1873,16 @@ fn advance_keeper_half(
     {
         // A merging child's boundary anchors its terminal crossing directly —
         // the block whose hash and height the beacon composed the parent from —
-        // so the certified terminal sits at the anchor height itself.
+        // so the certified terminal sits at the anchor height itself, and is
+        // the anchored block: a certified sibling at that height does not
+        // answer.
         let terminal = anchor.height;
         out.push(ReshapeRequest::Fetch {
             duty,
             from: half.child,
             kind: FetchKind::Block {
-                request: GetBlockRequest::new(terminal, BlockIntent::Execute),
+                request: GetBlockRequest::new(terminal, BlockIntent::Execute)
+                    .naming(anchor.block_hash),
             },
         });
         half.terminal_requested = true;

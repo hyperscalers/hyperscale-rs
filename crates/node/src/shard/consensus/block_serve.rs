@@ -35,6 +35,12 @@ use tracing::{trace, warn};
 /// never a certified tip that could still lose its height to a sibling,
 /// and is otherwise served as `Execute`.
 ///
+/// A request that names a block is answered by that block only. A server
+/// holding a different block at the height answers `not_found`, which is
+/// what sends a request this host serves itself on to its peers: a
+/// requester that applied a losing sibling holds that sibling, and would
+/// otherwise be handed it back on every refetch.
+///
 /// For `BlockIntent::Execute`, whether the requester needs `Block::Live` is
 /// a function of the block's own age against the dedup horizon: until
 /// `block_ts + RETENTION_HORIZON` passes, every honest validator still keeps
@@ -70,10 +76,13 @@ pub fn serve_block_request<S: ShardStorage>(
         intent = ?req.intent,
         "Handling block sync request"
     );
-    let found = if req.intent.admits_uncommitted() {
-        pending_chain.block_for_sync(req.height)
-    } else {
-        pending_chain.committed_block_for_sync(req.height)
+    let found = match (req.hash, req.intent.admits_uncommitted()) {
+        (None, true) => pending_chain.block_for_sync(req.height),
+        (None, false) => pending_chain.committed_block_for_sync(req.height),
+        (Some(hash), true) => pending_chain.named_block_for_sync(req.height, hash),
+        (Some(hash), false) => pending_chain
+            .committed_block_for_sync(req.height)
+            .filter(|found| found.block.hash() == hash),
     };
     let Some(BlockForSync {
         block,
@@ -162,7 +171,7 @@ pub fn serve_block_request<S: ShardStorage>(
 mod tests {
     use hyperscale_storage::ChainEntry;
     use hyperscale_storage::test_helpers::{
-        commit_settled_at, make_test_block, make_test_certified,
+        commit_settled_at, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     };
     use hyperscale_storage::tree::{CollectedWrites, JmtSnapshot};
     use hyperscale_storage_memory::SimShardStorage;
@@ -379,5 +388,90 @@ mod tests {
             !certified.block().is_live(),
             "a history answer carries no provision bodies",
         );
+    }
+
+    /// Hold `block` as a certified tip whose commit is pending.
+    fn hold_uncommitted(chain: &PendingChain<SimShardStorage>, block: Block) {
+        chain.insert(
+            block.hash(),
+            ChainEntry {
+                parent_block_hash: block.header().parent_block_hash(),
+                height: block.height(),
+                settled_txs: Vec::new(),
+                jmt_snapshot: Arc::new(JmtSnapshot::from_collected_writes(
+                    CollectedWrites::default(),
+                    SettledWrites::default(),
+                    StateRoot::ZERO,
+                    BlockHeight::GENESIS,
+                    StateRoot::ZERO,
+                    BlockHeight::GENESIS,
+                )),
+                certified_block: None,
+                certified_uncommitted: Some(make_test_certified(block)),
+            },
+        );
+    }
+
+    /// A requester that applied a losing sibling holds it, and serves its
+    /// own requests first: a fetch naming the winner must come back empty
+    /// from that store so it moves on to a peer, and must be answered by
+    /// a store that holds the winner beside the loser.
+    #[test]
+    fn a_named_request_is_answered_by_the_named_block_only() {
+        let storage = Arc::new(SimShardStorage::default());
+        let chain = PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT);
+        let loser = make_test_block(BlockHeight::new(1));
+        let winner = make_test_block_with_anchor_wt(BlockHeight::new(1), 5);
+        let (loser_hash, winner_hash) = (loser.hash(), winner.hash());
+        assert_ne!(loser_hash, winner_hash);
+        hold_uncommitted(&chain, loser);
+
+        let serve = |hash| {
+            serve_block_request(
+                &chain,
+                &ProvisionStore::new(),
+                &GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute).naming(hash),
+            )
+        };
+        assert!(
+            serve(winner_hash).certified.is_none(),
+            "a store holding only the loser does not answer a request naming the winner",
+        );
+        let served = serve(loser_hash);
+        assert_eq!(
+            served.certified.as_ref().map(|b| b.header().hash()),
+            Some(loser_hash),
+            "the block a request names answers it",
+        );
+
+        hold_uncommitted(&chain, winner);
+        let served = serve(winner_hash);
+        assert_eq!(
+            served.certified.as_ref().map(|b| b.header().hash()),
+            Some(winner_hash),
+            "a store holding both siblings answers with the named one",
+        );
+    }
+
+    /// A committed block answers a request naming it, and nothing else
+    /// at its height does.
+    #[test]
+    fn a_named_request_checks_the_committed_block() {
+        let chain = chain_with_a_retired_provision();
+        let committed = chain
+            .committed_block_for_sync(BlockHeight::new(1))
+            .expect("the fixture commits height 1")
+            .block
+            .hash();
+        let other = make_test_block_with_anchor_wt(BlockHeight::new(1), 5).hash();
+        let serve = |hash| {
+            serve_block_request(
+                &chain,
+                &ProvisionStore::new(),
+                &GetBlockRequest::new(BlockHeight::new(1), BlockIntent::History).naming(hash),
+            )
+        };
+        assert!(serve(committed).certified.is_some());
+        assert!(serve(other).certified.is_none());
     }
 }

@@ -2,10 +2,10 @@
 
 use hyperscale_hbor::Hbor;
 
-use crate::BlockHeight;
 use crate::network::response::GetBlockResponse;
 use crate::network::{MessageClass, NetworkMessage, Request};
 use crate::shard::inventory::Inventory;
+use crate::{BlockHash, BlockHeight};
 
 /// What the requester will do with the block it asks for.
 ///
@@ -50,6 +50,12 @@ impl BlockIntent {
 /// comes back `Live` with its provision bodies attached or `Sealed`
 /// without them.
 ///
+/// `hash`, when set, names the one block at `height` that answers: a
+/// requester that applied a certified sibling there and learned which
+/// block the chain commits asks for that block, and a server holding a
+/// different block at the height answers `not_found` so the request
+/// moves on to a peer holding the named one.
+///
 /// `inventory` advertises what the requester already has locally so the
 /// responder can elide transaction / certificate / provision bodies the
 /// requester can resolve without a re-download.
@@ -59,6 +65,8 @@ pub struct GetBlockRequest {
     pub height: BlockHeight,
     /// What the requester will do with the block.
     pub intent: BlockIntent,
+    /// The block the requester needs at `height`, when it knows which.
+    pub hash: Option<BlockHash>,
     /// Per-category inventory of hashes already held locally. Bodies
     /// matching these filters may be omitted from the response.
     pub inventory: Inventory,
@@ -73,8 +81,24 @@ impl GetBlockRequest {
         Self {
             height,
             intent,
+            hash: None,
             inventory: Inventory::empty(),
         }
+    }
+
+    /// Name the one block at the height that answers the request.
+    #[must_use]
+    pub const fn naming(mut self, hash: BlockHash) -> Self {
+        self.hash = Some(hash);
+        self
+    }
+
+    /// Whether a block hashing to `hash` answers the request: any block
+    /// at the height when the request names none, the named one when it
+    /// does.
+    #[must_use]
+    pub fn names(&self, hash: BlockHash) -> bool {
+        self.hash.is_none_or(|named| named == hash)
     }
 
     /// Attach the requester's inventory so the responder can elide bodies
@@ -119,7 +143,22 @@ mod tests {
         let request = GetBlockRequest::new(BlockHeight::new(42), BlockIntent::Execute);
         assert_eq!(request.height, BlockHeight::new(42));
         assert_eq!(request.intent, BlockIntent::Execute);
+        assert_eq!(request.hash, None);
         assert!(request.inventory.is_empty());
+    }
+
+    #[test]
+    fn a_request_naming_a_block_is_answered_by_that_block_only() {
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
+        let loser = BlockHash::from_raw(Hash::from_bytes(b"loser"));
+        let open = GetBlockRequest::new(BlockHeight::new(4), BlockIntent::Execute);
+        assert!(open.names(winner) && open.names(loser));
+        let named = open.naming(winner);
+        assert!(named.names(winner));
+        assert!(!named.names(loser));
+
+        let decoded: GetBlockRequest = hbor_from_slice(&hbor_to_vec(&named).unwrap()).unwrap();
+        assert_eq!(decoded.hash, Some(winner));
     }
 
     #[test]
