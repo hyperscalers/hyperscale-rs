@@ -2,8 +2,9 @@
 //! against the committed beacon placement.
 //!
 //! A join opens storage off the loop, snap-syncs a fresh store against the
-//! beacon-attested anchor, and seats the shard's vnodes on a new pinned
-//! thread; a leave refcounts memberships down and tears the thread, maps,
+//! beacon-attested anchor (parking until this host's topology carries one,
+//! unless the shard's chain runs from network genesis), and seats the
+//! shard's vnodes on a new pinned thread; a leave refcounts memberships down and tears the thread, maps,
 //! and storage down at zero. The reconcile pair is the committed-state
 //! backstop: [`ShardSupervisor::reconcile_joins`] brings up any shard a
 //! local validator holds a consensus seat in that a lost delta never
@@ -58,10 +59,11 @@ pub enum Rebuild {
 impl ShardSupervisor {
     /// Bring up `shard`: open its storage off this loop, then continue
     /// in [`Self::on_opened`] — seat directly for a retained store or a
-    /// genesis replay, or snap-sync against the beacon-attested anchor
-    /// first. A join for a shard still tearing down queues and replays
-    /// once the teardown finishes; one for a shard already running seats
-    /// into its loop.
+    /// genesis replay, snap-sync against the beacon-attested anchor
+    /// first, or park until the anchor reaches this host. A join for a
+    /// shard still tearing down queues and replays once the teardown
+    /// finishes; one for a shard already running seats into its loop,
+    /// and one for a shard parked on its anchor joins the parked vnodes.
     pub(super) fn join(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
         if self.bootstrapping.contains_key(&shard) {
             warn!(shard = ?shard, "Join rejected: shard still bootstrapping");
@@ -106,6 +108,15 @@ impl ShardSupervisor {
             self.seat_on_running(shard, vnodes);
             return;
         }
+        if let Some(parked) = self.awaiting_anchor.get_mut(&shard) {
+            for vnode in vnodes {
+                if !parked.iter().any(|v| v.validator_id == vnode.validator_id) {
+                    parked.push(vnode.clone());
+                }
+            }
+            info!(shard = ?shard, "Join parked with the shard's others awaiting its anchor");
+            return;
+        }
 
         // The RocksDB open (and a previously-used store's recovery
         // read) can stall on disk; run it off the loop and continue in
@@ -140,14 +151,20 @@ impl ShardSupervisor {
 
     /// Continue a join whose storage open finished.
     ///
-    /// Three paths by what the store and the beacon offer:
+    /// Four paths by what the store and this host's topology offer:
     /// - **retained storage** (committed height > 0) — seat directly;
     ///   normal block sync covers the tail;
     /// - **fresh store, attested anchor** — snap-sync bootstrap off
     ///   this loop (a tokio task), seated via [`Self::finish_join`]
     ///   when the import verifies against the anchor;
-    /// - **fresh store, no anchor** — seat directly and replay from
-    ///   genesis through block sync.
+    /// - **fresh store, genesis-born shard with no crossing yet** — seat
+    ///   directly and replay the chain from genesis through block sync;
+    /// - **fresh store, no anchor otherwise** — the shard's chain began
+    ///   past genesis, or has crossed a boundary this host's topology has
+    ///   not yet folded, so a genesis replay has nothing to start from.
+    ///   The store is dropped unseated and the join parks in
+    ///   `awaiting_anchor`, retried by [`Self::reconcile_joins`] once the
+    ///   anchor arrives.
     pub(super) fn on_opened(
         &mut self,
         shard: ShardId,
@@ -182,8 +199,8 @@ impl ShardSupervisor {
         vnodes.truncate(pending);
 
         let fresh_store = recovered.committed_height == BlockHeight::GENESIS;
-        let anchor = self.process.topology_snapshot().load().boundary(shard);
-        if fresh_store && anchor.is_some() {
+        let topology_snapshot = self.process.topology_snapshot().load_full();
+        if fresh_store && topology_snapshot.boundary(shard).is_some() {
             let process = Arc::clone(&self.process);
             let events = self.events_tx.clone();
             self.tokio_handle.spawn(async move {
@@ -214,6 +231,12 @@ impl ShardSupervisor {
             return;
         }
         self.bootstrapping.remove(&shard);
+        if fresh_store && !topology_snapshot.genesis_unanchored(shard) {
+            drop(storage);
+            info!(shard = ?shard, "Join parked until this host's topology carries the shard's anchor");
+            self.awaiting_anchor.insert(shard, vnodes);
+            return;
+        }
         self.seat_shard(shard, &vnodes, storage, &recovered);
     }
 
@@ -587,6 +610,14 @@ impl ShardSupervisor {
             }
             return;
         }
+        if let Some(parked) = self.awaiting_anchor.get_mut(&shard) {
+            parked.pop();
+            if parked.is_empty() {
+                self.awaiting_anchor.remove(&shard);
+                info!(shard = ?shard, "Last parked vnode left; join awaiting the anchor abandoned");
+            }
+            return;
+        }
         let Some(entry) = self.shards.get_mut(&shard) else {
             warn!(shard = ?shard, "Leave rejected: shard not hosted");
             return;
@@ -703,9 +734,26 @@ impl ShardSupervisor {
     /// and lost its queued replay, or work missed across a restart — so a
     /// dropped delta cannot strand the host off a shard it must run. Idempotent:
     /// the guards skip every shard already accounted for, and [`Self::join`]
-    /// rejects a double bring-up regardless. Run on the reshape tick.
+    /// rejects a double bring-up regardless. A join parked on its shard's
+    /// anchor is retried here once this host's topology carries it. Run on
+    /// the reshape tick.
     pub(crate) fn reconcile_joins(&mut self) {
         let topology_snapshot = self.process.topology_snapshot().load_full();
+        let anchored: Vec<ShardId> = self
+            .awaiting_anchor
+            .keys()
+            .copied()
+            .filter(|&shard| {
+                topology_snapshot.boundary(shard).is_some()
+                    || topology_snapshot.genesis_unanchored(shard)
+            })
+            .collect();
+        for shard in anchored {
+            if let Some(vnodes) = self.awaiting_anchor.remove(&shard) {
+                info!(shard = ?shard, "Retrying a join parked on its anchor");
+                self.join(shard, &vnodes);
+            }
+        }
         let host_ids: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
         // A running shard seats a local member it does not yet carry.
         let running: Vec<ShardId> = self
@@ -727,6 +775,7 @@ impl ShardSupervisor {
                     && !self.bootstrapping.contains_key(&shard)
                     && !self.draining.contains(&shard)
                     && !self.pending_joins.contains_key(&shard)
+                    && !self.awaiting_anchor.contains_key(&shard)
                     && !self.reshape.is_seating(shard)
                     && !self.reshape_stores.contains_key(&shard)
             })

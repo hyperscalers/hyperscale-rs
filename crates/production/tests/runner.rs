@@ -7,7 +7,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -506,4 +506,93 @@ async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
     .expect("the rebuilt store is seated");
 
     cluster.shutdown().await;
+}
+
+/// A join whose fresh store finds no attested anchor parks rather than
+/// seating at genesis, unless the shard's chain runs from network genesis
+/// with no crossing yet; the reshape tick retries it once this host's
+/// topology says the shard is seatable. ROOT here never crosses (its one
+/// seat runs nowhere), so the beacon projects it as a genesis replay; the
+/// test withholds that from the view to park the join, then restores it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
+    let messages = Messages::default();
+    let _ = Registry::default()
+        .with(messages.clone())
+        .with(fmt::layer().with_test_writer())
+        .try_init();
+
+    let fixtures = TestFixtures::with_surplus(47, 1, 1);
+    let surplus = ValidatorId::new(1);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[1], vec![], None);
+
+    let topology = Arc::clone(runner.topology_snapshot());
+    let reconfigure = runner.reconfigure_handle();
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
+    let handle = spawn(runner.run());
+    sleep(Duration::from_millis(200)).await;
+
+    let projected = topology.load_full();
+    assert!(
+        projected.boundary(ShardId::ROOT).is_none() && projected.genesis_unanchored(ShardId::ROOT),
+        "the beacon projects a genesis shard with no crossing as a genesis replay"
+    );
+    topology.store(Arc::new(
+        (*projected)
+            .clone()
+            .with_genesis_unanchored(BTreeSet::new()),
+    ));
+
+    reconfigure
+        .send(ShardCommand::Join {
+            shard: ShardId::ROOT,
+            vnodes: vec![VnodeConfig {
+                validator_id: surplus,
+                local_shard: ShardId::ROOT,
+                signer: fixtures.signer(1),
+            }],
+        })
+        .await
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while !messages
+            .contains("Join parked until this host's topology carries the shard's anchor")
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a fresh store with no anchor parks the join");
+    // Reshape ticks pass with the view unchanged; the join stays parked.
+    sleep(Duration::from_millis(2_500)).await;
+    assert!(
+        !messages.contains("Shard joined at runtime"),
+        "a parked join seats nothing while the view carries no anchor"
+    );
+
+    topology.store(projected);
+    for (needle, what) in [
+        (
+            "Retrying a join parked on its anchor",
+            "the reshape tick retries the parked join",
+        ),
+        (
+            "Shard joined at runtime",
+            "the retried join seats the shard",
+        ),
+    ] {
+        timeout(CONNECTION_TIMEOUT, async {
+            while !messages.contains(needle) {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect(what);
+    }
+
+    drop(shutdown);
+    let result = timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "runner exits after seating");
+    assert!(result.unwrap().is_ok(), "runner returns Ok");
 }

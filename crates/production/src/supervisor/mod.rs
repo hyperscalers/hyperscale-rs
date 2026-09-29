@@ -234,6 +234,11 @@ pub struct ShardSupervisor {
     /// the [`SupervisorEvent::TornDown`] handler. Dropping them instead
     /// would lose the placement delta until restart.
     pending_joins: HashMap<ShardId, Vec<VnodeConfig>>,
+    /// Joins whose fresh store found no attested anchor for a shard that
+    /// did not begin at network genesis. Nothing is seated; the reshape
+    /// tick's [`Self::reconcile_joins`] retries each once this host's
+    /// topology carries the anchor.
+    awaiting_anchor: BTreeMap<ShardId, Vec<VnodeConfig>>,
     /// Background-work completions land here; the runner's select loop
     /// drains the paired receiver into [`Self::on_event`].
     events_tx: mpsc::UnboundedSender<SupervisorEvent>,
@@ -302,6 +307,7 @@ impl ShardSupervisor {
             epoch_duration_ms,
             draining: HashSet::new(),
             pending_joins: HashMap::new(),
+            awaiting_anchor: BTreeMap::new(),
             pool: None,
             beacon_event_rx,
             vnode_keys,

@@ -124,6 +124,12 @@ pub struct TopologySnapshot {
     /// dissolve. Unlike the window-frozen projections this is the live head
     /// value, since it gates a runtime handoff, not a window's verification.
     advanced: BTreeSet<ShardId>,
+    /// Shards born at network genesis whose first boundary crossing the
+    /// beacon has not yet observed — projected live from the zeroed
+    /// genesis placeholders in `BeaconState.boundaries`. Such a shard has
+    /// no attested anchor, and its whole chain from genesis is the history
+    /// a fresh store replays. A live head value, like `advanced`.
+    genesis_unanchored: BTreeSet<ShardId>,
     /// Per-shard beacon-witness window base for the window this snapshot
     /// governs, projected from `BeaconState.witness_window_bases`.
     /// Absent shards read as `ZERO` (nothing consumed).
@@ -256,6 +262,7 @@ impl TopologySnapshot {
             shard_committees,
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            genesis_unanchored: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -306,6 +313,7 @@ impl TopologySnapshot {
             shard_committees,
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            genesis_unanchored: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -365,6 +373,7 @@ impl TopologySnapshot {
             shard_committees: committees,
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            genesis_unanchored: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -467,6 +476,7 @@ impl TopologySnapshot {
             scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            genesis_unanchored: BTreeSet::new(),
             pending_recoveries: BTreeMap::new(),
             recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
@@ -530,6 +540,16 @@ impl TopologySnapshot {
     #[must_use]
     pub fn with_advanced(mut self, advanced: BTreeSet<ShardId>) -> Self {
         self.advanced = advanced;
+        self
+    }
+
+    /// Set the genesis-born shards with no attested crossing yet (see
+    /// [`Self::genesis_unanchored`]). Defaults empty; the beacon
+    /// projection supplies the live value. Builder-set under the
+    /// [`Self::with_advanced`] rationale.
+    #[must_use]
+    pub fn with_genesis_unanchored(mut self, genesis_unanchored: BTreeSet<ShardId>) -> Self {
+        self.genesis_unanchored = genesis_unanchored;
         self
     }
 
@@ -982,13 +1002,21 @@ impl TopologySnapshot {
 
     /// The shard's beacon-attested boundary anchor.
     ///
-    /// `None` means the shard has no attested anchor — either the shard is
-    /// unknown or it has not yet had a committed boundary crossing — so a
-    /// bootstrapping joiner falls back to genesis replay instead of
-    /// snap-sync.
+    /// `None` means this view carries no attested anchor for the shard —
+    /// the shard is unknown here, or has not yet had a committed boundary
+    /// crossing. A fresh store replays from genesis only a shard
+    /// [`Self::genesis_unanchored`] names; any other waits for the anchor.
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
         self.boundaries.get(&shard).copied()
+    }
+
+    /// Whether `shard` was born at network genesis and the beacon has
+    /// observed none of its boundary crossings: it has no anchor to
+    /// snap-sync from, and a fresh store replays its chain from genesis.
+    #[must_use]
+    pub fn genesis_unanchored(&self, shard: ShardId) -> bool {
+        self.genesis_unanchored.contains(&shard)
     }
 
     /// Every shard's beacon-attested boundary anchor this snapshot

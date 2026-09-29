@@ -1906,10 +1906,12 @@ impl BeaconState {
             consensus_members.into_iter().collect();
 
         // Project each shard's snap-sync anchor into the snapshot.
-        // Genesis seeds zeroed placeholder boundaries until a shard's first
+        // Zeroed placeholder boundaries stand in until a shard's first
         // observed crossing; those aren't attested anchors, so they don't
-        // project — `boundary(shard)` returns `None` and a joiner replays
-        // from genesis instead of snap-syncing.
+        // project — `boundary(shard)` returns `None`. A placeholder genesis
+        // seeded projects into `genesis_unanchored` instead: a joiner
+        // replays that chain from genesis, and waits for any other
+        // shard's anchor.
         let boundaries: BTreeMap<ShardId, ShardAnchor> = self
             .boundaries
             .iter()
@@ -1929,6 +1931,16 @@ impl BeaconState {
                     },
                 )
             })
+            .collect();
+        let genesis_unanchored: BTreeSet<ShardId> = self
+            .boundaries
+            .iter()
+            .filter(|(_, b)| {
+                b.block_hash == BlockHash::ZERO
+                    && b.last_live_epoch == Epoch::GENESIS
+                    && b.terminal_epoch.is_none()
+            })
+            .map(|(sid, _)| *sid)
             .collect();
 
         let witness_bases: HashMap<ShardId, BeaconWitnessLeafCount> =
@@ -1957,6 +1969,7 @@ impl BeaconState {
         .with_scheduled_terminals(scheduled_terminals)
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
+        .with_genesis_unanchored(genesis_unanchored)
         .with_pending_recoveries(self.pending_recoveries.clone())
         .with_recoveries(self.recoveries.clone())
         .with_seeds(seeds)
@@ -2262,6 +2275,59 @@ mod tests {
         // Fewer eligible than a committee still floors at one epoch.
         state = single_pool_state(2);
         assert_eq!(state.beacon_recency_period(), 1);
+    }
+
+    /// Only a genesis-born placeholder projects as a genesis replay: a
+    /// runtime-born pending record has no genesis of the network's to
+    /// replay, and an attested boundary projects as the anchor.
+    #[test]
+    fn only_a_genesis_placeholder_projects_as_a_genesis_replay() {
+        let mut state = empty_state();
+        state.current_epoch = Epoch::new(5);
+        let genesis_shard = ShardId::leaf(2, 0);
+        let runtime_child = ShardId::leaf(2, 1);
+        let anchored = ShardId::leaf(2, 2);
+        let pending = |creation: Epoch| ShardBoundary {
+            used: DeclaredWork::ZERO,
+            blocks: 0,
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::GENESIS,
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            cumulative_fees: 0,
+            substate_bytes: 0,
+            last_live_epoch: creation,
+            consecutive_misses: 0,
+            terminal_epoch: None,
+            handoff_complete: None,
+            terminal_delivered: false,
+            terminal_settled_txs: None,
+            reshape_admitted_epoch: None,
+        };
+        state
+            .boundaries
+            .insert(genesis_shard, pending(Epoch::GENESIS));
+        state
+            .boundaries
+            .insert(runtime_child, pending(Epoch::new(4)));
+        state.boundaries.insert(
+            anchored,
+            ShardBoundary {
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"crossed")),
+                height: BlockHeight::new(9),
+                ..pending(Epoch::GENESIS)
+            },
+        );
+
+        let snapshot = state.derive_topology_snapshot(NetworkDefinition::simulator());
+        assert!(snapshot.genesis_unanchored(genesis_shard));
+        assert!(snapshot.boundary(genesis_shard).is_none());
+        assert!(!snapshot.genesis_unanchored(runtime_child));
+        assert!(snapshot.boundary(runtime_child).is_none());
+        assert!(!snapshot.genesis_unanchored(anchored));
+        assert!(snapshot.boundary(anchored).is_some());
     }
 
     /// The pending-anchor exclusion: a member placed at a runtime-born
