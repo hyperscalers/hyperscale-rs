@@ -1924,9 +1924,10 @@ impl BeaconCoordinator {
                 "Witness chunk failed root recomputation — dropping",
             );
         }
-        // Re-drive now that this response landed: on success the next
-        // crossing's chunk, on failure the same range against another peer.
-        // A terminated shard sends no further source header to trigger it.
+        // Re-drive now that this response landed: on failure the same range
+        // against another peer, on success a newer crossing's chunk if one
+        // has been observed since. A terminated shard sends no further source
+        // header to trigger it.
         self.fetch_witness_chunk(shard_id)
     }
 
@@ -1992,13 +1993,21 @@ impl BeaconCoordinator {
                 chunk_end,
             )
         };
-        if chunk_end <= prior {
+        // A run already pooled is answered: asking again only re-delivers
+        // it, and every re-delivery re-drives the same ask. Where the host
+        // serves the source shard itself the answer comes back from its own
+        // store with no round trip, so the re-drive never yields.
+        if chunk_end <= prior
+            || self
+                .shard_source
+                .has_witness_chunk(shard, anchor, prior, chunk_end)
+        {
             return Vec::new();
         }
-        // The request goes out regardless of in-flight status: the runner's
-        // fetch dedups ids it already tracks, so a re-issue only revives a
-        // run whose earlier fetch was fulfilled without admission or
-        // abandoned. The tracker's record is for cancellation, not dedup.
+        // An unheld run goes out regardless of in-flight status: the
+        // runner's fetch dedups ids it already tracks, so a re-issue only
+        // revives a run whose earlier fetch was fulfilled without admission
+        // or abandoned. The tracker's record is for cancellation, not dedup.
         self.shard_source
             .register_pending_fetch(shard, block_height, anchor, prior, chunk_end);
         vec![Action::Fetch(FetchRequest::Ask {
@@ -5599,6 +5608,48 @@ mod tests {
         // cap binds, the remainder follows once the watermark advances.
         assert_eq!(lo, LeafIndex::new(0));
         assert_eq!(hi, LeafIndex::new(MAX_WITNESSES_PER_SHARD as u64));
+    }
+
+    /// A pooled run is not asked for again until the fold moves past it.
+    /// Every landed response re-drives the fetch, so re-asking a held run
+    /// feeds itself: a host that serves the source shard answers from its
+    /// own store at once, and the loop never yields.
+    #[test]
+    fn a_pooled_witness_run_is_not_fetched_again() {
+        use hyperscale_types::ShardId;
+        let mut coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        let b = linked_block_header(shard, 5, BlockHash::ZERO, 1, 3);
+        let c = linked_block_header(shard, 6, b.block_hash(), 300_001, 3);
+        coord.on_verified_source_header(&b);
+        let asked = |actions: &[Action]| {
+            actions.iter().find_map(|a| match a {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ShardWitnesses(runs),
+                    ..
+                }) => runs.first().copied(),
+                _ => None,
+            })
+        };
+        let (_, _, anchor, lo, hi) = asked(&coord.on_verified_source_header(&c))
+            .expect("an observed crossing asks for its run");
+        assert_eq!((lo, hi), (LeafIndex::new(0), LeafIndex::new(3)));
+
+        coord.shard_source.admit_chunk(
+            shard,
+            anchor,
+            lo.inner(),
+            (0..3)
+                .map(|i| ShardWitnessPayload::StakeDeposit {
+                    pool_id: StakePoolId::new(i),
+                    amount: Stake::from_whole_tokens(1),
+                })
+                .collect(),
+            Vec::new(),
+        );
+
+        assert_eq!(asked(&coord.fetch_witness_chunk(shard)), None);
+        assert_eq!(asked(&coord.on_verified_source_header(&c)), None);
     }
 
     #[test]
