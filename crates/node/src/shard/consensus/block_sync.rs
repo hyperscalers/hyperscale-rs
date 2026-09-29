@@ -396,7 +396,11 @@ where
 ///
 /// When the fetch named a block, any other block is dropped and the peer
 /// rejected: the request said which block answers, and serving another
-/// is not an answer. "Peer doesn't have this height" is ambiguous (the
+/// is not an answer. The height backs off as for any other block a peer
+/// serves wrongly, so with no reachable holder of the named block the
+/// refetches are paced rather than back to back. The backoff does not
+/// count toward an unfounded target: the named block is certified, so
+/// the height exists. "Peer doesn't have this height" is ambiguous (the
 /// peer may simply be behind) and never rejects.
 fn block_sync_answer(
     height: BlockHeight,
@@ -413,7 +417,7 @@ fn block_sync_answer(
                 return (
                     ShardScopedInput::BlockSyncFetchFailed {
                         height,
-                        kind: FetchFailureKind::Exhausted,
+                        kind: FetchFailureKind::Transport,
                     },
                     ResponseVerdict::Reject,
                 );
@@ -1335,7 +1339,7 @@ mod tests {
 
     /// A peer answering a fetch that names the winner with the loser it
     /// also holds has not answered: the block is dropped before it
-    /// reaches consensus, the height re-queues, and the peer is marked.
+    /// reaches consensus, the height backs off, and the peer is marked.
     #[test]
     fn a_fetch_naming_a_block_drops_any_other() {
         let block = Block::Live {
@@ -1362,7 +1366,10 @@ mod tests {
         let (input, verdict) = block_sync_answer(HEIGHT, Some(winner), response());
         assert!(matches!(
             input,
-            ShardScopedInput::BlockSyncFetchFailed { height, .. } if height == HEIGHT
+            ShardScopedInput::BlockSyncFetchFailed {
+                height,
+                kind: FetchFailureKind::Transport,
+            } if height == HEIGHT
         ));
         assert_eq!(verdict, ResponseVerdict::Reject);
 

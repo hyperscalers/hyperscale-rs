@@ -443,7 +443,7 @@ struct KeeperHalf {
     child: ShardId,
     bootstrap: Box<ShardBootstrap>,
     terminal: Option<(BlockHeader, QuorumCertificate)>,
-    terminal_requested: bool,
+    terminal_requested: Option<BlockHash>,
 }
 
 impl KeeperHalf {
@@ -452,7 +452,7 @@ impl KeeperHalf {
             child,
             bootstrap: Box::new(ShardBootstrap::state_only(child, anchor)),
             terminal: None,
-            terminal_requested: false,
+            terminal_requested: None,
         }
     }
 
@@ -465,7 +465,7 @@ impl KeeperHalf {
             child,
             bootstrap: Box::new(ShardBootstrap::state_only(child, terminal_anchor(header))),
             terminal: Some((header.clone(), sighting.canonical_qc.clone())),
-            terminal_requested: true,
+            terminal_requested: None,
         }
     }
 }
@@ -841,7 +841,7 @@ impl ReshapeOrchestrator {
                             FetchKind::StateRange { sub_range, .. } => {
                                 half.bootstrap.on_state_range_failure(sub_range);
                             }
-                            FetchKind::Block { .. } => half.terminal_requested = false,
+                            FetchKind::Block { .. } => half.terminal_requested = None,
                             // A building half walks no headers.
                             FetchKind::Headers { .. } => {}
                         }
@@ -912,11 +912,23 @@ impl ReshapeOrchestrator {
             }
             // A building half walks no headers.
             FetchedKind::Headers { .. } => {}
+            // Only the anchored terminal is recorded; anything else leaves
+            // the half without one, and the next advance asks again.
             FetchedKind::Block { response } => {
+                let expected = half.terminal_requested.take();
                 if let Some(elided) = &response.certified {
-                    half.terminal = Some((elided.header().clone(), elided.qc().clone()));
+                    let served = elided.header().hash();
+                    if expected == Some(served) {
+                        half.terminal = Some((elided.header().clone(), elided.qc().clone()));
+                    } else {
+                        tracing::warn!(
+                            child = ?half.child,
+                            ?served,
+                            ?expected,
+                            "a keeper's terminal fetch returned a block other than the anchored terminal"
+                        );
+                    }
                 }
-                half.terminal_requested = false;
             }
         }
     }
@@ -1244,12 +1256,11 @@ impl ReshapeOrchestrator {
             }
             ObserverPhase::FetchingTerminal { anchor, requested } => {
                 if !*requested {
-                    let terminal = anchor.height.prev().unwrap_or(anchor.height);
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
                         from: child,
                         kind: FetchKind::Block {
-                            request: GetBlockRequest::new(terminal, BlockIntent::Execute),
+                            request: split_terminal_request(view, duty.parent, anchor),
                         },
                     });
                     *requested = true;
@@ -1712,12 +1723,11 @@ impl ReshapeOrchestrator {
                 // The seed gates on the local parent reaching the terminal, so
                 // the host's own retained chain serves the certified terminal.
                 if !*requested {
-                    let terminal = anchor.height.prev().unwrap_or(anchor.height);
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
                         from: parent,
                         kind: FetchKind::Block {
-                            request: GetBlockRequest::new(terminal, BlockIntent::Execute),
+                            request: split_terminal_request(view, parent, anchor),
                         },
                     });
                     *requested = true;
@@ -1754,6 +1764,29 @@ impl ReshapeOrchestrator {
         if let Some(phase) = next {
             duty.phase = phase;
         }
+    }
+}
+
+/// The fetch for a split parent's certified terminal, the block just
+/// below the child's seeded genesis.
+///
+/// The fold that seeds the child's anchor from the terminal contribution
+/// records that same crossing as the parent's boundary, so while the
+/// parent's record stands at the terminal's height it names the block: a
+/// certified sibling at the height does not answer. A record at any other
+/// height is not this crossing, and the request asks by height alone.
+fn split_terminal_request(
+    view: &ReshapeView,
+    parent: ShardId,
+    child_anchor: &ShardAnchor,
+) -> GetBlockRequest {
+    let terminal = child_anchor.height.prev().unwrap_or(child_anchor.height);
+    let request = GetBlockRequest::new(terminal, BlockIntent::Execute);
+    match view.boundary(parent) {
+        Some(record) if record.height == terminal && record.terminal_epoch.is_some() => {
+            request.naming(record.block_hash)
+        }
+        _ => request,
     }
 }
 
@@ -1868,7 +1901,7 @@ fn advance_keeper_half(
         });
     }
     if half.terminal.is_none()
-        && !half.terminal_requested
+        && half.terminal_requested.is_none()
         && let Some(anchor) = view.boundary(half.child)
     {
         // A merging child's boundary anchors its terminal crossing directly —
@@ -1885,7 +1918,7 @@ fn advance_keeper_half(
                     .naming(anchor.block_hash),
             },
         });
-        half.terminal_requested = true;
+        half.terminal_requested = Some(anchor.block_hash);
     }
 }
 
@@ -1895,17 +1928,23 @@ mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Bytes;
+    use hyperscale_storage::test_helpers::{
+        make_test_block, make_test_block_with_anchor_wt, make_test_certified,
+    };
+    use hyperscale_types::network::request::GetBlockRequest;
+    use hyperscale_types::network::response::GetBlockResponse;
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, LocalTimestamp,
-        NetworkDefinition, ReshapeSeat, ShardAnchor, ShardId, Signer, StateRoot, TopologySchedule,
-        TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, WeightedTimestamp,
+        BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, ElidedCertifiedBlock, Epoch, Hash,
+        Inventory, LocalTimestamp, NetworkDefinition, ReshapeSeat, ShardAnchor, ShardId, Signer,
+        StateRoot, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
+        WeightedTimestamp,
     };
 
     use super::{
-        FetchKind, KeeperDuty, KeeperMember, KeeperPhase, KeeperRecognition, ObserverDuty,
-        ObserverPhase, ParentHalfDuty, ParentHalfPhase, ReshapeEvent, ReshapeOrchestrator,
-        ReshapeRequest,
+        FetchKind, FetchedKind, KeeperDuty, KeeperMember, KeeperPhase, KeeperRecognition,
+        ObserverDuty, ObserverPhase, ParentHalfDuty, ParentHalfPhase, ReshapeEvent,
+        ReshapeOrchestrator, ReshapeRequest, split_terminal_request,
     };
     use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
     use crate::reshape::view::ReshapeView;
@@ -2991,6 +3030,137 @@ mod tests {
                 KeeperPhase::ReassertingReady | KeeperPhase::Building { .. }
             ),
             "the walk must hand back to the re-assert, which builds on the anchor",
+        );
+    }
+
+    /// The block fetches a duty emitted from `from`, as their requests.
+    fn block_fetches(requests: &[ReshapeRequest], from_shard: ShardId) -> Vec<GetBlockRequest> {
+        requests
+            .iter()
+            .filter_map(|r| match r {
+                ReshapeRequest::Fetch {
+                    from,
+                    kind: FetchKind::Block { request },
+                    ..
+                } if *from == from_shard => Some(request.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A split's terminal fetch names the parent's terminal crossing, the
+    /// block the parent's own boundary records one below the child's
+    /// seeded genesis; a record at another height is not that crossing,
+    /// and the fetch asks by height alone.
+    #[test]
+    fn a_split_terminal_fetch_names_the_parents_terminal_crossing() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let terminal_hash = BlockHash::from_raw(Hash::from_bytes(b"terminal"));
+        let parent_record = |height| ShardAnchor {
+            block_hash: terminal_hash,
+            height: BlockHeight::new(height),
+            terminal_epoch: Some(Epoch::new(3)),
+            ..anchor()
+        };
+        let observing = |record: ShardAnchor| {
+            let snap = snapshot(&[(child, &[1, 2])], &[], &[])
+                .with_boundaries(BTreeMap::from([(parent, record), (child, anchor())]));
+            let schedule = windowed(&snap);
+            let view = ReshapeView::new(&schedule);
+            assert_eq!(
+                split_terminal_request(&view, parent, &anchor()).hash,
+                (record.height == BlockHeight::new(7)).then_some(terminal_hash),
+                "the parent half's fetch names the same block",
+            );
+            let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+            orch.observers.insert(
+                child,
+                observer_duty(
+                    parent,
+                    child,
+                    5,
+                    ObserverPhase::FetchingTerminal {
+                        anchor: anchor(),
+                        requested: false,
+                    },
+                ),
+            );
+            let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+            let fetches = block_fetches(&requests, child);
+            assert_eq!(fetches.len(), 1, "got {requests:?}");
+            assert_eq!(fetches[0].height, BlockHeight::new(7));
+            fetches[0].hash
+        };
+        assert_eq!(observing(parent_record(7)), Some(terminal_hash));
+        assert_eq!(observing(parent_record(5)), None);
+    }
+
+    /// A keeper records only the anchored terminal: a fetch answered with
+    /// another block at the height leaves the half without a terminal and
+    /// asks again, and the anchored block ends the fetching.
+    #[test]
+    fn a_keeper_records_only_the_anchored_terminal() {
+        let parent = ShardId::ROOT;
+        let (left, right) = parent.children();
+        let terminal = make_test_block(BlockHeight::new(8));
+        let sibling = make_test_block_with_anchor_wt(BlockHeight::new(8), 5);
+        assert_ne!(terminal.hash(), sibling.hash());
+        let served = |block: &Block| ReshapeEvent::Fetched {
+            duty: parent,
+            from: left,
+            kind: FetchedKind::Block {
+                response: Box::new(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+                    block,
+                    make_test_certified(block.clone()).qc().clone(),
+                    &Inventory::empty(),
+                ))),
+            },
+        };
+        let snap = build(
+            &[(parent, &[5, 6]), (left, &[1, 2]), (right, &[3, 4])],
+            &[],
+            &uncredited(&[(left, 5, parent)]),
+            &[],
+            &[parent, left, right],
+            ShardAnchor {
+                block_hash: terminal.hash(),
+                ..anchor()
+            },
+        );
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            vec![ReshapeEvent::Opened { shard: parent }],
+            at(0),
+        );
+        let fetches = block_fetches(&requests, left);
+        assert_eq!(fetches.len(), 1, "got {requests:?}");
+        assert_eq!(fetches[0].hash, Some(terminal.hash()));
+
+        let requests = orch.step(&view, &BlsVerifier, vec![served(&sibling)], at(0));
+        assert_eq!(
+            block_fetches(&requests, left).len(),
+            1,
+            "a sibling answer is dropped and the terminal asked for again; got {requests:?}",
+        );
+
+        let requests = orch.step(&view, &BlsVerifier, vec![served(&terminal)], at(0));
+        assert!(
+            block_fetches(&requests, left).is_empty(),
+            "the anchored terminal is recorded; got {requests:?}",
+        );
+        let KeeperPhase::Building { left: half, .. } = &orch.keepers[&parent].phase else {
+            panic!("the keeper builds the parent");
+        };
+        assert_eq!(
+            half.terminal.as_ref().map(|(header, _)| header.hash()),
+            Some(terminal.hash())
         );
     }
 }
