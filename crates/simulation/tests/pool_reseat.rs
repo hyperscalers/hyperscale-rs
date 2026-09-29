@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_simulation::{EPOCH_MS, JoinKind, SimulationRunner};
-use hyperscale_types::ShardId;
+use hyperscale_storage_memory::SimShardStorage;
+use hyperscale_types::{ShardId, ValidatorId, ValidatorStatus, shard_prefix_path};
 use tracing_test::traced_test;
 
 mod support;
@@ -167,6 +168,64 @@ fn partitioned_follower_catches_up_via_beacon_sync() {
         "the follower catches up to where the network was during the outage \
          ({caught_up} >= {network_tip})"
     );
+}
+
+/// A fresh store joining a genesis-born shard that has not yet crossed a
+/// boundary has no anchor to snap-sync from, and none is coming until the
+/// shard crosses. It seats at the network genesis instead: the block and
+/// state every member committed at birth, which block sync extends.
+#[traced_test]
+#[test]
+fn a_join_before_the_first_crossing_seats_at_genesis() {
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED);
+    let runner = cluster.runner_mut();
+    let (member_host, _) = committee_member_host(&*runner, ShardId::ROOT, None);
+    let (pool_host, validator) = pooled_validator(&*runner);
+    let topology = runner.host_topology(pool_host).expect("host topology");
+    assert!(
+        topology.boundary(ShardId::ROOT).is_none() && topology.genesis_unanchored(ShardId::ROOT),
+        "ROOT has not crossed, so it has no anchor and replays from genesis"
+    );
+
+    let kind = runner.join_shard(
+        pool_host,
+        validator,
+        ShardId::ROOT,
+        SimShardStorage::new(shard_prefix_path(ShardId::ROOT)),
+    );
+    assert_eq!(kind, JoinKind::Genesis);
+    assert_eq!(runner.pooled_len(pool_host), 0);
+
+    // Let the scheduled genesis commit land, before the members extend it.
+    runner.run_until(runner.now() + Duration::from_millis(1));
+    let genesis = |host| {
+        let coordinator = runner
+            .vnode_state_in(host, ShardId::ROOT)
+            .expect("the host runs ROOT")
+            .shard_coordinator();
+        (coordinator.committed_hash(), coordinator.jmt_root())
+    };
+    assert_eq!(
+        genesis(pool_host),
+        genesis(member_host),
+        "the joiner commits the block and state every member began from",
+    );
+}
+
+/// A host carrying a `Pooled` validator, and that validator.
+fn pooled_validator(runner: &SimulationRunner) -> (NodeIndex, ValidatorId) {
+    let (_, state) = runner
+        .beacon_storage(0)
+        .expect("host 0 exists")
+        .latest_committed()
+        .expect("beacon committed");
+    state
+        .validators
+        .iter()
+        .filter(|(_, record)| matches!(record.status, ValidatorStatus::Pooled))
+        .map(|(&id, _)| (runner.network().validator_to_node(id), id))
+        .find(|&(host, _)| runner.pooled_len(host) > 0)
+        .expect("a pooled validator follows the beacon on its host")
 }
 
 /// The host's committed beacon-chain tip epoch.

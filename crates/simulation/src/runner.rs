@@ -38,10 +38,10 @@ use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
-    BeaconChainConfig, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash, GenesisValidators,
-    LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees, ShardId, Signer,
-    StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
-    ValidatorSet, Verifier, cache, shard_prefix_path,
+    BeaconChainConfig, Block, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash,
+    GenesisValidators, LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees,
+    ShardId, Signer, StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifier, cache, shard_prefix_path,
 };
 use invariants::Invariants;
 use tracing::{debug, info, trace};
@@ -52,6 +52,10 @@ use crate::memo_verifier::MemoVerifier;
 mod invariants;
 pub mod membership;
 pub mod reshape;
+
+/// The proposer the network genesis block names; every store that installs
+/// the genesis builds the same block with it.
+const GENESIS_PROPOSER: ValidatorId = ValidatorId::new(0);
 
 /// Consensus crypto scheme the simulated validators run.
 ///
@@ -1060,19 +1064,13 @@ impl SimulationRunner {
     /// I/O from firing into an unwired network.
     fn run_genesis(&mut self, config: &GenesisConfig) {
         let shard = ShardId::ROOT;
-        let proposer = ValidatorId::new(0);
         let num_hosts = NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex");
         let hosts_for_shard: Vec<NodeIndex> = (0..num_hosts)
             .filter(|&h| self.hosts[h as usize].hosted_shards().any(|s| s == shard))
             .collect();
 
         for &host_index in &hosts_for_shard {
-            let i = host_index as usize;
-            let ShardGenesis {
-                block,
-                certified,
-                setup_output,
-            } = self.hosts[i].build_shard_genesis(shard, proposer, config);
+            let block = self.install_shard_genesis(host_index, shard, config);
             if host_index == hosts_for_shard[0] {
                 info!(
                     shard = ?shard,
@@ -1082,24 +1080,6 @@ impl SimulationRunner {
                     "Initialized genesis for the ROOT shard"
                 );
             }
-            self.drain_host_io(host_index);
-            self.process_step_output(host_index, setup_output);
-            self.schedule_event(
-                host_index,
-                self.now,
-                HostEvent::protocol(
-                    shard,
-                    ProtocolEvent::BlockCommitted {
-                        // A genesis block anchors its own committee.
-                        committee_anchor: certified
-                            .block()
-                            .header()
-                            .parent_qc()
-                            .weighted_timestamp(),
-                        certified,
-                    },
-                ),
-            );
         }
 
         // Drain every host's construction-time output: a follower pool arms
@@ -1114,6 +1094,37 @@ impl SimulationRunner {
         for host in &mut self.hosts {
             host.register_inbound_handlers();
         }
+    }
+
+    /// Run the network genesis ceremony for `shard` on `host`, whose store for
+    /// it is fresh, and schedule the genesis commit. Every store that runs it
+    /// builds the same block: the config and the proposer are the network's.
+    pub(crate) fn install_shard_genesis(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        config: &GenesisConfig,
+    ) -> Block {
+        let ShardGenesis {
+            block,
+            certified,
+            setup_output,
+        } = self.hosts[host as usize].build_shard_genesis(shard, GENESIS_PROPOSER, config);
+        self.drain_host_io(host);
+        self.process_step_output(host, setup_output);
+        self.schedule_event(
+            host,
+            self.now,
+            HostEvent::protocol(
+                shard,
+                ProtocolEvent::BlockCommitted {
+                    // A genesis block anchors its own committee.
+                    committee_anchor: certified.block().header().parent_qc().weighted_timestamp(),
+                    certified,
+                },
+            ),
+        );
+        block
     }
 
     // ═══════════════════════════════════════════════════════════════════════

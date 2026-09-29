@@ -61,9 +61,14 @@ pub enum JoinKind {
         /// The retained store's committed tip at rejoin.
         committed_height: BlockHeight,
     },
-    /// Fresh store, but this host's topology does not yet carry the
-    /// shard's attested anchor: nothing was seated, and the placement scan
-    /// retries next slice once the fold reaches the host.
+    /// Fresh store on a shard born at network genesis that has not yet
+    /// crossed a boundary: the store installs the network genesis and the
+    /// chain replays from it through block sync.
+    Genesis,
+    /// Fresh store, but this host's topology carries neither the shard's
+    /// attested anchor nor a genesis to replay: nothing was seated, and
+    /// the placement scan retries next slice once the fold reaches the
+    /// host.
     AwaitingAnchor,
 }
 
@@ -79,7 +84,9 @@ impl SimulationRunner {
     /// supervisor would: a retained store (committed past genesis)
     /// seats directly, a fresh store snap-syncs against the
     /// beacon-attested anchor through the [`ShardBootstrap`] sequencer,
-    /// served from the shard's current committee hosts.
+    /// served from the shard's current committee hosts, or replays from
+    /// the network genesis on a genesis-born shard that has not crossed a
+    /// boundary.
     ///
     /// # Panics
     ///
@@ -99,7 +106,9 @@ impl SimulationRunner {
     /// Seat a group of this host's committee members onto `shard` from one
     /// `storage`: a retained store (committed past genesis) resumes in place, a
     /// fresh store snap-syncs against the beacon-attested anchor through the
-    /// [`ShardBootstrap`] sequencer, served from the shard's current committee.
+    /// [`ShardBootstrap`] sequencer, served from the shard's current committee,
+    /// and a fresh store on a genesis-born shard with no crossing yet installs
+    /// the network genesis and replays the chain from it.
     ///
     /// The routing question is whether there is a chain to resume, so it reads
     /// the committed tip. That is not the question the import gate asks —
@@ -133,6 +142,10 @@ impl SimulationRunner {
                 .topology_snapshot()
                 .load_full();
             let Some(anchor) = snapshot.boundary(shard) else {
+                if snapshot.genesis_unanchored(shard) {
+                    self.seat_group_at_genesis(host, shard, validators, storage);
+                    return JoinKind::Genesis;
+                }
                 return JoinKind::AwaitingAnchor;
             };
             // A fresh store needs the engine bootstrap (system packages, the
@@ -159,6 +172,32 @@ impl SimulationRunner {
         };
         self.seat_group(host, shard, validators, storage, &recovered);
         kind
+    }
+
+    /// Mount `shard` on `host` over a fresh `storage` at the network genesis,
+    /// seating `validators` on it: the same ceremony the cluster ran at birth,
+    /// so the block every other store committed at genesis is the one this
+    /// store commits, and block sync carries the chain forward from there.
+    fn seat_group_at_genesis(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        validators: &[ValidatorId],
+        storage: SimShardStorage,
+    ) {
+        let recovered = storage.load_recovered_state(shard);
+        let inits: Vec<VnodeInit> = validators
+            .iter()
+            .map(|&validator| self.runtime_vnode_init(host, validator, shard, &recovered))
+            .collect();
+        for &validator in validators {
+            self.network.bind_validator(validator, host);
+        }
+        self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
+        self.install_shard_genesis(host, shard, &self.genesis_config());
+        for &validator in validators {
+            self.hosts[host as usize].drop_pooled_vnode(validator);
+        }
     }
 
     /// Mount `shard` on `host` over `storage`, seating `validators` from the
