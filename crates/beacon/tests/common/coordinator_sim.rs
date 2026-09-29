@@ -166,6 +166,9 @@ pub struct CoordinatorSim {
     /// partition — candidates, votes, and blocks all stop crossing;
     /// cleared by [`Self::clear_block_partition`].
     blocked_block_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
+    /// Crossing children held back from a replica, released by
+    /// [`Self::release_withheld_crossing_children`].
+    withheld_crossing_children: Vec<(usize, Arc<Verified<CertifiedBlockHeader>>)>,
 }
 
 impl CoordinatorSim {
@@ -270,6 +273,7 @@ impl CoordinatorSim {
             pending_vote_equivocations: BTreeMap::new(),
             blocked_proposal_pairs: BTreeSet::new(),
             blocked_block_pairs: BTreeSet::new(),
+            withheld_crossing_children: Vec::new(),
         }
     }
 
@@ -371,13 +375,49 @@ impl CoordinatorSim {
         state_root: StateRoot,
         leaf_count: u64,
     ) -> BlockHash {
+        self.deliver_boundary_crossing_withholding_child(
+            None, shard, b_height, pred_wt, b_wt, state_root, leaf_count,
+        )
+    }
+
+    /// [`Self::deliver_boundary_crossing`], except the replica at
+    /// `withheld_from` holds `B` but not its child `C`, so `B`'s commit
+    /// is not established there until
+    /// [`Self::release_withheld_crossing_children`].
+    #[allow(clippy::too_many_arguments)] // the crossing's shape plus the replica left short
+    pub fn deliver_boundary_crossing_withholding_child(
+        &mut self,
+        withheld_from: Option<usize>,
+        shard: ShardId,
+        b_height: u64,
+        pred_wt: u64,
+        b_wt: u64,
+        state_root: StateRoot,
+        leaf_count: u64,
+    ) -> BlockHash {
         let (b, payloads, range_proof) =
             Self::build_boundary_block(shard, b_height, pred_wt, state_root, leaf_count);
         // `C`'s parent QC is the canonical QC over `B` — a genuine `2f+1`
         // of the governing shard committee, the form the beacon's
         // boundary-QC verification authenticates.
         let canonical_qc = self.genuine_boundary_qc(shard, &b, b_wt);
-        self.deliver_crossing_pair(shard, &b, b_height, canonical_qc, &payloads, &range_proof)
+        self.deliver_crossing_pair(
+            shard,
+            &b,
+            b_height,
+            canonical_qc,
+            &payloads,
+            &range_proof,
+            withheld_from,
+        )
+    }
+
+    /// Seat every crossing child a replica was left short of.
+    pub fn release_withheld_crossing_children(&mut self) {
+        for (idx, c) in std::mem::take(&mut self.withheld_crossing_children) {
+            let actions = self.coordinators[idx].on_verified_source_header(&c);
+            self.absorb(idx, actions);
+        }
     }
 
     /// Build boundary block `B` for `shard` whose beacon-witness
@@ -456,7 +496,15 @@ impl CoordinatorSim {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(b_wt),
         );
-        self.deliver_crossing_pair(shard, &b, b_height, forged_qc, &payloads, &range_proof)
+        self.deliver_crossing_pair(
+            shard,
+            &b,
+            b_height,
+            forged_qc,
+            &payloads,
+            &range_proof,
+            None,
+        )
     }
 
     /// Seat boundary block `B`, its child `C` (carrying `canonical_qc` as
@@ -464,6 +512,9 @@ impl CoordinatorSim {
     /// shard-source tracker. Seating the chunk is what lets a proposer
     /// satisfy the witness-availability coupling and report `shard` in its
     /// `boundary_qcs`, and what lets the assembler embed the contribution.
+    /// The replica at `withheld_from` gets `B` and the chunk but not `C`,
+    /// which waits in `withheld_crossing_children`.
+    #[allow(clippy::too_many_arguments)] // the crossing's parts plus the replica left short
     fn deliver_crossing_pair(
         &mut self,
         shard: ShardId,
@@ -472,6 +523,7 @@ impl CoordinatorSim {
         canonical_qc: QuorumCertificate,
         payloads: &[ShardWitnessPayload],
         range_proof: &[Hash],
+        withheld_from: Option<usize>,
     ) -> BlockHash {
         let b_hash = b.block_hash();
         // `C`'s own beacon-witness fields are never read for `B`'s
@@ -488,8 +540,12 @@ impl CoordinatorSim {
         for idx in 0..self.coordinators.len() {
             let a_b = self.coordinators[idx].on_verified_source_header(b);
             self.absorb(idx, a_b);
-            let a_c = self.coordinators[idx].on_verified_source_header(&c);
-            self.absorb(idx, a_c);
+            if withheld_from == Some(idx) {
+                self.withheld_crossing_children.push((idx, Arc::clone(&c)));
+            } else {
+                let a_c = self.coordinators[idx].on_verified_source_header(&c);
+                self.absorb(idx, a_c);
+            }
             let a_w = self.coordinators[idx].on_shard_witnesses_received(
                 shard,
                 b_hash,
@@ -762,14 +818,20 @@ impl CoordinatorSim {
         let Some(env) = env else {
             return false;
         };
+        self.deliver_envelope(env);
+        true
+    }
+
+    /// Hand one envelope to its addressee, or consume it against the
+    /// addressee's drop counter.
+    fn deliver_envelope(&mut self, env: Envelope) {
         if self.drop_counters[env.to_idx] > 0 {
             self.drop_counters[env.to_idx] -= 1;
-            return true;
+            return;
         }
         let emitter_idx = env.to_idx;
         let actions = self.deliver(env);
         self.absorb(emitter_idx, actions);
-        true
     }
 
     /// Drive `step()` up to `max_steps` times or until both queues
@@ -783,6 +845,34 @@ impl CoordinatorSim {
             steps += 1;
         }
         steps
+    }
+
+    /// Fire the committee-start timer on `idx`: its SPC instance
+    /// bootstraps and its proposal goes out.
+    pub fn fire_committee_start(&mut self, idx: usize) {
+        let actions = self.coordinators[idx].on_beacon_committee_start_timer();
+        self.absorb(idx, actions);
+    }
+
+    /// Fire the proposal-collection dwell on `idx`.
+    pub fn fire_input_dwell(&mut self, idx: usize) {
+        let actions = self.coordinators[idx].on_spc_input_dwell_timer();
+        self.absorb(idx, actions);
+    }
+
+    /// Deliver the envelopes already in flight, and none of what they
+    /// provoke.
+    pub fn run_queued(&mut self) -> usize {
+        let queued: Vec<Envelope> = self
+            .network_q
+            .drain(..)
+            .chain(self.loopback_q.drain(..))
+            .collect();
+        let delivered = queued.len();
+        for env in queued {
+            self.deliver_envelope(env);
+        }
+        delivered
     }
 
     /// Fire `on_beacon_spc_view_timer` on every replica and absorb the

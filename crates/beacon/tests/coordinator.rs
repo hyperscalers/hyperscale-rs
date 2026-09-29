@@ -890,6 +890,57 @@ fn proposal_lost_on_gossip_is_fetched_before_the_feed() {
     }
 }
 
+/// A member that abstains on peers' proposals because a boundary block
+/// they name has not committed locally yet admits them from its own
+/// input-dwell refetch once the block commits: the gossip evaluation's
+/// dedup slot does not outlive the local state it abstained for.
+#[test]
+fn dwell_refetch_reevaluates_a_proposal_abstained_for_local_state() {
+    let mut sim = CoordinatorSim::new(4, 0xD7E2);
+    let lagging = 1;
+    let anchor = StateRoot::from_raw(Hash::from_bytes(b"shard-root-anchor"));
+    sim.deliver_boundary_crossing_withholding_child(
+        Some(lagging),
+        ShardId::ROOT,
+        5,
+        299_000,
+        301_000,
+        anchor,
+        3,
+    );
+    for idx in 0..sim.n() {
+        sim.fire_committee_start(idx);
+    }
+    sim.run_queued();
+    let peers = [
+        ValidatorId::new(0),
+        ValidatorId::new(2),
+        ValidatorId::new(3),
+    ];
+    for peer in peers {
+        assert!(
+            sim.coordinators[lagging]
+                .proposal_pool()
+                .get(peer)
+                .is_none(),
+            "the gossiped proposal from {peer:?} must be abstained on",
+        );
+    }
+
+    sim.release_withheld_crossing_children();
+    sim.fire_input_dwell(lagging);
+    sim.run_queued();
+    for peer in peers {
+        assert!(
+            sim.coordinators[lagging]
+                .proposal_pool()
+                .get(peer)
+                .is_some(),
+            "the dwell refetch of {peer:?}'s proposal must be admitted",
+        );
+    }
+}
+
 /// A partition stalls the beacon instead of forking it: with the
 /// pool as the single commit quorum, the committee majority's SPC
 /// candidate cannot ratify on its side of a partition (four of

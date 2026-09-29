@@ -256,8 +256,14 @@ pub struct BeaconCoordinator {
     /// vnode has already run the witness-admission gate over, regardless
     /// of outcome. Bounds the per-epoch verification work to one
     /// evaluation per committee member so a peer flooding distinct
-    /// forged proposals can't force unbounded signature/merkle checks. Cleared
-    /// on `adopt_block` alongside the proposal-pool reset.
+    /// forged proposals can't force unbounded signature/merkle checks.
+    /// The input dwell's ask for a member's proposal releases that
+    /// member's slot: an abstention for want of local state (a boundary
+    /// block not yet synced or committed here) says nothing about the
+    /// proposal, and the answer to the ask is evaluated afresh. The
+    /// dwell asks at most once per re-arm, so the work stays bounded by
+    /// [`MAX_INPUT_DWELL_REARMS`] per member. Cleared on `adopt_block`
+    /// alongside the proposal-pool reset.
     evaluated_proposers: BTreeSet<ValidatorId>,
 
     /// Committee members whose in-flight-epoch proposal the input dwell
@@ -1397,6 +1403,9 @@ impl BeaconCoordinator {
                 })
                 .copied()
                 .collect();
+            for member in &missing {
+                self.evaluated_proposers.remove(member);
+            }
             self.dwell_fetches.extend(missing.iter().copied());
             let mut actions = self.fetch_missing_proposals(epoch, &missing);
             actions.push(Action::SetTimer {
