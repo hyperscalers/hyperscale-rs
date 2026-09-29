@@ -166,7 +166,8 @@ pub(super) fn filter_and_roll_randomness<'a>(
     // only control a member has over the roll above). The committed
     // value is the f+1-shared prefix (`qc1_certify`), so under synchrony
     // an honest proposal reaching a supermajority cannot be forced
-    // absent; a member with no entry chose silence. One absence jails —
+    // absent, and the input dwell fetches any proposal a member missed on
+    // gossip; a member with no entry chose silence. One absence jails —
     // no counter — under `JailReason::Withholding`, held out for a full
     // recency period so a grinder cannot cycle its foothold back inside
     // one committee turnover.

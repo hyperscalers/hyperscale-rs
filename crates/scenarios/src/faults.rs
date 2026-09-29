@@ -1812,12 +1812,14 @@ pub fn cross_shard_provisions_recovers_after_transient_outage(c: &mut impl Fault
     );
 }
 
-/// Every channel a beacon commit needs. With all seven dropped the committee
-/// never reaches its vote threshold, so each epoch commits as a skip block:
-/// the topology schedule keeps advancing — shards stay live and keep crossing
-/// epoch cuts — while no shard contribution seats.
-pub const BEACON_COMMIT_CHANNELS: [&str; 7] = [
+/// Every channel a beacon commit needs, the proposal fetch included. With all
+/// eight dropped the committee never reaches its vote threshold, so each
+/// epoch commits as a skip block: the topology schedule keeps advancing —
+/// shards stay live and keep crossing epoch cuts — while no shard
+/// contribution seats.
+pub const BEACON_COMMIT_CHANNELS: [&str; 8] = [
     "beacon.proposal",
+    "beacon.proposal.request",
     "beacon.spc.new_view",
     "beacon.spc.new_commit",
     "beacon.spc.empty_view",

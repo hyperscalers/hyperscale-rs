@@ -853,6 +853,43 @@ fn missed_proposal_gossip_recovers_via_fetch_protocol() {
     );
 }
 
+/// A proposal lost on gossip to every peer is fetched from its proposer
+/// during the input dwell, so every replica feeds the same full vector:
+/// the proposer's entry commits and its absence is never read as
+/// withholding.
+#[test]
+fn proposal_lost_on_gossip_is_fetched_before_the_feed() {
+    let mut sim = CoordinatorSim::new(4, 0xD7E1);
+    let proposer = ValidatorId::new(0);
+    for peer in 1..4 {
+        sim.block_proposal_from(proposer, ValidatorId::new(peer));
+    }
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let commit = commits
+            .first()
+            .unwrap_or_else(|| panic!("replica {r} failed to commit epoch 1"));
+        assert!(
+            commit
+                .block
+                .block()
+                .committed_proposals()
+                .iter()
+                .any(|(id, _)| *id == proposer),
+            "replica {r} committed epoch 1 without the lost proposal",
+        );
+        assert!(
+            !matches!(
+                commit.state.validators.get(&proposer).map(|rec| rec.status),
+                Some(ValidatorStatus::Jailed { .. })
+            ),
+            "replica {r} jailed a proposer whose proposal was only lost on gossip",
+        );
+    }
+}
+
 /// A partition stalls the beacon instead of forking it: with the
 /// pool as the single commit quorum, the committee majority's SPC
 /// candidate cannot ratify on its side of a partition (four of

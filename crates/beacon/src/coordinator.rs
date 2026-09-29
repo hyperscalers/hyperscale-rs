@@ -260,6 +260,14 @@ pub struct BeaconCoordinator {
     /// on `adopt_block` alongside the proposal-pool reset.
     evaluated_proposers: BTreeSet<ValidatorId>,
 
+    /// Committee members whose in-flight-epoch proposal the input dwell
+    /// has asked peers for. A proposal lost on gossip still reaches
+    /// every member that fetches it, so a member absent from the fed
+    /// vector is one no reachable peer holds: the absence the
+    /// withholding jail reads is a choice, not a dropped message.
+    /// Released at feed and on epoch advance.
+    dwell_fetches: BTreeSet<ValidatorId>,
+
     /// Commit-assembly sub-machine. Stashes SPC-decided epochs whose
     /// committed proposals reference a `BeaconProposal` the local pool
     /// hasn't observed, tracks the fetches that resolve them, and decides
@@ -436,6 +444,7 @@ impl BeaconCoordinator {
             vote_equivocations_observed: VoteEquivocationObservations::new(),
             proposal_pool: BeaconProposalPool::new(latest_epoch.next()),
             evaluated_proposers: BTreeSet::new(),
+            dwell_fetches: BTreeSet::new(),
             commit_assembly: CommitAssembler::new(),
             local_shard,
             topology_schedule,
@@ -1173,7 +1182,22 @@ impl BeaconCoordinator {
     fn feed_view_one_input(&mut self, epoch: Epoch) -> Vec<Action> {
         let input = self.compute_view_one_input(epoch);
         let effects = self.spc.feed_view_one_input(input);
-        self.lift_from_spc(effects)
+        let mut actions: Vec<Action> = self.release_dwell_fetches().into_iter().collect();
+        actions.extend(self.lift_from_spc(effects));
+        actions
+    }
+
+    /// Abandon the dwell's outstanding proposal fetches once the input
+    /// no longer reads them. A fetch commit assembly also awaits stays
+    /// live: the committed vector needs its answer.
+    fn release_dwell_fetches(&mut self) -> Option<Action> {
+        let epoch = self.proposal_pool.epoch();
+        let released: Vec<(Epoch, ValidatorId)> = std::mem::take(&mut self.dwell_fetches)
+            .into_iter()
+            .filter(|validator| !self.commit_assembly.is_awaiting(epoch, *validator))
+            .map(|validator| (epoch, validator))
+            .collect();
+        (!released.is_empty()).then(|| Action::AbandonFetch(FetchIds::BeaconProposals(released)))
     }
 
     /// Build the PC input vector for view 1: one `PcValueElement` per
@@ -1341,9 +1365,10 @@ impl BeaconCoordinator {
 
     /// `TimerId::BeaconSpcInputDwell` fired: the proposal-collection
     /// dwell elapsed. Feed the view-1 input once every committee
-    /// member's proposal is pooled; otherwise re-arm the dwell to give a
-    /// laggard more time, up to [`MAX_INPUT_DWELL_REARMS`] re-arms — only
-    /// then feed whatever is pooled. Waiting for full coverage keeps
+    /// member's proposal is pooled; otherwise ask peers for each missing
+    /// proposal and re-arm the dwell to give a laggard more time, up to
+    /// [`MAX_INPUT_DWELL_REARMS`] re-arms — only then feed whatever is
+    /// pooled. Waiting for full coverage keeps
     /// honest nodes feeding the same positional vector; a partial vector
     /// diverges and the inner PC's prefix consensus collapses it to an
     /// empty commit. A no-op when the fast path already fed it, or when
@@ -1361,10 +1386,24 @@ impl BeaconCoordinator {
             .count();
         if pooled < self.state.committee.len() && self.input_dwell_rearms < MAX_INPUT_DWELL_REARMS {
             self.input_dwell_rearms += 1;
-            return vec![Action::SetTimer {
+            let missing: Vec<ValidatorId> = self
+                .state
+                .committee
+                .iter()
+                .filter(|member| {
+                    **member != self.me
+                        && !self.proposal_pool.contains(**member)
+                        && !self.dwell_fetches.contains(member)
+                })
+                .copied()
+                .collect();
+            self.dwell_fetches.extend(missing.iter().copied());
+            let mut actions = self.fetch_missing_proposals(epoch, &missing);
+            actions.push(Action::SetTimer {
                 id: TimerId::BeaconSpcInputDwell,
                 duration: SPC_INPUT_DWELL,
-            }];
+            });
+            return actions;
         }
         self.feed_view_one_input(epoch)
     }
@@ -2117,6 +2156,7 @@ impl BeaconCoordinator {
         }
         abandoned_witness_ids.extend(self.retire_departed_sources());
         let next_epoch = self.state.current_epoch.next();
+        let released_dwell_fetches = self.release_dwell_fetches();
         self.proposal_pool.reset(next_epoch);
         self.evaluated_proposers.clear();
 
@@ -2159,6 +2199,7 @@ impl BeaconCoordinator {
                 abandoned_proposals,
             )));
         }
+        actions.extend(released_dwell_fetches);
         // Release in-flight witness fetches the boundary fold just consumed
         // — their leaves are below the advanced watermark, so a future
         // contribution can't include them and the runner's slot should
@@ -2472,19 +2513,23 @@ impl BeaconCoordinator {
     }
 
     /// Handle a [`ProtocolEvent::BeaconProposalFetched`] dispatch:
-    /// verify the returned proposal under the named validator's
-    /// pubkey, admit it to the pool, and resume the stashed assembly
-    /// for `epoch` once every awaited fetch has resolved.
+    /// verify the returned proposal under the named validator's pubkey,
+    /// then hand it to whichever consumer asked.
     ///
-    /// Out-of-band responses — no stash for the named epoch, or
-    /// validator not in the awaiting set — drop silently.
+    /// A proposal commit assembly awaits is admitted straight to the
+    /// pool, and the stashed assembly for `epoch` resumes once every
+    /// awaited fetch has resolved. That admission skips the
+    /// witness-admission gate: it only ever resolves a proposal an
+    /// already-committed `PcVector` element references, so the embedded
+    /// witnesses are threshold-vouched (≥ f+1 honest voters verified them
+    /// before the value could commit), and the committed-proposal decode
+    /// pins the fetched bytes to that element by hash.
     ///
-    /// Unlike the gossip path, this admission doesn't re-run the
-    /// witness-admission gate: a fetch only ever resolves a proposal
-    /// referenced by an already-committed `PcVector` element, so the
-    /// embedded witnesses are threshold-vouched (≥ f+1 honest voters
-    /// verified them before the value could commit). The committed-proposal
-    /// decode pins the fetched bytes to that committed element by hash.
+    /// A proposal the input dwell asked for is not yet vouched for by
+    /// anyone, so it enters through [`Self::on_beacon_proposal_received`]
+    /// exactly as a gossiped copy would.
+    ///
+    /// Out-of-band responses drop silently.
     ///
     /// [`ProtocolEvent::BeaconProposalFetched`]: hyperscale_core::ProtocolEvent::BeaconProposalFetched
     pub fn on_beacon_proposal_fetched(
@@ -2494,35 +2539,17 @@ impl BeaconCoordinator {
         proposal: Arc<Verifiable<BeaconProposal>>,
     ) -> Vec<Action> {
         if !self.commit_assembly.is_awaiting(epoch, validator) {
-            return Vec::new();
-        }
-        if let Some(record) = self.state.validators.get(&validator) {
-            let ctx = BeaconProposalVerifyContext {
-                verifier: self.verifier.as_ref(),
-                network: &self.network,
-                epoch,
-                sender_pk: record.pubkey,
-            };
-            match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
-                Ok(verified) => {
-                    let _ = self
-                        .proposal_pool
-                        .admit(validator, epoch, Arc::new(verified));
-                }
-                Err((_, err)) => {
-                    warn!(
-                        ?validator,
-                        epoch = epoch.inner(),
-                        ?err,
-                        "Fetched BeaconProposal failed VRF verification — dropping",
-                    );
-                }
+            if epoch != self.proposal_pool.epoch() || !self.dwell_fetches.remove(&validator) {
+                return Vec::new();
             }
-        } else {
-            warn!(
-                ?validator,
-                "Fetched proposal's validator is not in BeaconState — dropping",
-            );
+            return self
+                .verify_fetched_proposal(epoch, validator, proposal)
+                .map_or_else(Vec::new, |verified| {
+                    self.on_beacon_proposal_received(validator, epoch, verified)
+                });
+        }
+        if let Some(verified) = self.verify_fetched_proposal(epoch, validator, proposal) {
+            let _ = self.proposal_pool.admit(validator, epoch, verified);
         }
         match self.commit_assembly.on_proposal_resolved(
             epoch,
@@ -2534,6 +2561,42 @@ impl BeaconCoordinator {
                 committed, cert, ..
             } => self.assemble_and_broadcast_candidate(epoch, committed, *cert),
             AssemblyDecision::AwaitFetch { .. } | AssemblyDecision::Idle => Vec::new(),
+        }
+    }
+
+    /// VRF-verify a fetched proposal under `validator`'s registered
+    /// pubkey, or `None` with a warn when the validator is unknown or
+    /// the reveal fails.
+    fn verify_fetched_proposal(
+        &self,
+        epoch: Epoch,
+        validator: ValidatorId,
+        proposal: Arc<Verifiable<BeaconProposal>>,
+    ) -> Option<Arc<Verified<BeaconProposal>>> {
+        let Some(record) = self.state.validators.get(&validator) else {
+            warn!(
+                ?validator,
+                "Fetched proposal's validator is not in BeaconState — dropping",
+            );
+            return None;
+        };
+        let ctx = BeaconProposalVerifyContext {
+            verifier: self.verifier.as_ref(),
+            network: &self.network,
+            epoch,
+            sender_pk: record.pubkey,
+        };
+        match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
+            Ok(verified) => Some(Arc::new(verified)),
+            Err((_, err)) => {
+                warn!(
+                    ?validator,
+                    epoch = epoch.inner(),
+                    ?err,
+                    "Fetched BeaconProposal failed VRF verification — dropping",
+                );
+                None
+            }
         }
     }
 

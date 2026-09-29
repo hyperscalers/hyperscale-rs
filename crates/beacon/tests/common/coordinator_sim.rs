@@ -709,20 +709,25 @@ impl CoordinatorSim {
     /// The dwell re-arms while waiting for full proposal coverage; in
     /// production the re-armed `BeaconSpcInputDwell` timer fires again
     /// every `SPC_INPUT_DWELL` until coverage completes or the re-arm
-    /// budget runs out. At quiescence no further proposals will arrive,
-    /// so model that by firing the dwell until it stops producing work
-    /// (it no-ops once it has fed, or when there is no instance).
+    /// budget runs out. Each fire may ask peers for a missing proposal,
+    /// and a dwell is long against a network hop, so the traffic one
+    /// round of fires queues is delivered before the next round. Rounds
+    /// continue until no dwell produces work (it no-ops once it has fed,
+    /// or when there is no instance).
     pub fn kick_off(&mut self) {
-        for idx in 0..self.n() {
-            // Bounded so a re-arm logic error can't spin forever; the
-            // budget itself is a handful of fires.
-            for _ in 0..32 {
+        // Bounded so a re-arm logic error can't spin forever; the budget
+        // itself is a handful of fires.
+        for _ in 0..32 {
+            let mut fired = false;
+            for idx in 0..self.n() {
                 let actions = self.coordinators[idx].on_spc_input_dwell_timer();
-                if actions.is_empty() {
-                    break;
-                }
+                fired |= !actions.is_empty();
                 self.absorb(idx, actions);
             }
+            if !fired {
+                break;
+            }
+            self.run_for_at_most(usize::MAX);
         }
         for idx in 0..self.n() {
             let actions = self.coordinators[idx].on_beacon_committee_start_timer();
@@ -800,6 +805,9 @@ impl CoordinatorSim {
                 // boundary by firing the timer; if the sim is still quiescent
                 // afterwards it is genuinely stuck.
                 self.kick_off();
+                if self.all_committed_at_least(target_commits) {
+                    break;
+                }
                 assert!(
                     self.step(),
                     "sim went quiescent at step {steps} even after starting the next \
