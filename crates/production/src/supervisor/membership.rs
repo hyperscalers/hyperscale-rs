@@ -931,8 +931,8 @@ fn shard_retired(
         .get(&shard)
         .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)));
     // A reshape predecessor mid-handoff stays up even once it ages out of the
-    // routable window: under make-before-break its committee keeps coasting and
-    // serving its terminal until the successors are live, so they can seed and
+    // routable window: under make-before-break its committee stays seated,
+    // serving its terminal, until the successors are live, so they can seed and
     // finalize against it.
     !host_in_committee(shard, topology_snapshot, host_ids)
         && !in_routing

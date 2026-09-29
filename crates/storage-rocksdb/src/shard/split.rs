@@ -171,10 +171,11 @@ impl RocksDbShardStorage {
     ///
     /// The parent chain coasts past its crossing before it stops — empty
     /// blocks whose no-op commits advance the JMT version with a frozen
-    /// root. Under make-before-break it coasts an unbounded number of them
-    /// (until its successors go live), so the checkpoint sits at the
-    /// crossing version or any height above it, and the frozen root makes
-    /// the extracted subtree identical at every one. Only a checkpoint from
+    /// root. It coasts until its committed chain carries the terminal's
+    /// commit proof, and a view change inside the coast puts that proof
+    /// any number of blocks above the crossing, so the checkpoint sits at
+    /// the crossing version or any height above it, and the frozen root
+    /// makes the extracted subtree identical at every one. Only a checkpoint from
     /// *below* the crossing is refused here — a stale or foreign store
     /// that never held the terminal's child-half writes. The plan's
     /// root-equality check is the real guarantee, and it rejects a

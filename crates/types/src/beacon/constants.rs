@@ -245,10 +245,11 @@ pub const RESHAPE_READY_TTL_EPOCHS: u64 = 8;
 /// executes before the handoff is flagged as stalled.
 ///
 /// Under make-before-break a predecessor coasts past its weighted-time cut
-/// until the beacon shows its successors live (a split's two children, or a
-/// merge's reformed parent, have produced past their seeded genesis). The
-/// terminal commits and serves reliably, so the successors should seat and
-/// produce well inside this bound. Measured from execution (the terminal
+/// until its committed chain proves the terminal committed, and its committee
+/// stays seated, serving the terminal, until the beacon shows its successors
+/// live (a split's two children, or a merge's reformed parent, have produced
+/// past their seeded genesis). The terminal commits and serves reliably, so
+/// the successors should seat and produce well inside this bound. Measured from execution (the terminal
 /// boundary's `terminal_epoch`), the analogue of [`RESHAPE_READY_TTL_EPOCHS`]
 /// for the post-execution phase. Sits a touch above the readiness TTL because
 /// the window also absorbs the empty-commit lag across the reshape committee

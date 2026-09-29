@@ -1514,7 +1514,7 @@ pub enum Action {
     ///
     /// Emitted by a chain quiescing at a reshape boundary, for the pool
     /// entries its terminal sweep does not reach. Repeated a few times
-    /// while it coasts and once more when its successors are live: the
+    /// while it awaits its successors and once more when they are live: the
     /// successors seat from the terminal cut, well ahead of the fold that
     /// shows them live, so an early offer usually lands and waiting for
     /// that fold would leave a client watching `Pending` for an epoch or

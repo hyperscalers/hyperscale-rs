@@ -128,10 +128,11 @@ where
                     // the header's own hash-pinned anchor and clamped to
                     // the shard's terminal window — not the head's.
                     // A split parent leaves the head's committees at its
-                    // cut and keeps coasting, broadcasting exactly the
-                    // headers the crossing tracker reads its terminal
-                    // QC off; against the head those resolve to an empty
-                    // committee and every receiver rejects them.
+                    // cut and coasts to its terminal's commit proof,
+                    // broadcasting exactly the headers the crossing tracker
+                    // reads its terminal QC off; against the head those
+                    // resolve to an empty committee and every receiver
+                    // rejects them.
                     let schedule = process.topology_schedule();
                     let Some((signing, _)) = schedule
                         .at_for_shard(header_shard, header.parent_qc().weighted_timestamp())

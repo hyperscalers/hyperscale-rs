@@ -490,9 +490,9 @@ impl ShardSourceTracker {
     /// gate drops it for a live shard.
     ///
     /// Only crossings `contributes` accepts are candidates. A terminating
-    /// chain coasts past its terminal until its successors are live, and a
-    /// coast long enough to cross another boundary records a crossing newer
-    /// than the terminal that no fold admits; sourcing it would have every
+    /// chain coasts past its terminal until its committed chain proves the
+    /// terminal committed, and a coast long enough to cross another boundary
+    /// records a crossing newer than the terminal that no fold admits; sourcing it would have every
     /// verifier abstain on the proposal carrying it.
     #[must_use]
     pub fn next_crossing_to_source(

@@ -1133,10 +1133,11 @@ fn record_boundaries(
 /// QC. The beacon can commit empty for several epochs across the
 /// reshape's committee transition, so a bare window would drop the record
 /// first — stranding the children on their placeholders, or the merge
-/// parent uncomposed. It is also the anchor a coasting predecessor's
-/// observers snap-sync against while they finish adopting; under
-/// make-before-break the predecessor keeps coasting until its successors
-/// are live, so the record must outlive that moment regardless.
+/// parent uncomposed. It is also the anchor a predecessor's observers
+/// snap-sync against while they finish adopting; under make-before-break
+/// the predecessor's committee stays seated, serving its terminal, until
+/// its successors are live, so the record must outlive that moment
+/// regardless.
 fn gc_terminal_boundaries(state: &mut BeaconState, epoch: Epoch, windows: EpochWindows) {
     let now = windows.window_of(epoch).start;
     // Stamp the epoch a terminal's successors first read live. The
@@ -1170,7 +1171,7 @@ fn gc_terminal_boundaries(state: &mut BeaconState, epoch: Epoch, windows: EpochW
     // A handoff still pending RESHAPE_HANDOFF_TTL_EPOCHS after its execution
     // has stalled: make-before-break commits and serves the terminal reliably,
     // so the successors should have seated and produced past genesis well
-    // inside the bound. Surface it loudly. The predecessor keeps coasting — it
+    // inside the bound. Surface it loudly. The predecessor stays seated — it
     // is the successors' only anchor, so tearing it down here would strand them
     // — until they go live or an operator intervenes.
     for (shard, cut) in stalled_handoffs(&pending_fold, epoch) {

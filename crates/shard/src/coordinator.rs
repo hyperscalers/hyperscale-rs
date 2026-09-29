@@ -1290,9 +1290,11 @@ impl ShardCoordinator {
     /// decide a transaction — and execution's terminal latch reads the same
     /// flip off the same committed tip.
     ///
-    /// Quiescence is *not* the end of the chain's life: the committee keeps
-    /// coasting, voting, and serving past this point until its reshape
-    /// successors are live, which [`Self::dissolved`] is the test for.
+    /// Quiescence is *not* the end of the chain's life. The chain coasts on
+    /// until its committed chain proves the terminal committed (see
+    /// `terminal_commit_evidenced`), and the committee stays seated, serving
+    /// the terminal, until its reshape successors are live, which
+    /// [`Self::dissolved`] is the test for.
     #[must_use]
     pub fn quiescent(&self, topology_schedule: &TopologySchedule) -> bool {
         topology_schedule.past_terminal(self.local_shard, self.committed_block_anchor_wt)
@@ -1300,15 +1302,21 @@ impl ShardCoordinator {
 
     /// Whether this chain may **dissolve** — stop proposing, ingesting headers,
     /// and running its pacemaker, and let the committee tear down. Narrower than
-    /// [`Self::quiescent`]: the chain quiesces its content at the cut, but its
-    /// committee keeps coasting (empty blocks), voting, and serving until the
-    /// beacon shows its reshape successors **live** — both split children, or a
-    /// merge's reformed parent, producing on their own chains. Holding the
-    /// committee together through the handoff is what lets the terminal block
-    /// commit (so the children can seed from it) instead of being stranded as a
-    /// certified-but-uncommitted tail when members drop out at the cut. Once the
-    /// successors are live the handoff has demonstrably succeeded, so dropping
-    /// out — even a co-located pair in lockstep — loses nothing.
+    /// [`Self::quiescent`]: the chain quiesces its content at the cut, and its
+    /// committee stays seated until the beacon shows its reshape successors
+    /// **live** — both split children, or a merge's reformed parent, producing
+    /// on their own chains.
+    ///
+    /// Two stretches sit between the cut and dissolution. The committee first
+    /// coasts — certifies empty blocks — until the committed chain carries the
+    /// terminal's commit proof, a round-contiguous pair at or above it, which
+    /// is what lets the terminal commit (so the children can seed from it)
+    /// rather than be stranded as a certified-but-uncommitted tail. Once the
+    /// proof is on the committed chain and the head no longer seats the shard,
+    /// proposals route to that empty head and the chain certifies nothing
+    /// further; the committee serves the terminal until the successors are
+    /// live. By then the handoff has demonstrably succeeded, so dropping out —
+    /// even a co-located pair in lockstep — loses nothing.
     #[must_use]
     pub fn dissolved(&self, topology_schedule: &TopologySchedule) -> bool {
         self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
@@ -14856,11 +14864,11 @@ mod tests {
     }
 
     #[test]
-    fn quiescent_chain_coasts_until_its_successors_are_live() {
+    fn a_quiescent_chain_proposes_until_its_successors_are_live() {
         // Round 4 makes this validator (id 0 of 4) the proposer.
         // Quiescent (committed past the cut) but the children aren't live yet:
-        // the chain keeps coasting — still proposes empty blocks and runs its
-        // pacemaker — to hold the committee together so the terminal commits.
+        // the chain still proposes empty blocks and runs its pacemaker, which
+        // coasts it to the terminal's commit proof.
         let coasting = make_terminating_schedule(4);
         let mut done = coordinator_with_committed_anchor(1500);
         assert!(done.quiescent(&coasting));

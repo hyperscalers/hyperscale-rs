@@ -122,10 +122,10 @@ pub fn retention_floor(
         })
         // A reshape predecessor dropped from the live committees keeps a
         // lingering terminal boundary record so straggling observers can
-        // snap-sync its anchor and the coasting predecessor can resolve its
-        // own committee. Its schedule window must outlive the record, or the
-        // floor rises the instant the successors advance — a beat before the
-        // predecessor observes successor-live and stops coasting — and evicts
+        // snap-sync its anchor and the still-seated predecessor can resolve
+        // its own committee. Its schedule window must outlive the record, or
+        // the floor rises the instant the successors advance — a beat before
+        // the predecessor observes successor-live and dissolves — and evicts
         // the window mid-handoff.
         //
         // A terminal record pins the cut's own window: the shard leaves
@@ -5996,7 +5996,7 @@ mod tests {
     /// A reshape predecessor's terminal boundary record holds the floor at its
     /// cut even after it leaves the live committees — its schedule window must
     /// outlive the record so straggling observers can snap-sync its anchor and
-    /// the coasting predecessor can resolve its own committee through the
+    /// the still-seated predecessor can resolve its own committee through the
     /// beacon-fold lag before it observes its successors live.
     #[test]
     fn retention_floor_holds_a_terminal_predecessors_window() {
