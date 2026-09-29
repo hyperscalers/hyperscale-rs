@@ -43,10 +43,10 @@ use tracing::warn;
 /// once this replica catches up.
 const MAX_ROUND_AHEAD: u32 = 4;
 
-/// Round from which an unlocked member stops prevoting its candidate
-/// and concedes to the skip hash. Two full rounds of a held candidate
-/// failing to polka past the deadline means the pool isn't converging
-/// on it — joining skip breaks the value split.
+/// Round from which an unlocked member stops preferring its candidate
+/// and follows the pool's prevote tally. Two full rounds of a held
+/// candidate failing to polka past the deadline means the pool isn't
+/// converging on it — joining the leading value breaks the value split.
 const CANDIDATE_PATIENCE_ROUNDS: u32 = 3;
 
 /// What the tracker wants done after absorbing an event.
@@ -344,17 +344,27 @@ impl RatifyTracker {
 
     /// Cast the round's own prevote if the register is free and a
     /// value is available: the lock if one is held (leaving it only
-    /// for the other value's strictly newer polka), else the candidate
-    /// when held, else the skip hash once the deadline passed.
+    /// for the other value's strictly newer polka), else the value of
+    /// the newest polka observed, else the candidate when held, else
+    /// the skip hash once the deadline passed.
     ///
     /// An unlocked member's candidate preference is bounded: from
-    /// [`CANDIDATE_PATIENCE_ROUNDS`] on, it concedes to the skip hash.
-    /// Without the concession a pool can split on values forever —
-    /// members that saw a skip polka lock skip, while candidate-holding
-    /// members keep prevoting a candidate whose polka never forms, and
-    /// neither side reaches quorum. On the healthy path the candidate
-    /// polkas rounds before the patience runs out, so the concession
-    /// only ever fires on an already-stalled epoch.
+    /// [`CANDIDATE_PATIENCE_ROUNDS`] on, it follows the pool instead,
+    /// prevoting whichever of its prevotable values drew more prevotes
+    /// in the newest earlier round it observed, the skip hash on a tie.
+    /// Without that a pool can split on values forever: members locked
+    /// on one value prevote it every round and leave it only for a
+    /// newer polka of the other, so unlocked members that hold out for
+    /// the other value — a candidate the locked members refuse, or a
+    /// skip the candidate lockers refuse — starve both quorums. Locked
+    /// members prevote their lock round after round, so following the
+    /// tally joins them. On the healthy path the candidate polkas
+    /// rounds before the patience runs out, so the rule only ever
+    /// decides an already-stalled epoch.
+    ///
+    /// A polka outranks both preferences: an unlocked member that has
+    /// seen one prevotes its value, the value the members that
+    /// precommitted it are locked on.
     fn try_own_prevote(&mut self) -> Option<RatifyEffect> {
         if self.prevoted.contains_key(&self.round) {
             return None;
@@ -371,12 +381,14 @@ impl RatifyTracker {
                     _ => Some(locked),
                 }
             }
-            None if self.deadline_passed && self.round.inner() >= CANDIDATE_PATIENCE_ROUNDS => {
-                Some(self.skip_hash)
-            }
-            None => self
-                .candidate
-                .or_else(|| self.deadline_passed.then_some(self.skip_hash)),
+            None => self.newest_polka_value().or_else(|| {
+                if self.deadline_passed && self.round.inner() >= CANDIDATE_PATIENCE_ROUNDS {
+                    Some(self.leading_value())
+                } else {
+                    self.candidate
+                        .or_else(|| self.deadline_passed.then_some(self.skip_hash))
+                }
+            }),
         };
         let block_hash = choice?;
         self.prevoted.insert(self.round, block_hash);
@@ -396,6 +408,46 @@ impl RatifyTracker {
                 phase == RatifyPhase::Prevote && r > lock_round && r < self.round
             })
             .any(|&(r, _)| self.has_polka(r, block_hash))
+    }
+
+    /// The prevotable value — the held candidate or the skip hash —
+    /// with a polka at the newest round that has one.
+    fn newest_polka_value(&self) -> Option<BeaconBlockHash> {
+        let values: Vec<BeaconBlockHash> = self
+            .candidate
+            .into_iter()
+            .chain(std::iter::once(self.skip_hash))
+            .collect();
+        self.votes
+            .keys()
+            .rev()
+            .filter(|&&(_, phase)| phase == RatifyPhase::Prevote)
+            .find_map(|&(round, _)| {
+                values
+                    .iter()
+                    .copied()
+                    .find(|&value| self.has_polka(round, value))
+            })
+    }
+
+    /// The prevotable value that drew more prevotes in the newest round
+    /// before the current one with any: the held candidate when it
+    /// strictly leads the skip hash, the skip hash otherwise.
+    fn leading_value(&self) -> BeaconBlockHash {
+        let led_by_candidate = self.candidate.is_some_and(|candidate| {
+            self.votes
+                .keys()
+                .rev()
+                .find(|&&(round, phase)| phase == RatifyPhase::Prevote && round < self.round)
+                .is_some_and(|&(round, _)| {
+                    self.vote_count_for(round, RatifyPhase::Prevote, candidate)
+                        > self.vote_count_for(round, RatifyPhase::Prevote, self.skip_hash)
+                })
+        });
+        match self.candidate {
+            Some(candidate) if led_by_candidate => candidate,
+            _ => self.skip_hash,
+        }
     }
 
     fn has_polka(&self, round: RatifyRound, block_hash: BeaconBlockHash) -> bool {
@@ -742,6 +794,125 @@ mod tests {
         assert_eq!(t.round(), RatifyRound::new(3));
         assert_eq!(sign_precommit_round(&effects), Some((3, candidate_hash())),);
         assert_eq!(sign_prevote_round(&effects), Some((3, candidate_hash())));
+    }
+
+    /// An unlocked member that saw a candidate polka it could not
+    /// precommit (the polka completed behind its round) keeps
+    /// prevoting the candidate past the patience horizon: the members
+    /// that precommitted it are locked there, and conceding to skip
+    /// would split the pool with neither side at quorum.
+    #[test]
+    fn a_polka_outlasts_the_candidate_patience() {
+        // Pool 7, quorum 5.
+        let (mut t, keys) = tracker(7);
+        let effects = t.on_candidate(candidate_hash());
+        assert_eq!(sign_prevote_round(&effects), Some((1, candidate_hash())));
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        assert_eq!(sign_prevote_round(&effects), Some((2, candidate_hash())));
+
+        for i in 1..=5 {
+            let effects = t.observe(vote(&keys, i, 1, RatifyPhase::Prevote, candidate_hash()));
+            assert!(
+                sign_precommit_round(&effects).is_none(),
+                "a polka behind the current round is not precommittable",
+            );
+        }
+
+        for round in 3..=CANDIDATE_PATIENCE_ROUNDS + 2 {
+            let effects = t.on_round_timeout(RatifyRound::INITIAL);
+            assert_eq!(
+                sign_prevote_round(&effects),
+                Some((round, candidate_hash())),
+                "round {round} concedes to skip past a candidate polka",
+            );
+        }
+    }
+
+    /// Past the patience horizon an unlocked member that never saw a
+    /// polka follows the previous round's prevote tally: members locked
+    /// on the candidate keep prevoting it, and joining them completes
+    /// the polka that conceding to skip would starve.
+    #[test]
+    fn past_patience_an_unlocked_member_follows_the_leading_value() {
+        // Pool 8, quorum 6: four locked on the candidate, two holding it
+        // unlocked (this tracker is signer 0), two prevoting skip.
+        let (mut t, keys) = tracker(8);
+        let _ = t.on_candidate(candidate_hash());
+        while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
+            let _ = t.on_round_timeout(RatifyRound::INITIAL);
+        }
+        let previous = t.round().inner();
+        for i in 0..5 {
+            let _ = t.observe(vote(
+                &keys,
+                i,
+                previous,
+                RatifyPhase::Prevote,
+                candidate_hash(),
+            ));
+        }
+        for i in 5..8 {
+            let _ = t.observe(vote(
+                &keys,
+                i,
+                previous,
+                RatifyPhase::Prevote,
+                t.skip_block_hash(),
+            ));
+        }
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((previous + 1, candidate_hash())),
+        );
+    }
+
+    /// The tally is read against skip: when skip drew as many prevotes
+    /// as the candidate, the unlocked member joins skip.
+    #[test]
+    fn past_patience_a_tied_tally_prevotes_skip() {
+        let (mut t, keys) = tracker(8);
+        let _ = t.on_candidate(candidate_hash());
+        while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
+            let _ = t.on_round_timeout(RatifyRound::INITIAL);
+        }
+        let previous = t.round().inner();
+        for i in 0..4 {
+            let _ = t.observe(vote(
+                &keys,
+                i,
+                previous,
+                RatifyPhase::Prevote,
+                candidate_hash(),
+            ));
+        }
+        for i in 4..8 {
+            let _ = t.observe(vote(
+                &keys,
+                i,
+                previous,
+                RatifyPhase::Prevote,
+                t.skip_block_hash(),
+            ));
+        }
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((previous + 1, t.skip_block_hash())),
+        );
+    }
+
+    /// Without any polka, an unlocked member concedes to skip once its
+    /// candidate has had the patience horizon to converge.
+    #[test]
+    fn an_unconverged_candidate_concedes_to_skip() {
+        let (mut t, _) = tracker(7);
+        let _ = t.on_candidate(candidate_hash());
+        let mut last = None;
+        while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS {
+            last = sign_prevote_round(&t.on_round_timeout(RatifyRound::INITIAL));
+        }
+        assert_eq!(last, Some((CANDIDATE_PATIENCE_ROUNDS, t.skip_block_hash())));
     }
 
     /// A lock re-prevotes across rounds: once precommitted, the
