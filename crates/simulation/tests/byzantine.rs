@@ -26,7 +26,8 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
     Cluster, FaultHandle, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig,
-    StockedVenue, VENUE_SHARD, epochs, grind_onto, stand_up_venue, venue_genesis_accounts,
+    StockedVenue, VENUE_SHARD, committees_on_separate_hosts, epochs, grind_onto, stand_up_venue,
+    venue_genesis_accounts,
 };
 use hyperscale_types::network::request::GetStateProofRequest;
 use hyperscale_types::network::response::GetStateProofResponse;
@@ -52,9 +53,10 @@ const fn cross_shard_config() -> ScenarioConfig {
 
 /// A venue on one shard and its callers on the other, over the fixture
 /// packages: a swap's core reads the caller's escrowed record, which is
-/// the record read these tests attack.
+/// the record read these tests attack. Every committee sits on hosts of
+/// its own, so that read crosses the wire the rewrite sits on.
 fn venue_swap_cluster() -> SimCluster {
-    SimCluster::with_grown_packages(
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &cross_shard_config(),
         42,
         &venue_genesis_accounts(),
@@ -66,8 +68,7 @@ fn venue_swap_cluster() -> SimCluster {
 /// reads the caller's record by asking for it — the fetch these tests
 /// attack.
 fn cut_record_pushes(c: &mut SimCluster) {
-    let callers = c.committee_hosts(SWAPPER_SHARD);
-    let venues = c.committee_hosts(VENUE_SHARD);
+    let (callers, venues) = committees_on_separate_hosts(c, SWAPPER_SHARD, VENUE_SHARD);
     c.drop_type_between(&callers, &venues, "crossing.readings");
 }
 
@@ -119,13 +120,17 @@ fn swap_accepts(
 /// disposed twice.
 #[test]
 fn a_forged_state_proof_convinces_nobody() {
-    let mut cluster =
-        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
     let (payer_key, from, to) = cross_shard_cast();
     let payer_shard = ShardId::leaf(1, 0);
     let recipient_shard = ShardId::leaf(1, 1);
 
     cluster.run_faultable(|c| {
+        committees_on_separate_hosts(c, payer_shard, recipient_shard);
         let before = vault_balance(c, payer_shard, from);
         let recipient_before = vault_balance(c, recipient_shard, to);
         let refused_before = c.metric(

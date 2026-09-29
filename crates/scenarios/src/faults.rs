@@ -23,7 +23,7 @@ use crate::support::tx::{
 use crate::support::wait::{
     await_beacon_epoch, await_crossings_end, await_height, await_tx_terminal,
 };
-use crate::support::{Cluster, assume, epochs};
+use crate::support::{Cluster, assume, committees_on_separate_hosts, epochs};
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
@@ -1702,10 +1702,13 @@ pub fn cross_shard_header_fetch_fallback(c: &mut impl FaultableCluster) {
 ///
 /// # Panics
 ///
-/// Panics if the transfer fails to settle, the broadcast drop never fires, the
-/// provision fetch never engages, or anything aborts.
+/// Panics if the split children's committees share a host, the transfer fails
+/// to settle, the broadcast drop never fires, the provision fetch never
+/// engages, or anything aborts.
 pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableCluster) -> u64 {
     split_lifecycle(c);
+    let (payer_shard, recipient_shard) = ShardId::ROOT.children();
+    committees_on_separate_hosts(c, payer_shard, recipient_shard);
     let fetch_before = c.metric("fetch_items_sent", Some("provision"));
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let request_dropped = c.drop_type_with_probability("provision.request", 0.5);

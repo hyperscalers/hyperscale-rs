@@ -160,6 +160,34 @@ pub trait FaultableCluster: Cluster {
     fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64;
 }
 
+/// The hosts of `a`'s and `b`'s live committees, in that order, which
+/// share no host.
+///
+/// A host serving a shard answers its own requests to that shard from
+/// its own handler and puts nothing on the wire, so a host seating a
+/// vnode of each shard reads the other in-process, past every drop and
+/// rewrite. A scenario whose fault sits on the road between two shards
+/// takes the hosts its rules name from here, which also holds the
+/// harness to a layout where that road exists.
+///
+/// # Panics
+///
+/// Panics if the two committees share a host.
+pub fn committees_on_separate_hosts(
+    c: &impl FaultableCluster,
+    a: ShardId,
+    b: ShardId,
+) -> (Vec<usize>, Vec<usize>) {
+    let a_hosts = c.committee_hosts(a);
+    let b_hosts = c.committee_hosts(b);
+    assert!(
+        a_hosts.iter().all(|host| !b_hosts.contains(host)),
+        "{a:?}'s and {b:?}'s committees must sit on hosts of their own, or reads between \
+         them never reach the wire: {a:?} on {a_hosts:?}, {b:?} on {b_hosts:?}",
+    );
+    (a_hosts, b_hosts)
+}
+
 /// Report what the run's crossings cost: the fenced claims `c`'s
 /// replicas carried and refused, by what each read, and the weight of
 /// the claims section each committed block carried.

@@ -52,7 +52,9 @@ use crate::support::wait::{
     await_anchor_seeded, await_crossings_end, await_merge_keeper_count, await_serves,
     await_split_admitted, await_tx_terminal, measure_blocks_per_epoch,
 };
-use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
+use crate::support::{
+    Budget, Cluster, FaultHandle, FaultableCluster, committees_on_separate_hosts, epochs,
+};
 use crate::venue::{
     PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, caller_on_the_venues_shard,
     grind_onto, reserve_cell, stand_up_venue, swappers_on, venue_genesis_accounts_on,
@@ -590,12 +592,8 @@ pub fn answers_end_at_the_read_frontier_across_a_reshape<C: FaultableCluster>(
     budget: Budget,
 ) {
     let mut set = departing_callers(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
-    let venue_hosts = c.committee_hosts(STRADDLER_SURVIVOR);
-    let caller_hosts = c.committee_hosts(STRADDLER_SPLITTER);
-    assert!(
-        venue_hosts.iter().all(|host| !caller_hosts.contains(host)),
-        "the venue's committee and the callers' share no host",
-    );
+    let (venue_hosts, caller_hosts) =
+        committees_on_separate_hosts(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
     let unheard = [
         c.drop_type_between(&venue_hosts, &caller_hosts, "crossing.readings"),
         c.drop_type_between(&caller_hosts, &venue_hosts, "state_proof.request"),
@@ -692,13 +690,7 @@ pub fn an_unseen_never_goes_when_its_producer_aborts<C: FaultableCluster>(
         clock(c) < cut,
         "the swap goes while the callers' shard still runs"
     );
-    let leg_hosts = c.committee_hosts(caller_shard);
-    assert!(
-        c.committee_hosts(venue_shard)
-            .iter()
-            .all(|host| !leg_hosts.contains(host)),
-        "the venue's committee and the callers' share no host",
-    );
+    let (leg_hosts, _) = committees_on_separate_hosts(c, caller_shard, venue_shard);
     let mut charges = Charges::default();
     let (key, caller) = &set.swappers[0];
     let swap = build_swap_tx(
@@ -942,7 +934,8 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
 ///
 /// # Panics
 ///
-/// Panics as [`departing_callers`] does, and if the venue does not
+/// Panics as [`departing_callers`] does, and if the venue's and the
+/// callers' committees share a host, if the venue does not
 /// include both swaps before its terminal, if the sponsor's hold does
 /// not stand while the venue holds its swap, if the terminal does not
 /// fate both, if a child holds a row or the hold, if the readings were
@@ -958,6 +951,7 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
     let (key, caller) = &set.swappers[0];
     let window = await_fated_window(c, cut, budget);
 
+    committees_on_separate_hosts(c, venue_shard, caller_shard);
     let held_back = [
         c.drop_type("crossing.readings"),
         c.drop_type("state_proof.request"),
@@ -1049,7 +1043,8 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
 /// # Panics
 ///
 /// Panics if a quarter is unserved, if the venue misses its budget
-/// standing up, if the merge is never scheduled or the venue does not
+/// standing up, if the two committees share a host, if the merge is
+/// never scheduled or the venue does not
 /// include both swaps before it, if the sponsor's hold does not stand
 /// meanwhile, if either swap is not fated, if any record names one, if
 /// an input is credited to either side, if the sponsor is not charged
@@ -1071,6 +1066,7 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
 
     let mut charges = Charges::default();
     let (key, caller) = &set.swappers[0];
+    committees_on_separate_hosts(c, venue_shard, caller_shard);
     let held_back = [
         c.drop_type("crossing.readings"),
         c.drop_type("state_proof.request"),
@@ -1192,12 +1188,7 @@ pub fn a_crossing_a_merge_converges_finishes_on_the_successor<C: FaultableCluste
         "the grown four-shard topology must seat every quarter",
     );
     let mut set = stock_callers_against(c, venue_shard, caller_shard);
-    let venue_hosts = c.committee_hosts(venue_shard);
-    let caller_hosts = c.committee_hosts(caller_shard);
-    assert!(
-        venue_hosts.iter().all(|host| !caller_hosts.contains(host)),
-        "the venue's committee and the callers' share no host",
-    );
+    let (venue_hosts, caller_hosts) = committees_on_separate_hosts(c, venue_shard, caller_shard);
     let cuts = [
         c.drop_type_between(&venue_hosts, &caller_hosts, "crossing.readings"),
         c.drop_type_between(&caller_hosts, &venue_hosts, "state_proof.request"),

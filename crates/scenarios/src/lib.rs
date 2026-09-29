@@ -125,8 +125,8 @@ pub use straddler::{
 };
 pub use support::{
     Budget, Cluster, DISCARD, FaultHandle, FaultableCluster, Nemesis, ScenarioConfig, assume,
-    conservation, discard, epochs, grow_to, query, submission_shards, tx, vote_reshape_threshold,
-    wait,
+    committees_on_separate_hosts, conservation, discard, epochs, grow_to, query, submission_shards,
+    tx, vote_reshape_threshold, wait,
 };
 pub use swarm::{SWARM_ACCOUNTS, transfers_survive_a_nemesis};
 pub use transactions::livelock_resolves_promptly;

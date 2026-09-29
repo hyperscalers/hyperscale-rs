@@ -684,6 +684,18 @@ fn venue_cluster(seed: u64) -> SimCluster {
     )
 }
 
+/// [`venue_cluster`] with every committee on hosts of its own, so the
+/// venue's reads of its callers' shard cross the wire where a fault can
+/// reach them.
+fn venue_cluster_on_dedicated_hosts(seed: u64) -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        seed,
+        &venue_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
 /// Two venues on two shards and the traders on a third.
 fn route_cluster() -> SimCluster {
     SimCluster::with_grown_packages(
@@ -782,7 +794,7 @@ fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
 
 #[test]
 fn a_held_core_keeps_its_sponsors_hold_until_it_aborts_sim() {
-    let mut cluster = venue_cluster(42);
+    let mut cluster = venue_cluster_on_dedicated_hosts(42);
     cluster.run_faultable(|c| a_held_core_keeps_its_sponsors_hold_until_it_aborts(c, epochs(40)));
 }
 
@@ -998,7 +1010,7 @@ fn an_answer_written_past_the_deadline_is_read_on_a_later_ask_sim() {
 
 #[test]
 fn a_leg_whose_core_never_answers_refuses_at_the_deadline_sim() {
-    let mut cluster = SimCluster::with_grown_accounts(
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &cross_shard_config(),
         42,
         &[(remote_delegator().1, 1_000_000)],
@@ -1621,11 +1633,10 @@ fn shard_fork_drives_committee_recovery_sim() {
 /// engagement (its async retry path is nondeterministic), so that check lives
 /// here, keyed on the exact seed.
 fn request_loss_engages_at_seed(seed: u64) {
-    let mut cluster = SimCluster::with_execution_mode(
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
         &split_config(),
         seed,
         &cross_shard_fault_genesis_accounts(),
-        ExecutionMode::Serial,
     );
     let request_drops = cluster.run_faultable(cross_shard_provisions_fetch_with_request_loss);
     assume(
@@ -1785,7 +1796,7 @@ fn a_departing_venues_terminal_fates_what_it_could_not_run_sim() {
         STRADDLER_SPLITTER,
         &[STRADDLER_SURVIVOR],
     ));
-    let mut cluster = SimCluster::with_packages(
+    let mut cluster = SimCluster::with_packages_on_dedicated_pool_hosts(
         &departing_venue_config(),
         11,
         &accounts,
@@ -2031,7 +2042,7 @@ fn a_leg_issued_on_a_merging_shard_reaches_its_venue_sim() {
 
 #[test]
 fn a_merged_pair_locks_a_crossing_its_consumer_never_took_sim() {
-    let mut cluster = SimCluster::with_grown_packages(
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &merging_caller_config(),
         11,
         &merged_pair_genesis_accounts(),
@@ -2271,12 +2282,7 @@ fn surviving_sibling_split_seats_full_committees_sim() {
 
 #[test]
 fn an_abandoned_never_outlives_a_late_record_sim() {
-    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
-        &cross_shard_config(),
-        42,
-        &venue_genesis_accounts(),
-        GenesisPackages::with_fixtures(),
-    );
+    let mut cluster = venue_cluster_on_dedicated_hosts(42);
     cluster.run_faultable(|c| an_abandoned_never_outlives_a_late_record(c, epochs(40)));
 }
 
