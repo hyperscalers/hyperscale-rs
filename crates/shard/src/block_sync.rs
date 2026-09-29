@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, QcSubject};
 use hyperscale_metrics::record_sync_block_filtered;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ConsensusPublicKey,
@@ -493,7 +493,7 @@ impl BlockSyncManager {
             qc,
             public_keys,
             quorum_threshold,
-            block_hash,
+            subject: QcSubject::SyncedBlock(block_hash),
         }
     }
 

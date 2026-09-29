@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
+use hyperscale_core::{Action, CommitSource, FetchIds, QcSubject, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Capped;
 use hyperscale_shard::action_handlers::{build_proposal, committing_shards, verify_and_build_qc};
@@ -260,7 +260,7 @@ enum SimEvent {
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
     },
     QcSignatureVerified {
-        block_hash: BlockHash,
+        subject: QcSubject,
         result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     },
     BlockCheckCompleted {
@@ -1193,8 +1193,8 @@ impl ShardCoordinatorSim {
                 qc,
                 verified_votes,
             } => coord.on_qc_result(block_hash, qc, verified_votes),
-            SimEvent::QcSignatureVerified { block_hash, result } => {
-                coord.on_qc_signature_verified(topology_schedule, block_hash, result)
+            SimEvent::QcSignatureVerified { subject, result } => {
+                coord.on_qc_signature_verified(topology_schedule, subject, result)
             }
             SimEvent::BlockCheckCompleted {
                 block_hash,
@@ -1679,7 +1679,7 @@ impl ShardCoordinatorSim {
                 qc,
                 public_keys,
                 quorum_threshold,
-                block_hash,
+                subject,
             } => {
                 let qc_ctx = QcContext {
                     verifier: &BlsVerifier,
@@ -1690,7 +1690,7 @@ impl ShardCoordinatorSim {
                 let result = qc.upgrade(&qc_ctx).map_err(|(_, e)| e);
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::QcSignatureVerified { block_hash, result },
+                    event: SimEvent::QcSignatureVerified { subject, result },
                 });
             }
             Action::VerifyTransactionRoot {

@@ -90,9 +90,9 @@ impl ShardParticipation {
             } => self
                 .shard_coordinator
                 .on_qc_result(block_hash, qc, verified_votes),
-            ProtocolEvent::QcSignatureVerified { block_hash, result } => self
+            ProtocolEvent::QcSignatureVerified { subject, result } => self
                 .shard_coordinator
-                .on_qc_signature_verified(topology_schedule, block_hash, result),
+                .on_qc_signature_verified(topology_schedule, subject, result),
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,

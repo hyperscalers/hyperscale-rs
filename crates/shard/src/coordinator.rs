@@ -14,7 +14,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_core::{Action, CommitSource, FeeDemand, FeeSpan, ProtocolEvent, TimerId};
+use hyperscale_core::{
+    Action, CommitSource, FeeDemand, FeeSpan, ProtocolEvent, QcSubject, TimerId,
+};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror,
     Deadline, DeferOn, Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
@@ -3824,7 +3826,7 @@ impl ShardCoordinator {
                 qc: header.parent_qc_verifiable().clone(),
                 public_keys,
                 quorum_threshold,
-                block_hash,
+                subject: QcSubject::ParentOf(block_hash),
             }];
         }
 
@@ -4624,38 +4626,46 @@ impl ShardCoordinator {
     ///
     /// Called when the runner completes `Action::VerifyQcSignature`.
     /// On success, the verified QC rides in the event payload — no
-    /// separate cache lookup needed.
-    #[instrument(skip(self, topology_schedule, result), fields(block_hash = ?block_hash, valid = result.is_ok()))]
+    /// separate cache lookup needed. `subject` routes the result: a synced
+    /// block's own QC goes to block sync, a header's `parent_qc` to the
+    /// vote path. The two never share a correlation, since one block can
+    /// have both in flight and their QCs certify different blocks.
+    #[instrument(skip(self, topology_schedule, result), fields(subject = ?subject, valid = result.is_ok()))]
     pub fn on_qc_signature_verified(
         &mut self,
         topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
+        subject: QcSubject,
         result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
-        // Check if this is a synced block verification
         info!(
-            block_hash = ?block_hash,
+            ?subject,
             valid,
             pending_sync_count = self.block_sync.pending_verification_count(),
             pending_consensus_count = self.verification.pending_qc_count(),
             "on_qc_signature_verified: received callback"
         );
-        if let Some(sync_result) = self
-            .block_sync
-            .on_qc_verified(block_hash, result.as_ref().ok().cloned())
-        {
-            return match sync_result {
-                // Even on failure, try applying verified blocks below the gap.
-                // The failed block creates a gap that blocks further progress,
-                // but blocks already verified at lower heights can still apply.
-                BlockSyncVerificationResult::Failed | BlockSyncVerificationResult::Verified => {
-                    self.try_apply_verified_synced_blocks(topology_schedule)
-                }
-            };
-        }
+        let block_hash = match subject {
+            QcSubject::SyncedBlock(block_hash) => {
+                return match self.block_sync.on_qc_verified(block_hash, result.ok()) {
+                    // Even on failure, try applying verified blocks below the gap.
+                    // The failed block creates a gap that blocks further progress,
+                    // but blocks already verified at lower heights can still apply.
+                    Some(
+                        BlockSyncVerificationResult::Failed | BlockSyncVerificationResult::Verified,
+                    ) => self.try_apply_verified_synced_blocks(topology_schedule),
+                    None => {
+                        debug!(
+                            ?block_hash,
+                            "Synced block QC verified but sync no longer tracks the block"
+                        );
+                        vec![]
+                    }
+                };
+            }
+            QcSubject::ParentOf(block_hash) => block_hash,
+        };
 
-        // Otherwise, it's a consensus block QC verification
         let Some((header, is_valid)) = self.verification.on_qc_verified(block_hash, valid) else {
             warn!(
                 "QC signature verified but no pending verification for block {}",
@@ -10247,7 +10257,11 @@ mod tests {
         // so wrapping it as verified models the action arm's success result.
         let verified =
             Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
-        let _ = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(verified));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::ParentOf(block_hash),
+            Ok(verified),
+        );
         assert_eq!(
             state.latest_qc.as_deref().map(QuorumCertificate::height),
             Some(BlockHeight::new(1)),
@@ -10330,7 +10344,11 @@ mod tests {
         // SAFETY: synthetic test fixture, parent_qc built locally.
         let verified =
             Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
-        let after_qc = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(verified));
+        let after_qc = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::ParentOf(block_hash),
+            Ok(verified),
+        );
         assert!(
             !after_qc
                 .iter()
@@ -10448,7 +10466,11 @@ mod tests {
         // SAFETY: synthetic test fixture, parent_qc built locally.
         let verified =
             Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
-        let after_qc = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(verified));
+        let after_qc = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::ParentOf(block_hash),
+            Ok(verified),
+        );
         assert!(
             !after_qc
                 .iter()
@@ -10559,7 +10581,7 @@ mod tests {
 
         let actions = state.on_qc_signature_verified(
             &topology_schedule,
-            block_hash,
+            QcSubject::ParentOf(block_hash),
             Err(QcVerifyError::InvalidSignature),
         );
         assert!(actions.is_empty());
@@ -11349,7 +11371,7 @@ mod tests {
             block_with_parent_qc_ts(BlockHeight::new(5), 100),
         );
         let qc = make_test_qc(tip, BlockHeight::new(5));
-        let _ = state.on_qc_signature_verified(&schedule, tip, Ok(qc));
+        let _ = state.on_qc_signature_verified(&schedule, QcSubject::SyncedBlock(tip), Ok(qc));
 
         assert_eq!(
             state.latest_qc.as_ref().map(|qc| qc.height()),
@@ -11556,7 +11578,7 @@ mod tests {
             block_with_parent_qc_ts(BlockHeight::new(5), 100),
         );
         let qc = make_test_qc(applied, BlockHeight::new(5));
-        let _ = state.on_qc_signature_verified(&schedule, applied, Ok(qc));
+        let _ = state.on_qc_signature_verified(&schedule, QcSubject::SyncedBlock(applied), Ok(qc));
         assert!(
             state.recovery_behind_retained_tip(),
             "the offered tip is still above"
@@ -11594,14 +11616,14 @@ mod tests {
         let (four_hash, _) = deliver_synced(&mut state, &schedule, four.clone());
         let _ = state.on_qc_signature_verified(
             &schedule,
-            four_hash,
+            QcSubject::SyncedBlock(four_hash),
             Ok(make_test_qc(four_hash, BlockHeight::new(4))),
         );
         let five = block_chained_on(BlockHeight::new(5), four_hash, 110);
         let (five_hash, _) = deliver_synced(&mut state, &schedule, five.clone());
         let _ = state.on_qc_signature_verified(
             &schedule,
-            five_hash,
+            QcSubject::SyncedBlock(five_hash),
             Ok(make_test_qc(five_hash, BlockHeight::new(5))),
         );
         assert_eq!(state.committed_height, BlockHeight::new(3));
@@ -11829,7 +11851,7 @@ mod tests {
         );
         let _ = state.on_qc_signature_verified(
             &schedule,
-            five,
+            QcSubject::SyncedBlock(five),
             Ok(make_test_qc(five, BlockHeight::new(5))),
         );
         assert!(state.recovery_behind_retained_tip());
@@ -11868,7 +11890,7 @@ mod tests {
         );
         let _ = state.on_qc_signature_verified(
             &schedule,
-            five,
+            QcSubject::SyncedBlock(five),
             Ok(make_test_qc(five, BlockHeight::new(5))),
         );
         let _ = state.on_block_sync_complete(&schedule);
@@ -13307,7 +13329,11 @@ mod tests {
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
         );
         let qc = make_test_qc(block_hash, BlockHeight::new(4));
-        let actions = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(qc));
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(block_hash),
+            Ok(qc),
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -13408,11 +13434,15 @@ mod tests {
         // 6 and 7 verify; 5 fails (Byzantine peer served a forged QC).
         for (hash, height) in [(hash6, 6), (hash7, 7)] {
             let qc = make_test_qc(hash, BlockHeight::new(height));
-            let _ = state.on_qc_signature_verified(&topology_schedule, hash, Ok(qc));
+            let _ = state.on_qc_signature_verified(
+                &topology_schedule,
+                QcSubject::SyncedBlock(hash),
+                Ok(qc),
+            );
         }
         let _ = state.on_qc_signature_verified(
             &topology_schedule,
-            hash5,
+            QcSubject::SyncedBlock(hash5),
             Err(QcVerifyError::InvalidSignature),
         );
 
@@ -13474,7 +13504,11 @@ mod tests {
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
         );
         let qc = make_test_qc(loser, BlockHeight::new(4));
-        let _ = state.on_qc_signature_verified(&topology_schedule, loser, Ok(qc));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(loser),
+            Ok(qc),
+        );
         assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
 
         // The committing sibling arrives on a re-fetch at the same height.
@@ -13487,7 +13521,11 @@ mod tests {
             "certified sibling at an applied height must resubmit for verification; got {actions:?}"
         );
         let qc = make_test_qc(winner, BlockHeight::new(4));
-        let _ = state.on_qc_signature_verified(&topology_schedule, winner, Ok(qc));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(winner),
+            Ok(qc),
+        );
 
         // Both siblings' handles are cached; the two-chain rule commits
         // whichever one a round-contiguous child extends.
@@ -13575,7 +13613,11 @@ mod tests {
             block_with_parent_qc_ts(BlockHeight::new(4), 100),
         );
         let qc = make_test_qc(orphan, BlockHeight::new(4));
-        let _ = state.on_qc_signature_verified(&topology_schedule, orphan, Ok(qc));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(orphan),
+            Ok(qc),
+        );
         assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
 
         // The winner extends the same committed tip; a different parent
@@ -13591,7 +13633,11 @@ mod tests {
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
             "the child drains past the applied height; got {actions:?}"
         );
-        let actions = state.on_qc_signature_verified(&topology_schedule, child_hash, Ok(child_qc));
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(child_hash),
+            Ok(child_qc),
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -13612,7 +13658,7 @@ mod tests {
         assert_eq!(delivered, winner_hash);
         let actions = state.on_qc_signature_verified(
             &topology_schedule,
-            winner_hash,
+            QcSubject::SyncedBlock(winner_hash),
             Ok(make_test_qc(winner_hash, BlockHeight::new(4))),
         );
         assert!(
@@ -13643,12 +13689,20 @@ mod tests {
             block_with_parent_qc_ts(BlockHeight::new(4), 100),
         );
         let qc = make_test_qc(parent, BlockHeight::new(4));
-        let _ = state.on_qc_signature_verified(&topology_schedule, parent, Ok(qc));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(parent),
+            Ok(qc),
+        );
 
         let child = block_chained_on(BlockHeight::new(5), parent, 110);
         let child_qc = qc_on(&child);
         let (child_hash, _) = deliver_synced(&mut state, &topology_schedule, child);
-        let actions = state.on_qc_signature_verified(&topology_schedule, child_hash, Ok(child_qc));
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(child_hash),
+            Ok(child_qc),
+        );
         assert!(
             !actions
                 .iter()
@@ -13662,6 +13716,108 @@ mod tests {
                     if certified.block().hash() == parent
             )),
             "the applied parent commits under its round-contiguous child; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn parent_qc_result_leaves_a_synced_block_of_the_same_hash_waiting() {
+        // One block is in flight on both QC paths: its header arrived
+        // through consensus, which verifies the `parent_qc` it carries,
+        // while sync fetched the block with its own QC. The parent QC
+        // certifies height 3, so its result must not settle the synced
+        // block at height 4; only the block's own QC does.
+        let (mut state, topology_schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = parent_hash;
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let parent_qc = QuorumCertificate::new(
+            parent_hash,
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            BlockHash::ZERO,
+            Round::new(3),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(99_000),
+        );
+        let template = make_header_at_height(BlockHeight::new(4), 100_000);
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: template.shard_id(),
+            height: template.height(),
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            proposer: template.proposer(),
+            timestamp: template.timestamp(),
+            round: template.round(),
+            load: template.load(),
+            ..Default::default()
+        });
+        let block = Block::Live {
+            header,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let block_hash = block.hash();
+        let actions = state.on_block_header(
+            &topology_schedule,
+            block.header(),
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::VerifyQcSignature { subject: QcSubject::ParentOf(h), .. } if *h == block_hash
+            )),
+            "got {actions:?}"
+        );
+
+        state.set_block_syncing(true);
+        let (_, actions) = deliver_synced(&mut state, &topology_schedule, block.clone());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::VerifyQcSignature { subject: QcSubject::SyncedBlock(h), .. } if *h == block_hash
+            )),
+            "got {actions:?}"
+        );
+
+        // SAFETY: synthetic test fixture, parent_qc built locally.
+        let parent_qc = Verified::<QuorumCertificate>::new_unchecked_for_test(
+            block.header().parent_qc().clone(),
+        );
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::ParentOf(block_hash),
+            Ok(parent_qc),
+        );
+        assert!(state.block_sync.has_pending_verification(&block_hash));
+        assert_ne!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
+
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(block_hash),
+            Ok(qc_on(&block)),
+        );
+        assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
+        assert!(
+            state
+                .verification
+                .cached_verified_certified_block(block_hash)
+                .is_some()
         );
     }
 

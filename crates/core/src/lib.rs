@@ -41,7 +41,7 @@ mod traits;
 
 pub use action::{
     Action, ActionOwner, CrossShardExecutionRequest, FeeDemand, FeeSpan, KeepDelta, ObserveDelta,
-    ParticipationChange, ProvisionsRequest,
+    ParticipationChange, ProvisionsRequest, QcSubject,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock};
 pub use fetch_ids::FetchIds;

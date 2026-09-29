@@ -714,7 +714,7 @@ where
             qc,
             public_keys,
             quorum_threshold,
-            block_hash,
+            subject,
         } => {
             let qc_ctx = QcContext {
                 verifier: ctx.verifier,
@@ -732,7 +732,7 @@ where
             if measured {
                 record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
             }
-            ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { block_hash, result });
+            ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { subject, result });
         }
 
         Action::VerifyRemoteHeaderQc {

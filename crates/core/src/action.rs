@@ -31,6 +31,23 @@ use hyperscale_vm_effects::CrossingId;
 
 use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
 
+/// What an [`Action::VerifyQcSignature`] answers, echoed back on
+/// [`ProtocolEvent::QcSignatureVerified`].
+///
+/// A block's own QC and the `parent_qc` its header carries certify different
+/// blocks, and one block can have both in flight at once (its header arrived
+/// through consensus while sync fetched it with its QC), so the result names
+/// which of the two it settles rather than the block alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QcSubject {
+    /// The `parent_qc` in this block's header, which certifies its parent.
+    /// Verifying it gates the vote on this block.
+    ParentOf(BlockHash),
+    /// The QC sync fetched alongside this block, which certifies the block
+    /// itself.
+    SyncedBlock(BlockHash),
+}
+
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
 pub struct CrossShardExecutionRequest {
@@ -649,9 +666,8 @@ pub enum Action {
         public_keys: Vec<ConsensusPublicKey>,
         /// Quorum threshold for the QC's shard.
         quorum_threshold: VoteCount,
-        /// The block hash this QC verification is associated with (for correlation).
-        /// This is the hash of the block whose header contains this QC as `parent_qc`.
-        block_hash: BlockHash,
+        /// What the verification answers, echoed back on the result.
+        subject: QcSubject,
     },
 
     /// Verify a wire timeout's signature share off-thread, then tally it.

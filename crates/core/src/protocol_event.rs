@@ -26,7 +26,7 @@ use hyperscale_types::{
     Verified, WeightedTimestamp,
 };
 
-use crate::action::CrossShardExecutionRequest;
+use crate::action::{CrossShardExecutionRequest, QcSubject};
 
 /// What one tick's batch produced.
 #[derive(Debug, Clone)]
@@ -260,8 +260,8 @@ pub enum ProtocolEvent {
     /// verified QC directly so the consumer doesn't need a separate
     /// cache lookup after a positive result.
     QcSignatureVerified {
-        /// Block whose parent-QC signature was verified.
-        block_hash: BlockHash,
+        /// What the verification answers, as the request named it.
+        subject: QcSubject,
         /// Verified QC on success; the reason it failed otherwise.
         result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     },
