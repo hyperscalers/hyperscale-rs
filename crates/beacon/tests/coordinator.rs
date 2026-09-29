@@ -1080,6 +1080,7 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
     // Round timeout on all four: everyone enters round 2 unlocked with
     // the candidate held, re-prevotes it, and the polka, precommits,
     // and commit certificate follow.
+    sim.pass_ratify_round();
     for i in 0..4 {
         sim.fire_ratify_timer(i);
     }

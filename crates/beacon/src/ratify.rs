@@ -236,26 +236,28 @@ impl RatifyTracker {
         self.try_own_prevote().into_iter().collect()
     }
 
-    /// The current round timed out without a commit: enter the next
-    /// round — or jump straight to `target_round` when it is further
-    /// ahead — and re-prevote per the lock rule.
+    /// A round timer fired without a commit: enter `target_round` if
+    /// this member is not already there or past it, and re-prevote per
+    /// the lock rule.
     ///
     /// `target_round` is the caller's wall-clock round: elapsed time
     /// past the epoch's skip deadline divided by the round timeout.
-    /// Deriving progression from the shared deadline instead of
-    /// counting local fires keeps every pool member in the same round
-    /// despite per-host timer jitter — a polka needs a 2f+1 quorum at
-    /// one round, and members whose counters drift apart starve it:
-    /// a polka completing behind a member's current round is not
-    /// precommittable (the vote register is position-monotone), so
-    /// skew that outruns the round window loses the quorum entirely.
+    /// Progression is that round alone, never a count of local fires,
+    /// which keeps every pool member in the same round despite per-host
+    /// timer jitter — a polka needs a 2f+1 quorum at one round, and
+    /// members whose counters drift apart starve it: a polka completing
+    /// behind a member's current round is not precommittable (the vote
+    /// register is position-monotone), so skew that outruns the round
+    /// window loses the quorum entirely. A fire that lands before its
+    /// round boundary on the local clock therefore enters no round; the
+    /// re-armed fire at the boundary does.
     pub fn on_round_timeout(&mut self, target_round: RatifyRound) -> Vec<RatifyEffect> {
         if self.completed {
             return vec![];
         }
         // A round timeout only fires past the epoch's deadline.
         self.deadline_passed = true;
-        self.round = self.round.next().max(target_round);
+        self.round = self.round.max(target_round);
         self.try_own_prevote().into_iter().collect()
     }
 
@@ -345,8 +347,8 @@ impl RatifyTracker {
     /// Cast the round's own prevote if the register is free and a
     /// value is available: the lock if one is held (leaving it only
     /// for the other value's strictly newer polka), else the value of
-    /// the newest polka observed, else the candidate when held, else
-    /// the skip hash once the deadline passed.
+    /// the newest polka it has evidence of, else the candidate when
+    /// held, else the skip hash once the deadline passed.
     ///
     /// An unlocked member's candidate preference is bounded: from
     /// [`CANDIDATE_PATIENCE_ROUNDS`] on, it follows the pool instead,
@@ -362,9 +364,13 @@ impl RatifyTracker {
     /// rounds before the patience runs out, so the rule only ever
     /// decides an already-stalled epoch.
     ///
-    /// A polka outranks both preferences: an unlocked member that has
-    /// seen one prevotes its value, the value the members that
-    /// precommitted it are locked on.
+    /// Polka evidence outranks both preferences: an unlocked member
+    /// that has it prevotes the polka's value, the value the members
+    /// that precommitted it are locked on. Evidence is a prevote quorum
+    /// or more than `f` precommits; a lock held by `f` or fewer members
+    /// leaves none, and there the tally is what carries the pool to it.
+    /// Locked members prevote their lock every round, so a tally read
+    /// by a member that missed their precommits still leans their way.
     fn try_own_prevote(&mut self) -> Option<RatifyEffect> {
         if self.prevoted.contains_key(&self.round) {
             return None;
@@ -398,36 +404,42 @@ impl RatifyTracker {
         })
     }
 
-    /// Whether `block_hash` has a polka at some round strictly between
-    /// `lock_round` and the current round — the only evidence that
-    /// justifies prevoting away from a lock.
+    /// Whether `block_hash` has evidence of a polka at some round
+    /// strictly between `lock_round` and the current round — the only
+    /// thing that justifies prevoting away from a lock.
     fn newer_polka_exists(&self, block_hash: BeaconBlockHash, lock_round: RatifyRound) -> bool {
         self.votes
             .keys()
-            .filter(|&&(r, phase)| {
-                phase == RatifyPhase::Prevote && r > lock_round && r < self.round
-            })
-            .any(|&(r, _)| self.has_polka(r, block_hash))
+            .filter(|&&(r, _)| r > lock_round && r < self.round)
+            .any(|&(r, _)| self.polka_evidenced(r, block_hash))
     }
 
     /// The prevotable value — the held candidate or the skip hash —
-    /// with a polka at the newest round that has one.
+    /// with evidence of a polka at the newest round that has any.
     fn newest_polka_value(&self) -> Option<BeaconBlockHash> {
         let values: Vec<BeaconBlockHash> = self
             .candidate
             .into_iter()
             .chain(std::iter::once(self.skip_hash))
             .collect();
-        self.votes
-            .keys()
-            .rev()
-            .filter(|&&(_, phase)| phase == RatifyPhase::Prevote)
-            .find_map(|&(round, _)| {
-                values
-                    .iter()
-                    .copied()
-                    .find(|&value| self.has_polka(round, value))
-            })
+        self.votes.keys().rev().find_map(|&(round, _)| {
+            values
+                .iter()
+                .copied()
+                .find(|&value| self.polka_evidenced(round, value))
+        })
+    }
+
+    /// Whether `block_hash` had a polka at `round`: a prevote quorum
+    /// observed directly, or more precommits than the pool's fault
+    /// bound. An honest member precommits only on a polka it saw, and
+    /// more than `f` precommits include an honest one, so the polka
+    /// existed even when this member missed the prevotes that formed
+    /// it — and the members that precommitted it are locked on it.
+    fn polka_evidenced(&self, round: RatifyRound, block_hash: BeaconBlockHash) -> bool {
+        let faults = self.pool.len() - ratify_quorum(self.pool.len());
+        self.has_polka(round, block_hash)
+            || self.vote_count_for(round, RatifyPhase::Precommit, block_hash) > faults
     }
 
     /// The prevotable value that drew more prevotes in the newest round
@@ -583,6 +595,12 @@ mod tests {
         .expect("sign")
     }
 
+    /// A round fire one wall-clock round after the tracker's current one.
+    fn next_round(t: &mut RatifyTracker) -> Vec<RatifyEffect> {
+        let target = t.round().next();
+        t.on_round_timeout(target)
+    }
+
     fn sign_prevote_round(effects: &[RatifyEffect]) -> Option<(u32, BeaconBlockHash)> {
         effects.iter().find_map(|e| match e {
             RatifyEffect::SignPrevote { round, block_hash } => Some((round.inner(), *block_hash)),
@@ -618,7 +636,7 @@ mod tests {
         let effects = t.on_candidate(candidate_hash());
         assert!(effects.is_empty(), "round 1 prevote register is spent");
 
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(sign_prevote_round(&effects), Some((2, candidate_hash())));
     }
 
@@ -762,8 +780,8 @@ mod tests {
     #[test]
     fn stale_round_precommit_quorum_still_commits() {
         let (mut t, keys) = tracker(7);
-        let _ = t.on_round_timeout(RatifyRound::INITIAL);
-        let _ = t.on_round_timeout(RatifyRound::INITIAL);
+        let _ = next_round(&mut t);
+        let _ = next_round(&mut t);
         assert_eq!(t.round(), RatifyRound::new(3));
 
         let mut committed = false;
@@ -807,7 +825,7 @@ mod tests {
         let (mut t, keys) = tracker(7);
         let effects = t.on_candidate(candidate_hash());
         assert_eq!(sign_prevote_round(&effects), Some((1, candidate_hash())));
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(sign_prevote_round(&effects), Some((2, candidate_hash())));
 
         for i in 1..=5 {
@@ -819,7 +837,7 @@ mod tests {
         }
 
         for round in 3..=CANDIDATE_PATIENCE_ROUNDS + 2 {
-            let effects = t.on_round_timeout(RatifyRound::INITIAL);
+            let effects = next_round(&mut t);
             assert_eq!(
                 sign_prevote_round(&effects),
                 Some((round, candidate_hash())),
@@ -839,7 +857,7 @@ mod tests {
         let (mut t, keys) = tracker(8);
         let _ = t.on_candidate(candidate_hash());
         while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
-            let _ = t.on_round_timeout(RatifyRound::INITIAL);
+            let _ = next_round(&mut t);
         }
         let previous = t.round().inner();
         for i in 0..5 {
@@ -860,7 +878,7 @@ mod tests {
                 t.skip_block_hash(),
             ));
         }
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(
             sign_prevote_round(&effects),
             Some((previous + 1, candidate_hash())),
@@ -874,7 +892,7 @@ mod tests {
         let (mut t, keys) = tracker(8);
         let _ = t.on_candidate(candidate_hash());
         while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
-            let _ = t.on_round_timeout(RatifyRound::INITIAL);
+            let _ = next_round(&mut t);
         }
         let previous = t.round().inner();
         for i in 0..4 {
@@ -895,10 +913,183 @@ mod tests {
                 t.skip_block_hash(),
             ));
         }
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(
             sign_prevote_round(&effects),
             Some((previous + 1, t.skip_block_hash())),
+        );
+    }
+
+    /// The round is the wall clock's, not a count of fires: a fire
+    /// whose target is the round already held — one landing before its
+    /// boundary on a slow clock, then the re-armed fire at the boundary
+    /// — enters the target once, so members whose timers fire early
+    /// stay in the round their peers are in.
+    #[test]
+    fn round_timeout_enters_the_wall_clock_round_once() {
+        let (mut t, _) = tracker(7);
+        let _ = t.on_deadline();
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        assert_eq!(
+            t.round(),
+            RatifyRound::INITIAL,
+            "an early fire enters no round"
+        );
+        assert!(effects.is_empty(), "the round-1 prevote register is spent");
+
+        let effects = t.on_round_timeout(RatifyRound::new(2));
+        assert_eq!(t.round(), RatifyRound::new(2));
+        assert_eq!(sign_prevote_round(&effects), Some((2, t.skip_block_hash())));
+        let effects = t.on_round_timeout(RatifyRound::new(2));
+        assert_eq!(
+            t.round(),
+            RatifyRound::new(2),
+            "a repeat fire does not ratchet"
+        );
+        assert!(effects.is_empty());
+    }
+
+    /// A member whose clock lags its peers' sees their polka for the
+    /// round they entered first and fast-forwards into it; its own fire
+    /// for that round, landing after, must not carry it a round past
+    /// the pool.
+    #[test]
+    fn a_fast_forwarded_member_stays_in_the_pool_round() {
+        // Pool 7, quorum 5.
+        let (mut t, keys) = tracker(7);
+        let _ = t.on_deadline();
+        let skip = t.skip_block_hash();
+        for i in 1..=5 {
+            let _ = t.observe(vote(&keys, i, 2, RatifyPhase::Prevote, skip));
+        }
+        assert_eq!(t.round(), RatifyRound::new(2), "the polka fast-forwards");
+        let _ = t.on_round_timeout(RatifyRound::new(2));
+        assert_eq!(t.round(), RatifyRound::new(2));
+    }
+
+    /// Pool 8 (quorum 6, fault bound 2), this member holding the
+    /// candidate unlocked, one round short of the patience horizon.
+    /// The previous round's prevotes it saw lean to skip, but more
+    /// members than that precommitted the candidate on a polka whose
+    /// prevotes this member mostly missed.
+    fn missed_polka_with_candidate_precommits(precommits: u64) -> RatifyTracker {
+        let (mut t, keys) = tracker(8);
+        let _ = t.on_candidate(candidate_hash());
+        while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
+            let _ = next_round(&mut t);
+        }
+        let previous = t.round().inner();
+        for i in 1..3 {
+            let _ = t.observe(vote(
+                &keys,
+                i,
+                previous,
+                RatifyPhase::Prevote,
+                candidate_hash(),
+            ));
+        }
+        for i in 5..8 {
+            let _ = t.observe(vote(
+                &keys,
+                i,
+                previous,
+                RatifyPhase::Prevote,
+                t.skip_block_hash(),
+            ));
+        }
+        for i in 1..=precommits {
+            let _ = t.observe(vote(
+                &keys,
+                i,
+                previous,
+                RatifyPhase::Precommit,
+                candidate_hash(),
+            ));
+        }
+        t
+    }
+
+    /// More precommits than the fault bound prove a polka the member
+    /// missed: it prevotes the value the precommitters are locked on,
+    /// over both its patience and the prevote tally it saw.
+    #[test]
+    fn precommit_evidence_outranks_the_tally() {
+        let mut t = missed_polka_with_candidate_precommits(3);
+        let effects = next_round(&mut t);
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((CANDIDATE_PATIENCE_ROUNDS, candidate_hash())),
+        );
+    }
+
+    /// Precommits within the fault bound prove nothing: the member
+    /// follows the tally it saw.
+    #[test]
+    fn precommits_within_the_fault_bound_are_not_evidence() {
+        let mut t = missed_polka_with_candidate_precommits(2);
+        let effects = next_round(&mut t);
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((CANDIDATE_PATIENCE_ROUNDS, t.skip_block_hash())),
+        );
+    }
+
+    /// Precommit evidence of a newer polka releases a lock the way the
+    /// polka itself would.
+    #[test]
+    fn precommit_evidence_of_a_newer_polka_leaves_the_lock() {
+        // Pool 7, quorum 5, fault bound 2. Locked (skip, 1).
+        let (mut t, keys) = tracker(7);
+        let _ = t.on_deadline();
+        let skip = t.skip_block_hash();
+        for i in 0..5 {
+            let _ = t.observe(vote(&keys, i, 1, RatifyPhase::Prevote, skip));
+        }
+        let _ = t.on_candidate(candidate_hash());
+        let _ = t.on_round_timeout(RatifyRound::new(3));
+        for i in 1..4 {
+            let _ = t.observe(vote(&keys, i, 2, RatifyPhase::Precommit, candidate_hash()));
+        }
+        let effects = t.on_round_timeout(RatifyRound::new(4));
+        assert_eq!(sign_prevote_round(&effects), Some((4, candidate_hash())));
+    }
+
+    /// The tally covers what evidence cannot: pool 4 (quorum 3, fault
+    /// bound 1) with one member isolated. Members 0, 1 and 2 prevoted
+    /// the candidate; only member 1 saw all three and locked. Its one
+    /// precommit is within the fault bound, so it proves nothing, and
+    /// an unlocked member conceding to skip would leave skip at two
+    /// and the candidate at one for as long as the isolation holds.
+    /// Following the tally it saw — the candidate led — completes the
+    /// candidate's polka instead.
+    #[test]
+    fn past_patience_the_tally_carries_a_lock_below_the_evidence_bound() {
+        let (mut t, keys) = tracker(4);
+        let _ = t.on_candidate(candidate_hash());
+        while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
+            let _ = next_round(&mut t);
+        }
+        let previous = t.round().inner();
+        for i in 0..2 {
+            let _ = t.observe(vote(
+                &keys,
+                i,
+                previous,
+                RatifyPhase::Prevote,
+                candidate_hash(),
+            ));
+        }
+        let _ = t.observe(vote(
+            &keys,
+            1,
+            previous,
+            RatifyPhase::Precommit,
+            candidate_hash(),
+        ));
+        let effects = next_round(&mut t);
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((CANDIDATE_PATIENCE_ROUNDS, candidate_hash())),
         );
     }
 
@@ -910,7 +1101,7 @@ mod tests {
         let _ = t.on_candidate(candidate_hash());
         let mut last = None;
         while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS {
-            last = sign_prevote_round(&t.on_round_timeout(RatifyRound::INITIAL));
+            last = sign_prevote_round(&next_round(&mut t));
         }
         assert_eq!(last, Some((CANDIDATE_PATIENCE_ROUNDS, t.skip_block_hash())));
     }
@@ -934,7 +1125,7 @@ mod tests {
             "polka completes with the loopback vote",
         );
 
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(
             sign_prevote_round(&effects),
             Some((2, candidate_hash())),
@@ -958,9 +1149,9 @@ mod tests {
         assert_eq!(t.round(), RatifyRound::new(1));
 
         // Rounds 2 and 3: the lock re-prevotes the candidate.
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(sign_prevote_round(&effects), Some((2, candidate_hash())));
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(sign_prevote_round(&effects), Some((3, candidate_hash())));
 
         // A skip polka at round 2 lands late — the tracker is at
@@ -977,7 +1168,7 @@ mod tests {
 
         // ...but it is a strictly newer polka than the round-1 lock,
         // so round 4's prevote follows the pool to skip.
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(sign_prevote_round(&effects), Some((4, skip)));
     }
 
@@ -995,7 +1186,7 @@ mod tests {
 
         // Round 2: the rest of the pool prevotes skip; the polka
         // (6 of 7 without us) precommits and re-locks (skip, 2).
-        let _ = t.on_round_timeout(RatifyRound::INITIAL);
+        let _ = next_round(&mut t);
         let skip = t.skip_block_hash();
         let mut effects = vec![];
         for i in 1..=6 {
@@ -1004,7 +1195,7 @@ mod tests {
         assert_eq!(sign_precommit_round(&effects), Some((2, skip)));
 
         // Round 3: the new lock re-prevotes skip.
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(sign_prevote_round(&effects), Some((3, skip)));
     }
 
@@ -1040,7 +1231,7 @@ mod tests {
 
         // The next round re-prevotes the recovered lock, not the
         // candidate: no newer polka justifies leaving it.
-        let effects = t.on_round_timeout(RatifyRound::INITIAL);
+        let effects = next_round(&mut t);
         assert_eq!(sign_prevote_round(&effects), Some((3, skip)));
     }
 

@@ -28,13 +28,13 @@ use hyperscale_types::{
     ConsensusPublicKey, Epoch, GenesisPool, GenesisValidator, Hash, LeafIndex, LocalReceiptRoot,
     LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, PcScope, PcValueElement, PcVector, PcVote1,
     PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Randomness, RatifyPhase, RatifyRound, RatifyVerifyContext, RatifyVote,
-    RevealChain, Round, SKIP_TIMEOUT, ShardId, ShardLoad, ShardVoteEquivocation,
-    ShardWitnessPayload, Signer, SignerBitfield, SpcEmptyViewMsg, SpcNewCommitMsg,
-    SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-    TxsInFlight, ValidatorId, Verifiable, Verified, WeightedTimestamp, beacon_reveal_sign,
-    compute_merkle_root, compute_range_proof, genesis_config_hash, sign_empty_view_msg, sign_vote1,
-    sign_vote2, sign_vote3,
+    QuorumCertificate, RATIFY_ROUND_TIMEOUT, Randomness, RatifyPhase, RatifyRound,
+    RatifyVerifyContext, RatifyVote, RevealChain, Round, SKIP_TIMEOUT, ShardId, ShardLoad,
+    ShardVoteEquivocation, ShardWitnessPayload, Signer, SignerBitfield, SpcEmptyViewMsg,
+    SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot,
+    TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    beacon_reveal_sign, compute_merkle_root, compute_range_proof, genesis_config_hash,
+    sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3,
 };
 
 use super::fixtures::Committee;
@@ -674,6 +674,19 @@ impl CoordinatorSim {
             let next = coord.current_state().current_epoch.next().inner();
             let boundary = next * coord.current_state().chain_config.epoch_duration_ms;
             coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms));
+        }
+    }
+
+    /// Advance every replica's clock by one ratify round, so the next
+    /// ratify fire on each lands in the following wall-clock round.
+    pub fn pass_ratify_round(&mut self) {
+        let round_ms: u64 = RATIFY_ROUND_TIMEOUT
+            .as_millis()
+            .try_into()
+            .expect("RATIFY_ROUND_TIMEOUT fits in u64 millis");
+        for coord in &mut self.coordinators {
+            let now = coord.now().as_millis();
+            coord.set_now(LocalTimestamp::from_millis(now + round_ms));
         }
     }
 

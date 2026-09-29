@@ -3645,9 +3645,35 @@ mod tests {
         );
         assert_eq!(coord.ratify.round(), RatifyRound::INITIAL);
 
-        // A second fire is a round timeout: the round advances, and the
-        // unlocked tracker re-prevotes skip (still no candidate).
+        // A round fire that lands before the round boundary on this
+        // member's clock enters no round: the round is the wall clock's,
+        // and the re-arm at the boundary is the fire that enters it.
+        let round_ms: u64 = RATIFY_ROUND_TIMEOUT
+            .as_millis()
+            .try_into()
+            .expect("RATIFY_ROUND_TIMEOUT fits in u64 millis");
+        let round_two = boundary + timeout_ms + round_ms;
+        coord.set_now(LocalTimestamp::from_millis(round_two - 1));
         let actions = coord.on_beacon_ratify_timer();
+        assert_eq!(coord.ratify.round(), RatifyRound::INITIAL);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SetTimer {
+                    id: TimerId::BeaconRatifyTrigger,
+                    duration,
+                } if *duration == Duration::from_millis(1)
+            )),
+            "an early round fire must re-arm at the boundary; got {actions:?}",
+        );
+
+        // The fire at the boundary is a round timeout: the round
+        // advances, and the unlocked tracker re-prevotes skip (still no
+        // candidate). A second fire at the same instant enters nothing.
+        coord.set_now(LocalTimestamp::from_millis(round_two));
+        let actions = coord.on_beacon_ratify_timer();
+        assert_eq!(coord.ratify.round(), RatifyRound::new(2));
+        let _ = coord.on_beacon_ratify_timer();
         assert_eq!(coord.ratify.round(), RatifyRound::new(2));
         assert!(
             actions.iter().any(|a| matches!(
