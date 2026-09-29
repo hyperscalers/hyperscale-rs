@@ -175,10 +175,9 @@ impl SimulationRunner {
             .iter()
             .map(|&validator| self.runtime_vnode_init(host, validator, shard, recovered))
             .collect();
-        // A co-hosted pool extra has no host in the transport's layout until
-        // it is seated: bind it here, as the reshape seat does, or every
-        // notification addressed to it — headers, votes, ready-signal
-        // traffic — is dropped as unreachable and the seat never syncs.
+        // Bind each seated validator to this host in the transport's layout,
+        // as the reshape seat does, so every notification addressed to it —
+        // headers, votes, ready-signal traffic — reaches the seat.
         for &validator in validators {
             self.network.bind_validator(validator, host);
         }
