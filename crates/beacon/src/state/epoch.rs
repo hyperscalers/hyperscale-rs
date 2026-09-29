@@ -233,6 +233,10 @@ pub fn apply_epoch(
     // helper (including `pool_draw`'s seed binding) reads "the epoch
     // I'm in," not "the epoch before mine."
     state.current_epoch = epoch;
+    // Missed proposals count toward a jail only within the epoch that
+    // folds them: the threshold prices a validator's miss rate, so misses
+    // spread across its whole tenure on a shard must not add up to one.
+    state.miss_counters.clear();
 
     // Promote the lookahead committee into the active slot before the
     // pipeline runs. `next_shard_committees` was finalized one epoch ago

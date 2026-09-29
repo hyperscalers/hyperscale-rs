@@ -2004,6 +2004,14 @@ mod tests {
         }
     }
 
+    /// One epoch's worth of misses against `proposer_id`: exactly the
+    /// jail threshold.
+    fn threshold_misses(proposer_id: ValidatorId) -> Vec<ShardWitnessPayload> {
+        (0..MISSED_PROPOSAL_JAIL_THRESHOLD)
+            .map(|_| missed_payload(proposer_id))
+            .collect()
+    }
+
     /// A `MissedProposal` from shard S against a validator currently
     /// `OnShard { shard: S, .. }` increments their miss counter. Below
     /// threshold, no jail effect.
@@ -2103,6 +2111,29 @@ mod tests {
         assert_eq!(state.miss_counters.get(&target), Some(&3));
     }
 
+    /// Misses count toward a jail only within the epoch that folds them:
+    /// a validator one short of the threshold in one epoch and missing
+    /// once more in the next stays placed, its count restarted.
+    #[test]
+    fn missed_proposals_do_not_accumulate_across_epochs() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(1);
+
+        let mut below = threshold_misses(target);
+        below.pop();
+        let first = apply_witness_chunk(&mut state, 0, below);
+        let second = apply_witness_chunk(&mut state, 0, vec![missed_payload(target)]);
+
+        assert!(first.jailed.is_empty());
+        assert!(second.jailed.is_empty());
+        assert_eq!(state.miss_counters.get(&target), Some(&1));
+        assert!(matches!(
+            state.validators.get(&target).unwrap().status,
+            ValidatorStatus::OnShard { .. },
+        ));
+    }
+
     /// Crossing `MISSED_PROPOSAL_JAIL_THRESHOLD` jails the validator under
     /// `Performance`, cascades the committee removal + `pool_draw` refill,
     /// and clears the miss counter.
@@ -2125,11 +2156,7 @@ mod tests {
         );
 
         let target = ValidatorId::new(1);
-        state
-            .miss_counters
-            .insert(target, MISSED_PROPOSAL_JAIL_THRESHOLD - 1);
-
-        let effects = apply_witness_chunk(&mut state, 0, vec![missed_payload(target)]);
+        let effects = apply_witness_chunk(&mut state, 0, threshold_misses(target));
 
         assert_eq!(effects.jailed, vec![target]);
         assert_eq!(
@@ -2186,11 +2213,7 @@ mod tests {
         );
 
         let target = ValidatorId::new(1);
-        state
-            .miss_counters
-            .insert(target, MISSED_PROPOSAL_JAIL_THRESHOLD - 1);
-
-        let effects = apply_witness_chunk(&mut state, 0, vec![missed_payload(target)]);
+        let effects = apply_witness_chunk(&mut state, 0, threshold_misses(target));
 
         assert!(
             effects.jailed.is_empty(),
