@@ -396,12 +396,13 @@ where
 ///
 /// When the fetch named a block, any other block is dropped and the peer
 /// rejected: the request said which block answers, and serving another
-/// is not an answer. The height backs off as for any other block a peer
-/// serves wrongly, so with no reachable holder of the named block the
-/// refetches are paced rather than back to back. The backoff does not
-/// count toward an unfounded target: the named block is certified, so
-/// the height exists. "Peer doesn't have this height" is ambiguous (the
-/// peer may simply be behind) and never rejects.
+/// is not an answer. A named fetch that comes back empty is an honest
+/// answer from a peer without the block and is not rejected. Either way
+/// the height backs off, so with no reachable holder of the named block
+/// the refetches are paced rather than back to back, and neither counts
+/// toward an unfounded target: the named block is certified, so the
+/// height exists. An unnamed "peer doesn't have this height" is ambiguous
+/// (the peer may simply be behind), never rejects, and re-queues at once.
 fn block_sync_answer(
     height: BlockHeight,
     named: Option<BlockHash>,
@@ -420,6 +421,15 @@ fn block_sync_answer(
                         kind: FetchFailureKind::Transport,
                     },
                     ResponseVerdict::Reject,
+                );
+            }
+            if named.is_some() && block.is_none() {
+                return (
+                    ShardScopedInput::BlockSyncFetchFailed {
+                        height,
+                        kind: FetchFailureKind::Transport,
+                    },
+                    ResponseVerdict::Accept,
                 );
             }
             (
@@ -1337,6 +1347,24 @@ mod tests {
         assert!(validate_synced_block(HEIGHT, &certified).is_ok());
     }
 
+    /// A peer without the named block says so honestly: the peer is not
+    /// marked, and the height backs off as a failed fetch rather than
+    /// re-queueing at once, without counting as a not-found answer.
+    #[test]
+    fn a_named_fetch_answered_empty_backs_off() {
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
+        let (input, verdict) =
+            block_sync_answer(HEIGHT, Some(winner), Ok(GetBlockResponse::not_found()));
+        assert!(matches!(
+            input,
+            ShardScopedInput::BlockSyncFetchFailed {
+                height,
+                kind: FetchFailureKind::Transport,
+            } if height == HEIGHT
+        ));
+        assert_eq!(verdict, ResponseVerdict::Accept);
+    }
+
     /// A peer answering a fetch that names the winner with the loser it
     /// also holds has not answered: the block is dropped before it
     /// reaches consensus, the height backs off, and the peer is marked.
@@ -1386,8 +1414,7 @@ mod tests {
             assert_eq!(verdict, ResponseVerdict::Accept);
         }
 
-        let (input, verdict) =
-            block_sync_answer(HEIGHT, Some(winner), Ok(GetBlockResponse::not_found()));
+        let (input, verdict) = block_sync_answer(HEIGHT, None, Ok(GetBlockResponse::not_found()));
         assert!(matches!(
             input,
             ShardScopedInput::BlockSyncResponseReceived { block: None, .. }

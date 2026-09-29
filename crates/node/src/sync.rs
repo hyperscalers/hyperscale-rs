@@ -2073,6 +2073,50 @@ mod tests {
         );
     }
 
+    /// A transport-kind failure at the height above the frontier backs
+    /// off without counting toward an unfounded target, however often it
+    /// repeats: it is what a named height no peer serves reports, and that
+    /// height is certified.
+    #[test]
+    fn transport_failures_above_the_frontier_back_off_and_never_settle() {
+        let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 1,
+            max_concurrent_per_scope: 1,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(9_000),
+        });
+        let mut now = 0u64;
+        for _ in 0..NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED * 3 {
+            let outputs = s.handle(SyncInput::FetchFailed {
+                scope: 1,
+                from: BlockHeight::new(1),
+                count: 1,
+                kind: FetchFailureKind::Transport,
+                now: LocalTimestamp::from_millis(now),
+            });
+            assert!(
+                !outputs
+                    .iter()
+                    .any(|o| matches!(o, SyncOutput::Fetch { .. } | SyncOutput::Complete { .. })),
+                "a transport failure neither refetches at once nor settles",
+            );
+            now += DEFERRAL_MAX_MS * 2;
+            let outputs = s.handle(SyncInput::Tick {
+                now: LocalTimestamp::from_millis(now),
+            });
+            assert!(
+                outputs
+                    .iter()
+                    .any(|o| matches!(o, SyncOutput::Fetch { .. })),
+                "the backoff elapses and the height is fetched again",
+            );
+        }
+        assert_eq!(s.scopes[&1].target, BlockHeight::new(9_000));
+    }
+
     /// A window fetches many heights at once; a peer serving the ones
     /// above the gap says nothing about the gap, so those deliveries do
     /// not reset the streak.
