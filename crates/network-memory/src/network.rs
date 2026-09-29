@@ -883,10 +883,12 @@ impl SimulatedNetwork {
     /// with round-trip latency.
     ///
     /// For each request:
-    /// 1. Select a peer (`preferred_peer` if set, otherwise random from list)
-    /// 2. Check partition and packet loss (request + response directions)
-    /// 3. On error (partition/loss/no handler/empty): invoke callback immediately
-    /// 4. On success: invoke handler to get response bytes, sample two
+    /// 1. Where the requester serves the target shard and its own handler's
+    ///    answer is not empty, deliver that answer at `now` and stop
+    /// 2. Select a peer (`preferred_peer` if set, otherwise random from list)
+    /// 3. Check partition and packet loss (request + response directions)
+    /// 4. On error (partition/loss/no handler/empty): invoke callback immediately
+    /// 5. On success: invoke handler to get response bytes, sample two
     ///    independent latencies (request + response legs), schedule callback
     ///    delivery at `now + latency_request + latency_response`
     pub fn accept_requests(
@@ -898,7 +900,19 @@ impl SimulatedNetwork {
     ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
         for request in requests {
-            self.fulfill_request(requester, now, request, streams, &mut stats);
+            // A host serving the shard answers from its own handler first,
+            // as the production adapter does, and asks the committee only
+            // when that answer is empty.
+            match self.serve_locally(requester, &request) {
+                Some(bytes) => self.schedule_response(
+                    now,
+                    Duration::ZERO,
+                    requester,
+                    Ok(bytes),
+                    request.on_response,
+                ),
+                None => self.fulfill_request(requester, now, request, streams, &mut stats),
+            }
         }
         stats
     }
@@ -927,6 +941,7 @@ impl SimulatedNetwork {
             response_class,
             request_bytes,
             on_response,
+            ..
         } = request;
 
         let (candidates, initial) =
@@ -1027,6 +1042,19 @@ impl SimulatedNetwork {
             }
         };
         self.schedule_response(now, elapsed, requester, outcome, on_response);
+    }
+
+    /// What `requester`'s own handler answers `request` with, where the
+    /// host serves the target shard and the answer is not empty in the
+    /// request type's terms. No transport is involved, so no fault, loss or
+    /// latency applies.
+    fn serve_locally(&self, requester: NodeIndex, request: &PendingRequest) -> Option<Vec<u8>> {
+        let registry = self.registries.get(requester as usize)?;
+        if !registry.hosted_shards().contains(&request.shard) {
+            return None;
+        }
+        let handler = registry.get_request(request.type_id, request.shard)?;
+        Some(handler(&request.request_bytes)).filter(|bytes| !(request.is_empty_response)(bytes))
     }
 
     /// The committee a request may ask, and the peer to open with: the
@@ -1978,6 +2006,7 @@ mod tests {
             class: MessageClass::Recovery,
             response_class: MessageClass::Recovery,
             request_bytes: vec![1, 2, 3],
+            is_empty_response: <[u8]>::is_empty,
             on_response: Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
                 ResponseVerdict::Accept
@@ -2021,8 +2050,9 @@ mod tests {
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = LinkStreams::new(42);
 
-        // Every peer can serve; only the preferred one is unreachable.
-        for i in 0..4 {
+        // Every peer can serve; only the preferred one is unreachable. The
+        // requester serves nothing itself, so every attempt crosses the wire.
+        for i in 1..4 {
             let adapter = network.create_adapter(i);
             register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
@@ -2060,7 +2090,9 @@ mod tests {
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = LinkStreams::new(42);
 
-        for i in 0..4 {
+        // The requester serves nothing itself, so every attempt crosses the
+        // wire.
+        for i in 1..4 {
             let adapter = network.create_adapter(i);
             register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
@@ -2090,7 +2122,9 @@ mod tests {
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = LinkStreams::new(42);
 
-        for i in 0..4 {
+        // The requester serves nothing itself, so every attempt crosses the
+        // wire.
+        for i in 1..4 {
             let adapter = network.create_adapter(i);
             register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
@@ -2186,8 +2220,9 @@ mod tests {
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = LinkStreams::new(42);
 
-        // Register handlers on all nodes
-        for i in 0..4 {
+        // Register handlers on every peer; the requester serves nothing
+        // itself, so the request crosses the wire.
+        for i in 1..4 {
             let adapter = network.create_adapter(i);
             register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
@@ -2223,6 +2258,56 @@ mod tests {
         network.flush_responses(FAR_FUTURE);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::NoPeers)));
+    }
+
+    /// A requester serving the shard answers from its own handler at once:
+    /// nothing crosses the wire, and the answer lands at `now`.
+    #[test]
+    fn test_accept_requests_serves_a_hosted_shard_locally() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut rng = LinkStreams::new(42);
+        for i in 0..4 {
+            let adapter = network.create_adapter(i);
+            register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
+        }
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+
+        assert_eq!(stats.messages_sent, 0);
+        network.flush_responses(Duration::ZERO);
+        let captured = result.lock().unwrap().take().unwrap();
+        assert_eq!(captured.unwrap(), vec![1, 2, 3]);
+    }
+
+    /// An empty local answer is no answer: the request goes on to the
+    /// committee.
+    #[test]
+    fn test_accept_requests_asks_the_committee_past_an_empty_local_answer() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut rng = LinkStreams::new(42);
+        let silent: Arc<RawRequestHandler> = Arc::new(|_: &[u8]| -> Vec<u8> { Vec::new() });
+        network.create_adapter(0).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            silent,
+        );
+        for i in 1..4 {
+            let adapter = network.create_adapter(i);
+            register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
+        }
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+
+        assert_eq!(stats.messages_sent, 2);
+        network.flush_responses(FAR_FUTURE);
+        let captured = result.lock().unwrap().take().unwrap();
+        assert_eq!(captured.unwrap(), vec![1, 2, 3]);
     }
 
     #[test]

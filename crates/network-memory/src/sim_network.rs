@@ -81,6 +81,11 @@ pub struct PendingRequest {
     pub(crate) response_class: MessageClass,
     /// encoded request bytes.
     pub(crate) request_bytes: Vec<u8>,
+    /// Whether an encoded answer is empty in the request type's own
+    /// terms ([`Request::is_empty_response`]) — what decides whether a
+    /// host serving the shard answers from its own handler or asks the
+    /// committee.
+    pub(crate) is_empty_response: fn(&[u8]) -> bool,
     /// Callback that receives encoded response bytes (or error). Returns
     /// a [`ResponseVerdict`] for parity with the production `Network::request`
     /// signature; the simulation discards the verdict (deterministic harness
@@ -313,9 +318,16 @@ impl Network for SimNetworkAdapter {
             class: class_override.unwrap_or_else(R::class),
             response_class: <R::Response as NetworkMessage>::class(),
             request_bytes,
+            is_empty_response: is_empty_response_bytes::<R>,
             on_response: typed_callback,
         });
     }
+}
+
+/// [`Request::is_empty_response`] over encoded bytes. An answer that does
+/// not decode answers nothing.
+fn is_empty_response_bytes<R: Request>(bytes: &[u8]) -> bool {
+    hbor_from_slice::<R::Response>(bytes).map_or(true, |response| R::is_empty_response(&response))
 }
 
 #[cfg(test)]
