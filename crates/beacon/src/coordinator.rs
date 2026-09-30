@@ -2019,9 +2019,10 @@ impl BeaconCoordinator {
     /// leave it for the other without a newer polka: a pool split
     /// between members that hold the candidate and members that missed
     /// it on gossip never reaches a quorum. The ask goes to a member
-    /// that prevoted it — it verified the candidate, so it holds a copy
-    /// — over that member's shard; the answer enters as a gossiped
-    /// candidate does.
+    /// that prevoted it — before any polka an honest prevoter verified
+    /// the candidate, so it holds a copy — over that member's shard; the
+    /// answer enters as a gossiped candidate does. Once a polka forms
+    /// the tracker follows it without the block.
     fn ask_for_prevoted_candidates(&mut self) -> Vec<Action> {
         if self.ratify.is_completed()
             || self.ratify.candidate().is_some()

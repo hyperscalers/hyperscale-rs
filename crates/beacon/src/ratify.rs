@@ -9,16 +9,18 @@
 //! - **Prevote** the verified candidate's hash when it arrives, the
 //!   skip hash once the deadline passes without it. A precommit locks
 //!   its value: later rounds re-prevote the lock, leaving it only for
-//!   the other value when that value's prevote quorum (polka) is the
+//!   another value when that value's prevote quorum (polka) is the
 //!   newest one evidenced at a round strictly newer than the lock —
-//!   following the pool, never leading it. Every prevote carries the
+//!   following the pool, never leading it. An unlocked member follows
+//!   the newest polka it has evidence of, even for a candidate it does
+//!   not hold. Every prevote carries the
 //!   votes proving the newest polka this member has evidence of, so a
 //!   polka whose votes were lost reaches every member once the network
 //!   delivers.
 //! - **Precommit** a value exactly when its polka is observed, at
-//!   rounds no older than the current one. A polka carries honest
-//!   voters that verified the value, so the precommit needs no local
-//!   copy of the block.
+//!   rounds no older than the current one. The first honest prevote
+//!   for any value is one that verified it, so the precommit needs no
+//!   local copy of the block.
 //! - **Commit** when a quorum of precommits for one hash land in one
 //!   round — at any round, however stale: a certificate's validity
 //!   doesn't age.
@@ -111,7 +113,9 @@ pub struct RatifyTracker {
     /// Hash of the verified SPC candidate, once one arrived.
     /// First-wins: a second distinct candidate (an equivocating
     /// committee double-certifying) is ignored — the pool cert is what
-    /// commits, so the equivocation merely splits prevotes.
+    /// commits, and a polka for the other candidate is followed on its
+    /// evidence alone, so the equivocation merely splits prevotes until
+    /// one polkas.
     candidate: Option<BeaconBlockHash>,
     /// Whether the epoch's skip deadline (or any round timeout, which
     /// implies it) has passed — the precondition for prevoting skip.
@@ -256,10 +260,11 @@ impl RatifyTracker {
     /// than the pool's fault bound prevoted in one round, each with the
     /// members that prevoted it there. More than `f` prevotes include an
     /// honest member's, and an honest member prevotes only a candidate
-    /// it verified: the value is a real certified candidate this member
-    /// lacks, and every honest one of those members holds it. The
-    /// threshold also keeps up to `f` Byzantine prevoters from naming
-    /// hashes for this member to chase.
+    /// it verified or one whose polka it has evidence of: the value is a
+    /// real certified candidate this member lacks, held by the honest
+    /// members that prevoted it before any polka formed. The threshold
+    /// also keeps up to `f` Byzantine prevoters from naming hashes for
+    /// this member to chase.
     #[must_use]
     pub fn unheld_prevoted_candidates(&self) -> BTreeMap<BeaconBlockHash, BTreeSet<ValidatorId>> {
         let faults = self.pool.len() - ratify_quorum(self.pool.len());
@@ -459,10 +464,11 @@ impl RatifyTracker {
 
     /// Cast the round's own prevote if the register is free and a
     /// value is available: the lock if one is held (leaving it only
-    /// for the other value when that value's polka is the newest one
+    /// for another value when that value's polka is the newest one
     /// evidenced strictly after the lock), else the value of the newest
-    /// polka it has evidence of, else the candidate when held, else the
-    /// skip hash once the deadline passed.
+    /// polka it has evidence of, whether or not this member holds it,
+    /// else the candidate when held, else the skip hash once the
+    /// deadline passed.
     ///
     /// An unlocked member's candidate preference is bounded: from
     /// [`CANDIDATE_PATIENCE_ROUNDS`] on, one without polka evidence
@@ -485,26 +491,28 @@ impl RatifyTracker {
         if self.prevoted.contains_key(&self.round) {
             return None;
         }
-        let held: Vec<BeaconBlockHash> = self
-            .candidate
-            .into_iter()
-            .chain(std::iter::once(self.skip_hash))
-            .collect();
         let choice = match self.precommitted.iter().next_back() {
             Some((&lock_round, &locked)) => {
-                // The lock first: evidence for both values in one round
+                // The lock first: evidence for two values in one round
                 // takes more than `f` faults, and the lock does not
                 // leave on it.
-                let values: Vec<BeaconBlockHash> = std::iter::once(locked)
-                    .chain(held.into_iter().filter(|&value| value != locked))
-                    .collect();
                 let current = self.round;
                 Some(
-                    self.newest_polka_value(&values, |round| round > lock_round && round < current)
-                        .unwrap_or(locked),
+                    self.newest_polka_value(&[locked], |round| {
+                        round > lock_round && round < current
+                    })
+                    .unwrap_or(locked),
                 )
             }
-            None => self.newest_polka_value(&held, |_| true).or_else(|| {
+            None => {
+                let held: Vec<BeaconBlockHash> = self
+                    .candidate
+                    .into_iter()
+                    .chain(std::iter::once(self.skip_hash))
+                    .collect();
+                self.newest_polka_value(&held, |_| true)
+            }
+            .or_else(|| {
                 if self.deadline_passed && self.round.inner() >= CANDIDATE_PATIENCE_ROUNDS {
                     Some(self.skip_hash)
                 } else {
@@ -522,23 +530,45 @@ impl RatifyTracker {
         })
     }
 
-    /// The first of `values` with evidence of a polka at the newest
-    /// round `in_window` admits that has evidence for any of them.
+    /// The value with evidence of a polka at the newest round
+    /// `in_window` admits that has evidence for any value: the first of
+    /// `preferred` evidenced there, else the lowest evidenced hash.
+    ///
+    /// Any value qualifies, held or not. The first honest prevote for a
+    /// value is one that verified it — every later one follows evidence
+    /// that honest members prevoted it before — so a polka's value is a
+    /// certified candidate or the skip block, and a member holding a
+    /// different candidate from an equivocating committee follows it
+    /// rather than splitting the pool between the two.
     fn newest_polka_value(
         &self,
-        values: &[BeaconBlockHash],
+        preferred: &[BeaconBlockHash],
         in_window: impl Fn(RatifyRound) -> bool,
     ) -> Option<BeaconBlockHash> {
-        self.votes
-            .keys()
+        let rounds: BTreeSet<RatifyRound> = self.votes.keys().map(|&(round, _)| round).collect();
+        rounds
+            .into_iter()
             .rev()
-            .filter(|&&(round, _)| in_window(round))
-            .find_map(|&(round, _)| {
-                values
+            .filter(|&round| in_window(round))
+            .find_map(|round| {
+                let evidenced = self.evidenced_values(round);
+                preferred
                     .iter()
                     .copied()
-                    .find(|&value| self.polka_evidenced(round, value))
+                    .find(|value| evidenced.contains(value))
+                    .or_else(|| evidenced.first().copied())
             })
+    }
+
+    /// Every value with evidence of a polka at `round`.
+    fn evidenced_values(&self, round: RatifyRound) -> BTreeSet<BeaconBlockHash> {
+        [RatifyPhase::Prevote, RatifyPhase::Precommit]
+            .into_iter()
+            .filter_map(|phase| self.votes.get(&(round, phase)))
+            .flat_map(BTreeMap::values)
+            .map(|vote| vote.block_hash())
+            .filter(|&value| self.polka_evidenced(round, value))
+            .collect()
     }
 
     /// The votes proving the newest polka this member has evidence of,
@@ -1081,6 +1111,24 @@ mod tests {
         assert_eq!(t.round(), RatifyRound::new(2), "the polka fast-forwards");
         let _ = t.on_round_timeout(RatifyRound::new(2));
         assert_eq!(t.round(), RatifyRound::new(2));
+    }
+
+    /// An unlocked member holding one candidate follows a polka for
+    /// another it never received: the polka's value was verified by an
+    /// honest member, and the member's own candidate has no evidence.
+    #[test]
+    fn an_unlocked_member_follows_a_polka_for_a_candidate_it_lacks() {
+        // Pool 7, quorum 5.
+        let (mut t, keys) = tracker(7);
+        let other = BeaconBlockHash::from_raw(Hash::from_bytes(b"equivocation"));
+        let _ = t.on_candidate(other);
+        let _ = next_round(&mut t);
+        for i in 1..=5 {
+            let _ = t.observe(vote(&keys, i, 1, RatifyPhase::Prevote, candidate_hash()));
+        }
+        let effects = next_round(&mut t);
+        assert_eq!(t.candidate(), Some(other));
+        assert_eq!(sign_prevote_round(&effects), Some((3, candidate_hash())));
     }
 
     /// Pool 8 (quorum 6, fault bound 2), this member holding the
@@ -1805,6 +1853,39 @@ mod tests {
     fn a_restarted_lone_locker_without_its_polka_wedges() {
         let m = one_byzantine_lock_wedge(true, |m| m.restart(0, false), 12);
         assert_eq!(m.committed, vec![None; 3]);
+    }
+
+    /// An equivocating committee certified two candidates: A (0) holds
+    /// X, B (1) and C (2) hold Y. Round 1: A prevotes X, B and C prevote
+    /// Y, and D (3) sends its Y prevote to B alone — only B sees the
+    /// polka, and it locks. From round 2 D goes silent. A never
+    /// receives Y, yet once B's proof reaches it A follows the polka;
+    /// were it held to its own candidate, its X and then skip prevotes
+    /// would leave Y a vote short of quorum for good.
+    #[test]
+    fn a_member_holding_the_other_candidate_follows_its_polka() {
+        let (a, b, c) = (0, 1, 2);
+        let other = BeaconBlockHash::from_raw(Hash::from_bytes(b"equivocation"));
+        let polkaed = candidate_hash();
+        let mut m = HonestMembers::new(true);
+        let everything = |_: usize, _: usize| true;
+        for (member, value) in [(a, other), (b, polkaed), (c, polkaed)] {
+            let effects = m.trackers[member].on_candidate(value);
+            m.act(member, effects, &everything);
+        }
+        let d_prevote = vote(&m.keys, 3, 1, RatifyPhase::Prevote, polkaed);
+        m.deliver(b, d_prevote, &everything);
+        assert_eq!(
+            m.trackers[b].precommitted.get(&RatifyRound::INITIAL),
+            Some(&polkaed),
+            "B alone locks",
+        );
+
+        for round in 2..=4 {
+            m.enter_round(round, &everything);
+        }
+        assert_eq!(m.trackers[a].candidate(), Some(other));
+        assert_eq!(m.committed, vec![Some(polkaed); 3]);
     }
 
     /// Without them the same run is absorbing: A holds its lock, B and
