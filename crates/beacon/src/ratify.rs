@@ -25,9 +25,11 @@
 //!   round — at any round, however stale: a certificate's validity
 //!   doesn't age.
 //!
-//! Rounds only move forward: a round timeout advances by one, a polka
-//! at a newer round fast-forwards to it. Voting into rounds already
-//! left would let one validator's signatures straddle two quorums.
+//! Rounds only move forward: a round timeout enters the wall clock's
+//! round, and a polka at a newer round, or votes there from more
+//! signers than the pool's fault bound, fast-forward to it. Voting into
+//! rounds already left would let one validator's signatures straddle
+//! two quorums.
 //!
 //! No topology, no clocks — pure data structure; the coordinator
 //! feeds verified votes and timer edges in, and lifts the typed
@@ -419,15 +421,46 @@ impl RatifyTracker {
         };
         slot.insert(vote);
 
-        match phase {
+        let mut out = match phase {
             RatifyPhase::Prevote => self.on_possible_polka(round, block_hash),
             RatifyPhase::Precommit => self.try_assemble(round, block_hash).into_iter().collect(),
+        };
+        out.extend(self.catch_up(round));
+        out
+    }
+
+    /// Enter `round` once more members than the pool's fault bound have
+    /// voted there, in either phase, and prevote in it. An honest member
+    /// votes only in the round it is in, so more than `f` signers there
+    /// include an honest one that reached it — by its own wall clock, a
+    /// polka, or this same rule, which bottoms out in one of the other
+    /// two. Up to `f` Byzantine signers cannot move anyone, and no
+    /// member is carried past the furthest honest one: a member whose
+    /// timer lags its peers' joins their round without waiting out its
+    /// own window, and its later fire for that round
+    /// ([`Self::on_round_timeout`]) finds it already there.
+    fn catch_up(&mut self, round: RatifyRound) -> Option<RatifyEffect> {
+        if self.completed || round <= self.round {
+            return None;
         }
+        let faults = self.pool.len() - ratify_quorum(self.pool.len());
+        let signers: BTreeSet<ValidatorId> = [RatifyPhase::Prevote, RatifyPhase::Precommit]
+            .into_iter()
+            .filter_map(|phase| self.votes.get(&(round, phase)))
+            .flat_map(BTreeMap::keys)
+            .copied()
+            .collect();
+        if signers.len() <= faults {
+            return None;
+        }
+        self.round = round;
+        self.try_own_prevote()
     }
 
     /// React to a prevote landing: if it completed a polka at a round
-    /// no older than the current one, precommit (locking the value)
-    /// and fast-forward to that round.
+    /// no older than the current one, precommit (locking the value),
+    /// fast-forward to that round, and prevote there if this member has
+    /// not yet.
     fn on_possible_polka(
         &mut self,
         round: RatifyRound,
@@ -439,7 +472,6 @@ impl RatifyTracker {
         {
             return vec![];
         }
-        let advanced = round > self.round;
         self.round = round;
         self.precommitted.insert(round, block_hash);
         let polka = self
@@ -456,9 +488,7 @@ impl RatifyTracker {
             block_hash,
             polka,
         }];
-        if advanced {
-            out.extend(self.try_own_prevote());
-        }
+        out.extend(self.try_own_prevote());
         out
     }
 
@@ -1111,6 +1141,36 @@ mod tests {
         assert_eq!(t.round(), RatifyRound::new(2), "the polka fast-forwards");
         let _ = t.on_round_timeout(RatifyRound::new(2));
         assert_eq!(t.round(), RatifyRound::new(2));
+    }
+
+    /// Votes from `f` signers at a newer round do not move a member —
+    /// `f` Byzantine members can sign them from anywhere — and one more
+    /// signer, in either phase, carries it into that round, where it
+    /// prevotes. A signer voting in both phases there counts once, and
+    /// the member's own fire for the round, landing after, stays put.
+    #[test]
+    fn f_voters_ahead_do_not_move_a_member_and_f_plus_one_do() {
+        // Pool 7, fault bound 2.
+        let (mut t, keys) = tracker(7);
+        let _ = t.on_deadline();
+        let skip = t.skip_block_hash();
+        for i in 1..=2 {
+            for phase in [RatifyPhase::Prevote, RatifyPhase::Precommit] {
+                let effects = t.observe(vote(&keys, i, 3, phase, candidate_hash()));
+                assert!(effects.is_empty());
+            }
+        }
+        assert_eq!(
+            t.round(),
+            RatifyRound::INITIAL,
+            "f signers ahead move nothing"
+        );
+
+        let effects = t.observe(vote(&keys, 3, 3, RatifyPhase::Prevote, candidate_hash()));
+        assert_eq!(t.round(), RatifyRound::new(3), "f + 1 signers ahead do");
+        assert_eq!(sign_prevote_round(&effects), Some((3, skip)));
+        assert!(t.on_round_timeout(RatifyRound::new(3)).is_empty());
+        assert_eq!(t.round(), RatifyRound::new(3));
     }
 
     /// An unlocked member holding one candidate follows a polka for
