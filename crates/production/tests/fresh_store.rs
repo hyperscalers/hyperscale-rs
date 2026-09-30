@@ -289,3 +289,37 @@ fn a_restart_mid_handoff_without_the_parent_store_rejoins_the_child() {
         "the restarted host's child store catches up with the chain",
     );
 }
+
+/// A split child's parent-half member restarted before the handoff
+/// completes, with every store it held kept, resumes both: the departed
+/// parent's loop serves its terminal, the child's loop resumes from its
+/// own store, and the child catches up with the chain.
+#[test]
+#[serial]
+fn a_restart_mid_handoff_keeping_its_stores_catches_the_child_up() {
+    let mut cluster = ProdCluster::start(&split_config(), 11, SPLIT_EPOCH_MS);
+    grow_to(&mut cluster, 2);
+
+    let (child, member) = cluster
+        .beacon_state()
+        .expect("a beacon state is committed")
+        .derive_topology_snapshot(NetworkDefinition::simulator())
+        .reshape_parent_half_cohorts()
+        .iter()
+        .find_map(|(&child, cohort)| cohort.keys().next().map(|&member| (child, member)))
+        .expect("the handoff is still in flight once both children commit");
+    let host = cluster.host_of(member).expect("a host runs the member");
+    let before = cluster
+        .committed_height(child)
+        .expect("the child commits after the grow");
+
+    cluster.restart_with_wiped_shards(host, &[]);
+
+    let target = BlockHeight::new(before.inner() + CATCH_UP_BLOCKS);
+    assert!(
+        cluster.run_until(Budget(20), |c| c
+            .host_committed_height(host, child)
+            .is_some_and(|height| height >= target)),
+        "the restarted host's child store catches up with the chain",
+    );
+}

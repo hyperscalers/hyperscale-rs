@@ -234,7 +234,14 @@ impl RocksDbShardStorage {
     /// at its genesis, and recovery's `latest_qc: None` makes the first
     /// proposal extend the structural genesis QC reconstructed from the
     /// chain origin.
+    ///
+    /// A clone of the parent carries the parent's blocks at and past the
+    /// child's genesis height — the parent coasts on after its terminal
+    /// until the clone is cut — and none of them is the child's. They
+    /// drop in the same batch, so the child store holds no block above
+    /// its tip that it would otherwise serve and replay as its own.
     fn append_genesis_tip_to_batch(&self, batch: &mut WriteBatch, genesis: &Block) {
+        self.drop_blocks_from_to_batch(batch, genesis.height());
         let pair = Verified::<CertifiedBlock>::genesis_certified(genesis.clone());
         // A child's history begins here, and its genesis QC carries the
         // chain origin's anchor: dating it is what puts the floor at the
@@ -307,14 +314,18 @@ impl TreeReader for PreRootStore<'_> {
 mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES, Key, NibblePath};
-    use hyperscale_storage::test_helpers::{crossing_record_leaf, import_boundary_state};
+    use hyperscale_storage::test_helpers::{
+        commit_settled_at, crossing_record_leaf, import_boundary_state, make_test_block,
+        make_test_certified,
+    };
     use hyperscale_storage::{
         AdoptSource, BoundaryStore, ShardChainReader, SweepIndex, WitnessSeed,
     };
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
-        AddressClass, BlockHash, BlockHeight, FrontierInputs, SWEEP_BUCKET_MS, ShardId,
-        SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, ValidatorId, WeightedTimestamp,
+        AddressClass, BeaconWitnessCommit, BlockHash, BlockHeight, FrontierInputs, SWEEP_BUCKET_MS,
+        ShardId, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, ValidatorId,
+        WeightedTimestamp,
     };
     use tempfile::TempDir;
 
@@ -577,6 +588,50 @@ mod tests {
             Blake3Hasher::hash_internal(&[*roots[0].as_bytes(), *roots[1].as_bytes()]),
             *parent_root.as_bytes(),
             "adopted roots must compose to the parent's terminal root",
+        );
+    }
+
+    /// The parent's blocks a clone carries at and past the child's genesis
+    /// height are not the child's: the adoption leaves the genesis as the
+    /// only block at or above it.
+    #[test]
+    fn an_adopted_clone_holds_no_parent_block_past_its_genesis() {
+        let parent_dir = TempDir::new().unwrap();
+        let parent = parent_store(parent_dir.path());
+        for height in [10, 11] {
+            commit_settled_at(
+                &parent,
+                &make_test_certified(make_test_block(BlockHeight::new(height))),
+                &[],
+                &[],
+                &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            );
+        }
+        let (parent_version, _) = parent.read_jmt_metadata();
+        assert!(parent.get_block_metadata(BlockHeight::new(11)).is_some());
+
+        let child_dir = TempDir::new().unwrap();
+        let target = child_dir.path().join("store");
+        parent.checkpoint_into(&target).unwrap();
+        let child = RocksDbShardStorage::open(&target, child_path(0)).unwrap();
+        let genesis = genesis_at_10(
+            child_of(0),
+            child_root_from_parent(&parent, parent_version, 0),
+        );
+        child
+            .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+            .unwrap();
+
+        assert_eq!(
+            child
+                .get_certified_header(BlockHeight::new(10))
+                .map(|certified| certified.header().hash()),
+            Some(genesis.hash()),
+            "the genesis replaces the parent's block at its height"
+        );
+        assert!(
+            child.get_block_metadata(BlockHeight::new(11)).is_none(),
+            "no parent block survives above the child's tip"
         );
     }
 
