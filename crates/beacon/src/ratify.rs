@@ -1287,4 +1287,103 @@ mod tests {
             "fresh registers vote normally",
         );
     }
+
+    /// Lock the tracker on the candidate at round 1 in a pool of 7
+    /// (`f` = 2), then step it to round 3.
+    fn locked_at_one_in_round_three(keys: &[BlsSigner]) -> RatifyTracker {
+        let (active, _) = pool(7);
+        let mut t = RatifyTracker::new(Arc::new(BlsVerifier), anchor(), epoch(), active);
+        let _ = t.on_candidate(candidate_hash());
+        for i in 0..=5 {
+            let _ = t.observe(vote(keys, i, 1, RatifyPhase::Prevote, candidate_hash()));
+        }
+        let _ = next_round(&mut t);
+        let _ = next_round(&mut t);
+        assert_eq!(t.round(), RatifyRound::new(3));
+        t
+    }
+
+    /// Exactly `f` precommits for the other value at a newer round are
+    /// not polka evidence — `f` Byzantine members can sign them without
+    /// any honest member having seen a polka — so the lock holds; one
+    /// more is evidence and releases it.
+    #[test]
+    fn f_precommits_do_not_release_a_lock_and_f_plus_one_do() {
+        let (_, keys) = pool(7);
+        let mut t = locked_at_one_in_round_three(&keys);
+        let skip = t.skip_block_hash();
+        for i in 1..=2 {
+            let _ = t.observe(vote(&keys, i, 2, RatifyPhase::Precommit, skip));
+        }
+        let effects = next_round(&mut t);
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((4, candidate_hash())),
+            "f precommits leave the lock in place",
+        );
+
+        let _ = t.observe(vote(&keys, 3, 2, RatifyPhase::Precommit, skip));
+        let effects = next_round(&mut t);
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((5, skip)),
+            "f + 1 precommits prove the newer polka",
+        );
+    }
+
+    /// Evidence at or below the lock round does not release it: only a
+    /// polka strictly newer than the lock can have formed without the
+    /// honest members locked on it.
+    #[test]
+    fn evidence_at_or_below_the_lock_round_does_not_release_it() {
+        let (_, keys) = pool(7);
+        let mut t = locked_at_one_in_round_three(&keys);
+        let skip = t.skip_block_hash();
+        for i in 1..=3 {
+            let _ = t.observe(vote(&keys, i, 1, RatifyPhase::Precommit, skip));
+        }
+        let effects = next_round(&mut t);
+        assert_eq!(sign_prevote_round(&effects), Some((4, candidate_hash())));
+    }
+
+    /// A signer that prevotes both values in one round counts once, for
+    /// the value it signed first: its second prevote cannot complete a
+    /// polka the first did not.
+    #[test]
+    fn an_equivocating_prevote_counts_once() {
+        let (mut t, keys) = tracker(4);
+        let skip = t.skip_block_hash();
+        let _ = t.observe(vote(&keys, 1, 1, RatifyPhase::Prevote, candidate_hash()));
+        let _ = t.observe(vote(&keys, 2, 1, RatifyPhase::Prevote, skip));
+        let _ = t.observe(vote(&keys, 3, 1, RatifyPhase::Prevote, skip));
+        let effects = t.observe(vote(&keys, 1, 1, RatifyPhase::Prevote, skip));
+        assert!(
+            sign_precommit_round(&effects).is_none(),
+            "the equivocator's second prevote does not complete the skip polka",
+        );
+        assert_eq!(
+            t.vote_count_for(RatifyRound::new(1), RatifyPhase::Prevote, skip),
+            2
+        );
+    }
+
+    /// `f` members prevoting the other value round after round cannot
+    /// move a locked member off its lock: without a newer polka of the
+    /// other value, it keeps prevoting what it is locked on.
+    #[test]
+    fn f_steering_prevotes_do_not_move_a_lock() {
+        let (_, keys) = pool(7);
+        let mut t = locked_at_one_in_round_three(&keys);
+        let skip = t.skip_block_hash();
+        for round in 3..=6 {
+            for i in 1..=2 {
+                let _ = t.observe(vote(&keys, i, round, RatifyPhase::Prevote, skip));
+            }
+            let effects = next_round(&mut t);
+            assert_eq!(
+                sign_prevote_round(&effects),
+                Some((round + 1, candidate_hash())),
+            );
+        }
+    }
 }
