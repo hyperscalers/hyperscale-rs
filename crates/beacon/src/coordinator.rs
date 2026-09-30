@@ -2552,13 +2552,12 @@ impl BeaconCoordinator {
     /// proposal. The routing `shard` is the dispatching vnode's
     /// `local_shard` (peer selection rides the local committee), and
     /// each ask prefers the proposal's author: it caches what it signs
-    /// before gossiping it, so it holds the proposal whoever else missed
-    /// it. A peer's empty answer is a delivered response, so the
-    /// transport does not rotate past it, and every retry opens with the
-    /// preferred peer again; preferring a peer that is not the author
-    /// asks it forever when its copy of the gossip was lost too. An
-    /// author outside the local committee is no peer of this route, and
-    /// each retry then picks a local peer afresh.
+    /// before gossiping it, so an honest author holds the proposal
+    /// whoever else missed it. The author is only the first ask: a failed
+    /// answer drops the preference, so an author that answers some
+    /// members "not held" cannot keep them from the peers its gossip did
+    /// reach. An author outside the local committee is no peer of this
+    /// route, and every ask then picks a local peer.
     fn fetch_missing_proposals(&self, epoch: Epoch, missing: &[ValidatorId]) -> Vec<Action> {
         let local_shard = self.local_shard;
         missing

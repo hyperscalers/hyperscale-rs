@@ -156,6 +156,10 @@ struct Entry {
     preferred: Option<ValidatorId>,
     class: Option<MessageClass>,
     in_flight: bool,
+    /// The preferred peer the in-flight attempt went to. A re-ask may
+    /// restate `preferred` while the attempt is out; only a failure of
+    /// the peer actually asked drops the preference.
+    asked: Option<ValidatorId>,
     /// When the entry most recently transitioned to `in_flight=true`.
     /// `None` while the entry is awaiting dispatch. Wall-clock-derived
     /// because this is observability-only: an alert on
@@ -292,6 +296,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                         preferred,
                         class,
                         in_flight: false,
+                        asked: None,
                         dispatched_at: None,
                     },
                 );
@@ -306,6 +311,12 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         self.spawn_pending_fetches()
     }
 
+    /// Release a chunk's slots for retry. A chunk that reached its
+    /// preferred peer and failed also drops the preference: the hint
+    /// named where the answer should be, that peer has now been asked,
+    /// and pinning every retry to it would let one peer that answers
+    /// "not held" keep the requester from ever reaching the peers that
+    /// do hold it.
     fn handle_failed(&mut self, ids: &[Id], respawn: Respawn) -> Vec<FetchOutput<Id>> {
         let mut released = 0usize;
         for id in ids {
@@ -314,6 +325,10 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             {
                 entry.in_flight = false;
                 entry.dispatched_at = None;
+                let asked = entry.asked.take();
+                if matches!(respawn, Respawn::Now) && asked == entry.preferred {
+                    entry.preferred = None;
+                }
                 released += 1;
             }
         }
@@ -394,6 +409,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 for id in chunk {
                     if let Some(entry) = self.pending.get_mut(id) {
                         entry.in_flight = true;
+                        entry.asked = preferred;
                         entry.dispatched_at = Some(dispatched_at);
                     }
                 }
@@ -938,6 +954,44 @@ mod tests {
         let retry_out = p.handle(FetchInput::Failed { ids: chunk_ids });
         assert_eq!(p.in_flight_count(), 2);
         assert_eq!(retry_out.len(), 1);
+    }
+
+    /// A preferred peer that was asked and failed is not asked first
+    /// again: the retry goes to the network's rotation.
+    #[test]
+    fn a_failed_chunk_retries_without_its_preferred_peer() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        let out = p.handle(FetchInput::Request {
+            ids: vec![tx(1)],
+            shard: SHARD,
+            preferred: Some(vid(1)),
+            class: None,
+        });
+        let FetchOutput::Send { ids, preferred, .. } = &out[0];
+        assert_eq!(*preferred, Some(vid(1)));
+
+        let retried = p.handle(FetchInput::Failed { ids: ids.clone() });
+        let FetchOutput::Send { preferred, .. } = &retried[0];
+        assert_eq!(*preferred, None);
+    }
+
+    /// A chunk that never reached a peer asked no one, so it keeps its
+    /// preferred peer for the tick's retry.
+    #[test]
+    fn an_unroutable_chunk_keeps_its_preferred_peer() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        let out = p.handle(FetchInput::Request {
+            ids: vec![tx(1)],
+            shard: SHARD,
+            preferred: Some(vid(1)),
+            class: None,
+        });
+        let FetchOutput::Send { ids, .. } = &out[0];
+        p.handle(FetchInput::Unroutable { ids: ids.clone() });
+
+        let retried = p.handle(FetchInput::Tick);
+        let FetchOutput::Send { preferred, .. } = &retried[0];
+        assert_eq!(*preferred, Some(vid(1)));
     }
 
     /// A chunk that never reached a peer waits for the tick. Re-sending
