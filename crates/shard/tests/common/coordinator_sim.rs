@@ -40,21 +40,23 @@ use hyperscale_storage::{
     colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
+use hyperscale_types::network::Signed;
+use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
     Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
     CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey,
-    ConsensusReceipt, Epoch, Finalization, FrontierInputs, Hash, HborSigned, LocalReceiptRoot,
-    LocalTimestamp, NetworkDefinition, ProposerTimestamp, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round, SettledWrites, ShardId,
-    ShardLoad, ShardVoteEquivocation, ShardWitnessPayload, SharedTransactions, Signer,
-    SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt,
-    SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight, ValidatorId,
-    Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof, WeightedTimestamp,
-    local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
+    ConsensusReceipt, ConsensusSignature, Epoch, Finalization, FrontierInputs, Hash, HborSigned,
+    LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round,
+    SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
+    SharedTransactions, Signer, SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError,
+    StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight,
+    ValidatorId, Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -138,6 +140,9 @@ pub enum HoldFilter {
     /// replica from joining the timeout quorum so it can only catch
     /// up via an observed higher-round header.
     AnyTimeout,
+    /// Match any QC announcement. Keeps a formed QC with its aggregators,
+    /// as a scheduler that delays every announcement can.
+    AnyQcAnnouncement,
 }
 
 impl HoldFilter {
@@ -159,6 +164,7 @@ impl HoldFilter {
                 event,
                 SimEvent::UnverifiedTimeout { .. } | SimEvent::VerifiedTimeout { .. }
             ),
+            Self::AnyQcAnnouncement => matches!(event, SimEvent::QcAnnouncement { .. }),
         }
     }
 }
@@ -245,6 +251,9 @@ enum SimEvent {
     VerifiedTimeout {
         timeout: Verified<Timeout>,
     },
+    QcAnnouncement {
+        announcement: QcAnnouncementNotification,
+    },
     ProposalBuilt {
         height: BlockHeight,
         round: Round,
@@ -299,6 +308,7 @@ impl SimEvent {
             Self::VerifiedVote { .. } => "VerifiedVote",
             Self::UnverifiedTimeout { .. } => "UnverifiedTimeout",
             Self::VerifiedTimeout { .. } => "VerifiedTimeout",
+            Self::QcAnnouncement { .. } => "QcAnnouncement",
             Self::ProposalBuilt { .. } => "ProposalBuilt",
             Self::QcResult { .. } => "QcResult",
             Self::QcSignatureVerified { .. } => "QcSignatureVerified",
@@ -1173,6 +1183,9 @@ impl ShardCoordinatorSim {
             SimEvent::VerifiedTimeout { timeout } => {
                 coord.on_verified_timeout(topology_schedule, timeout)
             }
+            SimEvent::QcAnnouncement { announcement } => {
+                coord.on_qc_announcement(topology_schedule, &announcement)
+            }
             SimEvent::ProposalBuilt {
                 height,
                 round,
@@ -1365,6 +1378,27 @@ impl ShardCoordinatorSim {
                     to_idx: emitter_idx,
                     event: SimEvent::VerifiedVote { vote: verified },
                 });
+            }
+            Action::SignAndBroadcastQcAnnouncement { qc, recipients } => {
+                let mut announcement = QcAnnouncementNotification {
+                    qc,
+                    sender: me,
+                    sender_signature: ConsensusSignature::ZERO,
+                };
+                let message = announcement.signing_message(&self.network);
+                announcement.sender_signature = self.sks[emitter_idx].sign(&message).expect("sign");
+                for &recipient in &recipients {
+                    if recipient == me {
+                        continue;
+                    }
+                    let to_idx = self.idx_of(recipient);
+                    self.network_q.push_back(Envelope {
+                        to_idx,
+                        event: SimEvent::QcAnnouncement {
+                            announcement: announcement.clone(),
+                        },
+                    });
+                }
             }
             Action::SignAndBroadcastTimeout {
                 round,

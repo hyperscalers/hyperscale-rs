@@ -41,6 +41,21 @@ pub struct TimeoutMessage {
     pub high_qc_round: Round,
 }
 
+/// What a QC announcement's sender signature covers: the round and block
+/// the announced QC certifies. It authenticates the announcer, not the QC,
+/// which authenticates itself; a receiver spends one QC verification per
+/// announcer and round.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+#[hbor(signing_domain = "hyperscale-qc-announcement-v1", signing_context = NetworkId)]
+pub struct QcAnnouncementMessage {
+    /// Shard whose consensus the QC belongs to.
+    pub shard_id: ShardId,
+    /// Round of the certified block.
+    pub round: Round,
+    /// The certified block.
+    pub block_hash: BlockHash,
+}
+
 /// What a block header proposal's signature covers.
 ///
 /// Signed by the proposer when broadcasting block header proposals;

@@ -138,7 +138,7 @@ impl ShardMemoryStats {
     }
 }
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -149,6 +149,8 @@ use hyperscale_storage::{
     CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, ReplayWindow, RowState,
     record_arrivals,
 };
+use hyperscale_types::network::notification::QcAnnouncementNotification;
+use hyperscale_types::network::{Signed, SignedContext};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
@@ -398,6 +400,11 @@ pub struct ShardCoordinator {
     /// Timeout accounting for the pacemaker: per-round verified timeout shares,
     /// reporting the f+1 (Bracha) and 2f+1 (advance) thresholds.
     timeouts: TimeoutKeeper,
+
+    /// Per committee member, the highest round whose QC announcement from it
+    /// has been checked: one QC verification per announcer and round, and
+    /// an announcer that spends a round on a forgery spends only its own.
+    qc_announcements: BTreeMap<ValidatorId, Round>,
 
     /// The last round we broadcast our own timeout for, so Bracha amplification
     /// emits at most one timeout per round (the timer itself retransmits).
@@ -715,6 +722,7 @@ impl ShardCoordinator {
             recovered_blocks,
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
+            qc_announcements: BTreeMap::new(),
             last_timed_out_round: None,
             retained_tip: None,
             halt_harvest_progress: None,
@@ -4116,6 +4124,7 @@ impl ShardCoordinator {
         // below to route the vote — terminal-clamped, so a coasting shard
         // already dropped from the head still reaches its own committee.
         let anchored_wt = header.map(|h| h.parent_qc().weighted_timestamp());
+        let block_proposer = header.map(BlockHeader::proposer);
         self.last_voted_round = self.last_voted_round.max(round);
         self.locked_round = self.locked_round.max(parent_qc_round);
 
@@ -4167,7 +4176,17 @@ impl ShardCoordinator {
                     .filter(|snapshot| seats_anyone(snapshot))
             })
             .map_or_else(|| topology_schedule.head().as_ref(), Arc::as_ref);
-        let next_proposers = vote_recipients(governing, self.local_shard, self.me, round);
+        let mut next_proposers = vote_recipients(governing, self.local_shard, self.me, round);
+        // The block's own proposer announces its QC to the committee, so it
+        // must receive the votes. `vote_recipients` names the slot holders
+        // of the child's committee, which at an epoch-cut block is not the
+        // committee that elected this block's proposer.
+        if let Some(proposer) = block_proposer
+            && proposer != self.me
+            && !next_proposers.contains(&proposer)
+        {
+            next_proposers.push(proposer);
+        }
 
         // Emit SignAndBroadcastBlockVote — the io_loop persists the
         // ratcheted registers, signs on the consensus crypto pool,
@@ -5088,6 +5107,7 @@ impl ShardCoordinator {
             duration: self.current_view_change_timeout(),
         }];
 
+        actions.extend(self.announce_own_qc(topology_schedule, block_hash, qc));
         actions.extend(self.try_two_chain_commit(qc, CommitSource::Aggregator));
 
         // Propose the next block immediately — under the 2-chain commit rule,
@@ -5104,6 +5124,106 @@ impl ShardCoordinator {
             local_crossings,
         ));
 
+        actions
+    }
+
+    /// Announce the QC of a block this validator proposed to its committee.
+    /// Votes reach only the block's proposer and the next two, so the rest
+    /// of the committee would otherwise learn the QC only from the next
+    /// header — which a next leader can withhold until their timers fire on
+    /// a round a quorum certified.
+    fn announce_own_qc(
+        &self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+        qc: &Verified<QuorumCertificate>,
+    ) -> Option<Action> {
+        let proposer = self.chain_view().get_header(block_hash)?.proposer();
+        if proposer != self.me {
+            return None;
+        }
+        let committee = self.tip_committee(topology_schedule)?;
+        let recipients: Vec<ValidatorId> = committee
+            .committee_for_shard(self.local_shard)
+            .iter()
+            .copied()
+            .filter(|v| *v != self.me)
+            .collect();
+        Some(Action::SignAndBroadcastQcAnnouncement {
+            qc: (**qc).clone(),
+            recipients,
+        })
+    }
+
+    /// A committee member announced the QC of a block it proposed. Adopt it
+    /// when it is above our own `high_qc` and verifies, resetting the round
+    /// timer when it moves the view: the round it closes produced a block.
+    ///
+    /// Screened before any crypto: the QC must be above our `high_qc` and
+    /// within the pacemaker ceiling, and the announcer a committee member
+    /// that has not been heard for this round or a later one.
+    pub fn on_qc_announcement(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        announcement: &QcAnnouncementNotification,
+    ) -> Vec<Action> {
+        let qc = &announcement.qc;
+        let round = qc.round();
+        if qc.shard_id() != self.local_shard
+            || qc.is_genesis()
+            || round <= self.high_qc_round()
+            || round > self.max_pacemaker_round()
+            || qc_weighted_timestamp_too_far_ahead(qc, self.now)
+        {
+            return Vec::new();
+        }
+        let sender = announcement.sender;
+        if self
+            .qc_announcements
+            .get(&sender)
+            .is_some_and(|&checked| checked >= round)
+        {
+            return Vec::new();
+        }
+        let Some(committee) = self.tip_committee(topology_schedule) else {
+            return Vec::new();
+        };
+        let Some(public_key) = committee.public_key(sender) else {
+            return Vec::new();
+        };
+        if committee
+            .committee_index_for_shard(self.local_shard, sender)
+            .is_none()
+        {
+            return Vec::new();
+        }
+        self.qc_announcements.insert(sender, round);
+        let signed = announcement.verify_signature(&SignedContext {
+            network: committee.network(),
+            public_key: &public_key,
+            verifier: self.verifier.as_ref(),
+        });
+        if signed.is_err() {
+            warn!(validator = ?self.me, ?sender, "QC announcement with an invalid sender signature");
+            return Vec::new();
+        }
+        let Some(verified) = self.verify_qc_sync(topology_schedule, qc) else {
+            warn!(validator = ?self.me, ?sender, round = round.inner(), "Announced QC failed verification");
+            return Vec::new();
+        };
+        // Cached as a locally formed QC is: the two-chain commit of its
+        // parent looks it up there, and forming the same QC from votes
+        // later no longer raises `latest_qc`, so would not cache it.
+        self.verification.cache_verified_qc(verified.clone());
+        let view = self.view_change.view;
+        let mut actions = self.try_adopt_verified_qc(&verified);
+        if self.view_change.view > view {
+            self.record_leader_activity();
+            actions.push(Action::SetTimer {
+                id: TimerId::ViewChange,
+                duration: self.current_view_change_timeout(),
+            });
+        }
         actions
     }
 
@@ -10840,6 +10960,144 @@ mod tests {
         );
         // The share itself is still tallied for the pacemaker.
         assert_eq!(state.timeouts.power(Round::new(2)), VoteCount::new(1));
+    }
+
+    /// A 3-of-4 QC over `block` at round 1, signed by `keys[1..=3]`.
+    fn quorum_over_round_one(
+        state: &ShardCoordinator,
+        keys: &[BlsSigner],
+        block: &Block,
+    ) -> Verified<QuorumCertificate> {
+        let net = NetworkDefinition::simulator();
+        let votes: Vec<(usize, Verified<BlockVote>)> = [1usize, 2, 3]
+            .into_iter()
+            .map(|idx| {
+                let vote = Verified::<BlockVote>::sign_local(
+                    &net,
+                    block.hash(),
+                    state.committed_hash,
+                    ShardId::ROOT,
+                    BlockHeight::new(1),
+                    Round::new(1),
+                    ValidatorId::new(idx as u64),
+                    &keys[idx],
+                    ProposerTimestamp::from_millis(100_000),
+                )
+                .expect("sign");
+                (idx, vote)
+            })
+            .collect();
+        Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
+            block.hash(),
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            Round::new(1),
+            state.committed_hash,
+            WeightedTimestamp::ZERO,
+            &votes,
+        )
+        .expect("vote aggregation succeeds")
+    }
+
+    fn announcement(
+        qc: &QuorumCertificate,
+        sender: usize,
+        keys: &[BlsSigner],
+    ) -> QcAnnouncementNotification {
+        let mut announcement = QcAnnouncementNotification {
+            qc: qc.clone(),
+            sender: ValidatorId::new(sender as u64),
+            sender_signature: ConsensusSignature::ZERO,
+        };
+        let message = announcement.signing_message(&NetworkDefinition::simulator());
+        announcement.sender_signature = keys[sender].sign(&message).expect("sign");
+        announcement
+    }
+
+    /// A member that received no votes learns the QC from the proposer's
+    /// announcement, moves past the certified round, and restarts its round
+    /// timer there instead of timing the certified round out.
+    #[test]
+    fn an_announced_qc_moves_a_member_past_the_certified_round() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+
+        let actions = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 1, &keys));
+
+        assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
+        assert_eq!(state.view(), Round::new(2));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SetTimer {
+                    id: TimerId::ViewChange,
+                    ..
+                }
+            )),
+            "the round timer restarts in the new round; got {actions:?}",
+        );
+    }
+
+    /// An announcement is taken only above our own QC, from a committee
+    /// member, with a valid sender signature, and once per announcer and
+    /// round: a forgery spends only its own announcer's slot.
+    #[test]
+    fn an_announcement_is_screened_per_announcer_and_round() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+
+        let mut forged = announcement(&qc, 2, &keys);
+        forged.sender_signature = keys[3].sign(b"not the announcement").expect("sign");
+        let _ = state.on_qc_announcement(&topology_schedule, &forged);
+        assert!(
+            state.latest_qc().is_none(),
+            "a bad sender signature adopts nothing"
+        );
+        let _ = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 2, &keys));
+        assert!(
+            state.latest_qc().is_none(),
+            "announcer 2 already spent round 1 on its forgery",
+        );
+
+        let _ = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 3, &keys));
+        assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
+
+        // At our own QC's round nothing more is taken.
+        let before = state.qc_announcements.clone();
+        let _ = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 1, &keys));
+        assert_eq!(state.qc_announcements, before);
+    }
+
+    /// The proposer of a block announces the QC it forms for it; another
+    /// member forming the same QC does not.
+    #[test]
+    fn a_proposer_announces_the_qc_of_its_own_block() {
+        for me in [1u32, 0] {
+            let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(me);
+            let block = empty_block_at_round(state.committed_hash, 1);
+            assert_eq!(block.header().proposer(), ValidatorId::new(1));
+            install_complete_block(&mut state, &block);
+            let qc = quorum_over_round_one(&state, &keys, &block);
+
+            let announced = state.announce_own_qc(&topology_schedule, block.hash(), &qc);
+            if me == 1 {
+                let Some(Action::SignAndBroadcastQcAnnouncement { recipients, .. }) = announced
+                else {
+                    panic!("the proposer announces; got {announced:?}");
+                };
+                assert_eq!(recipients.len(), 3);
+                assert!(!recipients.contains(&state.me));
+            } else {
+                assert!(announced.is_none(), "a non-proposer does not announce");
+            }
+        }
     }
 
     #[test]

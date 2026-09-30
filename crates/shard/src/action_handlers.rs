@@ -19,19 +19,21 @@ use hyperscale_storage::{
     VersionedStore, committed_tx_cells, creations_of, record_arrivals, sweep_for_block,
     without_colliding_committed_cells, without_colliding_member_rows,
 };
+use hyperscale_types::network::Signed;
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
 };
 use hyperscale_types::network::notification::{
-    BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
+    BlockHeaderNotification, BlockVoteNotification, QcAnnouncementNotification,
+    ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRootContext, Block,
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
-    DeferOn, Derivation, Engagement, EngagementRoot, Epoch, EpochWindows, Finalization,
-    FrontierInputs, Hash, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
+    ConsensusSignature, DeferOn, Derivation, Engagement, EngagementRoot, Epoch, EpochWindows,
+    Finalization, FrontierInputs, Hash, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
@@ -1525,6 +1527,21 @@ where
             ctx.network.notify(&recipients, &gossip);
             // Feed our own signed timeout back for local TimeoutKeeper tracking.
             ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
+        }
+
+        Action::SignAndBroadcastQcAnnouncement { qc, recipients } => {
+            let mut announcement = QcAnnouncementNotification {
+                qc,
+                sender: ctx.me,
+                sender_signature: ConsensusSignature::ZERO,
+            };
+            let message = announcement.signing_message(ctx.topology_snapshot.network());
+            let Ok(signature) = ctx.signer.sign(&message) else {
+                tracing::error!("cannot sign QC announcement; skipping");
+                return;
+            };
+            announcement.sender_signature = signature;
+            ctx.network.notify(&recipients, &announcement);
         }
 
         Action::SignAndBroadcastReadySignal {

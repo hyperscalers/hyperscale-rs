@@ -75,6 +75,9 @@ impl ShardParticipation {
             ProtocolEvent::UnverifiedTimeoutReceived { timeout } => self
                 .shard_coordinator
                 .on_unverified_timeout(topology_schedule, &timeout),
+            ProtocolEvent::QcAnnouncementReceived { announcement } => self
+                .shard_coordinator
+                .on_qc_announcement(topology_schedule, &announcement),
             ProtocolEvent::ReadySignalReceived { signal } => {
                 self.shard_coordinator
                     .on_ready_signal_received(topology_schedule, signal);

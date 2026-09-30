@@ -81,6 +81,7 @@ where
             | Action::BroadcastBlockHeader { .. }
             | Action::SignAndBroadcastBlockVote { .. }
             | Action::SignAndBroadcastTimeout { .. }
+            | Action::SignAndBroadcastQcAnnouncement { .. }
             | Action::SignAndBroadcastReadySignal { .. }
             | Action::BroadcastCertifiedBlockHeader { .. }
             | Action::BroadcastShardForkProof { .. }

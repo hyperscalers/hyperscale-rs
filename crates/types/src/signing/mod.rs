@@ -70,7 +70,8 @@ pub use crossing_readings::CrossingReadingsSenderMessage;
 pub use execution::{ExecutionCertificatesSenderMessage, ExecutionVoteMessage};
 pub use provisions::ProvisionsSenderMessage;
 pub use shard::{
-    BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage, TimeoutMessage,
+    BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage,
+    QcAnnouncementMessage, TimeoutMessage,
 };
 pub use shard_reveal::{ShardRevealMessage, shard_reveal_sign, shard_reveal_verify};
 pub use validator_address::ValidatorAddressMessage;
@@ -135,6 +136,10 @@ mod tests {
             ("BlockVoteMessage", BlockVoteMessage::SIGNING_DOMAIN),
             ("BlockProposalMessage", BlockProposalMessage::SIGNING_DOMAIN),
             ("TimeoutMessage", TimeoutMessage::SIGNING_DOMAIN),
+            (
+                "QcAnnouncementMessage",
+                QcAnnouncementMessage::SIGNING_DOMAIN,
+            ),
             (
                 "CertifiedBlockHeaderSenderMessage",
                 CertifiedBlockHeaderSenderMessage::SIGNING_DOMAIN,

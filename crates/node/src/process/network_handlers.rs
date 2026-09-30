@@ -21,7 +21,7 @@ use hyperscale_types::network::notification::beacon::{
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, CrossingReadingsNotification,
     ExecutionCertificatesNotification, ExecutionVoteNotification, ProvisionsNotification,
-    ReadySignalNotification, TimeoutNotification,
+    QcAnnouncementNotification, ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::network::request::beacon::{
     GetBeaconBlockRequest, GetBeaconCandidateRequest, GetBeaconProposalRequest,
@@ -299,6 +299,28 @@ where
                         Err(timeout) => ProtocolEvent::UnverifiedTimeoutReceived { timeout },
                     };
                     push_protocol_event(tx, shard, event);
+                },
+            );
+
+        // ── shard.qc → ProtocolEvent::QcAnnouncementReceived ─
+        //
+        // The coordinator screens the announcer and round before it spends a
+        // signature check or a QC verification on one.
+        let senders = self.process.shard_event_senders.clone();
+        self.process
+            .network
+            .register_notification_handler::<QcAnnouncementNotification>(
+                move |announcement: QcAnnouncementNotification| {
+                    let shard = announcement.qc.shard_id();
+                    let senders = senders.load();
+                    let Some(tx) = senders.get(&shard) else {
+                        return;
+                    };
+                    push_protocol_event(
+                        tx,
+                        shard,
+                        ProtocolEvent::QcAnnouncementReceived { announcement },
+                    );
                 },
             );
 

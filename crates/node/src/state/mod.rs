@@ -353,6 +353,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
             | ProtocolEvent::VerifiedTimeoutReceived { .. }
             | ProtocolEvent::UnverifiedTimeoutReceived { .. }
+            | ProtocolEvent::QcAnnouncementReceived { .. }
             | ProtocolEvent::BlockReadyToCommit { .. }
             | ProtocolEvent::QuorumCertificateResult { .. }
             | ProtocolEvent::QcSignatureVerified { .. }

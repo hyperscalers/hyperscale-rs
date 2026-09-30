@@ -300,6 +300,16 @@ pub enum Action {
         position: VotePosition,
     },
 
+    /// Sign and send a just-formed QC for a block this validator proposed
+    /// to the local-shard committee, so members that received no votes
+    /// learn it before their round timers fire.
+    SignAndBroadcastQcAnnouncement {
+        /// The QC formed for our block.
+        qc: QuorumCertificate,
+        /// Local-shard committee members.
+        recipients: Vec<ValidatorId>,
+    },
+
     /// Sign and broadcast a "ready on shard" signal to the local committee.
     ///
     /// Emitted when block sync reaches the tip while the local validator is
@@ -1823,6 +1833,7 @@ impl Action {
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::SignAndBroadcastTimeout { .. }
+            | Self::SignAndBroadcastQcAnnouncement { .. }
             | Self::SignAndBroadcastReadySignal { .. }
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. }
@@ -1948,6 +1959,7 @@ impl Action {
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::SignAndBroadcastTimeout { .. }
+            | Self::SignAndBroadcastQcAnnouncement { .. }
             | Self::SignAndBroadcastReadySignal { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
             | Self::BroadcastShardForkProof { .. }

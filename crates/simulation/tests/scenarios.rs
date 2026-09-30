@@ -1349,8 +1349,6 @@ seeded!(
 #[allow(clippy::too_many_lines)] // one scripted fault scenario end to end
 fn shard_fork_drives_committee_recovery_sim() {
     let setup = halt_straddler_setup();
-    // A seed whose recovery draw seats a fresh member on a host that kept
-    // the forked shard, the rebuild this checks.
     let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 1, &setup.accounts);
     // A fork recovery supersedes whatever the old committee committed past
     // the attested boundary: the fresh committee rebuilds from the anchor,
@@ -1505,6 +1503,34 @@ fn shard_fork_drives_committee_recovery_sim() {
         "the fork proof must fold a RecoveryCause::Fork recovery"
     );
 
+    // The draw is host-blind, so a fresh member on a host that kept the
+    // forked shard is built rather than hoped for: before any host seats the
+    // fresh committee, move a drawn member onto one if the draw left none.
+    let fresh: Vec<ValidatorId> = cluster
+        .beacon_state()
+        .and_then(|state| {
+            state
+                .next_shard_committees
+                .get(&shard)
+                .map(|drawn| drawn.members.clone())
+        })
+        .expect("the fork recovery drew a fresh committee");
+    let host_of = |cluster: &SimCluster, validator: ValidatorId| {
+        cluster.runner().network().validator_to_node(validator) as usize
+    };
+    if !fresh
+        .iter()
+        .any(|validator| committee.contains(&host_of(&cluster, *validator)))
+    {
+        let kept = committee[0];
+        assert!(
+            fresh
+                .iter()
+                .any(|validator| cluster.rehome(*validator, kept)),
+            "no member of {fresh:?} could move onto kept host {kept}",
+        );
+    }
+
     // The fold pinned the recovery to the beacon-attested frontier. Capture
     // the anchor the fresh chain must extend and the retained membership the
     // incomers' refusal is keyed on.
@@ -1581,15 +1607,11 @@ fn shard_fork_drives_committee_recovery_sim() {
 
     // A fresh member drawn onto a host that kept running the forked shard
     // seats on a store rebuilt at the anchor, not on the loop's forked tip.
-    // Whether the draw lands a member there is the seed's; a draw that
-    // lands none never reaches the rebuild this checks.
     let recovered: BTreeSet<usize> = cluster.committee_hosts(shard).into_iter().collect();
-    assume(
+    assert!(
         recovered.iter().any(|host| committee.contains(host)),
-        &format!(
-            "the fresh committee must seat a member on a host that kept the forked \
-             shard; kept {committee:?}, recovered {recovered:?}"
-        ),
+        "the fresh committee must seat a member on a host that kept the forked \
+         shard; kept {committee:?}, recovered {recovered:?}",
     );
 
     // Every fresh replica's first block past the frontier extends the

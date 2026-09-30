@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_engine::TickEnvironment;
+use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     Anchor, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight,
@@ -169,6 +170,13 @@ pub enum ProtocolEvent {
     UnverifiedTimeoutReceived {
         /// Raw timeout off the wire.
         timeout: Timeout,
+    },
+
+    /// Received a QC a committee member announced for a block it proposed.
+    /// Neither the sender's signature nor the QC is checked yet.
+    QcAnnouncementReceived {
+        /// The announcement off the wire.
+        announcement: QcAnnouncementNotification,
     },
 
     /// Received a validator's "ready on shard" signal.
