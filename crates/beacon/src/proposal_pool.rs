@@ -14,62 +14,41 @@
 //! weight (we've already committed past it), and a future-epoch
 //! proposal can't be applied until the committee for that epoch is
 //! known. Both get dropped at admission.
-//!
-//! Held behind an `Arc` so the shard pinned thread's coordinator and
-//! the network worker's `GetBeaconProposalRequest` handler share a
-//! single map. Backed by [`papaya::HashMap`] — a lock-free concurrent
-//! map. Reads from the network worker are wait-free in the common
-//! case and never contend with the single state-machine writer.
-//!
-//! **Single-writer invariant**: `admit` and `reset` are only invoked
-//! from the shard pinned thread via `BeaconCoordinator`. Network
-//! workers call read-only methods (`get`, `epoch`, `contains`,
-//! `len`, `is_empty`) — the responder lives at
-//! `crates/node/src/shard_io/fetch/beacon_proposal_serve.rs` alongside
-//! the other inbound-fetch handlers.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyperscale_types::{BeaconProposal, Epoch, ValidatorId, Verified};
-use papaya::HashMap;
 
 /// Per-epoch cache of verified `BeaconProposal`s indexed by sender.
 #[derive(Debug)]
 pub struct BeaconProposalPool {
     /// Epoch this pool tracks. Admissions for any other epoch get
-    /// dropped. Stored as `AtomicU64` so the network-worker thread
-    /// can read it without locking; the shard thread updates it in
-    /// `reset` after clearing `proposals`.
-    epoch: AtomicU64,
+    /// dropped.
+    epoch: Epoch,
     /// Received proposals keyed by sender id. One entry per
     /// committee member; subsequent admissions from the same sender
     /// are dropped (first-write wins, mirroring the equivocation
     /// pool's discipline).
-    proposals: HashMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
+    proposals: BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
 }
 
 impl BeaconProposalPool {
     /// Fresh empty pool tracking `epoch`.
     #[must_use]
-    pub fn new(epoch: Epoch) -> Self {
+    pub const fn new(epoch: Epoch) -> Self {
         Self {
-            epoch: AtomicU64::new(epoch.inner()),
-            proposals: HashMap::new(),
+            epoch,
+            proposals: BTreeMap::new(),
         }
     }
 
     /// Reset the pool for `epoch`, dropping every prior entry. Called
     /// after a successful commit so the next in-flight epoch starts
     /// from a clean slate.
-    ///
-    /// Order matters: clear proposals first, *then* update the epoch
-    /// atomic. A network-worker read interleaved with a reset then
-    /// observes either old contents at the old epoch or an empty map
-    /// at the new epoch — both retry-safe for the client.
-    pub fn reset(&self, epoch: Epoch) {
-        self.proposals.pin().clear();
-        self.epoch.store(epoch.inner(), Ordering::Release);
+    pub fn reset(&mut self, epoch: Epoch) {
+        self.proposals.clear();
+        self.epoch = epoch;
     }
 
     /// Attempt to admit `proposal` from `from`. Returns `true` on
@@ -80,18 +59,16 @@ impl BeaconProposalPool {
     /// wins so a re-gossip of a different proposal from the same
     /// sender can't displace the earlier one.
     pub fn admit(
-        &self,
+        &mut self,
         from: ValidatorId,
         epoch: Epoch,
         proposal: Arc<Verified<BeaconProposal>>,
     ) -> bool {
-        if epoch.inner() != self.epoch.load(Ordering::Acquire) {
+        if epoch != self.epoch || self.proposals.contains_key(&from) {
             return false;
         }
-        self.proposals
-            .pin()
-            .try_insert_with(from, || proposal)
-            .is_ok()
+        self.proposals.insert(from, proposal);
+        true
     }
 }
 
@@ -99,18 +76,18 @@ impl BeaconProposalPool {
 #[allow(missing_docs)]
 impl BeaconProposalPool {
     #[must_use]
-    pub fn epoch(&self) -> Epoch {
-        Epoch::new(self.epoch.load(Ordering::Acquire))
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
     }
 
     #[must_use]
     pub fn get(&self, from: ValidatorId) -> Option<Arc<Verified<BeaconProposal>>> {
-        self.proposals.pin().get(&from).cloned()
+        self.proposals.get(&from).cloned()
     }
 
     #[must_use]
     pub(crate) fn contains(&self, from: ValidatorId) -> bool {
-        self.proposals.pin().contains_key(&from)
+        self.proposals.contains_key(&from)
     }
 
     #[must_use]
@@ -146,7 +123,7 @@ mod tests {
 
     #[test]
     fn admits_matching_epoch() {
-        let pool = BeaconProposalPool::new(Epoch::new(1));
+        let mut pool = BeaconProposalPool::new(Epoch::new(1));
         assert!(pool.admit(ValidatorId::new(0), Epoch::new(1), proposal(0xAB)));
         assert_eq!(pool.len(), 1);
         assert!(pool.contains(ValidatorId::new(0)));
@@ -154,14 +131,14 @@ mod tests {
 
     #[test]
     fn rejects_wrong_epoch() {
-        let pool = BeaconProposalPool::new(Epoch::new(1));
+        let mut pool = BeaconProposalPool::new(Epoch::new(1));
         assert!(!pool.admit(ValidatorId::new(0), Epoch::new(2), proposal(0xAB)));
         assert!(pool.is_empty());
     }
 
     #[test]
     fn rejects_duplicate_sender_first_wins() {
-        let pool = BeaconProposalPool::new(Epoch::new(1));
+        let mut pool = BeaconProposalPool::new(Epoch::new(1));
         assert!(pool.admit(ValidatorId::new(0), Epoch::new(1), proposal(0xAB)));
         // Second submission from same sender is rejected; the first
         // entry is what the pool keeps.
@@ -173,7 +150,7 @@ mod tests {
 
     #[test]
     fn reset_clears_and_re_targets_epoch() {
-        let pool = BeaconProposalPool::new(Epoch::new(1));
+        let mut pool = BeaconProposalPool::new(Epoch::new(1));
         pool.admit(ValidatorId::new(0), Epoch::new(1), proposal(0xAB));
         pool.admit(ValidatorId::new(1), Epoch::new(1), proposal(0xCD));
         assert_eq!(pool.len(), 2);

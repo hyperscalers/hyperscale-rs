@@ -4,8 +4,8 @@
 //! engine binding, the [`BeaconSyncSink`] each driver implements, and the
 //! single driving body both the shard loop and the follower pool route
 //! through. [`commit`] is the per-host beacon-commit dedup; [`proposal_cache`]
-//! and [`proposal_serve`] back the beacon-proposal pool's serve path.
-//! [`candidate_cache`] backs the ratify-candidate serve path.
+//! backs the beacon-proposal serve path and [`candidate_cache`] the
+//! ratify-candidate one.
 //! [`serve`] answers inbound `GetBeaconBlockRequest`s; [`gossip`] registers
 //! the beacon gossip handlers. [`fetch`] holds the two per-shard beacon
 //! fetches (missing proposals, shard-witness leaves) and their bindings;
@@ -16,7 +16,6 @@ mod commit;
 mod fetch;
 pub mod gossip;
 mod proposal_cache;
-mod proposal_serve;
 pub mod serve;
 mod sync;
 pub mod witness_serve;

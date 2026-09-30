@@ -26,7 +26,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{CodeAvailability, Executor};
 use hyperscale_network::Network;
 use hyperscale_shard::ShardStats;
-use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage, TickChain};
+use hyperscale_storage::{BeaconChainReader, BeaconStorage, PendingChain, ShardStorage, TickChain};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, Derivation, LocalTimestamp, NetworkDefinition, ShardId,
     TransactionStatus, TxHash, ValidatorId, Verified,
@@ -232,7 +232,10 @@ where
         let dispatch_handles = Arc::new(DispatchHandles {
             executor,
             network: Arc::clone(&network),
-            beacon_proposal_cache: Arc::new(BeaconProposalCache::new(beacon_network)),
+            beacon_proposal_cache: Arc::new(BeaconProposalCache::new(
+                beacon_network,
+                Arc::clone(&beacon_storage) as Arc<dyn BeaconChainReader>,
+            )),
             beacon_candidate_cache: Arc::new(BeaconCandidateCache::new()),
             beacon_storage: Arc::clone(&beacon_storage),
             per_shard,

@@ -279,7 +279,7 @@ mod tests {
     }
 
     fn pool_with(epoch: Epoch, entries: &[(ValidatorId, u8)]) -> BeaconProposalPool {
-        let pool = BeaconProposalPool::new(epoch);
+        let mut pool = BeaconProposalPool::new(epoch);
         for &(validator, seed) in entries {
             pool.admit(validator, epoch, proposal(seed));
         }
@@ -433,7 +433,7 @@ mod tests {
     fn resume_only_after_every_await_resolves() {
         let epoch = Epoch::new(7);
         let committee = make_committee(2);
-        let pool = BeaconProposalPool::new(epoch);
+        let mut pool = BeaconProposalPool::new(epoch);
         let output = PcVector::new(vec![element(1, epoch), element(2, epoch)]);
         let mut asm = CommitAssembler::new();
         let _ = asm.on_decided(epoch, &output, dummy_cert(), &pool, &committee);

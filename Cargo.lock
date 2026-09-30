@@ -2039,7 +2039,6 @@ dependencies = [
  "hyperscale-network",
  "hyperscale-storage",
  "hyperscale-types",
- "papaya",
  "proptest",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
