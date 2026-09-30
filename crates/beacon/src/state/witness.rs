@@ -8,7 +8,8 @@ use hyperscale_types::{
     JailReason, MAX_SHARDS, MISSED_PROPOSAL_JAIL_FLOOR, MISSED_PROPOSAL_JAIL_SHARE_BPS,
     NetworkDefinition, PendingReshape, PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId,
     ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
-    validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
+    byzantine_threshold, validator_possession_proof_verify, verify_shard_vote_equivocation,
+    verify_vote_equivocation,
 };
 
 use crate::rules;
@@ -87,6 +88,18 @@ pub(super) enum HostEvent {
 /// the halted chain's drained witness backlog — on the crossing that
 /// refreshes the record, which is why the set is read before the fold —
 /// and jailing on them exits custody holders the halt recovery needs.
+///
+/// Nor is a proposer jailed whose witnessed committee held fewer members
+/// than a quorum of the shard's `shard_size` seats. The share attributes
+/// a missed round to its leader on the premise that at most `f` of the
+/// seats are faulty, the same premise the withholding sweep checks before
+/// reading an absence as a choice. A committee short of a quorum of its
+/// seats is past that budget: the rounds it ran needed near every member
+/// it had, so one absent member times out the others' turns and the
+/// count blames the leaders for the shrink. The measure is the committee
+/// that ran the fold's rounds, not the one the fold promotes: the counts
+/// describe those rounds, and the promoted committee already reflects
+/// this fold's own jails.
 pub(super) fn jail_chronic_missers(
     state: &mut BeaconState,
     blocks_before: &BTreeMap<ShardId, u64>,
@@ -103,14 +116,8 @@ pub(super) fn jail_chronic_missers(
             *skipped.entry(shard).or_default() += u64::from(*misses);
         }
     }
-    let turns = |state: &BeaconState, shard: ShardId| {
-        let committed = state.boundaries.get(&shard).map_or(0, |record| {
-            record
-                .blocks
-                .saturating_sub(blocks_before.get(&shard).copied().unwrap_or(0))
-        });
-        let rounds = committed + skipped.get(&shard).copied().unwrap_or(0);
-        let size = witnessed
+    let committee_size = |state: &BeaconState, shard: ShardId| {
+        witnessed
             .get(&shard)
             .map(Vec::len)
             .filter(|size| *size > 0)
@@ -121,8 +128,18 @@ pub(super) fn jail_chronic_missers(
                     .map(Vec::len)
                     .filter(|size| *size > 0)
             })
-            .unwrap_or(1);
-        rounds / u64::try_from(size).expect("a committee size fits u64")
+            .unwrap_or(1)
+    };
+    let seats = state.chain_config.shard_size as usize;
+    let seat_quorum = seats - byzantine_threshold(seats);
+    let turns = |state: &BeaconState, shard: ShardId| {
+        let committed = state.boundaries.get(&shard).map_or(0, |record| {
+            record
+                .blocks
+                .saturating_sub(blocks_before.get(&shard).copied().unwrap_or(0))
+        });
+        let rounds = committed + skipped.get(&shard).copied().unwrap_or(0);
+        rounds / u64::try_from(committee_size(state, shard)).expect("a committee size fits u64")
     };
     let chronic: Vec<ValidatorId> = state
         .miss_counters
@@ -132,8 +149,9 @@ pub(super) fn jail_chronic_missers(
             let shard = placed(state, id)?;
             let missed_bps = u64::from(*misses) * u64::from(BASIS_POINTS);
             (missed_bps >= turns(state, shard) * u64::from(MISSED_PROPOSAL_JAIL_SHARE_BPS)
-                && !halted.contains(&shard))
-            .then_some(*id)
+                && !halted.contains(&shard)
+                && committee_size(state, shard) >= seat_quorum)
+                .then_some(*id)
         })
         .collect();
     for id in &chronic {
@@ -2260,6 +2278,25 @@ mod tests {
 
         assert!(run(6).is_empty(), "a third of the turns keeps the seat");
         assert_eq!(run(7), vec![ValidatorId::new(1)]);
+    }
+
+    /// A committee holding fewer members than a quorum of the shard's
+    /// seats keeps its leaders however many turns they miss: two of four
+    /// seats time out each other's rounds. At a quorum of seats the share
+    /// applies as usual.
+    #[test]
+    fn a_committee_short_of_a_seat_quorum_jails_no_misser() {
+        let run = |members: u64| {
+            let mut state = single_pool_state(members);
+            state.committee = (0..members).map(ValidatorId::new).collect();
+            let effects = apply_witness_chunk(&mut state, 0, threshold_misses(ValidatorId::new(1)));
+            (effects.jailed, state.chain_config.shard_size)
+        };
+
+        let (jailed, seats) = run(2);
+        assert_eq!(seats, 4);
+        assert!(jailed.is_empty(), "two of four seats is below the quorum");
+        assert_eq!(run(3).0, vec![ValidatorId::new(1)]);
     }
 
     /// Misses that reach the jail share while the proposer's shard sits
