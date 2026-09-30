@@ -19,7 +19,7 @@
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
 //! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,6 +73,7 @@ use crate::rpc::{
 use crate::status::SyncStatus;
 use crate::supervisor::{
     ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
+    holds_window_role,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -478,43 +479,6 @@ impl ProductionRunnerBuilder {
                     .collect(),
             );
         }
-        let mut local_shards: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
-        // A shard this host ran before a cut still holds what its
-        // counterparts read from it — the settled sets an abandonment record
-        // is held to, the terminal evidence a successor derives from —
-        // and routing names its ex-members for as long as the beacon
-        // keeps its boundary. Seating is a placement question and the
-        // answer stays no: the chain terminated. Serving is a storage
-        // one, and the store is on disk. Without this a restart inside
-        // the window leaves a counterpart asking for a set nobody
-        // answers until the evidence expires, and the legs it would
-        // abandon stay in their records.
-        let served = served_departed_shards(&beacon_state.boundaries, &seated, |shard| {
-            (self.storage_dir)(shard).exists()
-        });
-        for shard in served {
-            info!(?shard, "Serving a departed shard's store from disk");
-            let store = (self.storage_factory)(&(self.storage_dir)(shard), shard)
-                .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
-            storages.insert(shard, store);
-            local_shards.insert(shard);
-        }
-        let local_shards = local_shards;
-
-        // Build one (timer / callback / shutdown) channel triple per
-        // hosted shard so the per-shard event senders inside `ProcessIo`
-        // can point at each shard's own callback channel. `ShardChannels`
-        // carries both ends; the supervisor keeps the shutdown/callback
-        // senders alive for the shard's lifetime.
-        let mut shard_channels: BTreeMap<ShardId, ShardChannels> = BTreeMap::new();
-        let mut shard_callback_txs: BTreeMap<ShardId, Sender<HostEvent>> = BTreeMap::new();
-        for shard in &local_shards {
-            let (channels, callback_tx) = ShardChannels::new();
-            shard_callback_txs.insert(*shard, callback_tx);
-            shard_channels.insert(*shard, channels);
-        }
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
         // The network's genesis config: replicated into every fresh store
         // the supervisor opens for a post-genesis join or observer duty,
         // and installed whole by a fresh store on a never-crossed genesis
@@ -540,20 +504,21 @@ impl ProductionRunnerBuilder {
         // Seated validators boot from their own shard's recovered state;
         // pooled validators boot as shard-less beacon followers.
         let now = consensus_clock(chain_config.genesis_timestamp_ms);
+        let seat_config = || SeatConfig {
+            verifier: Arc::new(BlsVerifier),
+            derivation: executor.derivation(),
+            code: Arc::clone(&executor) as _,
+            beacon_network: beacon_network.clone(),
+            beacon_config_hash,
+            shard_config: shard_config.clone(),
+            mempool_config: self.mempool_config.clone(),
+            provision_config: self.provision_config,
+        };
         let mut vnode_inits: Vec<VnodeInit> = Vec::new();
         for (shard, shard_vnodes) in &seated_by_shard {
             let recovered = storages[shard].load_recovered_state(*shard);
             vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
-                config: SeatConfig {
-                    verifier: Arc::new(BlsVerifier),
-                    derivation: executor.derivation(),
-                    code: Arc::clone(&executor) as _,
-                    beacon_network: beacon_network.clone(),
-                    beacon_config_hash,
-                    shard_config: shard_config.clone(),
-                    mempool_config: self.mempool_config.clone(),
-                    provision_config: self.provision_config,
-                },
+                config: seat_config(),
                 beacon_storage: self.beacon_storage.as_ref(),
                 now,
                 shard: *shard,
@@ -572,6 +537,85 @@ impl ProductionRunnerBuilder {
                 signer,
             }));
         }
+
+        let mut local_shards: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
+        // A shard this host ran before a cut still holds what its
+        // counterparts read from it — the settled sets an abandonment record
+        // is held to, the terminal evidence a successor derives from — and
+        // routing names its ex-members for as long as the beacon keeps its
+        // boundary. A running host keeps such a shard's loop up, with the
+        // vnodes of every local validator still named in one of its window
+        // roles, until the supervisor's teardown reconcile retires it; a
+        // restart resumes the same loop from the store on disk, under the
+        // same rule and against the routing the process boots on. A store
+        // no local validator still serves from is left closed. Without this
+        // a restart inside the window leaves a counterpart asking for a set
+        // nobody answers until the evidence expires, and the legs it would
+        // abandon stay in their records.
+        let routing = vnode_inits
+            .first()
+            .expect("every local validator boots a vnode, seated or following")
+            .state
+            .beacon_coordinator()
+            .topology_schedule()
+            .routing_committees();
+        let departed = departed_shards_on_disk(&beacon_state.boundaries, &seated, |shard| {
+            (self.storage_dir)(shard).exists()
+        });
+        for shard in departed {
+            let serving: ShardVnodes = validators
+                .iter()
+                .filter(|v| {
+                    holds_window_role(
+                        shard,
+                        &shared_topology,
+                        &routing,
+                        &HashSet::from([v.validator_id]),
+                    )
+                })
+                .map(|v| (v.validator_id, Arc::clone(&v.signer)))
+                .collect();
+            if serving.is_empty() {
+                info!(
+                    ?shard,
+                    "Departed shard's store on disk holds no serving duty here; left closed"
+                );
+                continue;
+            }
+            info!(
+                ?shard,
+                vnodes = serving.len(),
+                "Serving a departed shard's store from disk"
+            );
+            let store = (self.storage_factory)(&(self.storage_dir)(shard), shard)
+                .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
+            let recovered = store.load_recovered_state(shard);
+            vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
+                config: seat_config(),
+                beacon_storage: self.beacon_storage.as_ref(),
+                now,
+                shard,
+                recovered: &recovered,
+                vnodes: serving,
+            }));
+            storages.insert(shard, store);
+            local_shards.insert(shard);
+        }
+        let local_shards = local_shards;
+
+        // Build one (timer / callback / shutdown) channel triple per
+        // hosted shard so the per-shard event senders inside `ProcessIo`
+        // can point at each shard's own callback channel. `ShardChannels`
+        // carries both ends; the supervisor keeps the shutdown/callback
+        // senders alive for the shard's lifetime.
+        let mut shard_channels: BTreeMap<ShardId, ShardChannels> = BTreeMap::new();
+        let mut shard_callback_txs: BTreeMap<ShardId, Sender<HostEvent>> = BTreeMap::new();
+        for shard in &local_shards {
+            let (channels, callback_tx) = ShardChannels::new();
+            shard_callback_txs.insert(*shard, callback_tx);
+            shard_channels.insert(*shard, channels);
+        }
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         // A handle per shard for `NodeHost::new`; the runner keeps its own
         // handles for GC and metrics.
@@ -1804,15 +1848,15 @@ pub fn spawn_pool_loop(pool: ProdPoolLoop, config: PoolLoopConfig) -> std::threa
         .expect("failed to spawn pool-loop thread")
 }
 
-/// Which departed shards this host serves from disk beside the ones it
+/// Which departed shards this host holds a store for beside the ones it
 /// is seated on.
 ///
 /// A shard the beacon still holds a terminal boundary for is one whose
-/// ex-members routing still names, so its counterparts still ask it for
-/// the settled sets and terminal evidence it left. Seating is a
+/// ex-members routing may still name, so its counterparts may still ask
+/// them for the settled sets and terminal evidence it left. Seating is a
 /// placement question and the answer is no — the chain terminated — but
 /// serving is a storage one, and the store is there or it is not.
-fn served_departed_shards(
+fn departed_shards_on_disk(
     boundaries: &BTreeMap<ShardId, ShardBoundary>,
     seated: &BTreeSet<ShardId>,
     on_disk: impl Fn(ShardId) -> bool,
@@ -1876,7 +1920,7 @@ mod tests {
         let hosted = BTreeSet::from([seated]);
 
         assert_eq!(
-            served_departed_shards(&boundaries, &hosted, |shard| shard != elsewhere),
+            departed_shards_on_disk(&boundaries, &hosted, |shard| shard != elsewhere),
             vec![departed],
         );
     }
@@ -1886,7 +1930,7 @@ mod tests {
     #[test]
     fn a_shard_the_beacon_no_longer_bounds_is_not_served() {
         assert!(
-            served_departed_shards(&BTreeMap::new(), &BTreeSet::new(), |_| true).is_empty(),
+            departed_shards_on_disk(&BTreeMap::new(), &BTreeSet::new(), |_| true).is_empty(),
             "the retention window is the beacon's to keep"
         );
     }

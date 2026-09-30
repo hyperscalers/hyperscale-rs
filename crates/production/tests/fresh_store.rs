@@ -160,3 +160,62 @@ fn a_wiped_store_on_a_split_child_rejoins_its_chain() {
         "the restarted host's child store catches up with the chain",
     );
 }
+
+/// A former member of a split parent restarted with the parent's store
+/// still on disk comes back up: the departed store serves its history
+/// for as long as routing names this host among the parent's members,
+/// and the host's child store resumes and catches up with the chain.
+#[test]
+#[serial]
+fn a_restart_beside_a_departed_parent_store_resumes() {
+    let mut cluster = ProdCluster::start(&split_config(), 11, SPLIT_EPOCH_MS);
+    let parent_committee = cluster
+        .beacon_state()
+        .expect("a beacon state is committed")
+        .derive_topology_snapshot(NetworkDefinition::simulator())
+        .committee_for_shard(ShardId::ROOT)
+        .to_vec();
+    grow_to(&mut cluster, 2);
+
+    let child = ShardId::leaf(1, 0);
+    let settled = |c: &ProdCluster| {
+        c.beacon_state().is_some_and(|state| {
+            let topology = state.derive_topology_snapshot(NetworkDefinition::simulator());
+            !topology.reshape_handoff_pending(ShardId::ROOT)
+                && topology.reshape_parent_half_cohorts().is_empty()
+                && topology.boundary(child).is_some()
+        })
+    };
+    assert!(
+        cluster.run_until(Budget(20), settled),
+        "the split hands off to its children"
+    );
+    let member = cluster
+        .beacon_state()
+        .expect("a beacon state is committed")
+        .derive_topology_snapshot(NetworkDefinition::simulator())
+        .committee_for_shard(child)
+        .iter()
+        .copied()
+        .find(|member| parent_committee.contains(member))
+        .expect("a parent member carries on into the child");
+    let host = cluster.host_of(member).expect("a host runs the member");
+    let before = cluster
+        .committed_height(child)
+        .expect("the child commits after the grow");
+    let served = cluster.committee_hosts(ShardId::ROOT).contains(&host);
+
+    cluster.restart_with_wiped_shards(host, &[]);
+    assert!(
+        !served || cluster.committee_hosts(ShardId::ROOT).contains(&host),
+        "a departed store the host served before the restart is served after it"
+    );
+
+    let target = BlockHeight::new(before.inner() + CATCH_UP_BLOCKS);
+    assert!(
+        cluster.run_until(Budget(20), |c| c
+            .host_committed_height(host, child)
+            .is_some_and(|height| height >= target)),
+        "the restarted host's child store catches up with the chain",
+    );
+}

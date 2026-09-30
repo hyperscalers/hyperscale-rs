@@ -995,16 +995,27 @@ fn shard_retired(
     routing: &RoutingCommittees,
     host_ids: &HashSet<ValidatorId>,
 ) -> bool {
-    let in_routing = routing
-        .get(&shard)
-        .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)));
     // A reshape predecessor mid-handoff stays up even once it ages out of the
     // routable window: under make-before-break its committee stays seated,
     // serving its terminal, until the successors are live, so they can seed and
     // finalize against it.
-    !host_in_committee(shard, topology_snapshot, host_ids)
-        && !in_routing
+    !holds_window_role(shard, topology_snapshot, routing, host_ids)
         && !topology_snapshot.reshape_handoff_pending(shard)
+}
+
+/// Whether a local validator in `host_ids` sits in `shard`'s committed
+/// committee in any window role or in its routing committee: the serving
+/// obligation a hosted shard's vnode keeps it up for.
+pub fn holds_window_role(
+    shard: ShardId,
+    topology_snapshot: &TopologySnapshot,
+    routing: &RoutingCommittees,
+    host_ids: &HashSet<ValidatorId>,
+) -> bool {
+    host_in_committee(shard, topology_snapshot, host_ids)
+        || routing
+            .get(&shard)
+            .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)))
 }
 
 /// Whether `shard`'s committed committee includes a local validator in any
