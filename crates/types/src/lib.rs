@@ -59,7 +59,7 @@ pub use beacon::{
     PcVoteEquivocation, PcVoteEquivocationContext, PcVoteEquivocationVerifyError, PcVoteRound,
     PcVoteVerifyContext, PcXpProof, PendingReshape, PendingRotation, PendingWithdrawal,
     PoolConviction, RECOVERY_HISTORY_DEPTH, RESHAPE_HANDOFF_TTL_EPOCHS, RESHAPE_READY_TTL_EPOCHS,
-    RESHAPE_TRIGGER_TTL_EPOCHS, RatifyCert, RatifyCertVerifyError, RatifyPhase,
+    RESHAPE_TRIGGER_TTL_EPOCHS, RatifyCert, RatifyCertVerifyError, RatifyPhase, RatifyPolka,
     RatifyVerifyContext, RatifyVote, RatifyVoteRecord, RatifyVoteVerifyError, ReadySignal,
     RecoveryBinding, RecoveryCause, SHARD_CAPACITY, SHARD_WITNESS_LEAF_DOMAIN_TAG,
     SHUFFLE_SYNC_HEADROOM, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ScheduledSplit, ShardBoundary,

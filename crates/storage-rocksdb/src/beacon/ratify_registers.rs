@@ -3,7 +3,7 @@
 
 use hyperscale_storage::RatifyRegisterStore;
 use hyperscale_types::{
-    BeaconBlockHash, Epoch, RatifyPhase, RatifyRound, RatifyVoteRecord, ValidatorId,
+    BeaconBlockHash, Epoch, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord, ValidatorId,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
@@ -19,6 +19,7 @@ impl RatifyRegisterStore for RocksDbBeaconStorage {
         round: RatifyRound,
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
+        polka: RatifyPolka,
     ) {
         // One guard spans the read-merge-write so concurrent signers'
         // writes stay monotone; ratify votes are write-cold (one or two
@@ -30,7 +31,7 @@ impl RatifyRegisterStore for RocksDbBeaconStorage {
             // for an older epoch is superseded outright.
             .filter(|stored| stored.epoch >= epoch)
             .unwrap_or_else(|| RatifyVoteRecord::new(epoch));
-        if record.epoch > epoch || !record.record(round, phase, block_hash) {
+        if record.epoch > epoch || !record.record(round, phase, block_hash, polka) {
             return; // superseded epoch or occupied slot — nothing to persist
         }
 

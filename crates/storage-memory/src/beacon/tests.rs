@@ -3,7 +3,7 @@ use std::sync::Arc;
 use hyperscale_storage::test_helpers::{make_test_beacon_block, make_test_beacon_state};
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter, RatifyRegisterStore};
 use hyperscale_types::{
-    BeaconBlockHash, BeaconState, Epoch, Hash, RatifyPhase, RatifyRound, ValidatorId,
+    BeaconBlockHash, BeaconState, Epoch, Hash, RatifyPhase, RatifyPolka, RatifyRound, ValidatorId,
 };
 
 use super::core::SimBeaconStorage;
@@ -129,8 +129,22 @@ fn ratify_records_first_wins_and_epoch_supersede() {
     let (e5, r1) = (Epoch::new(5), RatifyRound::new(1));
 
     assert!(store.ratify_record(v).is_none());
-    store.record_ratify_vote(v, e5, r1, RatifyPhase::Prevote, hash_a);
-    store.record_ratify_vote(v, e5, r1, RatifyPhase::Prevote, hash_b);
+    store.record_ratify_vote(
+        v,
+        e5,
+        r1,
+        RatifyPhase::Prevote,
+        hash_a,
+        RatifyPolka::empty(),
+    );
+    store.record_ratify_vote(
+        v,
+        e5,
+        r1,
+        RatifyPhase::Prevote,
+        hash_b,
+        RatifyPolka::empty(),
+    );
     let record = store.ratify_record(v).expect("record exists");
     assert_eq!(record.epoch, e5);
     assert_eq!(record.prevoted.get(&r1), Some(&hash_a), "first write wins");
@@ -141,13 +155,27 @@ fn ratify_records_first_wins_and_epoch_supersede() {
     );
 
     // A newer epoch supersedes the whole record; an older one is ignored.
-    store.record_ratify_vote(v, Epoch::new(6), r1, RatifyPhase::Precommit, hash_b);
+    store.record_ratify_vote(
+        v,
+        Epoch::new(6),
+        r1,
+        RatifyPhase::Precommit,
+        hash_b,
+        RatifyPolka::empty(),
+    );
     let record = store.ratify_record(v).expect("record exists");
     assert_eq!(record.epoch, Epoch::new(6));
     assert!(record.prevoted.is_empty());
     assert_eq!(record.precommitted.get(&r1), Some(&hash_b));
 
-    store.record_ratify_vote(v, e5, RatifyRound::new(9), RatifyPhase::Prevote, hash_a);
+    store.record_ratify_vote(
+        v,
+        e5,
+        RatifyRound::new(9),
+        RatifyPhase::Prevote,
+        hash_a,
+        RatifyPolka::empty(),
+    );
     assert_eq!(
         store.ratify_record(v).expect("record exists").epoch,
         Epoch::new(6)

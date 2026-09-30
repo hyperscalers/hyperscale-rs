@@ -23,8 +23,9 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BeaconProposal, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext, PcScope, PcVote1,
-    PcVote2, PcVote3, PcVoteVerifyContext, RatifyVerifyContext, RatifyVote, SpcEmptyViewMsg,
-    SpcRelayKind, SpcRelayMessage, SpcVerifyContext, Verifiable, Verified, signed_bytes,
+    PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase, RatifyPolka, RatifyVerifyContext,
+    RatifyVote, SpcEmptyViewMsg, SpcRelayKind, SpcRelayMessage, SpcVerifyContext, Verifiable,
+    Verified, signed_bytes,
 };
 
 /// Dispatch a beacon-owned [`Action`]. Panics on non-beacon variants —
@@ -231,11 +232,30 @@ where
             block_hash,
             proof,
         } => {
-            // The (round, phase) slot this vote consumes must be durable
-            // before the signature exists — a crash between them costs
-            // at most an abstention, never a double-vote or a lost lock.
+            // A proof holds at most a quorum of the pool, and a pool past
+            // the cap indexes no signer bitfield, so no cert could form
+            // there for a proof to help.
+            let (proof, polka) = match phase {
+                RatifyPhase::Prevote => (proof, RatifyPolka::empty()),
+                RatifyPhase::Precommit => (
+                    Vec::new(),
+                    RatifyPolka::new(proof.into_iter().map(Verified::into_inner).collect())
+                        .unwrap_or_else(|_| {
+                            tracing::error!(
+                                ?epoch,
+                                ?round,
+                                "ratify polka exceeds its cap; storing none"
+                            );
+                            RatifyPolka::empty()
+                        }),
+                ),
+            };
+            // The (round, phase) slot this vote consumes — and a
+            // precommit's polka — must be durable before the signature
+            // exists: a crash between them costs at most an abstention,
+            // never a double-vote, a lost lock, or a lock without proof.
             ctx.ratify_registers
-                .record_ratify_vote(me, epoch, round, phase, block_hash);
+                .record_ratify_vote(me, epoch, round, phase, block_hash, polka);
             let Ok(verified) = Verified::<RatifyVote>::sign_local(
                 ctx.signer.as_ref(),
                 me,
@@ -250,9 +270,6 @@ where
                 return;
             };
             let vote = Arc::new(verified);
-            // A proof holds at most a quorum of the pool, and a pool past
-            // the cap indexes no signer bitfield, so no cert could form
-            // there for a proof to help.
             let proof = RatifyProof::new(
                 proof
                     .into_iter()

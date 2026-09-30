@@ -1,7 +1,7 @@
 //! Durable ratification registers.
 
 use hyperscale_types::{
-    BeaconBlockHash, Epoch, RatifyPhase, RatifyRound, RatifyVoteRecord, ValidatorId,
+    BeaconBlockHash, Epoch, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord, ValidatorId,
 };
 
 /// Durable per-validator ratification registers.
@@ -10,7 +10,8 @@ use hyperscale_types::{
 /// `(round, phase)` slot it consumes is durable, so a crashed and
 /// restarted pool member can never double-vote a round — and its lock
 /// (the highest precommit) survives, so it keeps re-prevoting the
-/// locked value instead of freeing itself for a competing one.
+/// locked value instead of freeing itself for a competing one, with
+/// the polka it locked on to prove it.
 /// Implementations must uphold:
 ///
 /// - **Durable on return.** `record_ratify_vote` returns only once the
@@ -23,11 +24,15 @@ use hyperscale_types::{
 ///   never regresses to a superseded epoch.
 /// - **First-wins per slot.** A second write to an occupied
 ///   `(round, phase)` slot changes nothing and is a no-op (no fsync).
+/// - **The lock's polka.** A precommit that becomes the record's
+///   highest replaces the stored polka with its own, in the same
+///   durable write as its slot.
 ///
 /// All methods take `&self`; implementations use interior mutability.
 pub trait RatifyRegisterStore: Send + Sync {
     /// Record that `validator` signs `block_hash` at
-    /// `(epoch, round, phase)` and return once the record is durable.
+    /// `(epoch, round, phase)` — a precommit with `polka`, the prevote
+    /// quorum it locks on — and return once the record is durable.
     fn record_ratify_vote(
         &self,
         validator: ValidatorId,
@@ -35,6 +40,7 @@ pub trait RatifyRegisterStore: Send + Sync {
         round: RatifyRound,
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
+        polka: RatifyPolka,
     );
 
     /// The durable record for `validator`, or `None` when it has never

@@ -9,7 +9,7 @@
 use hyperscale_storage::RatifyRegisterStore;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_types::{
-    BeaconBlockHash, Epoch, RatifyPhase, RatifyRound, RatifyVoteRecord, ValidatorId,
+    BeaconBlockHash, Epoch, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord, ValidatorId,
 };
 
 use super::core::SimBeaconStorage;
@@ -22,6 +22,7 @@ impl RatifyRegisterStore for SimBeaconStorage {
         round: RatifyRound,
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
+        polka: RatifyPolka,
     ) {
         let mut inner = write_or_recover(&self.inner);
         let record = inner
@@ -36,7 +37,7 @@ impl RatifyRegisterStore for SimBeaconStorage {
         if record.epoch < epoch {
             *record = RatifyVoteRecord::new(epoch);
         }
-        record.record(round, phase, block_hash);
+        record.record(round, phase, block_hash, polka);
         drop(inner);
     }
 

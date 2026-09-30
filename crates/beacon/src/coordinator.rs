@@ -492,7 +492,7 @@ impl BeaconCoordinator {
     /// record for a different epoch than the pending ratification is
     /// ignored.
     pub fn install_recovered_ratify_record(&mut self, record: &RatifyVoteRecord) {
-        self.ratify.install_recovered_record(record);
+        self.ratify.install_recovered_record(record, &self.network);
     }
 
     /// Whether the local validator sits on the current beacon
@@ -768,12 +768,16 @@ impl BeaconCoordinator {
                         proof,
                     ));
                 }
-                RatifyEffect::SignPrecommit { round, block_hash } => {
+                RatifyEffect::SignPrecommit {
+                    round,
+                    block_hash,
+                    polka,
+                } => {
                     actions.extend(self.ratify_sign_action(
                         round,
                         RatifyPhase::Precommit,
                         block_hash,
-                        Vec::new(),
+                        polka,
                     ));
                 }
                 RatifyEffect::CertAssembled { cert } => {

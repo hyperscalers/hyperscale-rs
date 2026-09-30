@@ -90,9 +90,9 @@ pub use proposal::{
 };
 pub use ratify::{
     CandidateBeaconBlock, CandidateBeaconBlockVerifyError, CandidateVerifyContext, RatifyCert,
-    RatifyCertVerifyError, RatifyPhase, RatifyVerifyContext, RatifyVote, RatifyVoteRecord,
-    RatifyVoteVerifyError, build_ratify_cert, ratify_quorum, sign_ratify_vote, verify_ratify_cert,
-    verify_ratify_vote,
+    RatifyCertVerifyError, RatifyPhase, RatifyPolka, RatifyVerifyContext, RatifyVote,
+    RatifyVoteRecord, RatifyVoteVerifyError, build_ratify_cert, ratify_quorum, sign_ratify_vote,
+    verify_ratify_cert, verify_ratify_vote,
 };
 pub use ready_signal::{ReadySignal, ready_signal_window};
 pub use spc::{

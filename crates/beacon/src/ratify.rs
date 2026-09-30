@@ -27,17 +27,19 @@
 //! at a newer round fast-forwards to it. Voting into rounds already
 //! left would let one validator's signatures straddle two quorums.
 //!
-//! No topology, no crypto, no clocks — pure data structure; the
-//! coordinator feeds verified votes and timer edges in, and lifts the
-//! typed [`RatifyEffect`]s into actions. Tests need validator keypairs
-//! and an anchor, nothing more.
+//! No topology, no clocks — pure data structure; the coordinator
+//! feeds verified votes and timer edges in, and lifts the typed
+//! [`RatifyEffect`]s into actions. Its only crypto is assembling the
+//! cert and checking the votes a restart reads back from disk. Tests
+//! need validator keypairs and an anchor, nothing more.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconBlock, BeaconBlockHash, ConsensusPublicKey, Epoch, RatifyCert, RatifyPhase, RatifyRound,
-    RatifyVote, RatifyVoteRecord, ValidatorId, Verified, Verifier, ratify_quorum,
+    BeaconBlock, BeaconBlockHash, ConsensusPublicKey, Epoch, NetworkDefinition, RatifyCert,
+    RatifyPhase, RatifyRound, RatifyVerifyContext, RatifyVote, RatifyVoteRecord, ValidatorId,
+    Verified, Verifier, Verify, ratify_quorum,
 };
 use tracing::warn;
 
@@ -81,6 +83,9 @@ pub enum RatifyEffect {
         round: RatifyRound,
         /// Hash the precommit names.
         block_hash: BeaconBlockHash,
+        /// The prevote quorum the precommit locks on, persisted with
+        /// its slot so the lock keeps its proof across a restart.
+        polka: Vec<Verified<RatifyVote>>,
     },
     /// A precommit quorum assembled into a commit certificate — the
     /// epoch's block is decided.
@@ -167,9 +172,37 @@ impl RatifyTracker {
     /// round is re-entered. `deadline_passed` stays false — the local
     /// timer re-derives it, so skip prevoting waits for a fresh fire
     /// rather than trusting pre-crash timer state.
-    pub fn install_recovered_record(&mut self, record: &RatifyVoteRecord) {
+    ///
+    /// The lock's polka is pooled like any peer's votes, each only once
+    /// its signature verifies against the pool under `network`: the
+    /// record is read back from disk, and the lock's proof is only as
+    /// good as the signatures in it. Pooling it is what lets the
+    /// restarted member's prevotes carry the polka that locked it.
+    pub fn install_recovered_record(
+        &mut self,
+        record: &RatifyVoteRecord,
+        network: &NetworkDefinition,
+    ) {
         if record.epoch != self.epoch || self.completed {
             return;
+        }
+        let verify = RatifyVerifyContext {
+            network,
+            active_pool: &self.pool,
+            verifier: self.verifier.as_ref(),
+        };
+        let polka: Vec<Verified<RatifyVote>> = record
+            .lock_polka
+            .iter()
+            .filter(|vote| vote.anchor_hash() == self.anchor && vote.epoch() == self.epoch)
+            .filter_map(|vote| vote.verify(&verify).ok())
+            .collect();
+        for vote in polka {
+            self.votes
+                .entry((vote.round(), vote.phase()))
+                .or_default()
+                .entry(vote.signer())
+                .or_insert(vote);
         }
         if let Some(&max_round) = record
             .prevoted
@@ -404,7 +437,20 @@ impl RatifyTracker {
         let advanced = round > self.round;
         self.round = round;
         self.precommitted.insert(round, block_hash);
-        let mut out = vec![RatifyEffect::SignPrecommit { round, block_hash }];
+        let polka = self
+            .votes
+            .get(&(round, RatifyPhase::Prevote))
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(|vote| vote.block_hash() == block_hash)
+            .take(ratify_quorum(self.pool.len()))
+            .cloned()
+            .collect();
+        let mut out = vec![RatifyEffect::SignPrecommit {
+            round,
+            block_hash,
+            polka,
+        }];
         if advanced {
             out.extend(self.try_own_prevote());
         }
@@ -627,7 +673,7 @@ impl RatifyTracker {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, signer_from_u64_seed};
-    use hyperscale_types::{Hash, NetworkDefinition, Signer, verify_ratify_cert};
+    use hyperscale_types::{Hash, RatifyPolka, Signer, verify_ratify_cert};
 
     use super::*;
 
@@ -713,7 +759,9 @@ mod tests {
 
     fn sign_precommit_round(effects: &[RatifyEffect]) -> Option<(u32, BeaconBlockHash)> {
         effects.iter().find_map(|e| match e {
-            RatifyEffect::SignPrecommit { round, block_hash } => Some((round.inner(), *block_hash)),
+            RatifyEffect::SignPrecommit {
+                round, block_hash, ..
+            } => Some((round.inner(), *block_hash)),
             _ => None,
         })
     }
@@ -1290,10 +1338,14 @@ mod tests {
         let (mut t, _) = tracker(7);
         let skip = t.skip_block_hash();
         let mut record = RatifyVoteRecord::new(epoch());
-        record.record(RatifyRound::new(1), RatifyPhase::Prevote, skip);
-        record.record(RatifyRound::new(1), RatifyPhase::Precommit, skip);
-        record.record(RatifyRound::new(2), RatifyPhase::Prevote, skip);
-        t.install_recovered_record(&record);
+        for (round, phase) in [
+            (1, RatifyPhase::Prevote),
+            (1, RatifyPhase::Precommit),
+            (2, RatifyPhase::Prevote),
+        ] {
+            record.record(RatifyRound::new(round), phase, skip, RatifyPolka::empty());
+        }
+        t.install_recovered_record(&record, &net());
 
         assert_eq!(
             t.round(),
@@ -1323,8 +1375,13 @@ mod tests {
     fn recovered_record_for_another_epoch_is_ignored() {
         let (mut t, _) = tracker(7);
         let mut record = RatifyVoteRecord::new(epoch().next());
-        record.record(RatifyRound::new(1), RatifyPhase::Prevote, candidate_hash());
-        t.install_recovered_record(&record);
+        record.record(
+            RatifyRound::new(1),
+            RatifyPhase::Prevote,
+            candidate_hash(),
+            RatifyPolka::empty(),
+        );
+        t.install_recovered_record(&record, &net());
 
         let effects = t.on_candidate(candidate_hash());
         assert_eq!(
@@ -1332,6 +1389,50 @@ mod tests {
             Some((RatifyRound::INITIAL.inner(), candidate_hash())),
             "fresh registers vote normally",
         );
+    }
+
+    /// A recovered lock's polka is pooled vote by vote, only where the
+    /// signature verifies: a forged vote in the record is dropped, and
+    /// the genuine quorum becomes the proof the next prevote carries.
+    #[test]
+    fn a_recovered_lock_pools_only_the_verified_votes_of_its_polka() {
+        // Pool 7, quorum 5.
+        let (mut t, keys) = tracker(7);
+        let skip = t.skip_block_hash();
+        let genuine: Vec<RatifyVote> = (0..5)
+            .map(|i| vote(&keys, i, 1, RatifyPhase::Prevote, skip).into_inner())
+            .collect();
+        let forged = Verified::<RatifyVote>::sign_local(
+            &keys[6],
+            ValidatorId::new(5),
+            &net(),
+            anchor(),
+            epoch(),
+            RatifyRound::new(1),
+            RatifyPhase::Prevote,
+            skip,
+        )
+        .expect("sign")
+        .into_inner();
+        let polka = RatifyPolka::new(genuine.iter().cloned().chain([forged]).collect()).unwrap();
+        let mut record = RatifyVoteRecord::new(epoch());
+        record.record(
+            RatifyRound::new(1),
+            RatifyPhase::Prevote,
+            skip,
+            RatifyPolka::empty(),
+        );
+        record.record(RatifyRound::new(1), RatifyPhase::Precommit, skip, polka);
+        t.install_recovered_record(&record, &net());
+
+        assert_eq!(t.vote_count(RatifyRound::new(1), RatifyPhase::Prevote), 5);
+        let effects = next_round(&mut t);
+        assert_eq!(sign_prevote_round(&effects), Some((2, skip)));
+        let proof: Vec<RatifyVote> = prevote_proof(&effects)
+            .into_iter()
+            .map(Verified::into_inner)
+            .collect();
+        assert_eq!(proof, genuine, "the proof is the verified polka");
     }
 
     /// Lock the tracker on the candidate at round 1 in a pool of 7
@@ -1529,6 +1630,8 @@ mod tests {
     /// hand.
     struct HonestMembers {
         trackers: Vec<RatifyTracker>,
+        /// Each member's durable record, written as it signs.
+        records: Vec<RatifyVoteRecord>,
         keys: Vec<BlsSigner>,
         committed: Vec<Option<BeaconBlockHash>>,
         proofs: bool,
@@ -1543,10 +1646,26 @@ mod tests {
                         RatifyTracker::new(Arc::new(BlsVerifier), anchor(), epoch(), active.clone())
                     })
                     .collect(),
+                records: vec![RatifyVoteRecord::new(epoch()); 3],
                 keys,
                 committed: vec![None; 3],
                 proofs,
             }
+        }
+
+        /// Crash and restart `member`: a fresh tracker over its durable
+        /// record, with the lock's polka dropped from the record unless
+        /// `keep_polka`.
+        fn restart(&mut self, member: usize, keep_polka: bool) {
+            let mut record = self.records[member].clone();
+            if !keep_polka {
+                record.lock_polka = RatifyPolka::empty();
+            }
+            let (active, _) = pool(4);
+            let mut restarted =
+                RatifyTracker::new(Arc::new(BlsVerifier), anchor(), epoch(), active);
+            restarted.install_recovered_record(&record, &net());
+            self.trackers[member] = restarted;
         }
 
         fn deliver(&mut self, to: usize, vote: Verified<RatifyVote>, links: &Links) {
@@ -1554,25 +1673,31 @@ mod tests {
             self.act(to, effects, links);
         }
 
-        /// Carry out `from`'s effects: sign its votes and pool them at
-        /// itself and at every member `links` reaches, the proof riding
-        /// with a prevote when proofs are on; record an assembled cert.
+        /// Carry out `from`'s effects: record its votes durably, sign
+        /// them and pool them at itself and at every member `links`
+        /// reaches, the proof riding with a prevote when proofs are on;
+        /// record an assembled cert.
         fn act(&mut self, from: usize, effects: Vec<RatifyEffect>, links: &Links) {
             for effect in effects {
-                let (round, phase, block_hash, proof) = match effect {
+                let (round, phase, block_hash, proof, polka) = match effect {
                     RatifyEffect::SignPrevote {
                         round,
                         block_hash,
                         proof,
-                    } => (round, RatifyPhase::Prevote, block_hash, proof),
-                    RatifyEffect::SignPrecommit { round, block_hash } => {
-                        (round, RatifyPhase::Precommit, block_hash, Vec::new())
-                    }
+                    } => (round, RatifyPhase::Prevote, block_hash, proof, Vec::new()),
+                    RatifyEffect::SignPrecommit {
+                        round,
+                        block_hash,
+                        polka,
+                    } => (round, RatifyPhase::Precommit, block_hash, Vec::new(), polka),
                     RatifyEffect::CertAssembled { cert } => {
                         self.committed[from] = Some(cert.block_hash());
                         continue;
                     }
                 };
+                let polka = RatifyPolka::new(polka.into_iter().map(Verified::into_inner).collect())
+                    .unwrap();
+                self.records[from].record(round, phase, block_hash, polka);
                 let signer = u64::try_from(from).unwrap();
                 let own = vote(&self.keys, signer, round.inner(), phase, block_hash);
                 self.deliver(from, own.clone(), links);
@@ -1605,8 +1730,14 @@ mod tests {
     /// messages are lost and D prevotes skip. From round 3 the network
     /// delivers everything and D goes silent, and C asks for the
     /// candidate once more than `f` prevotes name it, as the
-    /// coordinator does. Returns the members after round `last`.
-    fn one_byzantine_lock_wedge(proofs: bool, last: u32) -> HonestMembers {
+    /// coordinator does; `before_round_three` runs first, where a
+    /// scenario crashes a member. Returns the members after round
+    /// `last`.
+    fn one_byzantine_lock_wedge(
+        proofs: bool,
+        before_round_three: fn(&mut HonestMembers),
+        last: u32,
+    ) -> HonestMembers {
         let (a, b, c) = (0, 1, 2);
         let candidate = candidate_hash();
         let mut m = HonestMembers::new(proofs);
@@ -1634,6 +1765,7 @@ mod tests {
             m.deliver(member, d_prevote, &round_two);
         }
 
+        before_round_three(&mut m);
         let everything = |_: usize, _: usize| true;
         for round in 3..=last {
             m.enter_round(round, &everything);
@@ -1654,8 +1786,25 @@ mod tests {
     /// commits the candidate.
     #[test]
     fn a_lock_below_the_evidence_bound_converges_once_the_network_delivers() {
-        let m = one_byzantine_lock_wedge(true, 6);
+        let m = one_byzantine_lock_wedge(true, |_| {}, 6);
         assert_eq!(m.committed, vec![Some(candidate_hash()); 3]);
+    }
+
+    /// The lone locker crashing between the lost round and the healed
+    /// network still converges the pool: its durable record carries
+    /// the polka that locked it, and its re-prevote proves it.
+    #[test]
+    fn a_restarted_lone_locker_converges_once_the_network_delivers() {
+        let m = one_byzantine_lock_wedge(true, |m| m.restart(0, true), 6);
+        assert_eq!(m.committed, vec![Some(candidate_hash()); 3]);
+    }
+
+    /// Restarted from registers alone, the lone locker holds a lock it
+    /// cannot prove, and the pool wedges as it does without proofs.
+    #[test]
+    fn a_restarted_lone_locker_without_its_polka_wedges() {
+        let m = one_byzantine_lock_wedge(true, |m| m.restart(0, false), 12);
+        assert_eq!(m.committed, vec![None; 3]);
     }
 
     /// Without them the same run is absorbing: A holds its lock, B and
@@ -1663,7 +1812,7 @@ mod tests {
     /// the silent D.
     #[test]
     fn without_proofs_a_lock_below_the_evidence_bound_wedges() {
-        let m = one_byzantine_lock_wedge(false, 12);
+        let m = one_byzantine_lock_wedge(false, |_| {}, 12);
         assert_eq!(m.committed, vec![None; 3]);
     }
 }

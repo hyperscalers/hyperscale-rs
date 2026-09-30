@@ -1658,10 +1658,12 @@ pub enum Action {
         /// Hash of the block the vote names — the verified candidate's
         /// or the canonical skip block's.
         block_hash: BeaconBlockHash,
-        /// Peers' verified votes proving the newest polka the tracker
-        /// has evidence of, broadcast alongside a prevote so a polka
-        /// whose votes were lost still reaches the pool. Empty for a
-        /// precommit.
+        /// Peers' verified votes proving the polka behind the vote. A
+        /// prevote's is the newest polka the tracker has evidence of,
+        /// broadcast alongside it so a polka whose votes were lost still
+        /// reaches the pool. A precommit's is the prevote quorum it
+        /// locks on, persisted with its slot rather than broadcast, so
+        /// a restarted member's lock still carries its proof.
         proof: Vec<Verified<RatifyVote>>,
     },
 
