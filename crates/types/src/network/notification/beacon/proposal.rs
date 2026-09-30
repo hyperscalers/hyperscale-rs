@@ -30,8 +30,9 @@ use crate::{BeaconProposal, Epoch, MessageClass, NetworkMessage, ValidatorId, Ve
 /// overhead isn't justified at that fanout.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct BeaconProposalNotification {
-    /// Claimed sender. The VRF reveal inside `proposal` authenticates
-    /// it — receivers verify against this validator's pubkey.
+    /// Claimed sender. The VRF reveal and body signature inside
+    /// `proposal` authenticate it — receivers verify both against this
+    /// validator's pubkey.
     pub sender: ValidatorId,
     /// Epoch this proposal targets. Bound by the VRF reveal's
     /// `(network, epoch)` signing context.

@@ -46,6 +46,7 @@ pub fn signed_bytes<M: HborSignedWith<Context = NetworkId>>(
 }
 
 mod beacon_pc;
+mod beacon_proposal;
 mod beacon_ratify;
 mod beacon_reveal;
 mod crossing_readings;
@@ -60,6 +61,7 @@ mod validator_possession_proof;
 pub use beacon_pc::{
     PcRound, PcScope, PcVoteMessage, SpcEmptyViewMessage, SpcRelayKind, SpcRelayMessage,
 };
+pub use beacon_proposal::BeaconProposalMessage;
 pub use beacon_ratify::RatifyVoteMessage;
 pub use beacon_reveal::{
     BeaconRevealMessage, beacon_reveal_sign, beacon_reveal_verify, vrf_output_from_proof,
