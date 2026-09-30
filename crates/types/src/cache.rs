@@ -26,8 +26,9 @@ const SHARDS: usize = 64;
 static PINNED: AtomicBool = AtomicBool::new(false);
 
 /// Make every cache built after this call hash with fixed keys. Called
-/// by the simulation before it builds any host; never by a production
-/// node.
+/// by the simulation before it builds any host; a production build has
+/// no way to call it.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn pin_hashing() {
     PINNED.store(true, Ordering::Relaxed);
 }
