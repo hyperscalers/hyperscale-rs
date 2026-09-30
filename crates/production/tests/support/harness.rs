@@ -34,8 +34,8 @@ use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, Sub
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, ShardId, StateRoot,
-    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    ValidatorId, WeightedTimestamp, shard_prefix_path,
+    SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxsInFlight, ValidatorId, WeightedTimestamp, shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
@@ -246,7 +246,8 @@ impl Harness {
     /// host down, and rebuild it over a copy of its data directory with
     /// those stores left out, so its beacon chain and every other shard's
     /// store survive. The rebuilt host bootstraps to another
-    /// running host.
+    /// running host. Returns the topology the rebuilt host starts on, read
+    /// before its runner runs and so before it folds any beacon block.
     ///
     /// The rebuild runs on a copy because a stopped runner's process
     /// resources are not all released in-process, and `RocksDB` refuses a
@@ -258,7 +259,11 @@ impl Harness {
     ///
     /// Panics if the cluster has a single host (nothing to bootstrap to)
     /// or the copy fails.
-    pub async fn restart_with_wiped_shards(&mut self, host: usize, shards: &[ShardId]) {
+    pub async fn restart_with_wiped_shards(
+        &mut self,
+        host: usize,
+        shards: &[ShardId],
+    ) -> Arc<TopologySnapshot> {
         let peer = (0..self.hosts.len())
             .find(|&i| i != host)
             .expect("a restart bootstraps to another host");
@@ -287,7 +292,9 @@ impl Harness {
             bootstrap_peers: vec![bootstrap],
             simulated_outbound_latency: self.build.simulated_outbound_latency,
         });
+        let startup = built.runner.topology_snapshot().load_full();
         self.hosts.insert(host, spawn_host(built));
+        startup
     }
 
     /// Number of hosts in the cluster.

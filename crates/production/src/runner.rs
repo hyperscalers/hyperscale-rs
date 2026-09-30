@@ -376,11 +376,7 @@ impl ProductionRunnerBuilder {
 
         let ed25519_keypair = generate_random_keypair();
 
-        // Genesis: build the beacon chain from the validator placement, then
-        // project the topology from its folded state — the same
-        // `BeaconState → derive_topology_snapshot` direction the runtime
-        // ArcSwap update follows, so the topology is derived rather than
-        // supplied alongside a beacon state it has to be kept consistent with.
+        // Genesis: build the beacon chain from the validator placement.
         let beacon_network = genesis_validators.network.clone();
         let seat_list: Vec<StakePoolSeat> = self
             .genesis_config
@@ -393,8 +389,19 @@ impl ProductionRunnerBuilder {
         // load — the coordinator's resume epoch is whatever state it's handed.
         boot.commit_if_empty(self.beacon_storage.as_ref());
         let beacon_config_hash = boot.config_hash;
+        let (_, beacon_state) = self
+            .beacon_storage
+            .latest_committed()
+            .expect("beacon chain is non-empty after the genesis commit above");
 
-        let shared_topology = Arc::clone(&boot.topology_snapshot);
+        // The host starts on the topology its committed beacon state
+        // projects — the head every hosted vnode's beacon coordinator
+        // resumes on, derived in the same `BeaconState →
+        // derive_topology_snapshot` direction the runtime fold publishes.
+        // Routing, validator keys, and seating all read it before the
+        // first fold of this run.
+        let shared_topology =
+            Arc::new(beacon_state.derive_topology_snapshot(beacon_network.clone()));
         let topology_snapshot: SharedTopologySnapshot =
             Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
@@ -419,10 +426,6 @@ impl ProductionRunnerBuilder {
         // validator placed `OnShard` is seated on that shard; one that is
         // `Pooled` (or otherwise unseated) follows the beacon in the host's
         // pool until a placement delta seats it. The operator names no shard.
-        let (_, beacon_state) = self
-            .beacon_storage
-            .latest_committed()
-            .expect("beacon chain is non-empty after the genesis commit above");
         let mut seated_by_shard: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
         let mut pooled: Vec<(ValidatorId, Arc<dyn Signer>)> = Vec::new();
         for v in &validators {

@@ -292,6 +292,63 @@ async fn beacon_chain_config_reaches_genesis() {
     );
 }
 
+/// A restarted host starts on the topology its committed beacon state
+/// projects, not the genesis one: before it folds a beacon block of the
+/// new run, its view already carries the anchor ROOT's crossing attested.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_restarted_host_starts_on_its_committed_topology() {
+    let _ = fmt().with_test_writer().try_init();
+
+    let fixtures = TestFixtures::new(49, 4);
+    let hosts = (0..4)
+        .map(|i| {
+            HostSpec::new(vec![LocalValidator {
+                validator_id: ValidatorId::new(u64::from(i)),
+                signer: fixtures.signer(i),
+            }])
+        })
+        .collect();
+    let mut cluster = Harness::start(ClusterSpec {
+        genesis: fixtures.genesis_validators(),
+        hosts,
+        beacon_chain_config: BeaconChainConfig {
+            epoch_duration_ms: 3_000,
+            shard_size: 4,
+            ..BeaconChainConfig::default()
+        },
+        genesis_config: None,
+        simulated_outbound_latency: Duration::from_millis(50),
+    })
+    .await;
+    assert!(
+        cluster.topology(3).load().boundary(ShardId::ROOT).is_none(),
+        "a network at genesis has no attested anchor"
+    );
+
+    let restarted = 3;
+    timeout(CONNECTION_TIMEOUT * 12, async {
+        while cluster
+            .topology(restarted)
+            .load()
+            .boundary(ShardId::ROOT)
+            .is_none_or(|anchor| anchor.block_hash == BlockHash::ZERO)
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the beacon attests a ROOT crossing");
+
+    let startup = cluster.restart_with_wiped_shards(restarted, &[]).await;
+    assert!(
+        startup.boundary(ShardId::ROOT).is_some(),
+        "the restarted host starts on the attested anchor its beacon chain holds"
+    );
+
+    cluster.shutdown().await;
+}
+
 /// Every event the process logs, in order: its message, then each other
 /// field as `name=value`.
 #[derive(Clone, Default)]
