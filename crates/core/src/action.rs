@@ -22,9 +22,10 @@ use hyperscale_types::{
     SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates,
     SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
     SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateClaim,
-    SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx,
-    ValidatorId, Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
+    SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TimeoutCertificate,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash,
+    TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount,
+    VotePosition, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -291,6 +292,9 @@ pub enum Action {
         /// The signer's highest certified block — carried so the next leader
         /// can adopt and extend the quorum-max QC. Self-authenticating.
         high_qc: QuorumCertificate,
+        /// The signer's highest timeout certificate, carried so a replica
+        /// behind it syncs its view. Self-authenticating.
+        high_tc: Option<TimeoutCertificate>,
         /// Local-shard committee members who tally timeouts for this round.
         recipients: Vec<ValidatorId>,
         /// The signing position this timeout ratchets. The runner

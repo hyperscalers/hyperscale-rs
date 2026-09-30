@@ -3270,6 +3270,7 @@ pub fn test_registers_recover_their_justification(
         locked_round: Round::new(6),
         last_voted_round: Round::new(7),
         high_qc: Some((*justification).clone()),
+        high_tc: None,
     };
     storage.persist_vote_position(
         validator,
@@ -3309,6 +3310,7 @@ pub fn test_registers_recover_their_justification(
                 locked_round: Round::new(2),
                 last_voted_round: Round::new(9),
                 high_qc: None,
+                high_tc: None,
             },
             justification: Vec::new(),
         },
@@ -4313,6 +4315,7 @@ pub const fn registers(locked: u64, last_voted: u64) -> SafeVoteRegisters {
         locked_round: Round::new(locked),
         last_voted_round: Round::new(last_voted),
         high_qc: None,
+        high_tc: None,
     }
 }
 

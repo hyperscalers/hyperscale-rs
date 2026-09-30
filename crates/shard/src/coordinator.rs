@@ -156,9 +156,9 @@ use hyperscale_types::{
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
     HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError,
     QuorumCertificate, ReadFence, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine,
-    Timeout, TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable,
-    Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload,
+    Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    VotePosition, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::field::Empty;
@@ -400,6 +400,21 @@ pub struct ShardCoordinator {
     /// Timeout accounting for the pacemaker: per-round verified timeout shares,
     /// reporting the f+1 (Bracha) and 2f+1 (advance) thresholds.
     timeouts: TimeoutKeeper,
+
+    /// The highest timeout certificate this replica holds — assembled from
+    /// its own tally, taken off a header, or carried on a peer's timeout.
+    /// Shipped on every timeout so a replica behind it catches up, and
+    /// durable in the safe-vote record so a restart resumes at it.
+    high_tc: Option<Arc<Verified<TimeoutCertificate>>>,
+
+    /// A `high_tc` restored from the safe-vote record, verified on the
+    /// first entry whose tip committee resolves.
+    restored_high_tc: Option<TimeoutCertificate>,
+
+    /// Per committee member, the `(view, high_qc round)` at which a
+    /// certificate or carried QC it sent was last checked: one check per
+    /// member until this replica's position moves, whatever it sends.
+    carried_checks: BTreeMap<ValidatorId, (Round, Round)>,
 
     /// Per committee member, the highest round whose QC announcement from it
     /// has been checked: one QC verification per announcer and round, and
@@ -722,6 +737,9 @@ impl ShardCoordinator {
             recovered_blocks,
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
+            high_tc: None,
+            restored_high_tc: recovered_registers.high_tc.clone(),
+            carried_checks: BTreeMap::new(),
             qc_announcements: BTreeMap::new(),
             last_timed_out_round: None,
             retained_tip: None,
@@ -6353,6 +6371,7 @@ impl ShardCoordinator {
         vec![Action::SignAndBroadcastTimeout {
             round,
             high_qc: self.proposal_parent(topology_schedule).1.into_inner(),
+            high_tc: self.high_tc.as_deref().map(|tc| (**tc).clone()),
             recipients,
             position: self.vote_position(None),
         }]
@@ -6450,7 +6469,7 @@ impl ShardCoordinator {
             || timeout.round() > self.max_pacemaker_round()
             || self.timeouts.contains(timeout.round(), timeout.voter())
         {
-            return Vec::new();
+            return self.absorb_carried(topology_schedule, timeout);
         }
         // `committee_timeout_power` above confirmed committee membership, so the
         // public key resolves; a miss is the same BeaconState invariant
@@ -6652,6 +6671,7 @@ impl ShardCoordinator {
             );
         }
         let carried_high_qc = timeout.high_qc().clone();
+        let carried_tc = timeout.high_tc().cloned();
         if !self.timeouts.record(timeout, power) {
             return Vec::new();
         }
@@ -6676,6 +6696,13 @@ impl ShardCoordinator {
         {
             actions.extend(self.try_adopt_verified_qc(&verified));
         }
+        // The carried certificate is read after the carried QC, whose
+        // adoption can raise the floor a proposal on it must extend, and
+        // before amplification, so a replica it lifts times out the round it
+        // lands in rather than one it just left.
+        if let Some(tc) = carried_tc {
+            actions.extend(self.absorb_timeout_certificate(topology_schedule, &tc));
+        }
 
         // Bracha amplification: f+1 timeouts seen → broadcast our own.
         if VoteCount::has_one_third(seen, total) {
@@ -6698,20 +6725,141 @@ impl ShardCoordinator {
         round: Round,
     ) -> Vec<Action> {
         let mut actions = self.adopt_timeout_quorum_high_qc(topology_schedule, round);
-        // One round past the pacemaker ceiling nothing is wire-valid (a
-        // proposal there would exceed `MAX_ROUND_GAP` vs any adoptable parent
-        // QC) and no timeout tallies, so the view must never enter it. The
-        // quorum-max `high_qc` adoption above may have just raised the
-        // ceiling; at the clamp the view parks until a higher carried
-        // `high_qc` slides it.
-        if self
+        if let Some(tc) = self.assemble_timeout_certificate(topology_schedule, round) {
+            self.hold_high_tc(tc);
+        }
+        actions.extend(self.enter_past_abandoned(topology_schedule, round));
+        actions
+    }
+
+    /// Enter the round after `round`, which a quorum abandoned — shown by
+    /// this replica's own tally or by a certificate — resetting the timer
+    /// baseline so the new leader gets a full window.
+    ///
+    /// One round past the pacemaker ceiling nothing is wire-valid (a
+    /// proposal there would exceed `MAX_ROUND_GAP` vs any adoptable parent
+    /// QC) and no timeout tallies, so the view never enters it; at the
+    /// clamp it parks until a higher `high_qc` slides it.
+    fn enter_past_abandoned(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        round: Round,
+    ) -> Vec<Action> {
+        if !self
             .view_change
             .advance_to(round.next().min(self.max_pacemaker_round()))
         {
-            // Reset the timeout baseline so the new leader gets a full window.
-            self.view_change.record_leader_activity(self.now);
-            self.timeouts.prune_below(self.view_change.view);
-            actions.extend(self.enter_round(topology_schedule));
+            return Vec::new();
+        }
+        self.view_change.record_leader_activity(self.now);
+        self.timeouts.prune_below(self.view_change.view);
+        self.enter_round(topology_schedule)
+    }
+
+    /// A certificate for `round` from this replica's own tally, capped at
+    /// its verified `high_qc`, under the committee the tally counts.
+    fn assemble_timeout_certificate(
+        &self,
+        topology_schedule: &TopologySchedule,
+        round: Round,
+    ) -> Option<Verified<TimeoutCertificate>> {
+        let committee = self.tip_committee(topology_schedule)?;
+        self.timeouts.certificate(
+            self.verifier.as_ref(),
+            self.local_shard,
+            round,
+            committee.consensus_committee_for_shard(self.local_shard),
+            &self.high_qc(),
+            committee.quorum_threshold_for_shard(self.local_shard),
+        )
+    }
+
+    /// Keep `tc` as `high_tc` when it is for a later round than the one
+    /// held.
+    fn hold_high_tc(&mut self, tc: Verified<TimeoutCertificate>) -> bool {
+        if self
+            .high_tc
+            .as_deref()
+            .is_some_and(|held| held.round() >= tc.round())
+        {
+            return false;
+        }
+        self.high_tc = Some(Arc::new(tc));
+        true
+    }
+
+    /// Verify `tc` under the tip committee: the committee this replica's
+    /// pacemaker counts, and the only one whose certificates move its view.
+    fn verify_timeout_certificate(
+        &self,
+        topology_schedule: &TopologySchedule,
+        tc: &TimeoutCertificate,
+    ) -> Option<Verified<TimeoutCertificate>> {
+        if tc.shard_id() != self.local_shard {
+            return None;
+        }
+        let committee = self.tip_committee(topology_schedule)?;
+        let public_keys = committee_public_keys(committee, self.local_shard);
+        tc.verify(&TimeoutCertificateContext {
+            network: committee.network(),
+            public_keys: &public_keys,
+            quorum_threshold: committee.quorum_threshold_for_shard(self.local_shard),
+            verifier: self.verifier.as_ref(),
+        })
+        .ok()
+    }
+
+    /// Take a certificate a peer carried: verified and held when it would
+    /// move the view, and the round after it entered.
+    fn absorb_timeout_certificate(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tc: &TimeoutCertificate,
+    ) -> Vec<Action> {
+        if tc.round() < self.view_change.view || tc.round() >= self.max_pacemaker_round() {
+            return Vec::new();
+        }
+        let Some(verified) = self.verify_timeout_certificate(topology_schedule, tc) else {
+            return Vec::new();
+        };
+        let round = verified.round();
+        self.hold_high_tc(verified);
+        self.enter_past_abandoned(topology_schedule, round)
+    }
+
+    /// Read what a committee member's timeout carries — its `high_qc` and
+    /// `high_tc` — whatever round the share itself is for. A share below
+    /// the view cannot tally, but what it carries can still lift this
+    /// replica, and both are self-authenticating, so the share's own
+    /// signature is not checked for it. One check per member until this
+    /// replica's view or `high_qc` moves bounds what a member can make it
+    /// verify.
+    fn absorb_carried(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        timeout: &Timeout,
+    ) -> Vec<Action> {
+        let qc_above = timeout.high_qc_round() > self.high_qc_round();
+        let certificate_ahead = timeout
+            .high_tc()
+            .is_some_and(|tc| tc.round() >= self.view_change.view);
+        if !qc_above && !certificate_ahead {
+            return Vec::new();
+        }
+        let position = (self.view_change.view, self.high_qc_round());
+        if self.carried_checks.get(&timeout.voter()) == Some(&position) {
+            return Vec::new();
+        }
+        self.carried_checks.insert(timeout.voter(), position);
+        let mut actions = Vec::new();
+        if qc_above
+            && !qc_weighted_timestamp_too_far_ahead(timeout.high_qc(), self.now)
+            && let Some(verified) = self.verify_qc_sync(topology_schedule, timeout.high_qc())
+        {
+            actions.extend(self.try_adopt_verified_qc(&verified));
+        }
+        if let Some(tc) = timeout.high_tc() {
+            actions.extend(self.absorb_timeout_certificate(topology_schedule, tc));
         }
         actions
     }
@@ -7002,6 +7150,20 @@ impl ShardCoordinator {
         )
     }
 
+    /// Take the restored `high_tc` once the tip committee resolves: a
+    /// restarted replica resumes at the view it held a certificate for. One
+    /// that no longer verifies — the committee moved while it was down — is
+    /// dropped, and the replica catches up from its peers.
+    fn resume_restored_high_tc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        if self.restored_high_tc.is_none() || self.tip_committee(topology_schedule).is_none() {
+            return Vec::new();
+        }
+        let Some(tc) = self.restored_high_tc.take() else {
+            return Vec::new();
+        };
+        self.absorb_timeout_certificate(topology_schedule, &tc)
+    }
+
     /// Check if we're behind and need to catch up via sync. Called
     /// periodically by the cleanup timer. Delegates the decision to
     /// [`BlockSyncManager::health_check`] and translates a trigger into a
@@ -7015,6 +7177,7 @@ impl ShardCoordinator {
         actions.extend(self.try_adopt_anchor_qc(topology_schedule));
         actions.extend(self.reoffer_retained_tip(topology_schedule));
         actions.extend(self.resume_recovered_blocks(topology_schedule));
+        actions.extend(self.resume_restored_high_tc(topology_schedule));
 
         let next_needed_height = self.committed_height.next();
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
@@ -7406,6 +7569,7 @@ impl ShardCoordinator {
             locked_round: self.locked_round,
             last_voted_round: self.last_voted_round,
             high_qc: self.latest_qc.as_deref().map(|qc| (*qc).clone()),
+            high_tc: self.high_tc.as_deref().map(|tc| (**tc).clone()),
         }
     }
 
@@ -10960,6 +11124,164 @@ mod tests {
         );
         // The share itself is still tallied for the pacemaker.
         assert_eq!(state.timeouts.power(Round::new(2)), VoteCount::new(1));
+    }
+
+    /// A certificate for `round` from `keys[1..=3]`, each reporting the
+    /// genesis QC.
+    fn certificate_at(keys: &[BlsSigner], round: u64) -> TimeoutCertificate {
+        let net = NetworkDefinition::simulator();
+        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let shares: Vec<Verified<Timeout>> = (1..=3)
+            .map(|idx| {
+                Verified::<Timeout>::sign_local(
+                    &net,
+                    ShardId::ROOT,
+                    Round::new(round),
+                    genesis.clone(),
+                    ValidatorId::new(idx as u64),
+                    &keys[idx],
+                )
+                .expect("sign")
+            })
+            .collect();
+        let positioned: Vec<(usize, &Verified<Timeout>)> = (1..=3).zip(&shares).collect();
+        Verified::<TimeoutCertificate>::from_verified_timeouts(
+            &BlsVerifier,
+            ShardId::ROOT,
+            Round::new(round),
+            &positioned,
+            genesis,
+            VoteCount::of(3),
+        )
+        .expect("assembles")
+        .into_inner()
+    }
+
+    /// One timeout carrying a certificate lifts a replica several rounds
+    /// behind straight to the round after it, whatever round the share
+    /// itself times out.
+    #[test]
+    fn a_carried_certificate_lifts_a_lagging_replica_past_its_round() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let net = NetworkDefinition::simulator();
+        let tc = certificate_at(&keys, 5);
+        let timeout = Verified::<Timeout>::sign_local(
+            &net,
+            ShardId::ROOT,
+            Round::new(1),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            ValidatorId::new(1),
+            &keys[1],
+        )
+        .expect("sign")
+        .with_high_tc(Some(tc));
+
+        assert_eq!(state.view(), Round::new(1));
+        let _ = state.on_verified_timeout(&topology_schedule, timeout);
+        assert_eq!(state.view(), Round::new(6));
+        assert_eq!(
+            state.high_tc.as_deref().map(|tc| tc.round()),
+            Some(Round::new(5))
+        );
+    }
+
+    /// A share for a round this replica already left still hands over the
+    /// QC it carries.
+    #[test]
+    fn a_below_view_share_hands_over_its_carried_qc() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+        state.view_change.advance_to(Round::new(4));
+        let share = Timeout::new(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            Round::new(2),
+            (*qc).clone(),
+            ValidatorId::new(2),
+            &keys[2],
+        )
+        .expect("sign");
+
+        let _ = state.on_unverified_timeout(&topology_schedule, &share);
+        assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
+    }
+
+    /// What a member's timeout carries is checked once per member until this
+    /// replica's view or `high_qc` moves: a garbage certificate spends only
+    /// its sender's check.
+    #[test]
+    fn carried_fields_are_checked_once_per_member_and_position() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.view_change.advance_to(Round::new(4));
+        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let net = NetworkDefinition::simulator();
+        let below = |voter: usize, tc: TimeoutCertificate| {
+            Verified::<Timeout>::sign_local(
+                &net,
+                ShardId::ROOT,
+                Round::new(2),
+                genesis.clone(),
+                ValidatorId::new(voter as u64),
+                &keys[voter],
+            )
+            .expect("sign")
+            .with_high_tc(Some(tc))
+            .into_inner()
+        };
+        let genuine = certificate_at(&keys, 7);
+        let forged = certificate_at(&make_multi_validator_state_with_keys(0).2, 7);
+
+        let _ = state.on_unverified_timeout(&topology_schedule, &below(1, forged));
+        assert_eq!(
+            state.view(),
+            Round::new(4),
+            "a forged certificate moves nothing"
+        );
+        let _ = state.on_unverified_timeout(&topology_schedule, &below(1, genuine.clone()));
+        assert_eq!(
+            state.view(),
+            Round::new(4),
+            "member 1 already spent its check"
+        );
+
+        let _ = state.on_unverified_timeout(&topology_schedule, &below(2, genuine));
+        assert_eq!(state.view(), Round::new(8));
+    }
+
+    /// A restarted replica resumes at the view its durable certificate
+    /// shows, once its tip committee resolves.
+    #[test]
+    fn a_restored_certificate_resumes_the_view_it_shows() {
+        let (_, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        let tc = certificate_at(&keys, 5);
+        let mut recovered = RecoveredState::default();
+        recovered.safe_vote_registers.insert(
+            ValidatorId::new(0),
+            SafeVoteRegisters {
+                high_tc: Some(tc),
+                ..SafeVoteRegisters::default()
+            },
+        );
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            recovered,
+        );
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let _ = state.check_sync_health(&topology_schedule);
+        assert_eq!(state.view(), Round::new(6));
+        assert_eq!(
+            state.safe_vote_registers().high_tc.map(|tc| tc.round()),
+            Some(Round::new(5)),
+            "the certificate is written back on the next signing position",
+        );
     }
 
     /// A 3-of-4 QC over `block` at round 1, signed by `keys[1..=3]`.

@@ -1403,6 +1403,7 @@ impl ShardCoordinatorSim {
             Action::SignAndBroadcastTimeout {
                 round,
                 high_qc,
+                high_tc,
                 recipients,
                 position,
             } => {
@@ -1417,7 +1418,8 @@ impl ShardCoordinatorSim {
                     me,
                     self.sks[emitter_idx].as_ref(),
                 )
-                .expect("sign");
+                .expect("sign")
+                .with_high_tc(high_tc);
                 for &recipient in &recipients {
                     if recipient == me {
                         continue;

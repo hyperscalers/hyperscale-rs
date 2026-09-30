@@ -1506,6 +1506,7 @@ where
         Action::SignAndBroadcastTimeout {
             round,
             high_qc,
+            high_tc,
             recipients,
             position,
         } => {
@@ -1523,6 +1524,7 @@ where
                 tracing::error!(?round, "cannot sign timeout; abstaining");
                 return;
             };
+            let verified = verified.with_high_tc(high_tc);
             let gossip = TimeoutNotification::new(verified.clone());
             ctx.network.notify(&recipients, &gossip);
             // Feed our own signed timeout back for local TimeoutKeeper tracking.

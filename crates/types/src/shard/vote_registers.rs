@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
 
-use crate::{Block, QuorumCertificate, Round};
+use crate::{Block, QuorumCertificate, Round, TimeoutCertificate};
 
 /// Snapshot of a validator's monotone safe-vote registers, with the
 /// certificate that authorizes the lock they record.
@@ -38,6 +38,11 @@ pub struct SafeVoteRegisters {
     /// QC it has adopted. `None` only for a validator that has never
     /// voted, whose lock is at the origin and needs no justification.
     pub high_qc: Option<QuorumCertificate>,
+    /// The highest timeout certificate the validator held. Liveness
+    /// only: it lets a restarted validator resume at the view it had
+    /// certified evidence for, instead of climbing back one round at a
+    /// time. Losing it costs catch-up time, never safety.
+    pub high_tc: Option<TimeoutCertificate>,
 }
 
 impl SafeVoteRegisters {
@@ -56,10 +61,15 @@ impl SafeVoteRegisters {
         } else {
             self.high_qc
         };
+        let later_certificate = match (self.high_tc, other.high_tc) {
+            (Some(a), Some(b)) => Some(if b.round() > a.round() { b } else { a }),
+            (a, b) => a.or(b),
+        };
         Self {
             locked_round: self.locked_round.max(other.locked_round),
             last_voted_round: self.last_voted_round.max(other.last_voted_round),
             high_qc,
+            high_tc: later_certificate,
         }
     }
 }
@@ -83,4 +93,59 @@ pub struct VotePosition {
     pub registers: SafeVoteRegisters,
     /// The uncommitted chain behind `registers.high_qc`, oldest first.
     pub justification: Vec<Arc<Block>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+
+    use super::*;
+    use crate::{
+        ChainOrigin, NetworkDefinition, ShardId, Timeout, ValidatorId, Verified, VoteCount,
+    };
+
+    fn certificate_at(round: u64) -> TimeoutCertificate {
+        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let shares: Vec<Verified<Timeout>> = (0..3u64)
+            .map(|voter| {
+                Verified::<Timeout>::sign_local(
+                    &NetworkDefinition::simulator(),
+                    ShardId::ROOT,
+                    Round::new(round),
+                    genesis.clone(),
+                    ValidatorId::new(voter),
+                    &BlsSigner::generate(),
+                )
+                .expect("sign")
+            })
+            .collect();
+        let positioned: Vec<(usize, &Verified<Timeout>)> = (0..3).zip(&shares).collect();
+        Verified::<TimeoutCertificate>::from_verified_timeouts(
+            &BlsVerifier,
+            ShardId::ROOT,
+            Round::new(round),
+            &positioned,
+            genesis,
+            VoteCount::of(3),
+        )
+        .expect("assembles")
+        .into_inner()
+    }
+
+    /// The merge keeps the later-round certificate whichever side holds it.
+    #[test]
+    fn the_merge_keeps_the_later_certificate() {
+        let with = |round| SafeVoteRegisters {
+            high_tc: Some(certificate_at(round)),
+            ..SafeVoteRegisters::default()
+        };
+        let merged_round =
+            |a: SafeVoteRegisters, b: SafeVoteRegisters| a.max(b).high_tc.map(|tc| tc.round());
+        assert_eq!(merged_round(with(3), with(5)), Some(Round::new(5)));
+        assert_eq!(merged_round(with(5), with(3)), Some(Round::new(5)));
+        assert_eq!(
+            merged_round(SafeVoteRegisters::default(), with(3)),
+            Some(Round::new(3)),
+        );
+    }
 }

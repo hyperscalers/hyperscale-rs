@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::signing::TimeoutMessage;
 use crate::{
     ConsensusPublicKey, ConsensusSignature, NetworkDefinition, QuorumCertificate, Round, ShardId,
-    ValidatorId, Verified, Verify, signed_bytes,
+    TimeoutCertificate, ValidatorId, Verified, Verify, signed_bytes,
 };
 
 /// A validator's timeout for a shard consensus round.
@@ -42,6 +42,10 @@ pub struct Timeout {
     /// disagrees with it.
     high_qc_round: Round,
     high_qc: QuorumCertificate,
+    /// The sender's highest timeout certificate, outside the signature
+    /// and self-authenticating: a receiver behind the round it abandons
+    /// syncs its view to it.
+    high_tc: Option<TimeoutCertificate>,
     voter: ValidatorId,
     signature: ConsensusSignature,
 }
@@ -65,6 +69,7 @@ impl Timeout {
             round,
             high_qc_round: high_qc.round(),
             high_qc,
+            high_tc: None,
             voter,
             signature: ConsensusSignature::ZERO,
         };
@@ -95,6 +100,12 @@ impl Timeout {
     #[must_use]
     pub const fn high_qc_round(&self) -> Round {
         self.high_qc_round
+    }
+
+    /// The sender's highest timeout certificate, unverified.
+    #[must_use]
+    pub const fn high_tc(&self) -> Option<&TimeoutCertificate> {
+        self.high_tc.as_ref()
     }
 
     /// Validator who timed out.
@@ -207,6 +218,17 @@ impl Verified<Timeout> {
         Ok(Self::new_unchecked(Timeout::new(
             network, shard_id, round, high_qc, voter, signer,
         )?))
+    }
+
+    /// Carry `high_tc` beside the share. It sits outside the signed
+    /// message and is checked where it is used, so attaching it leaves the
+    /// share's predicate as it was.
+    #[must_use]
+    pub fn with_high_tc(self, high_tc: Option<TimeoutCertificate>) -> Self {
+        Self::new_unchecked(Timeout {
+            high_tc,
+            ..self.into_inner()
+        })
     }
 }
 

@@ -222,6 +222,7 @@ fn recovered_registers_floor_boot_values() {
             locked_round: Round::new(3),
             last_voted_round: Round::new(7),
             high_qc: None,
+            high_tc: None,
         },
     );
 
@@ -249,6 +250,7 @@ fn recovered_registers_of_other_validators_are_ignored() {
             locked_round: Round::new(3),
             last_voted_round: Round::new(7),
             high_qc: None,
+            high_tc: None,
         },
     );
 
