@@ -69,7 +69,9 @@ pub use beacon_reveal::{
 pub use crossing_readings::CrossingReadingsSenderMessage;
 pub use execution::{ExecutionCertificatesSenderMessage, ExecutionVoteMessage};
 pub use provisions::ProvisionsSenderMessage;
-pub use shard::{BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage};
+pub use shard::{
+    BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage, TimeoutMessage,
+};
 pub use shard_reveal::{ShardRevealMessage, shard_reveal_sign, shard_reveal_verify};
 pub use validator_address::ValidatorAddressMessage;
 pub use validator_bind::{VALIDATOR_BIND_NONCE_LEN, ValidatorBindMessage};
@@ -83,9 +85,7 @@ mod tests {
     use hyperscale_hbor::HborSigned as _;
 
     use super::*;
-    use crate::{
-        BlockHash, BlockHeight, Hash, ReadySignal, Round, ShardId, Timeout, TransactionEnvelope,
-    };
+    use crate::{BlockHash, BlockHeight, Hash, ReadySignal, Round, ShardId, TransactionEnvelope};
 
     /// The context is covered: the same message signed for two networks
     /// commits to two byte strings, which is what makes a cross-network
@@ -134,7 +134,7 @@ mod tests {
             ("ReadySignal", ReadySignal::SIGNING_DOMAIN),
             ("BlockVoteMessage", BlockVoteMessage::SIGNING_DOMAIN),
             ("BlockProposalMessage", BlockProposalMessage::SIGNING_DOMAIN),
-            ("Timeout", Timeout::SIGNING_DOMAIN),
+            ("TimeoutMessage", TimeoutMessage::SIGNING_DOMAIN),
             (
                 "CertifiedBlockHeaderSenderMessage",
                 CertifiedBlockHeaderSenderMessage::SIGNING_DOMAIN,

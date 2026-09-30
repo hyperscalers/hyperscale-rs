@@ -6224,9 +6224,15 @@ impl ShardCoordinator {
             .copied()
             .filter(|v| *v != self.me)
             .collect();
+        // The QC reported is the one this replica would extend, which a
+        // halt harvest can step below `high_qc` over an unbuildable tail.
+        // Its round is the bound a timeout certificate states for this
+        // share, and a recovery proposal on the stepped-down parent must
+        // meet it. `proposal_parent` never steps below the lock, so the
+        // bound is never understated.
         vec![Action::SignAndBroadcastTimeout {
             round,
-            high_qc: self.high_qc(),
+            high_qc: self.proposal_parent(topology_schedule).1.into_inner(),
             recipients,
             position: self.vote_position(None),
         }]

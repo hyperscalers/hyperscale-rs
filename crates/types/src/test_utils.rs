@@ -16,6 +16,7 @@ use hyperscale_vm_types::{
 };
 
 use crate::crypto::Ed25519PrivateKey;
+use crate::signing::TimeoutMessage;
 use crate::{
     AbortCharge, AggregateSignature, Anchor, Attested, Block, BlockHash, BlockHeader,
     BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVoteMessage, CertifiedBlock,
@@ -25,7 +26,7 @@ use crate::{
     MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
     ProtocolStatics, QuorumCertificate, Role, Round, Routing, Settlement, ShardForkProof, ShardId,
     ShardLoad, SignerBitfield, StateClaim, StateRoot, StateWrites, StoredReceipt, TickHalf, TickId,
-    TickLine, Timeout, TimestampRange, TopologySnapshot, Transaction, TransactionDecision,
+    TickLine, TimestampRange, TopologySnapshot, Transaction, TransactionDecision,
     TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
     Verified, VrfProof, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
     install_protocol_statics, protocol_statics_installed, signed_bytes,
@@ -1773,7 +1774,7 @@ impl WithholdingSigner {
             &[
                 votes,
                 <BlockProposalMessage as HborSignedWith>::SIGNING_DOMAIN,
-                <Timeout as HborSignedWith>::SIGNING_DOMAIN,
+                <TimeoutMessage as HborSignedWith>::SIGNING_DOMAIN,
             ]
         } else if withheld >= Withheld::Votes as u8 {
             &[votes]

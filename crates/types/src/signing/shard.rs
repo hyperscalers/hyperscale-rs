@@ -27,6 +27,20 @@ pub struct BlockVoteMessage {
     pub parent_block_hash: BlockHash,
 }
 
+/// What a shard timeout share's signature covers: the round it gives up on
+/// and the round of the QC it reports. A timeout certificate re-derives one
+/// of these per signer to check its aggregate.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+#[hbor(signing_domain = "hyperscale-timeout-v1", signing_context = NetworkId)]
+pub struct TimeoutMessage {
+    /// Shard whose consensus the timeout belongs to.
+    pub shard_id: ShardId,
+    /// The round timed out.
+    pub round: Round,
+    /// Round of the QC the signer reports as its highest.
+    pub high_qc_round: Round,
+}
+
 /// What a block header proposal's signature covers.
 ///
 /// Signed by the proposer when broadcasting block header proposals;

@@ -212,6 +212,9 @@ pub use shard::tick_manifest::{
     DiscardCause, Holds, Joins, Reach, Settlement, TickLine, TickManifest,
 };
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
+pub use shard::timeout_cert::{
+    TimeoutCertificate, TimeoutCertificateContext, TimeoutCertificateVerifyError,
+};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
 pub use shard::{
