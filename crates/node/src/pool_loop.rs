@@ -306,8 +306,8 @@ where
             }
             // Catch-up sync: a follower fell behind a gossiped block, so drive
             // the FSM to fetch the missing epochs from a live committee.
-            Action::StartBeaconBlockSync { target } => {
-                beacon::start(self, target);
+            Action::StartBeaconBlockSync { tip, target } => {
+                beacon::start(self, tip, target);
             }
             other if other.owner() == ActionOwner::Beacon => {
                 self.run_beacon_action(vnode_idx, other, queue);
@@ -467,10 +467,6 @@ where
                 },
             ),
         );
-    }
-
-    fn beacon_tip(&self) -> Option<Epoch> {
-        self.process.beacon_storage.latest_committed_epoch()
     }
 
     fn now(&self) -> LocalTimestamp {

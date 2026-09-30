@@ -83,32 +83,33 @@ pub trait BeaconSyncSink {
     /// driver — each side captures its own cloned sender/target instead.
     fn dispatch_fetch(&self, epoch: Epoch);
 
-    /// Local beacon tip, for the restart seed (identical logic both sides).
-    fn beacon_tip(&self) -> Option<Epoch>;
-
     /// This driver's current consensus clock — the deterministic time the
     /// FSM anchors its `pending_admission` and retry-backoff deadlines on,
     /// matching every other `self.now` site (set via `set_time`).
     fn now(&self) -> LocalTimestamp;
 }
 
-/// Begin (or extend) a catch-up sync toward `target`.
+/// Begin (or extend) a catch-up sync from the requesting coordinator's
+/// `tip` toward `target`.
 ///
-/// Seeds the FSM's committed watermark from the local beacon tip before the
-/// first fetch. `Admitted` creates and seeds the scope even ahead of
+/// Seeds the FSM's committed watermark from that coordinator's tip before
+/// the first fetch. `Admitted` creates and seeds the scope even ahead of
 /// `StartSync`, so a serial (`window_size = 1`) sync starts from `tip + 1`
-/// rather than `genesis + 1`. This is idempotent with the `Admitted`-on-commit
-/// stream and only load-bearing right after a restart, when this session
-/// hasn't committed anything yet — without it the window would pin at
-/// `genesis + 1`, a block the coordinator drops as past-tip and never admits,
-/// so `committed` never advances and sync wedges.
-pub fn start<K: BeaconSyncSink>(sink: &mut K, target: Epoch) {
-    if let Some(tip) = sink.beacon_tip() {
-        let _ = sink.beacon_fsm().handle(BeaconBlockSyncInput::Admitted {
-            scope: (),
-            height: tip,
-        });
-    }
+/// rather than `genesis + 1`; without the seed right after a restart, when
+/// this session has committed nothing yet, the window would pin at
+/// `genesis + 1`, a block the coordinator drops as past-tip and never
+/// admits, so `committed` never advances and sync wedges.
+///
+/// The seed is the coordinator's tip, not the host's beacon storage: a
+/// co-hosted coordinator on another driver writes the shared storage as
+/// it commits, so the stored tip can stand past the requester's, and a
+/// watermark seeded there reads the requester as caught up and fetches
+/// nothing it lacks.
+pub fn start<K: BeaconSyncSink>(sink: &mut K, tip: Epoch, target: Epoch) {
+    let _ = sink.beacon_fsm().handle(BeaconBlockSyncInput::Admitted {
+        scope: (),
+        height: tip,
+    });
     let outputs = sink
         .beacon_fsm()
         .handle(BeaconBlockSyncInput::StartSync { scope: (), target });
@@ -283,5 +284,40 @@ mod tests {
                 .any(|o| matches!(o, SyncOutput::Complete { height, .. } if height.inner() == 8))
         );
         assert!(!sync.is_syncing());
+    }
+
+    /// A driver whose own coordinator sits at `tip` while it records the
+    /// fetches its FSM dispatches.
+    struct RecordingSink {
+        fsm: BeaconBlockSync,
+        fetched: std::cell::RefCell<Vec<u64>>,
+    }
+
+    impl BeaconSyncSink for RecordingSink {
+        fn beacon_fsm(&mut self) -> &mut BeaconBlockSync {
+            &mut self.fsm
+        }
+
+        fn deliver_block(&mut self, _block: Arc<Verifiable<CertifiedBeaconBlock>>) {}
+
+        fn dispatch_fetch(&self, epoch: Epoch) {
+            self.fetched.borrow_mut().push(epoch.inner());
+        }
+
+        fn now(&self) -> LocalTimestamp {
+            LocalTimestamp::from_millis(0)
+        }
+    }
+
+    /// A coordinator one epoch behind asks for the epoch above its own
+    /// tip, whatever else the host has committed.
+    #[test]
+    fn start_fetches_above_the_requesting_coordinators_tip() {
+        let mut sink = RecordingSink {
+            fsm: BeaconBlockSync::new(beacon_block_sync_config()),
+            fetched: std::cell::RefCell::new(Vec::new()),
+        };
+        start(&mut sink, h(16), h(17));
+        assert_eq!(*sink.fetched.borrow(), vec![17]);
     }
 }

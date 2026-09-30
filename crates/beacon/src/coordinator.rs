@@ -1467,7 +1467,10 @@ impl BeaconCoordinator {
             // claimed epoch is only a target hint — the runner's sync
             // backs off on epochs that don't exist, so a bogus far-future
             // epoch can't busy-loop the network.
-            return vec![Action::StartBeaconBlockSync { target: epoch }];
+            return vec![Action::StartBeaconBlockSync {
+                tip: tip_epoch,
+                target: epoch,
+            }];
         }
 
         if block.prev_block_hash() != self.latest_block.block_hash() {
@@ -1647,6 +1650,7 @@ impl BeaconCoordinator {
         // not-found at the height above its own as the tip.
         if vote.epoch() > expected_epoch {
             return vec![Action::StartBeaconBlockSync {
+                tip: self.latest_block.epoch(),
                 target: vote.epoch().saturating_sub(1),
             }];
         }
@@ -4537,7 +4541,8 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::StartBeaconBlockSync { target } if target == Epoch::new(5)
+            Action::StartBeaconBlockSync { tip, target }
+                if tip == Epoch::GENESIS && target == Epoch::new(5)
         ));
         assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
     }
@@ -5252,7 +5257,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::StartBeaconBlockSync { target } if *target == Epoch::new(98)
+                Action::StartBeaconBlockSync { target, .. } if *target == Epoch::new(98)
             )),
             "a vote ratifying a future epoch reveals missing beacon blocks \
              and must trigger gap-fill sync toward its anchor epoch; got {actions:?}",

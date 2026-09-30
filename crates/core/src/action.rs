@@ -1451,6 +1451,11 @@ pub enum Action {
     /// `Sync` machine fetches the missing blocks epoch by epoch and feeds
     /// each back as `ProtocolEvent::BeaconBlockSyncReadyToApply`.
     StartBeaconBlockSync {
+        /// The requesting coordinator's own tip. Co-hosted coordinators
+        /// share the host's beacon storage but adopt blocks one by one,
+        /// so the host's committed tip can stand past this one's; the
+        /// sync fetches from here.
+        tip: Epoch,
         /// The epoch we need to sync the beacon chain up to.
         target: Epoch,
     },

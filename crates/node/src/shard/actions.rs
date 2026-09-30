@@ -138,8 +138,8 @@ where
             Action::SettleBlockSync => {
                 self.process_settle_block_sync();
             }
-            Action::StartBeaconBlockSync { target } => {
-                self.process_start_beacon_block_sync(target);
+            Action::StartBeaconBlockSync { tip, target } => {
+                self.process_start_beacon_block_sync(tip, target);
             }
             Action::StartRemoteHeaderSync {
                 source_shard,

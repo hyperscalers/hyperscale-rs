@@ -72,10 +72,6 @@ where
         );
     }
 
-    fn beacon_tip(&self) -> Option<Epoch> {
-        self.process.beacon_storage.latest_committed_epoch()
-    }
-
     fn now(&self) -> LocalTimestamp {
         self.now
     }
@@ -89,8 +85,8 @@ where
 {
     /// Handle `Action::StartBeaconBlockSync`: feed the FSM and dispatch any
     /// fetch it emits.
-    pub(in crate::shard) fn process_start_beacon_block_sync(&mut self, target: Epoch) {
-        beacon::start(self, target);
+    pub(in crate::shard) fn process_start_beacon_block_sync(&mut self, tip: Epoch, target: Epoch) {
+        beacon::start(self, tip, target);
     }
 
     /// A beacon-block sync response landed.
