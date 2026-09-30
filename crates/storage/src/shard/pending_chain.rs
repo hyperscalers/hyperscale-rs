@@ -185,9 +185,30 @@ where
         }
     }
 
-    /// Append an entry.
-    pub fn insert(&self, block_hash: BlockHash, entry: ChainEntry) {
-        write_or_recover(&self.entries).insert(block_hash, entry);
+    /// Append an entry, or restate the prepared state of one already held.
+    ///
+    /// Every seat on a host prepares the blocks it applies into this one
+    /// chain, so a block a sibling seat already holds is prepared again
+    /// when another seat applies it. The hash names the same block, so the
+    /// restated entry keeps the certification already attached to it: a
+    /// re-prepare that dropped it would leave a certified tip no host
+    /// serves, and a halted shard's recovery committee cannot fetch the
+    /// tip it must extend from anyone.
+    pub fn insert(&self, block_hash: BlockHash, mut entry: ChainEntry) {
+        let mut entries = write_or_recover(&self.entries);
+        if let Some(held) = entries.get_mut(&block_hash) {
+            entry.certified_block = entry
+                .certified_block
+                .or_else(|| held.certified_block.take());
+            entry.certified_uncommitted = if entry.certified_block.is_some() {
+                None
+            } else {
+                entry
+                    .certified_uncommitted
+                    .or_else(|| held.certified_uncommitted.take())
+            };
+        }
+        entries.insert(block_hash, entry);
     }
 
     /// What a committed-tail walk that could not read `height` has
@@ -1847,6 +1868,40 @@ mod tests {
         assert!(chain.transactions_for_block(BlockHeight::new(5)).is_none());
         // The dedup-horizon reference stays anchored to committed QCs.
         assert!(chain.latest_qc().is_none());
+    }
+
+    #[test]
+    fn a_re_prepared_block_keeps_its_certification() {
+        // A second seat on the host applies a block the first already
+        // holds and prepares it again. The certified tip must stay
+        // servable, and a committed block must stay committed.
+        let chain = empty_chain();
+        let tip = insert_pending(&chain, BlockHeight::new(5), false);
+        chain.attach_certified_uncommitted(tip.block().hash(), Arc::clone(&tip));
+        let committed = insert_pending(&chain, BlockHeight::new(4), true);
+
+        for certified in [&tip, &committed] {
+            chain.insert(
+                certified.block().hash(),
+                ChainEntry {
+                    parent_block_hash: BlockHash::ZERO,
+                    height: certified.block().height(),
+                    settled_txs: Vec::new(),
+                    jmt_snapshot: empty_snapshot(),
+                    certified_block: None,
+                    certified_uncommitted: None,
+                },
+            );
+        }
+
+        let served = chain
+            .block_for_sync(BlockHeight::new(5))
+            .expect("block sync still serves the certified tip");
+        assert_eq!(served.block.hash(), tip.block().hash());
+        let held = chain
+            .certified_block(BlockHeight::new(4))
+            .expect("the committed block stays committed");
+        assert_eq!(held.block().hash(), committed.block().hash());
     }
 
     #[test]
