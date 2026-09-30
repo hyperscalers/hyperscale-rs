@@ -6,8 +6,9 @@
 //! - [`NodeHost::initialize_shard_genesis`] feeds the supplied genesis
 //!   block into every vnode of its shard and drains the resulting
 //!   actions via the common [`NodeHost::drain_actions`] path.
-//! - [`NodeHost::install_engine_genesis`] commits the genesis substates +
-//!   computes the genesis state root. Only runs on a fresh node.
+//! - [`network_genesis_block`] commits the network genesis substates into a
+//!   fresh store and builds the genesis block over their state root. Every
+//!   store that installs it builds the same block.
 //! - [`NodeHost::register_inbound_handlers`] wires the request / gossip /
 //!   notification handler closures into the network adapter. Required
 //!   before the host starts processing events; reached by both genesis
@@ -21,7 +22,7 @@ use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, RecoveredState, ShardStorage};
 use hyperscale_types::{
-    Block, CertifiedBlock, ChainOrigin, ShardId, StateRoot, ValidatorId, Verified,
+    Block, CertifiedBlock, ChainOrigin, ShardId, TopologySnapshot, ValidatorId, Verified,
 };
 
 use crate::host::{NodeHost, ShardGenesis};
@@ -74,79 +75,35 @@ where
     }
 
     /// Run the deterministic part of one shard's genesis ceremony: install
-    /// engine genesis, build the genesis block under `proposer`, persist it
-    /// into the shard's vnodes, and drain the resulting setup output.
+    /// the network genesis into the shard's fresh store (see
+    /// [`network_genesis_block`]), persist the block into the shard's
+    /// vnodes, and drain the resulting setup output.
     ///
     /// Returns the block, its certified form, and the drained
     /// [`StepOutput`]. The caller commits the
     /// certified block — production steps `BlockCommitted` inline, simulation
     /// schedules it after the network is wired — so this stops short of the
     /// commit, the one step the two runners can't share.
-    pub fn build_shard_genesis(
-        &mut self,
-        shard: ShardId,
-        proposer: ValidatorId,
-        config: &GenesisConfig,
-    ) -> ShardGenesis
+    pub fn build_shard_genesis(&mut self, shard: ShardId, config: &GenesisConfig) -> ShardGenesis
     where
         S: GenesisCommit,
     {
-        let genesis_jmt_root = self.install_engine_genesis(shard, config);
-        let block = Block::genesis(shard, proposer, genesis_jmt_root, ChainOrigin::ROOT);
+        let topology_snapshot = self.process.topology_snapshot.load_full();
+        let block = network_genesis_block(
+            self.shard_io(shard).storage.as_ref(),
+            shard,
+            &topology_snapshot,
+            config,
+        );
         self.initialize_shard_genesis(&block);
         self.flush_all_batches();
         let setup_output = self.drain_pending_output();
-        let certified = Arc::new(Verified::<CertifiedBlock>::genesis(
-            shard,
-            proposer,
-            genesis_jmt_root,
-            ChainOrigin::ROOT,
-        ));
+        let certified = Arc::new(Verified::<CertifiedBlock>::genesis_certified(block.clone()));
         ShardGenesis {
             block,
             certified,
             setup_output,
         }
-    }
-
-    /// Install genesis on `shard`'s storage.
-    ///
-    /// Commits the genesis substates and computes the JMT root at version
-    /// 0. Returns the genesis state root.
-    ///
-    /// Independent of network-handler registration — runners call
-    /// [`Self::register_inbound_handlers`] once their genesis-or-resume
-    /// decision is settled.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the JMT is already initialized (genesis must run on a fresh
-    /// store).
-    pub fn install_engine_genesis(&mut self, shard: ShardId, config: &GenesisConfig) -> StateRoot
-    where
-        S: GenesisCommit,
-    {
-        // A per-shard store holds only its own shard's accounts:
-        // prefix-rooting (each store roots its JMT at the shard's prefix)
-        // requires it, since a foreign-prefix key would be mis-bucketed
-        // beneath this shard's root.
-        let topology_snapshot = self.process.topology_snapshot.load();
-        let mut config = config.clone();
-        config
-            .accounts
-            .retain(|(address, _)| topology_snapshot.shard_for_prefix(*address) == shard);
-        let merged = genesis_writes(&config.accounts, &config.pools, &config.packages);
-        // The stdlib package is replicated to every shard's substate store
-        // for read availability, but the prefix-rooted JMT must hold only
-        // this shard's subtree, so the committed state root is the global
-        // tree's node at the shard prefix.
-        let jmt_writes = filter_genesis_writes_for_shard(
-            &merged,
-            owned_by(shard, topology_snapshot.shard_trie()),
-        );
-        self.shard_io(shard)
-            .storage
-            .install_genesis(&merged, &jmt_writes)
     }
 
     /// Register inbound network handlers (requests, gossip, notifications).
@@ -159,4 +116,55 @@ where
         self.register_gossip_handlers();
         self.register_notification_handlers();
     }
+}
+
+/// The proposer every network genesis block names. A genesis block is
+/// built, never proposed, and every store that installs it has to build
+/// the same one.
+const GENESIS_PROPOSER: ValidatorId = ValidatorId::new(0);
+
+/// Install the network genesis for `shard` into its fresh `storage` and
+/// build the genesis block over the resulting state root.
+///
+/// This is the ceremony every member of a network-genesis shard ran at
+/// birth. `config` is the
+/// network's genesis config, so every store that runs this builds the
+/// same block, and block sync extends it with the chain the members
+/// committed since.
+///
+/// `topology_snapshot` places the genesis accounts: a store holds only
+/// the ones whose address falls in `shard`'s range, which is the same
+/// under any topology `shard` is a leaf of.
+///
+/// Independent of network-handler registration — runners call
+/// [`NodeHost::register_inbound_handlers`] once their genesis-or-resume
+/// decision is settled.
+///
+/// # Panics
+///
+/// Panics if the store's JMT is already initialized (genesis must run on
+/// a fresh store).
+pub fn network_genesis_block<S: GenesisCommit>(
+    storage: &S,
+    shard: ShardId,
+    topology_snapshot: &TopologySnapshot,
+    config: &GenesisConfig,
+) -> Block {
+    // A per-shard store holds only its own shard's accounts:
+    // prefix-rooting (each store roots its JMT at the shard's prefix)
+    // requires it, since a foreign-prefix key would be mis-bucketed
+    // beneath this shard's root.
+    let mut config = config.clone();
+    config
+        .accounts
+        .retain(|(address, _)| topology_snapshot.shard_for_prefix(*address) == shard);
+    let merged = genesis_writes(&config.accounts, &config.pools, &config.packages);
+    // The stdlib package is replicated to every shard's substate store
+    // for read availability, but the prefix-rooted JMT must hold only
+    // this shard's subtree, so the committed state root is the global
+    // tree's node at the shard prefix.
+    let jmt_writes =
+        filter_genesis_writes_for_shard(&merged, owned_by(shard, topology_snapshot.shard_trie()));
+    let state_root = storage.install_genesis(&merged, &jmt_writes);
+    Block::genesis(shard, GENESIS_PROPOSER, state_root, ChainOrigin::ROOT)
 }

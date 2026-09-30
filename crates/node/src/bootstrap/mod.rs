@@ -57,7 +57,7 @@ use self::witness_history::WitnessHistorySync;
 /// before its authenticated span imports.
 ///
 /// Every genesis-born store carries the stdlib package on its substate
-/// side for read availability (`install_engine_genesis` writes it
+/// side for read availability (`network_genesis_block` writes it
 /// unfiltered while the JMT takes only the shard's prefix subtree).
 /// Account balances are not replicated: account state is authenticated
 /// and arrives through the span import, which overwrites the replicated

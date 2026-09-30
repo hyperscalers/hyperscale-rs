@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
-use hyperscale_node::{SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_vnode_group};
+use hyperscale_node::{
+    SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, network_genesis_block, seat_vnode_group,
+};
 use hyperscale_storage::{RecoveredState, ShardChainReader};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
@@ -157,8 +159,9 @@ impl ShardSupervisor {
     /// - **fresh store, attested anchor** — snap-sync bootstrap off
     ///   this loop (a tokio task), seated via [`Self::finish_join`]
     ///   when the import verifies against the anchor;
-    /// - **fresh store, genesis-born shard with no crossing yet** — seat
-    ///   directly and replay the chain from genesis through block sync;
+    /// - **fresh store, genesis-born shard with no crossing yet** — install
+    ///   the network genesis the shard's members committed at birth, seat on
+    ///   it, and let block sync carry the chain forward from there;
     /// - **fresh store, no anchor otherwise** — the shard's chain began
     ///   past genesis, or has crossed a boundary this host's topology has
     ///   not yet folded, so a genesis replay has nothing to start from.
@@ -231,13 +234,29 @@ impl ShardSupervisor {
             return;
         }
         self.bootstrapping.remove(&shard);
-        if fresh_store && !topology_snapshot.genesis_unanchored(shard) {
+        if !fresh_store {
+            self.seat_shard(shard, &vnodes, storage, &recovered);
+            return;
+        }
+        if !topology_snapshot.genesis_unanchored(shard) {
             drop(storage);
             info!(shard = ?shard, "Join parked until this host's topology carries the shard's anchor");
             self.awaiting_anchor.insert(shard, vnodes);
             return;
         }
-        self.seat_shard(shard, &vnodes, storage, &recovered);
+        let genesis = network_genesis_block(
+            storage.as_ref(),
+            shard,
+            &topology_snapshot,
+            &self.engine_bootstrap.config,
+        );
+        info!(
+            shard = ?shard,
+            genesis_hash = ?genesis.hash(),
+            state_root = ?genesis.header().state_root(),
+            "Seating a fresh store at the network genesis"
+        );
+        self.seat_shard_with_genesis(shard, &vnodes, storage, &recovered, Some(&genesis));
     }
 
     /// Settle a finished bootstrap: seat the shard on success, clear
@@ -282,10 +301,10 @@ impl ShardSupervisor {
         self.seat_shard_with_genesis(shard, vnodes, storage, recovered, None);
     }
 
-    /// [`Self::seat_shard`] with an optional pre-spawn genesis install —
-    /// a split child's flip commits its derived genesis through the
-    /// freshly attached loop before the thread spawns, exactly the
-    /// startup runners' network-genesis sequence.
+    /// [`Self::seat_shard`] with an optional pre-spawn genesis install,
+    /// committed through the freshly attached loop before the thread
+    /// spawns: a split child's flip commits its derived genesis, and a
+    /// fresh store on a never-crossed genesis shard the network's.
     pub(super) fn seat_shard_with_genesis(
         &mut self,
         shard: ShardId,

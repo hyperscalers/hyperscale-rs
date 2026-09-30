@@ -56,10 +56,9 @@ async fn a_wiped_store_on_a_never_crossed_shard_rejoins_at_genesis() {
 
     let restarted = 3;
     let before = await_height(&cluster, None, BlockHeight::new(CATCH_UP_BLOCKS)).await;
-    cluster
+    let topology = cluster
         .restart_with_wiped_shards(restarted, &[ShardId::ROOT])
         .await;
-    let topology = cluster.topology(restarted).load_full();
     assert!(
         topology.boundary(ShardId::ROOT).is_none() && topology.genesis_unanchored(ShardId::ROOT),
         "ROOT has not crossed, so a fresh store rejoins it at genesis"
@@ -115,7 +114,6 @@ const fn split_config() -> ScenarioConfig {
 /// fresh store has nothing to replay from genesis: it has to snap-sync.
 #[test]
 #[serial]
-#[ignore = "a fresh store at startup is seated at a network genesis nobody else has, and the host never extends the split child's chain"]
 fn a_wiped_store_on_a_split_child_rejoins_its_chain() {
     let mut cluster = ProdCluster::start(&split_config(), 11, SPLIT_EPOCH_MS);
     grow_to(&mut cluster, 2);

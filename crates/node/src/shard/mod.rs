@@ -40,6 +40,7 @@ mod actions;
 mod beacon_sink;
 mod fetch_dispatch;
 mod lifecycle;
+pub use lifecycle::network_genesis_block;
 mod metrics;
 mod protocol_event;
 mod timer;
@@ -746,19 +747,19 @@ where
     }
 
     /// Install `genesis` on every hosted vnode and commit it through
-    /// the normal pipeline — the same sequence the startup runners
-    /// perform for a network genesis, used pre-spawn by a split child's
-    /// flip with the deterministic
-    /// [`Block::split_child_genesis`](hyperscale_types::Block::split_child_genesis).
-    /// The storage's adoption already points the JMT at the genesis
-    /// version, so the commit's genesis arm re-records that height.
+    /// the normal pipeline, pre-spawn: a split child's flip with the
+    /// deterministic
+    /// [`Block::split_child_genesis`](hyperscale_types::Block::split_child_genesis),
+    /// or a fresh store on a never-crossed genesis shard with its
+    /// [`network_genesis_block`](crate::network_genesis_block). The
+    /// store already holds the genesis state at the genesis version, so
+    /// the commit's genesis arm re-records that height.
     ///
     /// Returns the timer ops the genesis commit produced — chiefly the
     /// consensus pacemaker's [`TimerId::ViewChange`] arm. The caller spawns
     /// the loop after this returns, so it must hand these back as the loop's
     /// initial timer ops; otherwise the first `run_step` clears them and the
-    /// shard never arms its pacemaker (the startup runner threads the
-    /// equivalent ops through `initial_timer_ops`).
+    /// shard never arms its pacemaker.
     pub fn install_genesis(&mut self, genesis: &Block) -> Vec<TimerOp> {
         let certified = Arc::new(Verified::<CertifiedBlock>::genesis_certified(
             genesis.clone(),

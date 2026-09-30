@@ -184,7 +184,9 @@ pub struct ShardSupervisor {
     storage_dir: StorageDirResolver,
     /// Replicated into every fresh store this supervisor opens — a
     /// post-genesis joiner or observer store must carry the engine
-    /// bootstrap on its substate side before its span imports.
+    /// bootstrap on its substate side before its span imports — and the
+    /// genesis config a fresh store on a never-crossed genesis shard
+    /// installs.
     engine_bootstrap: EngineBootstrap,
     /// Cloned into every spawned shard loop's config so placement
     /// deltas reach the runner's reconfiguration loop.
@@ -345,13 +347,12 @@ impl ShardSupervisor {
 
     /// Spawn a startup shard's pinned thread and record it. Used by the
     /// runner for the shards composed into the `NodeHost` at build time,
-    /// which arrive with their channels and genesis timer ops already
-    /// prepared.
+    /// each resuming a retained store, which arrive with their channels
+    /// already prepared.
     pub(crate) fn spawn_recorded(
         &mut self,
         shard_loop: ProdShardLoop,
         channels: ShardChannels,
-        initial_timer_ops: Vec<TimerOp>,
         vnode_count: usize,
     ) {
         let shard = shard_loop.shard;
@@ -362,7 +363,7 @@ impl ShardSupervisor {
             .iter()
             .map(|v| v.validator_id.inner())
             .collect();
-        let cfg = self.loop_config(channels, initial_timer_ops);
+        let cfg = self.loop_config(channels, Vec::new());
         let join = spawn_shard_loop(shard_loop, cfg);
         self.shards.insert(
             shard,

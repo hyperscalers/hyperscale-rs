@@ -53,10 +53,6 @@ mod invariants;
 pub mod membership;
 pub mod reshape;
 
-/// The proposer the network genesis block names; every store that installs
-/// the genesis builds the same block with it.
-const GENESIS_PROPOSER: ValidatorId = ValidatorId::new(0);
-
 /// Consensus crypto scheme the simulated validators run.
 ///
 /// Every scheme is constructible on any build; the feature only moves the
@@ -1137,7 +1133,7 @@ impl SimulationRunner {
             block,
             certified,
             setup_output,
-        } = self.hosts[host as usize].build_shard_genesis(shard, GENESIS_PROPOSER, config);
+        } = self.hosts[host as usize].build_shard_genesis(shard, config);
         self.drain_host_io(host);
         self.process_step_output(host, setup_output);
         self.schedule_event(

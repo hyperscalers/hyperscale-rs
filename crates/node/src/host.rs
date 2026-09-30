@@ -13,10 +13,9 @@
 //! [`ShardLoop::run_step`]; simulation keeps the whole host and drives it
 //! single-threaded over a global event queue through [`NodeHost::step`],
 //! which fans a `HostEvent::Process` out across every hosted shard.
-//! Production also calls `step` once at startup for the genesis commit,
-//! before it decomposes the host. Both paths share `ShardLoop::step` for
-//! dispatch and the same `clear_scratch` / `take_output` scratch lifecycle,
-//! so the two drivers cannot drift.
+//! Both paths share `ShardLoop::step` for dispatch and the same
+//! `clear_scratch` / `take_output` scratch lifecycle, so the two drivers
+//! cannot drift.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
