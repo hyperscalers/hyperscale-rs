@@ -28,7 +28,7 @@
 //! typed [`RatifyEffect`]s into actions. Tests need validator keypairs
 //! and an anchor, nothing more.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
@@ -206,6 +206,42 @@ impl RatifyTracker {
     #[must_use]
     pub const fn deadline_passed(&self) -> bool {
         self.deadline_passed
+    }
+
+    /// Values other than the held candidate and the skip hash that more
+    /// than the pool's fault bound prevoted in one round, each with the
+    /// members that prevoted it there. More than `f` prevotes include an
+    /// honest member's, and an honest member prevotes only a candidate
+    /// it verified: the value is a real certified candidate this member
+    /// lacks, and every honest one of those members holds it. The
+    /// threshold also keeps up to `f` Byzantine prevoters from naming
+    /// hashes for this member to chase.
+    #[must_use]
+    pub fn unheld_prevoted_candidates(&self) -> BTreeMap<BeaconBlockHash, BTreeSet<ValidatorId>> {
+        let faults = self.pool.len() - ratify_quorum(self.pool.len());
+        let mut unheld: BTreeMap<BeaconBlockHash, BTreeSet<ValidatorId>> = BTreeMap::new();
+        for ((_, phase), bucket) in &self.votes {
+            if *phase != RatifyPhase::Prevote {
+                continue;
+            }
+            let mut by_value: BTreeMap<BeaconBlockHash, BTreeSet<ValidatorId>> = BTreeMap::new();
+            for (signer, vote) in bucket {
+                by_value
+                    .entry(vote.block_hash())
+                    .or_default()
+                    .insert(*signer);
+            }
+            for (value, voters) in by_value {
+                if value == self.skip_hash
+                    || Some(value) == self.candidate
+                    || voters.len() <= faults
+                {
+                    continue;
+                }
+                unheld.entry(value).or_default().extend(voters);
+            }
+        }
+        unheld
     }
 
     /// Whether `validator` sits in the epoch's active pool.

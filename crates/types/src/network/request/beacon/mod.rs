@@ -6,9 +6,11 @@
 //! via these per-payload requests.
 
 mod block;
+mod candidate;
 mod proposal;
 mod shard_witnesses;
 
 pub use block::GetBeaconBlockRequest;
+pub use candidate::GetBeaconCandidateRequest;
 pub use proposal::GetBeaconProposalRequest;
 pub use shard_witnesses::GetShardWitnessesRequest;

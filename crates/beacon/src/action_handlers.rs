@@ -256,6 +256,7 @@ where
             ctx.notify_protocol(ProtocolEvent::VerifiedRatifyVoteReceived { vote });
         }
         Action::BroadcastBeaconCandidate { candidate } => {
+            (ctx.cache_beacon_candidate)(Arc::clone(&candidate));
             ctx.network
                 .broadcast_global(&BeaconCandidateGossip::new(Arc::new(Verifiable::from(
                     Arc::unwrap_or_clone(candidate),
@@ -315,6 +316,9 @@ where
                 })
                 .map(Arc::new)
                 .map_err(|(_, e)| e);
+            if let Ok(verified) = &result {
+                (ctx.cache_beacon_candidate)(Arc::clone(verified));
+            }
             ctx.notify_protocol(ProtocolEvent::BeaconCandidateVerified { result });
         }
         Action::VerifyPcVote1 {

@@ -64,7 +64,7 @@ use hyperscale_types::{
 pub use io::ShardIo;
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::beacon::{BeaconBlockSync, BeaconProposalCache};
+use crate::beacon::{BeaconBlockSync, BeaconCandidateCache, BeaconProposalCache};
 pub use crate::event::{
     EventPriority, FetchFailureKind, HostEvent, PoolScopedInput, ProcessScopedInput,
     ShardScopedInput,
@@ -102,6 +102,10 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     /// notification handler, read by the `GetBeaconProposalRequest`
     /// responder. No coordinator touches it.
     pub(crate) beacon_proposal_cache: Arc<BeaconProposalCache>,
+    /// Process-level serve cache for ratify candidates — fed by the
+    /// candidate broadcast and verify handlers, read by the
+    /// `GetBeaconCandidateRequest` responder.
+    pub(crate) beacon_candidate_cache: Arc<BeaconCandidateCache>,
     /// Process-level beacon store, threaded to the ratify-vote sign
     /// handler as its durable-register seam.
     pub(crate) beacon_storage: Arc<dyn BeaconStorage>,

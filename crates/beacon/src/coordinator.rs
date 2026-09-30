@@ -232,6 +232,11 @@ pub struct BeaconCoordinator {
     /// assembler's certified-block broadcast instead.
     pending_candidate: Option<Arc<Verified<CandidateBeaconBlock>>>,
 
+    /// Candidates the pool prevoted that this member never received and
+    /// has asked a prevoter for, as `(epoch, block_hash)`. One ask per
+    /// candidate; the asks are abandoned when the epoch settles.
+    candidate_asks: BTreeSet<(Epoch, BeaconBlockHash)>,
+
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
     equivocations: EquivocationObservations,
@@ -451,6 +456,7 @@ impl BeaconCoordinator {
             proposal_pool: BeaconProposalPool::new(latest_epoch.next()),
             evaluated_proposers: BTreeSet::new(),
             dwell_fetches: BTreeSet::new(),
+            candidate_asks: BTreeSet::new(),
             commit_assembly: CommitAssembler::new(),
             local_shard,
             topology_schedule,
@@ -1871,7 +1877,52 @@ impl BeaconCoordinator {
             return Vec::new();
         }
         let effects = self.ratify.observe(vote);
-        self.lift_ratify_effects(effects)
+        let mut actions = self.lift_ratify_effects(effects);
+        actions.extend(self.ask_for_prevoted_candidates());
+        actions
+    }
+
+    /// Ask for every candidate the pool prevoted that this member does
+    /// not hold, once each. Without the candidate a member can prevote
+    /// only the skip hash, and members locked on either value never
+    /// leave it for the other without a newer polka: a pool split
+    /// between members that hold the candidate and members that missed
+    /// it on gossip never reaches a quorum. The ask goes to a member
+    /// that prevoted it — it verified the candidate, so it holds a copy
+    /// — over that member's shard; the answer enters as a gossiped
+    /// candidate does.
+    fn ask_for_prevoted_candidates(&mut self) -> Vec<Action> {
+        if self.ratify.is_completed()
+            || self.ratify.candidate().is_some()
+            || self.pending_candidate.is_some()
+        {
+            return Vec::new();
+        }
+        let epoch = self.state.current_epoch.next();
+        let mut actions = Vec::new();
+        for (block_hash, voters) in self.ratify.unheld_prevoted_candidates() {
+            if self.candidate_asks.contains(&(epoch, block_hash)) {
+                continue;
+            }
+            let Some((voter, shard)) =
+                voters
+                    .iter()
+                    .find_map(|voter| match self.state.validators.get(voter)?.status {
+                        ValidatorStatus::OnShard { shard, .. } => Some((*voter, shard)),
+                        _ => None,
+                    })
+            else {
+                continue;
+            };
+            self.candidate_asks.insert((epoch, block_hash));
+            actions.push(Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::BeaconCandidates(vec![(epoch, block_hash)]),
+                shard,
+                preferred: Some(voter),
+                class: None,
+            }));
+        }
+        actions
     }
 
     /// A shard-witness chunk arrived. Resolve the anchor block's header
@@ -2133,6 +2184,10 @@ impl BeaconCoordinator {
         );
         self.latest_block = Arc::clone(&block);
         self.spc.clear();
+        let abandoned_candidates: Vec<(Epoch, BeaconBlockHash)> =
+            std::mem::take(&mut self.candidate_asks)
+                .into_iter()
+                .collect();
         self.restart_ratification();
         self.prune_folded_evidence();
 
@@ -2222,6 +2277,11 @@ impl BeaconCoordinator {
             )));
         }
         actions.extend(released_dwell_fetches);
+        if !abandoned_candidates.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::BeaconCandidates(
+                abandoned_candidates,
+            )));
+        }
         // Release in-flight witness fetches the boundary fold just consumed
         // — their leaves are below the advanced watermark, so a future
         // contribution can't include them and the runner's slot should

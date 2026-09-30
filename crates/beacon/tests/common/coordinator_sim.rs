@@ -21,13 +21,14 @@ use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
-    AggregateSignature, BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
-    BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-    BlockHeaderParts, BlockHeight, BlockVote, CandidateBeaconBlock, CandidateVerifyContext,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader,
-    ConsensusPublicKey, Epoch, GenesisPool, GenesisValidator, Hash, LeafIndex, LocalReceiptRoot,
-    LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, PcScope, PcValueElement, PcVector, PcVote1,
-    PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot,
+    AggregateSignature, BEACON_SIGNER_COUNT, BeaconBlockHash, BeaconCert, BeaconChainConfig,
+    BeaconGenesisConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
+    BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockVote, CandidateBeaconBlock,
+    CandidateVerifyContext, CertificateRoot, CertifiedBeaconBlock,
+    CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader, ConsensusPublicKey, Epoch,
+    GenesisPool, GenesisValidator, Hash, LeafIndex, LocalReceiptRoot, LocalTimestamp,
+    MIN_STAKE_FLOOR, NetworkDefinition, PcScope, PcValueElement, PcVector, PcVote1, PcVote2,
+    PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot,
     QuorumCertificate, RATIFY_ROUND_TIMEOUT, Randomness, RatifyPhase, RatifyRound,
     RatifyVerifyContext, RatifyVote, RevealChain, Round, SKIP_TIMEOUT, ShardId, ShardLoad,
     ShardVoteEquivocation, ShardWitnessPayload, Signer, SignerBitfield, SpcEmptyViewMsg,
@@ -166,6 +167,12 @@ pub struct CoordinatorSim {
     /// partition — candidates, votes, and blocks all stop crossing;
     /// cleared by [`Self::clear_block_partition`].
     blocked_block_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
+    /// Replicas every `BroadcastBeaconCandidate` delivery skips — a
+    /// candidate lost on gossip to them.
+    blocked_candidate_receivers: BTreeSet<ValidatorId>,
+    /// Every candidate any replica broadcast, by block hash: what a
+    /// replica holding one serves a candidate fetch from.
+    broadcast_candidates: BTreeMap<BeaconBlockHash, Arc<Verified<CandidateBeaconBlock>>>,
     /// Crossing children held back from a replica, released by
     /// [`Self::release_withheld_crossing_children`].
     withheld_crossing_children: Vec<(usize, Arc<Verified<CertifiedBlockHeader>>)>,
@@ -273,6 +280,8 @@ impl CoordinatorSim {
             pending_vote_equivocations: BTreeMap::new(),
             blocked_proposal_pairs: BTreeSet::new(),
             blocked_block_pairs: BTreeSet::new(),
+            blocked_candidate_receivers: BTreeSet::new(),
+            broadcast_candidates: BTreeMap::new(),
             withheld_crossing_children: Vec::new(),
         }
     }
@@ -288,6 +297,13 @@ impl CoordinatorSim {
                 self.blocked_block_pairs.insert((y, x));
             }
         }
+    }
+
+    /// Drop every candidate broadcast addressed to `receiver`: it
+    /// misses the candidate on gossip and holds it only if it fetches
+    /// it.
+    pub fn block_candidates_to(&mut self, receiver: ValidatorId) {
+        self.blocked_candidate_receivers.insert(receiver);
     }
 
     /// Heal the block-dissemination partition.
@@ -1238,12 +1254,17 @@ impl CoordinatorSim {
                 }
             }
             Action::BroadcastBeaconCandidate { candidate } => {
+                self.broadcast_candidates
+                    .entry(candidate.block_hash())
+                    .or_insert_with(|| Arc::clone(&candidate));
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
                     }
                     let rcpt = self.members[to_idx].0;
-                    if self.blocked_block_pairs.contains(&(me, rcpt)) {
+                    if self.blocked_block_pairs.contains(&(me, rcpt))
+                        || self.blocked_candidate_receivers.contains(&rcpt)
+                    {
                         continue;
                     }
                     self.network_q.push_back(Envelope {
@@ -1529,6 +1550,34 @@ impl CoordinatorSim {
                             epoch,
                             validator,
                             proposal,
+                        },
+                    });
+                }
+            }
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::BeaconCandidates(ref wanted),
+                preferred,
+                ..
+            }) if wanted.len() == 1 => {
+                let (_, block_hash) = wanted[0];
+                // Served by a replica that holds the candidate, the
+                // preferred prevoter first; an unanswered ask queues
+                // nothing, as production releases the slot to retry.
+                let mut peer_order: Vec<usize> = (0..self.coordinators.len())
+                    .filter(|&i| i != emitter_idx)
+                    .collect();
+                if let Some(p) = preferred {
+                    let preferred_idx = self.idx_of(p);
+                    peer_order.sort_by_key(|&i| i32::from(i != preferred_idx));
+                }
+                let held = peer_order.iter().any(|&peer_idx| {
+                    self.coordinators[peer_idx].pending_candidate_hash() == Some(block_hash)
+                });
+                if held && let Some(candidate) = self.broadcast_candidates.get(&block_hash) {
+                    self.loopback_q.push_back(Envelope {
+                        to_idx: emitter_idx,
+                        event: SimEvent::BeaconCandidate {
+                            candidate: Arc::clone(candidate),
                         },
                     });
                 }

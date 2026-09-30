@@ -9,8 +9,8 @@
 //! state machine.
 
 use hyperscale_types::{
-    Address, Anchor, BlockHash, BlockHeight, Epoch, FinalizationHash, Hash, LeafIndex,
-    ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId,
+    Address, Anchor, BeaconBlockHash, BlockHash, BlockHeight, Epoch, FinalizationHash, Hash,
+    LeafIndex, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId,
 };
 
 /// A batch of ids under the binding that fetches them, keyed exactly as
@@ -43,6 +43,9 @@ pub enum FetchIds {
     SettledTxs(Vec<TerminalEvidence>),
     /// Missing beacon proposals as `(epoch, validator)`.
     BeaconProposals(Vec<(Epoch, ValidatorId)>),
+    /// Ratify candidates a pool prevoted and the local member never
+    /// received, as `(epoch, block_hash)`.
+    BeaconCandidates(Vec<(Epoch, BeaconBlockHash)>),
     /// Beacon-witness leaf runs as `(source_shard, block_height,
     /// committed_block_hash, lo, hi)`.
     ShardWitnesses(Vec<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>),

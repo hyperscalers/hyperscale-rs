@@ -1146,3 +1146,43 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
         assert!(matches!(commit.block.cert(), BeaconCert::Normal { .. }));
     }
 }
+
+/// A pool member that missed the candidate on gossip asks a member that
+/// prevoted it, prevotes it once it holds it, and the pool commits the
+/// candidate. Without the ask the two members that missed it could only
+/// prevote skip: four of six prevotes for the candidate and two for skip
+/// reach neither quorum of five, and the members holding the candidate
+/// keep leaning its way, so the pool never converges.
+#[test]
+fn a_member_that_missed_the_candidate_fetches_it_from_a_prevoter() {
+    let mut sim = CoordinatorSim::new_with_pool(4, 6, 0xCA_4D);
+    for missed in [ValidatorId::new(4), ValidatorId::new(5)] {
+        sim.block_candidates_to(missed);
+    }
+    sim.kick_off();
+    sim.run_for_at_most(200_000);
+    // The members that missed the candidate reach the deadline without
+    // it; the rounds after it are where a split would show.
+    for _ in 0..4 {
+        if sim.commits.iter().all(|commits| !commits.is_empty()) {
+            break;
+        }
+        sim.pass_skip_deadline();
+        for idx in 0..sim.n() {
+            sim.fire_ratify_timer(idx);
+        }
+        sim.run_for_at_most(200_000);
+        sim.pass_ratify_round();
+    }
+
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let commit = commits
+            .first()
+            .unwrap_or_else(|| panic!("replica {r} never committed epoch 1"));
+        assert_eq!(commit.epoch, Epoch::new(1));
+        assert!(
+            matches!(commit.block.cert(), BeaconCert::Normal { .. }),
+            "replica {r} committed a skip: the pool never converged on the candidate",
+        );
+    }
+}

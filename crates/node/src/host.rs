@@ -34,7 +34,8 @@ use hyperscale_types::{
 
 use crate::NodeStateMachine;
 use crate::beacon::{
-    BeaconBlockSync, BeaconFetchState, BeaconProposalCache, beacon_block_sync_config,
+    BeaconBlockSync, BeaconCandidateCache, BeaconFetchState, BeaconProposalCache,
+    beacon_block_sync_config,
 };
 use crate::config::NodeConfig;
 use crate::pool_loop::PoolLoop;
@@ -232,6 +233,7 @@ where
             executor,
             network: Arc::clone(&network),
             beacon_proposal_cache: Arc::new(BeaconProposalCache::new(beacon_network)),
+            beacon_candidate_cache: Arc::new(BeaconCandidateCache::new()),
             beacon_storage: Arc::clone(&beacon_storage),
             per_shard,
         });

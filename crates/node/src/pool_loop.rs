@@ -33,8 +33,8 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
 use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
 use hyperscale_types::{
-    BeaconProposal, CertifiedBeaconBlock, Epoch, LocalTimestamp, ShardId, ValidatorId, Verifiable,
-    Verified,
+    BeaconProposal, CandidateBeaconBlock, CertifiedBeaconBlock, Epoch, LocalTimestamp, ShardId,
+    ValidatorId, Verifiable, Verified,
 };
 use tracing::{trace, warn};
 
@@ -374,6 +374,10 @@ where
             |from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>| {
                 proposal_cache.admit(from, epoch, proposal);
             };
+        let candidate_cache = &self.process.dispatch_handles.beacon_candidate_cache;
+        let cache_beacon_candidate = |candidate: Arc<Verified<CandidateBeaconBlock>>| {
+            candidate_cache.admit(candidate);
+        };
         let vnode = &self.vnodes[vnode_idx];
         let ctx = BeaconActionContext {
             topology_snapshot: vnode.state.topology_arc(),
@@ -384,6 +388,7 @@ where
             verifier: vnode.state.beacon_coordinator().verifier().as_ref(),
             notify,
             cache_beacon_proposal: &cache_beacon_proposal,
+            cache_beacon_candidate: &cache_beacon_candidate,
         };
         handle_beacon_action(action, &ctx);
         drop(ctx);

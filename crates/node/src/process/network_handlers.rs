@@ -24,7 +24,8 @@ use hyperscale_types::network::notification::{
     ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::network::request::beacon::{
-    GetBeaconBlockRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
+    GetBeaconBlockRequest, GetBeaconCandidateRequest, GetBeaconProposalRequest,
+    GetShardWitnessesRequest,
 };
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
@@ -1285,6 +1286,14 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetBeaconProposalRequest>(shard, move |req| {
             proposal_cache.serve(&req)
+        });
+
+    // ── beacon.candidate.request → process-level serve cache ─────
+    let candidate_cache = Arc::clone(&process.dispatch_handles.beacon_candidate_cache);
+    process
+        .network
+        .register_request_handler::<GetBeaconCandidateRequest>(shard, move |req| {
+            candidate_cache.serve(&req)
         });
 
     // ── beacon.block.request → committed beacon block by epoch ──

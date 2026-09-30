@@ -15,9 +15,9 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    Anchor, BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, ShardId, SubstateKey,
-    TerminalEvidence, TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
-    WeightedTimestamp,
+    Anchor, BeaconProposal, BeaconWitnessCommit, CandidateBeaconBlock, CertifiedBlock, Epoch,
+    ShardId, SubstateKey, TerminalEvidence, TopologySchedule, TransactionStatus, TxHash,
+    ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -679,6 +679,59 @@ where
 
     // ─── Delegated Work ─────────────────────────────────────────────────
 
+    /// Whether `me` may emit `action` from this shard's vnode.
+    ///
+    /// One beacon signature per validator per position: a co-hosted
+    /// vnode that hasn't claimed the current SPC view has its beacon
+    /// signing actions dropped here, before any signature exists.
+    /// The state machines stay single-node — passivity is purely a
+    /// driver decision at this funnel. A dissolved shard's vnode
+    /// stops emitting SPC traffic entirely: its successors are live,
+    /// so the validator's live vnode carries the duty, and a stale
+    /// coordinator claiming views it can't follow through starves
+    /// the beacon of this validator's signatures.
+    fn beacon_emission_allowed(&self, me: ValidatorId, action: &Action) -> bool {
+        let shard = self.shard;
+        if action.is_beacon_consensus_emission()
+            && self.process.topology_snapshot.load().successors_live(shard)
+        {
+            trace!(
+                validator = ?me,
+                shard = shard.inner(),
+                action = action.type_name(),
+                "Dropping beacon emission from a dissolved shard's vnode"
+            );
+            return false;
+        }
+        if let Some(position) = action.ratify_signing_position() {
+            if !self.process.allow_ratify_signing(me, position) {
+                trace!(
+                    validator = ?me,
+                    shard = shard.inner(),
+                    epoch = position.0.inner(),
+                    round = position.1.inner(),
+                    "Dropping already-covered ratify vote position"
+                );
+                return false;
+            }
+        } else if let Some((epoch, view)) = action.beacon_signing_position()
+            && !self
+                .process
+                .allow_beacon_signing(me, Some(shard), epoch, view)
+        {
+            trace!(
+                validator = ?me,
+                shard = shard.inner(),
+                epoch = epoch.inner(),
+                view = view.inner(),
+                action = action.type_name(),
+                "Dropping beacon signing action for an unclaimed view"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Dispatch a delegated action to the appropriate thread pool.
     ///
     /// Spawns the work as a fire-and-forget closure. Results return via
@@ -696,50 +749,7 @@ where
         let vnode = self.vnode(vnode_idx);
         let me = vnode.validator_id;
 
-        // One beacon signature per validator per position: a co-hosted
-        // vnode that hasn't claimed the current SPC view has its beacon
-        // signing actions dropped here, before any signature exists.
-        // The state machines stay single-node — passivity is purely a
-        // driver decision at this funnel. A dissolved shard's vnode
-        // stops emitting SPC traffic entirely: its successors are live,
-        // so the validator's live vnode carries the duty, and a stale
-        // coordinator claiming views it can't follow through starves
-        // the beacon of this validator's signatures.
-        if action.is_beacon_consensus_emission()
-            && self.process.topology_snapshot.load().successors_live(shard)
-        {
-            trace!(
-                validator = ?me,
-                shard = shard.inner(),
-                action = action.type_name(),
-                "Dropping beacon emission from a dissolved shard's vnode"
-            );
-            return;
-        }
-        if let Some(position) = action.ratify_signing_position() {
-            if !self.process.allow_ratify_signing(me, position) {
-                trace!(
-                    validator = ?me,
-                    shard = shard.inner(),
-                    epoch = position.0.inner(),
-                    round = position.1.inner(),
-                    "Dropping already-covered ratify vote position"
-                );
-                return;
-            }
-        } else if let Some((epoch, view)) = action.beacon_signing_position()
-            && !self
-                .process
-                .allow_beacon_signing(me, Some(shard), epoch, view)
-        {
-            trace!(
-                validator = ?me,
-                shard = shard.inner(),
-                epoch = epoch.inner(),
-                view = view.inner(),
-                action = action.type_name(),
-                "Dropping beacon signing action for an unclaimed view"
-            );
+        if !self.beacon_emission_allowed(me, &action) {
             return;
         }
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
@@ -775,6 +785,9 @@ where
                 |from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>| {
                     handles.beacon_proposal_cache.admit(from, epoch, proposal);
                 };
+            let cache_beacon_candidate = |candidate: Arc<Verified<CandidateBeaconBlock>>| {
+                handles.beacon_candidate_cache.admit(candidate);
+            };
             let ctx = ActionContext {
                 executor: handles.executor.as_ref(),
                 topology_snapshot: &topology_snapshot,
@@ -791,6 +804,7 @@ where
                 notify,
                 commit_prepared: &commit_prepared,
                 cache_beacon_proposal: &cache_beacon_proposal,
+                cache_beacon_candidate: &cache_beacon_candidate,
                 par,
             };
             match owner {
