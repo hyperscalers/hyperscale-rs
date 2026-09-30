@@ -1042,7 +1042,7 @@ impl ProductionRunner {
                     // marks a reshape-seated shard as in-flight this same tick, so
                     // the join backstop skips it rather than racing a redundant
                     // snap-sync against the orchestrator's seat.
-                    supervisor.reshape_step(Vec::new());
+                    supervisor.reshape_tick();
                     supervisor.reconcile_joins();
                 }
             }

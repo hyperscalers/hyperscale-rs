@@ -30,7 +30,7 @@ use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::process::ProcessIo;
 use hyperscale_node::reshape::PreparedStore;
-use hyperscale_node::reshape::orchestrator::{ReshapeOrchestrator, ReshapeRequest};
+use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator, ReshapeRequest};
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{NodeConfig, TimerOp};
 use hyperscale_provisions::ProvisionConfig;
@@ -233,6 +233,10 @@ pub struct ShardSupervisor {
     /// Shards whose teardown is parked on the off-loop thread join.
     /// A `Join` arriving meanwhile queues in [`Self::pending_joins`].
     draining: HashSet<ShardId>,
+    /// Reshape io results held for the next reshape tick rather than fed
+    /// straight back: a deferral whose cause still stands would otherwise
+    /// re-issue its request as fast as it fails.
+    deferred_reshape_events: Vec<ReshapeEvent>,
     /// Joins that arrived while their shard was draining, replayed by
     /// the [`SupervisorEvent::TornDown`] handler. Dropping them instead
     /// would lose the placement delta until restart.
@@ -309,6 +313,7 @@ impl ShardSupervisor {
             pending_reshape_prep: HashMap::new(),
             epoch_duration_ms,
             draining: HashSet::new(),
+            deferred_reshape_events: Vec::new(),
             pending_joins: HashMap::new(),
             awaiting_anchor: BTreeMap::new(),
             pool: None,

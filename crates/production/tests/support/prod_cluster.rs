@@ -25,8 +25,9 @@ use hyperscale_scenarios::{
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeight, Derivation, LocalKey, NetworkDefinition,
-    PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
+    PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, TopologySnapshot,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
+    WeightedTimestamp,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
@@ -211,10 +212,15 @@ impl ProdCluster {
 
     /// Restart host `host` with its stores for `shards` wiped and every
     /// other store, its beacon chain included, kept (see
-    /// [`Harness::restart_with_wiped_shards`]).
-    pub fn restart_with_wiped_shards(&mut self, host: usize, shards: &[ShardId]) {
+    /// [`Harness::restart_with_wiped_shards`]). Returns the topology the
+    /// rebuilt host starts on.
+    pub fn restart_with_wiped_shards(
+        &mut self,
+        host: usize,
+        shards: &[ShardId],
+    ) -> Arc<TopologySnapshot> {
         self.runtime
-            .block_on(self.inner.restart_with_wiped_shards(host, shards));
+            .block_on(self.inner.restart_with_wiped_shards(host, shards))
     }
 
     /// A host serving any shard `tx` touches, for submission routing.

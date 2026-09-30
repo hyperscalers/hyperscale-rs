@@ -94,8 +94,10 @@ pub enum ReshapeRequest {
     },
     /// Seed `child`'s store by cloning the host's local `parent` store onto the
     /// child subtree, once the local parent has committed through the terminal
-    /// crossing. Answered by [`ReshapeEvent::Opened`] when the clone lands, or
-    /// [`ReshapeEvent::SeedDeferred`] while the local parent is still behind.
+    /// crossing. Answered by [`ReshapeEvent::Opened`] when the clone lands,
+    /// [`ReshapeEvent::SeedDeferred`] while the local parent is still behind,
+    /// or [`ReshapeEvent::SeedUnavailable`] when the host holds no parent
+    /// store to clone.
     SeedFromParent {
         /// The splitting parent whose store is cloned.
         parent: ShardId,
@@ -280,6 +282,14 @@ pub enum ReshapeEvent {
     /// should be re-armed and retried.
     SeedDeferred {
         /// The split child whose seed is deferred.
+        child: ShardId,
+    },
+    /// A [`ReshapeRequest::SeedFromParent`] found no parent store on this
+    /// host to clone — it restarted without one — so the parent half can
+    /// never seed. The duty relinquishes the child's seat to the adapter's
+    /// ordinary join, which seats the child against its attested anchor.
+    SeedUnavailable {
+        /// The split child whose seat is relinquished.
         child: ShardId,
     },
 }
@@ -605,6 +615,10 @@ enum ParentHalfPhase {
     Prepared,
     /// Seated; inert until the committed projection releases the duty.
     Seated,
+    /// The host holds no parent store to seed the child from, so the child's
+    /// seat is the adapter's ordinary join's. Inert, and kept only so the
+    /// duty is not rediscovered, until the committed projection releases it.
+    Relinquished,
 }
 
 /// One split parent-half duty, keyed by the child it seats. As with an observer
@@ -682,7 +696,18 @@ impl ReshapeOrchestrator {
     pub fn is_seating(&self, shard: ShardId) -> bool {
         self.keepers.contains_key(&shard)
             || self.observers.contains_key(&shard)
-            || self.parent_halves.contains_key(&shard)
+            || (self.parent_halves.contains_key(&shard) && !self.relinquished(shard))
+    }
+
+    /// Whether this host's parent-half duty for `shard` relinquished the
+    /// child's seat to the adapter's ordinary join (see
+    /// [`ReshapeEvent::SeedUnavailable`]). The adapter reads the committed
+    /// cohort as reshape ownership; a relinquished seat is not.
+    #[must_use]
+    pub fn relinquished(&self, shard: ShardId) -> bool {
+        self.parent_halves
+            .get(&shard)
+            .is_some_and(|duty| matches!(duty.phase, ParentHalfPhase::Relinquished))
     }
 
     /// Advance every duty one step: apply the io results in `events`, discover
@@ -714,12 +739,14 @@ impl ReshapeOrchestrator {
         for child in halves {
             self.advance_parent_half(child, view, verifier, &mut requests);
         }
-        // A seated parent half lingers only to keep its child from being
-        // re-discovered; once the projection releases it (the child committed
-        // past genesis) the duty is done.
+        // A seated or relinquished parent half lingers only to keep its child
+        // from being re-discovered; once the projection releases it (the child
+        // committed past genesis) the duty is done.
         self.parent_halves.retain(|child, duty| {
-            !matches!(duty.phase, ParentHalfPhase::Seated)
-                || view.parent_half_cohorts().contains_key(child)
+            !matches!(
+                duty.phase,
+                ParentHalfPhase::Seated | ParentHalfPhase::Relinquished
+            ) || view.parent_half_cohorts().contains_key(child)
         });
         // A seated observer lingers through the parent-half phase so its child
         // stays in `observers`, deferring any co-hosted parent half to the seat
@@ -812,6 +839,16 @@ impl ReshapeOrchestrator {
                         | ParentHalfPhase::SeedingAt { requested, .. } => *requested = false,
                         _ => {}
                     }
+                }
+            }
+            ReshapeEvent::SeedUnavailable { child } => {
+                if let Some(duty) = self.parent_halves.get_mut(&child)
+                    && matches!(
+                        duty.phase,
+                        ParentHalfPhase::Seeding { .. } | ParentHalfPhase::SeedingAt { .. }
+                    )
+                {
+                    duty.phase = ParentHalfPhase::Relinquished;
                 }
             }
         }
@@ -1749,7 +1786,9 @@ impl ReshapeOrchestrator {
                     });
                 }
             }
-            ParentHalfPhase::AwaitingAdopt | ParentHalfPhase::Seated => {}
+            ParentHalfPhase::AwaitingAdopt
+            | ParentHalfPhase::Seated
+            | ParentHalfPhase::Relinquished => {}
             ParentHalfPhase::Prepared => {
                 if duty
                     .validators
@@ -2735,6 +2774,58 @@ mod tests {
                 |r| matches!(r, ReshapeRequest::SeedFromParent { child: c, .. } if *c == child)
             ),
             "a deferred seed must re-arm and retry; got {requests:?}",
+        );
+    }
+
+    /// A seed with no parent store to clone relinquishes the seat: the duty
+    /// stops seeding and no longer claims the child, but stays until the
+    /// projection releases the cohort, so it is not rediscovered into the
+    /// same missing store.
+    #[test]
+    fn an_unavailable_seed_relinquishes_the_seat_until_the_projection_releases_it() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+
+        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        assert!(
+            orch.is_seating(child),
+            "the discovered duty claims the child"
+        );
+
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            vec![ReshapeEvent::SeedUnavailable { child }],
+            at(0),
+        );
+        assert!(
+            requests.is_empty(),
+            "a relinquished duty emits nothing; got {requests:?}"
+        );
+        assert!(orch.relinquished(child));
+        assert!(
+            !orch.is_seating(child),
+            "a relinquished seat is the join's to take"
+        );
+        assert!(
+            orch.step(&view, &BlsVerifier, Vec::new(), at(0)).is_empty(),
+            "the duty is not rediscovered while the cohort stands"
+        );
+
+        let released = snapshot_parent_halves(&[(child, &[1, 5])], &[], &[child]);
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&released)),
+            &BlsVerifier,
+            Vec::new(),
+            at(0),
+        );
+        assert!(
+            !orch.relinquished(child) && !orch.parent_halves.contains_key(&child),
+            "the released cohort ends the relinquished duty"
         );
     }
 
