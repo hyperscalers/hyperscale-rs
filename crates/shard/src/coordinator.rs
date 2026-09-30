@@ -2826,6 +2826,13 @@ impl ShardCoordinator {
         if self.recovery_behind_retained_tip() {
             return vec![];
         }
+        // Every kind self-votes once built, so none may build at a round
+        // this validator already voted or timed out in: amplification can
+        // time out a round above the view, and entering that round later
+        // must not sign in it.
+        if round <= self.last_voted_round {
+            return vec![];
+        }
         let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
         // A genesis QC parents only the chain's first block. A member seated
         // above its chain's origin with no QC yet — a recovery's fresh
@@ -4109,7 +4116,7 @@ impl ShardCoordinator {
         // below to route the vote — terminal-clamped, so a coasting shard
         // already dropped from the head still reaches its own committee.
         let anchored_wt = header.map(|h| h.parent_qc().weighted_timestamp());
-        self.last_voted_round = round;
+        self.last_voted_round = self.last_voted_round.max(round);
         self.locked_round = self.locked_round.max(parent_qc_round);
 
         // Reset the view change timer — voting proves the leader produced a
@@ -4821,6 +4828,17 @@ impl ShardCoordinator {
                 );
                 return vec![];
             }
+        }
+        // The round may have timed out while the build ran; broadcasting
+        // would self-vote in a round this validator gave up.
+        if round <= self.last_voted_round {
+            debug!(
+                height = height.inner(),
+                round = round.inner(),
+                last_voted_round = self.last_voted_round.inner(),
+                "ProposalBuilt for a round already voted or timed out - discarding"
+            );
+            return vec![];
         }
 
         let has_certificates = !block.certificates().is_empty();
@@ -10547,6 +10565,58 @@ mod tests {
         )));
     }
 
+    /// Amplification times out a round above the view. Entering that round
+    /// later as its leader builds nothing: the fallback would self-vote in
+    /// a round this validator already gave up.
+    #[test]
+    fn a_leader_that_timed_out_its_round_builds_nothing_on_entering_it() {
+        let (mut state, topology_schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let _ = state.broadcast_timeout(&topology_schedule, Round::new(2));
+        assert_eq!(state.last_voted_round, Round::new(2));
+
+        let actions = advance_one_round(&mut state, &topology_schedule);
+        assert_eq!(state.view(), Round::new(2));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildProposal { .. })),
+            "no proposal at a timed-out round; got {actions:?}",
+        );
+    }
+
+    /// A build that completes after its round timed out is dropped rather
+    /// than broadcast and self-voted.
+    #[test]
+    fn a_build_finishing_after_its_round_timed_out_is_dropped() {
+        use hyperscale_storage::test_helpers::make_test_block;
+
+        let (mut state, topology_schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let actions = advance_one_round(&mut state, &topology_schedule);
+        let Some(Action::BuildProposal { height, round, .. }) = actions
+            .iter()
+            .find(|a| matches!(a, Action::BuildProposal { .. }))
+        else {
+            panic!("the leader builds on entering its round; got {actions:?}");
+        };
+        let (height, round) = (*height, *round);
+
+        let _ = state.broadcast_timeout(&topology_schedule, round);
+        let block = make_test_block(height);
+        let actions = state.on_proposal_built(
+            &topology_schedule,
+            height,
+            round,
+            &block,
+            block.hash(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        assert!(actions.is_empty(), "got {actions:?}");
+    }
+
     #[test]
     fn test_safe_vote_rule_clauses() {
         // HotStuff-2 Rule 1: vote iff the block is at the current round, beyond
@@ -11377,7 +11447,7 @@ mod tests {
         let held = state.build_and_dispatch_proposal(
             &schedule,
             BlockHeight::new(4),
-            Round::new(0),
+            Round::new(1),
             ProposalKind::Sync,
         );
         assert!(!builds_a_proposal(&held), "got {held:?}");
@@ -11386,7 +11456,7 @@ mod tests {
         let built = state.build_and_dispatch_proposal(
             &schedule,
             BlockHeight::new(4),
-            Round::new(0),
+            Round::new(1),
             ProposalKind::Sync,
         );
         assert!(builds_a_proposal(&built), "got {built:?}");
@@ -14102,7 +14172,7 @@ mod tests {
         let sync_actions = state.build_and_dispatch_proposal(
             &topology_schedule,
             BlockHeight::new(4),
-            Round::new(0),
+            Round::new(1),
             ProposalKind::Sync,
         );
         state.set_block_syncing(false);
@@ -14112,7 +14182,7 @@ mod tests {
         let fallback_actions = state.build_and_broadcast_fallback_block(
             &topology_schedule,
             BlockHeight::new(4),
-            Round::new(1),
+            Round::new(2),
         );
 
         let find_proposal = |actions: &[Action]| -> (bool, ProposerTimestamp) {
